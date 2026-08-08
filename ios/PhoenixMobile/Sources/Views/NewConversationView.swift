@@ -12,6 +12,7 @@ struct NewConversationView: View {
     @State private var modelIDs: [String] = []
     @State private var selectedModel: String?
     @State private var serverDefaultModel: String?
+    @State private var modelsAvailable = true
     @State private var cwdStatus: CwdStatus = .unknown
     @State private var creating = false
     @State private var errorText: String?
@@ -62,6 +63,13 @@ struct NewConversationView: View {
                         }
                     }
                 }
+                if !modelsAvailable {
+                    Section {
+                        Label("No model is configured on this server.", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .font(.callout)
+                    }
+                }
 
                 Section("First message") {
                     TextField("What should the agent do?", text: $firstMessage, axis: .vertical)
@@ -98,8 +106,11 @@ struct NewConversationView: View {
                 if let api = model.api,
                    let models = try? await api.models() {
                     modelIDs = models.modelIDs
-                    serverDefaultModel = models.default
-                    selectedModel = models.default ?? models.modelIDs.first
+                    modelsAvailable = models.llm_configured ?? !models.modelIDs.isEmpty
+                    serverDefaultModel = models.default.flatMap {
+                        models.modelIDs.contains($0) ? $0 : nil
+                    }
+                    selectedModel = serverDefaultModel ?? models.modelIDs.first
                 }
             }
         }
@@ -108,7 +119,9 @@ struct NewConversationView: View {
     private var canCreate: Bool {
         if creating { return false }
         if firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        guard selectedModel != nil else { return false }
+        guard modelsAvailable, let selectedModel, modelIDs.contains(selectedModel) else {
+            return false
+        }
         if case .valid = cwdStatus { return true }
         return false
     }

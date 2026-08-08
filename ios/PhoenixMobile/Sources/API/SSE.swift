@@ -72,7 +72,9 @@ struct SSEParser: Sendable {
 enum PhoenixEvent: Sendable {
     case initSnapshot(InitSnapshot)
     case message(seq: Int64, message: Message)
-    case messageUpdated(seq: Int64, messageId: String, content: JSONValue?, displayData: JSONValue?)
+    case messageUpdated(
+        seq: Int64, messageId: String, content: JSONValue?, displayData: JSONValue?,
+        transcriptGeneration: Int64?)
     case stateChange(seq: Int64, state: JSONValue, presentationMode: String?)
     case token(seq: Int64, text: String, requestId: String)
     case agentDone(seq: Int64)
@@ -175,7 +177,8 @@ enum PhoenixEvent: Sendable {
             guard let messageId = json["message_id"]?.stringValue else { return nil }
             return .messageUpdated(
                 seq: seq, messageId: messageId,
-                content: json["content"], displayData: json["display_data"])
+                content: json["content"], displayData: json["display_data"],
+                transcriptGeneration: json["transcript_generation"]?.numberValue.map(Int64.init))
 
         case "state_change":
             return .stateChange(

@@ -85,7 +85,10 @@ struct ConnectionStateBar: View {
         case .connecting:
             bar { Text("Connecting…") }
         case .offline:
-            EmptyView()  // OfflineBanner already covers this
+            if let syncedAt = session.snapshotSyncedAt,
+               Date().timeIntervalSince(syncedAt) > 120 {
+                bar { Text(cacheAgeLabel(syncedAt)) }
+            }
         case .waitingToRetry:
             bar { Text("Connection lost — reconnecting…") }
         }
@@ -98,6 +101,12 @@ struct ConnectionStateBar: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 3)
             .background(.thinMaterial)
+    }
+
+    private func cacheAgeLabel(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return "Conversation updated \(formatter.localizedString(for: date, relativeTo: Date()))"
     }
 }
 

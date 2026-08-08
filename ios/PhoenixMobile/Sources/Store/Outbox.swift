@@ -102,7 +102,7 @@ final class Outbox {
     /// EnqueueLocalMessage: the entry exists (and persists) before any POST
     /// is attempted, so navigation or connection loss cannot erase the
     /// user's words.
-    func enqueue(text: String, images: [ImagePayload] = []) -> OutboxEntry {
+    func enqueue(text: String, images: [ImagePayload] = []) -> OutboxEntry? {
         let entry = OutboxEntry(
             localId: UUID().uuidString.lowercased(),
             conversationId: conversationId,
@@ -115,7 +115,10 @@ final class Outbox {
             lastError: nil,
             attemptCount: 0)
         entries.append(entry)
-        persist()
+        guard persist() else {
+            entries.removeAll { $0.localId == entry.localId }
+            return nil
+        }
         return entry
     }
 

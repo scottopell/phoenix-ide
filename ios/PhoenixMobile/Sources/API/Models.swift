@@ -145,6 +145,7 @@ struct ValidateCwdResponse: Codable {
 struct ModelsResponse: Codable {
     var models: [JSONValue]
     var `default`: String?
+    var llm_configured: Bool?
 
     /// Model IDs, tolerant of the entry shape (string or object with `id`).
     var modelIDs: [String] {

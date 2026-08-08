@@ -50,7 +50,8 @@ struct ComposerView: View {
     }
 
     private func send() {
-        session.send(text: draft)
-        draft = ""
+        if session.send(text: draft) {
+            draft = ""
+        }
     }
 }

@@ -48,7 +48,7 @@ final class OutboxTests: XCTestCase {
     func testEnqueueCreatesPendingVisibleEntry() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         XCTAssertEqual(entry.status, .pending)
         XCTAssertFalse(entry.acceptedByServer)
         XCTAssertTrue(entry.isVisible)
@@ -60,7 +60,7 @@ final class OutboxTests: XCTestCase {
         // The entry must survive a "restart" (new instance) even though no
         // POST was ever attempted — enqueue itself is the durability point.
         freshDiskStore()
-        let entry = Outbox(conversationId: "c1").enqueue(text: "queued in a tunnel")
+        let entry = Outbox(conversationId: "c1").enqueue(text: "queued in a tunnel")!
         let rehydrated = Outbox(conversationId: "c1")
         XCTAssertEqual(rehydrated.visibleEntries.map(\.localId), [entry.localId])
         XCTAssertEqual(rehydrated.visibleEntries[0].text, "queued in a tunnel")
@@ -78,6 +78,7 @@ final class OutboxTests: XCTestCase {
         _ = outbox.enqueue(text: "must stay local")
 
         XCTAssertFalse(outbox.prepareForDelivery())
+        XCTAssertTrue(outbox.entries.isEmpty)
     }
 
     // MARK: - PostAccepted{AsSteeringQueued, AsPendingReflection}
@@ -86,7 +87,7 @@ final class OutboxTests: XCTestCase {
     func testAcceptedSteeringBecomesSteeringQueued() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: true)
         XCTAssertEqual(outbox.entries[0].status, .steeringQueued)
         XCTAssertTrue(outbox.entries[0].acceptedByServer)
@@ -96,7 +97,7 @@ final class OutboxTests: XCTestCase {
     func testAcceptedNonSteeringStaysPendingUntilReflected() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: false)
         XCTAssertEqual(outbox.entries[0].status, .pending)
         XCTAssertTrue(outbox.entries[0].acceptedByServer)
@@ -109,7 +110,7 @@ final class OutboxTests: XCTestCase {
     func testServerRejectionMarksFailedWithError() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "HTTP 400: bad request")
         XCTAssertEqual(outbox.entries[0].status, .failed)
         XCTAssertEqual(outbox.entries[0].lastError, "HTTP 400: bad request")
@@ -120,7 +121,7 @@ final class OutboxTests: XCTestCase {
     func testRetryReturnsFailedEntryToPending() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.retry(entry.localId)
         XCTAssertEqual(outbox.entries[0].status, .pending)
@@ -132,7 +133,7 @@ final class OutboxTests: XCTestCase {
         // Spec precondition: retry applies to failed / recoverable only.
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markAccepted(entry.localId, steering: true)
         outbox.retry(entry.localId)
         XCTAssertEqual(outbox.entries[0].status, .steeringQueued, "retry must not touch steering_queued")
@@ -142,7 +143,7 @@ final class OutboxTests: XCTestCase {
     func testDismissHidesEntryAndPrunesOnRestart() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.dismiss(entry.localId)
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
@@ -156,8 +157,8 @@ final class OutboxTests: XCTestCase {
     func testReconcileHidesEntriesPresentInServerHistory() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let a = outbox.enqueue(text: "first")
-        let b = outbox.enqueue(text: "second")
+        let a = outbox.enqueue(text: "first")!
+        let b = outbox.enqueue(text: "second")!
         outbox.reconcile(authoritativeMessageIds: [a.localId])
         XCTAssertEqual(outbox.visibleEntries.map(\.localId), [b.localId])
     }
@@ -166,7 +167,7 @@ final class OutboxTests: XCTestCase {
     func testReconcileAppliesToSteeringQueuedEntries() {
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "steer me")
+        let entry = outbox.enqueue(text: "steer me")!
         outbox.markAccepted(entry.localId, steering: true)
         outbox.reconcile(authoritativeMessageIds: [entry.localId])
         XCTAssertTrue(outbox.visibleEntries.isEmpty)
@@ -177,7 +178,7 @@ final class OutboxTests: XCTestCase {
         // Identity join must hold across app restarts: the persisted
         // localId is what matches the server's message_id.
         freshDiskStore()
-        let entry = Outbox(conversationId: "c1").enqueue(text: "hi")
+        let entry = Outbox(conversationId: "c1").enqueue(text: "hi")!
         let rehydrated = Outbox(conversationId: "c1")
         rehydrated.reconcile(authoritativeMessageIds: [entry.localId])
         XCTAssertTrue(rehydrated.visibleEntries.isEmpty)
@@ -271,7 +272,7 @@ final class OutboxTests: XCTestCase {
         // after the user discarded the entry must not bring it back.
         freshDiskStore()
         let outbox = Outbox(conversationId: "c1")
-        let entry = outbox.enqueue(text: "hi")
+        let entry = outbox.enqueue(text: "hi")!
         outbox.markFailed(entry.localId, error: "boom")
         outbox.dismiss(entry.localId)
         outbox.markAccepted(entry.localId, steering: true)

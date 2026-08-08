@@ -58,9 +58,11 @@ final class ConversationSession {
         /// Missing only in snapshots written before transcript generations
         /// were part of the iOS cache; nil forces replacement on next init.
         var transcriptGeneration: Int64?
+        var syncedAt: Date?
     }
 
     private var transcriptGeneration: Int64?
+    private(set) var snapshotSyncedAt: Date?
 
     init(
         conversationId: String,
@@ -80,6 +82,7 @@ final class ConversationSession {
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
+            snapshotSyncedAt = snap.syncedAt
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
@@ -140,7 +143,8 @@ final class ConversationSession {
             Snapshot(
                 conversation: conversation, messages: messages,
                 lastSequenceId: lastSequenceId,
-                transcriptGeneration: transcriptGeneration),
+                transcriptGeneration: transcriptGeneration,
+                syncedAt: snapshotSyncedAt),
             name: snapshotName)
     }
 
@@ -149,11 +153,16 @@ final class ConversationSession {
     /// Optimistic enqueue-then-send. The entry is persisted before the POST
     /// leaves the device; if the network is down the send is deferred, not
     /// failed.
-    func send(text: String) {
+    @discardableResult
+    func send(text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        _ = outbox.enqueue(text: trimmed)
+        guard !trimmed.isEmpty else { return false }
+        guard outbox.enqueue(text: trimmed) != nil else {
+            lastErrorToast = "Message could not be saved on this device. Free storage and try again."
+            return false
+        }
         drainOutbox()
+        return true
     }
 
     func retryEntry(_ localId: String) {
@@ -322,6 +331,7 @@ final class ConversationSession {
                 coverage: snap.transcriptCoverage,
                 generationMatches: generationMatches)
             transcriptGeneration = snap.transcriptGeneration
+            snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
             if previousSequenceFloor == 0 || !generationMatches
@@ -371,6 +381,7 @@ final class ConversationSession {
         case .message(let seq, let message):
             guard applyIfNewer(seq) else { return }
             upsert(message)
+            snapshotSyncedAt = Date()
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
@@ -381,7 +392,8 @@ final class ConversationSession {
                 reconcileOutbox()
             }
 
-        case .messageUpdated(let seq, let messageId, let content, let displayData):
+        case .messageUpdated(
+            let seq, let messageId, let content, let displayData, let updatedGeneration):
             // Stale guard applies here too: a replayed update from before
             // the floor must not clobber content a newer update already set.
             guard applyIfNewer(seq) else { return }
@@ -390,7 +402,12 @@ final class ConversationSession {
             }
             if let content, content != .null { messages[idx].content = content }
             if let displayData, displayData != .null { messages[idx].display_data = displayData }
+            if let updatedGeneration {
+                transcriptGeneration = updatedGeneration
+                conversation?.transcript_generation = updatedGeneration
+            }
             if messages[idx].message_type == "agent" { rebuildToolUseIndex() }
+            snapshotSyncedAt = Date()
             persistSnapshot()
 
         case .stateChange(let seq, let state, let mode):
@@ -447,6 +464,8 @@ final class ConversationSession {
                 if let v = update["task_title"]?.stringValue { conv.task_title = v }
                 if let v = update["conv_mode_label"]?.stringValue { conv.conv_mode_label = v }
                 if let v = update["slug"]?.stringValue { conv.slug = v }
+                if let v = update["title"]?.stringValue { conv.title = v }
+                if let v = update["updated_at"]?.stringValue { conv.updated_at = v }
                 conversation = conv
                 persistSnapshot()
                 onConversationUpdate?(conv)
