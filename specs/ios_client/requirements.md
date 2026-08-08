@@ -368,6 +368,10 @@ WHEN the device is offline or a resolution is in flight
 THE SYSTEM SHALL disable the resolution controls
 AND, when offline, state that approval is never queued
 
+WHEN the server reports that a submitted resolution failed retryably while
+the conversation remains awaiting approval
+THE SYSTEM SHALL re-enable the resolution controls
+
 **Rationale:** Plan approval is the highest-value blocking decision to
 make away from the desk. The no-optimistic-state rule matters because
 approval is multi-client: the server 400s a decision on an

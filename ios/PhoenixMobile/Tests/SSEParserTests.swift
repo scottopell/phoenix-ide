@@ -308,7 +308,6 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(messageId, "tool-result")
         XCTAssertEqual(durationMs, 1234)
     }
-
     func testHardDeletionRetainsConversationIdentity() {
         let json = #"{"sequence_id":11,"conversation_id":"c1"}"#
         guard case .conversationHardDeleted(let sequence, let conversationId) =
@@ -338,5 +337,18 @@ final class SSEParserTests: XCTestCase {
 
         XCTAssertEqual(session.connection, .offline)
         session.stop()
+    }
+
+    func testRetryableErrorSignalIsDecoded() {
+        let frame = SSEFrame(
+            event: "error",
+            data: #"{"sequence_id":9,"message":"approval failed","can_auto_retry":true}"#)
+
+        guard case .errorEvent(let seq, let message, let retryable) = PhoenixEvent.decode(
+            frame: frame)
+        else { return XCTFail("expected retryable error event") }
+        XCTAssertEqual(seq, 9)
+        XCTAssertEqual(message, "approval failed")
+        XCTAssertTrue(retryable)
     }
 }

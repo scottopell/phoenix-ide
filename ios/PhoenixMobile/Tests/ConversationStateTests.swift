@@ -147,6 +147,24 @@ final class ConversationStateTests: XCTestCase {
             .other(type: "quantum_reticulating"))
     }
 
+    func testFallbackErrorDetailsCoverCreationAndContinuationFailures() throws {
+        let creation = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(#"{"type":"creation_failed","error":"directory vanished"}"#.utf8))
+        let continuation = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(
+                #"{"type":"recoverable_continuation_failure","failure":{"message":"handoff failed"}}"#.utf8))
+
+        XCTAssertEqual(
+            StateDetailView.fallbackErrorMessage(type: "creation_failed", state: creation),
+            "directory vanished")
+        XCTAssertEqual(
+            StateDetailView.fallbackErrorMessage(
+                type: "recoverable_continuation_failure", state: continuation),
+            "handoff failed")
+    }
+
     func testMissingTypeBecomesUnknown() {
         XCTAssertEqual(parse("{\"attempt\":1}"), .unknown)
         XCTAssertEqual(ConversationState.parse(nil), .unknown)

@@ -98,8 +98,8 @@ struct StateDetailView: View {
             // needs the user still gets a card, not silence.
             if session.presentationMode == "error" {
                 errorCard(
-                    message: session.convState?["message"]?.stringValue
-                        ?? type.replacingOccurrences(of: "_", with: " "),
+                    message: Self.fallbackErrorMessage(
+                        type: type, state: session.convState),
                     dismissible: false)
             } else if session.presentationMode == "needs_action" {
                 needsActionCard(
@@ -124,6 +124,13 @@ struct StateDetailView: View {
                 }
             }
         }
+    }
+
+    nonisolated static func fallbackErrorMessage(type: String, state: JSONValue?) -> String {
+        state?["message"]?.stringValue
+            ?? state?["error"]?.stringValue
+            ?? state?["failure"]?["message"]?.stringValue
+            ?? type.replacingOccurrences(of: "_", with: " ")
     }
 
     private func progressSuffix(remaining: Int, completed: Int) -> String {

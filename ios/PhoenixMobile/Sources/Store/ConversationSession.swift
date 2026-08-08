@@ -689,9 +689,12 @@ final class ConversationSession {
             _ = applyIfNewer(seq)
             outbox.markAccepted(messageId, steering: true)
 
-        case .errorEvent(let seq, let message):
+        case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
+            if retryable, actionInFlight?.waitsForAuthoritativeStateChange == true {
+                actionInFlight = nil
+            }
 
         case .conversationBecameTerminal(let seq):
             _ = applyIfNewer(seq)

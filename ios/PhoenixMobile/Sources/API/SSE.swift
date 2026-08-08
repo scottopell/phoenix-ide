@@ -81,7 +81,7 @@ enum PhoenixEvent: Sendable {
     case agentDone(seq: Int64)
     case conversationUpdate(seq: Int64, conversation: JSONValue)
     case steerMessageQueued(seq: Int64, messageId: String)
-    case errorEvent(seq: Int64, message: String)
+    case errorEvent(seq: Int64, message: String, retryable: Bool)
     case conversationBecameTerminal(seq: Int64)
     case conversationHardDeleted(seq: Int64, conversationId: String)
     case other(type: String, seq: Int64?)
@@ -208,7 +208,9 @@ enum PhoenixEvent: Sendable {
 
         case "error":
             return .errorEvent(
-                seq: seq, message: json["message"]?.stringValue ?? "Unknown error")
+                seq: seq,
+                message: json["message"]?.stringValue ?? "Unknown error",
+                retryable: json["can_auto_retry"]?.boolValue ?? false)
 
         case "conversation_became_terminal":
             return .conversationBecameTerminal(seq: seq)
