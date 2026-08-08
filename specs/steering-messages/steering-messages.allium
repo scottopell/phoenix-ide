@@ -27,17 +27,15 @@
 --   bedrock via Event::SteerDrainedUserMessages { entries }, which bedrock
 --   handles with explicit transition arms from Idle and from LlmRequesting.
 --
---   Trade-off: the queue's existence stays orthogonal to bedrock (state
---   machine purity preserved), but the delivery contract — "drained steers
---   become UserMessages in the transcript" — is typed in bedrock. This
---   preserves the single-writer transcript-persistence invariant: all user
---   messages, including drained steers, flow through Effect::persist_user_message.
+--   The queue's existence stays orthogonal to bedrock, while the delivery
+--   contract is typed in bedrock. The reducer selects the exact FIFO batch,
+--   next state, and post-commit LLM action in one CommitSteeringDrain effect.
 --
 --   The queue is persisted in the steering_messages table (one row per entry,
 --   ordered by ordinal; each entry's attachments live in the grandchild
 --   steering_message_files / steering_message_images tables) and loaded into
---   executor memory on startup, enabling crash recovery without re-delivery
---   (the message_id PRIMARY KEY prevents double-insert).
+--   executor memory on startup. Startup drains use the same reducer and atomic
+--   transaction as live drains.
 --
 -- Requirement traceability: REQ-STEER-001 through REQ-STEER-005
 
@@ -204,14 +202,10 @@ rule DrainOnIdleEntry {
         -- user is clearing a banner, not completing a turn, so queued steers
         -- must wait for an explicit retry/send.
         --
-        -- Drain-all (not one-at-a-time): the executor uses std::mem::take to swap
-        -- the entire Vec<SteerEntry> out atomically. The bedrock arm for
-        -- (Idle, SteerDrainedUserMessages) emits one Effect::persist_user_message
-        -- per entry in iteration order, then Effect::PersistState, then
-        -- Effect::ClearSteeringQueueEntries { message_ids }, then
-        -- NotifyLlmRequesting, and finally Effect::RequestLlm. The effect loop
-        -- runs persist effects serially, each allocating a sequential
-        -- sequence_id, so transcript order is FIFO and matches enqueue order.
+        -- Drain-all (not one-at-a-time): the executor takes the complete durable
+        -- FIFO snapshot under the queue projection fence. The bedrock arm emits
+        -- one CommitSteeringDrain effect carrying that exact ordered batch and
+        -- StartLlmAndNotifyState. The executor supplies the reducer's next state.
         --
         -- Single RequestLlm: only one is emitted regardless of how many entries
         -- were drained. The next LLM call sees all N messages as freshly-persisted
@@ -221,14 +215,17 @@ rule DrainOnIdleEntry {
         -- apply_transition_result call that triggered the hook, not via the
         -- outer event loop. This is what makes ordering deterministic.
         --
-        -- Crash recovery: ClearSteeringQueueEntries removes ONLY the drained
-        -- message_ids (not the whole queue), so a concurrent enqueue during
-        -- the drain window is preserved. It runs AFTER persist effects, so a
-        -- crash mid-drain can leave drained rows in the DB queue. Runtime
-        -- startup removes queued rows whose message_id is already materialized
-        -- in the transcript before loading the pending queue. Unmaterialized
-        -- rows remain queued; materialized rows are continued from transcript
-        -- without being inserted or delivered twice.
+        -- Database::commit_steering_drain inserts every supplied transcript
+        -- message, persists the supplied state, and deletes only the supplied
+        -- queue ids in one transaction. Failure rolls back all three. Messages,
+        -- state, and RequestLlm are published only after commit. A concurrent
+        -- enqueue has a different id and survives the exact deletes.
+        --
+        -- Startup routes the durable queue through this same reducer arm. A
+        -- matching pre-transaction message is a typed legacy partial and is
+        -- consumed without duplication. A mismatched identity or stale batch
+        -- fails once, leaves the durable queue intact, and stops that runtime so
+        -- a later reconstruction retries from database truth.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
@@ -292,8 +289,7 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         --   1. Defers any Effect::RequestLlm from the original effects.
         --   2. Runs the remaining original effects.
         --   3. Synchronously transitions (LlmRequesting, SteerDrainedUserMessages)
-        --      and runs its effects (N Effect::persist_user_message,
-        --      Effect::PersistState, Effect::ClearSteeringQueueEntries).
+        --      and runs its single CommitSteeringDrain effect.
         --   4. Runs the deferred RequestLlm. The spawned LLM task's
         --      build_llm_messages_static reads a DB that already contains the
         --      steered messages — deterministic, no race.
@@ -303,13 +299,11 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         -- closes the failure mode where a no-tool LLM response would settle
         -- the conversation to Idle with steers persisted but unanswered.
         --
-        -- ClearSteeringQueueEntries removes only the drained ids (not the whole
-        -- queue), so a concurrent enqueue during the drain window is preserved.
-        -- Removal failure keeps the inline effect sequence in a retry loop;
-        -- RequestLlm remains deferred until durable removal succeeds.
-        -- Crash recovery reconciles queue rows against materialized transcript
-        -- ids before runtime publication, removing completed drain remnants
-        -- while retaining entries whose messages were never persisted.
+        -- CommitSteeringDrain atomically inserts the exact FIFO batch, persists
+        -- the reducer's LlmRequesting state, and deletes only those queue ids.
+        -- The deferred RequestLlm runs only after commit. A failed transaction
+        -- performs no publication or dispatch and is not retried while holding
+        -- the projection fence.
 }
 
 -- REQ-STEER-003
@@ -474,10 +468,7 @@ surface SteeringQueueApi {
 
     @guarantee EnqueueDuringDrainPreserved
         -- A steering message enqueued while a drain is in progress is not lost.
-        -- Effect::ClearSteeringQueueEntries removes only the specific drained
-        -- message_ids (not the whole queue); the DB method
-        -- Database::remove_steering_entries deletes exactly those message_id
-        -- rows from steering_messages (cascading their attachments) as a direct
-        -- DELETE, while Database::append_steering_entry inserts only the new row.
-        -- Neither path rewrites rows owned by the other mutation.
+        -- Database::commit_steering_drain deletes only the reducer-supplied
+        -- message_ids, while Database::append_steering_entry inserts only the
+        -- new row. Neither path rewrites rows owned by the other mutation.
 }

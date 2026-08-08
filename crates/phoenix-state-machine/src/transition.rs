@@ -800,26 +800,20 @@ pub fn transition_core(
             Ok(CoreTransitionResult::new(state.clone()))
         }
 
-        // Steering queue drain (REQ-SM-*): persist all entries, then ask LLM.
-        // ClearSteeringQueueEntries runs AFTER persist+state so a crash mid-
-        // drain leaves the queue intact for re-drain on restart, and removes
-        // only the drained ids so a concurrent enqueue is preserved.
+        // Steering queue drain (REQ-SM-*): commit the exact reducer-selected
+        // batch and next state before asking the LLM.
         (CoreState::Idle, CoreEvent::SteerDrainedUserMessages { entries }) => {
             if entries.is_empty() {
                 return Ok(CoreTransitionResult::new(CoreState::Idle));
             }
-            let drained_ids: Vec<String> = entries.iter().map(|e| e.message_id.clone()).collect();
-            let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
-            for entry in entries {
-                result = result.with_effect(steer_entry_to_persist_effect(entry));
-            }
-            Ok(result
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::ClearSteeringQueueEntries {
-                    message_ids: drained_ids,
-                })
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm))
+            Ok(
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 }).with_effect(
+                    Effect::CommitSteeringDrain {
+                        messages: entries.iter().map(steer_entry_to_drain_message).collect(),
+                        post_commit: crate::effect::SteeringDrainPostCommit::StartLlmAndNotifyState,
+                    },
+                ),
+            )
         }
 
         // Mid-turn drain: an LLM request is already in flight (just transitioned
@@ -831,16 +825,14 @@ pub fn transition_core(
                     attempt,
                 }));
             }
-            let drained_ids: Vec<String> = entries.iter().map(|e| e.message_id.clone()).collect();
-            let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt });
-            for entry in entries {
-                result = result.with_effect(steer_entry_to_persist_effect(entry));
-            }
-            Ok(result.with_effect(Effect::PersistState).with_effect(
-                Effect::ClearSteeringQueueEntries {
-                    message_ids: drained_ids,
-                },
-            ))
+            Ok(
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt }).with_effect(
+                    Effect::CommitSteeringDrain {
+                        messages: entries.iter().map(steer_entry_to_drain_message).collect(),
+                        post_commit: crate::effect::SteeringDrainPostCommit::ContinueExistingLlm,
+                    },
+                ),
+            )
         }
 
         // Invalid Transitions
@@ -851,11 +843,10 @@ pub fn transition_core(
     }
 }
 
-/// Build a `PersistMessage` effect from a queued steering entry.
-/// `idempotent: true` because steering-queue re-drain after crash recovery
-/// may re-emit this effect with the same `message_id`.
-fn steer_entry_to_persist_effect(entry: &crate::event::SteerEntry) -> Effect {
-    Effect::persist_user_message(
+fn steer_entry_to_drain_message(
+    entry: &crate::event::SteerEntry,
+) -> crate::effect::SteeringDrainMessage {
+    let effect = Effect::persist_user_message(
         entry.text.clone(),
         entry.llm_text.clone(),
         entry.images.clone(),
@@ -863,8 +854,24 @@ fn steer_entry_to_persist_effect(entry: &crate::event::SteerEntry) -> Effect {
         entry.message_id.clone(),
         entry.user_agent.clone(),
         entry.skill_invocation.clone(),
-        true,
-    )
+        false,
+    );
+    let Effect::PersistMessage {
+        content,
+        display_data,
+        usage_data,
+        message_id,
+        ..
+    } = effect
+    else {
+        unreachable!("persist_user_message must produce PersistMessage")
+    };
+    crate::effect::SteeringDrainMessage {
+        content,
+        display_data,
+        usage_data,
+        message_id,
+    }
 }
 
 // ============================================================================
@@ -1736,7 +1743,7 @@ fn creation_provisioned_transition(
             | Effect::ApproveTaskFreshHandoff { .. }
             | Effect::PersistForkProposal { .. }
             | Effect::ResolveTask { .. }
-            | Effect::ClearSteeringQueueEntries { .. } => {}
+            | Effect::CommitSteeringDrain { .. } => {}
         }
     }
     let request_index = result
@@ -6544,74 +6551,24 @@ mod tests {
             result.new_state
         );
 
-        let persist_ids: Vec<&str> = result
-            .effects
-            .iter()
-            // reason: selecting one Effect variant out of ~22; listing the rest just to
-            // map them all to None would obscure the single variant of interest.
-            .filter_map(|e| {
-                #[allow(clippy::wildcard_enum_match_arm)]
-                match e {
-                    Effect::PersistMessage { message_id, .. } => Some(message_id.as_str()),
-                    _ => None,
-                }
-            })
-            .collect();
+        assert_eq!(result.effects.len(), 1);
+        let Effect::CommitSteeringDrain {
+            messages,
+            post_commit,
+        } = &result.effects[0]
+        else {
+            panic!("drain must be represented by one atomic effect")
+        };
         assert_eq!(
-            persist_ids,
-            vec!["m1", "m2", "m3"],
-            "must emit PersistMessage effects in input order"
+            messages
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"]
         );
-
-        let persist_state_count = result
-            .effects
-            .iter()
-            .filter(|e| matches!(e, Effect::PersistState))
-            .count();
-        assert_eq!(persist_state_count, 1, "must emit exactly one PersistState");
-
-        let request_llm_count = result
-            .effects
-            .iter()
-            .filter(|e| matches!(e, Effect::RequestLlm))
-            .count();
         assert_eq!(
-            request_llm_count, 1,
-            "Idle path must issue exactly one RequestLlm"
-        );
-
-        let notify_count = result
-            .effects
-            .iter()
-            .filter(|e| matches!(e, Effect::NotifyStateChange))
-            .count();
-        assert_eq!(
-            notify_count, 1,
-            "Idle path must emit exactly one state-change notification"
-        );
-
-        // Crash-safety ordering: ClearSteeringQueue must come AFTER PersistState
-        // (so DB queue is only cleared once messages + state are durable).
-        let last_persist_msg_idx = result
-            .effects
-            .iter()
-            .rposition(|e| matches!(e, Effect::PersistMessage { .. }))
-            .expect("PersistMessage must be present");
-        let persist_state_idx = result
-            .effects
-            .iter()
-            .position(|e| matches!(e, Effect::PersistState))
-            .expect("PersistState must be present");
-        let clear_idx = result
-            .effects
-            .iter()
-            .position(|e| matches!(e, Effect::ClearSteeringQueueEntries { .. }))
-            .expect("ClearSteeringQueueEntries must be present");
-        assert!(
-            last_persist_msg_idx < persist_state_idx
-                && persist_state_idx < clear_idx,
-            "ordering must be: all PersistMessage < PersistState < ClearSteeringQueue, \
-             got persist_msg={last_persist_msg_idx} persist_state={persist_state_idx} clear={clear_idx}"
+            *post_commit,
+            crate::effect::SteeringDrainPostCommit::StartLlmAndNotifyState
         );
     }
 
@@ -6635,58 +6592,24 @@ mod tests {
             result.new_state
         );
 
-        let persist_count = result
-            .effects
-            .iter()
-            .filter(|e| matches!(e, Effect::PersistMessage { .. }))
-            .count();
-        assert_eq!(persist_count, 2, "must persist all entries");
-
-        assert!(
-            result
-                .effects
+        assert_eq!(result.effects.len(), 1);
+        let Effect::CommitSteeringDrain {
+            messages,
+            post_commit,
+        } = &result.effects[0]
+        else {
+            panic!("drain must be represented by one atomic effect")
+        };
+        assert_eq!(
+            messages
                 .iter()
-                .any(|e| matches!(e, Effect::PersistState)),
-            "must emit PersistState"
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
         );
-
-        assert!(
-            !result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::RequestLlm)),
-            "mid-turn drain must NOT issue RequestLlm — request already in flight"
-        );
-
-        assert!(
-            !result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::NotifyStateChange)),
-            "mid-turn drain must NOT emit state-change notification — state unchanged"
-        );
-
-        // Crash-safety ordering: ClearSteeringQueue must come AFTER PersistState.
-        let last_persist_msg_idx = result
-            .effects
-            .iter()
-            .rposition(|e| matches!(e, Effect::PersistMessage { .. }))
-            .expect("PersistMessage must be present");
-        let persist_state_idx = result
-            .effects
-            .iter()
-            .position(|e| matches!(e, Effect::PersistState))
-            .expect("PersistState must be present");
-        let clear_idx = result
-            .effects
-            .iter()
-            .position(|e| matches!(e, Effect::ClearSteeringQueueEntries { .. }))
-            .expect("ClearSteeringQueueEntries must be present");
-        assert!(
-            last_persist_msg_idx < persist_state_idx
-                && persist_state_idx < clear_idx,
-            "mid-turn ordering must be: all PersistMessage < PersistState < ClearSteeringQueue, \
-             got persist_msg={last_persist_msg_idx} persist_state={persist_state_idx} clear={clear_idx}"
+        assert_eq!(
+            *post_commit,
+            crate::effect::SteeringDrainPostCommit::ContinueExistingLlm
         );
     }
 
@@ -7214,7 +7137,7 @@ mod tests {
                 | Effect::ApproveTaskFreshHandoff { .. }
                 | Effect::PersistForkProposal { .. }
                 | Effect::ResolveTask { .. }
-                | Effect::ClearSteeringQueueEntries { .. } => None,
+                | Effect::CommitSteeringDrain { .. } => None,
             });
             let tool_call = execute_effect.expect("approval should emit ExecuteTool");
             match &tool_call.input {

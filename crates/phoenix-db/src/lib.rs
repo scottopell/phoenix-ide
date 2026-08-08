@@ -145,6 +145,12 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringDrainMessageStatus {
+    Inserted,
+    LegacyAlreadyMaterialized,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSearchMetadata {
     pub slug: String,
@@ -5305,6 +5311,101 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically materialize one reducer-selected steering batch, persist its
+    /// supplied next state, and remove exactly that batch from the queue.
+    /// Matching pre-existing message identities are accepted as a bounded
+    /// legacy-partial recovery case; a missing queue row or cross-conversation
+    /// identity conflict rolls back the full transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or serialization error when any message, state, or
+    /// exact queue deletion cannot be committed as one transaction.
+    pub async fn commit_steering_drain(
+        &self,
+        id: &str,
+        messages: &[Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<Vec<SteeringDrainMessageStatus>> {
+        if messages.is_empty() {
+            return Err(DbError::Serialization(
+                "steering drain conflict: atomic batch cannot be empty".to_string(),
+            ));
+        }
+
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let mut statuses = Vec::with_capacity(messages.len());
+
+        for message in messages {
+            if message.conversation_id != id {
+                return Err(DbError::Serialization(format!(
+                    "steering drain conflict: message {} targets conversation {} instead of {id}",
+                    message.message_id, message.conversation_id
+                )));
+            }
+            match steering_message_matches_tx(&mut tx, message).await? {
+                Some(true) => {
+                    statuses.push(SteeringDrainMessageStatus::LegacyAlreadyMaterialized);
+                }
+                Some(false) => {
+                    return Err(DbError::Serialization(format!(
+                        "steering drain conflict: message {} already exists with different data",
+                        message.message_id
+                    )));
+                }
+                None => {
+                    insert_message_tx(&mut tx, message).await?;
+                    if steering_message_matches_tx(&mut tx, message).await? != Some(true) {
+                        return Err(DbError::Serialization(format!(
+                            "steering drain conflict: message {} was not inserted exactly",
+                            message.message_id
+                        )));
+                    }
+                    statuses.push(SteeringDrainMessageStatus::Inserted);
+                }
+            }
+        }
+
+        let updated = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(&state_json)
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at.to_rfc3339())
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+
+        for message in messages {
+            let removed = sqlx::query(
+                "DELETE FROM steering_messages WHERE conversation_id = ?1 AND message_id = ?2",
+            )
+            .bind(id)
+            .bind(&message.message_id)
+            .execute(&mut *tx)
+            .await?;
+            if removed.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "steering drain conflict: queue entry {} was no longer pending",
+                    message.message_id
+                )));
+            }
+        }
+
+        tx.commit().await?;
+        Ok(statuses)
+    }
+
     /// Return the owning conversation for a globally unique steering message id.
     ///
     /// # Errors
@@ -9898,6 +9999,86 @@ async fn insert_message_tx(
     Ok(())
 }
 
+async fn steering_message_matches_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &Message,
+) -> DbResult<Option<bool>> {
+    let row = sqlx::query(
+        "SELECT conversation_id, message_type, content, display_data, usage_data
+         FROM messages WHERE message_id = ?1",
+    )
+    .bind(&message.message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let stored_content: serde_json::Value = serde_json::from_str(&row.get::<String, _>("content"))
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let stored_display = row
+        .get::<Option<String>, _>("display_data")
+        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .transpose()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let stored_usage = row
+        .get::<Option<String>, _>("usage_data")
+        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .transpose()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let expected_usage = message
+        .usage_data
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if row.get::<String, _>("conversation_id") != message.conversation_id
+        || row.get::<String, _>("message_type") != message.message_type.to_string()
+        || stored_content != message.content.to_stored_json()
+        || stored_display != message.display_data
+        || stored_usage != expected_usage
+    {
+        return Ok(Some(false));
+    }
+
+    let (images, files) = message.content.attachments();
+    let stored_files = sqlx::query(
+        "SELECT original_name, media_type, size_bytes, stored_path
+         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
+    )
+    .bind(&message.message_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if stored_files.len() != files.len()
+        || stored_files.iter().zip(files).any(|(row, file)| {
+            row.get::<String, _>("original_name") != file.original_name
+                || row.get::<String, _>("media_type") != file.media_type
+                || row.get::<i64, _>("size_bytes")
+                    != i64::try_from(file.size_bytes).unwrap_or(i64::MAX)
+                || row.get::<String, _>("stored_path") != file.stored_path
+        })
+    {
+        return Ok(Some(false));
+    }
+
+    let stored_images = sqlx::query(
+        "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
+    )
+    .bind(&message.message_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if stored_images.len() != images.len()
+        || stored_images.iter().zip(images).any(|(row, image)| {
+            row.get::<String, _>("media_type") != image.media_type
+                || row.get::<String, _>("data") != image.data
+        })
+    {
+        return Ok(Some(false));
+    }
+
+    Ok(Some(true))
+}
+
 /// Write a message's user/skill attachments to the `message_files` /
 /// `message_images` child tables. `INSERT OR IGNORE` keyed on
 /// `(message_id, ordinal)` makes this idempotent under retry, matching the
@@ -14229,6 +14410,169 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    fn steering_drain_message(
+        conversation_id: &str,
+        message_id: &str,
+        sequence_id: i64,
+    ) -> Message {
+        let content = MessageContent::User(UserContent::new(message_id));
+        Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn steering_entry(message_id: &str) -> phoenix_core::domain::sm_event::SteerEntry {
+        phoenix_core::domain::sm_event::SteerEntry {
+            text: message_id.to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_drain_commits_fifo_messages_state_and_exact_queue_ids() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("drain-ok", "drain-ok", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_steering_queue(
+            "drain-ok",
+            &[
+                steering_entry("a"),
+                steering_entry("b"),
+                steering_entry("concurrent"),
+            ],
+        )
+        .await
+        .unwrap();
+        let next_state = ConvState::LlmRequesting { attempt: 1 };
+        let state_updated_at = Utc::now();
+
+        let statuses = db
+            .commit_steering_drain(
+                "drain-ok",
+                &[
+                    steering_drain_message("drain-ok", "a", 10),
+                    steering_drain_message("drain-ok", "b", 11),
+                ],
+                &next_state,
+                state_updated_at,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![
+                SteeringDrainMessageStatus::Inserted,
+                SteeringDrainMessageStatus::Inserted,
+            ]
+        );
+        assert_eq!(
+            db.get_messages("drain-ok")
+                .await
+                .unwrap()
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        let queue = db.get_steering_queue("drain-ok").await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].message_id, "concurrent");
+        let conversation = db.get_conversation("drain-ok").await.unwrap();
+        assert_eq!(conversation.state, next_state);
+        assert_eq!(conversation.state_updated_at, state_updated_at);
+    }
+
+    #[tokio::test]
+    async fn steering_drain_missing_supplied_queue_id_rolls_back_every_write() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("drain-rollback", "drain-rollback", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_steering_queue("drain-rollback", &[steering_entry("a")])
+            .await
+            .unwrap();
+
+        let error = db
+            .commit_steering_drain(
+                "drain-rollback",
+                &[
+                    steering_drain_message("drain-rollback", "a", 10),
+                    steering_drain_message("drain-rollback", "missing", 11),
+                ],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect_err("stale reducer batch must fail");
+        assert!(error.to_string().contains("was no longer pending"));
+        assert!(db.get_messages("drain-rollback").await.unwrap().is_empty());
+        assert_eq!(
+            db.get_steering_queue("drain-rollback").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            db.get_conversation("drain-rollback").await.unwrap().state,
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_drain_recovers_matching_legacy_materialized_message_once() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("drain-legacy", "drain-legacy", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_steering_queue("drain-legacy", &[steering_entry("a")])
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "a",
+            "drain-legacy",
+            4,
+            &MessageContent::User(UserContent::new("a")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let statuses = db
+            .commit_steering_drain(
+                "drain-legacy",
+                &[steering_drain_message("drain-legacy", "a", 10)],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses,
+            vec![SteeringDrainMessageStatus::LegacyAlreadyMaterialized]
+        );
+        let messages = db.get_messages("drain-legacy").await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sequence_id, 4);
+        assert!(db
+            .get_steering_queue("drain-legacy")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Regression for task 02679: messages must persist with the seq their

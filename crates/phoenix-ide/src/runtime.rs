@@ -3412,36 +3412,11 @@ impl RuntimeManager {
         // live executor is published first and receives their channel event.
         let steering_projection_gate = self.steering_projection.gate_for(conversation_id).await;
         let steering_projection_guard = steering_projection_gate.clone().lock_owned().await;
-        let mut steering_queue = self
+        let steering_queue = self
             .db
             .get_steering_queue(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let mut materialized_ids = Vec::new();
-        for entry in &steering_queue {
-            if self
-                .db
-                .message_exists(&entry.message_id)
-                .await
-                .map_err(|e| e.to_string())?
-            {
-                materialized_ids.push(entry.message_id.clone());
-            }
-        }
-        if !materialized_ids.is_empty() {
-            self.db
-                .remove_steering_entries(conversation_id, &materialized_ids)
-                .await
-                .map_err(|e| e.to_string())?;
-            let materialized_ids: std::collections::HashSet<_> =
-                materialized_ids.into_iter().collect();
-            steering_queue.retain(|entry| !materialized_ids.contains(&entry.message_id));
-            tracing::info!(
-                conv_id = %conversation_id,
-                count = materialized_ids.len(),
-                "Removed materialized steering entries during runtime recovery"
-            );
-        }
         let runtime = runtime
             .with_steering_queue(steering_queue)
             .with_steering_projection_gate(steering_projection_gate);
@@ -5456,53 +5431,6 @@ mod scope_liveness_tests {
             .await
             .expect("materialization joins")
             .expect("materialization succeeds");
-        assert!(mgr
-            .db()
-            .get_steering_queue(conversation_id)
-            .await
-            .expect("durable queue")
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn runtime_startup_removes_materialized_steering_entries() {
-        let mgr = Arc::new(test_manager().await);
-        let conversation_id = "startup-materialized-steering";
-        let message_id = "already-materialized";
-        mgr.db()
-            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
-            .await
-            .expect("create");
-        mgr.db()
-            .append_steering_entry(
-                conversation_id,
-                &crate::state_machine::event::SteerEntry {
-                    text: "recover this drain".to_string(),
-                    llm_text: None,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    message_id: message_id.to_string(),
-                    user_agent: None,
-                    skill_invocation: None,
-                },
-            )
-            .await
-            .expect("seed queue");
-        mgr.db()
-            .add_message(
-                message_id,
-                conversation_id,
-                &crate::db::MessageContent::user("recover this drain"),
-                None,
-                None,
-            )
-            .await
-            .expect("materialize queued message");
-
-        mgr.get_or_create(conversation_id)
-            .await
-            .expect("materialize runtime");
-
         assert!(mgr
             .db()
             .get_steering_queue(conversation_id)

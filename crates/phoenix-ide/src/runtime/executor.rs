@@ -27,7 +27,7 @@ use crate::state_machine::state::{
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
-    Effect, Event, StepResult,
+    Effect, Event, SteeringDrainMessage, SteeringDrainPostCommit, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
@@ -45,9 +45,15 @@ use tracing::Instrument;
 const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.";
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
-const STEERING_REMOVAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSteeringDrainOutcome {
+    NotNeeded,
+    StartedLlm,
+    ResumeLlm,
+}
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
@@ -2172,23 +2178,56 @@ where
     async fn run_inner(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
+        let startup_drain = match self.commit_startup_steering_queue().await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(
+                    conversation_id = %self.context.conversation_id,
+                    %error,
+                    "Startup steering drain failed; leaving durable queue intact for retry"
+                );
+                let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                    sequence_id,
+                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                        "recover queued steering messages",
+                    ),
+                });
+                return;
+            }
+        };
+
         // Check if we need to resume an interrupted operation
         // This handles crash recovery for in-flight LLM requests
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
-            tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
-                tracing::error!(error = %e, "Failed to resume LLM request");
+            if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    "Startup steering drain started the LLM request"
+                );
+            } else {
+                tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
+            }
+            let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
+                false
+            } else if let Err(error) = self.execute_effect(Effect::RequestLlm).await {
+                tracing::error!(%error, "Failed to resume LLM request");
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::with_action(
                         "resume the LLM request",
                     ),
                 });
-            } else if let Some((job_id, claim)) = self.startup_creation_completion.take() {
-                let _ = self
-                    .execute_effect(Effect::CompleteCreation { job_id, claim })
-                    .await;
+                true
+            } else {
+                false
+            };
+            if !resume_failed {
+                if let Some((job_id, claim)) = self.startup_creation_completion.take() {
+                    let _ = self
+                        .execute_effect(Effect::CompleteCreation { job_id, claim })
+                        .await;
+                }
             }
         }
 
@@ -2930,9 +2969,16 @@ where
             let will_drain_from_idle = matches!(self.state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
+            let will_commit_steering_drain = result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CommitSteeringDrain { .. }));
             let will_settle_active_direct_turn =
                 self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-            if !will_drain_from_idle && !will_settle_active_direct_turn {
+            if !will_drain_from_idle
+                && !will_commit_steering_drain
+                && !will_settle_active_direct_turn
+            {
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
@@ -3062,10 +3108,11 @@ where
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(effect, Effect::PersistState);
+                let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let effect_result = self.execute_effect(effect).await;
                 let effect_result = match effect_result {
                     Ok(effect_result) => effect_result,
-                    Err(error) if is_state_persist => {
+                    Err(error) if is_state_persist || is_steering_drain => {
                         let failed_state = std::mem::replace(&mut self.state, old_state.clone());
                         self.state_updated_at = old_state_updated_at;
                         self.manage_deadline(&failed_state);
@@ -3179,6 +3226,7 @@ where
             Event::SteerDrainedUserMessages { entries },
         )
         .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
+        let drain_old_state_updated_at = self.state_updated_at;
         let drain_old_state = std::mem::replace(&mut self.state, drain_result.new_state);
         // Same gating as apply_transition_result: only stamp a fresh entry
         // time when the drain actually changes phase. A mid-turn drain
@@ -3189,16 +3237,16 @@ where
         // jump the elapsed counter (REQ-WPV-001).
         if self.state != drain_old_state {
             self.state_updated_at = Utc::now();
-            // Mirror apply_transition_result: publish the new state so live-state
-            // observers (e.g. effective_conversation_state) stay current after a
-            // steering drain transition (Idle → LlmRequesting is the common path).
-            if let Some(tx) = &self.state_watcher {
-                let _ = tx.send(self.state.clone());
-            }
         }
         for effect in drain_result.effects {
-            if let Some(gen_event) = self.execute_effect(effect).await? {
-                generated_events.push(gen_event);
+            match self.execute_effect(effect).await {
+                Ok(Some(gen_event)) => generated_events.push(gen_event),
+                Ok(None) => {}
+                Err(error) => {
+                    self.state = drain_old_state;
+                    self.state_updated_at = drain_old_state_updated_at;
+                    return Err(error);
+                }
             }
         }
 
@@ -3300,6 +3348,40 @@ where
         )))
     }
 
+    async fn commit_startup_steering_queue(
+        &mut self,
+    ) -> Result<StartupSteeringDrainOutcome, String> {
+        if self.context.is_sub_agent
+            || !matches!(
+                self.state,
+                ConvState::Idle | ConvState::LlmRequesting { .. }
+            )
+        {
+            return Ok(StartupSteeringDrainOutcome::NotNeeded);
+        }
+        let Some((event, projection_guard)) = self.prepare_immediate_steering_drain().await? else {
+            return Ok(StartupSteeringDrainOutcome::NotNeeded);
+        };
+        let result = transition(&self.state, &self.context, event)
+            .map_err(|error| format!("startup steering drain transition failed: {error:?}"))?;
+        let outcome = if result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::CommitSteeringDrain {
+                    post_commit: SteeringDrainPostCommit::StartLlmAndNotifyState,
+                    ..
+                }
+            )
+        }) {
+            StartupSteeringDrainOutcome::StartedLlm
+        } else {
+            StartupSteeringDrainOutcome::ResumeLlm
+        };
+        self.apply_transition_result(result).await?;
+        drop(projection_guard);
+        Ok(outcome)
+    }
+
     async fn prepare_steering_drain(
         &mut self,
         old_state: &ConvState,
@@ -3346,8 +3428,8 @@ where
     /// If the current state transition is a steering-queue drain hook point and
     /// the queue is non-empty, drain all entries into a single
     /// `SteerDrainedUserMessages` event. The DB queue is NOT touched here; it
-    /// is updated later by `Effect::ClearSteeringQueueEntries` once the emitted
-    /// event is processed and all `PersistMessage` effects succeed.
+    /// is consumed only by the atomic `CommitSteeringDrain` effect emitted by
+    /// the reducer for this exact batch.
     ///
     /// Sub-agents do not have steering queues; this returns `None` for them.
     ///
@@ -3387,9 +3469,6 @@ where
             mid_turn = entering_llm_requesting_from_tool_round,
             "Draining queued steering messages"
         );
-        // DB queue is updated by `Effect::ClearSteeringQueueEntries` AFTER
-        // persist effects run, so a crash mid-drain leaves the queue intact
-        // for idempotent re-drain on restart.
         Some(Event::SteerDrainedUserMessages { entries })
     }
 
@@ -4297,11 +4376,8 @@ where
                 message_id,
                 idempotent,
             } => {
-                // Idempotent path: skip if already persisted. Prevents double-
-                // insert (and seq gap) when a SteerDrainedUserMessages re-fires
-                // after crash recovery before ClearSteeringQueueEntries ran.
-                // Gated to idempotent=true so non-replayable persists pay no
-                // extra query.
+                // Idempotent recovery paths skip an already-persisted identity;
+                // ordinary message effects avoid the extra existence query.
                 if idempotent && self.storage.message_exists(&message_id).await? {
                     tracing::debug!(
                         message_id = %message_id,
@@ -5122,36 +5198,127 @@ where
                 .await
             }
 
-            Effect::ClearSteeringQueueEntries { message_ids } => {
-                let mut attempt = 1_u32;
-                loop {
-                    match self
-                        .storage
-                        .remove_steering_entries(&self.context.conversation_id, &message_ids)
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(error) => {
-                            tracing::warn!(
-                                conversation_id = %self.context.conversation_id,
-                                message_ids = ?message_ids,
-                                attempt,
-                                %error,
-                                "Failed to remove drained steering entries; retrying before LLM dispatch"
-                            );
-                            attempt = attempt.saturating_add(1);
-                            tokio::time::sleep(STEERING_REMOVAL_RETRY_DELAY).await;
-                        }
+            Effect::CommitSteeringDrain {
+                messages,
+                post_commit,
+            } => self.commit_steering_drain(messages, post_commit).await,
+        }
+    }
+
+    async fn commit_steering_drain(
+        &mut self,
+        messages: Vec<SteeringDrainMessage>,
+        post_commit: SteeringDrainPostCommit,
+    ) -> Result<Option<Event>, String> {
+        if messages.is_empty() {
+            return Err("reducer emitted an empty steering drain commit".to_string());
+        }
+        let (reserved_range, sequences) = self
+            .broadcast_tx
+            .reserve_next_persisted_message_range(messages.len());
+        let created_at = Utc::now();
+        let committed_messages: Vec<crate::db::Message> = messages
+            .into_iter()
+            .zip(sequences)
+            .map(|(message, sequence_id)| crate::db::Message {
+                message_id: message.message_id,
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id,
+                message_type: message.content.message_type(),
+                content: message.content,
+                display_data: message.display_data,
+                usage_data: message.usage_data,
+                created_at,
+            })
+            .collect();
+
+        let statuses = self
+            .storage
+            .commit_steering_drain(
+                &self.context.conversation_id,
+                &committed_messages,
+                &self.state,
+                self.state_updated_at,
+            )
+            .await?;
+        if statuses.len() != committed_messages.len() {
+            tracing::error!(
+                conversation_id = %self.context.conversation_id,
+                message_count = committed_messages.len(),
+                status_count = statuses.len(),
+                "Steering drain storage returned an invalid post-commit status count"
+            );
+        }
+
+        for (index, message) in committed_messages.into_iter().enumerate() {
+            let status = statuses
+                .get(index)
+                .copied()
+                .unwrap_or(crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized);
+            match status {
+                crate::db::SteeringDrainMessageStatus::Inserted => {
+                    let _ = self.broadcast_tx.send_message(message);
+                }
+                crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized => {
+                    tracing::warn!(
+                        conversation_id = %self.context.conversation_id,
+                        message_id = %message.message_id,
+                        "Recovered a legacy partially-materialized steering drain"
+                    );
+                    let _ =
+                        self.broadcast_tx
+                            .send_reserved_seq(message.sequence_id, |sequence_id| {
+                                SseEvent::StateChange {
+                                    sequence_id,
+                                    state: self.state.clone(),
+                                    presentation_mode: self.state.presentation_mode().to_string(),
+                                    state_updated_at: self.state_updated_at,
+                                }
+                            });
+                }
+            }
+        }
+        drop(reserved_range);
+
+        self.finish_steering_drain(post_commit).await
+    }
+
+    async fn finish_steering_drain(
+        &mut self,
+        post_commit: SteeringDrainPostCommit,
+    ) -> Result<Option<Event>, String> {
+        match post_commit {
+            SteeringDrainPostCommit::StartLlmAndNotifyState => {
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|sequence_id| SseEvent::StateChange {
+                        sequence_id,
+                        state: self.state.clone(),
+                        presentation_mode: self.state.presentation_mode().to_string(),
+                        state_updated_at: self.state_updated_at,
+                    });
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
+                match self.dispatch_llm_request().await {
+                    Ok(event) => Ok(event),
+                    Err(error) => {
+                        tracing::error!(
+                            conversation_id = %self.context.conversation_id,
+                            %error,
+                            "Steering drain committed but LLM dispatch failed"
+                        );
+                        let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                            sequence_id,
+                            error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                                "start the queued steering turn",
+                            ),
+                        });
+                        Ok(None)
                     }
                 }
-                tracing::info!(
-                    conversation_id = %self.context.conversation_id,
-                    message_ids = ?message_ids,
-                    attempts = attempt,
-                    "Removed drained steering entries"
-                );
-                Ok(None)
             }
+            SteeringDrainPostCommit::ContinueExistingLlm => Ok(None),
         }
     }
 
@@ -11830,6 +11997,7 @@ mod steer_drain_detector_tests {
         Arc<InMemoryStorage>,
     ) {
         let storage = Arc::new(InMemoryStorage::new());
+        storage.set_steering_queue(conv_id, queue.clone());
         let context = ConvContext::new(conv_id, PathBuf::from("/tmp"), "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -11867,9 +12035,8 @@ mod steer_drain_detector_tests {
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
     /// entries, the executor must emit one `SteerDrainedUserMessages` carrying
-    /// all 3 entries and clear in-memory `self.steering_queue`. DB queue clear
-    /// is the `Effect::ClearSteeringQueueEntries` arm's job, covered by
-    /// `clear_steering_queue_entries_preserves_concurrent_enqueue`.
+    /// all 3 entries and clear in-memory `self.steering_queue` through the
+    /// reducer's atomic drain effect.
     /// Drain-all on entering Idle is processed INLINE: persists land before
     /// `apply_transition_result` returns. Assertion is via storage rather than
     /// `generated_events` because the drain event no longer surfaces externally.
@@ -11930,6 +12097,10 @@ mod steer_drain_detector_tests {
     async fn steer_arriving_after_idle_drains_immediately() {
         let (mut rt, storage) =
             build_runtime_with_state_and_queue("conv-late-steer", ConvState::Idle, vec![]);
+        storage.set_steering_queue(
+            "conv-late-steer",
+            vec![mk_entry("late-steer", "do this next")],
+        );
 
         rt.process_event(mk_steer_event("late-steer", "do this next"))
             .await
@@ -11945,6 +12116,64 @@ mod steer_drain_detector_tests {
         );
         assert!(rt.steering_queue.is_empty());
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn startup_idle_queue_commits_before_starting_llm() {
+        let conversation_id = "startup-idle-drain";
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![mk_entry("startup", "recover")],
+        );
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup drain");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::StartedLlm);
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert!(rt.llm_task_handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_legacy_partial_commits_before_one_resume_request() {
+        use crate::runtime::traits::MessageStore;
+
+        let conversation_id = "startup-legacy-drain";
+        let entry = mk_entry("legacy", "recover");
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![entry],
+        );
+        storage
+            .add_message(
+                "legacy",
+                conversation_id,
+                &MessageContent::user("recover"),
+                None,
+                None,
+            )
+            .await
+            .expect("legacy partial message");
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup legacy drain");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::ResumeLlm);
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "run_inner owns the single resume request"
+        );
     }
 
     #[tokio::test]
@@ -12721,17 +12950,13 @@ mod steer_drain_detector_tests {
             "queue must be preserved when no drain hook fires"
         );
         assert_eq!(rt.steering_queue[0].message_id, "keep-me");
-        // No persist call happened on this path, so storage's queue is still empty
-        // (it was never written to). The point of the assertion above is that the
-        // in-memory queue is the live source — it was not modified.
-        let _ = storage; // touch to silence unused warning
+        assert_eq!(storage.get_steering_queue("conv-intermediate").len(), 1);
     }
 
-    /// `Effect::ClearSteeringQueueEntries` removes ONLY the matching `message_ids`
-    /// from storage; concurrently-enqueued entries are preserved. Models the
-    /// enqueue-during-drain race.
+    /// The atomic drain removes only its reducer-selected identities, preserving
+    /// an entry appended after that batch was selected.
     #[tokio::test]
-    async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
+    async fn atomic_steering_drain_preserves_concurrent_enqueue() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
@@ -12748,36 +12973,59 @@ mod steer_drain_detector_tests {
             ],
         );
 
-        // Drain only removes p1 and p2.
-        rt.execute_effect(Effect::ClearSteeringQueueEntries {
-            message_ids: vec!["p1".to_string(), "p2".to_string()],
-        })
-        .await
-        .expect("ClearSteeringQueueEntries effect must succeed");
+        let result = transition(
+            &rt.state,
+            &rt.context,
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_entry("p1", "pending-1"), mk_entry("p2", "pending-2")],
+            },
+        )
+        .expect("drain transition");
+        rt.apply_transition_result(result)
+            .await
+            .expect("atomic steering drain must succeed");
 
         let remaining = storage.get_steering_queue("conv-clear-effect");
         assert_eq!(remaining.len(), 1, "concurrent enqueue must survive drain");
         assert_eq!(remaining[0].message_id, "c1");
+        assert_eq!(
+            storage
+                .get_all_messages("conv-clear-effect")
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2"]
+        );
     }
 
     #[tokio::test]
-    async fn failed_steering_removal_retries_before_llm_dispatch() {
+    async fn failed_atomic_steering_drain_rolls_back_without_retry_or_dispatch() {
         let queue = vec![mk_entry("s1", "must not dispatch yet")];
-        let (mut rt, storage) = build_runtime_with_state_and_queue(
-            "conv-clear-failure",
-            ConvState::LlmRequesting { attempt: 1 },
-            queue,
-        );
-        storage.set_steering_removal_failures(1);
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-clear-failure", ConvState::Idle, queue);
+        storage.set_steering_drain_failures(1);
 
-        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
+        let result = transition(
+            &rt.state,
+            &rt.context,
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_entry("s1", "must not dispatch yet")],
+            },
+        )
+        .expect("drain transition");
+        let error = rt
+            .apply_transition_result(result)
             .await
-            .expect("transient durable queue removal failure must recover");
+            .expect_err("failed transaction must be surfaced without an executor retry loop");
 
+        assert!(error.contains("injected steering drain failure"));
         assert!(
-            rt.llm_task_handle.is_some(),
-            "RequestLlm must dispatch only after queue removal recovers"
+            rt.llm_task_handle.is_none(),
+            "LLM dispatch must not happen before commit"
         );
+        assert!(storage.get_all_messages("conv-clear-failure").is_empty());
+        assert_eq!(storage.get_steering_queue("conv-clear-failure").len(), 1);
+        assert_eq!(rt.state, ConvState::Idle);
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

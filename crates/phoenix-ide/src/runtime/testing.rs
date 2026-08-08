@@ -542,7 +542,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
-    steering_removal_failures: Mutex<usize>,
+    steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
     continuation_commit_error_once: Mutex<bool>,
@@ -577,7 +577,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
-            steering_removal_failures: Mutex::new(0),
+            steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
             continuation_commit_error_once: Mutex::new(false),
@@ -598,8 +598,8 @@ impl InMemoryStorage {
         *self.fail_state_update.lock().unwrap() = fail;
     }
 
-    pub fn set_steering_removal_failures(&self, failures: usize) {
-        *self.steering_removal_failures.lock().unwrap() = failures;
+    pub fn set_steering_drain_failures(&self, failures: usize) {
+        *self.steering_drain_failures.lock().unwrap() = failures;
     }
 
     pub fn set_continuation_start_recovery_outcome(
@@ -1446,27 +1446,59 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
-    async fn remove_steering_entries(
+    async fn commit_steering_drain(
         &self,
         conv_id: &str,
-        message_ids: &[String],
-    ) -> Result<(), String> {
-        let mut failures = self.steering_removal_failures.lock().unwrap();
+        messages: &[Message],
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::db::SteeringDrainMessageStatus>, String> {
+        let mut failures = self.steering_drain_failures.lock().unwrap();
         if *failures > 0 {
             *failures -= 1;
-            return Err("injected steering removal failure".to_string());
+            return Err("injected steering drain failure".to_string());
         }
         drop(failures);
-        if message_ids.is_empty() {
-            return Ok(());
-        }
+
         let mut guard = self.steering_queues.lock().unwrap();
-        if let Some(queue) = guard.get_mut(conv_id) {
-            let to_remove: std::collections::HashSet<&str> =
-                message_ids.iter().map(String::as_str).collect();
-            queue.retain(|e| !to_remove.contains(e.message_id.as_str()));
+        let queue = guard.entry(conv_id.to_string()).or_default();
+        if messages.iter().any(|message| {
+            !queue
+                .iter()
+                .any(|entry| entry.message_id == message.message_id)
+        }) {
+            return Err("steering drain batch changed".to_string());
         }
-        Ok(())
+        let mut stored = self.messages.lock().unwrap();
+        let transcript = stored.entry(conv_id.to_string()).or_default();
+        let statuses = messages
+            .iter()
+            .map(|message| {
+                if transcript
+                    .iter()
+                    .any(|existing| existing.message_id == message.message_id)
+                {
+                    crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized
+                } else {
+                    transcript.push(message.clone());
+                    crate::db::SteeringDrainMessageStatus::Inserted
+                }
+            })
+            .collect();
+        self.states
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state.clone());
+        self.state_updated_ats
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), state_updated_at);
+        let ids: std::collections::HashSet<&str> = messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect();
+        queue.retain(|entry| !ids.contains(entry.message_id.as_str()));
+        Ok(statuses)
     }
 }
 
