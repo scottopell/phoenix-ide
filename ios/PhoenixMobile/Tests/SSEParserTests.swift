@@ -204,6 +204,15 @@ final class SSEParserTests: XCTestCase {
             APIError.http(status: 400, body: "rejected").isRetryableChatDeliveryFailure)
         XCTAssertTrue(APIError.http(status: 404, body: "gone").isNotFound)
         XCTAssertFalse(APIError.http(status: 500, body: "retry").isNotFound)
+        XCTAssertTrue(
+            APIError.http(status: 401, body: "unauthorized")
+                .isPermanentStreamAuthenticationFailure)
+        XCTAssertTrue(
+            APIError.http(status: 403, body: "forbidden")
+                .isPermanentStreamAuthenticationFailure)
+        XCTAssertFalse(
+            APIError.http(status: 500, body: "retry")
+                .isPermanentStreamAuthenticationFailure)
     }
 
     func testStateChangeRetainsServerTimestamp() {
@@ -227,6 +236,26 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(
             ConversationSession.durableMessages([persisted, eager], through: 4),
             [persisted])
+    }
+
+    func testCommittedLiveMessagesAdvanceDurableBoundaryButEagerAgentDoesNot() {
+        let toolResult = Message(
+            message_id: "tool", conversation_id: "c1", sequence_id: 6,
+            message_type: "tool", content: .string("done"),
+            display_data: nil, created_at: nil)
+        let eagerAgent = Message(
+            message_id: "agent", conversation_id: "c1", sequence_id: 7,
+            message_type: "agent", content: .string("working"),
+            display_data: nil, created_at: nil)
+
+        XCTAssertEqual(
+            ConversationSession.durableCeilingAfterLiveMessage(
+                current: 4, message: toolResult),
+            6)
+        XCTAssertEqual(
+            ConversationSession.durableCeilingAfterLiveMessage(
+                current: 6, message: eagerAgent),
+            6)
     }
 
     func testPreserveCoverageKeepsGenerationMatchedTranscript() {

@@ -52,6 +52,7 @@ final class ConversationSession {
     private var onHardDeleted: (String) -> Void
     private var viewIsActive = false
     private var replayFromPendingAnchor = false
+    private var streamBlockedUntilConfigurationChange = false
     /// Init's persisted-message anchor. Live messages above it may be eager
     /// assistant output, so snapshot persistence excludes them until resync.
     private var durableMessageSequenceCeiling: Int64 = 0
@@ -155,7 +156,7 @@ final class ConversationSession {
     }
 
     private func resumeLiveTasks() {
-        guard viewIsActive else { return }
+        guard viewIsActive, !streamBlockedUntilConfigurationChange else { return }
         if streamTask == nil {
             streamTask = Task { await streamLoop() }
         }
@@ -172,7 +173,7 @@ final class ConversationSession {
     }
 
     private func connectivityRestored() {
-        if viewIsActive {
+        if viewIsActive, !streamBlockedUntilConfigurationChange {
             // Wake the stream loop out of its backoff sleep by restarting it.
             streamTask?.cancel()
             streamTask = Task { await streamLoop() }
@@ -352,6 +353,12 @@ final class ConversationSession {
                     handleHardDeletion()
                     return
                 }
+                if error.isPermanentStreamAuthenticationFailure {
+                    streamBlockedUntilConfigurationChange = true
+                    lastErrorToast = error.errorDescription
+                    connection = .idle
+                    return
+                }
             } catch {
                 if Task.isCancelled { return }
             }
@@ -452,6 +459,9 @@ final class ConversationSession {
         case .message(let seq, let message):
             guard applyIfNewer(seq) else { return }
             upsert(message)
+            durableMessageSequenceCeiling = Self.durableCeilingAfterLiveMessage(
+                current: durableMessageSequenceCeiling,
+                message: message)
             outbox.suppress(authoritativeMessageIds: [message.message_id])
             if let createdAt = message.created_at,
                let messageDate = message.createdAtDate,
@@ -543,6 +553,9 @@ final class ConversationSession {
 
         case .agentDone(let seq):
             guard applyIfNewer(seq) else { return }
+            // agent_done follows the turn's final commit, so all transcript
+            // rows observed before this boundary are durable.
+            durableMessageSequenceCeiling = max(durableMessageSequenceCeiling, seq)
             streamingText = ""
             streamingRequestId = nil
             agentWorking = false
@@ -667,6 +680,8 @@ final class ConversationSession {
             case .persisted:
                 guard let message = result.message else { return }
                 upsert(message)
+                durableMessageSequenceCeiling = max(
+                    durableMessageSequenceCeiling, message.sequence_id)
                 lastSequenceId = max(lastSequenceId, message.sequence_id)
                 rebuildToolUseIndex()
                 if persistSnapshot() {
@@ -688,7 +703,7 @@ final class ConversationSession {
     }
 
     private func restartStreamForResync() {
-        guard streamTask != nil else { return }
+        guard streamTask != nil, !streamBlockedUntilConfigurationChange else { return }
         streamTask?.cancel()
         streamTask = Task { await streamLoop() }
     }
@@ -733,6 +748,15 @@ final class ConversationSession {
         _ messages: [Message], through sequenceCeiling: Int64
     ) -> [Message] {
         messages.filter { $0.sequence_id <= sequenceCeiling }
+    }
+
+    nonisolated static func durableCeilingAfterLiveMessage(
+        current: Int64, message: Message
+    ) -> Int64 {
+        // The wire shares one event shape for eager and committed assistant
+        // messages. Every other message type is emitted only after commit.
+        guard message.message_type != "agent" else { return current }
+        return max(current, message.sequence_id)
     }
 
     private func reconcileOutbox() {

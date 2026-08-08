@@ -44,9 +44,26 @@ struct MessageView: View {
     }
 
     private var noteText: String {
-        message.content.stringValue
-            ?? message.content["text"]?.stringValue
-            ?? message.content.compactDescription
+        Self.noteText(messageType: message.message_type, content: message.content)
+    }
+
+    nonisolated static func noteText(messageType: String, content: JSONValue) -> String {
+        let typedText: String?
+        switch messageType {
+        case "continuation":
+            typedText = content["summary"]?.stringValue
+        case "skill":
+            typedText = content["trigger"]?.stringValue
+                ?? content["name"]?.stringValue
+        case "error":
+            typedText = content["message"]?.stringValue
+        default:
+            typedText = nil
+        }
+        return typedText
+            ?? content.stringValue
+            ?? content["text"]?.stringValue
+            ?? content.compactDescription
     }
 }
 
@@ -228,7 +245,7 @@ struct GenericToolResultCard: View {
             }
             .buttonStyle(.plain)
             if expanded {
-                ScrollView(.horizontal) {
+                ScrollView([.horizontal, .vertical]) {
                     Text(output.isEmpty ? "(no output)" : output)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)

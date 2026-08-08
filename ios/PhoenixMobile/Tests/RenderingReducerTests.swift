@@ -2,6 +2,28 @@ import XCTest
 @testable import PhoenixMobile
 
 final class RenderingReducerTests: XCTestCase {
+    func testKnownNoteShapesUseUserFacingFields() {
+        XCTAssertEqual(
+            MessageView.noteText(
+                messageType: "continuation",
+                content: .object(["summary": .string("Continue from here")])),
+            "Continue from here")
+        XCTAssertEqual(
+            MessageView.noteText(
+                messageType: "skill",
+                content: .object([
+                    "name": .string("build"),
+                    "body": .string("expanded prompt"),
+                    "trigger": .string("/build"),
+                ])),
+            "/build")
+        XCTAssertEqual(
+            MessageView.noteText(
+                messageType: "error",
+                content: .object(["message": .string("Something failed")])),
+            "Something failed")
+    }
+
     func testDisplayDataPatchPreservesExistingMetadataAndToolStarts() {
         let existing: JSONValue = .object([
             "command": .string("cargo test"),

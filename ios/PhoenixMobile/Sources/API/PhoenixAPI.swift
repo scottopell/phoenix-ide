@@ -46,6 +46,13 @@ enum APIError: Error, LocalizedError {
         if case .http(status: 404, body: _) = self { return true }
         return false
     }
+
+    var isPermanentStreamAuthenticationFailure: Bool {
+        if case .http(let status, _) = self {
+            return status == 401 || status == 403
+        }
+        return false
+    }
 }
 
 /// Server trust handling for Phoenix's self-signed TLS posture (TLS.md):
