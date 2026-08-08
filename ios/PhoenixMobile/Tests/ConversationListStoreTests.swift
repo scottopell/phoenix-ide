@@ -3,11 +3,16 @@ import XCTest
 @testable import PhoenixMobile
 
 final class ConversationListStoreTests: XCTestCase {
-    private func conversation(id: String, title: String) throws -> Conversation {
+    private func conversation(
+        id: String,
+        title: String,
+        archived: Bool = false
+    ) throws -> Conversation {
         let data = try JSONSerialization.data(withJSONObject: [
             "id": id,
             "slug": id,
             "title": title,
+            "archived": archived,
         ])
         return try JSONDecoder().decode(Conversation.self, from: data)
     }
@@ -27,5 +32,23 @@ final class ConversationListStoreTests: XCTestCase {
         XCTAssertEqual(byId["one"]?.title, "SSE update")
         XCTAssertEqual(byId["two"]?.title, "fresh")
         XCTAssertEqual(byId["three"]?.title, "new conversation")
+    }
+
+    func testRefreshMergeCannotResurrectArchivedRows() throws {
+        let merged = ConversationListStore.merging(
+            [
+                try conversation(id: "fresh-archived", title: "old", archived: true),
+                try conversation(id: "removed-during-refresh", title: "old"),
+                try conversation(id: "active", title: "active"),
+            ],
+            preserving: [
+                "pushed-archived": try conversation(
+                    id: "pushed-archived", title: "archived", archived: true),
+                "removed-during-refresh": try conversation(
+                    id: "removed-during-refresh", title: "newer update"),
+            ],
+            excluding: ["removed-during-refresh"])
+
+        XCTAssertEqual(merged.map(\.id), ["active"])
     }
 }

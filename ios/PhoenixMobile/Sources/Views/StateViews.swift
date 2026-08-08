@@ -74,10 +74,7 @@ struct StateDetailView: View {
             errorCard(message: message)
 
         case .contextExhausted:
-            // Gate on the server's mode, per this type's own rule: an
-            // already-continued conversation is presented as done and must
-            // not look blocked; only an uncontinued one needs action.
-            if session.presentationMode == "needs_action" {
+            if session.presentationMode != "done" {
                 needsActionCard(
                     icon: "arrow.triangle.2.circlepath",
                     title: "Context exhausted",
@@ -98,7 +95,15 @@ struct StateDetailView: View {
         case .unknown:
             fallbackState(type: "Unknown state")
 
-        case .idle, .awaitingLlm, .awaitingContinuation, .terminal, .handedOff:
+        case .handedOff(let successorConversationId):
+            if let successorConversationId {
+                NavigationLink(value: successorConversationId) {
+                    Label("Open new conversation", systemImage: "arrow.right.circle")
+                }
+                .font(.callout.bold())
+            }
+
+        case .idle, .awaitingLlm, .awaitingContinuation, .terminal:
             if session.agentWorking {
                 workingRow {
                     Text("Working…")
@@ -286,11 +291,6 @@ struct TaskApprovalCard: View {
                     if showFeedbackField {
                         guard let feedback = TaskFeedback(feedbackText) else { return }
                         session.perform(.provideTaskFeedback(feedback))
-                        // Deliberately NOT cleared here: on success the
-                        // state change unmounts this card (draft discarded
-                        // with it); on failure the user's typed annotations
-                        // must survive for retry — these actions don't
-                        // queue, so the draft is the only copy.
                     } else {
                         withAnimation(.easeInOut(duration: 0.15)) {
                             showFeedbackField = true

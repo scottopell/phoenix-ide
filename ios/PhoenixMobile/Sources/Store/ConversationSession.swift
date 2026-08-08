@@ -50,6 +50,7 @@ final class ConversationSession {
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
     private var cancelNeedsAgentDoneFallback = false
+    private var actionOriginState: ConversationState?
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
@@ -346,6 +347,7 @@ final class ConversationSession {
             cancelNeedsAgentDoneFallback = true
         }
         actionInFlight = action
+        actionOriginState = typedState
         Task {
             do {
                 switch action {
@@ -362,16 +364,12 @@ final class ConversationSession {
                     try await api.sendTaskFeedback(
                         conversationId: conversationId, annotations: feedback.text)
                 }
-                // Success needs no local state change: the server emits the
-                // resulting state_change over SSE and the reducer applies it.
-                if !action.waitsForAuthoritativeStateChange {
-                    actionInFlight = nil
-                }
             } catch {
                 if case .cancel = action {
                     cancelNeedsAgentDoneFallback = false
                 }
                 actionInFlight = nil
+                actionOriginState = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -673,6 +671,10 @@ final class ConversationSession {
                 typedState: typedState,
                 cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
             cancelNeedsAgentDoneFallback = false
+            if case .cancel = actionInFlight {
+                actionInFlight = nil
+                actionOriginState = nil
+            }
             if shouldMoveToIdle {
                 conversation?.state = .string("idle")
                 // The mode must move with the state, or the snapshot
@@ -719,6 +721,7 @@ final class ConversationSession {
             lastErrorToast = message
             if retryable, actionInFlight?.waitsForAuthoritativeStateChange == true {
                 actionInFlight = nil
+                actionOriginState = nil
             }
 
         case .conversationBecameTerminal(let seq):
@@ -795,11 +798,14 @@ final class ConversationSession {
     }
 
     private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
-        guard let action = actionInFlight, action.waitsForAuthoritativeStateChange else {
+        guard actionInFlight?.waitsForAuthoritativeStateChange == true,
+              let origin = actionOriginState
+        else {
             return
         }
-        if case .awaitingTaskApproval = currentState { return }
+        guard currentState != origin else { return }
         actionInFlight = nil
+        actionOriginState = nil
     }
 
     private func upsert(_ message: Message) {

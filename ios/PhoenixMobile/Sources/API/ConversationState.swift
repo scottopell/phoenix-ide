@@ -32,7 +32,7 @@ enum ConversationState: Equatable {
     case cancellingTool
     case cancellingSubAgents
     case terminal
-    case handedOff
+    case handedOff(successorConversationId: String?)
     /// Recognized envelope, variant without a typed case yet.
     case other(type: String)
     /// Payload didn't match the envelope at all (nil, or no type name).
@@ -95,7 +95,7 @@ enum ConversationState: Equatable {
         case "terminal":
             return .terminal
         case "handed_off":
-            return .handedOff
+            return .handedOff(successorConversationId: json["successor_conv_id"]?.stringValue)
         default:
             return .other(type: type)
         }

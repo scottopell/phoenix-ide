@@ -106,6 +106,15 @@ final class ConversationStateTests: XCTestCase {
             .cancellingSubAgents)
     }
 
+    func testHandedOffCarriesSuccessorConversationId() {
+        XCTAssertEqual(
+            parse("{\"type\":\"handed_off\",\"successor_conv_id\":\"next-123\"}"),
+            .handedOff(successorConversationId: "next-123"))
+        XCTAssertEqual(
+            parse("{\"type\":\"handed_off\"}"),
+            .handedOff(successorConversationId: nil))
+    }
+
     func testAwaitingContinuationIsWorkingButNotInteractive() {
         let state = parse("{\"type\":\"awaiting_continuation\",\"attempt\":1}")
         XCTAssertEqual(state, .awaitingContinuation)
@@ -198,7 +207,8 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertTrue(
             ConversationAction.provideTaskFeedback(feedback)
                 .waitsForAuthoritativeStateChange)
-        XCTAssertFalse(ConversationAction.cancel.waitsForAuthoritativeStateChange)
+        XCTAssertTrue(ConversationAction.cancel.waitsForAuthoritativeStateChange)
+        XCTAssertTrue(ConversationAction.dismissError.waitsForAuthoritativeStateChange)
     }
 
     func testTaskFeedbackIsNonEmptyByConstruction() {

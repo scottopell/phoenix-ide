@@ -27,12 +27,7 @@ enum ConversationAction: Equatable {
     case provideTaskFeedback(TaskFeedback)
 
     var waitsForAuthoritativeStateChange: Bool {
-        switch self {
-        case .cancel, .dismissError:
-            return false
-        case .approveTask, .rejectTask, .provideTaskFeedback:
-            return true
-        }
+        true
     }
 }
 

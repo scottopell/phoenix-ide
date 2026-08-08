@@ -299,6 +299,10 @@ WHEN deciding whether the agent is busy
 THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from
 the typed state
 
+WHEN rendering context exhaustion from a legacy or cached payload
+THE SYSTEM SHALL keep the needs-action card visible unless presentation_mode
+explicitly reports done
+
 WHEN a state variant is promoted from the catch-all to typed support
 THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
 and a decoding test together
@@ -357,9 +361,17 @@ request-changes resolutions
 WHEN request-changes feedback is constructed
 THE SYSTEM SHALL require non-empty text after trimming whitespace
 
+WHILE request-changes feedback remains on the current approval card
+THE SYSTEM SHALL preserve the draft across request failure
+UNTIL the user edits it or an authoritative state change replaces the card
+
 WHEN approval is chosen
 THE SYSTEM SHALL require an explicit placement choice between continuing in
 the current conversation and starting a fresh work conversation
+
+WHEN fresh-work approval hands off to a successor conversation
+THE SYSTEM SHALL retain the successor conversation identifier from the state
+AND offer navigation to that conversation
 
 WHEN the state omits the title, priority, or plan required for review
 THE SYSTEM SHALL render a non-actionable fallback rather than approval controls

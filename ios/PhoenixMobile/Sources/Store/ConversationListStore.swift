@@ -19,12 +19,14 @@ final class ConversationListStore {
         var lastRefreshed: Date
     }
 
-    /// Destructive mutations invalidate an in-flight refresh. Server-driven
-    /// upserts instead enter `upsertsDuringRefresh` and merge over its result.
+    /// Reset invalidates an in-flight refresh. Row-level changes are folded
+    /// into its result so the refresh can still update unrelated rows.
     private var generation = 0
     private var refreshToken: UUID?
     /// Server-pushed rows received after the current full refresh began.
     private var upsertsDuringRefresh: [String: Conversation] = [:]
+    /// Rows removed or archived after the current full refresh began.
+    private var exclusionsDuringRefresh: Set<String> = []
 
     init() {
         if let cache = DiskStore.load(Cache.self, name: Self.cacheName) {
@@ -41,13 +43,17 @@ final class ConversationListStore {
             if refreshToken == token {
                 refreshToken = nil
                 upsertsDuringRefresh.removeAll()
+                exclusionsDuringRefresh.removeAll()
             }
         }
         let startedGeneration = generation
         do {
             let fresh = try await api.listConversations()
             guard generation == startedGeneration else { return }
-            apply(Self.merging(fresh, preserving: upsertsDuringRefresh))
+            apply(Self.merging(
+                fresh,
+                preserving: upsertsDuringRefresh,
+                excluding: exclusionsDuringRefresh))
             lastError = nil
         } catch {
             guard generation == startedGeneration else { return }
@@ -58,10 +64,14 @@ final class ConversationListStore {
 
     nonisolated static func merging(
         _ fresh: [Conversation],
-        preserving upserts: [String: Conversation]
+        preserving upserts: [String: Conversation],
+        excluding exclusions: Set<String> = []
     ) -> [Conversation] {
-        var byId = Dictionary(uniqueKeysWithValues: fresh.map { ($0.id, $0) })
-        for (id, conversation) in upserts {
+        var byId = Dictionary(uniqueKeysWithValues: fresh
+            .filter { $0.archived != true && !exclusions.contains($0.id) }
+            .map { ($0.id, $0) })
+        for (id, conversation) in upserts
+        where conversation.archived != true && !exclusions.contains(id) {
             byId[id] = conversation
         }
         return Array(byId.values)
@@ -77,7 +87,17 @@ final class ConversationListStore {
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
         if lastRefreshed == nil { lastRefreshed = Date() }
+        if conversation.archived == true {
+            if isRefreshing {
+                upsertsDuringRefresh[conversation.id] = nil
+                exclusionsDuringRefresh.insert(conversation.id)
+            }
+            conversations.removeAll { $0.id == conversation.id }
+            persistCache()
+            return
+        }
         if isRefreshing {
+            exclusionsDuringRefresh.remove(conversation.id)
             upsertsDuringRefresh[conversation.id] = conversation
         }
         if let idx = conversations.firstIndex(where: { $0.id == conversation.id }) {
@@ -97,8 +117,10 @@ final class ConversationListStore {
     }
 
     func remove(id: String) {
-        generation += 1
         upsertsDuringRefresh[id] = nil
+        if isRefreshing {
+            exclusionsDuringRefresh.insert(id)
+        }
         conversations.removeAll { $0.id == id }
         persistCache()
     }
@@ -112,6 +134,7 @@ final class ConversationListStore {
         generation += 1
         refreshToken = nil
         upsertsDuringRefresh.removeAll()
+        exclusionsDuringRefresh.removeAll()
         conversations = []
         lastRefreshed = nil
         lastError = nil
