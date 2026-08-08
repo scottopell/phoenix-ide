@@ -167,6 +167,30 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(merged.map(\.message_id), ["fresh"])
     }
 
+    func testDiskRestoreReplaysFromPendingAnchor() {
+        XCTAssertEqual(
+            ConversationSession.replayFloor(
+                previous: 50,
+                anchor: 40,
+                generationMatches: true,
+                restoredFromDisk: true),
+            40)
+        XCTAssertEqual(
+            ConversationSession.replayFloor(
+                previous: 50,
+                anchor: 40,
+                generationMatches: true,
+                restoredFromDisk: false),
+            50)
+    }
+
+    func testChatDecodingFailureRemainsRetryable() {
+        let error = APIError.decoding(underlying: URLError(.cannotDecodeContentData))
+        XCTAssertTrue(error.isRetryableChatDeliveryFailure)
+        XCTAssertFalse(
+            APIError.http(status: 400, body: "rejected").isRetryableChatDeliveryFailure)
+    }
+
     func testPreserveCoverageKeepsGenerationMatchedTranscript() {
         let cached = message(id: "cached", sequence: 1, text: "cached")
         let merged = ConversationSession.reconcileTranscript(

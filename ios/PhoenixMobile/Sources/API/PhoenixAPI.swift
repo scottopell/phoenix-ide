@@ -32,6 +32,15 @@ enum APIError: Error, LocalizedError {
         if case .transport = self { return true }
         return false
     }
+
+    var isRetryableChatDeliveryFailure: Bool {
+        switch self {
+        case .transport, .decoding:
+            return true
+        case .http, .certificatePinMismatch, .invalidURL:
+            return false
+        }
+    }
 }
 
 /// Server trust handling for Phoenix's self-signed TLS posture (TLS.md):

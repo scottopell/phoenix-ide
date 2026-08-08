@@ -48,9 +48,10 @@ final class ConversationSession {
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
     private var retryDelay: TimeInterval = 1
-    private let onConversationUpdate: ((Conversation) -> Void)?
-    private let onHardDeleted: (String) -> Void
+    private var onConversationUpdate: ((Conversation) -> Void)?
+    private var onHardDeleted: (String) -> Void
     private var viewIsActive = false
+    private var replayFromPendingAnchor = false
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
@@ -88,6 +89,7 @@ final class ConversationSession {
             lastSequenceId = snap.lastSequenceId
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
+            replayFromPendingAnchor = true
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
@@ -105,6 +107,14 @@ final class ConversationSession {
             }
         }
         resumeLiveTasks()
+    }
+
+    func adoptOpenOwnership(
+        onConversationUpdate: @escaping (Conversation) -> Void,
+        onHardDeleted: @escaping (String) -> Void
+    ) {
+        self.onConversationUpdate = onConversationUpdate
+        self.onHardDeleted = onHardDeleted
     }
 
     func stop() {
@@ -241,7 +251,7 @@ final class ConversationSession {
                     if response.already_persisted == true {
                         await reconcileAlreadyPersisted(entry.localId)
                     }
-                } catch let error as APIError where error.isTransport {
+                } catch let error as APIError where error.isRetryableChatDeliveryFailure {
                     // Offline or unreachable: stay pending. The next drain
                     // trigger (connectivity restore, reconnect, foreground)
                     // retries automatically.
@@ -326,6 +336,13 @@ final class ConversationSession {
                 }
                 // Server closed the stream (e.g. broadcast lag): reconnect
                 // promptly — the next init resyncs any missed state.
+            } catch let error as APIError {
+                if Task.isCancelled { return }
+                if case .certificatePinMismatch = error {
+                    lastErrorToast = error.errorDescription
+                    connection = .idle
+                    return
+                }
             } catch {
                 if Task.isCancelled { return }
             }
@@ -355,6 +372,8 @@ final class ConversationSession {
         case .initSnapshot(let snap):
             let previousSequenceFloor = lastSequenceId
             let generationMatches = transcriptGeneration == snap.transcriptGeneration
+            let mustReplayFromAnchor = replayFromPendingAnchor
+            replayFromPendingAnchor = false
             conversation = snap.conversation
             conversation?.transcript_generation = snap.transcriptGeneration
             conversation?.presentation_mode = snap.presentationMode
@@ -371,7 +390,7 @@ final class ConversationSession {
             snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
-            if previousSequenceFloor == 0 || !generationMatches
+            if mustReplayFromAnchor || previousSequenceFloor == 0 || !generationMatches
                 || !snap.agentWorking || snap.pendingTruncated {
                 streamingText = ""
                 streamingRequestId = nil
@@ -381,9 +400,11 @@ final class ConversationSession {
             // replay floor is the ring anchor — ring entries sit in
             // (anchor, last_sequence_id], so anchoring at the tip would
             // silently drop the whole replay.
-            lastSequenceId = previousSequenceFloor == 0 || !generationMatches
-                ? snap.pendingAnchorSequenceId
-                : max(previousSequenceFloor, snap.pendingAnchorSequenceId)
+            lastSequenceId = Self.replayFloor(
+                previous: previousSequenceFloor,
+                anchor: snap.pendingAnchorSequenceId,
+                generationMatches: generationMatches,
+                restoredFromDisk: mustReplayFromAnchor)
             if !snap.pendingTruncated {
                 for entry in snap.pendingEvents {
                     if let pending = PhoenixEvent.decode(pendingEntry: entry) {
@@ -418,6 +439,14 @@ final class ConversationSession {
         case .message(let seq, let message):
             guard applyIfNewer(seq) else { return }
             upsert(message)
+            if let createdAt = message.created_at,
+               let messageDate = message.createdAtDate,
+               var conversation,
+               conversation.updatedAtDate.map({ messageDate > $0 }) ?? true {
+                conversation.updated_at = createdAt
+                self.conversation = conversation
+                onConversationUpdate?(conversation)
+            }
             snapshotSyncedAt = Date()
             if message.message_type == "agent" {
                 streamingText = ""
@@ -669,6 +698,18 @@ final class ConversationSession {
             }
             return byId.values.sorted { $0.sequence_id < $1.sequence_id }
         }
+    }
+
+    nonisolated static func replayFloor(
+        previous: Int64,
+        anchor: Int64,
+        generationMatches: Bool,
+        restoredFromDisk: Bool
+    ) -> Int64 {
+        if restoredFromDisk || previous == 0 || !generationMatches {
+            return anchor
+        }
+        return max(previous, anchor)
     }
 
     private func reconcileOutbox() {

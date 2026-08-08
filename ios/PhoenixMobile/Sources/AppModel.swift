@@ -89,19 +89,25 @@ final class AppModel {
     func session(for conversationId: String) -> ConversationSession? {
         guard let api else { return nil }
         if let existing = sessions[conversationId] { return existing }
-        // Transfer ownership from the background-only delivery session. Its
-        // outbox is disk-backed, so the newly opened session reloads the same
-        // authoritative queue after cancellation.
-        drainSessions.removeValue(forKey: conversationId)?.stop()
-        let session = ConversationSession(
-            conversationId: conversationId, api: api, connectivity: connectivity,
-            onConversationUpdate: { [weak self] conversation in
-                self?.listStore.upsert(conversation)
-            },
-            onHardDeleted: { [weak self] deletedId in
-                self?.sessions[deletedId] = nil
-                self?.listStore.remove(id: deletedId)
-            })
+        let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
+            self?.listStore.upsert(conversation)
+        }
+        let onHardDeleted: (String) -> Void = { [weak self] deletedId in
+            self?.sessions[deletedId] = nil
+            self?.listStore.remove(id: deletedId)
+        }
+        let session: ConversationSession
+        if let draining = drainSessions.removeValue(forKey: conversationId) {
+            draining.adoptOpenOwnership(
+                onConversationUpdate: onConversationUpdate,
+                onHardDeleted: onHardDeleted)
+            session = draining
+        } else {
+            session = ConversationSession(
+                conversationId: conversationId, api: api, connectivity: connectivity,
+                onConversationUpdate: onConversationUpdate,
+                onHardDeleted: onHardDeleted)
+        }
         sessions[conversationId] = session
         return session
     }

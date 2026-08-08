@@ -13,9 +13,9 @@ final class ConversationListStore {
     private(set) var lastError: String?
 
     private static let cacheName = "conversations"
-    private static let metaName = "conversations-meta"
 
-    private struct Meta: Codable {
+    private struct Cache: Codable {
+        var conversations: [Conversation]
         var lastRefreshed: Date
     }
 
@@ -26,8 +26,10 @@ final class ConversationListStore {
     private var refreshToken: UUID?
 
     init() {
-        conversations = DiskStore.load([Conversation].self, name: Self.cacheName) ?? []
-        lastRefreshed = DiskStore.load(Meta.self, name: Self.metaName)?.lastRefreshed
+        if let cache = DiskStore.load(Cache.self, name: Self.cacheName) {
+            conversations = cache.conversations
+            lastRefreshed = cache.lastRefreshed
+        }
     }
 
     func refresh(api: PhoenixAPI) async {
@@ -53,20 +55,20 @@ final class ConversationListStore {
     private func apply(_ fresh: [Conversation]) {
         conversations = Self.sortedByUpdatedAt(fresh)
         lastRefreshed = Date()
-        DiskStore.save(conversations, name: Self.cacheName)
-        DiskStore.save(Meta(lastRefreshed: lastRefreshed!), name: Self.metaName)
+        persistCache()
     }
 
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
+        if lastRefreshed == nil { lastRefreshed = Date() }
         if let idx = conversations.firstIndex(where: { $0.id == conversation.id }) {
             conversations[idx] = conversation
         } else {
             conversations.insert(conversation, at: 0)
         }
         conversations = Self.sortedByUpdatedAt(conversations)
-        DiskStore.save(conversations, name: Self.cacheName)
+        persistCache()
     }
 
     nonisolated static func sortedByUpdatedAt(_ conversations: [Conversation]) -> [Conversation] {
@@ -78,7 +80,7 @@ final class ConversationListStore {
 
     func remove(id: String) {
         conversations.removeAll { $0.id == id }
-        DiskStore.save(conversations, name: Self.cacheName)
+        persistCache()
     }
 
     /// Drop in-memory state after the disk cache is cleared (or the user
@@ -92,5 +94,12 @@ final class ConversationListStore {
         conversations = []
         lastRefreshed = nil
         lastError = nil
+    }
+
+    private func persistCache() {
+        guard let lastRefreshed else { return }
+        DiskStore.save(
+            Cache(conversations: conversations, lastRefreshed: lastRefreshed),
+            name: Self.cacheName)
     }
 }
