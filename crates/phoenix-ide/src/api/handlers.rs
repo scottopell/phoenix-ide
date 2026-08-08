@@ -4522,7 +4522,11 @@ async fn cancel_steering_message(
     // Executor removal is independently idempotent and runs even when the DB
     // row was already absent. This repairs an interrupted earlier handler that
     // committed the delete but did not reach its in-memory notification.
-    if let Some(handle) = state.runtime.try_get_handle(&id).await {
+    if let Some(handle) = state
+        .runtime
+        .try_get_handle_or_wait_for_materialization(&id)
+        .await
+    {
         let _ = handle
             .event_tx
             .send(Event::CancelSteerMessage {

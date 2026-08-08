@@ -3753,6 +3753,37 @@ impl RuntimeManager {
         })
     }
 
+    /// Return a live handle, waiting for an already-running materialization if
+    /// necessary. This never starts a new runtime. The final live-handle recheck
+    /// closes the slot-removal race between the first lookup and subscription.
+    pub async fn try_get_handle_or_wait_for_materialization(
+        &self,
+        conversation_id: &str,
+    ) -> Option<ConversationHandle> {
+        if let Some(handle) = self.try_get_handle(conversation_id).await {
+            return Some(handle);
+        }
+
+        let pending = self
+            .runtime_creations
+            .lock()
+            .await
+            .get(conversation_id)
+            .map(watch::Sender::subscribe);
+        let Some(mut result_rx) = pending else {
+            return self.try_get_handle(conversation_id).await;
+        };
+
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result.ok();
+            }
+            if result_rx.changed().await.is_err() {
+                return self.try_get_handle(conversation_id).await;
+            }
+        }
+    }
+
     /// Subscribe to the authoritative in-memory state for one conversation.
     ///
     /// This is the non-HTTP completion boundary used by one-shot runtime drivers.
@@ -5357,6 +5388,52 @@ mod scope_liveness_tests {
             .expect("materialize runtime");
 
         assert!(reserved.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn live_handle_lookup_waits_for_existing_materialization_without_starting_one() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "wait-for-materialization";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let waiting_lookup = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.try_get_handle_or_wait_for_materialization(conversation_id)
+                    .await
+            })
+        };
+        barrier.wait().await;
+
+        let materialized = materialization
+            .await
+            .expect("materialization joins")
+            .expect("materialization succeeds");
+        let waited = waiting_lookup
+            .await
+            .expect("waiting lookup joins")
+            .expect("waiting lookup sees handle");
+        assert!(materialized.broadcast_tx.same_channel(&waited.broadcast_tx));
+
+        assert!(
+            mgr.try_get_handle_or_wait_for_materialization("never-started")
+                .await
+                .is_none(),
+            "lookup must not start an absent runtime"
+        );
     }
 
     #[tokio::test]
