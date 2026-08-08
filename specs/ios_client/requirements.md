@@ -129,6 +129,9 @@ AND disable further interaction with the deleted conversation
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
 design means the client never needs gap detection.
 
+The precise session, retry, replay, cache-boundary, delivery-ownership, and
+hard-deletion lifecycle is specified in `ios_client_lifecycle.allium`.
+
 ---
 
 ### REQ-IOS-006: Steering Visibility

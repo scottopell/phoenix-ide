@@ -11,6 +11,11 @@ own CI job (`.github/workflows/ios.yml`, macOS runner) that generates the
 Xcode project and runs the unit-test target on a simulator for any change
 under `ios/`.
 
+The connection, foreground/background, delivery-ownership, replay, cache,
+and hard-deletion lifecycle is normative in `ios_client_lifecycle.allium`.
+It composes with the existing server SSE and user-message queue contracts
+rather than duplicating their state machines.
+
 Unit coverage follows a contract-test pattern (see `ios/README.md`
 "Testing"): pure components get one test per rule of the contract they
 implement; views stay untested. Covered so far: `SSEParser` (SSE wire
@@ -29,7 +34,7 @@ injection first).
 | REQ-IOS-002 offline queue | `Outbox` (contract), `ConversationSession.send/drainOutbox` |
 | REQ-IOS-003 idempotent delivery | `Outbox.enqueue` (localId = message_id), `ConversationSession.inFlight` |
 | REQ-IOS-004 auto drain | drain triggers in `ConversationSession` + `ConnectivityMonitor` observers |
-| REQ-IOS-005 SSE + reconnect | `SSEParser`, `PhoenixEvent`, `ConversationSession.streamLoop` |
+| REQ-IOS-005 SSE + reconnect | `ios_client_lifecycle.allium`, `SSEParser`, `PhoenixEvent`, `ConversationSession.streamLoop` |
 | REQ-IOS-006 steering visibility | `Outbox.markAccepted(steering:)`, `OutboxEntryView` |
 | REQ-IOS-007 connectivity transparency | `OfflineBanner`, `ConnectionStateBar`, composer send tint |
 | REQ-IOS-008 auth/TLS | `PhoenixAPI` (Bearer), `ServerTrustDelegate` + `CertPinStore` (TOFU pinning), `Keychain` |

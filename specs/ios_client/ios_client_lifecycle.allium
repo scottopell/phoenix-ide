@@ -1,0 +1,531 @@
+-- allium: 3
+-- ios_client_lifecycle.allium
+--
+-- Scope: The lifecycle of one iOS conversation session: open-view stream
+--        ownership, persisted-queue delivery ownership, foreground and
+--        background suspension, reconnect backoff, init resynchronization,
+--        sequence-guarded live reduction, durable cache boundaries, and
+--        hard deletion.
+--
+-- Includes: The user-visible connection states; one delivery owner per
+--           conversation; retry-window ownership; valid init as the boundary
+--           that resets retry state; replay from the persisted-message anchor;
+--           and the distinction between potentially eager assistant messages
+--           and definitely committed transcript rows.
+--
+-- Excludes: SSE server emission ordering (see ../sse_wire/sse_wire.allium),
+--           queue-entry delivery states (see
+--           ../user_message_queue/user_message_queue.allium), message content
+--           rendering, TLS trust establishment, and platform scheduling APIs.
+
+use "../user_message_queue/user_message_queue.allium" as queue
+use "../sse_wire/sse_wire.allium" as sse_wire
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- NetworkPathAvailable() -> Boolean
+--   True when the device reports a usable network path.
+-- replay_floor(previous, persisted_anchor, server_tip) -> Integer
+--   Selects the safe sequence floor for an init resynchronization. A server
+--   tip behind the previous floor resets to the persisted anchor.
+-- max(a, b) -> Integer
+--   Returns the greater integer.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A decoded init occurrence governed by the imported SSE wire contract.
+external entity ReceivedStreamInit {
+    session: IosConversationSession
+    snapshot: sse_wire/InitSnapshot
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum SessionState {
+    dormant
+    | connecting
+    | live
+    | waiting_to_retry
+    | offline
+    | blocked
+    | deleted
+}
+
+enum DeliveryOwnerKind {
+    open_session
+    | retained_session
+    | persisted_queue_sweep
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity IosConversationSession {
+    scope: queue/ConversationScope
+    state: SessionState
+    view_open: Boolean
+    interaction_enabled: Boolean
+    sequence_floor: Integer
+    retry_attempt: Integer
+
+    cache: CachedConversation with session = this
+    delivery_owner: DeliveryOwner with session = this
+    retry_window: RetryWindow with session = this
+
+    transitions state {
+        dormant -> connecting
+        dormant -> offline
+        connecting -> live
+        connecting -> waiting_to_retry
+        connecting -> offline
+        connecting -> blocked
+        connecting -> deleted
+        connecting -> dormant
+        live -> waiting_to_retry
+        live -> offline
+        live -> deleted
+        live -> dormant
+        waiting_to_retry -> connecting
+        waiting_to_retry -> offline
+        waiting_to_retry -> dormant
+        offline -> connecting
+        offline -> dormant
+        terminal: blocked, deleted
+    }
+}
+
+entity CachedConversation {
+    session: IosConversationSession
+    durable_message_ceiling: Integer
+    synced: Boolean
+}
+
+entity DeliveryOwner {
+    session: IosConversationSession
+    kind: DeliveryOwnerKind
+}
+
+entity RetryWindow {
+    session: IosConversationSession
+    delay_attempt: Integer
+}
+
+------------------------------------------------------------
+-- Rules -- ownership and app lifecycle
+------------------------------------------------------------
+
+rule SessionCreatedForConversation {
+    when: ConversationSessionNeeded(
+        scope,
+        restored_sequence_floor,
+        restored_durable_ceiling,
+        restored_cache_synced
+    )
+
+    requires: not exists IosConversationSession{scope}
+    requires: restored_durable_ceiling <= restored_sequence_floor
+
+    ensures:
+        let session = IosConversationSession.created(
+            scope: scope,
+            state: dormant,
+            view_open: false,
+            interaction_enabled: true,
+            sequence_floor: restored_sequence_floor,
+            retry_attempt: 0
+        )
+        CachedConversation.created(
+            session: session,
+            durable_message_ceiling: restored_durable_ceiling,
+            synced: restored_cache_synced
+        )
+        DeliveryOwner.created(session: session, kind: retained_session)
+}
+
+rule SessionCreatedForPersistedQueueSweep {
+    when: PersistedQueueSweepNeeded(scope)
+
+    requires: not exists IosConversationSession{scope}
+
+    ensures:
+        let session = IosConversationSession.created(
+            scope: scope,
+            state: dormant,
+            view_open: false,
+            interaction_enabled: true,
+            sequence_floor: 0,
+            retry_attempt: 0
+        )
+        CachedConversation.created(
+            session: session,
+            durable_message_ceiling: 0,
+            synced: false
+        )
+        DeliveryOwner.created(session: session, kind: persisted_queue_sweep)
+}
+
+rule OpenConversationOnline {
+    -- REQ-IOS-003, REQ-IOS-004, REQ-IOS-005
+    when: OpenConversation(session)
+
+    requires: session.state = dormant
+    requires: NetworkPathAvailable()
+
+    ensures: session.state = connecting
+    ensures: session.view_open = true
+    ensures: session.delivery_owner.kind = open_session
+}
+
+rule OpenConversationOffline {
+    -- REQ-IOS-004, REQ-IOS-005, REQ-IOS-007
+    when: OpenConversation(session)
+
+    requires: session.state = dormant
+    requires: not NetworkPathAvailable()
+
+    ensures: session.state = offline
+    ensures: session.view_open = true
+    ensures: session.delivery_owner.kind = open_session
+}
+
+rule ConversationViewClosed {
+    -- REQ-IOS-005: stop live work while retaining delivery ownership.
+    when: CloseConversation(session)
+
+    requires: session.view_open
+    requires: session.state in {
+        connecting, live, waiting_to_retry, offline
+    }
+
+    ensures: session.state = dormant
+    ensures: session.view_open = false
+    ensures: session.delivery_owner.kind = retained_session
+    ensures: not exists session.retry_window
+}
+
+rule BlockedConversationViewClosed {
+    when: CloseConversation(session)
+
+    requires: session.view_open
+    requires: session.state = blocked
+
+    ensures: session.view_open = false
+    ensures: session.delivery_owner.kind = retained_session
+}
+
+rule DormantConversationViewClosed {
+    when: CloseConversation(session)
+
+    requires: session.view_open
+    requires: session.state = dormant
+
+    ensures: session.view_open = false
+    ensures: session.delivery_owner.kind = retained_session
+}
+
+rule AppBackgroundsOpenConversation {
+    -- REQ-IOS-001, REQ-IOS-002, REQ-IOS-005
+    when: AppBackgrounded(session)
+
+    requires: session.view_open
+    requires: session.state in {
+        connecting, live, waiting_to_retry, offline
+    }
+
+    ensures: session.state = dormant
+    ensures: not exists session.retry_window
+}
+
+rule ReopenBlockedConversation {
+    when: OpenConversation(session)
+
+    requires: not session.view_open
+    requires: session.state = blocked
+
+    ensures: session.view_open = true
+    ensures: session.delivery_owner.kind = open_session
+    ensures: StreamFailureSurfaced(session: session)
+}
+
+rule AppForegroundsOnline {
+    -- REQ-IOS-004, REQ-IOS-005
+    when: AppForegrounded(session)
+
+    requires: session.view_open
+    requires: session.state = dormant
+    requires: NetworkPathAvailable()
+
+    ensures: session.state = connecting
+}
+
+rule AppForegroundsOffline {
+    when: AppForegrounded(session)
+
+    requires: session.view_open
+    requires: session.state = dormant
+    requires: not NetworkPathAvailable()
+
+    ensures: session.state = offline
+}
+
+------------------------------------------------------------
+-- Rules -- connection and retry lifecycle
+------------------------------------------------------------
+
+rule NetworkPathLost {
+    -- REQ-IOS-005, REQ-IOS-007
+    when: NetworkBecameUnavailable(session)
+
+    requires: session.state in { connecting, live, waiting_to_retry }
+
+    ensures: session.state = offline
+    ensures: not exists session.retry_window
+}
+
+rule NetworkPathRestored {
+    -- REQ-IOS-004, REQ-IOS-005
+    when: NetworkBecameAvailable(session)
+
+    requires: session.state = offline
+    requires: session.view_open
+
+    ensures: session.state = connecting
+}
+
+rule StreamFailedBeforeInit {
+    -- REQ-IOS-005
+    when: RetryableStreamFailure(session)
+
+    requires: session.state = connecting
+
+    ensures: session.state = waiting_to_retry
+    ensures: session.retry_attempt = session.retry_attempt + 1
+    ensures: RetryWindow.created(
+        session: session,
+        delay_attempt: session.retry_attempt + 1
+    )
+}
+
+rule LiveStreamClosed {
+    when: RetryableStreamFailure(session)
+
+    requires: session.state = live
+
+    ensures: session.state = waiting_to_retry
+    ensures: session.retry_attempt = session.retry_attempt + 1
+    ensures: RetryWindow.created(
+        session: session,
+        delay_attempt: session.retry_attempt + 1
+    )
+}
+
+rule RetryWindowElapsed {
+    when: RetryElapsed(session)
+
+    requires: session.state = waiting_to_retry
+    requires: exists session.retry_window
+    requires: NetworkPathAvailable()
+
+    ensures: session.state = connecting
+    ensures: not exists session.retry_window
+}
+
+rule PermanentStreamAuthenticationFailure {
+    -- REQ-IOS-005, REQ-IOS-007, REQ-IOS-008
+    when: StreamAuthenticationRejected(session)
+
+    requires: session.state = connecting
+
+    ensures: session.state = blocked
+    ensures: StreamFailureSurfaced(session: session)
+}
+
+------------------------------------------------------------
+-- Rules -- init, replay, and durable cache boundary
+------------------------------------------------------------
+
+rule ValidInitAccepted {
+    -- REQ-IOS-001, REQ-IOS-004, REQ-IOS-005
+    when: received: ReceivedStreamInit.created
+
+    let session = received.session
+    let init = received.snapshot
+
+    requires: session.state = connecting
+    requires: init.pending_anchor_sequence_id <= init.last_sequence_id
+
+    ensures: session.state = live
+    ensures: session.retry_attempt = 0
+    ensures: session.sequence_floor = replay_floor(
+        session.sequence_floor,
+        init.pending_anchor_sequence_id,
+        init.last_sequence_id
+    )
+    ensures: session.cache.durable_message_ceiling = init.pending_anchor_sequence_id
+    ensures: session.cache.synced = true
+    ensures:
+        if not init.pending_truncated:
+            PendingEventsReducedThroughSharedSequenceGuard(
+                session: session,
+                entries: init.pending_events
+            )
+}
+
+rule PotentiallyEagerAssistantObserved {
+    -- REQ-IOS-001, REQ-IOS-005
+    when: PotentiallyEagerAssistantMessageReceived(session, event_sequence)
+
+    requires: session.state = live
+    requires: event_sequence > session.sequence_floor
+
+    ensures: session.sequence_floor = event_sequence
+}
+
+rule CommittedTranscriptMessageObserved {
+    -- REQ-IOS-001, REQ-IOS-005
+    when: CommittedTranscriptMessageReceived(
+        session, event_sequence, message_sequence
+    )
+
+    requires: session.state = live
+    requires: event_sequence > session.sequence_floor
+
+    ensures: session.sequence_floor = event_sequence
+    ensures: session.cache.durable_message_ceiling = max(
+        session.cache.durable_message_ceiling,
+        message_sequence
+    )
+}
+
+rule AlreadyPersistedMessageReconciled {
+    when: PersistedMessageReconciled(session, message_sequence)
+
+    requires: session.state != deleted
+
+    ensures: session.sequence_floor = max(
+        session.sequence_floor,
+        message_sequence
+    )
+    ensures: session.cache.durable_message_ceiling = max(
+        session.cache.durable_message_ceiling,
+        message_sequence
+    )
+}
+
+rule TurnCompletionCommitsObservedTranscript {
+    when: AgentTurnCompleted(session, event_sequence)
+
+    requires: session.state = live
+    requires: event_sequence > session.sequence_floor
+
+    ensures: session.sequence_floor = event_sequence
+    ensures: session.cache.durable_message_ceiling = event_sequence
+}
+
+rule StaleOrDuplicateEventDiscarded {
+    -- REQ-IOS-005
+    when: StreamEventReceived(session, event_sequence)
+
+    requires: event_sequence <= session.sequence_floor
+
+    ensures: StreamEventDiscarded(
+        session: session,
+        event_sequence: event_sequence
+    )
+}
+
+------------------------------------------------------------
+-- Rules -- terminal deletion
+------------------------------------------------------------
+
+rule HardDeletionEventReceived {
+    -- REQ-IOS-005
+    when: ConversationHardDeleted(session)
+
+    requires: session.state = live
+
+    ensures: session.state = deleted
+    ensures: session.view_open = false
+    ensures: session.interaction_enabled = false
+    ensures: not exists session.cache
+    ensures: not exists session.delivery_owner
+    ensures: not exists session.retry_window
+    ensures:
+        for entry in queue/LocalQueueEntries where scope = session.scope:
+            not exists entry
+}
+
+rule HardDeletionConfirmedWhileConnecting {
+    when: ConversationNotFound(session)
+
+    requires: session.state = connecting
+
+    ensures: session.state = deleted
+    ensures: session.view_open = false
+    ensures: session.interaction_enabled = false
+    ensures: not exists session.cache
+    ensures: not exists session.delivery_owner
+    ensures: not exists session.retry_window
+    ensures:
+        for entry in queue/LocalQueueEntries where scope = session.scope:
+            not exists entry
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneSessionPerConversation {
+    for a in IosConversationSessions:
+        for b in IosConversationSessions:
+            a != b implies a.scope != b.scope
+}
+
+invariant OneDeliveryOwnerPerConversation {
+    for a in DeliveryOwners:
+        for b in DeliveryOwners:
+            a != b implies a.session.scope != b.session.scope
+}
+
+invariant AtMostOneRetryWindowPerSession {
+    for a in RetryWindows:
+        for b in RetryWindows:
+            a != b implies a.session != b.session
+}
+
+invariant RetryWindowMatchesAttempt {
+    for window in RetryWindows:
+        window.delay_attempt = window.session.retry_attempt
+}
+
+invariant LiveSessionsHaveOpenViews {
+    for session in IosConversationSessions:
+        session.state = live implies session.view_open
+}
+
+invariant PersistedSweepsNeverOwnLiveStreams {
+    for owner in DeliveryOwners:
+        owner.kind = persisted_queue_sweep implies owner.session.state = dormant
+}
+
+invariant DurableCacheNeverLeadsReducer {
+    for cache in CachedConversations:
+        cache.durable_message_ceiling <= cache.session.sequence_floor
+}
+
+invariant DeletedSessionsOwnNoLocalState {
+    for session in IosConversationSessions:
+        session.state = deleted implies (
+            not session.interaction_enabled
+            and not exists session.cache
+            and not exists session.delivery_owner
+            and not exists session.retry_window
+        )
+}
