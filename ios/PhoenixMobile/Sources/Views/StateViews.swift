@@ -201,7 +201,10 @@ struct StateDetailView: View {
                         session.perform(.dismissError)
                     }
                     .font(.callout.bold())
-                    .disabled(!model.connectivity.isOnline)
+                    .disabled(
+                        !model.connectivity.isOnline
+                            || !session.acceptsConversationActions
+                            || session.actionInFlight != nil)
                 }
             }
         }
