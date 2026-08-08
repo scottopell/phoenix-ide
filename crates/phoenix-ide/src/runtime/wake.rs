@@ -395,6 +395,9 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             };
+            let _message_acceptance = manager
+                .lock_message_acceptance(&current.conversation_id)
+                .await;
             let active_direct_turn =
                 phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
                     .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -411,7 +414,6 @@ async fn deliver_pending(
                 cursor = Some(next_cursor);
                 continue;
             }
-            let _steering_acceptance = manager.lock_steering_acceptance().await;
             let rendered = render_terminal_result(&current);
             let display_data = Some(serde_json::json!({
                 "type": "wake_result",

@@ -1,7 +1,7 @@
 use crate::api::{record_pr_auto_fix_context_baseline, validate_submitted_attachments};
 use crate::api::{FileAttachment, ImageAttachment};
 use crate::db::ConvState;
-use crate::runtime::{RuntimeManager, SteeringAcceptanceReceipt};
+use crate::runtime::{RuntimeManager, SteeringAcceptanceKey, SteeringAcceptanceReceipt};
 use crate::state_machine::{check_user_message_acceptable, Event, TransitionError};
 use phoenix_core::domain::db_schema::ImageData;
 use phoenix_core::domain::skill_invocation::SkillInvocation;
@@ -139,23 +139,30 @@ impl SendChatApplicationService {
                 code: "target_unavailable",
             });
         }
+        let acceptance_guard = self.runtime.lock_message_acceptance(&conversation.id).await;
+        let receipt_key = SteeringAcceptanceKey {
+            conversation_id: req.conversation_id.clone(),
+            message_id: req.message_id.clone(),
+        };
         {
-            let mut receipts = self.runtime.lock_steering_acceptance().await;
-            let receipt_key = (req.conversation_id.clone(), req.message_id.clone());
+            let receipts = self.runtime.lock_steering_acceptance_receipts().await;
             if let Some(receipt) = receipts.get(&receipt_key) {
-                return replay_steering_receipt(receipt, &req, &request_fingerprint);
+                return replay_steering_receipt(receipt, &request_fingerprint);
             }
-            if let Some((queued_conversation_id, queued_entry)) =
-                find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
+        }
+        if let Some((queued_conversation_id, queued_entry)) =
+            find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
+        {
+            if queued_conversation_id != req.conversation_id
+                || !queued_retry_matches(&queued_entry, &req)
             {
-                if queued_conversation_id != req.conversation_id
-                    || !queued_retry_matches(&queued_entry, &req)
-                {
-                    return Err(SendChatServiceError::IdempotencyConflict);
-                }
-                receipts.remove(&receipt_key);
-                return Ok(SendChatOutcome::QueuedAsSteering);
+                return Err(SendChatServiceError::IdempotencyConflict);
             }
+            self.runtime
+                .lock_steering_acceptance_receipts()
+                .await
+                .remove(&receipt_key);
+            return Ok(SendChatOutcome::QueuedAsSteering);
         }
 
         let effective_state = self
@@ -193,25 +200,17 @@ impl SendChatApplicationService {
             }
         }
 
-        let mut acceptance_guard = self.runtime.lock_steering_acceptance().await;
         let acceptance_state = self
             .effective_state(&conversation.id, &conversation.state)
             .await?;
         let acceptance_acceptability = check_user_message_acceptable(&acceptance_state);
-        let receipt_key = (req.conversation_id.clone(), req.message_id.clone());
-        if let Some(receipt) = acceptance_guard.get(&receipt_key) {
-            return replay_steering_receipt(receipt, &req, &request_fingerprint);
-        }
-        if let Some((queued_conversation_id, queued_entry)) =
-            find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
-        {
-            if queued_conversation_id != req.conversation_id
-                || !queued_retry_matches(&queued_entry, &req)
-            {
-                return Err(SendChatServiceError::IdempotencyConflict);
+        if let Err(err) = &acceptance_acceptability {
+            if !should_enqueue_steering(&acceptance_acceptability) {
+                return Ok(SendChatOutcome::Rejected {
+                    message: err.to_string(),
+                    code: transition_code(err),
+                });
             }
-            acceptance_guard.remove(&receipt_key);
-            return Ok(SendChatOutcome::QueuedAsSteering);
         }
         let steering_queue = self
             .runtime
@@ -243,16 +242,18 @@ impl SendChatApplicationService {
                 .enqueue_steer_message(&conversation.id, event)
                 .await
                 .map_err(SendChatServiceError::Dispatch)?;
-            insert_transient_steering_receipt(
-                &self.db,
-                &mut acceptance_guard,
-                receipt_key,
-                SteeringAcceptanceReceipt {
-                    conversation_id: conversation.id.clone(),
-                    request_fingerprint,
-                },
-            )
-            .await;
+            {
+                let mut receipts = self.runtime.lock_steering_acceptance_receipts().await;
+                insert_transient_steering_receipt(
+                    &self.db,
+                    &mut receipts,
+                    receipt_key,
+                    SteeringAcceptanceReceipt {
+                        request_fingerprint,
+                    },
+                )
+                .await;
+            }
             drop(acceptance_guard);
             if let Err(error) = record_pr_auto_fix_context_baseline(
                 self.runtime.db(),
@@ -607,25 +608,28 @@ fn map_db_internal_error(error: &crate::db::DbError) -> SendChatServiceError {
 
 async fn insert_transient_steering_receipt(
     db: &crate::db::Database,
-    receipts: &mut std::collections::HashMap<(String, String), SteeringAcceptanceReceipt>,
-    key: (String, String),
+    receipts: &mut std::collections::HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>,
+    key: SteeringAcceptanceKey,
     receipt: SteeringAcceptanceReceipt,
 ) {
     const CLEANUP_THRESHOLD: usize = 1_024;
     if receipts.len() >= CLEANUP_THRESHOLD {
-        let candidates = receipts
-            .iter()
-            .map(|(key, receipt)| (key.clone(), receipt.conversation_id.clone()))
-            .collect::<Vec<_>>();
-        for (key, conversation_id) in candidates {
-            let id = &key.1;
-            let persisted = db.message_exists(id).await.unwrap_or(false);
-            let queued = db
-                .get_steering_queue(&conversation_id)
+        let candidates = receipts.keys().cloned().collect::<Vec<_>>();
+        for candidate in candidates {
+            let persisted = db
+                .message_exists(&candidate.message_id)
                 .await
-                .is_ok_and(|queue| queue.iter().any(|entry| entry.message_id == *id));
+                .unwrap_or(false);
+            let queued = db
+                .get_steering_queue(&candidate.conversation_id)
+                .await
+                .is_ok_and(|queue| {
+                    queue
+                        .iter()
+                        .any(|entry| entry.message_id == candidate.message_id)
+                });
             if persisted || queued {
-                receipts.remove(&key);
+                receipts.remove(&candidate);
             }
         }
     }
@@ -749,12 +753,9 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
 
 fn replay_steering_receipt(
     receipt: &SteeringAcceptanceReceipt,
-    req: &SendChatRequest,
     request_fingerprint: &str,
 ) -> Result<SendChatOutcome, SendChatServiceError> {
-    if receipt.conversation_id != req.conversation_id
-        || receipt.request_fingerprint != request_fingerprint
-    {
+    if receipt.request_fingerprint != request_fingerprint {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
     Ok(SendChatOutcome::QueuedAsSteering)
@@ -1103,11 +1104,10 @@ mod tests {
         let req = request();
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let receipt = crate::runtime::SteeringAcceptanceReceipt {
-            conversation_id: req.conversation_id.clone(),
             request_fingerprint: fingerprint.clone(),
         };
         assert_eq!(
-            replay_steering_receipt(&receipt, &req, &fingerprint).unwrap(),
+            replay_steering_receipt(&receipt, &fingerprint).unwrap(),
             super::SendChatOutcome::QueuedAsSteering
         );
 
@@ -1115,7 +1115,7 @@ mod tests {
         changed.user_agent = Some("changed".to_string());
         let changed_fingerprint = super::request_fingerprint(&changed).unwrap();
         assert!(matches!(
-            replay_steering_receipt(&receipt, &changed, &changed_fingerprint),
+            replay_steering_receipt(&receipt, &changed_fingerprint),
             Err(SendChatServiceError::IdempotencyConflict)
         ));
     }

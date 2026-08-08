@@ -51,7 +51,7 @@ use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tracing::Instrument;
 
@@ -146,8 +146,60 @@ pub struct TaskApprovalHandoffResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SteeringAcceptanceReceipt {
-    pub conversation_id: String,
     pub request_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SteeringAcceptanceKey {
+    pub conversation_id: String,
+    pub message_id: String,
+}
+
+#[derive(Default)]
+struct ConversationMessageAcceptanceGates {
+    gates: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+impl ConversationMessageAcceptanceGates {
+    async fn gate_for(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
+        const CLEANUP_THRESHOLD: usize = 1_024;
+        let mut gates = self.gates.lock().await;
+        if gates.len() >= CLEANUP_THRESHOLD {
+            gates.retain(|_, gate| gate.strong_count() > 0);
+        }
+        if let Some(gate) = gates.get(conversation_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        gates.insert(conversation_id.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn lock(&self, conversation_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate_for(conversation_id).await.lock_owned().await
+    }
+}
+
+#[cfg(test)]
+mod message_acceptance_gate_tests {
+    use super::ConversationMessageAcceptanceGates;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn gates_are_shared_within_one_conversation_and_independent_across_conversations() {
+        let gates = ConversationMessageAcceptanceGates::default();
+        let first_a = gates.gate_for("conversation-a").await;
+        let second_a = gates.gate_for("conversation-a").await;
+        let conversation_b = gates.gate_for("conversation-b").await;
+
+        assert!(Arc::ptr_eq(&first_a, &second_a));
+        assert!(!Arc::ptr_eq(&first_a, &conversation_b));
+
+        let _first_guard = first_a.lock_owned().await;
+        assert!(second_a.try_lock_owned().is_err());
+
+        assert!(conversation_b.try_lock_owned().is_ok());
+    }
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
@@ -190,8 +242,11 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
-    /// Serializes legacy steering admission until the normalized queue row is visible.
-    steering_acceptance_receipts: AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>,
+    /// Serializes message admission per conversation while leaving unrelated
+    /// conversations independent.
+    message_acceptance: ConversationMessageAcceptanceGates,
+    steering_acceptance_receipts:
+        AsyncMutex<HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1381,6 +1436,7 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
+            message_acceptance: ConversationMessageAcceptanceGates::default(),
             steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
@@ -3363,9 +3419,17 @@ impl RuntimeManager {
         }
     }
 
-    pub(crate) async fn lock_steering_acceptance(
+    pub(crate) async fn lock_message_acceptance(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), SteeringAcceptanceReceipt>> {
+        conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.message_acceptance.lock(conversation_id).await
+    }
+
+    pub(crate) async fn lock_steering_acceptance_receipts(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>
+    {
         self.steering_acceptance_receipts.lock().await
     }
 

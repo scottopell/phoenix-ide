@@ -432,13 +432,17 @@ surface SteeringQueueApi {
         -- the new state before the HTTP response is returned to the caller.
 
     @guarantee PendingQueueFencesDirectAcceptance
-        -- A non-empty durable steering queue prevents an idle observation from
-        -- routing a later request into direct-turn acceptance. The queue check
-        -- and direct acceptance are serialized with steering persistence. The
-        -- later request joins the steering queue, covering the window where a
-        -- steer was accepted while busy but reaches the executor after it became
-        -- idle. Error recovery remains a direct turn so it cannot be stranded
-        -- behind a queue that error dismissal intentionally does not drain.
+        -- Message admission is serialized per conversation from before state
+        -- observation through validation and durable acceptance. A busy send
+        -- therefore reserves its place before slow payload work, and a non-empty
+        -- durable steering queue prevents a later idle observation from routing
+        -- into direct-turn acceptance. The later request joins the steering queue,
+        -- covering the window where a steer was accepted while busy but reaches
+        -- the executor after it became idle. The state is checked again before
+        -- acceptance; terminal and interaction-blocked states reject rather than
+        -- parking an undeliverable message. Error recovery remains a direct turn
+        -- so it cannot be stranded behind a queue that error dismissal does not
+        -- drain. Admission for unrelated conversations remains independent.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
