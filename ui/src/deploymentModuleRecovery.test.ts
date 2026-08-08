@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, screen } from '@testing-library/react';
 import { installDeploymentModuleRecovery } from './deploymentModuleRecovery';
 
 function preloadError(payload: unknown): Event {
@@ -10,70 +11,59 @@ function preloadError(payload: unknown): Event {
 }
 
 describe('deployment module recovery', () => {
-  beforeEach(() => {
-    sessionStorage.clear();
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-  });
-
   afterEach(() => {
+    document.getElementById('phoenix-module-load-notice')?.remove();
     vi.restoreAllMocks();
   });
 
-  it('reloads once when a deployed module cannot be loaded', () => {
+  it('preserves the page until the user chooses to reload', () => {
     const reload = vi.fn();
-    const uninstall = installDeploymentModuleRecovery({ now: () => 1_000, reload });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const uninstall = installDeploymentModuleRecovery({ reload });
     const event = preloadError(new TypeError('Failed to fetch dynamically imported module: /assets/flow.js'));
 
     window.dispatchEvent(event);
 
     expect(event.defaultPrevented).toBe(true);
-    expect(reload).toHaveBeenCalledOnce();
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('unsent attachments will be lost');
     expect(console.error).toHaveBeenCalledWith(
       '[Phoenix] Failed to load a deployed UI module.',
       expect.stringContaining('/assets/flow.js'),
     );
-    uninstall();
-  });
 
-  it('does not reload-loop when the coherent generation is still unavailable', () => {
-    const firstReload = vi.fn();
-    const uninstallFirst = installDeploymentModuleRecovery({ now: () => 1_000, reload: firstReload });
-    window.dispatchEvent(preloadError(new Error('first failure')));
-    uninstallFirst();
-
-    const secondReload = vi.fn();
-    const uninstallSecond = installDeploymentModuleRecovery({ now: () => 2_000, reload: secondReload });
-    const secondEvent = preloadError(new Error('persistent failure'));
-    window.dispatchEvent(secondEvent);
-
-    expect(firstReload).toHaveBeenCalledOnce();
-    expect(secondReload).not.toHaveBeenCalled();
-    expect(secondEvent.defaultPrevented).toBe(false);
-    uninstallSecond();
-  });
-
-  it('uses one guard across routes in the same deployment session', () => {
-    const reload = vi.fn();
-    const uninstall = installDeploymentModuleRecovery({ now: () => 1_000, reload });
-    window.dispatchEvent(preloadError(new Error('first route failure')));
-    history.pushState({}, '', '/another-route');
-    window.dispatchEvent(preloadError(new Error('second route failure')));
-
+    fireEvent.click(screen.getByRole('button', { name: 'Reload Phoenix' }));
     expect(reload).toHaveBeenCalledOnce();
     uninstall();
   });
 
-  it('allows another recovery after the bounded window', () => {
-    const firstReload = vi.fn();
-    const uninstallFirst = installDeploymentModuleRecovery({ now: () => 1_000, reload: firstReload });
-    window.dispatchEvent(preloadError(new Error('first failure')));
-    uninstallFirst();
+  it('consumes persistent failures without duplicating the recovery surface', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const reload = vi.fn();
+    const uninstall = installDeploymentModuleRecovery({ reload });
+    const firstEvent = preloadError(new Error('first failure'));
+    const secondEvent = preloadError(new Error('persistent failure'));
 
-    const laterReload = vi.fn();
-    const uninstallLater = installDeploymentModuleRecovery({ now: () => 31_001, reload: laterReload });
-    window.dispatchEvent(preloadError(new Error('later failure')));
+    window.dispatchEvent(firstEvent);
+    window.dispatchEvent(secondEvent);
 
-    expect(laterReload).toHaveBeenCalledOnce();
-    uninstallLater();
+    expect(firstEvent.defaultPrevented).toBe(true);
+    expect(secondEvent.defaultPrevented).toBe(true);
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(reload).not.toHaveBeenCalled();
+    uninstall();
+  });
+
+  it('allows the warning to be dismissed while preserving the current page', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const reload = vi.fn();
+    const uninstall = installDeploymentModuleRecovery({ reload });
+    window.dispatchEvent(preloadError(new Error('optional feature failed')));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss module load warning' }));
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(reload).not.toHaveBeenCalled();
+    uninstall();
   });
 });

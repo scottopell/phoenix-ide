@@ -8995,6 +8995,49 @@ html * {
   opacity: 0.85;
 }
 
+.module-load-notice {
+  position: fixed;
+  z-index: 3000;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(620px, calc(100vw - 32px));
+  padding: 10px 12px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--accent-red, #ef4444);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 24%);
+  font-size: 13px;
+}
+
+.module-load-notice__text {
+  flex: 1;
+}
+
+.module-load-notice__reload {
+  flex-shrink: 0;
+  padding: 5px 9px;
+  color: white;
+  background: var(--accent-blue, #2563eb);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.module-load-notice__dismiss {
+  flex-shrink: 0;
+  padding: 2px 5px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
 /* --- SSE Error Toast --- */
 
 .sse-error-toast {
