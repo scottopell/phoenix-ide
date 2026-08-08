@@ -54,6 +54,7 @@ ui/src/
 specs/           # Behavioural specs (read before modifying anything spec'd!)
 tasks/           # Task tracking
 phoenix-client.py  # CLI client — interact with the app without a browser
+ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_client/)
 ```
 
 `phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.

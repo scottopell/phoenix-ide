@@ -1,0 +1,69 @@
+# XcodeGen project spec. Regenerate the .xcodeproj with:
+#   brew install xcodegen && xcodegen generate
+# The .xcodeproj is NOT checked in; this file is the source of truth.
+name: PhoenixMobile
+options:
+  bundleIdPrefix: com.phoenix
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  PhoenixMobile:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.phoenix.mobile
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        GENERATE_INFOPLIST_FILE: YES
+        # Personal-tool posture: Phoenix servers live on LAN/tailnet hosts
+        # with self-signed TLS (or plain http in dev). ATS exceptions are
+        # required to reach them; the in-app trust toggle governs actual
+        # certificate acceptance.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Phoenix connects to your Phoenix server on the local network."
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Phoenix
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: "Phoenix connects to your Phoenix server on the local network."
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+
+  PhoenixMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: PhoenixMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
+# Shared scheme so `xcodebuild test -scheme PhoenixMobile` works in CI
+# without anyone having opened Xcode first.
+schemes:
+  PhoenixMobile:
+    build:
+      targets:
+        PhoenixMobile: all
+        PhoenixMobileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PhoenixMobileTests
