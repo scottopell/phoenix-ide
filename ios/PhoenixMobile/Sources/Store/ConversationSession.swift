@@ -248,7 +248,7 @@ final class ConversationSession {
     func send(text: String) -> Bool {
         guard !isHardDeleted else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty, typedState.acceptsChatMessage else { return false }
         guard outbox.enqueue(text: trimmed) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
@@ -514,13 +514,15 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
-            if let conversation { onConversationUpdate?(conversation) }
+            if let conversation {
+                onConversationUpdate?(conversation)
+            }
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
             outbox.suppress(authoritativeMessageIds: Set(snap.messages.map(\.message_id)))
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
             drainOutbox()
@@ -559,7 +561,7 @@ final class ConversationSession {
                 rebuildToolUseIndex()
             }
             // Snapshot before outbox prune — see the init branch.
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
 
@@ -589,7 +591,7 @@ final class ConversationSession {
             }
             if messages[idx].message_type == "agent" { rebuildToolUseIndex() }
             snapshotSyncedAt = Date()
-            persistSnapshot()
+            persistSnapshot(authoritative: true)
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
@@ -605,7 +607,7 @@ final class ConversationSession {
                 }
                 self.conversation = conversation
                 snapshotSyncedAt = Date()
-                persistSnapshot()
+                persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
             }
             if let mode {
@@ -648,9 +650,9 @@ final class ConversationSession {
             // agent_done can close a turn without a trailing idle
             // state_change; leave resting/needs-action states alone but
             // clear in-flight ones so the spinner doesn't outlive the turn.
-            switch typedState {
-            case .llmRequesting, .toolExecuting, .awaitingSubAgents,
-                 .awaitingLlm, .cancelling:
+            if presentationMode == "working"
+                || (presentationMode == nil && typedState.isKnownWorkingState)
+            {
                 typedState = .idle
                 convState = .string("idle")
                 conversation?.state = .string("idle")
@@ -659,13 +661,11 @@ final class ConversationSession {
                 // the spinner back for a turn that already ended.
                 presentationMode = "idle"
                 conversation?.presentation_mode = "idle"
-            default:
-                break
             }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
             drainOutbox()
@@ -685,7 +685,7 @@ final class ConversationSession {
                 if let v = update["title"]?.stringValue { conv.title = v }
                 if let v = update["updated_at"]?.stringValue { conv.updated_at = v }
                 conversation = conv
-                persistSnapshot()
+                persistSnapshot(authoritative: true)
                 onConversationUpdate?(conv)
             }
 
@@ -787,7 +787,7 @@ final class ConversationSession {
                     durableMessageSequenceCeiling, message.sequence_id)
                 lastSequenceId = max(lastSequenceId, message.sequence_id)
                 rebuildToolUseIndex()
-                if persistSnapshot() {
+                if persistSnapshot(authoritative: true) {
                     reconcileOutbox()
                 }
             case .steeringQueued:

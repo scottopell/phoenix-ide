@@ -68,7 +68,7 @@ struct StateDetailView: View {
                     footnote: "Continue this work from the web UI.")
             }
 
-        case .cancelling:
+        case .cancelling, .cancellingTool, .cancellingSubAgents:
             workingRow {
                 Text("Cancelling…")
                     .font(.caption)
@@ -93,7 +93,7 @@ struct StateDetailView: View {
                 }
             }
 
-        case .idle, .awaitingLlm, .terminal, .handedOff, .unknown:
+        case .idle, .awaitingLlm, .awaitingContinuation, .terminal, .handedOff, .unknown:
             if session.agentWorking {
                 workingRow {
                     Text("Working…")

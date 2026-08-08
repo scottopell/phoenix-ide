@@ -77,11 +77,41 @@ final class ConversationStateTests: XCTestCase {
             .error(message: "rate limited"))
     }
 
-    func testCancellingVariantsCollapse() {
+    func testCancellingVariantsRemainStructurallyDistinct() {
         XCTAssertEqual(parse("{\"type\":\"cancelling\"}"), .cancelling)
         XCTAssertEqual(
-            parse("{\"type\":\"cancelling_tool\",\"tool_use_id\":\"t1\"}"), .cancelling)
-        XCTAssertEqual(parse("{\"type\":\"cancelling_sub_agents\",\"pending\":[]}"), .cancelling)
+            parse("{\"type\":\"cancelling_tool\",\"tool_use_id\":\"t1\"}"),
+            .cancellingTool)
+        XCTAssertEqual(
+            parse("{\"type\":\"cancelling_sub_agents\",\"pending\":[]}"),
+            .cancellingSubAgents)
+    }
+
+    func testAwaitingContinuationIsWorkingButNotInteractive() {
+        let state = parse("{\"type\":\"awaiting_continuation\",\"attempt\":1}")
+        XCTAssertEqual(state, .awaitingContinuation)
+        XCTAssertTrue(state.isKnownWorkingState)
+        XCTAssertFalse(state.isCancellable)
+        XCTAssertFalse(state.acceptsChatMessage)
+    }
+
+    func testChatEligibilityDistinguishesCancellationFamilies() {
+        XCTAssertFalse(ConversationState.cancelling.acceptsChatMessage)
+        XCTAssertTrue(ConversationState.cancellingTool.acceptsChatMessage)
+        XCTAssertTrue(ConversationState.cancellingSubAgents.acceptsChatMessage)
+    }
+
+    func testCancellationAvailabilityTracksServerTransitionStates() {
+        XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).isCancellable)
+        XCTAssertTrue(
+            ConversationState.toolExecuting(
+                toolName: "bash", remainingCount: 0, completedCount: 0).isCancellable)
+        XCTAssertTrue(
+            ConversationState.awaitingSubAgents(pendingCount: 1, completedCount: 0)
+                .isCancellable)
+        XCTAssertFalse(ConversationState.awaitingLlm.isCancellable)
+        XCTAssertFalse(ConversationState.awaitingContinuation.isCancellable)
+        XCTAssertFalse(ConversationState.cancellingTool.isCancellable)
     }
 
     // MARK: - Fallback rules (a newer server must degrade, not break)

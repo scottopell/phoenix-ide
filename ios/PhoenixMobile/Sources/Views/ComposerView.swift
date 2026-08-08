@@ -22,7 +22,7 @@ struct ComposerView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .focused($focused)
 
-                if session.agentWorking {
+                if session.typedState.isCancellable {
                     Button {
                         session.perform(.cancel)
                     } label: {
@@ -41,7 +41,9 @@ struct ComposerView: View {
                         .font(.title2)
                         .foregroundStyle(model.connectivity.isOnline ? Color.accentColor : .orange)
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || !session.typedState.acceptsChatMessage)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -50,6 +52,7 @@ struct ComposerView: View {
     }
 
     private func send() {
+        guard session.typedState.acceptsChatMessage else { return }
         if session.send(text: draft) {
             draft = ""
         }
