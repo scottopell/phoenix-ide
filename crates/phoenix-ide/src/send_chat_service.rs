@@ -110,28 +110,8 @@ impl SendChatApplicationService {
                 return Ok(SendChatOutcome::Delivered);
             }
         }
-        if let Ok(message) = self
-            .db
-            .get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
-            .await
-        {
-            let persisted_matches = match &message.content {
-                phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
-                    persisted_skill_matches(skill, &req)
-                }
-                content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
-                    persisted_user_message_matches(content, &req)
-                }
-                phoenix_core::domain::db_schema::MessageContent::Agent(_)
-                | phoenix_core::domain::db_schema::MessageContent::Tool(_)
-                | phoenix_core::domain::db_schema::MessageContent::System(_)
-                | phoenix_core::domain::db_schema::MessageContent::Error(_)
-                | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
-            };
-            if message.conversation_id != req.conversation_id || !persisted_matches {
-                return Err(SendChatServiceError::IdempotencyConflict);
-            }
-            return Ok(SendChatOutcome::AlreadyPersisted);
+        if let Some(outcome) = lookup_persisted_message_replay(&self.db, &req).await? {
+            return Ok(outcome);
         }
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
@@ -144,12 +124,6 @@ impl SendChatApplicationService {
             conversation_id: req.conversation_id.clone(),
             message_id: req.message_id.clone(),
         };
-        {
-            let receipts = self.runtime.lock_steering_acceptance_receipts().await;
-            if let Some(receipt) = receipts.get(&receipt_key) {
-                return replay_steering_receipt(receipt, &request_fingerprint);
-            }
-        }
         if let Some((queued_conversation_id, queued_entry)) =
             find_queued_message(&self.db, &req.conversation_id, &req.message_id).await?
         {
@@ -158,11 +132,14 @@ impl SendChatApplicationService {
             {
                 return Err(SendChatServiceError::IdempotencyConflict);
             }
+            return Ok(SendChatOutcome::QueuedAsSteering);
+        }
+        if let Some(outcome) = lookup_persisted_message_replay(&self.db, &req).await? {
             self.runtime
                 .lock_steering_acceptance_receipts()
                 .await
                 .remove(&receipt_key);
-            return Ok(SendChatOutcome::QueuedAsSteering);
+            return Ok(outcome);
         }
 
         // The pre-lock lookup is only a fast path. A concurrent request with
@@ -184,6 +161,12 @@ impl SendChatApplicationService {
             DurableReplayOutcome::ExactUnmaterializedLive => {
                 self.runtime.kick_direct_turn_worker();
                 return Ok(SendChatOutcome::Delivered);
+            }
+        }
+        {
+            let receipts = self.runtime.lock_steering_acceptance_receipts().await;
+            if let Some(receipt) = receipts.get(&receipt_key) {
+                return replay_terminal_steering_receipt(receipt, &request_fingerprint);
             }
         }
 
@@ -639,7 +622,7 @@ async fn insert_transient_steering_receipt(
                         .iter()
                         .any(|entry| entry.message_id == candidate.message_id)
                 });
-            if persisted || queued {
+            if persisted || !queued {
                 receipts.remove(&candidate);
             }
         }
@@ -659,6 +642,37 @@ async fn find_queued_message(
         .into_iter()
         .find(|entry| entry.message_id == message_id);
     Ok(entry.map(|entry| (conversation_id.to_string(), entry)))
+}
+
+async fn lookup_persisted_message_replay(
+    db: &crate::db::Database,
+    req: &SendChatRequest,
+) -> Result<Option<SendChatOutcome>, SendChatServiceError> {
+    let message = match db
+        .get_message_by_id_in_conversation(&req.conversation_id, &req.message_id)
+        .await
+    {
+        Ok(message) => message,
+        Err(crate::db::DbError::MessageNotFound(_)) => return Ok(None),
+        Err(error) => return Err(map_db_internal_error(&error)),
+    };
+    let persisted_matches = match &message.content {
+        phoenix_core::domain::db_schema::MessageContent::Skill(skill) => {
+            persisted_skill_matches(skill, req)
+        }
+        content @ phoenix_core::domain::db_schema::MessageContent::User(_) => {
+            persisted_user_message_matches(content, req)
+        }
+        phoenix_core::domain::db_schema::MessageContent::Agent(_)
+        | phoenix_core::domain::db_schema::MessageContent::Tool(_)
+        | phoenix_core::domain::db_schema::MessageContent::System(_)
+        | phoenix_core::domain::db_schema::MessageContent::Error(_)
+        | phoenix_core::domain::db_schema::MessageContent::Continuation(_) => false,
+    };
+    if message.conversation_id != req.conversation_id || !persisted_matches {
+        return Err(SendChatServiceError::IdempotencyConflict);
+    }
+    Ok(Some(SendChatOutcome::AlreadyPersisted))
 }
 
 fn queued_retry_matches(
@@ -762,14 +776,17 @@ fn request_fingerprint(req: &SendChatRequest) -> Result<String, SendChatServiceE
     ))
 }
 
-fn replay_steering_receipt(
+fn replay_terminal_steering_receipt(
     receipt: &SteeringAcceptanceReceipt,
     request_fingerprint: &str,
 ) -> Result<SendChatOutcome, SendChatServiceError> {
     if receipt.request_fingerprint != request_fingerprint {
         return Err(SendChatServiceError::IdempotencyConflict);
     }
-    Ok(SendChatOutcome::QueuedAsSteering)
+    Ok(SendChatOutcome::Rejected {
+        message: "The accepted message was cancelled or failed before delivery.".to_string(),
+        code: "turn_terminal",
+    })
 }
 
 fn map_images(images: Vec<ImageAttachment>) -> Vec<ImageData> {
@@ -799,7 +816,7 @@ mod tests {
     use super::{
         active_turn_fences_direct_acceptance, lookup_durable_replay, map_conversation_load_error,
         map_direct_turn_accept_error, pending_queue_fences_direct_acceptance,
-        persisted_skill_matches, queued_retry_matches, replay_steering_receipt,
+        persisted_skill_matches, queued_retry_matches, replay_terminal_steering_receipt,
         should_enqueue_steering, submitted_identity_from_request, DurableReplayOutcome,
         MessageExpansionPolicy, SendChatRequest, SendChatServiceError,
     };
@@ -1132,22 +1149,26 @@ mod tests {
     }
 
     #[test]
-    fn steering_acceptance_receipt_replay_uses_submitted_request_fingerprint() {
+    fn absent_durable_steering_receipt_replay_is_terminal() {
         let req = request();
         let fingerprint = super::request_fingerprint(&req).unwrap();
         let receipt = crate::runtime::SteeringAcceptanceReceipt {
             request_fingerprint: fingerprint.clone(),
         };
         assert_eq!(
-            replay_steering_receipt(&receipt, &fingerprint).unwrap(),
-            super::SendChatOutcome::QueuedAsSteering
+            replay_terminal_steering_receipt(&receipt, &fingerprint).unwrap(),
+            super::SendChatOutcome::Rejected {
+                message: "The accepted message was cancelled or failed before delivery."
+                    .to_string(),
+                code: "turn_terminal",
+            }
         );
 
         let mut changed = req.clone();
         changed.user_agent = Some("changed".to_string());
         let changed_fingerprint = super::request_fingerprint(&changed).unwrap();
         assert!(matches!(
-            replay_steering_receipt(&receipt, &changed_fingerprint),
+            replay_terminal_steering_receipt(&receipt, &changed_fingerprint),
             Err(SendChatServiceError::IdempotencyConflict)
         ));
     }

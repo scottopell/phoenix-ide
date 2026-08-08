@@ -3618,11 +3618,15 @@ impl RuntimeManager {
     ) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         handle
-            .event_tx
-            .send(event)
+            .acknowledged_event_tx
+            .send((event, ack_tx))
             .await
-            .map_err(|e| format!("Failed to send event: {e}"))
+            .map_err(|error| error.to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "runtime stopped before event settled".to_string())?
     }
 
     pub async fn send_event_and_wait_for_state(
@@ -4922,6 +4926,51 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn send_event_requires_runtime_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "send-event-settlement";
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, mut acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+
+        let sender = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .send_event(conversation_id, Event::DismissError)
+                    .await
+            })
+        };
+        let (_event, acknowledgement) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acknowledged_event_rx.recv(),
+        )
+        .await
+        .expect("runtime event delivery must not hang")
+        .expect("event must reach the runtime settlement channel");
+        assert!(!sender.is_finished(), "channel admission is not success");
+        drop(acknowledgement);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), sender)
+                .await
+                .expect("runtime settlement rejection must not hang")
+                .unwrap(),
+            Err("runtime stopped before event settled".to_string())
+        );
     }
 
     #[tokio::test]
