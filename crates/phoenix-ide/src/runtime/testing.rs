@@ -542,7 +542,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
-    fail_steering_removal: Mutex<bool>,
+    steering_removal_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
     continuation_commit_error_once: Mutex<bool>,
@@ -577,7 +577,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
-            fail_steering_removal: Mutex::new(false),
+            steering_removal_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
             continuation_commit_error_once: Mutex::new(false),
@@ -598,8 +598,8 @@ impl InMemoryStorage {
         *self.fail_state_update.lock().unwrap() = fail;
     }
 
-    pub fn set_fail_steering_removal(&self, fail: bool) {
-        *self.fail_steering_removal.lock().unwrap() = fail;
+    pub fn set_steering_removal_failures(&self, failures: usize) {
+        *self.steering_removal_failures.lock().unwrap() = failures;
     }
 
     pub fn set_continuation_start_recovery_outcome(
@@ -1451,9 +1451,12 @@ impl StateStore for InMemoryStorage {
         conv_id: &str,
         message_ids: &[String],
     ) -> Result<(), String> {
-        if *self.fail_steering_removal.lock().unwrap() {
+        let mut failures = self.steering_removal_failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
             return Err("injected steering removal failure".to_string());
         }
+        drop(failures);
         if message_ids.is_empty() {
             return Ok(());
         }

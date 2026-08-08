@@ -45,6 +45,7 @@ use tracing::Instrument;
 const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.";
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
+const STEERING_REMOVAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
@@ -5122,21 +5123,31 @@ where
             }
 
             Effect::ClearSteeringQueueEntries { message_ids } => {
-                self.storage
-                    .remove_steering_entries(&self.context.conversation_id, &message_ids)
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(
-                            conversation_id = %self.context.conversation_id,
-                            message_ids = ?message_ids,
-                            %error,
-                            "Failed to remove drained steering entries"
-                        );
-                        format!("Failed to remove drained steering entries: {error}")
-                    })?;
+                let mut attempt = 1_u32;
+                loop {
+                    match self
+                        .storage
+                        .remove_steering_entries(&self.context.conversation_id, &message_ids)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                conversation_id = %self.context.conversation_id,
+                                message_ids = ?message_ids,
+                                attempt,
+                                %error,
+                                "Failed to remove drained steering entries; retrying before LLM dispatch"
+                            );
+                            attempt = attempt.saturating_add(1);
+                            tokio::time::sleep(STEERING_REMOVAL_RETRY_DELAY).await;
+                        }
+                    }
+                }
                 tracing::info!(
                     conversation_id = %self.context.conversation_id,
                     message_ids = ?message_ids,
+                    attempts = attempt,
                     "Removed drained steering entries"
                 );
                 Ok(None)
@@ -12750,24 +12761,22 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
-    async fn failed_steering_removal_aborts_before_llm_dispatch() {
+    async fn failed_steering_removal_retries_before_llm_dispatch() {
         let queue = vec![mk_entry("s1", "must not dispatch yet")];
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-failure",
             ConvState::LlmRequesting { attempt: 1 },
             queue,
         );
-        storage.set_fail_steering_removal(true);
+        storage.set_steering_removal_failures(1);
 
-        let error = rt
-            .apply_transition_result(TransitionResult::new(ConvState::Idle))
+        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
             .await
-            .expect_err("durable queue removal failure must abort the drain");
+            .expect("transient durable queue removal failure must recover");
 
-        assert!(error.contains("injected steering removal failure"));
         assert!(
-            rt.llm_client.recorded_requests().is_empty(),
-            "RequestLlm must remain deferred when queue removal fails"
+            rt.llm_task_handle.is_some(),
+            "RequestLlm must dispatch only after queue removal recovers"
         );
     }
 

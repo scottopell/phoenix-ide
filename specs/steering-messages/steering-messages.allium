@@ -224,13 +224,11 @@ rule DrainOnIdleEntry {
         -- Crash recovery: ClearSteeringQueueEntries removes ONLY the drained
         -- message_ids (not the whole queue), so a concurrent enqueue during
         -- the drain window is preserved. It runs AFTER persist effects, so a
-        -- crash mid-drain leaves the drained entries in the DB queue. On
-        -- restart the queue reloads; the next drain hook re-fires
-        -- SteerDrainedUserMessages with the same entries; Effect::PersistMessage
-        -- skips already-persisted entries via a storage.message_exists()
-        -- precheck gated by an idempotent: bool flag (so non-replayable
-        -- persists pay no extra DB query). At-least-once delivery without
-        -- double-insertion.
+        -- crash mid-drain can leave drained rows in the DB queue. Runtime
+        -- startup removes queued rows whose message_id is already materialized
+        -- in the transcript before loading the pending queue. Unmaterialized
+        -- rows remain queued; materialized rows are continued from transcript
+        -- without being inserted or delivered twice.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
@@ -307,12 +305,11 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         --
         -- ClearSteeringQueueEntries removes only the drained ids (not the whole
         -- queue), so a concurrent enqueue during the drain window is preserved.
-        -- Removal failure aborts the inline effect sequence before RequestLlm;
-        -- it is never logged as success while delivery continues.
-        -- Crash recovery: queue updated AFTER persist effects, so a crash
-        -- mid-drain reloads the drained entries on restart; idempotent
-        -- PersistMessage (gated by idempotent: bool, via storage.message_exists)
-        -- prevents double-insertion on re-drain.
+        -- Removal failure keeps the inline effect sequence in a retry loop;
+        -- RequestLlm remains deferred until durable removal succeeds.
+        -- Crash recovery reconciles queue rows against materialized transcript
+        -- ids before runtime publication, removing completed drain remnants
+        -- while retaining entries whose messages were never persisted.
 }
 
 -- REQ-STEER-003
