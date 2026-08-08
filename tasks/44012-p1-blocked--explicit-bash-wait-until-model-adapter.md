@@ -24,6 +24,10 @@ An agent starts a long Bash command, explicitly registers one tagged `wait_until
 
 ## Stop gate
 
+**Triggered during implementation investigation.** The authority foundation has no production observation/delivery/admission executor. Current production execution still uses the legacy `workflow::wake::WakeRepository`, `wake_profile`, and `runtime::wake::WakeWorker`. A correct Bash adapter would therefore require a coordinated replacement across `phoenix-tools`, `phoenix-db`, runtime execution, and conversation admission before one journey can run. Building that generic runtime here would violate this task's complexity budget and create the second-authority risk the foundation forbids.
+
+No adapter code was added. Resume only with a separately reviewed, bounded plan that shows how the existing durable-workflow executor can run the foundation effects without introducing a new wake worker or generic provider framework.
+
 Pause this adapter if it requires a second wake authority, a generic provider framework, broad UI, combinators, or unrelated ownership-transfer work. Do not start TmuxWindow until this PR is understandable and green.
 
 ## Out of scope
