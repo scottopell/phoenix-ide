@@ -133,13 +133,6 @@ struct ConnectionStateBar: View {
     let session: ConversationSession
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
-            content(at: context.date)
-        }
-    }
-
-    @ViewBuilder
-    private func content(at now: Date) -> some View {
         switch session.connection {
         case .live, .idle:
             EmptyView()
@@ -160,7 +153,6 @@ struct ConnectionStateBar: View {
             .padding(.vertical, 3)
             .background(.thinMaterial)
     }
-
 }
 
 /// In-flight LLM text from token events.
