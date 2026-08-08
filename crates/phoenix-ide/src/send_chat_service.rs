@@ -165,6 +165,28 @@ impl SendChatApplicationService {
             return Ok(SendChatOutcome::QueuedAsSteering);
         }
 
+        // The pre-lock lookup is only a fast path. A concurrent request with
+        // this client identity may commit while this request waits for the
+        // per-conversation admission gate, so durable replay must be checked
+        // again after acquiring the gate and before choosing direct vs queue.
+        match lookup_durable_replay(&self.db, &req, &submitted).await? {
+            DurableReplayOutcome::Missing => {}
+            DurableReplayOutcome::ExactMaterialized => {
+                return Ok(SendChatOutcome::AlreadyPersisted);
+            }
+            DurableReplayOutcome::ExactUnmaterializedTerminal => {
+                return Ok(SendChatOutcome::Rejected {
+                    message: "The accepted message was cancelled or failed before delivery."
+                        .to_string(),
+                    code: "turn_terminal",
+                });
+            }
+            DurableReplayOutcome::ExactUnmaterializedLive => {
+                self.runtime.kick_direct_turn_worker();
+                return Ok(SendChatOutcome::Delivered);
+            }
+        }
+
         let effective_state = self
             .effective_state(&conversation.id, &conversation.state)
             .await?;
@@ -180,26 +202,6 @@ impl SendChatApplicationService {
 
         let validated_files = validate_files(&req).await?;
         let expanded = expand_request(&self.db, &conversation, &req).await?;
-        if should_enqueue_steering(&acceptability) {
-            match lookup_durable_replay(&self.db, &req, &submitted).await? {
-                DurableReplayOutcome::Missing => {}
-                DurableReplayOutcome::ExactMaterialized => {
-                    return Ok(SendChatOutcome::AlreadyPersisted);
-                }
-                DurableReplayOutcome::ExactUnmaterializedTerminal => {
-                    return Ok(SendChatOutcome::Rejected {
-                        message: "The accepted message was cancelled or failed before delivery."
-                            .to_string(),
-                        code: "turn_terminal",
-                    });
-                }
-                DurableReplayOutcome::ExactUnmaterializedLive => {
-                    self.runtime.kick_direct_turn_worker();
-                    return Ok(SendChatOutcome::Delivered);
-                }
-            }
-        }
-
         let acceptance_state = self
             .effective_state(&conversation.id, &conversation.state)
             .await?;

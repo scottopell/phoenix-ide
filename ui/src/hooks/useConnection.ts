@@ -199,6 +199,7 @@ function transformInitData(raw: SseInitData): InitPayload {
       used: raw.context_window_size ?? 0,
     },
     transcriptGeneration: raw.transcript_generation,
+    streamIncarnation: raw.stream_incarnation,
     lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,

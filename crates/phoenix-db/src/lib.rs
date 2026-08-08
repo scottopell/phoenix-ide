@@ -5206,6 +5206,73 @@ impl Database {
         Ok(())
     }
 
+    /// Append one steering entry atomically and return its committed zero-based
+    /// queue position. Existing rows are never rewritten, so a concurrent drain
+    /// cannot be resurrected by a stale read-modify-write snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or serialization error if the transaction cannot be
+    /// committed or its queue position cannot fit in `usize`.
+    pub async fn append_steering_entry(
+        &self,
+        id: &str,
+        entry: &phoenix_core::domain::sm_event::SteerEntry,
+    ) -> DbResult<usize> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        let (queue_position, ordinal): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) + 1
+             FROM steering_messages
+             WHERE conversation_id = ?1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        insert_steering_entry_tx(&mut tx, id, ordinal, entry).await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        usize::try_from(queue_position)
+            .map_err(|_| DbError::Serialization("steering queue position overflow".to_string()))
+    }
+
+    /// Remove one steering entry and report whether this call removed a row.
+    /// The boolean is the publication fence for cancellation SSE: an
+    /// idempotent retry succeeds but must not announce a second mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the delete transaction cannot be committed.
+    pub async fn remove_steering_entry(&self, id: &str, message_id: &str) -> DbResult<bool> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let removed = sqlx::query(
+            "DELETE FROM steering_messages WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if removed {
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     /// Remove the steering entries with the given `message_ids` from a
     /// conversation. A plain `DELETE` on `steering_messages` (cascading the
     /// grandchild attachment rows) — no read-modify-write window, so a
@@ -14110,6 +14177,58 @@ mod tests {
         // Replace-all with an empty queue clears everything.
         db.update_steering_queue("conv-s", &[]).await.unwrap();
         assert!(db.get_steering_queue("conv-s").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_append_returns_committed_fifo_position_without_resurrecting_drains() {
+        use phoenix_core::domain::sm_event::SteerEntry;
+
+        fn entry(message_id: &str) -> SteerEntry {
+            SteerEntry {
+                text: message_id.to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: message_id.to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            }
+        }
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-append", "append", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.append_steering_entry("conv-append", &entry("a"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.append_steering_entry("conv-append", &entry("b"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(db.remove_steering_entry("conv-append", "a").await.unwrap());
+        assert!(!db.remove_steering_entry("conv-append", "a").await.unwrap());
+        assert_eq!(
+            db.append_steering_entry("conv-append", &entry("c"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let queue = db.get_steering_queue("conv-append").await.unwrap();
+        assert_eq!(
+            queue
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
     }
 
     /// Regression for task 02679: messages must persist with the seq their

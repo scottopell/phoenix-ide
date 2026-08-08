@@ -203,7 +203,13 @@ class FakeEventSource {
   }
 }
 
-function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: unknown[] = [], conversation: unknown = baseConversation) {
+function emitInit(
+  source: FakeEventSource,
+  messages: Message[],
+  pendingEvents: unknown[] = [],
+  conversation: unknown = baseConversation,
+  replay: { anchor: number; tip: number } = { anchor: 100, tip: 100 },
+) {
   source.emit('init', {
     type: 'init',
     sequence_id: 100,
@@ -213,11 +219,12 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     messages,
     steering_messages: [],
     agent_working: false,
-    last_sequence_id: 100,
+    last_sequence_id: replay.tip,
+    stream_incarnation: 'test-stream',
     presentation_mode: 'idle',
     context_window_size: 0,
     project_name: null,
-    pending_anchor_sequence_id: 100,
+    pending_anchor_sequence_id: replay.anchor,
     pending_events: pendingEvents,
     pending_truncated: false,
   });
@@ -3119,7 +3126,7 @@ describe('SubAgentStatus inline activity', () => {
       type: 'message',
       sequence_id: pendingTool.sequence_id,
       message: pendingTool,
-    }]));
+    }], baseConversation, { anchor: 2, tip: 3 }));
 
     expect(await screen.findByText('bash')).toBeInTheDocument();
     expect(screen.getByText('cache')).toBeInTheDocument();

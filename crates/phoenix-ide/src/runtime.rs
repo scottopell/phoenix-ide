@@ -606,7 +606,7 @@ enum RingOp {
     /// `send_seq` and for eager (non-persisted) Message broadcasts.
     Append,
     /// Broadcast without consuming reconnect replay capacity. Used for
-    /// replaceable, non-authoritative progress snapshots.
+    /// replaceable progress and durable-state-subsumed live projections.
     BroadcastOnly,
 }
 
@@ -653,8 +653,8 @@ impl Drop for ReservedBroadcastRange {
 ///    closure so the caller cannot forget to insert it. These append to
 ///    the `ReplayRing` so a reconnect mid-turn can replay them.
 ///
-/// Live bash progress is the exception: it is replaceable UI state broadcast
-/// with the current sequence witness and is intentionally not replayed.
+/// Live bash progress and durable-state-subsumed projections are exceptions:
+/// they broadcast with the current sequence witness and are not replayed.
 ///
 /// 2. **Persisted `Message` events** already carry a `message.sequence_id`
 ///    allocated by `add_message` in the DB layer. Use
@@ -673,6 +673,9 @@ impl Drop for ReservedBroadcastRange {
 #[derive(Clone)]
 pub struct SseBroadcaster {
     tx: broadcast::Sender<SseEvent>,
+    /// Identity of this in-memory cursor/replay incarnation. Changes whenever
+    /// a new broadcaster is created after replay state was lost.
+    stream_incarnation: Arc<str>,
     /// Highest `sequence_id` emitted so far for this conversation.
     /// `next_seq()` returns `fetch_add(1)` + 1 atomically; `observe_seq(s)`
     /// bumps this value up to at least `s` so message-originated ids integrate
@@ -703,6 +706,7 @@ impl SseBroadcaster {
         ring.anchor_seq = initial_last_seq;
         Self {
             tx,
+            stream_incarnation: Arc::from(uuid::Uuid::new_v4().to_string()),
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
@@ -748,6 +752,10 @@ impl SseBroadcaster {
     #[allow(dead_code)]
     pub fn current_seq(&self) -> i64 {
         self.last_seq.load(Ordering::Acquire)
+    }
+
+    pub fn stream_incarnation(&self) -> &str {
+        &self.stream_incarnation
     }
 
     /// Subscribe to the SSE broadcast stream.
@@ -869,6 +877,16 @@ impl SseBroadcaster {
         let seq = self.next_seq();
         let event = build(seq);
         self.send_with_ring(event, seq, RingOp::Append)
+    }
+
+    /// Broadcast a durable-state-subsumed live projection at the current
+    /// sequence witness. It neither allocates a cursor position nor retains
+    /// its potentially large payload in the reconnect ring; authoritative init
+    /// reconstructs the represented state after a missed event.
+    pub fn send_live_projection(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let witnessed_seq = self.current_seq();
+        let event = build(witnessed_seq);
+        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a replaceable live-progress event without consuming the
@@ -1113,11 +1131,10 @@ impl InitTranscript {
 
 /// Events sent to SSE clients.
 ///
-/// Every variant carries a `sequence_id` drawn from the conversation's single
-/// monotonic counter (task 02675). The client's `applyIfNewer` guard relies on
-/// this total order to dedup reconnect replays. Allocation is the
-/// responsibility of [`SseBroadcaster`] — do not hand-craft `sequence_id`
-/// values at call sites.
+/// Replayable variants carry a `sequence_id` drawn from the conversation's
+/// monotonic counter. Live-only projections carry the current counter as an
+/// ordering witness without allocating a replay cursor. Stamping is the
+/// responsibility of [`SseBroadcaster`] — do not hand-craft values at call sites.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SseEvent {
@@ -1136,6 +1153,9 @@ pub enum SseEvent {
         /// client seeds `atom.lastSequenceId` with so subsequent
         /// `applyIfNewer` checks start at the right floor.
         last_sequence_id: i64,
+        /// Identity of the in-memory replay/cursor incarnation. A changed id
+        /// tells reconnecting clients to reset ephemeral sequence state.
+        stream_incarnation: String,
         /// Current context window usage in tokens
         context_window_size: u64,
         /// Human-readable project name derived from the repo root directory name.
@@ -1299,9 +1319,8 @@ pub enum SseEvent {
         active: bool,
     },
     /// Ephemeral bounded/rate-limited live output snapshot for one in-flight
-    /// bash tool call. Replayed from the conversation ring on reconnect, keyed
-    /// by `tool_use_id` so client tool widgets can attach without parsing tool
-    /// result messages.
+    /// bash tool call. Live-only and keyed by `tool_use_id` so client tool
+    /// widgets can attach without parsing tool result messages.
     BashToolProgress {
         sequence_id: i64,
         tool_use_id: String,
@@ -1309,14 +1328,16 @@ pub enum SseEvent {
     },
     /// A steering message was accepted and queued for delivery when the
     /// conversation next reaches `Idle`. The UI uses this to show the message
-    /// with a "Queued" indicator instead of "Sending...".
+    /// with a "Queued" indicator instead of "Sending...". Live-only; init
+    /// reconstructs the authoritative durable queue.
     SteerMessageQueued {
         sequence_id: i64,
         message: crate::state_machine::event::SteerEntry,
         /// Zero-based position in the steering queue.
         queue_position: usize,
     },
-    /// A queued steering message was cancelled before delivery.
+    /// A queued steering message was cancelled before delivery. Live-only;
+    /// init reconstructs the authoritative durable queue.
     SteerMessageCancelled {
         sequence_id: i64,
         message_id: String,
@@ -3409,13 +3430,10 @@ impl RuntimeManager {
         // losing, not-yet-spawned executor.
         {
             let mut runtimes = self.runtimes.write().await;
+            let mut reservations = self.evicted_broadcasters.write().await;
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
-                drop(runtimes);
-                self.evicted_broadcasters
-                    .write()
-                    .await
-                    .remove(conversation_id);
+                reservations.remove(conversation_id);
                 return Ok(existing);
             }
             runtimes.insert(
@@ -3429,16 +3447,10 @@ impl RuntimeManager {
                     state_rx,
                 },
             );
+            // The live handle and reservation hand-off change atomically under
+            // the same lock order used by `conversation_broadcaster`.
+            reservations.remove(conversation_id);
         }
-
-        // The live handle is now reachable, so remove the manager-owned
-        // reservation. Stream arrivals during materialization could find the
-        // reservation; arrivals after this point find the same broadcaster on
-        // the runtime handle.
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id);
 
         tokio::spawn(async move {
             runtime.run().await;
@@ -3503,7 +3515,12 @@ impl RuntimeManager {
     pub async fn evict_runtime(&self, conversation_id: &str, reason: EvictionReason) {
         let old = {
             let mut runtimes = self.runtimes.write().await;
-            runtimes.remove(conversation_id)
+            let mut reservations = self.evicted_broadcasters.write().await;
+            let old = runtimes.remove(conversation_id);
+            if let Some(handle) = &old {
+                reservations.insert(conversation_id.to_string(), handle.broadcast_tx.clone());
+            }
+            old
         };
 
         // Record the cause unconditionally (even if no runtime was live): the
@@ -3521,13 +3538,6 @@ impl RuntimeManager {
 
         if let Some(handle) = old {
             let receivers = handle.broadcast_tx.receiver_count();
-            // Preserve broadcaster for the incoming runtime. The new runtime
-            // inherits it in get_or_create so SSE clients stay connected.
-            self.evicted_broadcasters
-                .write()
-                .await
-                .insert(conversation_id.to_string(), handle.broadcast_tx);
-
             // Signal old runtime to exit cleanly. It drops its broadcaster
             // clone on exit, completing the reference hand-off.
             let _ = handle.event_tx.send(Event::Shutdown).await;
@@ -3654,28 +3664,24 @@ impl RuntimeManager {
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),
         };
-        let db = self.db();
-        let mut queue = db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| format!("Failed to load steering queue for enqueue: {e}"))?;
-        queue.push(new_entry);
-        db.update_steering_queue(conversation_id, &queue)
+        let queue_position = self
+            .db()
+            .append_steering_entry(conversation_id, &new_entry)
             .await
             .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
-        let queue_position = queue.len() - 1;
-        let persisted_entry = queue[queue_position].clone();
-        let _ = handle
-            .broadcast_tx
-            .send_seq(|sequence_id| SseEvent::SteerMessageQueued {
-                sequence_id,
-                message: persisted_entry,
-                queue_position,
-            });
+        let persisted_entry = new_entry;
+        let _ =
+            handle
+                .broadcast_tx
+                .send_live_projection(|sequence_id| SseEvent::SteerMessageQueued {
+                    sequence_id,
+                    message: persisted_entry,
+                    queue_position,
+                });
         tracing::info!(
             conversation_id,
             message_id,
-            queue_depth = queue.len(),
+            queue_depth = queue_position + 1,
             "Persisted steering message before executor delivery"
         );
 
@@ -3755,24 +3761,22 @@ impl RuntimeManager {
         if let Some(handle) = self.try_get_handle(conversation_id).await {
             return handle.broadcast_tx;
         }
-        if let Some(broadcaster) = self
-            .evicted_broadcasters
-            .read()
-            .await
-            .get(conversation_id)
-            .cloned()
-        {
-            return broadcaster;
-        }
         let initial_last_seq = self
             .db
             .get_last_sequence_id(conversation_id)
             .await
             .unwrap_or(0);
         let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
-        self.evicted_broadcasters
-            .write()
-            .await
+        // Keep the live-handle check and reservation insertion atomic with
+        // runtime publication. Otherwise a caller can reserve a new orphan
+        // channel in the narrow gap between handle publication and reservation
+        // cleanup, stranding a cross-client event on the wrong broadcaster.
+        let runtimes = self.runtimes.read().await;
+        if let Some(handle) = runtimes.get(conversation_id) {
+            return handle.broadcast_tx.clone();
+        }
+        let mut reservations = self.evicted_broadcasters.write().await;
+        reservations
             .entry(conversation_id.to_string())
             .or_insert(candidate)
             .clone()
@@ -4376,6 +4380,40 @@ mod broadcaster_tests {
             b.current_seq(),
             1,
             "replaceable progress must not create replay gaps"
+        );
+    }
+
+    #[test]
+    fn durable_live_projection_broadcasts_without_sequence_or_replay_entry() {
+        let b = SseBroadcaster::new(16, 7);
+        let mut rx = b.subscribe();
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "queued".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "steer-1".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+
+        let _ = b.send_live_projection(|sequence_id| SseEvent::SteerMessageQueued {
+            sequence_id,
+            message: entry,
+            queue_position: 0,
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SseEvent::SteerMessageQueued { sequence_id: 7, .. })
+        ));
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
+        assert_eq!((anchor, truncated, highest), (7, false, 7));
+        assert!(events.is_empty());
+        assert_eq!(
+            b.current_seq(),
+            7,
+            "live projection must not create a replay gap"
         );
     }
 

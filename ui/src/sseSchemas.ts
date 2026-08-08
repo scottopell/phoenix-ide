@@ -189,6 +189,7 @@ export const SseInitDataSchema = v.looseObject({
   steering_messages: v.array(QueuedSteeringMessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),
+  stream_incarnation: v.string(),
   presentation_mode: v.string(),
   context_window_size: v.number(),
   project_name: v.nullable(v.string()),

@@ -85,6 +85,8 @@ export interface ConversationAtom {
   steeringMessages: QueuedSteeringMessage[];
   contextWindow: { used: number };
   systemPrompt: string | null;
+  /** Identity of the server-side in-memory sequence/replay incarnation. */
+  streamIncarnation: string | null;
   lastAppliedEventSeq: number;
   bufferedEventEnvelopes: Record<number, SSEAction>;
   eventGap: EventGap | null;
@@ -182,6 +184,7 @@ export interface InitPayload {
   phase: ConversationState;
   contextWindow: { used: number };
   transcriptGeneration: number;
+  streamIncarnation: string;
   /** Legacy wire `last_sequence_id` converted at the UI boundary. This is an
    *  event-sequence cursor, not transcript message availability. */
   lastAppliedEventSeq: number;
@@ -407,6 +410,7 @@ export function createInitialAtom(): ConversationAtom {
     steeringMessages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
+    streamIncarnation: null,
     lastAppliedEventSeq: 0,
     bufferedEventEnvelopes: {},
     eventGap: null,
@@ -868,6 +872,16 @@ function applyContiguousWireAction(
     if (sequenceId < atom.lastAppliedEventSeq) return atom;
     return applyWireActionBody(atom, action as SSEAction);
   }
+  if (
+    action.type === 'sse_steer_message_queued'
+    || action.type === 'sse_steer_message_cancelled'
+  ) {
+    // Steering mutations are live projections of the durable queue. Their
+    // sequence_id is a current-stream witness, not a newly allocated cursor;
+    // init replaces the projection after reconnect or a missed event.
+    if (sequenceId < atom.lastAppliedEventSeq) return atom;
+    return applyWireActionBody(atom, action as SSEAction);
+  }
   const mutatesOnlyIfConversationPresent = action.type === 'sse_browser_session_state';
   if (mutatesOnlyIfConversationPresent && !atom.conversation) {
     return atom;
@@ -1250,6 +1264,12 @@ export function conversationReducer(
       const isFreshConnect = !ownsIncomingTranscript
         || atom.lastAppliedEventSeq === 0
         || generationChanged;
+      // Ephemeral sequence positions disappear with the in-memory replay ring
+      // on server restart. A lower authoritative init watermark therefore
+      // starts a new cursor incarnation even when transcript generation is
+      // unchanged; retaining the old floor would drop every new live event.
+      const streamIncarnationChanged = atom.streamIncarnation !== null
+        && atom.streamIncarnation !== p.streamIncarnation;
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
       const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
       const nextTranscriptCoverage = transcriptCoverageAfterInit(atom, p);
@@ -1271,7 +1291,9 @@ export function conversationReducer(
         0,
       );
       const phase1Floor = Math.max(
-        isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq,
+        isFreshConnect || streamIncarnationChanged
+          ? p.pendingAnchorSequenceId
+          : atom.lastAppliedEventSeq,
         snapshotMessageAnchor,
       );
       const initPhaseAuthoritySeq = Math.max(phase1Floor, p.lastAppliedEventSeq);
@@ -1291,7 +1313,10 @@ export function conversationReducer(
       // disconnected and we clear. See SseInitReconnectMerge in
       // specs/conversation_atom/conversation_atom.allium.
       const phase1StreamingBuffer =
-        !isFreshConnect && p.phase.type === 'llm_requesting' && !p.pendingTruncated
+        !isFreshConnect
+        && !streamIncarnationChanged
+        && p.phase.type === 'llm_requesting'
+        && !p.pendingTruncated
           ? atom.streamingBuffer
           : null;
       let next: ConversationAtom = {
@@ -1302,6 +1327,7 @@ export function conversationReducer(
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
         conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
+        streamIncarnation: p.streamIncarnation,
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
         eventGap: null,

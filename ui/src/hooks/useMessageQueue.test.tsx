@@ -27,8 +27,8 @@ describe('deriveDisplayedPendingMessages', () => {
 
     expect(displayed.map((message) => [message.localId, message.text])).toEqual([
       ['same-id', 'server copy'],
-      ['local-only', 'waiting locally'],
       ['external-id', 'from coordinator'],
+      ['local-only', 'waiting locally'],
     ]);
   });
 
@@ -47,6 +47,32 @@ describe('deriveDisplayedPendingMessages', () => {
       ['direct-a', 'text-direct-a'],
       ['steer-b', 'authoritative B'],
     ]);
+  });
+
+  it('keeps a later local send behind the durable steering FIFO', () => {
+    const laterLocal = queued('local-b', { status: 'pending', timestamp: 2 });
+
+    const displayed = deriveDisplayedPendingMessages([laterLocal], [{
+      message_id: 'server-a',
+      text: 'authoritative A',
+      images: [],
+      files: [],
+    }], false);
+
+    expect(displayed.map((message) => message.localId)).toEqual(['server-a', 'local-b']);
+  });
+
+  it('uses authoritative queue order for matching local copies', () => {
+    const localA = queued('server-a', { status: 'steering_queued' });
+    const localB = queued('server-b', { status: 'steering_queued' });
+
+    const displayed = deriveDisplayedPendingMessages([localB, localA], [{
+      message_id: 'server-a', text: 'A', images: [], files: [],
+    }, {
+      message_id: 'server-b', text: 'B', images: [], files: [],
+    }], false);
+
+    expect(displayed.map((message) => message.localId)).toEqual(['server-a', 'server-b']);
   });
 
   it('does not render queued input for an archived conversation', () => {

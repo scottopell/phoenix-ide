@@ -3963,6 +3963,7 @@ async fn stream_conversation(
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
+        stream_incarnation: broadcast_tx.stream_incarnation().to_string(),
         context_window_size,
         project_name,
         pending_anchor_sequence_id,
@@ -4495,35 +4496,41 @@ async fn cancel_steering_message(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // Delete the entry directly (cascading its attachments); a missing entry is
-    // a no-op, matching the idempotent contract.
-    state
+    // Serialize removal and publication with queue admission. This preserves
+    // one durable mutation order and prevents a cancel event from overtaking
+    // an append event for the same conversation.
+    let _acceptance_guard = state.runtime.lock_message_acceptance(&id).await;
+
+    // Delete the entry directly (cascading its attachments). Idempotent retries
+    // return success but do not publish a second cancellation projection.
+    let removed = state
         .runtime
         .db()
-        .remove_steering_entries(&id, std::slice::from_ref(&message_id))
+        .remove_steering_entry(&id, &message_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let broadcaster = state.runtime.conversation_broadcaster(&id).await;
-    let cancelled_message_id = message_id.clone();
-    let _ = broadcaster.send_seq(|sequence_id| SseEvent::SteerMessageCancelled {
-        sequence_id,
-        message_id: cancelled_message_id,
-    });
+    if removed {
+        let broadcaster = state.runtime.conversation_broadcaster(&id).await;
+        let cancelled_message_id = message_id.clone();
+        let _ = broadcaster.send_live_projection(|sequence_id| SseEvent::SteerMessageCancelled {
+            sequence_id,
+            message_id: cancelled_message_id,
+        });
 
-    // Notify the live executor (if running) to remove the entry from its
-    // in-memory queue. DB is already updated above, so the executor write
-    // in its SteerMessage handler is a no-op if the executor restarts.
-    if let Some(handle) = state.runtime.try_get_handle(&id).await {
-        let _ = handle
-            .event_tx
-            .send(Event::CancelSteerMessage {
-                message_id: message_id.clone(),
-            })
-            .await;
+        // DB is already authoritative; notify a live executor to remove its
+        // in-memory projection after every connected client has the same delta.
+        if let Some(handle) = state.runtime.try_get_handle(&id).await {
+            let _ = handle
+                .event_tx
+                .send(Event::CancelSteerMessage {
+                    message_id: message_id.clone(),
+                })
+                .await;
+        }
     }
 
-    tracing::info!(conv_id = %id, %message_id, "Steering message cancelled");
+    tracing::info!(conv_id = %id, %message_id, removed, "Steering cancellation settled");
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -5512,14 +5519,14 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
         let conv_id = id.to_string();
         let _ = handle
             .broadcast_tx
-            .send_seq(|seq| SseEvent::ConversationHardDeleted {
+            .send_live_projection(|seq| SseEvent::ConversationHardDeleted {
                 sequence_id: seq,
                 conversation_id: conv_id,
             });
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
         let conv_id = id.to_string();
-        let _ = tx.send_seq(|seq| SseEvent::ConversationHardDeleted {
+        let _ = tx.send_live_projection(|seq| SseEvent::ConversationHardDeleted {
             sequence_id: seq,
             conversation_id: conv_id,
         });
@@ -7789,6 +7796,7 @@ async fn shared_sse_stream(
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
+        stream_incarnation: broadcast_tx.stream_incarnation().to_string(),
         context_window_size,
         project_name,
         pending_anchor_sequence_id,
@@ -14693,6 +14701,155 @@ mod chat_authority_tests {
             .expect("durable queue");
         assert_eq!(durable_queue.len(), 1, "broadcast follows durable append");
         assert_eq!(durable_queue[0].message_id, message.message_id);
+    }
+
+    #[tokio::test]
+    async fn cancellation_commits_before_broadcast_and_reaches_every_live_client_once() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-cancel", "cancel", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .runtime
+            .inject_handle_for_test("c-cancel", ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let mut first = state
+            .runtime
+            .subscribe("c-cancel")
+            .await
+            .expect("first client");
+        let mut second = state
+            .runtime
+            .subscribe("c-cancel")
+            .await
+            .expect("second client");
+        let message_id = uuid::Uuid::new_v4().to_string();
+
+        let result = send_chat(
+            State(state.clone()),
+            Path("c-cancel".to_string()),
+            Json(ChatRequest {
+                text: "cancel me".to_string(),
+                message_id: message_id.clone(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+            }),
+        )
+        .await
+        .expect("enqueue");
+        assert!(result.0.steering);
+        for receiver in [&mut first, &mut second] {
+            assert!(matches!(
+                receiver.recv().await.expect("queued event"),
+                SseEvent::SteerMessageQueued { .. }
+            ));
+        }
+
+        let _ = cancel_steering_message(
+            State(state.clone()),
+            Path(("c-cancel".to_string(), message_id.clone())),
+        )
+        .await
+        .expect("cancel");
+
+        assert!(state
+            .db
+            .get_steering_queue("c-cancel")
+            .await
+            .expect("durable queue after cancel")
+            .is_empty());
+        for receiver in [&mut first, &mut second] {
+            assert!(matches!(
+                receiver.recv().await.expect("cancelled event"),
+                SseEvent::SteerMessageCancelled { message_id: ref cancelled, .. }
+                    if cancelled == &message_id
+            ));
+        }
+
+        let _ = cancel_steering_message(State(state), Path(("c-cancel".to_string(), message_id)))
+            .await
+            .expect("idempotent retry");
+        if let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(25), first.recv()).await
+        {
+            panic!("idempotent retry published an unexpected event: {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_steering_admissions_publish_committed_fifo_positions() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-order", "order", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .runtime
+            .inject_handle_for_test("c-order", ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let mut events = state.runtime.subscribe("c-order").await.expect("client");
+
+        let send = |message_id: &'static str, text: &'static str| {
+            send_chat(
+                State(state.clone()),
+                Path("c-order".to_string()),
+                Json(ChatRequest {
+                    text: text.to_string(),
+                    message_id: message_id.to_string(),
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    user_agent: None,
+                }),
+            )
+        };
+        let (first_result, second_result) =
+            tokio::join!(send("order-a", "A"), send("order-b", "B"));
+        assert!(first_result.expect("first admission").0.steering);
+        assert!(second_result.expect("second admission").0.steering);
+
+        let mut published = Vec::new();
+        for _ in 0..2 {
+            let SseEvent::SteerMessageQueued {
+                message,
+                queue_position,
+                ..
+            } = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("queued event timeout")
+                .expect("queued event")
+            else {
+                panic!("expected queued event");
+            };
+            published.push((queue_position, message.message_id));
+        }
+        published.sort_by_key(|(position, _)| *position);
+
+        let durable = state
+            .db
+            .get_steering_queue("c-order")
+            .await
+            .expect("durable queue");
+        assert_eq!(
+            published
+                .iter()
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            published
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>(),
+            durable
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }
 

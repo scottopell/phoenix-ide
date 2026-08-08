@@ -78,6 +78,7 @@ function makeConnectionInit(conversation: Conversation): InitPayload {
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
+    streamIncarnation: 'test-stream',
     lastAppliedEventSeq: 0,
     pendingAnchorSequenceId: 0,
     pendingEvents: [],

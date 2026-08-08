@@ -36,11 +36,9 @@
 --           The queued-message derivation in useMessageQueue (see
 --           user_message_queue spec, if written).
 --
--- Rationale: this reducer is the nexus of SSE-state fragility. Past bugs
--- (02673, 02675, 02676, ongoing "streaming-finalizes-then-disappears")
--- were all invariant violations of the atomic-triple or phase-coupling
--- rules below. Naming them here makes the next violation diagnosable by
--- construction instead of by refresh-and-hope.
+-- Rationale: this reducer is the nexus of SSE-state fragility. The
+-- atomic-triple and phase-coupling rules make stream reconstruction
+-- failures diagnosable by construction instead of by refresh-and-hope.
 --
 -- Self-contained: this spec does not `use` any other spec. External
 -- types (Phase, Message content, Conversation metadata) are declared
@@ -122,6 +120,7 @@ entity ConversationAtom {
     steeringMessages: List<SteeringMessage>
     transcriptGeneration: Integer?
     transcriptCoverage: TranscriptCoverage
+    streamIncarnation: String?
     lastSequenceId: Integer
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
@@ -164,6 +163,50 @@ enum TranscriptCoverage { complete | tail }
 actor ClientReducer {
     identified_by: ConversationAtom
 }
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+-- Allium has no formal helper declarations. This block defines every
+-- bare helper identifier used by the reducer rules.
+--
+--   apply_pending_in_order(atom, events) -> ConversationAtom
+--       Fold events through their ordinary reducers in list order.
+--   reconcile_transcript(existing, incoming, coverage,
+--                        localGeneration, incomingGeneration) -> List<Message>
+--       Preserve, merge by identity, or replace as detailed by init guidance;
+--       return sequence order.
+--   coverage_after_init(localCoverage, incomingCoverage,
+--                       localGeneration, incomingGeneration) -> TranscriptCoverage
+--       Preserve local coverage only for a generation-matched preserve init;
+--       otherwise adopt the incoming complete/tail coverage.
+--   preserve_buffer_after_init(buffer, phase, pendingTruncated,
+--                              localIncarnation, serverIncarnation)
+--                              -> StreamingBuffer?
+--       Preserve only an untruncated in-flight buffer from the same stream
+--       incarnation; otherwise clear it.
+--   reconnect_cursor_floor(local, localIncarnation, serverIncarnation,
+--                          anchor) -> Integer
+--       Return anchor when a known local incarnation changed; otherwise local.
+--   without_delivered(steering, messages) -> List<SteeringMessage>
+--       Remove queued identities already materialized in the transcript.
+--   message_in_list(messages, messageId) -> Boolean
+--       True iff messages contains messageId.
+--   append(messages, message) -> List<Message>
+--       Append message at the tail.
+--   replace_message(messages, messageId) -> List<Message>
+--       Replace the matching message with the update payload supplied by the
+--       calling rule and preserve all other entries.
+--   accumulate_token(buffer, delta, seq) -> StreamingBuffer
+--       Create or extend the buffer with delta and record seq.
+--   upsert_by_id(steering, message) -> List<SteeringMessage>
+--       Replace a matching steering identity in place, or append it.
+--   remove_by_id(steering, messageId) -> List<SteeringMessage>
+--       Remove every matching steering identity.
+--   upsert_boundary(boundaries, boundary) -> List<ContinuationBoundary>
+--       Replace a matching boundary identity in place, or append it.
+--   max_int(left, right) -> Integer
+--       Return the greater integer.
 
 ------------------------------------------------------------
 -- Rules — wire-originated transitions
@@ -237,6 +280,7 @@ rule SseInitFreshConnect {
     ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, payload.messages)
     ensures: atom.phase = payload.phase
+    ensures: atom.streamIncarnation = payload.stream_incarnation
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
     ensures: atom.uiError = null
@@ -308,23 +352,44 @@ rule SseInitReconnectMerge {
     ensures: atom.productLifecycle = payload.product_conversation_lifecycle
     ensures: atom.steeringMessages = without_delivered(payload.steering_messages, atom.messages)
     ensures: atom.phase = payload.phase
-    ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
+    ensures: atom.streamingBuffer = preserve_buffer_after_init(
+                 atom.streamingBuffer,
+                 payload.phase,
+                 payload.pending_truncated,
+                 atom.streamIncarnation,
+                 payload.stream_incarnation)
     ensures: atom.uiError = null
+
+    -- A changed server incarnation proves the in-memory replay ring restarted.
+    -- Reset to its durable anchor so new-incarnation live events are accepted;
+    -- otherwise preserve the already-observed reconnect floor.
+    ensures: atom.streamIncarnation = payload.stream_incarnation
+    ensures: atom.lastSequenceId = reconnect_cursor_floor(
+                 atom.lastSequenceId,
+                 atom.streamIncarnation,
+                 payload.stream_incarnation,
+                 payload.pending_anchor_sequence_id)
 
     -- Phase 2: apply pending events. Per-event applyIfNewer naturally
     -- filters entries with seq <= atom.lastSequenceId. Each accepted
     -- entry advances the floor.
     ensures: atom = apply_pending_in_order(atom, payload.pending_events)
 
-    -- Phase 3: safety belt — never regress lastSequenceId, but also
-    -- never let it stay below the server's witnessed tip if the
-    -- replay couldn't bring it there.
+    -- Phase 3: safety belt. Within one server incarnation the cursor does not
+    -- regress. A lower init watermark is the explicit restart boundary above.
     ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
 
     @guidance
-        -- preserve_buffer_when_streaming(buf, phase, pendingTruncated):
+        -- preserve_buffer_after_init(buf, phase, pendingTruncated, localIncarnation, serverIncarnation):
         --   if phase.type = llm_requesting and not pendingTruncated
+        --      and serverIncarnation = localIncarnation
         --     then buf else null
+        -- reconnect_cursor_floor(local, localIncarnation, serverIncarnation, anchor):
+        --   if localIncarnation != null and serverIncarnation != localIncarnation
+        --     then anchor else local
+        -- A server restart discards ephemeral replay positions while durable
+        -- transcript sequence anchors remain. The explicit incarnation changes
+        -- exactly when that in-memory cursor/replay state is replaced.
         -- Rationale: on reconnect the atom may already hold a live
         -- streamingBuffer from tokens this connection has accepted.
         -- Clearing it unconditionally creates a blank-UI window because
@@ -557,19 +622,27 @@ rule SseConversationUpdateApplied {
 rule SseSteerMessageQueuedApplied {
     when: SseSteerMessageQueuedDispatched(atom, message, seq)
 
-    requires: seq > atom.lastSequenceId
+    requires: seq >= atom.lastSequenceId
 
     ensures: atom.steeringMessages = upsert_by_id(atom.steeringMessages, message)
-    ensures: atom.lastSequenceId = seq
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- This is a live-only projection of the durable queue. The seq is the
+        -- current stream watermark witness, not a newly allocated cursor.
+        -- A missed event is recovered by the next authoritative init snapshot.
 }
 
 rule SseSteerMessageCancelledApplied {
     when: SseSteerMessageCancelledDispatched(atom, messageId, seq)
 
-    requires: seq > atom.lastSequenceId
+    requires: seq >= atom.lastSequenceId
 
     ensures: atom.steeringMessages = remove_by_id(atom.steeringMessages, messageId)
-    ensures: atom.lastSequenceId = seq
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- Live-only durable projection; reconnect/init replaces the queue.
 }
 
 rule LocalSteerMessageCancelledApplied {

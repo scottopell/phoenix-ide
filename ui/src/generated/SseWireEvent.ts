@@ -40,7 +40,7 @@ messages: Array<unknown>,
 /**
  * Durable server-authoritative steering queue at snapshot time.
  */
-steering_messages: Array<QueuedSteeringMessage>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, 
+steering_messages: Array<QueuedSteeringMessage>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, stream_incarnation: string, context_window_size: number, project_name: string | null, transcript_generation: number, 
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has

@@ -123,6 +123,7 @@ describe('parseEvent', () => {
       steering_messages: [],
       agent_working: false,
       last_sequence_id: 0,
+      stream_incarnation: 'test-stream',
       presentation_mode: 'idle',
       context_window_size: 0,
       project_name: null,

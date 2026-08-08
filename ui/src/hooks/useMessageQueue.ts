@@ -68,19 +68,17 @@ export function derivePendingMessages(
 }
 
 /** Merge local optimistic bubbles with the authoritative server queue.
- * Server ownership wins by message id, while the matching authoritative copy
- * keeps the local admission position so a later steer cannot jump ahead of an
- * earlier accepted direct send. Server-only entries retain their FIFO order. */
+ * Accepted direct turns precede the steering queue; authoritative steering
+ * entries keep durable FIFO order; not-yet-accepted local sends follow them. */
 export function deriveDisplayedPendingMessages(
   localPendingMessages: PendingUserMessage[],
   steeringMessages: QueuedSteeringMessage[],
   conversationArchived: boolean,
 ): PendingUserMessage[] {
   if (conversationArchived) return [];
-  const authoritativeById = new Map(
-    steeringMessages.map((message) => [message.message_id, message]),
+  const authoritativeIds = new Set(
+    steeringMessages.map((message) => message.message_id),
   );
-  const localIds = new Set(localPendingMessages.map((message) => message.localId));
   const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
     localId: message.message_id,
     text: message.text,
@@ -88,14 +86,13 @@ export function deriveDisplayedPendingMessages(
     files: message.files,
     status: 'steering_queued',
   });
+  const unmatchedLocal = localPendingMessages.filter(
+    (message) => !authoritativeIds.has(message.localId),
+  );
   return [
-    ...localPendingMessages.map((message) => {
-      const authoritative = authoritativeById.get(message.localId);
-      return authoritative ? renderAuthoritative(authoritative) : message;
-    }),
-    ...steeringMessages
-      .filter((message) => !localIds.has(message.message_id))
-      .map(renderAuthoritative),
+    ...unmatchedLocal.filter((message) => message.status === 'accepted'),
+    ...steeringMessages.map(renderAuthoritative),
+    ...unmatchedLocal.filter((message) => message.status !== 'accepted'),
   ];
 }
 

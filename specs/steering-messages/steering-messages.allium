@@ -162,12 +162,12 @@ rule EnqueueSteeringMessage {
         -- the expanded content is stored in llm_text. If expansion fails, the
         -- message is still enqueued with llm_text absent.
         --
-        -- Persistence order (P1): enqueue_steer_message() reads the current queue
-        -- from DB, appends the new SteerEntry, and writes the updated queue to DB
-        -- *before* sending Event::SteerMessage to the executor channel. The HTTP
-        -- response is returned only after the DB write succeeds. This guarantees
-        -- that a crash between acceptance and executor processing does not lose
-        -- the entry.
+        -- Persistence order: Database::append_steering_entry inserts only the
+        -- new row and returns its committed zero-based FIFO position. Existing
+        -- rows are never rewritten, so a concurrent drain cannot be resurrected
+        -- from a stale queue snapshot. Only after commit does the runtime publish
+        -- SteerMessageQueued and deliver Event::SteerMessage to the executor.
+        -- A failed append publishes no success event and no HTTP success.
 }
 
 -- REQ-STEER-002
@@ -315,30 +315,36 @@ rule DrainOnEnteringLlmRoundFromToolRound {
 
 -- REQ-STEER-003
 -- A queued steering entry can be cancelled before it is drained.
--- Cancellation by message_id is idempotent: if the entry is already gone
--- (drained or never existed), the operation succeeds silently.
-rule CancelSteeringMessage {
+-- Cancellation of an existing entry commits before its live projection.
+rule CancelExistingSteeringMessage {
     when: UserCancelsSteeringMessage(conversation, message_id)
     for q in SteeringQueue where q.conversation = conversation:
+        requires: q.entries.any(e => e.message_id = message_id)
         ensures: not q.entries.any(e => e.message_id = message_id)
         ensures: SteerMessageCancelledEmitted(conversation, message_id)
 
     @guidance
-        -- The HTTP response is 200 OK in all cases, including when no entry with
-        -- the given message_id exists in the queue. The caller cannot distinguish
-        -- a successful cancel from a cancel of an already-drained entry; this is
-        -- intentional: the postcondition "entry is not in queue" holds in both cases.
-        --
-        -- Cancel sequence (P2): the handler updates the DB first, then sends
-        -- Event::CancelSteerMessage{message_id} to the live executor (if one is
-        -- currently loaded) via try_get_handle(). The executor removes the matching
-        -- entry from its in-memory steering_queue without a further DB write.
-        -- If no executor is running, the DB update alone is sufficient: the next
-        -- executor to start loads the already-corrected queue from DB.
-        --
-        -- queue_position values reported in earlier SteerMessageQueuedEmitted
-        -- events are not retroactively adjusted after a cancel. Clients should
-        -- treat queue_position as an ordering hint at enqueue time, not a live index.
+        -- Database::remove_steering_entry returns true only when its committed
+        -- DELETE removed a row. That true result is the publication fence:
+        -- SteerMessageCancelled is sent live to every authorized client only
+        -- after commit, then the executor removes its in-memory projection.
+        -- If no executor is running, the DB mutation is sufficient: the next
+        -- executor loads the already-corrected queue from durable state.
+        -- Earlier queue_position values are not rewritten after cancellation;
+        -- clients treat them as enqueue-time ordering witnesses.
+}
+
+-- Cancellation is idempotent when the entry is already gone.
+rule CancelAbsentSteeringMessage {
+    when: UserCancelsSteeringMessage(conversation, message_id)
+    for q in SteeringQueue where q.conversation = conversation:
+        requires: not q.entries.any(e => e.message_id = message_id)
+        ensures: not q.entries.any(e => e.message_id = message_id)
+        ensures: not SteerMessageCancelledEmitted(conversation, message_id)
+
+    @guidance
+        -- HTTP returns 200 because the requested postcondition already holds.
+        -- No false cancellation event is published for an absent row.
 }
 
 -- REQ-STEER-004
@@ -410,7 +416,8 @@ surface SteeringQueueApi {
         -- When a message is accepted as a steering entry (conversation was busy
         -- at call time), the HTTP response body contains { steering: true } and
         -- an SSE event carrying the renderable SteerEntry and its queue position
-        -- is emitted to all connected clients before the response is flushed.
+        -- is emitted live to all connected authorized clients before the response
+        -- is flushed. It is not replayed; init reconstructs the durable queue.
 
     @guarantee AuthoritativeQueueProjection
         -- A newly-subscribed client receives the complete persisted queue in
@@ -420,7 +427,8 @@ surface SteeringQueueApi {
 
     @guarantee SteerMessageCancelledAck
         -- After cancellation is durable, all connected clients receive the
-        -- cancelled message_id and remove that queued entry if present.
+        -- cancelled message_id and remove that queued entry if present. An
+        -- idempotent retry of an already-absent id emits no second event.
 
     @guarantee DirectSendTransparency
         -- When a message is sent while the conversation is idle, { steering: false }
@@ -462,6 +470,6 @@ surface SteeringQueueApi {
         -- message_ids (not the whole queue); the DB method
         -- Database::remove_steering_entries deletes exactly those message_id
         -- rows from steering_messages (cascading their attachments) as a direct
-        -- DELETE — there is no read-modify-write window, so a concurrent
-        -- enqueue's read-append-write cannot be clobbered.
+        -- DELETE, while Database::append_steering_entry inserts only the new row.
+        -- Neither path rewrites rows owned by the other mutation.
 }
