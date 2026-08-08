@@ -21,7 +21,7 @@ struct ComposerView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .focused($focused)
 
-                if session.typedState.isCancellable {
+                if showsUnconfirmedStop {
                     Button {
                         session.perform(.cancel)
                     } label: {
@@ -55,5 +55,11 @@ struct ComposerView: View {
         if session.send(text: draft) {
             draft = ""
         }
+    }
+
+    private var showsUnconfirmedStop: Bool {
+        guard session.typedState.isCancellable else { return false }
+        if case .awaitingTaskApproval = session.typedState { return false }
+        return true
     }
 }

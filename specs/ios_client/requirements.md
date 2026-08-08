@@ -375,6 +375,10 @@ WHEN the device is offline or a resolution is in flight
 THE SYSTEM SHALL disable the resolution controls
 AND, when offline, state that approval is never queued
 
+WHILE a task plan is awaiting approval
+THE SYSTEM SHALL route rejection through the confirmed plan-rejection action
+AND SHALL NOT offer an unconfirmed generic cancel control
+
 WHEN the server reports that a submitted resolution failed retryably while
 the conversation remains awaiting approval
 THE SYSTEM SHALL decode retryability from the typed error payload

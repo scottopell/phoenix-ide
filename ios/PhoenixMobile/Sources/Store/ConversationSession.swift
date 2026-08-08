@@ -496,7 +496,7 @@ final class ConversationSession {
             default:
                 cancelNeedsAgentDoneFallback = false
             }
-            clearResolvedActionIfStateAdvanced()
+            clearResolvedActionIfStateAdvanced(currentState: typedState)
             messages = Self.reconcileTranscript(
                 existing: messages,
                 incoming: snap.messages,
@@ -613,7 +613,6 @@ final class ConversationSession {
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
             cancelNeedsAgentDoneFallback = false
-            clearResolvedActionIfStateAdvanced()
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
@@ -627,6 +626,8 @@ final class ConversationSession {
                 persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
             }
+            clearResolvedActionIfStateAdvanced(
+                currentState: ConversationState.parse(state))
             if let mode {
                 // The server's presentation_mode (idle | working |
                 // needs_action | error | done) is authoritative and covers
@@ -793,11 +794,11 @@ final class ConversationSession {
             || (presentationMode == nil && typedState.isKnownWorkingState)
     }
 
-    private func clearResolvedActionIfStateAdvanced() {
+    private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
         guard let action = actionInFlight, action.waitsForAuthoritativeStateChange else {
             return
         }
-        if case .awaitingTaskApproval = typedState { return }
+        if case .awaitingTaskApproval = currentState { return }
         actionInFlight = nil
     }
 
