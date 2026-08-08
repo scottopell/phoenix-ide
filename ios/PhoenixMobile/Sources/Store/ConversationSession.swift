@@ -491,10 +491,6 @@ final class ConversationSession {
                     connection = .idle
                     return
                 }
-                if error.isNotFound {
-                    handleHardDeletion()
-                    return
-                }
                 if error.isPermanentStreamAuthenticationFailure {
                     streamBlockedUntilConfigurationChange = true
                     lastErrorToast = error.errorDescription

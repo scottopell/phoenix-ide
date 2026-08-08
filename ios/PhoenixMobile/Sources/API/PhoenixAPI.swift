@@ -32,6 +32,7 @@ enum APIError: Error, LocalizedError {
         if case .transport = self { return true }
         return false
     }
+
     var isRetryableChatDeliveryFailure: Bool {
         switch self {
         case .transport, .decoding:

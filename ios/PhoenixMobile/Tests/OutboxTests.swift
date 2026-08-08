@@ -211,6 +211,18 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testCanonicalAuthoritativeIdentitySuppressesDuplicate() async {
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = await outbox.enqueue(text: "first")!
+
+        outbox.suppress(authoritativeMessageIds: ["c1:\(entry.localId)"])
+
+        XCTAssertTrue(outbox.visibleEntries.isEmpty)
+        XCTAssertEqual(outbox.entries[0].status, .pending)
+    }
+
+    @MainActor
     func testReconcileRecognizesConversationScopedCanonicalMessageId() async {
         freshDiskStore()
         let entry = makeEntry(
