@@ -71,7 +71,13 @@ struct ConversationView: View {
     /// Cache-age note while disconnected (REQ-IOS-001): only shown when
     /// the snapshot is meaningfully stale, mirroring the list's threshold.
     private func cacheAgeNote(at now: Date) -> String? {
-        guard !model.connectivity.isOnline,
+        let serverUnavailable: Bool
+        if case .waitingToRetry = session.connection {
+            serverUnavailable = true
+        } else {
+            serverUnavailable = false
+        }
+        guard (!model.connectivity.isOnline || serverUnavailable),
               session.connection != .live,
               let syncedAt = session.snapshotSyncedAt,
               now.timeIntervalSince(syncedAt) > 120
@@ -142,16 +148,7 @@ struct ConnectionStateBar: View {
         case .offline:
             EmptyView()  // OfflineBanner and the conversation cache note cover this.
         case .waitingToRetry:
-            if let syncedAt = session.snapshotSyncedAt,
-               now.timeIntervalSince(syncedAt) > 120 {
-                bar {
-                    Text(
-                        "Connection lost — reconnecting… · "
-                            + cacheAgeLabel(syncedAt, relativeTo: now))
-                }
-            } else {
-                bar { Text("Connection lost — reconnecting…") }
-            }
+            bar { Text("Connection lost — reconnecting…") }
         }
     }
 
