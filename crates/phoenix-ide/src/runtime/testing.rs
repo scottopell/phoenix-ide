@@ -1427,6 +1427,19 @@ impl StateStore for InMemoryStorage {
         Ok(())
     }
 
+    async fn load_steering_entries(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<crate::state_machine::event::SteerEntry>, String> {
+        Ok(self
+            .steering_queues
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn remove_steering_entries(
         &self,
         conv_id: &str,

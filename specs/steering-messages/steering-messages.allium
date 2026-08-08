@@ -332,9 +332,11 @@ rule CancelExistingSteeringMessage {
         -- executor loads the already-corrected queue from durable state.
         -- Runtime startup and queue mutations share a per-conversation fence.
         -- Startup reloads the durable queue while holding that fence immediately
-        -- before publishing and spawning the executor. Therefore a cancellation
-        -- either commits first and is absent from the startup snapshot, or runs
-        -- after publication and delivers the idempotent in-memory removal.
+        -- before publishing and spawning the executor. Before draining, the
+        -- executor reloads the durable queue under the same fence and holds it
+        -- until persistence and removal commit. Cancellation and delivery thus
+        -- have one durable winner: a committed cancellation is filtered before
+        -- use, while a completed drain makes the later delete report no removal.
         -- Earlier queue_position values are not rewritten after cancellation;
         -- clients treat them as enqueue-time ordering witnesses.
 }

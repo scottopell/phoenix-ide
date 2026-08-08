@@ -1837,6 +1837,8 @@ where
     /// Loaded from DB at executor startup; persisted back after each enqueue
     /// or dequeue.
     steering_queue: Vec<crate::state_machine::event::SteerEntry>,
+    /// Serializes durable cancellation with the final queue read and drain.
+    steering_projection_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     /// Unified liveness deadline for every waiting state — the single backstop
     /// that guarantees a waiting conversation cannot wedge forever. It is armed
     /// on entering any waiting state (`AwaitingSubAgents`, `CancellingTool`,
@@ -2003,6 +2005,7 @@ where
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
             steering_queue: Vec::new(),
+            steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
             active_work_subagents: 0,
@@ -2152,6 +2155,11 @@ where
         queue: Vec<crate::state_machine::event::SteerEntry>,
     ) -> Self {
         self.steering_queue = queue;
+        self
+    }
+
+    pub fn with_steering_projection_gate(mut self, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.steering_projection_gate = Some(gate);
         self
     }
 
@@ -2693,6 +2701,7 @@ where
         // A steer normally waits for the next drain hook. If channel delivery
         // loses the race with a transition to Idle, drain it immediately so a
         // successfully accepted prompt cannot wait for an unrelated future turn.
+        let mut immediate_drain_guard = None;
         let event = match event {
             Event::SteerMessage {
                 text,
@@ -2714,9 +2723,13 @@ where
                         skill_invocation,
                     });
                 if matches!(self.state, ConvState::Idle) && !self.context.is_sub_agent {
-                    Event::SteerDrainedUserMessages {
-                        entries: std::mem::take(&mut self.steering_queue),
-                    }
+                    let Some((drain_event, projection_guard)) =
+                        Box::pin(self.prepare_immediate_steering_drain()).await?
+                    else {
+                        return Ok(());
+                    };
+                    immediate_drain_guard = projection_guard;
+                    drain_event
                 } else {
                     return Ok(());
                 }
@@ -2800,6 +2813,8 @@ where
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
         }
+
+        drop(immediate_drain_guard);
 
         Ok(())
     }
@@ -3031,9 +3046,16 @@ where
                     if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
             )
         });
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, is_error_dismissal) {
-            self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
-                .await?;
+        if let Some((drain_event, projection_guard)) =
+            Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
+        {
+            Box::pin(self.run_effects_with_inline_drain(
+                result.effects,
+                drain_event,
+                projection_guard,
+                &mut generated_events,
+            ))
+            .await?;
         } else {
             for effect in result.effects {
                 let is_authoritative_persist =
@@ -3071,8 +3093,11 @@ where
             if let Some(tx) = &self.state_watcher {
                 let _ = tx.send(self.state.clone());
             }
-            if let Some(drain_event) = self.maybe_drain_steering_queue(&self.state.clone(), false) {
+            if let Some((drain_event, projection_guard)) =
+                Box::pin(self.prepare_steering_drain(&self.state.clone(), false)).await?
+            {
                 Box::pin(self.process_event(drain_event)).await?;
+                drop(projection_guard);
             }
             return Ok(Vec::new());
         }
@@ -3105,6 +3130,7 @@ where
         &mut self,
         original_effects: Vec<Effect>,
         drain_event: Event,
+        projection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
         let mut deferred_request_llm: Option<Effect> = None;
@@ -3175,6 +3201,11 @@ where
             }
         }
 
+        // Persistence and removal above commit queue consumption. A waiting
+        // cancellation now observes the entry absent instead of reporting
+        // success for a prompt already being delivered.
+        drop(projection_guard);
+
         if let Some(effect) = deferred_request_llm {
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
@@ -3244,6 +3275,73 @@ where
         Ok(None)
     }
 
+    async fn prepare_immediate_steering_drain(
+        &mut self,
+    ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        let projection_guard = if let Some(gate) = self.steering_projection_gate.clone() {
+            let guard = gate.lock_owned().await;
+            self.steering_queue = self
+                .storage
+                .load_steering_entries(&self.context.conversation_id)
+                .await?;
+            Some(guard)
+        } else {
+            None
+        };
+        if self.steering_queue.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            Event::SteerDrainedUserMessages {
+                entries: std::mem::take(&mut self.steering_queue),
+            },
+            projection_guard,
+        )))
+    }
+
+    async fn prepare_steering_drain(
+        &mut self,
+        old_state: &ConvState,
+        is_error_dismissal: bool,
+    ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        if !self.is_steering_drain_hook(old_state, is_error_dismissal) {
+            return Ok(None);
+        }
+
+        let projection_guard = if let Some(gate) = self.steering_projection_gate.clone() {
+            let guard = gate.lock_owned().await;
+            self.steering_queue = self
+                .storage
+                .load_steering_entries(&self.context.conversation_id)
+                .await?;
+            Some(guard)
+        } else {
+            None
+        };
+
+        Ok(self
+            .maybe_drain_steering_queue(old_state, is_error_dismissal)
+            .map(|event| (event, projection_guard)))
+    }
+
+    fn is_steering_drain_hook(&self, old_state: &ConvState, is_error_dismissal: bool) -> bool {
+        if self.context.is_sub_agent || is_error_dismissal {
+            return false;
+        }
+
+        let entering_idle =
+            !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
+        let entering_llm_requesting_from_tool_round =
+            matches!(
+                old_state,
+                ConvState::ToolExecuting { .. }
+                    | ConvState::AwaitingSubAgents { .. }
+                    | ConvState::CancellingSubAgents { .. }
+            ) && matches!(self.state, ConvState::LlmRequesting { .. });
+
+        entering_idle || entering_llm_requesting_from_tool_round
+    }
+
     /// If the current state transition is a steering-queue drain hook point and
     /// the queue is non-empty, drain all entries into a single
     /// `SteerDrainedUserMessages` event. The DB queue is NOT touched here; it
@@ -3263,17 +3361,6 @@ where
         old_state: &ConvState,
         is_error_dismissal: bool,
     ) -> Option<Event> {
-        if self.context.is_sub_agent {
-            return None;
-        }
-
-        // An error dismissal enters Idle but is not a turn-end, so it must not
-        // drain (see the call site). Draining is reserved for turn-completion
-        // idle entries.
-        if is_error_dismissal {
-            return None;
-        }
-
         let entering_idle =
             !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
         let entering_llm_requesting_from_tool_round =
@@ -3284,7 +3371,7 @@ where
                     | ConvState::CancellingSubAgents { .. }
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
-        if !(entering_idle || entering_llm_requesting_from_tool_round)
+        if !self.is_steering_drain_hook(old_state, is_error_dismissal)
             || self.steering_queue.is_empty()
         {
             return None;
@@ -11809,6 +11896,27 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
+    async fn drain_reloads_durable_queue_and_filters_cancelled_startup_entry() {
+        let conversation_id = "conv-cancel-before-drain";
+        let stale_entry = mk_entry("cancelled", "must not be delivered");
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![stale_entry],
+        );
+        storage.set_steering_queue(conversation_id, Vec::new());
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
+            .await
+            .expect("cancelled durable entry must be filtered");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::Idle));
+    }
+
+    #[tokio::test]
     async fn steer_arriving_after_idle_drains_immediately() {
         let (mut rt, storage) =
             build_runtime_with_state_and_queue("conv-late-steer", ConvState::Idle, vec![]);
@@ -11827,6 +11935,22 @@ mod steer_drain_detector_tests {
         );
         assert!(rt.steering_queue.is_empty());
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn late_steer_reloads_durable_queue_before_immediate_drain() {
+        let conversation_id = "conv-cancelled-late-steer";
+        let (rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, ConvState::Idle, vec![]);
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(mk_steer_event("cancelled", "must not be delivered"))
+            .await
+            .expect("cancelled late steer must be absorbed");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::Idle));
     }
 
     /// Task 60004: entering Idle with a non-empty steering queue must NOT

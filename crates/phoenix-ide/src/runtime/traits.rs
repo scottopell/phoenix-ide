@@ -343,6 +343,12 @@ pub trait StateStore: Send + Sync {
         metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String>;
 
+    /// Load the current durable steering queue in FIFO order.
+    async fn load_steering_entries(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String>;
+
     /// Remove specific drained entries from the persisted steering queue,
     /// preserving any concurrently-enqueued entries. Implementations must be
     /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing
@@ -733,6 +739,13 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
         (**self).upsert_llm_request_metrics(metrics).await
+    }
+
+    async fn load_steering_entries(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String> {
+        (**self).load_steering_entries(conv_id).await
     }
 
     async fn remove_steering_entries(
@@ -1330,6 +1343,16 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .upsert_llm_request_metrics(metrics)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn load_steering_entries(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String> {
+        self.db
+            .get_steering_queue(conv_id)
             .await
             .map_err(|e| e.to_string())
     }

@@ -3410,13 +3410,16 @@ impl RuntimeManager {
         // publication and executor spawn. Queue mutations use the same gate,
         // so either they commit first and this reload observes them, or the
         // live executor is published first and receives their channel event.
-        let steering_projection_guard = self.lock_steering_projection(conversation_id).await;
+        let steering_projection_gate = self.steering_projection.gate_for(conversation_id).await;
+        let steering_projection_guard = steering_projection_gate.clone().lock_owned().await;
         let steering_queue = self
             .db
             .get_steering_queue(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let runtime = runtime.with_steering_queue(steering_queue);
+        let runtime = runtime
+            .with_steering_queue(steering_queue)
+            .with_steering_projection_gate(steering_projection_gate);
 
         // Start runtime in background
         let conv_id = conversation_id.to_string();
@@ -3436,8 +3439,6 @@ impl RuntimeManager {
             identity: identity.clone(),
             state_rx: state_rx.clone(),
         };
-        let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
-
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
         // losing, not-yet-spawned executor.
@@ -3466,33 +3467,6 @@ impl RuntimeManager {
         }
 
         tokio::spawn(async move {
-            // A cancellation may have committed after construction loaded the
-            // queue but before this task was scheduled. Re-read under the same
-            // mutation fence before any recovery work can use the snapshot.
-            let startup_queue = {
-                let _projection_guard =
-                    manager_for_cleanup.lock_steering_projection(&conv_id).await;
-                manager_for_cleanup
-                    .db
-                    .get_steering_queue(&conv_id)
-                    .await
-                    .map_err(|error| error.to_string())
-            };
-            let runtime = match startup_queue {
-                Ok(queue) => runtime.with_steering_queue(queue),
-                Err(error) => {
-                    let _ = startup_ready_tx.send(Err(error));
-                    let mut runtimes = manager_for_cleanup.runtimes.write().await;
-                    if runtimes
-                        .get(&conv_id)
-                        .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &cleanup_identity))
-                    {
-                        runtimes.remove(&conv_id);
-                    }
-                    return;
-                }
-            };
-            let _ = startup_ready_tx.send(Ok(()));
             runtime.run().await;
 
             // Only remove this runtime's HashMap entry. After evict_runtime()
@@ -3514,9 +3488,6 @@ impl RuntimeManager {
         });
 
         drop(steering_projection_guard);
-        startup_ready_rx
-            .await
-            .map_err(|_| "runtime exited before reconciling its steering queue".to_string())??;
 
         Ok(handle)
     }
