@@ -68,9 +68,34 @@ CI runs the same thing on a macOS runner for any change under `ios/`
 (`.github/workflows/ios.yml`) — the Linux-based `./dev.py check` lanes
 cannot cover Swift.
 
+The opt-in live-server UI journey has its own scheme so normal unit tests
+never depend on a running Phoenix instance. Start an auth-disabled dev server
+with `PHOENIX_ENABLE_MOCK_MODEL=1`, then run:
+
+```bash
+cd ios/PhoenixMobile
+xcodegen generate
+xcrun simctl boot 'iPhone 16' 2>/dev/null || true
+xcrun simctl bootstatus 'iPhone 16' -b
+xcrun simctl uninstall 'iPhone 16' com.phoenix.mobile 2>/dev/null || true
+PHOENIX_UI_TEST_SERVER_URL=https://127.0.0.1:<port> \
+PHOENIX_UI_TEST_CWD=/tmp \
+xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobileUIQA \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+The uninstall only clears Phoenix from that simulator, making the first-run
+TLS setup deterministic on every run.
+
+The native UI test sends events directly to the Simulator through XCUITest;
+it does not take over the Mac's mouse or keyboard. It covers first-run
+self-signed TLS setup, explicit mock-model conversation creation, optimistic
+send reconciliation without duplicate bubbles, and cold-launch persistence.
+
 **The testing pattern:** pure components get *contract tests* — one test
-per rule of the contract they implement, named after that rule — and
-views stay untested. Representative exemplars:
+per rule of the contract they implement, named after that rule. One focused
+XCUITest covers the highest-risk live UI journey; the remaining views stay
+outside the unit suite. Representative exemplars:
 
 - `Tests/SSEParserTests.swift` — contract: the SSE wire format.
 - `Tests/OutboxTests.swift` — contract: the delivery rules in

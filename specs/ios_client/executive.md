@@ -13,7 +13,9 @@ under `ios/`.
 
 Unit coverage follows a contract-test pattern (see `ios/README.md`
 "Testing"): pure components get one test per rule of the contract they
-implement; views stay untested. Coverage includes SSE framing and typed
+implement. An opt-in live-server XCUITest covers first-run TLS setup, mock
+conversation creation, optimistic-send reconciliation, and cold relaunch;
+it is isolated from the ordinary CI scheme. Coverage includes SSE framing and typed
 hard-delete decoding, the outbox delivery and real-disk durability rules,
 versioned-store downgrade protection, typed conversation states and chat
 eligibility, question encoding, image processing, attention diffs, bash

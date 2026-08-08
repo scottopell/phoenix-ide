@@ -169,6 +169,8 @@ struct StreamingBubble: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 40)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.streaming")
         .opacity(0.85)
     }
 }
@@ -183,6 +185,8 @@ struct OutboxSection: View {
         ForEach(session.outbox.visibleEntries) { entry in
             OutboxEntryView(entry: entry, session: session)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.outbox")
     }
 }
 

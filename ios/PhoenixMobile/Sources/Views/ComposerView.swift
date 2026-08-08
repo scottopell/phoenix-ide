@@ -50,6 +50,7 @@ struct ComposerView: View {
                     .background(Color(.secondarySystemBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .focused($focused)
+                    .accessibilityIdentifier("conversation.composer")
 
                 if session.agentWorking {
                     Button {
@@ -60,6 +61,7 @@ struct ComposerView: View {
                             .foregroundStyle(.red)
                     }
                     .disabled(!model.connectivity.isOnline)
+                    .accessibilityIdentifier("conversation.cancel")
                 }
 
                 Button {
@@ -71,6 +73,7 @@ struct ComposerView: View {
                         .foregroundStyle(model.connectivity.isOnline ? Color.accentColor : .orange)
                 }
                 .disabled(!canSend)
+                .accessibilityIdentifier("conversation.send")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)

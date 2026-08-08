@@ -19,6 +19,7 @@ struct SetupView: View {
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .accessibilityIdentifier("setup.serverURL")
                     SecureField("Password (blank if auth disabled)", text: $passwordText)
                     Toggle("Trust self-signed certificate", isOn: $trustSelfSigned)
                 }
@@ -45,6 +46,7 @@ struct SetupView: View {
                         }
                     }
                     .disabled(checking || URL(string: urlText)?.host == nil)
+                    .accessibilityIdentifier("setup.connect")
                 } footer: {
                     Text(
                         "Phoenix dev and prod servers usually serve TLS with a "

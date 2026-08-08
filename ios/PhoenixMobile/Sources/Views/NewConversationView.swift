@@ -38,6 +38,7 @@ struct NewConversationView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .font(.body.monospaced())
+                            .accessibilityIdentifier("newConversation.cwd")
                     }
                     if case .invalid(let reason) = cwdStatus {
                         Text(reason)
@@ -54,12 +55,14 @@ struct NewConversationView: View {
                                 Text(id).tag(String?.some(id))
                             }
                         }
+                        .accessibilityIdentifier("newConversation.model")
                     }
                 }
 
                 Section("First message") {
                     TextField("What should the agent do?", text: $firstMessage, axis: .vertical)
                         .lineLimit(3...10)
+                        .accessibilityIdentifier("newConversation.message")
                 }
 
                 if let errorText {
@@ -81,6 +84,7 @@ struct NewConversationView: View {
                         Task { await create() }
                     }
                     .disabled(!canCreate)
+                    .accessibilityIdentifier("newConversation.create")
                 }
             }
             .onChange(of: cwd) { _, newValue in

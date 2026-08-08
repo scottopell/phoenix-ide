@@ -65,6 +65,7 @@ struct ConversationListView: View {
                         Image(systemName: "plus")
                     }
                     .disabled(!model.connectivity.isOnline)
+                    .accessibilityIdentifier("conversationList.new")
                 }
             }
             .sheet(isPresented: $showNewConversation) {
@@ -118,6 +119,7 @@ struct ConversationListView: View {
                             conversation: conversation,
                             isCoordinator: conversation.id == model.coordinatorConversationId)
                     }
+                    .accessibilityIdentifier("conversationList.row.\(conversation.id)")
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         if conversation.id != model.coordinatorConversationId {
                             Button {

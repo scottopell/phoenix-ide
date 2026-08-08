@@ -120,6 +120,8 @@ struct UserMessageView: View {
                 }
             }
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.user")
     }
 }
 
@@ -139,6 +141,8 @@ struct AgentMessageView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("message.agent")
     }
 
     @ViewBuilder
