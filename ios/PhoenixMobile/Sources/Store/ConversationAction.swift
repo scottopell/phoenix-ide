@@ -16,16 +16,32 @@ enum ConversationAction: Equatable {
     /// revises and re-proposes.
     case provideTaskFeedback(annotations: String)
 
-    enum DeliveryPolicy {
+    var waitsForAuthoritativeStateChange: Bool {
+        switch self {
+        case .cancel, .dismissError:
+            return false
+        case .approveTask, .rejectTask, .provideTaskFeedback:
+            return true
+        }
+    }
+}
+
+/// Delivery classification for user-authored iOS operations.
+enum ClientOperation {
+    case chat
+    case archive
+    case conversationAction(ConversationAction)
+
+    enum DeliveryPolicy: Equatable {
         case onlineOnly
         case outboxed
     }
 
     var policy: DeliveryPolicy {
         switch self {
-        case .cancel, .dismissError:
-            return .onlineOnly
-        case .approveTask, .rejectTask, .provideTaskFeedback:
+        case .chat:
+            return .outboxed
+        case .archive, .conversationAction:
             return .onlineOnly
         }
     }

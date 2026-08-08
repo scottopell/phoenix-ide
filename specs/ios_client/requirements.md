@@ -299,6 +299,12 @@ WHEN deciding whether the agent is busy
 THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from
 the typed state
 
+WHEN a state variant is promoted from the catch-all to typed support
+THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
+and a decoding test together
+AND verify the fields against the server `ConvState` and web
+`ConversationState` unions
+
 **Rationale:** The state machine visualization is the mobile UI's primary
 feedback mechanism (the REQ-API-011 rationale); string-matching state
 names at each usage site drifts. The decode-with-fallback shape matches

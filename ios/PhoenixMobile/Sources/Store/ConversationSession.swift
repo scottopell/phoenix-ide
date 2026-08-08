@@ -239,6 +239,7 @@ final class ConversationSession {
     @discardableResult
     func send(text: String) -> Bool {
         guard !isHardDeleted else { return false }
+        guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, typedState.acceptsChatMessage else { return false }
         guard outbox.enqueue(text: trimmed) != nil else {
@@ -320,7 +321,7 @@ final class ConversationSession {
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
         guard actionInFlight == nil else { return }
-        switch action.policy {
+        switch ClientOperation.conversationAction(action).policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
                 lastErrorToast = "This action needs a connection — it can't be queued."
@@ -331,7 +332,6 @@ final class ConversationSession {
         }
         actionInFlight = action
         Task {
-            defer { actionInFlight = nil }
             do {
                 switch action {
                 case .cancel:
@@ -349,7 +349,11 @@ final class ConversationSession {
                 }
                 // Success needs no local state change: the server emits the
                 // resulting state_change over SSE and the reducer applies it.
+                if !action.waitsForAuthoritativeStateChange {
+                    actionInFlight = nil
+                }
             } catch {
+                actionInFlight = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -470,6 +474,7 @@ final class ConversationSession {
             }
             convState = snap.conversation.state
             typedState = ConversationState.parse(snap.conversation.state)
+            clearResolvedActionIfStateAdvanced()
             messages = Self.reconcileTranscript(
                 existing: messages,
                 incoming: snap.messages,
@@ -587,6 +592,7 @@ final class ConversationSession {
             guard applyIfNewer(seq) else { return }
             convState = state
             typedState = ConversationState.parse(state)
+            clearResolvedActionIfStateAdvanced()
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
@@ -749,6 +755,14 @@ final class ConversationSession {
             }
         }
         return .object(merged)
+    }
+
+    private func clearResolvedActionIfStateAdvanced() {
+        guard let action = actionInFlight, action.waitsForAuthoritativeStateChange else {
+            return
+        }
+        if case .awaitingTaskApproval = typedState { return }
+        actionInFlight = nil
     }
 
     private func upsert(_ message: Message) {

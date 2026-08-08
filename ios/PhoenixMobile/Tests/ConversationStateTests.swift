@@ -162,4 +162,23 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(
             parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
     }
+
+    func testDeliveryPolicyCoversChatArchiveAndSessionActions() {
+        XCTAssertEqual(ClientOperation.chat.policy, .outboxed)
+        XCTAssertEqual(ClientOperation.archive.policy, .onlineOnly)
+        XCTAssertEqual(
+            ClientOperation.conversationAction(.cancel).policy, .onlineOnly)
+    }
+
+    func testTaskResolutionWaitsForAuthoritativeStateChange() {
+        XCTAssertTrue(
+            ConversationAction.approveTask(
+                handoff: .continueInCurrentConversation)
+                .waitsForAuthoritativeStateChange)
+        XCTAssertTrue(ConversationAction.rejectTask.waitsForAuthoritativeStateChange)
+        XCTAssertTrue(
+            ConversationAction.provideTaskFeedback(annotations: "revise")
+                .waitsForAuthoritativeStateChange)
+        XCTAssertFalse(ConversationAction.cancel.waitsForAuthoritativeStateChange)
+    }
 }

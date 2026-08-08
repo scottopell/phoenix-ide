@@ -1,11 +1,7 @@
 import SwiftUI
 
-// State-detail rendering: the dispatch view for the typed ConversationState.
-// Same extension recipe as the tool renderers — add a case here when a
-// variant graduates from the generic fallbacks (see ConversationState's
-// doc comment for the full checklist). Cases fall into three visual
-// families: working detail (inline, quiet), needs-action cards (blue,
-// prominent), and the error card (red, with its dismiss action).
+// State-detail rendering falls into three visual families: working detail,
+// needs-action cards, and error cards.
 
 /// Rendered between the transcript and the composer. Quiet when idle.
 struct StateDetailView: View {
@@ -100,7 +96,12 @@ struct StateDetailView: View {
             // Unhandled variant: label it rather than guessing. The server's
             // presentation mode decides the family — an untyped variant that
             // needs the user still gets a card, not silence.
-            if session.presentationMode == "needs_action" {
+            if session.presentationMode == "error" {
+                errorCard(
+                    message: session.convState?["message"]?.stringValue
+                        ?? type.replacingOccurrences(of: "_", with: " "),
+                    dismissible: false)
+            } else if session.presentationMode == "needs_action" {
                 needsActionCard(
                     icon: "person.crop.circle.badge.exclamationmark",
                     title: "Action needed",
@@ -169,7 +170,7 @@ struct StateDetailView: View {
         .padding(.vertical, 6)
     }
 
-    private func errorCard(message: String) -> some View {
+    private func errorCard(message: String, dismissible: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("Agent error", systemImage: "exclamationmark.triangle.fill")
                 .font(.callout.bold())
@@ -177,16 +178,15 @@ struct StateDetailView: View {
             Text(message)
                 .font(.callout)
                 .lineLimit(4)
-            HStack {
-                Spacer()
-                // Exemplar online-only action (see ConversationAction):
-                // resumable errors clear server-side; non-resumable ones
-                // come back as a conflict toast explaining why.
-                Button("Dismiss error") {
-                    session.perform(.dismissError)
+            if dismissible {
+                HStack {
+                    Spacer()
+                    Button("Dismiss error") {
+                        session.perform(.dismissError)
+                    }
+                    .font(.callout.bold())
+                    .disabled(!model.connectivity.isOnline)
                 }
-                .font(.callout.bold())
-                .disabled(!model.connectivity.isOnline)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

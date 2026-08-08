@@ -114,15 +114,12 @@ final class AppModel {
         await listStore.refresh(api: api)
     }
 
-    /// List-scoped conversation action (see ConversationAction's policy
-    /// doc — archive is online-only: it transitions live server state and
-    /// frees resources, so a queued stale archive must not replay later).
-    /// Returns false (with `lastActionError` set) on failure so callers
-    /// can leave the row in place.
+    /// Online-only archive. Returns false with `lastActionError` on failure.
     var lastActionError: String?
 
     @discardableResult
     func archive(conversationId: String) async -> Bool {
+        guard ClientOperation.archive.policy == .onlineOnly else { return false }
         let hasInMemoryMessages = sessions[conversationId]?.outbox.visibleEntries.isEmpty == false
         guard !hasInMemoryMessages,
               !Outbox.hasVisibleEntries(conversationId: conversationId)

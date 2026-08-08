@@ -10,12 +10,6 @@ import Foundation
 /// in `.unknown`. A newer server can therefore never break rendering — it
 /// only degrades it.
 ///
-/// To promote a variant from `.other` to a typed case:
-///   1. Add the case with the fields the UI needs (check the union in
-///      ui/src/api.ts and `ConvState` in phoenix-core sm_state.rs).
-///   2. Parse it in `parse(_:)`.
-///   3. Render it in `StateDetailView` (Views/StateViews.swift).
-///   4. Add a decoding test in ConversationStateTests, one per shape rule.
 /// Note: whether the agent is *busy* comes from the server's
 /// `presentation_mode`, not from this type — don't re-derive it here.
 enum ConversationState: Equatable {
