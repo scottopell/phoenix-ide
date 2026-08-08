@@ -303,7 +303,8 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         -- the reducer's LlmRequesting state, and deletes only those queue ids.
         -- The deferred RequestLlm runs only after commit. A failed transaction
         -- performs no publication or dispatch and is not retried while holding
-        -- the projection fence.
+        -- the projection fence. The runtime exits; its successor reconstructs
+        -- the untouched batch from database truth.
 }
 
 -- REQ-STEER-003

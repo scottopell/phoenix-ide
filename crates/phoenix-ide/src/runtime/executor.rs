@@ -1670,6 +1670,13 @@ enum ContinuationEffectDisposition {
     AbortRemaining,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RuntimeRecoveryDisposition {
+    #[default]
+    Continue,
+    RecreateFromDatabase,
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -1891,6 +1898,7 @@ where
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     continuation_effect_disposition: ContinuationEffectDisposition,
+    recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -2022,6 +2030,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
+            recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_cancellation_initiated: false,
@@ -2284,6 +2293,13 @@ where
         //   deadline          — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery          — credential helper settlement (REQ-BED-030)
         loop {
+            if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
+                tracing::warn!(
+                    conversation_id = %self.context.conversation_id,
+                    "Exiting runtime to reconstruct an uncommitted operation from database truth"
+                );
+                return;
+            }
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
@@ -5232,7 +5248,7 @@ where
             })
             .collect();
 
-        let statuses = self
+        let statuses = match self
             .storage
             .commit_steering_drain(
                 &self.context.conversation_id,
@@ -5240,7 +5256,14 @@ where
                 &self.state,
                 self.state_updated_at,
             )
-            .await?;
+            .await
+        {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err(error);
+            }
+        };
         if statuses.len() != committed_messages.len() {
             tracing::error!(
                 conversation_id = %self.context.conversation_id,
@@ -13026,6 +13049,10 @@ mod steer_drain_detector_tests {
         assert!(storage.get_all_messages("conv-clear-failure").is_empty());
         assert_eq!(storage.get_steering_queue("conv-clear-failure").len(), 1);
         assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the
