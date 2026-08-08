@@ -129,6 +129,7 @@ struct NewConversationView: View {
 
     private var canCreate: Bool {
         if creating { return false }
+        if !model.connectivity.isOnline { return false }
         if firstMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         guard !loadingModels, modelsError == nil,
               modelsAvailable, let selectedModel, modelIDs.contains(selectedModel) else {

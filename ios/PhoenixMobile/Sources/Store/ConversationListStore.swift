@@ -47,9 +47,7 @@ final class ConversationListStore {
     }
 
     private func apply(_ fresh: [Conversation]) {
-        conversations = fresh.sorted {
-            ($0.updatedAtDate ?? .distantPast) > ($1.updatedAtDate ?? .distantPast)
-        }
+        conversations = Self.sortedByUpdatedAt(fresh)
         lastRefreshed = Date()
         DiskStore.save(conversations, name: Self.cacheName)
         DiskStore.save(Meta(lastRefreshed: lastRefreshed!), name: Self.metaName)
@@ -63,10 +61,15 @@ final class ConversationListStore {
         } else {
             conversations.insert(conversation, at: 0)
         }
-        conversations.sort {
-            ($0.updatedAtDate ?? .distantPast) > ($1.updatedAtDate ?? .distantPast)
-        }
+        conversations = Self.sortedByUpdatedAt(conversations)
         DiskStore.save(conversations, name: Self.cacheName)
+    }
+
+    nonisolated static func sortedByUpdatedAt(_ conversations: [Conversation]) -> [Conversation] {
+        conversations
+            .map { (conversation: $0, updatedAt: $0.updatedAtDate ?? .distantPast) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .map(\.conversation)
     }
 
     func remove(id: String) {

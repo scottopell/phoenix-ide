@@ -325,6 +325,9 @@ final class ConversationSession {
             conversation = snap.conversation
             conversation?.transcript_generation = snap.transcriptGeneration
             conversation?.presentation_mode = snap.presentationMode
+            if let mode = snap.presentationMode {
+                conversation?.requires_action = mode == "needs_action"
+            }
             convState = snap.conversation.state
             messages = Self.reconcileTranscript(
                 existing: messages,
@@ -421,7 +424,10 @@ final class ConversationSession {
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
-                if let mode { conversation.presentation_mode = mode }
+                if let mode {
+                    conversation.presentation_mode = mode
+                    conversation.requires_action = mode == "needs_action"
+                }
                 self.conversation = conversation
                 snapshotSyncedAt = Date()
                 persistSnapshot()

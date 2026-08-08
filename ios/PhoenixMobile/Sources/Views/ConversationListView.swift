@@ -54,13 +54,26 @@ struct ConversationListView: View {
     @ViewBuilder
     private var list: some View {
         if model.listStore.conversations.isEmpty {
-            ContentUnavailableView {
-                Label("No conversations", systemImage: "bubble.left.and.bubble.right")
-            } description: {
-                Text(
-                    model.connectivity.isOnline
-                        ? "Start one with the + button."
-                        : "Nothing cached yet — connect once to populate the list.")
+            if let error = model.listStore.lastError {
+                ContentUnavailableView {
+                    Label("Couldn't load conversations", systemImage: "exclamationmark.icloud")
+                } description: {
+                    Text(error)
+                } actions: {
+                    Button("Retry") {
+                        Task { await model.refreshList() }
+                    }
+                    .disabled(!model.connectivity.isOnline || model.listStore.isRefreshing)
+                }
+            } else {
+                ContentUnavailableView {
+                    Label("No conversations", systemImage: "bubble.left.and.bubble.right")
+                } description: {
+                    Text(
+                        model.connectivity.isOnline
+                            ? "Start one with the + button."
+                            : "Nothing cached yet — connect once to populate the list.")
+                }
             }
         } else {
             List {
