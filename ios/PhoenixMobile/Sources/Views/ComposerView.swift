@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Message input. Always enabled — sending offline or mid-turn is the
-/// normal case, not an error: the outbox holds the message until it can be
-/// delivered (or the server steers it into the running turn).
+/// Message input. Offline and supported mid-turn sends remain available;
+/// state decisions and archive operations disable submission.
 struct ComposerView: View {
     @Environment(AppModel.self) private var model
     let session: ConversationSession
@@ -22,9 +21,9 @@ struct ComposerView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
                     .focused($focused)
 
-                if session.agentWorking {
+                if showsUnconfirmedStop {
                     Button {
-                        session.cancelAgent()
+                        session.perform(.cancel)
                     } label: {
                         Image(systemName: "stop.circle.fill")
                             .font(.title2)
@@ -41,7 +40,9 @@ struct ComposerView: View {
                         .font(.title2)
                         .foregroundStyle(model.connectivity.isOnline ? Color.accentColor : .orange)
                 }
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || !session.acceptsChatMessage)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -50,8 +51,15 @@ struct ComposerView: View {
     }
 
     private func send() {
+        guard session.acceptsChatMessage else { return }
         if session.send(text: draft) {
             draft = ""
         }
+    }
+
+    private var showsUnconfirmedStop: Bool {
+        guard session.typedState.isCancellable else { return false }
+        if case .awaitingTaskApproval = session.typedState { return false }
+        return true
     }
 }

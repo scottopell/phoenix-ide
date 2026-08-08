@@ -114,6 +114,44 @@ final class AppModel {
         await listStore.refresh(api: api)
     }
 
+    /// Online-only archive. Returns false with `lastActionError` on failure.
+    var lastActionError: String?
+
+    @discardableResult
+    func archive(conversationId: String) async -> Bool {
+        guard ClientOperation.archive.policy == .onlineOnly else { return false }
+        guard let api, connectivity.isOnline else {
+            lastActionError = "Archiving needs a connection — it can't be queued."
+            return false
+        }
+        guard !Outbox.hasVisibleEntries(conversationId: conversationId),
+              let session = session(for: conversationId),
+              session.beginArchiving()
+        else {
+            lastActionError =
+                "This conversation has queued or unconfirmed messages. Retry or discard them before archiving."
+            return false
+        }
+        var archived = false
+        defer {
+            if !archived { session.endArchiving() }
+        }
+        do {
+            try await api.archive(conversationId: conversationId)
+            archived = true
+            session.stop()
+            sessions[conversationId] = nil
+            listStore.remove(id: conversationId)
+            DiskStore.remove(name: "outbox-\(conversationId)")
+            DiskStore.remove(name: "conv-\(conversationId)")
+            return true
+        } catch {
+            lastActionError = (error as? APIError)?.errorDescription
+                ?? error.localizedDescription
+            return false
+        }
+    }
+
     func foregrounded() {
         for session in sessions.values {
             session.resyncAfterForeground()

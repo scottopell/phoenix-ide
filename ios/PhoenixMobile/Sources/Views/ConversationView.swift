@@ -18,7 +18,37 @@ struct ConversationView: View {
                     systemImage: "trash",
                     description: Text("This conversation was deleted on the server."))
             } else {
-                messageList
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    if let staleness = cacheAgeNote(at: context.date) {
+                        Text(staleness)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 2)
+                            .background(.thinMaterial)
+                    }
+                }
+                if !session.outbox.persistenceHealthy {
+                    Label(
+                        "Storage write failed — queued messages may not survive a restart",
+                        systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.caption2)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                        .background(.red.gradient)
+                }
+                if isUncachedOffline {
+                    ContentUnavailableView {
+                        Label("Not cached on this device", systemImage: "icloud.slash")
+                    } description: {
+                        Text("Open this conversation once while connected to read it offline.")
+                    }
+                    .frame(maxHeight: .infinity)
+                } else {
+                    messageList
+                }
+                StateDetailView(session: session)
                 ComposerView(session: session, draft: $draft)
             }
         }
@@ -38,6 +68,35 @@ struct ConversationView: View {
         .onDisappear { session.closeView() }
     }
 
+    /// Cache-age note while disconnected (REQ-IOS-001): only shown when
+    /// the snapshot is meaningfully stale, mirroring the list's threshold.
+    private func cacheAgeNote(at now: Date) -> String? {
+        let serverUnavailable: Bool
+        if case .waitingToRetry = session.connection {
+            serverUnavailable = true
+        } else {
+            serverUnavailable = false
+        }
+        guard (!model.connectivity.isOnline || serverUnavailable),
+              session.connection != .live,
+              let syncedAt = session.snapshotSyncedAt,
+              now.timeIntervalSince(syncedAt) > 120
+        else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        let rel = formatter.localizedString(for: syncedAt, relativeTo: now)
+        return "Cached \(rel)"
+    }
+
+    /// Offline with nothing cached and nothing queued: an empty transcript
+    /// would read as data loss — name the actual situation instead.
+    private var isUncachedOffline: Bool {
+        !model.connectivity.isOnline
+            && session.conversation == nil
+            && session.messages.isEmpty
+            && session.outbox.visibleEntries.isEmpty
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -51,10 +110,6 @@ struct ConversationView: View {
                             .id("streaming")
                     }
                     OutboxSection(session: session)
-                    if session.agentWorking && session.streamingText.isEmpty {
-                        WorkingIndicator(stateType: currentStateType)
-                            .id("working")
-                    }
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 12)
@@ -71,10 +126,6 @@ struct ConversationView: View {
             }
         }
     }
-
-    private var currentStateType: String? {
-        session.convState?.stringValue ?? session.convState?["type"]?.stringValue
-    }
 }
 
 /// Inline connection state, shown only when not live — quiet when healthy.
@@ -82,34 +133,15 @@ struct ConnectionStateBar: View {
     let session: ConversationSession
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
-            content(at: context.date)
-        }
-    }
-
-    @ViewBuilder
-    private func content(at now: Date) -> some View {
         switch session.connection {
         case .live, .idle:
             EmptyView()
         case .connecting:
             bar { Text("Connecting…") }
         case .offline:
-            if let syncedAt = session.snapshotSyncedAt,
-               now.timeIntervalSince(syncedAt) > 120 {
-                bar { Text(cacheAgeLabel(syncedAt, relativeTo: now)) }
-            }
+            EmptyView()  // OfflineBanner and the conversation cache note cover this.
         case .waitingToRetry:
-            if let syncedAt = session.snapshotSyncedAt,
-               now.timeIntervalSince(syncedAt) > 120 {
-                bar {
-                    Text(
-                        "Connection lost — reconnecting… · "
-                            + cacheAgeLabel(syncedAt, relativeTo: now))
-                }
-            } else {
-                bar { Text("Connection lost — reconnecting…") }
-            }
+            bar { Text("Connection lost — reconnecting…") }
         }
     }
 
@@ -120,37 +152,6 @@ struct ConnectionStateBar: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 3)
             .background(.thinMaterial)
-    }
-
-    private func cacheAgeLabel(_ date: Date, relativeTo now: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return "Conversation updated \(formatter.localizedString(for: date, relativeTo: now))"
-    }
-}
-
-/// The state-machine phase indicator while the agent works.
-struct WorkingIndicator: View {
-    let stateType: String?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 4)
-    }
-
-    private var label: String {
-        switch stateType {
-        case "llm_requesting": return "Thinking…"
-        case "tool_executing": return "Running tools…"
-        case "awaiting_sub_agents": return "Waiting on sub-agents…"
-        default: return "Working…"
-        }
     }
 }
 

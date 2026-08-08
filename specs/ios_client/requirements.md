@@ -269,3 +269,142 @@ payload is fixed boilerplate addressed to the LLM, not the user)
 shapes must degrade visibly, not vanish (omission is data loss). Native
 renderers are per-tool and additive; the generic cards are the structural
 floor that makes every tool legible before it earns a dedicated view.
+
+---
+
+### REQ-IOS-011: Typed Conversation State Rendering
+
+WHEN a conversation state arrives (init snapshot, state_change event, or
+cached conversation)
+THE SYSTEM SHALL decode it into a typed state: recognized variants carry
+the fields the UI consumes; a recognized envelope with an unhandled
+variant degrades to a labeled catch-all; an unparseable payload degrades
+to unknown
+
+WHEN rendering the conversation, the typed state SHALL drive a state
+detail area between transcript and composer:
+- in-flight states render inline working detail (current tool name plus
+  completed/queued counts for tool execution; retry attempt for LLM
+  requests; sub-agent progress counts)
+- states requiring the user render a prominent needs-action card (question
+  asked, task plan awaiting approval, context exhausted)
+- the error state renders an error card carrying the message and the
+  dismiss action
+
+WHEN the server state permits cancellation
+THE SYSTEM SHALL expose the cancel control, including while provisioning,
+awaiting recovery, or awaiting commission-review approval
+
+WHEN deciding whether the agent is busy
+THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from
+the typed state
+
+WHEN rendering context exhaustion from a legacy or cached payload
+THE SYSTEM SHALL keep the needs-action card visible unless presentation_mode
+explicitly reports done
+
+WHEN context exhaustion carries a continuation summary
+THE SYSTEM SHALL render that summary in the needs-action card
+
+WHEN a conversation snapshot is archived
+THE SYSTEM SHALL keep its transcript readable
+AND SHALL disable chat and state-transition actions
+
+WHEN a state variant is promoted from the catch-all to typed support
+THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
+and a decoding test together
+AND verify the fields against the server `ConvState` and web
+`ConversationState` unions
+
+**Rationale:** The state machine visualization is the mobile UI's primary
+feedback mechanism (the REQ-API-011 rationale); string-matching state
+names at each usage site drifts. The decode-with-fallback shape matches
+the SSE event and tool-renderer patterns so a newer server degrades
+rendering instead of breaking it.
+
+---
+
+### REQ-IOS-012: Action Delivery Policy
+
+WHEN a user-initiated conversation operation is defined
+THE SYSTEM SHALL declare its delivery policy in the action's type:
+- outboxed: persisted locally before any network I/O, idempotency-keyed,
+  auto-retried (chat messages)
+- online-only: requires a live server answer because it reads or
+  transitions live server state (cancel, dismiss-error, archive)
+
+WHEN an online-only action is invoked while offline
+THE SYSTEM SHALL disable the control or fail immediately with an
+explanation
+AND SHALL NOT queue the action for later replay
+
+WHEN an online-only action is rejected by the server (e.g. dismissing a
+non-resumable error)
+THE SYSTEM SHALL surface the server's explanation
+
+WHEN archive is requested while the conversation has a visible outbox entry
+THE SYSTEM SHALL block archive until the user retries or discards that entry
+SO THAT archive cannot delete the only durable copy of user-authored text
+
+WHEN an archive request is in flight
+THE SYSTEM SHALL disable new message submission for that conversation
+UNTIL archive fails or completes
+
+**Rationale:** Queuing an action against live server state fabricates a
+stale intent — an archive or cancel replayed minutes later can destroy
+work the user did in between. Only idempotency-keyed sends are safe to
+defer; the type forces each new action to make that choice explicitly.
+
+---
+
+### REQ-IOS-013: Task Approval
+
+WHEN a conversation is awaiting task approval
+THE SYSTEM SHALL render the proposed task's title, priority, and plan
+(plan collapsed with an expand affordance)
+AND offer approve, reject (with confirmation), and free-text
+request-changes resolutions
+
+WHEN request-changes feedback is constructed
+THE SYSTEM SHALL require non-empty text after trimming whitespace
+
+WHILE request-changes feedback remains on the current approval card
+THE SYSTEM SHALL preserve the draft across request failure
+UNTIL the user edits it or an authoritative state change replaces the card
+
+WHEN approval is chosen
+THE SYSTEM SHALL require an explicit placement choice between continuing in
+the current conversation and starting a fresh work conversation
+
+WHEN fresh-work approval hands off to a successor conversation
+THE SYSTEM SHALL retain the successor conversation identifier from the state
+AND offer navigation to that conversation
+
+WHEN the state omits the title, priority, or plan required for review
+THE SYSTEM SHALL render a non-actionable fallback rather than approval controls
+
+WHEN a resolution is submitted
+THE SYSTEM SHALL send it as an online-only action (REQ-IOS-012)
+AND rely on the server's resulting state change to clear the card rather
+than optimistic local state
+SO THAT a decision made concurrently from another client wins cleanly and
+this client simply observes the state move on
+
+WHEN the device is offline or a resolution is in flight
+THE SYSTEM SHALL disable the resolution controls
+AND, when offline, state that approval is never queued
+
+WHILE a task plan is awaiting approval
+THE SYSTEM SHALL route rejection through the confirmed plan-rejection action
+AND SHALL NOT offer an unconfirmed generic cancel control
+
+WHEN the server reports that a submitted resolution failed retryably while
+the conversation remains awaiting approval
+THE SYSTEM SHALL decode retryability from the typed error payload
+AND re-enable the resolution controls
+
+**Rationale:** Plan approval is the highest-value blocking decision to
+make away from the desk. The no-optimistic-state rule matters because
+approval is multi-client: the server 400s a decision on an
+already-decided plan, which surfaces as an explanatory error instead of a
+silent double-apply.

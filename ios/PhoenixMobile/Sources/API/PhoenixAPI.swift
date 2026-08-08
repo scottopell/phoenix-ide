@@ -317,6 +317,44 @@ struct PhoenixAPI: Sendable {
             "api/conversations/\(conversationId)/archive", body: [:], as: OkResponse.self)
     }
 
+    /// Clears a user-resumable error state. The server responds 409 when
+    /// the error is not dismissable or the conversation isn't errored.
+    func dismissError(conversationId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/dismiss-error", body: [:],
+            as: SuccessResponse.self)
+    }
+
+    // Task approval (awaiting_task_approval): the server 400s when the
+    // conversation isn't in that state — e.g. another client decided first.
+
+    func approveTask(
+        conversationId: String,
+        handoff: TaskApprovalHandoff
+    ) async throws {
+        struct ApprovalResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/approve-task",
+            body: ["handoff": handoff.rawValue],
+            as: ApprovalResponse.self)
+    }
+
+    func rejectTask(conversationId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/reject-task", body: [:],
+            as: SuccessResponse.self)
+    }
+
+    func sendTaskFeedback(conversationId: String, annotations: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/task-feedback",
+            body: ["annotations": annotations],
+            as: SuccessResponse.self)
+    }
+
     func validateCwd(path: String) async throws -> ValidateCwdResponse {
         try await get(
             "api/validate-cwd",

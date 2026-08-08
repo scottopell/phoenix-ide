@@ -57,6 +57,10 @@ final class Outbox {
     let conversationId: String
     private(set) var entries: [OutboxEntry] = []
     private var suppressedMessageIds: Set<String> = []
+    /// False when the last disk write failed (storage full/unavailable).
+    /// Queued entries then exist in memory only — the UI warns that they
+    /// won't survive an app restart. Cleared by the next successful write.
+    private(set) var persistenceHealthy = true
 
     private var storeName: String { "outbox-\(conversationId)" }
 
@@ -77,11 +81,18 @@ final class Outbox {
         entries.contains { $0.status == .pending && !$0.acceptedByServer }
     }
 
+    static func hasVisibleEntries(conversationId: String) -> Bool {
+        let name = "outbox-\(conversationId)"
+        return (DiskStore.load([OutboxEntry].self, name: name) ?? [])
+            .contains { $0.conversationId == conversationId && $0.isVisible }
+    }
+
     @discardableResult
     private func persist() -> Bool {
         // Terminal entries are pruned at persistence time; they carry no
         // future obligation.
-        return DiskStore.save(entries.filter(\.isVisible), name: storeName)
+        persistenceHealthy = DiskStore.save(entries.filter(\.isVisible), name: storeName)
+        return persistenceHealthy
     }
 
     /// Re-establish the enqueue-before-POST durability point immediately

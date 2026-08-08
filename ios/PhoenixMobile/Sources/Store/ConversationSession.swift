@@ -24,13 +24,21 @@ final class ConversationSession {
     private(set) var messages: [Message] = []
     private(set) var agentWorking = false
     private(set) var presentationMode: String?
-    private(set) var convState: JSONValue?
+    var convState: JSONValue? { conversation?.state }
+    var typedState: ConversationState { ConversationState.parse(conversation?.state) }
     private(set) var connection: ConnectionState = .idle
     /// In-flight LLM text accumulated from token events; cleared when the
     /// finalized message arrives or the turn ends.
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
     private(set) var isHardDeleted = false
+    private(set) var isArchiving = false
+    var acceptsChatMessage: Bool {
+        acceptsConversationActions && typedState.acceptsChatMessage
+    }
+    var acceptsConversationActions: Bool {
+        !isHardDeleted && !isArchiving && conversation?.archived != true
+    }
     /// tool_use_id -> the invoking block's tool name + input. Lets a tool
     /// result message (which carries only `tool_use_id`) find its native
     /// renderer. Rebuilt on message changes, not per render.
@@ -44,6 +52,8 @@ final class ConversationSession {
     private var streamTask: Task<Void, Never>?
     private var drainTask: Task<Void, Never>?
     private var staleCheckTask: Task<Void, Never>?
+    private var cancelNeedsAgentDoneFallback = false
+    private var actionOriginState: ConversationState?
     /// localIds with a POST in flight — prevents duplicate concurrent sends
     /// of one entry (resending a *different* entry is always safe).
     private var inFlight: Set<String> = []
@@ -66,6 +76,7 @@ final class ConversationSession {
         /// Missing only in snapshots written before transcript generations
         /// were part of the iOS cache; nil forces replacement on next init.
         var transcriptGeneration: Int64?
+        /// Missing in snapshots written before cache freshness was tracked.
         var syncedAt: Date?
     }
 
@@ -95,6 +106,11 @@ final class ConversationSession {
             transcriptGeneration = snap.transcriptGeneration
             snapshotSyncedAt = snap.syncedAt
             replayFromPendingAnchor = true
+            presentationMode = snap.conversation?.presentation_mode
+            // Busy flag follows the cached mode the same way live
+            // state_change events derive it — a snapshot taken mid-turn
+            // must not open looking idle.
+            agentWorking = presentationMode == "working"
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
@@ -202,17 +218,22 @@ final class ConversationSession {
     }
 
     @discardableResult
-    private func persistSnapshot() -> Bool {
+    private func persistSnapshot(authoritative: Bool = false) -> Bool {
         guard !isHardDeleted else { return false }
-        return DiskStore.save(
+        let syncedAt = authoritative ? Date() : snapshotSyncedAt
+        let didSave = DiskStore.save(
             Snapshot(
                 conversation: conversation,
                 messages: Self.durableMessages(
                     messages, through: durableMessageSequenceCeiling),
                 lastSequenceId: lastSequenceId,
                 transcriptGeneration: transcriptGeneration,
-                syncedAt: snapshotSyncedAt),
+                syncedAt: syncedAt),
             name: snapshotName)
+        if didSave, authoritative {
+            snapshotSyncedAt = syncedAt
+        }
+        return didSave
     }
 
     // MARK: - Sending
@@ -223,8 +244,9 @@ final class ConversationSession {
     @discardableResult
     func send(text: String) -> Bool {
         guard !isHardDeleted else { return false }
+        guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty, acceptsChatMessage else { return false }
         guard outbox.enqueue(text: trimmed) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
@@ -240,6 +262,16 @@ final class ConversationSession {
 
     func dismissEntry(_ localId: String) {
         outbox.dismiss(localId)
+    }
+
+    func beginArchiving() -> Bool {
+        guard !isArchiving, outbox.visibleEntries.isEmpty else { return false }
+        isArchiving = true
+        return true
+    }
+
+    func endArchiving() {
+        isArchiving = false
     }
 
     /// Attempt delivery of every sendable entry, oldest first. Safe to call
@@ -294,11 +326,53 @@ final class ConversationSession {
         }
     }
 
-    func cancelAgent() {
+    /// The action currently being executed, or nil. Views use this to
+    /// disable controls and show progress — approval buttons especially
+    /// must not double-fire.
+    private(set) var actionInFlight: ConversationAction?
+
+    /// Execute a session-scoped action per its declared delivery policy
+    /// (ConversationAction). Online-only actions fail fast with a toast
+    /// when offline — deliberately not queued, see the policy doc.
+    func perform(_ action: ConversationAction) {
+        guard acceptsConversationActions, actionInFlight == nil else { return }
+        switch ClientOperation.conversationAction(action).policy {
+        case .onlineOnly:
+            guard connectivity.isOnline else {
+                lastErrorToast = "This action needs a connection — it can't be queued."
+                return
+            }
+        case .outboxed:
+            break  // never blocked on connectivity by definition
+        }
+        if case .cancel = action,
+           case .awaitingCommissionReviewApproval = typedState {
+            cancelNeedsAgentDoneFallback = true
+        }
+        actionInFlight = action
+        actionOriginState = typedState
         Task {
             do {
-                _ = try await api.cancel(conversationId: conversationId)
+                switch action {
+                case .cancel:
+                    _ = try await api.cancel(conversationId: conversationId)
+                case .dismissError:
+                    try await api.dismissError(conversationId: conversationId)
+                case .approveTask(let handoff):
+                    try await api.approveTask(
+                        conversationId: conversationId, handoff: handoff)
+                case .rejectTask:
+                    try await api.rejectTask(conversationId: conversationId)
+                case .provideTaskFeedback(let feedback):
+                    try await api.sendTaskFeedback(
+                        conversationId: conversationId, annotations: feedback.text)
+                }
             } catch {
+                if case .cancel = action {
+                    cancelNeedsAgentDoneFallback = false
+                }
+                actionInFlight = nil
+                actionOriginState = nil
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -417,7 +491,13 @@ final class ConversationSession {
             if let mode = snap.presentationMode {
                 conversation?.requires_action = mode == "needs_action"
             }
-            convState = snap.conversation.state
+            switch typedState {
+            case .awaitingCommissionReviewApproval:
+                break
+            default:
+                cancelNeedsAgentDoneFallback = false
+            }
+            clearResolvedActionIfStateAdvanced(currentState: typedState)
             messages = Self.reconcileTranscript(
                 existing: messages,
                 incoming: snap.messages,
@@ -427,7 +507,6 @@ final class ConversationSession {
             durableMessageSequenceCeiling = Self.durableCeilingAfterInit(
                 anchor: snap.pendingAnchorSequenceId,
                 messages: snap.messages)
-            snapshotSyncedAt = Date()
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
             if mustReplayFromAnchor || previousSequenceFloor == 0 || !generationMatches
@@ -455,13 +534,15 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
-            if let conversation { onConversationUpdate?(conversation) }
+            if let conversation {
+                onConversationUpdate?(conversation)
+            }
             // Persist the authoritative snapshot BEFORE reconciling: the
             // outbox prune must never become durable while the message
             // snapshot that justifies it is still memory-only — a crash
             // between the two writes would lose the user's text from both.
             outbox.suppress(authoritativeMessageIds: Set(snap.messages.map(\.message_id)))
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
             drainOutbox()
@@ -493,14 +574,13 @@ final class ConversationSession {
                 self.conversation = conversation
                 onConversationUpdate?(conversation)
             }
-            snapshotSyncedAt = Date()
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
                 rebuildToolUseIndex()
             }
             // Snapshot before outbox prune — see the init branch.
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
 
@@ -529,12 +609,11 @@ final class ConversationSession {
                 conversation?.transcript_generation = updatedGeneration
             }
             if messages[idx].message_type == "agent" { rebuildToolUseIndex() }
-            snapshotSyncedAt = Date()
-            persistSnapshot()
+            persistSnapshot(authoritative: true)
 
         case .stateChange(let seq, let state, let mode, let stateUpdatedAt):
             guard applyIfNewer(seq) else { return }
-            convState = state
+            cancelNeedsAgentDoneFallback = false
             if let mode { presentationMode = mode }
             if var conversation {
                 conversation.state = state
@@ -545,9 +624,11 @@ final class ConversationSession {
                 }
                 self.conversation = conversation
                 snapshotSyncedAt = Date()
-                persistSnapshot()
+                persistSnapshot(authoritative: true)
                 onConversationUpdate?(conversation)
             }
+            clearResolvedActionIfStateAdvanced(
+                currentState: ConversationState.parse(state))
             if let mode {
                 // The server's presentation_mode (idle | working |
                 // needs_action | error | done) is authoritative and covers
@@ -567,6 +648,10 @@ final class ConversationSession {
 
         case .token(let seq, let text, let requestId):
             guard applyIfNewer(seq) else { return }
+            // A late/replayed token after the turn closed would recreate a
+            // ghost bubble below the finalized message — only accumulate
+            // while a turn is actually running.
+            guard agentWorking else { return }
             if streamingRequestId != requestId {
                 streamingRequestId = requestId
                 streamingText = ""
@@ -581,10 +666,32 @@ final class ConversationSession {
             streamingText = ""
             streamingRequestId = nil
             agentWorking = false
+            // agent_done can close a turn without a trailing idle
+            // state_change; leave resting/needs-action states alone but
+            // clear in-flight ones so the spinner doesn't outlive the turn.
+            let shouldMoveToIdle = Self.shouldMoveToIdleOnAgentDone(
+                presentationMode: presentationMode,
+                typedState: typedState,
+                cancelledCommissionApproval: cancelNeedsAgentDoneFallback)
+            cancelNeedsAgentDoneFallback = false
+            if case .cancel = actionInFlight {
+                actionInFlight = nil
+                actionOriginState = nil
+            }
+            if shouldMoveToIdle {
+                conversation?.state = .string("idle")
+                // The mode must move with the state, or the snapshot
+                // persists idle-with-working-mode and a cold reopen seeds
+                // the spinner back for a turn that already ended.
+                presentationMode = "idle"
+                conversation?.presentation_mode = "idle"
+                conversation?.requires_action = false
+                if let conversation { onConversationUpdate?(conversation) }
+            }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
-            if persistSnapshot() {
+            if persistSnapshot(authoritative: true) {
                 reconcileOutbox()
             }
             drainOutbox()
@@ -604,7 +711,7 @@ final class ConversationSession {
                 if let v = update["title"]?.stringValue { conv.title = v }
                 if let v = update["updated_at"]?.stringValue { conv.updated_at = v }
                 conversation = conv
-                persistSnapshot()
+                persistSnapshot(authoritative: true)
                 onConversationUpdate?(conv)
             }
 
@@ -612,9 +719,13 @@ final class ConversationSession {
             _ = applyIfNewer(seq)
             outbox.markAccepted(messageId, steering: true)
 
-        case .errorEvent(let seq, let message):
+        case .errorEvent(let seq, let message, let retryable):
             guard applyIfNewer(seq) else { return }
             lastErrorToast = message
+            if retryable, actionInFlight?.waitsForAuthoritativeStateChange == true {
+                actionInFlight = nil
+                actionOriginState = nil
+            }
 
         case .conversationBecameTerminal(let seq):
             _ = applyIfNewer(seq)
@@ -644,7 +755,6 @@ final class ConversationSession {
         conversation = nil
         messages = []
         durableMessageSequenceCeiling = 0
-        convState = nil
         presentationMode = "done"
         agentWorking = false
         streamingText = ""
@@ -680,6 +790,42 @@ final class ConversationSession {
         return .object(merged)
     }
 
+    nonisolated static func shouldMoveToIdleOnAgentDone(
+        presentationMode: String?,
+        typedState: ConversationState,
+        cancelledCommissionApproval: Bool
+    ) -> Bool {
+        cancelledCommissionApproval
+            || presentationMode == "working"
+            || (presentationMode == nil && typedState.isKnownWorkingState)
+    }
+
+    private func clearResolvedActionIfStateAdvanced(currentState: ConversationState) {
+        guard let action = actionInFlight,
+              action.waitsForAuthoritativeStateChange
+        else {
+            return
+        }
+        guard !Self.actionStillAwaitsOriginalState(
+            action: action, origin: actionOriginState, current: currentState)
+        else { return }
+        actionInFlight = nil
+        actionOriginState = nil
+    }
+
+    nonisolated static func actionStillAwaitsOriginalState(
+        action: ConversationAction,
+        origin: ConversationState?,
+        current: ConversationState
+    ) -> Bool {
+        switch action {
+        case .cancel:
+            return current.isCancellable
+        case .dismissError, .approveTask, .rejectTask, .provideTaskFeedback:
+            return current == origin
+        }
+    }
+
     private func upsert(_ message: Message) {
         if let idx = messages.firstIndex(where: { $0.message_id == message.message_id }) {
             // Eager (in-flight) messages are later re-broadcast persisted
@@ -706,7 +852,7 @@ final class ConversationSession {
                     durableMessageSequenceCeiling, message.sequence_id)
                 lastSequenceId = max(lastSequenceId, message.sequence_id)
                 rebuildToolUseIndex()
-                if persistSnapshot() {
+                if persistSnapshot(authoritative: true) {
                     reconcileOutbox()
                 }
             case .steeringQueued:

@@ -40,6 +40,9 @@ injection first).
 | REQ-IOS-008 auth/TLS | `PhoenixAPI` (Bearer), `ServerTrustDelegate` + `CertPinStore` (TOFU pinning), `Keychain` |
 | REQ-IOS-009 creation flow | `NewConversationView` |
 | REQ-IOS-010 rendering | `MessageViews.swift` (generic fallback), `ToolViews.swift` (dispatch + native bash/think renderers), `ConversationSession.toolUseIndex` (result join) |
+| REQ-IOS-011 typed state | `ConversationState.swift` (decode + fallback, tested), `StateViews.swift` (detail dispatch) |
+| REQ-IOS-012 action policy | `ConversationAction.swift` (policy axis), `ConversationSession.perform`, `AppModel.archive` |
+| REQ-IOS-013 task approval | `TaskApprovalCard` (StateViews.swift), approve/reject/feedback actions |
 
 ## Known Gaps / Future Work
 
@@ -47,7 +50,11 @@ injection first).
 - No push notifications; updates arrive only while the app is foregrounded
   with a stream open.
 - Steering-queue entries are not reorderable/deletable server-side from the app.
-- No archived-conversations view, rename, or delete.
+- No archived-conversations view, rename, or delete (archive itself is
+  wired via swipe).
+- Task approval is answerable in-app; the remaining needs-action states
+  (respond-to-question, commission review approval) render as cards but
+  resolve from the web UI — natural next ConversationAction cases.
 - Markdown rendering is inline-only (no fenced code blocks or tables).
 - Native tool renderers cover `bash` and `think` only; all other tools
   (patch, browser, keyword_search, tmux, …) hit the generic JSON cards.

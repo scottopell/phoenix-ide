@@ -29,11 +29,14 @@ enum DiskStore {
         return try? JSONDecoder().decode(type, from: data)
     }
 
+    /// Returns whether the write actually reached disk. Cache callers may
+    /// ignore this (stale cache self-heals); the outbox must not — its
+    /// enqueue-before-POST durability point is only real if the write was.
     @discardableResult
     static func save<T: Encodable>(_ value: T, name: String) -> Bool {
         guard let data = try? JSONEncoder().encode(value) else { return false }
-        // Atomic write: a crash mid-write must not corrupt cached state.
         do {
+            // Atomic write: a crash mid-write must not corrupt cached state.
             try data.write(to: url(for: name), options: .atomic)
             return true
         } catch {
