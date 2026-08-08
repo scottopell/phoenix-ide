@@ -156,11 +156,11 @@ pub(crate) struct SteeringAcceptanceKey {
 }
 
 #[derive(Default)]
-struct ConversationMessageAcceptanceGates {
+struct ConversationMutexGates {
     gates: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
 }
 
-impl ConversationMessageAcceptanceGates {
+impl ConversationMutexGates {
     async fn gate_for(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
         const CLEANUP_THRESHOLD: usize = 1_024;
         let mut gates = self.gates.lock().await;
@@ -181,13 +181,13 @@ impl ConversationMessageAcceptanceGates {
 }
 
 #[cfg(test)]
-mod message_acceptance_gate_tests {
-    use super::ConversationMessageAcceptanceGates;
+mod conversation_mutex_gate_tests {
+    use super::ConversationMutexGates;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn gates_are_shared_within_one_conversation_and_independent_across_conversations() {
-        let gates = ConversationMessageAcceptanceGates::default();
+        let gates = ConversationMutexGates::default();
         let first_a = gates.gate_for("conversation-a").await;
         let second_a = gates.gate_for("conversation-a").await;
         let conversation_b = gates.gate_for("conversation-b").await;
@@ -245,7 +245,11 @@ pub struct RuntimeManager {
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
-    message_acceptance: ConversationMessageAcceptanceGates,
+    message_acceptance: ConversationMutexGates,
+    /// Serializes the final durable queue snapshot and executor publication
+    /// with queue mutations. The database remains authoritative; this gate
+    /// only prevents a newly-started executor from observing an older snapshot.
+    steering_projection: ConversationMutexGates,
     steering_acceptance_receipts:
         AsyncMutex<HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
@@ -1516,7 +1520,8 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
-            message_acceptance: ConversationMessageAcceptanceGates::default(),
+            message_acceptance: ConversationMutexGates::default(),
+            steering_projection: ConversationMutexGates::default(),
             steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
@@ -3267,14 +3272,6 @@ impl RuntimeManager {
                 None
             };
 
-        // Seed the executor's in-memory steering queue from the normalized
-        // steering_messages tables.
-        let steering_queue = self
-            .db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| e.to_string())?;
-
         let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
             &storage,
             conversation_id,
@@ -3348,7 +3345,6 @@ impl RuntimeManager {
             .with_wake_registrar(self.wake_registrar())
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
-            .with_steering_queue(steering_queue)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
@@ -3410,6 +3406,18 @@ impl RuntimeManager {
             tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
         }
 
+        // Fence the final durable queue snapshot through live-handle
+        // publication and executor spawn. Queue mutations use the same gate,
+        // so either they commit first and this reload observes them, or the
+        // live executor is published first and receives their channel event.
+        let steering_projection_guard = self.lock_steering_projection(conversation_id).await;
+        let steering_queue = self
+            .db
+            .get_steering_queue(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let runtime = runtime.with_steering_queue(steering_queue);
+
         // Start runtime in background
         let conv_id = conversation_id.to_string();
         let manager_for_cleanup = Arc::clone(self);
@@ -3428,6 +3436,7 @@ impl RuntimeManager {
             identity: identity.clone(),
             state_rx: state_rx.clone(),
         };
+        let (startup_ready_tx, startup_ready_rx) = oneshot::channel();
 
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
@@ -3457,6 +3466,33 @@ impl RuntimeManager {
         }
 
         tokio::spawn(async move {
+            // A cancellation may have committed after construction loaded the
+            // queue but before this task was scheduled. Re-read under the same
+            // mutation fence before any recovery work can use the snapshot.
+            let startup_queue = {
+                let _projection_guard =
+                    manager_for_cleanup.lock_steering_projection(&conv_id).await;
+                manager_for_cleanup
+                    .db
+                    .get_steering_queue(&conv_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+            let runtime = match startup_queue {
+                Ok(queue) => runtime.with_steering_queue(queue),
+                Err(error) => {
+                    let _ = startup_ready_tx.send(Err(error));
+                    let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                    if runtimes
+                        .get(&conv_id)
+                        .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &cleanup_identity))
+                    {
+                        runtimes.remove(&conv_id);
+                    }
+                    return;
+                }
+            };
+            let _ = startup_ready_tx.send(Ok(()));
             runtime.run().await;
 
             // Only remove this runtime's HashMap entry. After evict_runtime()
@@ -3476,6 +3512,11 @@ impl RuntimeManager {
                 );
             }
         });
+
+        drop(steering_projection_guard);
+        startup_ready_rx
+            .await
+            .map_err(|_| "runtime exited before reconciling its steering queue".to_string())??;
 
         Ok(handle)
     }
@@ -3585,6 +3626,13 @@ impl RuntimeManager {
         self.message_acceptance.lock(conversation_id).await
     }
 
+    pub(crate) async fn lock_steering_projection(
+        &self,
+        conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.steering_projection.lock(conversation_id).await
+    }
+
     pub(crate) async fn lock_steering_acceptance_receipts(
         &self,
     ) -> tokio::sync::MutexGuard<'_, HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>
@@ -3682,6 +3730,7 @@ impl RuntimeManager {
         // executor loads the old queue, not the just-appended entry that it
         // will also receive through the channel below.
         let handle = self.get_or_create(conversation_id).await?;
+        let _projection_guard = self.lock_steering_projection(conversation_id).await;
 
         // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
@@ -3751,37 +3800,6 @@ impl RuntimeManager {
             identity: h.identity.clone(),
             state_rx: h.state_rx.clone(),
         })
-    }
-
-    /// Return a live handle, waiting for an already-running materialization if
-    /// necessary. This never starts a new runtime. The final live-handle recheck
-    /// closes the slot-removal race between the first lookup and subscription.
-    pub async fn try_get_handle_or_wait_for_materialization(
-        &self,
-        conversation_id: &str,
-    ) -> Option<ConversationHandle> {
-        if let Some(handle) = self.try_get_handle(conversation_id).await {
-            return Some(handle);
-        }
-
-        let pending = self
-            .runtime_creations
-            .lock()
-            .await
-            .get(conversation_id)
-            .map(watch::Sender::subscribe);
-        let Some(mut result_rx) = pending else {
-            return self.try_get_handle(conversation_id).await;
-        };
-
-        loop {
-            if let Some(result) = result_rx.borrow().clone() {
-                return result.ok();
-            }
-            if result_rx.changed().await.is_err() {
-                return self.try_get_handle(conversation_id).await;
-            }
-        }
     }
 
     /// Subscribe to the authoritative in-memory state for one conversation.
@@ -5391,49 +5409,60 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn live_handle_lookup_waits_for_existing_materialization_without_starting_one() {
+    async fn runtime_startup_waits_for_steering_mutation_before_publishing_handle() {
         let mgr = Arc::new(test_manager().await);
-        let conversation_id = "wait-for-materialization";
+        let conversation_id = "startup-steering-fence";
         mgr.db()
             .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
             .await
             .expect("create");
+        mgr.db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "cancel before startup".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "cancel-before-startup".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .expect("seed queue");
+
+        let startup_guard = mgr.lock_steering_projection(conversation_id).await;
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         mgr.runtime_materialization_barriers
             .lock()
             .await
             .insert(conversation_id.to_string(), Arc::clone(&barrier));
-
         let materialization = {
             let mgr = Arc::clone(&mgr);
             tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
         };
         barrier.wait().await;
-        let waiting_lookup = {
-            let mgr = Arc::clone(&mgr);
-            tokio::spawn(async move {
-                mgr.try_get_handle_or_wait_for_materialization(conversation_id)
-                    .await
-            })
-        };
         barrier.wait().await;
 
-        let materialized = materialization
+        assert!(mgr.try_get_handle(conversation_id).await.is_none());
+        assert!(mgr
+            .db()
+            .remove_steering_entry(conversation_id, "cancel-before-startup")
+            .await
+            .expect("delete queued row"));
+        drop(startup_guard);
+
+        materialization
             .await
             .expect("materialization joins")
             .expect("materialization succeeds");
-        let waited = waiting_lookup
+        assert!(mgr
+            .db()
+            .get_steering_queue(conversation_id)
             .await
-            .expect("waiting lookup joins")
-            .expect("waiting lookup sees handle");
-        assert!(materialized.broadcast_tx.same_channel(&waited.broadcast_tx));
-
-        assert!(
-            mgr.try_get_handle_or_wait_for_materialization("never-started")
-                .await
-                .is_none(),
-            "lookup must not start an absent runtime"
-        );
+            .expect("durable queue")
+            .is_empty());
     }
 
     #[tokio::test]

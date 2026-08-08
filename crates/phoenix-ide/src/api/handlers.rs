@@ -4500,6 +4500,7 @@ async fn cancel_steering_message(
     // one durable mutation order and prevents a cancel event from overtaking
     // an append event for the same conversation.
     let _acceptance_guard = state.runtime.lock_message_acceptance(&id).await;
+    let _projection_guard = state.runtime.lock_steering_projection(&id).await;
 
     // Delete the entry directly (cascading its attachments). Idempotent retries
     // return success but do not publish a second cancellation projection.
@@ -4522,11 +4523,7 @@ async fn cancel_steering_message(
     // Executor removal is independently idempotent and runs even when the DB
     // row was already absent. This repairs an interrupted earlier handler that
     // committed the delete but did not reach its in-memory notification.
-    if let Some(handle) = state
-        .runtime
-        .try_get_handle_or_wait_for_materialization(&id)
-        .await
-    {
+    if let Some(handle) = state.runtime.try_get_handle(&id).await {
         let _ = handle
             .event_tx
             .send(Event::CancelSteerMessage {

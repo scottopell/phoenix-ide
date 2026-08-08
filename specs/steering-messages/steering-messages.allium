@@ -330,9 +330,11 @@ rule CancelExistingSteeringMessage {
         -- after commit, then the executor removes its in-memory projection.
         -- If no executor is running, the DB mutation is sufficient: the next
         -- executor loads the already-corrected queue from durable state.
-        -- If runtime materialization is already in flight, cancellation joins
-        -- it without starting a new runtime and delivers the idempotent removal
-        -- to reconcile any queue snapshot loaded before the DELETE.
+        -- Runtime startup and queue mutations share a per-conversation fence.
+        -- Startup reloads the durable queue while holding that fence immediately
+        -- before publishing and spawning the executor. Therefore a cancellation
+        -- either commits first and is absent from the startup snapshot, or runs
+        -- after publication and delivers the idempotent in-memory removal.
         -- Earlier queue_position values are not rewritten after cancellation;
         -- clients treat them as enqueue-time ordering witnesses.
 }
