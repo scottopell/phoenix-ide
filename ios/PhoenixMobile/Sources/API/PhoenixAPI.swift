@@ -60,7 +60,7 @@ enum APIError: Error, LocalizedError {
 /// enabled self-signed trust, a failing chain is accepted only under the
 /// trust-on-first-use pin in CertPinStore (REQ-IOS-008) — never blindly,
 /// because every request carries the Bearer password.
-final class ServerTrustDelegate: NSObject, URLSessionDelegate {
+final class ServerTrustDelegate: NSObject, URLSessionTaskDelegate {
     let allowSelfSigned: Bool
 
     init(allowSelfSigned: Bool) {
@@ -70,6 +70,22 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handle(challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        handle(challenge, completionHandler: completionHandler)
+    }
+
+    private func handle(
+        _ challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
         guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
@@ -157,6 +173,7 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
 struct PhoenixAPI: Sendable {
     let baseURL: URL
     let password: String?
+    private let trustDelegate: ServerTrustDelegate
     private let session: URLSession
     /// Long-lived session for SSE: effectively no per-request deadline; the
     /// idle timeout covers gaps between events (the server keep-alives).
@@ -170,6 +187,7 @@ struct PhoenixAPI: Sendable {
         self.password = password
 
         let delegate = ServerTrustDelegate(allowSelfSigned: allowSelfSigned)
+        self.trustDelegate = delegate
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
@@ -204,7 +222,7 @@ struct PhoenixAPI: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await session.data(for: req, delegate: trustDelegate)
         } catch {
             if hasCertificatePinMismatch {
                 throw APIError.certificatePinMismatch
@@ -406,7 +424,7 @@ struct PhoenixAPI: Sendable {
         req.timeoutInterval = 90
         let (bytes, response): (URLSession.AsyncBytes, URLResponse)
         do {
-            (bytes, response) = try await streamSession.bytes(for: req)
+            (bytes, response) = try await streamSession.bytes(for: req, delegate: trustDelegate)
         } catch {
             if hasCertificatePinMismatch {
                 throw APIError.certificatePinMismatch
