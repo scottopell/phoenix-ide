@@ -19,10 +19,12 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - Notes bind to the exact live-target `WorkScope`, file identity, and current content revision; other scopes, stale content, and conversations that reject chat remain read-only.
 - A target or revision change keeps in-session notes visible but disables Send until refresh/re-anchor or explicit discard.
 - Reader re-anchoring validates every retained note against one current revision before updating the session.
+- A note that cannot be re-anchored can be discarded individually while other reader notes remain intact.
 - Send formats notes into a structural editable conversation contribution that owns both text and exact scope/file/revision authority, then clears the reader notes and closes the reader.
 - Composer edits preserve each retained review contribution's authority; removal deletes its text and authority together without disturbing unrelated text or images.
 - Actual message submission revalidates every binding, preserves staged images in the same outbox entry, and clears the draft only after positive disk-persistence evidence.
-- Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then offers refresh/re-anchor or structural contribution removal.
+- The ordinary queue entry cannot become sendable until persistence evidence exists; a cleared composer is reinitialized with an editable empty plain segment.
+- Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
 - The leaf queue separates reader fidelity from session-scoped note composition.
 

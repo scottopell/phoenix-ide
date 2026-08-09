@@ -689,6 +689,8 @@ AND disable Send until the user refreshes and re-anchors the note against the
 eligible scope and current revision, or explicitly discards it
 AND, when refreshing, replace every retained note's source line and raw content
 as one validated re-anchor operation before updating the session revision
+AND allow any note that cannot be re-anchored to be individually discarded
+without removing other notes from the open reader session
 
 WHEN the user chooses Send for one or more eligible notes
 THE SYSTEM SHALL format and inject them into the conversation's editable message
@@ -702,6 +704,7 @@ AND SHALL NOT deliver the notes independently of that message input
 WHILE the user edits a retained review contribution
 THE SYSTEM SHALL preserve that contribution's authority binding with its text
 AND SHALL NOT represent the text and authority as independently removable data
+AND treat a whitespace-only contribution as ineligible retained review text
 
 WHEN the user explicitly removes a review contribution
 THE SYSTEM SHALL remove its text and authority together
@@ -713,6 +716,8 @@ target, and the current content revision for every authority binding
 AND, when every binding remains valid, enqueue the exact rendered draft text and
 all staged image attachments through one ordinary durable message-queue entry
 according to `REQ-IOS-002`, `REQ-IOS-003`, and `REQ-IOS-015`
+AND SHALL NOT create a sendable ordinary queue entry before that message is
+durably persisted
 AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
@@ -726,6 +731,8 @@ unavailable chat, a changed live target, unavailable content, and a changed
 content revision
 AND allow the user to refresh and re-anchor that review contribution or
 explicitly discard that contribution while preserving unrelated draft text
+AND clear or recompute the displayed failure set whenever review authority
+changes so that no failure identifies a removed or repaired contribution
 
 WHEN the user attempts to close a reader with unsent notes
 THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`

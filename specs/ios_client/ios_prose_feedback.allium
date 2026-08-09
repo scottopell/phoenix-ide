@@ -44,6 +44,10 @@ use "../user_message_queue/user_message_queue.allium" as queue
 -- render_composer_draft(draft) -> String
 --   Joins plain segments and review authorities by position into the exact
 --   user-visible message text. No second stored text representation exists.
+-- is_blank(text) -> Boolean
+--   True when text contains no non-whitespace characters.
+-- message_payload_fingerprint(scope, local_id, text, images) -> String
+--   Produces one deterministic identity for the complete queue payload.
 -- review_authority_failures(draft) -> List<ReviewAuthorityFailure>
 --   Returns typed failures for every review authority that cannot submit. Each
 --   result identifies its contribution and one of: chat unavailable, live
@@ -105,10 +109,13 @@ external entity IosProductConversation {
 }
 
 -- Positive evidence that the version-fenced disk writer durably stored the
--- full visible outbox including entry. In-memory LocalQueueEntry creation is
--- not sufficient evidence.
-external entity PersistedLocalQueueEntry {
-    entry: queue/LocalQueueEntry
+-- full visible outbox including the exact fingerprinted message payload. The
+-- ordinary queue entry is not created, and therefore cannot become sendable,
+-- before this receipt exists.
+external entity ReviewOutboxPersistenceReceipt {
+    scope: queue/ConversationScope
+    local_id: String
+    payload_fingerprint: String
     persistence_revision: Integer
 }
 
@@ -146,6 +153,7 @@ entity ComposerDraft {
     plain_segments: PlainDraftSegment with draft = this
     review_authorities: ProseReviewAuthority with draft = this
     pending_enqueue: PendingReviewDraftEnqueue with draft = this
+    submission_block: ReviewSubmissionBlock with draft = this
 }
 
 entity PlainDraftSegment {
@@ -276,6 +284,13 @@ rule ReaderNotesReanchorToCurrentRevision {
             )
 }
 
+rule UserDiscardsIndividualReaderNote {
+    -- REQ-IOS-021
+    when: UserDiscardsProseReviewNote(note)
+
+    ensures: not exists note
+}
+
 rule EmptyReaderClosesImmediately {
     -- REQ-IOS-021, REQ-PF-011
     when: UserRequestsCloseProseReview(session)
@@ -327,12 +342,11 @@ rule ComposerDraftCreated {
             conversation: conversation,
             images: images
         )
-        if initial_text != "":
-            PlainDraftSegment.created(
-                draft: draft,
-                position: 0,
-                text: initial_text
-            )
+        PlainDraftSegment.created(
+            draft: draft,
+            position: 0,
+            text: initial_text
+        )
 }
 
 rule EligibleNotesBecomeReviewBoundDraftContribution {
@@ -363,6 +377,7 @@ rule EligibleNotesBecomeReviewBoundDraftContribution {
         file: session.file,
         content_revision: session.content_revision
     )
+    ensures: not exists draft.submission_block
     ensures:
         for note in session.notes:
             not exists note
@@ -381,7 +396,7 @@ rule UserEditsReviewContributionText {
     -- REQ-IOS-021
     when: UserEditsReviewContribution(authority, edited_text)
 
-    requires: edited_text != ""
+    requires: not is_blank(edited_text)
     requires: not exists authority.draft.pending_enqueue
 
     ensures: authority.text = edited_text
@@ -424,6 +439,7 @@ rule RefreshedNotesReplaceBoundDraftContribution {
     ensures: authority.work_scope = refreshed_session.work_scope
     ensures: authority.file = refreshed_session.file
     ensures: authority.content_revision = refreshed_session.content_revision
+    ensures: not exists authority.draft.submission_block
     ensures:
         for note in refreshed_session.notes:
             not exists note
@@ -434,8 +450,11 @@ rule UserDiscardsBoundReviewContribution {
     -- REQ-IOS-021
     when: UserDiscardsDraftReview(authority)
 
+    let draft = authority.draft
+
     requires: not exists authority.draft.pending_enqueue
 
+    ensures: not exists draft.submission_block
     ensures: not exists authority
 }
 
@@ -450,16 +469,17 @@ rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
     let local_id = new_local_message_id(draft)
     let message_text = render_composer_draft(draft)
 
-    requires: message_text != "" or draft.images != empty_list
+    requires: not is_blank(message_text) or draft.images != empty_list
     requires: draft.review_authorities.count > 0
     requires: not exists draft.pending_enqueue
+    requires: not exists draft.submission_block
     requires: review_authority_failures(draft) = empty_list
 
-    ensures: queue/UserSendsMessage(
-        draft.conversation.queue_scope,
-        local_id,
-        message_text,
-        draft.images
+    ensures: PersistReviewDraftMessage(
+        scope: draft.conversation.queue_scope,
+        local_id: local_id,
+        text: message_text,
+        images: draft.images
     )
     ensures: PendingReviewDraftEnqueue.created(
         draft: draft,
@@ -468,27 +488,41 @@ rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
     )
 }
 
-rule DurableQueuePersistenceClearsDraftReviewAuthority {
+rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
     -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
-    when: persistence: PersistedLocalQueueEntry.created
+    when: persistence: ReviewOutboxPersistenceReceipt.created
 
-    let entry = persistence.entry
     let pending_enqueue = PendingReviewDraftEnqueue{
-        scope: entry.scope,
-        local_id: entry.local_id
+        scope: persistence.scope,
+        local_id: persistence.local_id
     }
 
     requires: exists pending_enqueue
     requires: persistence.persistence_revision > 0
-    requires: entry.text = render_composer_draft(pending_enqueue.draft)
-    requires: entry.images = pending_enqueue.draft.images
+    requires: persistence.payload_fingerprint = message_payload_fingerprint(
+        persistence.scope,
+        persistence.local_id,
+        render_composer_draft(pending_enqueue.draft),
+        pending_enqueue.draft.images
+    )
 
+    ensures: queue/UserSendsMessage(
+        persistence.scope,
+        persistence.local_id,
+        render_composer_draft(pending_enqueue.draft),
+        pending_enqueue.draft.images
+    )
     ensures: pending_enqueue.draft.images = empty_list
     ensures:
         for segment in pending_enqueue.draft.plain_segments:
             not exists segment
         for authority in pending_enqueue.draft.review_authorities:
             not exists authority
+        PlainDraftSegment.created(
+            draft: pending_enqueue.draft,
+            position: 0,
+            text: ""
+        )
         not exists pending_enqueue
 }
 
@@ -500,6 +534,7 @@ rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
 
     requires: draft.review_authorities.count > 0
     requires: not exists draft.pending_enqueue
+    requires: not exists draft.submission_block
     requires: failures != empty_list
 
     ensures: ReviewSubmissionBlock.created(
