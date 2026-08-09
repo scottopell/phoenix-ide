@@ -615,19 +615,29 @@ cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative
 ### REQ-IOS-019: Inspect Conversation Grounding and Project Files
 
 WHEN the user opens a conversation's grounding surface
-THE SYSTEM SHALL show the project and working context attached to that
-conversation
+THE SYSTEM SHALL show every attached `WorkScope` that provides project or
+working context for that conversation
+AND identify each context root by its exact attached `WorkScope`
+AND bind context selection, file navigation, and displayed contents to that
+exact scope
+AND SHALL NOT collapse different attached scopes into one implicit project root
 AND distinguish unavailable, loading, stale, empty, and failed context
 
 WHEN the user browses a supported project file
 THE SYSTEM SHALL treat its path as a server-side location
 AND fetch and display the file's contents without offering phone-local file
 actions
+AND SHALL NOT offer an action whose effect is to open or reveal the path on the
+server host's desktop
 
 WHEN file contents cannot be fetched
-THE SYSTEM SHALL preserve any already-visible contents with a stale indicator
+THE SYSTEM SHALL preserve already-visible contents with a stale indicator only
+when those contents belong to the same exact attached `WorkScope` and requested
+file identity
 OR show an explicit unavailable or error state
 AND SHALL NOT present an empty document as a successful load
+AND SHALL NOT retain another scope's or file's contents under the requested
+file's selection
 
 **Rationale:** Mobile decisions often depend on the files and project state the
 agent is using. Read-only server-backed context provides that evidence without
@@ -657,21 +667,25 @@ requires a reading surface rather than a transcript card or raw-file dump.
 
 ### REQ-IOS-021: Comment on Project Prose Reliably
 
-WHEN the user creates a comment on a supported prose location
-THE SYSTEM SHALL keep the referenced file and source location understandable
-AND preserve the draft before attempting delivery
+WHEN the user creates a note on a supported prose location
+THE SYSTEM SHALL keep the server-side file path, source line, raw line content,
+and note understandable
+AND maintain the note in memory while that file's reader remains open
 
-WHEN comment delivery fails transiently
-THE SYSTEM SHALL keep the draft visible with Retry and Discard affordances
-AND SHALL NOT lose it when the reader is closed or the app restarts
+WHEN the user chooses Send for one or more notes
+THE SYSTEM SHALL format and inject them into the conversation's editable message
+input according to `REQ-PF-009`
+AND clear the notes and close the reader
+AND SHALL NOT deliver the notes independently of that message input
 
-WHEN the user leaves a reader with unsent comments
-THE SYSTEM SHALL require successful delivery or explicit discard
+WHEN the user attempts to close a reader with unsent notes
+THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`
 
-WHEN the referenced prose has changed enough that the original location cannot
-be identified safely
-THE SYSTEM SHALL surface the stale anchor and require the user to re-anchor or
-discard the comment
+WHEN the reader closes after Send or Discard
+THE SYSTEM SHALL NOT persist its notes
+AND reopening the file SHALL start a fresh review session with zero notes
+according to `REQ-PF-011`
 
-**Rationale:** Mobile review is only useful when feedback survives unreliable
-connectivity and still points to an understandable part of the document.
+**Rationale:** Session-scoped notes protect against accidental loss while the
+reader is open, then become an editable conversation draft so the user can add
+context before relying on the ordinary message-delivery contract.

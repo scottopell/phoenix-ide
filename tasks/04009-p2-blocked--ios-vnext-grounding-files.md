@@ -10,13 +10,14 @@ Blocked by ProductConversation migration and the rendering fixture harness.
 
 ## Scope
 
-Catalog the authoritative grounding, task/skill, worktree, Git-status, and file-content surfaces, then create numbered `REQ-IOS-019` leaf tasks for the native panel and file browser. File locations remain server-side handles; portable file contents must cross the API boundary. Each component leaf task adds its deterministic fixtures to the base harness.
+Catalog the authoritative grounding, task/skill, worktree, Git-status, and file-content surfaces, then create numbered `REQ-IOS-019` leaf tasks for the native panel and file browser. Every context root and file request remains bound to one exact attached `WorkScope`; portable file contents cross the API boundary, while server-host reveal/open actions are absent. Each component leaf task adds its deterministic fixtures to the base harness.
 
 ## Acceptance
 
-- Grounding is scoped to the ProductConversation and its attached environment.
+- Every grounding root identifies its exact attached `WorkScope`; multiple roots remain separately selectable.
 - The user can navigate supported server files and open their contents.
-- Remote/server-local actions are not presented as phone-local filesystem actions.
+- Navigation, contents, and stale fallback remain bound to the selected scope and requested file identity.
+- Phone-local and server-host desktop reveal/open actions are not offered.
 - Loading, empty, stale, offline, permission, missing-file, and error states are intentional.
 
 ## Out of scope
