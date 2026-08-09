@@ -152,6 +152,12 @@ pub enum SteeringDrainMessageStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteeringAcceptanceFingerprint {
+    Exact(String),
+    LegacyUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSearchMetadata {
     pub slug: String,
     pub archived: bool,
@@ -5194,6 +5200,15 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         for (ordinal, entry) in queue.iter().enumerate() {
+            sqlx::query(
+                "INSERT OR IGNORE INTO steering_acceptance_receipts
+                    (conversation_id, message_id, request_fingerprint)
+                 VALUES (?1, ?2, NULL)",
+            )
+            .bind(id)
+            .bind(&entry.message_id)
+            .execute(&mut *tx)
+            .await?;
             insert_steering_entry_tx(
                 &mut tx,
                 id,
@@ -5224,6 +5239,7 @@ impl Database {
         &self,
         id: &str,
         entry: &phoenix_core::domain::sm_event::SteerEntry,
+        request_fingerprint: &str,
     ) -> DbResult<usize> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
@@ -5237,6 +5253,16 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
+        sqlx::query(
+            "INSERT INTO steering_acceptance_receipts
+                (conversation_id, message_id, request_fingerprint)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(id)
+        .bind(&entry.message_id)
+        .bind(request_fingerprint)
+        .execute(&mut *tx)
+        .await?;
         insert_steering_entry_tx(&mut tx, id, ordinal, entry).await?;
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
@@ -5247,6 +5273,33 @@ impl Database {
 
         usize::try_from(queue_position)
             .map_err(|_| DbError::Serialization("steering queue position overflow".to_string()))
+    }
+
+    /// Load the immutable request fingerprint recorded when a steering
+    /// identity was accepted. A legacy receipt has no reconstructable
+    /// fingerprint and is represented explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the lookup fails.
+    pub async fn get_steering_acceptance_fingerprint(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> DbResult<Option<SteeringAcceptanceFingerprint>> {
+        let fingerprint: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT request_fingerprint
+             FROM steering_acceptance_receipts
+             WHERE conversation_id = ?1 AND message_id = ?2",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(fingerprint.map(|fingerprint| match fingerprint {
+            Some(exact) => SteeringAcceptanceFingerprint::Exact(exact),
+            None => SteeringAcceptanceFingerprint::LegacyUnknown,
+        }))
     }
 
     /// Remove one steering entry and report whether this call removed a row.
@@ -14382,13 +14435,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("a"))
+            db.append_steering_entry("conv-append", &entry("a"), "fp-a")
                 .await
                 .unwrap(),
             0
         );
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("b"))
+            db.append_steering_entry("conv-append", &entry("b"), "fp-b")
                 .await
                 .unwrap(),
             1
@@ -14396,7 +14449,13 @@ mod tests {
         assert!(db.remove_steering_entry("conv-append", "a").await.unwrap());
         assert!(!db.remove_steering_entry("conv-append", "a").await.unwrap());
         assert_eq!(
-            db.append_steering_entry("conv-append", &entry("c"))
+            db.get_steering_acceptance_fingerprint("conv-append", "a")
+                .await
+                .unwrap(),
+            Some(SteeringAcceptanceFingerprint::Exact("fp-a".to_string()))
+        );
+        assert_eq!(
+            db.append_steering_entry("conv-append", &entry("c"), "fp-c")
                 .await
                 .unwrap(),
             1
@@ -14409,6 +14468,69 @@ mod tests {
                 .map(|entry| entry.message_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_append_rolls_back_receipt_when_queue_insert_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("receipt-a", "receipt-a", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("receipt-b", "receipt-b", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.append_steering_entry("receipt-a", &steering_entry("shared"), "fp-a")
+            .await
+            .unwrap();
+
+        db.append_steering_entry("receipt-b", &steering_entry("shared"), "fp-b")
+            .await
+            .expect_err("global queue identity conflict must abort append");
+
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint("receipt-b", "shared")
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(db.get_steering_queue("receipt-b").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_queue_replace_records_unknown_receipt_without_overwriting_exact_receipt() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("receipt-legacy", "receipt-legacy", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.append_steering_entry(
+            "receipt-legacy",
+            &steering_entry("exact"),
+            "exact-fingerprint",
+        )
+        .await
+        .unwrap();
+
+        db.update_steering_queue(
+            "receipt-legacy",
+            &[steering_entry("exact"), steering_entry("legacy")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint("receipt-legacy", "exact")
+                .await
+                .unwrap(),
+            Some(SteeringAcceptanceFingerprint::Exact(
+                "exact-fingerprint".to_string()
+            ))
+        );
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint("receipt-legacy", "legacy")
+                .await
+                .unwrap(),
+            Some(SteeringAcceptanceFingerprint::LegacyUnknown)
         );
     }
 
@@ -14496,6 +14618,12 @@ mod tests {
         let conversation = db.get_conversation("drain-ok").await.unwrap();
         assert_eq!(conversation.state, next_state);
         assert_eq!(conversation.state_updated_at, state_updated_at);
+        assert_eq!(
+            db.get_steering_acceptance_fingerprint("drain-ok", "a")
+                .await
+                .unwrap(),
+            Some(SteeringAcceptanceFingerprint::LegacyUnknown)
+        );
     }
 
     #[tokio::test]

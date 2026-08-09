@@ -144,17 +144,6 @@ pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SteeringAcceptanceReceipt {
-    pub request_fingerprint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct SteeringAcceptanceKey {
-    pub conversation_id: String,
-    pub message_id: String,
-}
-
 #[derive(Default)]
 struct ConversationMutexGates {
     gates: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -250,8 +239,6 @@ pub struct RuntimeManager {
     /// with queue mutations. The database remains authoritative; this gate
     /// only prevents a newly-started executor from observing an older snapshot.
     steering_projection: ConversationMutexGates,
-    steering_acceptance_receipts:
-        AsyncMutex<HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -1522,7 +1509,6 @@ impl RuntimeManager {
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
-            steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -3604,13 +3590,6 @@ impl RuntimeManager {
         self.steering_projection.lock(conversation_id).await
     }
 
-    pub(crate) async fn lock_steering_acceptance_receipts(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<SteeringAcceptanceKey, SteeringAcceptanceReceipt>>
-    {
-        self.steering_acceptance_receipts.lock().await
-    }
-
     pub async fn send_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -3687,6 +3666,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
         event: Event,
+        request_fingerprint: &str,
     ) -> Result<(), String> {
         let Event::SteerMessage {
             ref text,
@@ -3720,7 +3700,7 @@ impl RuntimeManager {
             let _projection_guard = self.lock_steering_projection(conversation_id).await;
             let queue_position = self
                 .db()
-                .append_steering_entry(conversation_id, &new_entry)
+                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
                 .await
                 .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
             let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
@@ -5451,6 +5431,7 @@ mod scope_liveness_tests {
                     user_agent: None,
                     skill_invocation: None,
                 },
+                "startup-test-fingerprint",
             )
             .await
             .expect("seed queue");

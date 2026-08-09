@@ -37,6 +37,13 @@
 --   executor memory on startup. Startup drains use the same reducer and atomic
 --   transaction as live drains.
 --
+--   Accepted client identities also have an immutable durable fingerprint.
+--   This identity record is not queue state: the pending queue determines
+--   whether a request is queued, and the transcript determines whether it was
+--   delivered. An identity found in neither is terminal and cannot be admitted
+--   again. Legacy pending identities with no recoverable fingerprint are
+--   represented explicitly and validated against their durable queue payload.
+--
 -- Requirement traceability: REQ-STEER-001 through REQ-STEER-005
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -161,11 +168,13 @@ rule EnqueueSteeringMessage {
         -- message is still enqueued with llm_text absent.
         --
         -- Persistence order: Database::append_steering_entry inserts only the
-        -- new row and returns its committed zero-based FIFO position. Existing
-        -- rows are never rewritten, so a concurrent drain cannot be resurrected
-        -- from a stale queue snapshot. Only after commit does the runtime publish
+        -- new queue row and its immutable acceptance identity in one transaction,
+        -- then returns the committed zero-based FIFO position. Existing rows are
+        -- never rewritten, so a concurrent drain cannot be resurrected from a
+        -- stale queue snapshot. Only after commit does the runtime publish
         -- SteerMessageQueued and deliver Event::SteerMessage to the executor.
-        -- A failed append publishes no success event and no HTTP success.
+        -- A failed append persists neither row and publishes no success event or
+        -- HTTP success.
 }
 
 -- REQ-STEER-002
@@ -441,6 +450,15 @@ surface SteeringQueueApi {
     @guarantee PersistenceBeforeResponse
         -- In all cases that mutate the queue (enqueue, cancel), the DB reflects
         -- the new state before the HTTP response is returned to the caller.
+
+    @guarantee DurableSteeringIdempotency
+        -- A retry whose accepted identity is still queued returns the queued
+        -- outcome; an identity present in the transcript returns the delivered
+        -- outcome; an accepted identity present in neither returns a stable
+        -- terminal outcome. An exact fingerprint mismatch is rejected. A
+        -- legacy pending identity without a recoverable fingerprint is checked
+        -- against its durable queue payload. Cancellation and drain never erase
+        -- the immutable acceptance identity.
 
     @guarantee PendingQueueFencesDirectAcceptance
         -- Message admission is serialized per conversation from before state
