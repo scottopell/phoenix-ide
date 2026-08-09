@@ -350,128 +350,86 @@ async fn test_browser_eval_local() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_eval_inner_text_not_undefined() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r"<!DOCTYPE html>
-        <html>
-        <head><title>InnerText Test</title></head>
-        <body><p>Hello from innerText</p></body>
-        </html>",
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-eval-innertext");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.body.innerText"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of text: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("Hello from innerText"),
-        "Expected page text, got: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_eval_inner_html_slice_not_undefined() {
+async fn dom_eval_regressions_share_one_browser_fixture() {
     require_chrome!();
 
     let server = TestServer::start(
         r#"<!DOCTYPE html>
-        <html><head><title>Slice Test</title></head>
-        <body><div id="content">Slice test content</div></body>
+        <html><head><title>DOM Eval Test</title></head>
+        <body><div id="content">Hello from innerText</div></body>
         </html>"#,
     )
     .await;
 
-    let (ctx, manager) = test_context("test-eval-htmlslice");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+    let (ctx, manager) = test_context("test-dom-eval-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav_result = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            nav_result.is_success(),
+            "fixture navigation failed: {}",
+            nav_result.output()
+        );
 
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
-            ctx.clone(),
-        )
-        .await;
+        let eval_tool = BrowserEvalTool;
 
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of HTML: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("content") || result.output().len() > 10,
-        "Expected HTML content, got: {}",
-        result.output()
-    );
+        let inner_text = eval_tool
+            .run(
+                json!({"expression": "document.body.innerText"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_text.is_success(),
+            "innerText eval failed: {}",
+            inner_text.output()
+        );
+        assert!(
+            !inner_text.output().contains("undefined")
+                && inner_text.output().contains("Hello from innerText"),
+            "innerText regression: {}",
+            inner_text.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
+        let inner_html = eval_tool
+            .run(
+                json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_html.is_success(),
+            "innerHTML.slice eval failed: {}",
+            inner_html.output()
+        );
+        assert!(
+            !inner_html.output().contains("undefined") && inner_html.output().contains("content"),
+            "innerHTML.slice regression: {}",
+            inner_html.output()
+        );
 
-#[tokio::test]
-async fn test_eval_json_stringify_dom_not_undefined() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html><head><title>JSON Test</title></head>
-        <body><p id="msg">test content</p></body>
-        </html>"#,
-    )
+        let json_dom = eval_tool
+            .run(
+                json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            json_dom.is_success(),
+            "JSON.stringify DOM eval failed: {}",
+            json_dom.output()
+        );
+        assert!(
+            !json_dom.output().contains("undefined") && json_dom.output().contains("bodyText"),
+            "JSON.stringify DOM regression: {}",
+            json_dom.output()
+        );
+    })
     .await;
-
-    let (ctx, manager) = test_context("test-eval-jsonstringify");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let eval_tool = BrowserEvalTool;
-    // This is the exact pattern from the bug report
-    let result = eval_tool
-        .run(
-            json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of JSON: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("bodyText"),
-        "Expected JSON with bodyText key, got: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
+    outcome.expect("DOM eval regression scenario");
 }
 
 #[tokio::test]
