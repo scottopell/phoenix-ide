@@ -4284,21 +4284,26 @@ async fn cancel_conversation(
                 no_op: false,
             }));
         }
-        if matches!(effective_state, ConvState::Idle)
-            && state
-                .runtime
-                .db()
-                .has_steering_entries(&id)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?
-        {
-            state
-                .runtime
-                .send_event(&id, Event::SteeringQueueChanged)
-                .await
-                .map_err(|error| {
-                    AppError::Internal(format!("failed to wake steering queue: {error}"))
-                })?;
+        if matches!(effective_state, ConvState::Idle) {
+            match state.runtime.wake_deferred_steering(&id).await {
+                Ok(
+                    crate::runtime::SteeringWakeOutcome::Applied
+                    | crate::runtime::SteeringWakeOutcome::NothingToDrain,
+                ) => {}
+                Ok(crate::runtime::SteeringWakeOutcome::Conflict) => {
+                    return Err(AppError::Conflict(Box::new(
+                        ConflictErrorResponse::new(
+                            "Deferred steering could not be reconciled with the current conversation state",
+                            "steering_wake_conflict",
+                        ),
+                    )));
+                }
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to wake steering queue: {error}"
+                    )));
+                }
+            }
         }
         if cancelled_direct_turn.is_none() {
             tracing::debug!(
@@ -11673,7 +11678,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn retrying_cancel_repairs_failed_deferred_steering_wake() {
+    async fn later_idle_cancel_repairs_failed_deferred_steering_wake() {
         let state = make_test_state().await;
         let conversation_id = "c-retry-cancel-wake";
         state
@@ -11716,7 +11721,7 @@ pub(crate) mod hard_delete_cascade_tests {
         let Json(response) =
             cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
                 .await
-                .expect("idempotent cancel retry wakes deferred steering");
+                .expect("later idle cancellation wakes deferred steering");
 
         assert!(response.ok);
         assert!(response.no_op, "the direct turn was already terminal");
@@ -11741,7 +11746,7 @@ pub(crate) mod hard_delete_cascade_tests {
             }
         })
         .await
-        .expect("cancel retry repairs deferred steering wake");
+        .expect("later idle cancellation repairs deferred steering wake");
     }
 
     #[tokio::test]

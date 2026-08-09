@@ -229,6 +229,10 @@ rule DrainOnIdleEntry {
         -- queue ids in one transaction. Failure rolls back all three. Messages,
         -- state, and RequestLlm are published only after commit. A concurrent
         -- enqueue has a different id and survives the exact deletes.
+        -- If the transaction commits but the LLM task cannot start, the
+        -- committed LlmRequesting state remains authoritative. The runtime is
+        -- reconstructed from database truth and the ordinary startup recovery
+        -- issues one LLM request without recreating or redraining queue rows.
         --
         -- Startup routes the durable queue through this same reducer arm. A
         -- matching pre-transaction message is a typed legacy partial and is
@@ -484,11 +488,12 @@ surface SteeringQueueApi {
 
     @guarantee CancelledDirectTurnReleasesDeferredSteering
         -- Cancelling an unmaterialized direct turn while its conversation is
-        -- idle checks for durable deferred steering, then awaits an executor
-        -- wake after durable cancellation. The executor reloads queue authority
-        -- and submits the exact durable batch to the ordinary reducer-owned
-        -- drain transaction. A failed wake is reported so an idempotent cancel
-        -- retry can attempt the same DB-derived repair.
+        -- idle attempts an executor wake after durable cancellation. The wake
+        -- settles as Applied, NothingToDrain, or Conflict. NothingToDrain starts
+        -- no LLM request and leaves no idle runtime behind. Applied reloads queue
+        -- authority and submits the exact durable batch to the ordinary
+        -- reducer-owned drain transaction. Conflict reports that durable queue
+        -- work could not be reconciled with the current conversation state.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one

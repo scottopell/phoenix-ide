@@ -128,6 +128,16 @@ pub enum EvictionReason {
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
+    /// A one-shot steering wake found no durable work, or a committed
+    /// `LlmRequesting` state needs the ordinary runtime reconstruction path.
+    SteeringReconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteeringWakeOutcome {
+    Applied,
+    NothingToDrain,
+    Conflict,
 }
 
 #[derive(Debug)]
@@ -3560,7 +3570,7 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
-            EvictionReason::CreationProvisioned => {}
+            EvictionReason::CreationProvisioned | EvictionReason::SteeringReconciliation => {}
         }
 
         if let Some(handle) = old {
@@ -3606,6 +3616,59 @@ impl RuntimeManager {
         ack_rx
             .await
             .map_err(|_| "runtime stopped before event settled".to_string())?
+    }
+
+    pub(crate) async fn wake_deferred_steering(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<SteeringWakeOutcome, String> {
+        if !self
+            .db
+            .has_steering_entries(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(SteeringWakeOutcome::NothingToDrain);
+        }
+
+        if let Err(error) = self
+            .send_event(conversation_id, Event::SteeringQueueChanged)
+            .await
+        {
+            let conversation = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|db_error| db_error.to_string())?;
+            if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
+                self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+                    .await;
+                self.get_or_create(conversation_id).await?;
+                return Ok(SteeringWakeOutcome::Applied);
+            }
+            return Err(error);
+        }
+
+        let _projection_guard = self.lock_steering_projection(conversation_id).await;
+        let state = self
+            .effective_conversation_state(conversation_id)
+            .await
+            .ok_or_else(|| "steering wake lost its conversation state".to_string())?;
+        if state.is_busy() {
+            return Ok(SteeringWakeOutcome::Applied);
+        }
+        if self
+            .db
+            .has_steering_entries(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(SteeringWakeOutcome::Conflict);
+        }
+
+        self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+            .await;
+        Ok(SteeringWakeOutcome::NothingToDrain)
     }
 
     pub async fn send_event_and_wait_for_state(
@@ -3869,23 +3932,7 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
-        if matches!(conv.state, ConvState::LlmRequesting { .. })
-            && self
-                .db
-                .get_conversation_creation_job_for_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_some_and(|job| {
-                    matches!(
-                        job.protocol.status,
-                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
-                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
-                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
-                                ..
-                            }
-                    )
-                })
-        {
+        if matches!(conv.state, ConvState::LlmRequesting { .. }) {
             return Ok((conv.state, row_state_updated_at, false));
         }
 
@@ -4908,12 +4955,52 @@ mod scope_liveness_tests {
         )
     }
 
-    #[tokio::test]
-    async fn send_event_requires_runtime_settlement() {
-        let manager = Arc::new(test_manager().await);
-        let conversation_id = "send-event-settlement";
+    struct RecordingLlm {
+        requests: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for RecordingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            Ok(phoenix_llm::LlmResponse {
+                content: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    async fn test_manager_with_recording_llm(llm: Arc<RecordingLlm>) -> RuntimeManager {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm)),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        )
+    }
+
+    async fn insert_acknowledged_idle_handle(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) -> mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)> {
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let (acknowledged_event_tx, mut acknowledged_event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
         manager.runtimes.write().await.insert(
             conversation_id.to_string(),
@@ -4926,6 +5013,15 @@ mod scope_liveness_tests {
                 state_rx,
             },
         );
+        acknowledged_event_rx
+    }
+
+    #[tokio::test]
+    async fn send_event_requires_runtime_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "send-event-settlement";
+        let mut acknowledged_event_rx =
+            insert_acknowledged_idle_handle(&manager, conversation_id).await;
 
         let sender = {
             let manager = Arc::clone(&manager);
@@ -4950,6 +5046,179 @@ mod scope_liveness_tests {
                 .expect("runtime settlement rejection must not hang")
                 .unwrap(),
             Err("runtime stopped before event settled".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_wake_retires_runtime_when_guarded_reload_finds_no_work() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-wake-empty-reload";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "removed during startup".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "removed-before-wake".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "empty-reload-fingerprint",
+            )
+            .await
+            .expect("seed queue");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let wake = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.wake_deferred_steering(conversation_id).await })
+        };
+
+        barrier.wait().await;
+        let projection_guard = manager.lock_steering_projection(conversation_id).await;
+        assert!(manager
+            .db()
+            .remove_steering_entry(conversation_id, "removed-before-wake")
+            .await
+            .expect("remove final queue row"));
+        drop(projection_guard);
+        barrier.wait().await;
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), wake)
+            .await
+            .expect("wake must settle")
+            .expect("wake task joins")
+            .expect("empty guarded reload is a typed outcome");
+        assert_eq!(outcome, SteeringWakeOutcome::NothingToDrain);
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert!(manager
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .expect("messages")
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("conversation")
+                .state,
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_steering_dispatch_failure_reconstructs_one_llm_request() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "steering-post-commit-recovery";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "accepted once".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "post-commit-fingerprint",
+            )
+            .await
+            .expect("seed queue");
+
+        let mut acknowledged_event_rx =
+            insert_acknowledged_idle_handle(&manager, conversation_id).await;
+
+        let wake = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.wake_deferred_steering(conversation_id).await })
+        };
+        let (event, acknowledgement) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acknowledged_event_rx.recv(),
+        )
+        .await
+        .expect("wake reaches runtime in time")
+        .expect("wake reaches runtime");
+        assert!(matches!(event, Event::SteeringQueueChanged));
+
+        manager
+            .db()
+            .add_message(
+                "committed-steer",
+                conversation_id,
+                &crate::db::MessageContent::user("accepted once"),
+                None,
+                None,
+            )
+            .await
+            .expect("materialize accepted steer");
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .expect("persist requesting state");
+        assert!(manager
+            .db()
+            .remove_steering_entry(conversation_id, "committed-steer")
+            .await
+            .expect("remove committed queue row"));
+        acknowledgement
+            .send(Err("injected post-commit dispatch failure".to_string()))
+            .expect("return dispatch failure");
+
+        assert_eq!(
+            wake.await
+                .expect("wake task joins")
+                .expect("ordinary recovery reconstructs runtime"),
+            SteeringWakeOutcome::Applied
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), llm.started.notified())
+            .await
+            .expect("recovered LLM request starts");
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .expect("queue")
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .expect("messages")
+                .iter()
+                .filter(|message| message.message_id == "committed-steer")
+                .count(),
+            1
         );
     }
 

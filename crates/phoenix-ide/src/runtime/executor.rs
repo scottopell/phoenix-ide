@@ -5355,6 +5355,8 @@ where
                 match self.dispatch_llm_request().await {
                     Ok(event) => Ok(event),
                     Err(error) => {
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::RecreateFromDatabase;
                         tracing::error!(
                             conversation_id = %self.context.conversation_id,
                             %error,
@@ -5366,7 +5368,7 @@ where
                                 "start the queued steering turn",
                             ),
                         });
-                        Ok(None)
+                        Err(error)
                     }
                 }
             }
@@ -13133,6 +13135,48 @@ mod steer_drain_detector_tests {
         assert!(storage.get_all_messages("conv-clear-failure").is_empty());
         assert_eq!(storage.get_steering_queue("conv-clear-failure").len(), 1);
         assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_dispatch_failure_preserves_drain_and_requests_reconstruction() {
+        let conversation_id = "conv-post-commit-dispatch-failure";
+        let entry = mk_entry("accepted-steer", "accepted once");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![entry.clone()],
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let error = rt
+            .process_event(Event::SteeringQueueChanged)
+            .await
+            .expect_err("unsupported persisted effort fails before LLM task spawn");
+
+        assert!(error.contains("Persisted effort"));
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1,
+            "the committed user message remains authoritative"
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("committed state"),
+            ConvState::LlmRequesting { attempt: 1 }
+        );
+        assert!(rt.llm_task_handle.is_none());
         assert_eq!(
             rt.recovery_disposition,
             RuntimeRecoveryDisposition::RecreateFromDatabase
