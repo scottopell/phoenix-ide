@@ -2,7 +2,7 @@
 
 ## Product journey
 
-A parent Work conversation can run multiple Work child agents concurrently in the parent's writable environment. Work/Branch children share the parent worktree; Direct children share the parent cwd. Sibling writes are not locked, Phoenix performs no child merge, and assignments should be disjoint.
+A parent Work conversation can run multiple Work child agents concurrently without allowing overlapping writes to silently corrupt or replace sibling work. The architecture must provide an enforceable ownership, isolation, serialization, or conflict-detection boundary; LLM-authored assignment discipline alone is not a correctness boundary. Whether children share the parent writable environment directly or use isolated write targets is an architecture decision, not a precondition of the feature.
 
 This remains a desired P1 product feature. It is blocked until the ProductConversation Close/subagent settlement integration boundary is stable enough to build against. It must not delay, widen, or destabilize the P0 ProductConversation Close, settlement, WorkScope-retirement, History, or deletion stack.
 
@@ -10,8 +10,8 @@ This remains a desired P1 product feature. It is blocked until the ProductConver
 
 - **ChildMaterializationOwner:** define how fresh creation and reconstruction share one owner and one typed completion while preserving exactly-once initial task bootstrap.
 - **InstalledChildCancelRoute:** make an installed child structurally and immediately cancellable without waiting behind unrelated spawn materialization.
-- **ParentResultSink:** define who retains `{child_id, parent_id, outcome}` until exact parent acceptance, refreshes stale parent routes, retries delivery, and cleans up.
-- Decide explicitly whether terminal child results survive Phoenix process restart. If yes, design a durable outbox rather than hiding durability inside an in-memory enum.
+- **ParentResultSink:** define who durably retains `{child_id, parent_id, outcome}` until exact parent acceptance, refreshes stale parent routes, retries delivery across Phoenix process restart, and cleans up. REQ-SA-009 requires restart-durable terminal evidence and delivery; a process-local pending marker is insufficient.
+- **Write-conflict boundary:** choose and enforce structural write ownership, child isolation plus reconciliation, serialization, or conflict detection that covers every writable tool path. Prompt instructions and disjoint task descriptions are guidance only.
 - Define how ProductConversation Close consumes one typed subagent settlement operation without reproducing child lifecycle or fan-in authority.
 
 ## Authority constraints
@@ -36,6 +36,8 @@ This remains a desired P1 product feature. It is blocked until the ProductConver
 - Process-restart behavior is explicit and tested.
 - ProductConversation Close settles parallel children through one typed operation.
 - Sequential Work-child behavior remains valid.
+- Overlapping sibling write attempts cannot silently overwrite or interleave changes, including writes performed through bash or Git rather than patch.
+- A child terminal outcome persisted before Phoenix restart is reconstructed and delivered after restart when the parent has not yet accepted it.
 
 ## Timing
 
