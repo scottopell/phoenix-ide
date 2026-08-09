@@ -824,10 +824,8 @@ describe('ConversationPage context exhausted handoff', () => {
       conv_mode_label: 'Work',
     }));
 
-    const editButton = await screen.findByRole('button', { name: 'Edit first' });
-    fireEvent.click(editButton);
-    expect(editButton).not.toBeInTheDocument();
-    const handoff = screen.getByTestId('context-exhausted-handoff');
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit first' }));
+    const handoff = await screen.findByTestId('context-exhausted-handoff');
     fireEvent.change(handoff, { target: { value: 'Edited handoff for successor' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue with edits' }));
 
@@ -1232,7 +1230,7 @@ describe('ConversationPage archived read-only rendering', () => {
       options.dispatch({ type: 'sse_init', payload: tailPayload });
       options.onValidatedInit?.(tailPayload);
     });
-    expect(store.getSnapshot(slug).transcriptCoverage).toBe('tail');
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
 
     const preservePayload = {
       ...makeConnectionInit(conversation),
@@ -1270,9 +1268,7 @@ describe('ConversationPage archived read-only rendering', () => {
       options.onValidatedInit?.(payload);
     });
 
-    expect(store.getSnapshot(slug).transcriptCoverage).toBe('tail');
-    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
-    fireEvent.click(screen.getByRole('button', { name: 'Load older messages' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Load older messages' }));
 
     await waitFor(() => expect(api.getConversation).toHaveBeenCalledWith(conversationId));
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();

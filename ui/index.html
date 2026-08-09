@@ -5,23 +5,6 @@
     <link rel="icon" type="image/svg+xml" href="/phoenix.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Phoenix</title>
-    <script>
-      window.addEventListener('error', function (event) {
-        var target = event.target;
-        if (!(target instanceof HTMLScriptElement) || target.type !== 'module') return;
-        if (document.getElementById('phoenix-module-load-notice')) return;
-
-        var notice = document.createElement('div');
-        notice.id = 'phoenix-module-load-notice';
-        notice.setAttribute('role', 'alert');
-        notice.style.cssText = 'position:fixed;z-index:3000;right:16px;bottom:16px;display:flex;align-items:center;gap:10px;max-width:calc(100vw - 32px);padding:10px 12px;color:#24292f;background:#fff;border:1px solid #ef4444;border-radius:6px;box-shadow:0 8px 24px rgb(0 0 0 / 24%);font:13px system-ui,sans-serif';
-        notice.innerHTML = '<span style="flex:1">Phoenix could not start because a deployed UI module is unavailable.</span><button type="button" style="padding:5px 9px;color:white;background:#2563eb;border:0;border-radius:4px;cursor:pointer">Reload Phoenix</button>';
-        notice.querySelector('button').addEventListener('click', function () {
-          window.location.reload();
-        });
-        document.body.appendChild(notice);
-      }, true);
-    </script>
   </head>
   <body>
     <div id="root"></div>
