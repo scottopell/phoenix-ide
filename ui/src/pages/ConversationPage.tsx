@@ -1882,7 +1882,7 @@ function ConversationPageContent({
       const prs = openFileState;
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseFileViewer}>
             <FileViewer
               filePath={prs.path}
               rootDir={prs.rootDir}
@@ -1899,7 +1899,7 @@ function ConversationPageContent({
     if (paneDiffOpen && conversationId) {
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseDiff}>
             <ConversationDiffViewer
               conversationId={conversationId}
               target={diffTarget}
@@ -1915,7 +1915,7 @@ function ConversationPageContent({
     if (browserViewerOpen && conversationId) {
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseBrowserView}>
             <BrowserViewPanel
               conversationId={conversationId}
               onClose={handleCloseBrowserView}
@@ -1929,7 +1929,7 @@ function ConversationPageContent({
     if (inspectViewerOpen && inspectSlot) {
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseInspector}>
             <ProcessInspectorPanel
               handleId={inspectSlot.handleId}
               conversationId={conversationId}
@@ -1943,7 +1943,7 @@ function ConversationPageContent({
     if (messageViewerOpen && messageSlot) {
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseMessageViewer}>
             <MessageViewer
               sequenceId={messageSlot.sequenceId}
               messages={viewableMessages}
@@ -1958,7 +1958,7 @@ function ConversationPageContent({
     if (commissionReviewViewerOpen && commissionReviewSlot) {
       return (
         <div id="app">
-          <RecoverableLazyPanel>
+          <RecoverableLazyPanel onClose={handleCloseMessageViewer}>
             <CommissionReviewViewer
               sequenceId={commissionReviewSlot.requestSequenceId}
               messages={viewableMessages}

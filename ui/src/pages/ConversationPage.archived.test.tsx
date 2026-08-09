@@ -824,8 +824,10 @@ describe('ConversationPage context exhausted handoff', () => {
       conv_mode_label: 'Work',
     }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Edit first' }));
-    const handoff = await screen.findByTestId('context-exhausted-handoff');
+    const editButton = await screen.findByRole('button', { name: 'Edit first' });
+    fireEvent.click(editButton);
+    expect(editButton).not.toBeInTheDocument();
+    const handoff = screen.getByTestId('context-exhausted-handoff');
     fireEvent.change(handoff, { target: { value: 'Edited handoff for successor' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue with edits' }));
 

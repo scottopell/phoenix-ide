@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { RecoverableLazyPanel } from './RecoverableLazyPanel';
 
 function BrokenPanel(): never {
@@ -27,5 +27,19 @@ describe('RecoverableLazyPanel', () => {
       expect.any(TypeError),
       expect.any(String),
     );
+  });
+
+  it('offers a non-destructive close transition for a replacement viewer', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const onClose = vi.fn();
+
+    render(
+      <RecoverableLazyPanel onClose={onClose}>
+        <BrokenPanel />
+      </RecoverableLazyPanel>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Return to conversation' }));
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });
