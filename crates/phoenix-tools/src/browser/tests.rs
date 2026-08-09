@@ -1465,408 +1465,255 @@ async fn test_click_with_wait() {
 // TDD: browser_type tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_type_in_input() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-input");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type into input
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
+async fn reset_type_fixture(ctx: &ToolContext) {
+    let reset = BrowserEvalTool
         .run(
-            json!({"selector": "#input", "text": "Hello World"}),
+            json!({"expression": r"(() => {
+                for (const id of ['input', 'textarea', 'clear-input', 'append-input', 'special-input', 'password']) {
+                    const element = document.getElementById(id);
+                    element.value = '';
+                    element.setSelectionRange(0, 0);
+                    element.blur();
+                }
+                document.getElementById('clear-input').value = 'existing text';
+                document.getElementById('append-input').value = 'Hello ';
+                document.getElementById('mirror').textContent = '';
+                window.typeEvents = { input: 0, change: 0 };
+                document.body.focus();
+                return true;
+            })()"}),
             ctx.clone(),
         )
         .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
     assert!(
-        result.output().contains("Hello World"),
-        "Input value wrong: {}",
-        result.output()
+        reset.is_success() && reset.output().contains("true"),
+        "type fixture reset failed: {}",
+        reset.output()
     );
-
-    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
-async fn test_type_in_textarea() {
+#[allow(clippy::too_many_lines)]
+async fn type_regressions_share_one_browser_fixture() {
     require_chrome!();
 
     let server = TestServer::start(
         r#"<!DOCTYPE html>
         <html>
         <head><title>Type Test</title></head>
-        <body>
+        <body tabindex="-1">
+            <input type="text" id="input" />
             <textarea id="textarea"></textarea>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-textarea");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type multiline text
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#textarea", "text": "Line 1\nLine 2\nLine 3"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('textarea').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Line 1") && result.output().contains("Line 2"),
-        "Textarea value wrong: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_triggers_react_events() {
-    require_chrome!();
-
-    // Simulates React-like behavior: tracks input via event listeners
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
+            <input type="text" id="clear-input" value="existing text" />
+            <input type="text" id="append-input" value="Hello " />
+            <input type="text" id="special-input" />
+            <input type="password" id="password" />
             <div id="mirror"></div>
             <script>
+                window.typeEvents = { input: 0, change: 0 };
                 const input = document.getElementById('input');
-                const mirror = document.getElementById('mirror');
-                
-                // React-style: only updates on input event
-                input.addEventListener('input', (e) => {
-                    mirror.textContent = 'Value: ' + e.target.value;
+                input.addEventListener('input', (event) => {
+                    window.typeEvents.input += 1;
+                    document.getElementById('mirror').textContent = 'Value: ' + event.target.value;
                 });
+                input.addEventListener('change', () => window.typeEvents.change += 1);
             </script>
         </body>
         </html>"#,
     )
     .await;
 
-    let (ctx, manager) = test_context("test-type-react");
+    let (ctx, manager) = test_context("test-type-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let navigation = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            navigation.is_success(),
+            "type fixture navigation failed: {}",
+            navigation.output()
+        );
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+        let type_tool = BrowserTypeTool;
+        let eval_tool = BrowserEvalTool;
 
-    // Type into input - should trigger input events
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "React test"}),
-            ctx.clone(),
-        )
-        .await;
+        reset_type_fixture(&ctx).await;
+        let input = type_tool
+            .run(
+                json!({"selector": "#input", "text": "Hello World"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(input.is_success(), "input typing failed: {}", input.output());
+        let input_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('input').value === 'Hello World'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            input_value.is_success() && input_value.output().contains("true"),
+            "input value wrong: {}",
+            input_value.output()
+        );
 
-    assert!(result.is_success(), "Type failed: {}", result.output());
+        reset_type_fixture(&ctx).await;
+        let textarea = type_tool
+            .run(
+                json!({"selector": "#textarea", "text": "Line 1\nLine 2\nLine 3"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            textarea.is_success(),
+            "textarea typing failed: {}",
+            textarea.output()
+        );
+        let textarea_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('textarea').value === 'Line 1\\nLine 2\\nLine 3'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            textarea_value.is_success() && textarea_value.output().contains("true"),
+            "textarea value wrong: {}",
+            textarea_value.output()
+        );
 
-    // Verify event handler was triggered
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('mirror').textContent"}),
-            ctx.clone(),
-        )
-        .await;
+        reset_type_fixture(&ctx).await;
+        let events = type_tool
+            .run(
+                json!({"selector": "#input", "text": "React test"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(events.is_success(), "event typing failed: {}", events.output());
+        let event_state = eval_tool
+            .run(
+                json!({"expression": "({ mirror: document.getElementById('mirror').textContent, inputEvents: window.typeEvents.input, changeEvents: window.typeEvents.change })"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            event_state.is_success()
+                && event_state.output().contains("Value: React test")
+                && event_state.output().contains("inputEvents")
+                && !event_state.output().contains("inputEvents\":0"),
+            "React-style input event was not dispatched: {}",
+            event_state.output()
+        );
 
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("React test"),
-        "React-style event not triggered: {}",
-        result.output()
-    );
+        reset_type_fixture(&ctx).await;
+        let clear = type_tool
+            .run(
+                json!({"selector": "#clear-input", "text": "new text", "clear": true}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(clear.is_success(), "clear typing failed: {}", clear.output());
+        let clear_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('clear-input').value === 'new text'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            clear_value.is_success() && clear_value.output().contains("true"),
+            "clear did not replace the existing value: {}",
+            clear_value.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
+        reset_type_fixture(&ctx).await;
+        let append = type_tool
+            .run(
+                json!({"selector": "#append-input", "text": "World"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(append.is_success(), "append typing failed: {}", append.output());
+        let append_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('append-input').value === 'Hello World'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            append_value.is_success() && append_value.output().contains("true"),
+            "typing did not append: {}",
+            append_value.output()
+        );
 
-#[tokio::test]
-async fn test_type_with_clear() {
-    require_chrome!();
+        reset_type_fixture(&ctx).await;
+        let missing = type_tool
+            .run(
+                json!({"selector": "#nonexistent", "text": "hello"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(!missing.is_success(), "missing selector unexpectedly succeeded");
+        assert!(
+            missing.output().to_lowercase().contains("not found")
+                || missing.output().to_lowercase().contains("no element")
+                || missing.output().to_lowercase().contains("could not find"),
+            "missing selector error was unclear: {}",
+            missing.output()
+        );
 
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" value="existing text" />
-        </body>
-        </html>"#,
-    )
+        reset_type_fixture(&ctx).await;
+        let special_text = "Test <>&\"' special!@#$%";
+        let special = type_tool
+            .run(
+                json!({"selector": "#special-input", "text": special_text}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            special.is_success(),
+            "special-character typing failed: {}",
+            special.output()
+        );
+        let special_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('special-input').value === `Test <>&\\\"' special!@#$%`"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            special_value.is_success() && special_value.output().contains("true"),
+            "special characters were corrupted: {}",
+            special_value.output()
+        );
+
+        reset_type_fixture(&ctx).await;
+        let password = type_tool
+            .run(
+                json!({"selector": "#password", "text": "secret123"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            password.is_success(),
+            "password typing failed: {}",
+            password.output()
+        );
+        let password_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('password').type === 'password' && document.getElementById('password').value === 'secret123'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            password_value.is_success() && password_value.output().contains("true"),
+            "password field behavior changed: {}",
+            password_value.output()
+        );
+    })
     .await;
 
-    let (ctx, manager) = test_context("test-type-clear");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type with clear option - should replace existing text
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "new text", "clear": true}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify old text is gone
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("new text") && !result.output().contains("existing"),
-        "Clear didn't work: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_append() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" value="Hello " />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-append");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type without clear - should append
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(json!({"selector": "#input", "text": "World"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify text was appended
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Hello World") || result.output().contains("Hello  World"),
-        "Append didn't work: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_element_not_found() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body><div>No inputs here</div></body></html>").await;
-    let (ctx, manager) = test_context("test-type-not-found");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#nonexistent", "text": "hello"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(!result.is_success(), "Should fail when element not found");
-    assert!(
-        result.output().to_lowercase().contains("not found")
-            || result.output().to_lowercase().contains("no element")
-            || result.output().to_lowercase().contains("could not find"),
-        "Should mention element not found: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_special_characters() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-special");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type special characters
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "Test <>&\"' special!@#$%"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("<>&"),
-        "Special chars not typed: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_password_field() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="password" id="password" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-password");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type into password field
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#password", "text": "secret123"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value (password fields still have value attribute)
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('password').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("secret123"),
-        "Password not typed: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser type regression scenario");
 }
 
 // ============================================================================
