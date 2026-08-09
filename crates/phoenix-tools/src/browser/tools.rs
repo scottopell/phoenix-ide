@@ -1267,8 +1267,7 @@ async fn dispatch_key_cdp(
         .r#type(DispatchKeyEventType::RawKeyDown)
         .key(key.to_string())
         .code(code.to_string())
-        .windows_virtual_key_code(vk)
-        .native_virtual_key_code(vk);
+        .windows_virtual_key_code(vk);
     if let Some(m) = mod_opt {
         keydown = keydown.modifiers(m);
     }
@@ -1286,8 +1285,7 @@ async fn dispatch_key_cdp(
             .key(key.to_string())
             .code(code.to_string())
             .text(key_str.to_string())
-            .windows_virtual_key_code(vk)
-            .native_virtual_key_code(vk);
+            .windows_virtual_key_code(vk);
         if let Some(m) = mod_opt {
             kp = kp.modifiers(m);
         }
@@ -1304,8 +1302,7 @@ async fn dispatch_key_cdp(
         .r#type(DispatchKeyEventType::KeyUp)
         .key(key.to_string())
         .code(code.to_string())
-        .windows_virtual_key_code(vk)
-        .native_virtual_key_code(vk);
+        .windows_virtual_key_code(vk);
     if let Some(m) = mod_opt {
         keyup = keyup.modifiers(m);
     }
