@@ -108,94 +108,275 @@ pub struct SubAgentSpawnRequest {
     pub parent_turn_link: opentelemetry::trace::SpanContext,
 }
 
-/// Request to cancel sub-agents
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentCancelObligation {
+    CancelInstalled,
+    ReportQueuedCancellation,
+}
+
+/// Notification for a cancellation obligation already chosen by `SubAgentControl`.
 #[derive(Debug)]
-pub struct SubAgentCancelRequest {
-    pub ids: Vec<String>,
+struct SubAgentCancelRequest {
+    agent_id: String,
+    obligation: SubAgentCancelObligation,
     #[allow(dead_code)] // Used for logging/debugging
-    pub parent_conversation_id: String,
-    pub parent_event_tx: mpsc::Sender<Event>,
+    parent_conversation_id: String,
+    parent_event_tx: mpsc::Sender<Event>,
+}
+
+#[derive(Debug)]
+enum SubAgentControlNotification {
+    Spawn(Box<SubAgentSpawnRequest>),
+    Cancel(SubAgentCancelRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubAgentAdmissionState {
+enum SubAgentControlState {
     Queued,
     Materializing,
-    CancelRequestedWhileMaterializing,
-    Running,
-    CancelledBeforeMaterialization,
+    MaterializingCancelPending,
+    Installed,
+    InstalledCancelPending,
+    TerminalResultPending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubAgentSpawnAdmission {
-    Materialize,
-    SuppressCancelled,
-    SuppressDuplicate,
+pub(super) enum QueueSpawnOutcome {
+    Queued,
+    Duplicate,
+    ManagerUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubAgentCancelAdmission {
-    CancelRuntime,
-    TerminalizeQueued,
-    DeferredToMaterialization,
-    AlreadyTerminalized,
+enum BeginMaterializationOutcome {
+    Admit,
+    SuppressAndReportCancellation,
+    Inconsistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    Installed,
+    InstalledCancelPending,
+    Inconsistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResultPendingOutcome {
+    SendResult,
+    AlreadyPending,
+    Inconsistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RequestCancelOutcome {
+    ManagerNotified,
+    DeferredToInstallation,
+    AlreadyPending,
     UnknownIdentity,
+    ManagerUnavailable,
 }
 
-#[cfg(test)]
-impl SubAgentCancelAdmission {
-    const fn emits_parent_result(self) -> bool {
-        matches!(self, Self::TerminalizeQueued)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelNotificationOutcome {
+    Fulfill,
+    NoLongerPending,
+    Inconsistent,
+}
+
+#[derive(Debug)]
+pub(super) struct SubAgentControl {
+    states: AsyncMutex<HashMap<String, SubAgentControlState>>,
+    notification_tx: mpsc::UnboundedSender<SubAgentControlNotification>,
+}
+
+impl SubAgentControl {
+    fn new(notification_tx: mpsc::UnboundedSender<SubAgentControlNotification>) -> Self {
+        Self {
+            states: AsyncMutex::new(HashMap::new()),
+            notification_tx,
+        }
     }
-}
 
-#[derive(Debug, Default)]
-pub(super) struct SubAgentAdmissionFence {
-    states: AsyncMutex<HashMap<String, SubAgentAdmissionState>>,
-}
+    #[cfg(test)]
+    pub(super) fn disconnected_for_test() -> Arc<Self> {
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        drop(notification_rx);
+        Arc::new(Self::new(notification_tx))
+    }
 
-impl SubAgentAdmissionFence {
-    async fn queued(&self, agent_id: &str) -> bool {
+    pub(super) async fn queue_spawn(&self, request: SubAgentSpawnRequest) -> QueueSpawnOutcome {
+        use std::collections::hash_map::Entry;
+
+        let agent_id = request.spec.agent_id.clone();
+        let mut states = self.states.lock().await;
+        match states.entry(agent_id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(SubAgentControlState::Queued);
+            }
+            Entry::Occupied(_) => return QueueSpawnOutcome::Duplicate,
+        }
+        if self
+            .notification_tx
+            .send(SubAgentControlNotification::Spawn(Box::new(request)))
+            .is_err()
+        {
+            states.remove(&agent_id);
+            return QueueSpawnOutcome::ManagerUnavailable;
+        }
+        QueueSpawnOutcome::Queued
+    }
+
+    pub(super) async fn request_cancel(
+        &self,
+        ids: Vec<String>,
+        parent_conversation_id: String,
+        parent_event_tx: mpsc::Sender<Event>,
+    ) -> Vec<RequestCancelOutcome> {
+        let mut outcomes = Vec::with_capacity(ids.len());
+        let mut states = self.states.lock().await;
+        for agent_id in ids {
+            let (previous, next, success, obligation) = match states.get(&agent_id).copied() {
+                Some(SubAgentControlState::Queued) => (
+                    SubAgentControlState::Queued,
+                    SubAgentControlState::TerminalResultPending,
+                    RequestCancelOutcome::ManagerNotified,
+                    Some(SubAgentCancelObligation::ReportQueuedCancellation),
+                ),
+                Some(SubAgentControlState::Materializing) => (
+                    SubAgentControlState::Materializing,
+                    SubAgentControlState::MaterializingCancelPending,
+                    RequestCancelOutcome::DeferredToInstallation,
+                    None,
+                ),
+                Some(SubAgentControlState::Installed) => (
+                    SubAgentControlState::Installed,
+                    SubAgentControlState::InstalledCancelPending,
+                    RequestCancelOutcome::ManagerNotified,
+                    Some(SubAgentCancelObligation::CancelInstalled),
+                ),
+                Some(
+                    SubAgentControlState::MaterializingCancelPending
+                    | SubAgentControlState::InstalledCancelPending
+                    | SubAgentControlState::TerminalResultPending,
+                ) => {
+                    outcomes.push(RequestCancelOutcome::AlreadyPending);
+                    continue;
+                }
+                None => {
+                    outcomes.push(RequestCancelOutcome::UnknownIdentity);
+                    continue;
+                }
+            };
+            states.insert(agent_id.clone(), next);
+            let manager_unavailable = obligation.is_some_and(|obligation| {
+                self.notification_tx
+                    .send(SubAgentControlNotification::Cancel(SubAgentCancelRequest {
+                        agent_id: agent_id.clone(),
+                        obligation,
+                        parent_conversation_id: parent_conversation_id.clone(),
+                        parent_event_tx: parent_event_tx.clone(),
+                    }))
+                    .is_err()
+            });
+            if manager_unavailable {
+                states.insert(agent_id, previous);
+                outcomes.push(RequestCancelOutcome::ManagerUnavailable);
+            } else {
+                outcomes.push(success);
+            }
+        }
+        outcomes
+    }
+
+    async fn consume_cancel_notification(
+        &self,
+        agent_id: &str,
+        obligation: SubAgentCancelObligation,
+    ) -> CancelNotificationOutcome {
+        let states = self.states.lock().await;
+        match (obligation, states.get(agent_id)) {
+            (
+                SubAgentCancelObligation::CancelInstalled,
+                Some(SubAgentControlState::InstalledCancelPending),
+            )
+            | (
+                SubAgentCancelObligation::ReportQueuedCancellation,
+                Some(SubAgentControlState::TerminalResultPending),
+            ) => CancelNotificationOutcome::Fulfill,
+            (
+                SubAgentCancelObligation::CancelInstalled,
+                None | Some(SubAgentControlState::TerminalResultPending),
+            )
+            | (SubAgentCancelObligation::ReportQueuedCancellation, None) => {
+                CancelNotificationOutcome::NoLongerPending
+            }
+            _ => CancelNotificationOutcome::Inconsistent,
+        }
+    }
+
+    async fn begin_materialization(&self, agent_id: &str) -> BeginMaterializationOutcome {
+        let mut states = self.states.lock().await;
+        match states.get_mut(agent_id) {
+            Some(state @ SubAgentControlState::Queued) => {
+                *state = SubAgentControlState::Materializing;
+                BeginMaterializationOutcome::Admit
+            }
+            Some(SubAgentControlState::TerminalResultPending) => {
+                BeginMaterializationOutcome::SuppressAndReportCancellation
+            }
+            _ => BeginMaterializationOutcome::Inconsistent,
+        }
+    }
+
+    async fn restore_parent_pending<'a>(&self, agent_ids: impl IntoIterator<Item = &'a str>) {
+        let mut states = self.states.lock().await;
+        for agent_id in agent_ids {
+            states
+                .entry(agent_id.to_string())
+                .or_insert(SubAgentControlState::Materializing);
+        }
+    }
+
+    async fn begin_reconstruction(&self, agent_id: &str) -> bool {
         use std::collections::hash_map::Entry;
 
         let mut states = self.states.lock().await;
         match states.entry(agent_id.to_string()) {
             Entry::Vacant(entry) => {
-                entry.insert(SubAgentAdmissionState::Queued);
+                entry.insert(SubAgentControlState::Materializing);
                 true
             }
-            Entry::Occupied(_) => false,
+            Entry::Occupied(entry) => matches!(
+                entry.get(),
+                SubAgentControlState::Materializing
+                    | SubAgentControlState::MaterializingCancelPending
+            ),
         }
     }
 
-    async fn begin_spawn(&self, agent_id: &str) -> SubAgentSpawnAdmission {
+    async fn install_with_routing(
+        &self,
+        agent_id: &str,
+        handle: ConversationHandle,
+        runtimes: &RwLock<HashMap<String, ConversationHandle>>,
+    ) -> InstallOutcome {
         let mut states = self.states.lock().await;
-        match states.get(agent_id) {
-            Some(SubAgentAdmissionState::Queued) => {
-                states.insert(agent_id.to_string(), SubAgentAdmissionState::Materializing);
-                SubAgentSpawnAdmission::Materialize
+        let outcome = match states.get_mut(agent_id) {
+            Some(state @ SubAgentControlState::Materializing) => {
+                *state = SubAgentControlState::Installed;
+                InstallOutcome::Installed
             }
-            Some(SubAgentAdmissionState::CancelledBeforeMaterialization) => {
-                states.remove(agent_id);
-                SubAgentSpawnAdmission::SuppressCancelled
+            Some(state @ SubAgentControlState::MaterializingCancelPending) => {
+                *state = SubAgentControlState::InstalledCancelPending;
+                InstallOutcome::InstalledCancelPending
             }
-            _ => SubAgentSpawnAdmission::SuppressDuplicate,
+            _ => InstallOutcome::Inconsistent,
+        };
+        if outcome != InstallOutcome::Inconsistent {
+            runtimes.write().await.insert(agent_id.to_string(), handle);
         }
-    }
-
-    async fn materialized(&self, agent_id: &str) -> bool {
-        let mut states = self.states.lock().await;
-        match states.get(agent_id) {
-            Some(SubAgentAdmissionState::Materializing) => {
-                states.insert(agent_id.to_string(), SubAgentAdmissionState::Running);
-                false
-            }
-            Some(SubAgentAdmissionState::CancelRequestedWhileMaterializing) => {
-                states.remove(agent_id);
-                true
-            }
-            _ => false,
-        }
+        outcome
     }
 
     async fn materialization_failed(&self, agent_id: &str) {
@@ -203,70 +384,53 @@ impl SubAgentAdmissionFence {
         if matches!(
             states.get(agent_id),
             Some(
-                SubAgentAdmissionState::Materializing
-                    | SubAgentAdmissionState::CancelRequestedWhileMaterializing
+                SubAgentControlState::Materializing
+                    | SubAgentControlState::MaterializingCancelPending
             )
         ) {
             states.remove(agent_id);
         }
     }
 
-    async fn cancel(&self, agent_id: &str) -> SubAgentCancelAdmission {
-        use std::collections::hash_map::Entry;
-
-        let mut states = self.states.lock().await;
-        match states.entry(agent_id.to_string()) {
-            Entry::Vacant(_) => SubAgentCancelAdmission::UnknownIdentity,
-            Entry::Occupied(mut entry) => match entry.get() {
-                SubAgentAdmissionState::Queued => {
-                    entry.insert(SubAgentAdmissionState::CancelledBeforeMaterialization);
-                    SubAgentCancelAdmission::TerminalizeQueued
-                }
-                SubAgentAdmissionState::Materializing => {
-                    entry.insert(SubAgentAdmissionState::CancelRequestedWhileMaterializing);
-                    SubAgentCancelAdmission::DeferredToMaterialization
-                }
-                SubAgentAdmissionState::CancelRequestedWhileMaterializing
-                | SubAgentAdmissionState::CancelledBeforeMaterialization => {
-                    SubAgentCancelAdmission::AlreadyTerminalized
-                }
-                SubAgentAdmissionState::Running => {
-                    entry.remove();
-                    SubAgentCancelAdmission::CancelRuntime
-                }
-            },
-        }
+    #[cfg(test)]
+    pub(super) async fn install_for_test(&self, agent_id: &str) {
+        let replaced = self
+            .states
+            .lock()
+            .await
+            .insert(agent_id.to_string(), SubAgentControlState::Installed);
+        assert!(replaced.is_none(), "test child identity must be new");
     }
 
-    async fn queue_send_failed(&self, agent_id: &str) {
+    pub(super) async fn result_pending(&self, agent_id: &str) -> ResultPendingOutcome {
         let mut states = self.states.lock().await;
-        if matches!(
-            states.get(agent_id),
+        match states.get_mut(agent_id) {
             Some(
-                SubAgentAdmissionState::Queued
-                    | SubAgentAdmissionState::CancelledBeforeMaterialization
-            )
-        ) {
-            states.remove(agent_id);
+                state @ (SubAgentControlState::Materializing
+                | SubAgentControlState::MaterializingCancelPending
+                | SubAgentControlState::Installed
+                | SubAgentControlState::InstalledCancelPending),
+            ) => {
+                *state = SubAgentControlState::TerminalResultPending;
+                ResultPendingOutcome::SendResult
+            }
+            Some(SubAgentControlState::TerminalResultPending) => {
+                ResultPendingOutcome::AlreadyPending
+            }
+            _ => ResultPendingOutcome::Inconsistent,
         }
     }
 
-    async fn terminal_result_sent(&self, agent_id: &str) {
-        let mut states = self.states.lock().await;
-        if !matches!(
-            states.get(agent_id),
-            Some(SubAgentAdmissionState::CancelledBeforeMaterialization)
-        ) {
-            states.remove(agent_id);
-        }
+    pub(super) async fn result_sent(&self, agent_id: &str) {
+        self.states.lock().await.remove(agent_id);
     }
 }
 
-async fn send_cancelled_before_materialization(
+pub(super) async fn send_cancelled_before_materialization(
     parent_event_tx: &mpsc::Sender<Event>,
     agent_id: String,
-) {
-    let _ = parent_event_tx
+) -> bool {
+    parent_event_tx
         .send(Event::SubAgentResult {
             agent_id,
             outcome: SubAgentOutcome::Failure {
@@ -274,7 +438,22 @@ async fn send_cancelled_before_materialization(
                 error_kind: crate::db::ErrorKind::Cancelled,
             },
         })
-        .await;
+        .await
+        .is_ok()
+}
+
+async fn send_installation_cancel_if_pending(
+    install: InstallOutcome,
+    event_tx: &mpsc::Sender<Event>,
+) {
+    if install == InstallOutcome::InstalledCancelPending {
+        let _ = event_tx
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
+            .await;
+    }
 }
 
 /// Why a runtime was evicted. Passed to `evict_runtime` so the next
@@ -376,15 +555,10 @@ pub struct RuntimeManager {
     /// a handful of small `String`s for conversations evicted-for-upgrade but
     /// never re-accessed within one process lifetime — not worth a TTL.
     evicted_model_upgrades: RwLock<HashSet<String>>,
-    /// Channel for sub-agent spawn requests
-    spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
-    spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
-    /// Channel for sub-agent cancel requests
-    cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
-    cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
-    /// Child-identity admission fence shared by queued spawn and cancellation.
-    /// Parent fan-in remains authoritative for pending/result state.
-    sub_agent_admissions: Arc<SubAgentAdmissionFence>,
+    /// Required child admission/cancellation capability. Channels are notifications;
+    /// this control owns ordering while parent/child state machines own lifecycle.
+    sub_agent_control: Arc<SubAgentControl>,
+    sub_agent_notification_rx: RwLock<Option<mpsc::UnboundedReceiver<SubAgentControlNotification>>>,
     handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
     handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
     /// Channel to the single serialized fork-resolution consumer. Every fork
@@ -1540,8 +1714,7 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
-        let (spawn_tx, spawn_rx) = mpsc::channel(32);
-        let (cancel_tx, cancel_rx) = mpsc::channel(32);
+        let (sub_agent_notification_tx, sub_agent_notification_rx) = mpsc::unbounded_channel();
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
         let (fork_cmd_tx, fork_cmd_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
@@ -1595,11 +1768,8 @@ impl RuntimeManager {
             steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
-            spawn_tx,
-            spawn_rx: RwLock::new(Some(spawn_rx)),
-            cancel_tx,
-            cancel_rx: RwLock::new(Some(cancel_rx)),
-            sub_agent_admissions: Arc::new(SubAgentAdmissionFence::default()),
+            sub_agent_control: Arc::new(SubAgentControl::new(sub_agent_notification_tx)),
+            sub_agent_notification_rx: RwLock::new(Some(sub_agent_notification_rx)),
             handoff_tx,
             handoff_rx: RwLock::new(Some(handoff_rx)),
             fork_cmd_tx,
@@ -1698,18 +1868,6 @@ impl RuntimeManager {
 
     pub fn wake_registrar(&self) -> Option<Arc<dyn WakeRegistrar>> {
         self.wake_registrar.clone()
-    }
-
-    /// Get the spawn channel sender (cloned for each runtime)
-    #[allow(dead_code)] // Used internally by get_or_create
-    fn spawn_tx(&self) -> mpsc::Sender<SubAgentSpawnRequest> {
-        self.spawn_tx.clone()
-    }
-
-    /// Get the cancel channel sender (cloned for each runtime)
-    #[allow(dead_code)] // Used internally by get_or_create
-    fn cancel_tx(&self) -> mpsc::Sender<SubAgentCancelRequest> {
-        self.cancel_tx.clone()
     }
 
     /// Start the bridge task that converts `BrowserSessionManager` lifecycle
@@ -2504,43 +2662,39 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
 
         // Take the receivers (can only be done once)
-        let spawn_rx = self.spawn_rx.write().await.take();
-        let cancel_rx = self.cancel_rx.write().await.take();
+        let sub_agent_notification_rx = self.sub_agent_notification_rx.write().await.take();
         let handoff_rx = self.handoff_rx.write().await.take();
         let fork_cmd_rx = self.fork_cmd_rx.write().await.take();
 
-        if let (
-            Some(mut spawn_rx),
-            Some(mut cancel_rx),
-            Some(mut handoff_rx),
-            Some(mut fork_cmd_rx),
-        ) = (spawn_rx, cancel_rx, handoff_rx, fork_cmd_rx)
+        if let (Some(mut sub_agent_notification_rx), Some(mut handoff_rx), Some(mut fork_cmd_rx)) =
+            (sub_agent_notification_rx, handoff_rx, fork_cmd_rx)
         {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        Some(req) = spawn_rx.recv() => {
-                            let agent_id = req.spec.agent_id.clone();
-                            match manager.sub_agent_admissions.begin_spawn(&agent_id).await {
-                                SubAgentSpawnAdmission::Materialize => {
-                                    if manager.handle_spawn_request(req).await {
-                                        if manager.sub_agent_admissions.materialized(&agent_id).await {
-                                            manager.cancel_materialized_sub_agent(&agent_id).await;
+                        Some(notification) = sub_agent_notification_rx.recv() => {
+                            match notification {
+                                SubAgentControlNotification::Spawn(req) => {
+                                    let req = *req;
+                                    let agent_id = req.spec.agent_id.clone();
+                                    match manager.sub_agent_control.begin_materialization(&agent_id).await {
+                                        BeginMaterializationOutcome::Admit => {
+                                            if !manager.handle_spawn_request(req).await {
+                                                manager.sub_agent_control.materialization_failed(&agent_id).await;
+                                            }
                                         }
-                                    } else {
-                                        manager.sub_agent_admissions.materialization_failed(&agent_id).await;
+                                        BeginMaterializationOutcome::SuppressAndReportCancellation => {
+                                            tracing::info!(%agent_id, "Suppressing cancelled queued sub-agent spawn");
+                                        }
+                                        BeginMaterializationOutcome::Inconsistent => {
+                                            tracing::error!(%agent_id, "Sub-agent spawn notification has inconsistent control state");
+                                        }
                                     }
                                 }
-                                SubAgentSpawnAdmission::SuppressCancelled => {
-                                    tracing::info!(%agent_id, "Suppressing cancelled queued sub-agent spawn");
-                                }
-                                SubAgentSpawnAdmission::SuppressDuplicate => {
-                                    tracing::warn!(%agent_id, "Suppressing duplicate sub-agent spawn request");
+                                SubAgentControlNotification::Cancel(req) => {
+                                    manager.handle_cancel_request(req).await;
                                 }
                             }
-                        }
-                        Some(req) = cancel_rx.recv() => {
-                            manager.handle_cancel_request(req).await;
                         }
                         Some(req) = handoff_rx.recv() => {
                             manager.handle_task_handoff_request(req).await;
@@ -2579,6 +2733,37 @@ impl RuntimeManager {
         })
     }
 
+    async fn report_materialization_failure(
+        &self,
+        parent_event_tx: &mpsc::Sender<Event>,
+        agent_id: &str,
+        error: String,
+    ) {
+        match self.sub_agent_control.result_pending(agent_id).await {
+            ResultPendingOutcome::SendResult => {
+                let accepted = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: agent_id.to_string(),
+                        outcome: SubAgentOutcome::Failure {
+                            error,
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await
+                    .is_ok();
+                if accepted {
+                    self.sub_agent_control.result_sent(agent_id).await;
+                }
+            }
+            ResultPendingOutcome::AlreadyPending => {
+                tracing::debug!(%agent_id, "Sub-agent materialization result is already pending");
+            }
+            ResultPendingOutcome::Inconsistent => {
+                tracing::error!(%agent_id, "Sub-agent materialization failure has inconsistent control state");
+            }
+        }
+    }
+
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) -> bool {
@@ -2601,33 +2786,27 @@ impl RuntimeManager {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to look up parent conversation");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Failed to look up parent conversation: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
+                self.report_materialization_failure(
+                    &parent_event_tx,
+                    &spec.agent_id,
+                    format!("Failed to look up parent conversation: {e}"),
+                )
+                .await;
                 return false;
             }
         };
 
         if let Some(effort) = parent_conv.effort {
             if !self.llm_registry.supports_effort(&spec.model_id, effort) {
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!(
-                                "Parent effort '{effort}' is not supported by sub-agent model '{}'",
-                                spec.model_id
-                            ),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
+                self.report_materialization_failure(
+                    &parent_event_tx,
+                    &spec.agent_id,
+                    format!(
+                        "Parent effort '{effort}' is not supported by sub-agent model '{}'",
+                        spec.model_id
+                    ),
+                )
+                .await;
                 return false;
             }
         }
@@ -2647,15 +2826,12 @@ impl RuntimeManager {
             Ok(cwd) => cwd,
             Err(e) => {
                 tracing::warn!(agent_id = %spec.agent_id, cwd = %spec.cwd, error = %e, "Rejected sub-agent spawn with invalid cwd");
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Invalid sub-agent working directory: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
+                self.report_materialization_failure(
+                    &parent_event_tx,
+                    &spec.agent_id,
+                    format!("Invalid sub-agent working directory: {e}"),
+                )
+                .await;
                 return false;
             }
         };
@@ -2683,16 +2859,12 @@ impl RuntimeManager {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create sub-agent conversation");
-                // Notify parent of failure
-                let _ = parent_event_tx
-                    .send(Event::SubAgentResult {
-                        agent_id: spec.agent_id,
-                        outcome: SubAgentOutcome::Failure {
-                            error: format!("Failed to create conversation: {e}"),
-                            error_kind: crate::db::ErrorKind::SubAgentError,
-                        },
-                    })
-                    .await;
+                self.report_materialization_failure(
+                    &parent_event_tx,
+                    &spec.agent_id,
+                    format!("Failed to create conversation: {e}"),
+                )
+                .await;
                 return false;
             }
         };
@@ -2721,15 +2893,12 @@ impl RuntimeManager {
             .await
         {
             tracing::error!(error = %e, "Failed to add initial message");
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error: format!("Failed to add initial message: {e}"),
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
+            self.report_materialization_failure(
+                &parent_event_tx,
+                &spec.agent_id,
+                format!("Failed to add initial message: {e}"),
+            )
+            .await;
             return false;
         }
 
@@ -2818,12 +2987,11 @@ impl RuntimeManager {
             event_rx,
             event_tx.clone(),
             broadcaster.clone(),
+            self.sub_agent_control.clone(),
         )
         .with_wake_registrar(self.wake_registrar())
         .with_parent(parent_event_tx.clone())
         .with_acknowledged_event_receiver(acknowledged_event_rx)
-        .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-        .with_sub_agent_admission_fence(self.sub_agent_admissions.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
@@ -2842,19 +3010,28 @@ impl RuntimeManager {
             }
         }
 
-        // 7. Store handle
+        // 7. Install control state and routing as one handoff.
         let sub_agent_identity = Arc::new(());
-        self.runtimes.write().await.insert(
-            conv.id.clone(),
-            ConversationHandle {
-                event_tx: event_tx.clone(),
-                acknowledged_event_tx,
-                turn_trigger,
-                broadcast_tx: broadcaster.clone(),
-                identity: sub_agent_identity.clone(),
-                state_rx: sub_state_rx,
-            },
-        );
+        let install = self
+            .sub_agent_control
+            .install_with_routing(
+                &conv.id,
+                ConversationHandle {
+                    event_tx: event_tx.clone(),
+                    acknowledged_event_tx,
+                    turn_trigger,
+                    broadcast_tx: broadcaster.clone(),
+                    identity: sub_agent_identity.clone(),
+                    state_rx: sub_state_rx,
+                },
+                &self.runtimes,
+            )
+            .await;
+        if install == InstallOutcome::Inconsistent {
+            tracing::error!(agent_id = %conv.id, "Sub-agent installation has inconsistent control state");
+            return false;
+        }
+        send_installation_cancel_if_pending(install, &event_tx).await;
 
         // 8. Set up per-agent timeout — sends UserCancel if sub-agent exceeds its limit.
         // This is a safety net; the parent's AwaitingSubAgents deadline is the primary
@@ -2936,30 +3113,29 @@ impl RuntimeManager {
 
     /// Handle a sub-agent cancel request
     async fn handle_cancel_request(&self, req: SubAgentCancelRequest) {
-        let SubAgentCancelRequest {
-            ids,
-            parent_conversation_id: _,
-            parent_event_tx,
-        } = req;
-
-        for agent_id in ids {
-            match self.sub_agent_admissions.cancel(&agent_id).await {
-                SubAgentCancelAdmission::CancelRuntime => {
+        let agent_id = req.agent_id;
+        match self
+            .sub_agent_control
+            .consume_cancel_notification(&agent_id, req.obligation)
+            .await
+        {
+            CancelNotificationOutcome::Fulfill => match req.obligation {
+                SubAgentCancelObligation::CancelInstalled => {
                     self.cancel_materialized_sub_agent(&agent_id).await;
                 }
-                SubAgentCancelAdmission::TerminalizeQueued => {
-                    tracing::info!(%agent_id, "Terminalizing queued sub-agent before materialization");
-                    send_cancelled_before_materialization(&parent_event_tx, agent_id).await;
+                SubAgentCancelObligation::ReportQueuedCancellation => {
+                    if send_cancelled_before_materialization(&req.parent_event_tx, agent_id.clone())
+                        .await
+                    {
+                        self.sub_agent_control.result_sent(&agent_id).await;
+                    }
                 }
-                SubAgentCancelAdmission::DeferredToMaterialization => {
-                    tracing::info!(%agent_id, "Deferring sub-agent cancellation until materialization completes");
-                }
-                SubAgentCancelAdmission::AlreadyTerminalized => {
-                    tracing::debug!(%agent_id, "Ignoring duplicate sub-agent cancellation");
-                }
-                SubAgentCancelAdmission::UnknownIdentity => {
-                    tracing::debug!(%agent_id, "Ignoring cancellation for unknown or finished sub-agent identity");
-                }
+            },
+            CancelNotificationOutcome::NoLongerPending => {
+                tracing::debug!(%agent_id, "Ignoring stale sub-agent cancel notification");
+            }
+            CancelNotificationOutcome::Inconsistent => {
+                tracing::error!(%agent_id, "Sub-agent cancel notification has inconsistent control state");
             }
         }
     }
@@ -3088,6 +3264,13 @@ impl RuntimeManager {
         Ok(())
     }
 
+    fn get_or_create_boxed<'a>(
+        self: &'a Arc<Self>,
+        conversation_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<ConversationHandle, String>> {
+        Box::pin(self.get_or_create(conversation_id))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn materialize_runtime(
         self: &Arc<Self>,
@@ -3131,6 +3314,19 @@ impl RuntimeManager {
 
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();
+        if is_sub_agent
+            && !self
+                .sub_agent_control
+                .begin_reconstruction(conversation_id)
+                .await
+        {
+            return Err("sub-agent reconstruction has inconsistent control state".to_string());
+        }
+        let reconstructed_parent_event_tx = if let Some(parent_id) = &conv.parent_conversation_id {
+            Some(self.get_or_create_boxed(parent_id).await?.event_tx)
+        } else {
+            None
+        };
         let is_coordinator =
             !is_sub_agent && conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
         let conv_cwd = if is_coordinator {
@@ -3352,6 +3548,16 @@ impl RuntimeManager {
         let recovery_started = std::time::Instant::now();
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
+        if !is_sub_agent {
+            let pending = match &initial_state {
+                ConvState::AwaitingSubAgents { pending, .. }
+                | ConvState::CancellingSubAgents { pending, .. } => pending.as_slice(),
+                _ => &[],
+            };
+            self.sub_agent_control
+                .restore_parent_pending(pending.iter().map(|child| child.agent_id.as_str()))
+                .await;
+        }
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3439,6 +3645,7 @@ impl RuntimeManager {
             event_rx,
             event_tx.clone(),
             broadcaster.clone(),
+            self.sub_agent_control.clone(),
         );
         let runtime = runtime.with_acknowledged_event_receiver(acknowledged_event_rx);
         let runtime = if is_coordinator {
@@ -3454,11 +3661,14 @@ impl RuntimeManager {
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_steering_queue(steering_queue)
-            .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-            .with_sub_agent_admission_fence(self.sub_agent_admissions.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_catalog(agent_catalog);
+        let runtime = if let Some(parent_event_tx) = reconstructed_parent_event_tx {
+            runtime.with_parent(parent_event_tx)
+        } else {
+            runtime
+        };
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -3538,28 +3748,27 @@ impl RuntimeManager {
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
         // losing, not-yet-spawned executor.
-        {
-            let mut runtimes = self.runtimes.write().await;
-            if let Some(existing) = runtimes.get(conversation_id) {
-                let existing = existing.clone();
-                drop(runtimes);
-                self.evicted_broadcasters
-                    .write()
-                    .await
-                    .remove(conversation_id);
-                return Ok(existing);
+        if let Some(existing) = self.runtimes.read().await.get(conversation_id).cloned() {
+            self.evicted_broadcasters
+                .write()
+                .await
+                .remove(conversation_id);
+            return Ok(existing);
+        }
+        if is_sub_agent {
+            let install = self
+                .sub_agent_control
+                .install_with_routing(conversation_id, handle.clone(), &self.runtimes)
+                .await;
+            if install == InstallOutcome::Inconsistent {
+                return Err("sub-agent reconstruction has inconsistent control state".to_string());
             }
-            runtimes.insert(
-                conversation_id.to_string(),
-                ConversationHandle {
-                    event_tx,
-                    acknowledged_event_tx,
-                    turn_trigger,
-                    broadcast_tx: broadcaster,
-                    identity,
-                    state_rx,
-                },
-            );
+            send_installation_cancel_if_pending(install, &event_tx).await;
+        } else {
+            self.runtimes
+                .write()
+                .await
+                .insert(conversation_id.to_string(), handle.clone());
         }
 
         // The live handle is now reachable, so remove the manager-owned
@@ -4855,98 +5064,322 @@ mod broadcaster_tests {
 }
 
 #[cfg(test)]
-mod sub_agent_admission_fence_tests {
+mod sub_agent_control_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn cancellation_before_materialization_terminalizes_once_and_suppresses_spawn() {
-        let fence = SubAgentAdmissionFence::default();
+    fn control() -> (
+        SubAgentControl,
+        mpsc::UnboundedReceiver<SubAgentControlNotification>,
+    ) {
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        (SubAgentControl::new(notification_tx), notification_rx)
+    }
 
-        assert!(fence.queued("child").await);
-        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
-        assert_eq!(
-            cancellations,
-            [
-                SubAgentCancelAdmission::TerminalizeQueued,
-                SubAgentCancelAdmission::AlreadyTerminalized,
-            ]
-        );
-        let (parent_event_tx, mut parent_event_rx) = mpsc::channel(2);
-        for cancellation in cancellations {
-            if cancellation.emits_parent_result() {
-                send_cancelled_before_materialization(&parent_event_tx, "child".to_string()).await;
-            }
-        }
-        let result = parent_event_rx
-            .try_recv()
-            .expect("queued cancellation must send one parent result");
+    async fn seed_queued(control: &SubAgentControl, agent_id: &str) {
+        control
+            .states
+            .lock()
+            .await
+            .insert(agent_id.to_string(), SubAgentControlState::Queued);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_dequeue_suppresses_materialization_and_reports_once() {
+        let (control, mut notifications) = control();
+        seed_queued(&control, "child").await;
+
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(2);
+        let first = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx.clone(),
+            )
+            .await;
+        let duplicate = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx,
+            )
+            .await;
+
+        assert_eq!(first, vec![RequestCancelOutcome::ManagerNotified]);
+        assert_eq!(duplicate, vec![RequestCancelOutcome::AlreadyPending]);
         assert!(matches!(
-            result,
-            Event::SubAgentResult { ref agent_id, .. } if agent_id == "child"
+            notifications.try_recv(),
+            Ok(SubAgentControlNotification::Cancel(SubAgentCancelRequest {
+                agent_id,
+                obligation: SubAgentCancelObligation::ReportQueuedCancellation,
+                ..
+            })) if agent_id == "child"
         ));
-        assert!(
-            parent_event_rx.try_recv().is_err(),
-            "duplicate cancellation must not send a second parent result"
-        );
+        assert!(notifications.try_recv().is_err());
         assert_eq!(
-            fence.begin_spawn("child").await,
-            SubAgentSpawnAdmission::SuppressCancelled
-        );
-        assert!(fence.states.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn materialization_before_cancellation_cancels_runtime_once() {
-        let fence = SubAgentAdmissionFence::default();
-
-        assert!(fence.queued("child").await);
-        assert_eq!(
-            fence.begin_spawn("child").await,
-            SubAgentSpawnAdmission::Materialize
-        );
-        assert!(!fence.materialized("child").await);
-        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
-        assert_eq!(
-            cancellations,
-            [
-                SubAgentCancelAdmission::CancelRuntime,
-                SubAgentCancelAdmission::UnknownIdentity,
-            ]
-        );
-        assert_eq!(
-            cancellations
-                .iter()
-                .filter(|admission| admission.emits_parent_result())
-                .count(),
-            0
+            control.begin_materialization("child").await,
+            BeginMaterializationOutcome::SuppressAndReportCancellation
         );
     }
 
     #[tokio::test]
-    async fn cancellation_during_materialization_is_delivered_after_runtime_exists() {
-        let fence = SubAgentAdmissionFence::default();
+    async fn cancel_during_materialization_is_owed_at_installation_once() {
+        let (control, mut notifications) = control();
+        seed_queued(&control, "child").await;
+        assert_eq!(
+            control.begin_materialization("child").await,
+            BeginMaterializationOutcome::Admit
+        );
 
-        assert!(fence.queued("child").await);
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(2);
+        let first = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx.clone(),
+            )
+            .await;
+        let duplicate = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx,
+            )
+            .await;
+
+        assert_eq!(first, vec![RequestCancelOutcome::DeferredToInstallation]);
+        assert_eq!(duplicate, vec![RequestCancelOutcome::AlreadyPending]);
+        assert!(notifications.try_recv().is_err());
         assert_eq!(
-            fence.begin_spawn("child").await,
-            SubAgentSpawnAdmission::Materialize
+            control.states.lock().await.get("child"),
+            Some(&SubAgentControlState::MaterializingCancelPending)
         );
-        let cancellations = [fence.cancel("child").await, fence.cancel("child").await];
+    }
+
+    fn test_handle() -> ConversationHandle {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        ConversationHandle {
+            event_tx,
+            acknowledged_event_tx,
+            turn_trigger: Arc::new(Mutex::new(None)),
+            broadcast_tx: SseBroadcaster::new(1, 0),
+            identity: Arc::new(()),
+            state_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconstruction_fulfills_cancel_owed_at_installation() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        send_installation_cancel_if_pending(InstallOutcome::InstalledCancelPending, &event_tx)
+            .await;
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Event::UserCancel {
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconstruction_is_adopted_before_routing_publication() {
+        let (control, _notifications) = control();
+        let runtimes = RwLock::new(HashMap::new());
+        assert!(control.begin_reconstruction("child").await);
+        assert!(!runtimes.read().await.contains_key("child"));
+
         assert_eq!(
-            cancellations,
-            [
-                SubAgentCancelAdmission::DeferredToMaterialization,
-                SubAgentCancelAdmission::AlreadyTerminalized,
-            ]
+            control
+                .install_with_routing("child", test_handle(), &runtimes)
+                .await,
+            InstallOutcome::Installed
+        );
+        assert!(runtimes.read().await.contains_key("child"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_racing_reconstruction_is_owed_at_installation() {
+        let (control, mut notifications) = control();
+        let runtimes = RwLock::new(HashMap::new());
+        assert!(control.begin_reconstruction("child").await);
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(1);
+
+        assert_eq!(
+            control
+                .request_cancel(
+                    vec!["child".to_string()],
+                    "parent".to_string(),
+                    parent_event_tx,
+                )
+                .await,
+            vec![RequestCancelOutcome::DeferredToInstallation]
+        );
+        assert!(notifications.try_recv().is_err());
+        assert_eq!(
+            control
+                .install_with_routing("child", test_handle(), &runtimes)
+                .await,
+            InstallOutcome::InstalledCancelPending
+        );
+        assert!(runtimes.read().await.contains_key("child"));
+    }
+
+    #[tokio::test]
+    async fn failed_materialization_delivery_remains_pending() {
+        let (control, _notifications) = control();
+        seed_queued(&control, "child").await;
+        assert_eq!(
+            control.begin_materialization("child").await,
+            BeginMaterializationOutcome::Admit
+        );
+
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::SendResult
+        );
+        control.materialization_failed("child").await;
+
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::AlreadyPending
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_result_supersedes_unconsumed_installed_cancel_notification() {
+        let (control, mut notifications) = control();
+        control.install_for_test("child").await;
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(1);
+
+        assert_eq!(
+            control
+                .request_cancel(
+                    vec!["child".to_string()],
+                    "parent".to_string(),
+                    parent_event_tx,
+                )
+                .await,
+            vec![RequestCancelOutcome::ManagerNotified]
+        );
+        let SubAgentControlNotification::Cancel(request) =
+            notifications.try_recv().expect("cancel notification")
+        else {
+            panic!("expected cancel notification")
+        };
+        assert_eq!(
+            request.obligation,
+            SubAgentCancelObligation::CancelInstalled
+        );
+
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::SendResult
         );
         assert_eq!(
-            cancellations
-                .iter()
-                .filter(|admission| admission.emits_parent_result())
-                .count(),
-            0
+            control
+                .consume_cancel_notification(&request.agent_id, request.obligation)
+                .await,
+            CancelNotificationOutcome::NoLongerPending
         );
-        assert!(fence.materialized("child").await);
+    }
+
+    #[tokio::test]
+    async fn terminal_result_stays_pending_until_parent_acceptance() {
+        let (control, _notifications) = control();
+        control
+            .states
+            .lock()
+            .await
+            .insert("child".to_string(), SubAgentControlState::Installed);
+
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::SendResult
+        );
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::AlreadyPending
+        );
+        assert_eq!(
+            control.states.lock().await.get("child"),
+            Some(&SubAgentControlState::TerminalResultPending)
+        );
+
+        let (closed_parent_tx, closed_parent_rx) = mpsc::channel(1);
+        drop(closed_parent_rx);
+        assert!(closed_parent_tx
+            .send(Event::SubAgentResult {
+                agent_id: "child".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".to_string(),
+                },
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            control.states.lock().await.get("child"),
+            Some(&SubAgentControlState::TerminalResultPending)
+        );
+
+        let (parent_tx, mut parent_rx) = mpsc::channel(1);
+        parent_tx
+            .send(Event::SubAgentResult {
+                agent_id: "child".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "done".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        control.result_sent("child").await;
+
+        assert!(matches!(
+            parent_rx.try_recv(),
+            Ok(Event::SubAgentResult { agent_id, .. }) if agent_id == "child"
+        ));
+        assert!(!control.states.lock().await.contains_key("child"));
+    }
+
+    #[tokio::test]
+    async fn cancel_after_installation_notifies_manager_once() {
+        let (control, mut notifications) = control();
+        control
+            .states
+            .lock()
+            .await
+            .insert("child".to_string(), SubAgentControlState::Installed);
+
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(2);
+        let first = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx.clone(),
+            )
+            .await;
+        let duplicate = control
+            .request_cancel(
+                vec!["child".to_string()],
+                "parent".to_string(),
+                parent_event_tx,
+            )
+            .await;
+
+        assert_eq!(first, vec![RequestCancelOutcome::ManagerNotified]);
+        assert_eq!(duplicate, vec![RequestCancelOutcome::AlreadyPending]);
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(SubAgentControlNotification::Cancel(SubAgentCancelRequest {
+                agent_id,
+                obligation: SubAgentCancelObligation::CancelInstalled,
+                ..
+            })) if agent_id == "child"
+        ));
+        assert!(notifications.try_recv().is_err());
     }
 }
 

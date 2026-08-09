@@ -3,6 +3,7 @@
 //! These mocks enable integration testing without real I/O.
 
 use super::traits::*;
+use super::SubAgentControl;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
 use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
@@ -1533,6 +1534,7 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
             event_rx,
             event_tx.clone(),
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         );
 
         let handle = tokio::spawn(async move {
@@ -1866,6 +1868,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -1990,6 +1993,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -2096,6 +2100,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -2212,6 +2217,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -2322,6 +2328,7 @@ mod tests {
             event_rx,
             event_tx,
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -2774,6 +2781,7 @@ mod tests {
             event_rx,
             event_tx,
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         // 11 tasks: one over the cap of 10.
@@ -2873,6 +2881,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -2986,6 +2995,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         )
         .with_parent_tool_cycle_cap(3);
 
@@ -3120,6 +3130,7 @@ mod tests {
                 event_rx,
                 event_tx.clone(),
                 broadcast_tx,
+                SubAgentControl::disconnected_for_test(),
             );
 
             // Runtime runs until its outcome_rx/event_rx both become empty
@@ -3568,6 +3579,7 @@ mod tests {
             event_rx,
             event_tx.clone(),
             broadcast_tx,
+            SubAgentControl::disconnected_for_test(),
         );
 
         tokio::spawn(async move { runtime.run().await });
@@ -3717,6 +3729,8 @@ mod tests {
             assistant_message,
             pending_sub_agents: vec![],
         };
+        let sub_agent_control = SubAgentControl::disconnected_for_test();
+        sub_agent_control.install_for_test("sub-1").await;
         let runtime = ConversationRuntime::new(
             context,
             initial_state,
@@ -3731,6 +3745,7 @@ mod tests {
             event_rx,
             event_tx,
             broadcast_tx,
+            sub_agent_control,
         )
         .with_parent(parent_tx);
 

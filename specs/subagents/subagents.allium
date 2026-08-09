@@ -144,26 +144,40 @@ rule WorkSubAgentRequiresWriteableParent {
         -- read-only sub-agents.
 }
 
--- Cancellation is authoritative over queued spawn admission. A child identity
--- terminalized before materialization cannot later create a runtime, execute
--- tools, or emit a second parent result. If materialization wins first,
--- cancellation is delivered to that one runtime and its normal result remains
--- the parent fan-in event.
+-- Child control owns only admission and cancellation ordering. Spawn/cancel
+-- channels are notifications; their consumer order cannot decide whether a
+-- child may materialize. The child state machine owns execution/result truth,
+-- the parent state machine owns pending fan-in, and the runtime registry owns
+-- routing only. Fresh and reconstructed children pass through the same install
+-- handoff before routing publication.
 rule CancelQueuedSubAgentBeforeMaterialization {
     when: QueuedSubAgentCancellationRequested(parent, task)
     requires: SpawnAdmissionQueued(task.agent_id)
-    ensures: SpawnAdmissionDenied(task.agent_id)
+    ensures: TerminalResultPending(task.agent_id)
     ensures: SubAgentReportsResult(parent,
         result: cancelled_result_for(task.agent_id))
 }
 
 rule SuppressCancelledQueuedSpawn {
     when: QueuedSubAgentSpawnDequeued(parent, task)
-    requires: SpawnAdmissionDenied(task.agent_id)
+    requires: TerminalResultPending(task.agent_id)
     ensures: not SubAgentRuntimeCreated(task.agent_id)
     ensures: not SubAgentToolsExecuted(task.agent_id)
     ensures: not SubAgentReportsResult(parent,
         result: any_additional_result_for(task.agent_id))
+}
+
+rule SubAgentInstalledBeforeRoutingPublication {
+    when: SubAgentRuntimeConstructed(sub_agent)
+    requires: sub_agent.parent != none
+    ensures: SubAgentControlInstalled(sub_agent.id)
+    ensures: SubAgentRoutingPublishedAfterControlInstall(sub_agent.id)
+}
+
+rule SubAgentResultAccepted {
+    when: SubAgentReportsResult(parent, result)
+    requires: ParentResultAccepted(parent, result)
+    ensures: not TerminalResultPending(result.agent_id)
 }
 
 -- ===========================================================

@@ -15,15 +15,9 @@
 
 use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
-    SseBroadcaster, SseEvent, SubAgentAdmissionFence, SubAgentCancelRequest, SubAgentSpawnRequest,
-    TaskApprovalHandoffData, TaskApprovalHandoffRequest,
+    QueueSpawnOutcome, RequestCancelOutcome, ResultPendingOutcome, SseBroadcaster, SseEvent,
+    SubAgentControl, SubAgentSpawnRequest, TaskApprovalHandoffData, TaskApprovalHandoffRequest,
 };
-
-struct SubAgentChannels {
-    spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
-    cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
-    admissions: Arc<SubAgentAdmissionFence>,
-}
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
@@ -1823,8 +1817,8 @@ where
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
-    /// Parent-side spawn/cancel capability and its shared child-identity admission fence.
-    sub_agent_channels: Option<Box<SubAgentChannels>>,
+    /// Required shared child admission/cancellation capability.
+    sub_agent_control: Arc<SubAgentControl>,
 
     handoff_tx: Option<mpsc::Sender<TaskApprovalHandoffRequest>>,
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
@@ -1950,6 +1944,7 @@ where
         event_rx: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
         broadcast_tx: SseBroadcaster,
+        sub_agent_control: Arc<SubAgentControl>,
     ) -> Self {
         // Generation-tagged, per-effect outcome channels. Background tasks send
         // typed outcomes (LlmOutcome, ToolExecOutcome, retry fires) through
@@ -2001,7 +1996,7 @@ where
             retry_outcome_tx,
             retry_outcome_rx,
             parent_event_tx: None,
-            sub_agent_channels: None,
+            sub_agent_control,
             handoff_tx: None,
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
@@ -2125,30 +2120,6 @@ where
     /// parent conversations so both surfaces share one catalog (REQ-AG-008).
     pub fn with_agent_catalog(mut self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
         self.agent_catalog = catalog;
-        self
-    }
-
-    /// Set the spawn/cancel channels (for parent conversations)
-    pub fn with_spawn_channels(
-        mut self,
-        spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
-        cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
-    ) -> Self {
-        self.sub_agent_channels = Some(Box::new(SubAgentChannels {
-            spawn_tx,
-            cancel_tx,
-            admissions: Arc::new(SubAgentAdmissionFence::default()),
-        }));
-        self
-    }
-
-    pub fn with_sub_agent_admission_fence(
-        mut self,
-        admissions: Arc<SubAgentAdmissionFence>,
-    ) -> Self {
-        if let Some(channels) = &mut self.sub_agent_channels {
-            channels.admissions = admissions;
-        }
         self
     }
 
@@ -3976,7 +3947,7 @@ where
             });
         }
 
-        // Captured before borrowing spawn_tx (current_turn_span needs &mut
+        // Captured before borrowing the control (current_turn_span needs &mut
         // self). Each sub-agent's turn links back to this span; the context
         // is extracted here, while the turn span is open, because a closed
         // span no longer resolves to an OTel context.
@@ -3990,35 +3961,12 @@ where
                 .clone()
         };
 
-        // All specs validated; require a spawn channel before sending any.
-        let Some(channels) = &self.sub_agent_channels else {
-            tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
-            let result = ToolResult::error(
-                tool_use_id.clone(),
-                "Sub-agent spawning not configured".to_string(),
-            );
-            return Ok(Some(Event::ToolComplete {
-                tool_use_id,
-                result,
-            }));
-        };
-        let spawn_tx = &channels.spawn_tx;
-        let admissions = &channels.admissions;
+        // All specs validated; require the shared control before sending any.
+        let control = &self.sub_agent_control;
 
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
             let agent_id = spec.agent_id.clone();
-            if !Box::pin(admissions.queued(&agent_id)).await {
-                tracing::error!(%agent_id, "Duplicate sub-agent identity rejected by admission fence");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    "Duplicate sub-agent identity".to_string(),
-                );
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id,
-                    result,
-                }));
-            }
             let pending = PendingSubAgent {
                 agent_id: agent_id.clone(),
                 task: spec.task.clone(),
@@ -4030,19 +3978,31 @@ where
                 parent_event_tx: self.event_tx.clone(),
                 parent_turn_link: parent_turn_link.clone(),
             };
-            if let Err(e) = spawn_tx.send(request).await {
-                Box::pin(admissions.queue_send_failed(&agent_id)).await;
-                tracing::error!(error = %e, "Failed to send spawn request");
-                let result = ToolResult::error(
-                    tool_use_id.clone(),
-                    format!("Failed to spawn sub-agents: {e}"),
-                );
-                return Ok(Some(Event::ToolComplete {
-                    tool_use_id,
-                    result,
-                }));
+            match Box::pin(control.queue_spawn(request)).await {
+                QueueSpawnOutcome::Queued => spawned.push(pending),
+                QueueSpawnOutcome::Duplicate => {
+                    tracing::error!(%agent_id, "Duplicate sub-agent identity rejected by control");
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        "Duplicate sub-agent identity".to_string(),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+                QueueSpawnOutcome::ManagerUnavailable => {
+                    tracing::error!(%agent_id, "Sub-agent manager unavailable");
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        "Failed to spawn sub-agent: manager unavailable".to_string(),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
             }
-            spawned.push(pending);
         }
 
         // Build success result
@@ -4887,18 +4847,30 @@ where
             Effect::CancelSubAgents { ids } => {
                 tracing::info!(?ids, "Cancelling sub-agents");
 
-                if let Some(channels) = &self.sub_agent_channels {
-                    let cancel_tx = &channels.cancel_tx;
-                    let request = SubAgentCancelRequest {
+                {
+                    let outcomes = Box::pin(self.sub_agent_control.request_cancel(
                         ids,
-                        parent_conversation_id: self.context.conversation_id.clone(),
-                        parent_event_tx: self.event_tx.clone(),
-                    };
-                    if let Err(e) = cancel_tx.send(request).await {
-                        tracing::error!(error = %e, "Failed to send cancel request");
+                        self.context.conversation_id.clone(),
+                        self.event_tx.clone(),
+                    ))
+                    .await;
+                    for outcome in outcomes {
+                        match outcome {
+                            RequestCancelOutcome::UnknownIdentity => {
+                                tracing::error!(
+                                    "Sub-agent cancellation targeted an unknown identity"
+                                );
+                            }
+                            RequestCancelOutcome::ManagerUnavailable => {
+                                tracing::error!(
+                                    "Sub-agent control manager unavailable during cancellation"
+                                );
+                            }
+                            RequestCancelOutcome::ManagerNotified
+                            | RequestCancelOutcome::DeferredToInstallation
+                            | RequestCancelOutcome::AlreadyPending => {}
+                        }
                     }
-                } else {
-                    tracing::warn!("No cancel channel configured, cannot cancel sub-agents");
                 }
                 Ok(None)
             }
@@ -4906,20 +4878,39 @@ where
             Effect::NotifyParent { outcome } => {
                 tracing::info!(?outcome, "Notifying parent of sub-agent completion");
 
-                if let Some(parent_tx) = &self.parent_event_tx {
-                    let agent_id = self.context.conversation_id.clone();
-                    let event = Event::SubAgentResult {
-                        agent_id: agent_id.clone(),
-                        outcome,
-                    };
-                    if let Err(e) = parent_tx.send(event).await {
-                        // Parent may have terminated - that's OK
-                        tracing::warn!(error = %e, "Failed to notify parent (may have terminated)");
-                    } else if let Some(channels) = &self.sub_agent_channels {
-                        Box::pin(channels.admissions.terminal_result_sent(&agent_id)).await;
+                let agent_id = self.context.conversation_id.clone();
+                match Box::pin(self.sub_agent_control.result_pending(&agent_id)).await {
+                    ResultPendingOutcome::SendResult => {
+                        if let Some(parent_tx) = &self.parent_event_tx {
+                            let event = Event::SubAgentResult {
+                                agent_id: agent_id.clone(),
+                                outcome,
+                            };
+                            if let Err(e) = parent_tx.send(event).await {
+                                tracing::warn!(
+                                    error = %e,
+                                    agent_id,
+                                    "Failed to notify parent; terminal result remains pending"
+                                );
+                            } else {
+                                Box::pin(self.sub_agent_control.result_sent(&agent_id)).await;
+                            }
+                        } else {
+                            tracing::warn!(
+                                agent_id,
+                                "No parent channel configured; terminal result remains pending"
+                            );
+                        }
                     }
-                } else {
-                    tracing::warn!("No parent channel configured for sub-agent");
+                    ResultPendingOutcome::AlreadyPending => {
+                        tracing::debug!(agent_id, "Sub-agent terminal result is already pending");
+                    }
+                    ResultPendingOutcome::Inconsistent => {
+                        tracing::error!(
+                            agent_id,
+                            "Sub-agent terminal result has inconsistent control state"
+                        );
+                    }
                 }
                 Ok(None)
             }
@@ -9095,6 +9086,7 @@ mod dispatch_context_budget_tests {
             event_rx,
             event_tx,
             SseBroadcaster::new(16, 0),
+            SubAgentControl::disconnected_for_test(),
         );
 
         runtime
@@ -9115,6 +9107,85 @@ mod dispatch_context_budget_tests {
             "only the provider can authoritatively reject the assembled request"
         );
         assert_eq!(requests[0].reserved_output_tokens(), 16_384);
+    }
+}
+
+#[cfg(test)]
+mod notify_parent_effect_tests {
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn runtime(control: Arc<SubAgentControl>, parent_tx: mpsc::Sender<Event>) -> TestRuntime {
+        let context = ConvContext::new("child", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (event_tx, event_rx) = mpsc::channel(8);
+        ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            Arc::new(InMemoryStorage::new()),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            SseBroadcaster::new(16, 0),
+            control,
+        )
+        .with_parent(parent_tx)
+    }
+
+    fn success_effect() -> Effect {
+        Effect::NotifyParent {
+            outcome: SubAgentOutcome::Success {
+                result: "done".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_parent_delivery_keeps_terminal_result_pending() {
+        let control = SubAgentControl::disconnected_for_test();
+        control.install_for_test("child").await;
+        let (parent_tx, parent_rx) = mpsc::channel(1);
+        drop(parent_rx);
+        let mut runtime = runtime(control.clone(), parent_tx);
+
+        runtime.execute_effect(success_effect()).await.unwrap();
+
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::AlreadyPending
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_callback_emits_one_parent_result() {
+        let control = SubAgentControl::disconnected_for_test();
+        control.install_for_test("child").await;
+        let (parent_tx, mut parent_rx) = mpsc::channel(2);
+        let mut runtime = runtime(control.clone(), parent_tx);
+
+        runtime.execute_effect(success_effect()).await.unwrap();
+        runtime.execute_effect(success_effect()).await.unwrap();
+
+        assert!(matches!(
+            parent_rx.try_recv(),
+            Ok(Event::SubAgentResult { agent_id, .. }) if agent_id == "child"
+        ));
+        assert!(parent_rx.try_recv().is_err());
+        assert_eq!(
+            control.result_pending("child").await,
+            ResultPendingOutcome::Inconsistent
+        );
     }
 }
 
@@ -9323,6 +9394,7 @@ mod authoritative_user_message_effect_tests {
                 event_rx,
                 event_tx_dup,
                 broadcaster,
+                SubAgentControl::disconnected_for_test(),
             ),
             storage,
             broadcast_rx,
@@ -10351,6 +10423,7 @@ mod context_exhausted_preserves_worktree_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         );
         (rt, broadcast_rx)
     }
@@ -11231,6 +11304,7 @@ mod approve_task_failure_effect_tests {
             event_rx,
             event_tx_dup,
             SseBroadcaster::new(128, 0),
+            SubAgentControl::disconnected_for_test(),
         );
 
         let result = rt
@@ -11559,6 +11633,7 @@ mod explore_prompt_cache_shape_tests {
             runtime_event_rx,
             event_tx.clone(),
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         );
         let runtime_handle = tokio::spawn(async move { runtime.run().await });
 
@@ -11733,6 +11808,7 @@ mod steer_drain_detector_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         )
         .with_steering_queue(queue);
         (rt, storage)
@@ -12629,6 +12705,7 @@ mod steer_drain_detector_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         )
         .with_steering_queue(vec![mk_entry("ignored", "should not drain")]);
 
@@ -12884,6 +12961,7 @@ mod subagent_grace_tool_surface_tests {
             event_rx,
             event_tx,
             SseBroadcaster::new(16, 0),
+            SubAgentControl::disconnected_for_test(),
         );
         runtime.llm_turn_count = 1;
 
@@ -12948,6 +13026,7 @@ mod subagent_grace_tool_surface_tests {
             event_rx,
             event_tx,
             SseBroadcaster::new(16, 0),
+            SubAgentControl::disconnected_for_test(),
         );
         runtime.llm_turn_count = 1;
 
@@ -13018,6 +13097,7 @@ mod subagent_grace_tool_surface_tests {
             event_rx,
             event_tx,
             SseBroadcaster::new(16, 0),
+            SubAgentControl::disconnected_for_test(),
         );
         runtime.llm_turn_count = 2;
         runtime.grace_turn_granted = true;
@@ -13071,6 +13151,7 @@ mod work_subagent_cwd_guard_tests {
     use super::*;
     use crate::db::ToolOutcome;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::SubAgentControlNotification;
     use crate::state_machine::state::{SpawnAgentsInput, SubAgentMode, SubAgentTask, ToolInput};
     use crate::state_machine::ConvContext;
     use crate::system_prompt::ModeContext;
@@ -13080,9 +13161,10 @@ mod work_subagent_cwd_guard_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    fn runtime_in_mode(
+    fn runtime_in_mode_with_control(
         working_dir: &std::path::Path,
         mode_context: ModeContext,
+        control: Arc<SubAgentControl>,
     ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         let storage = Arc::new(InMemoryStorage::new());
         let mut context = ConvContext::new(
@@ -13112,6 +13194,18 @@ mod work_subagent_cwd_guard_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            control,
+        )
+    }
+
+    fn runtime_in_mode(
+        working_dir: &std::path::Path,
+        mode_context: ModeContext,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        runtime_in_mode_with_control(
+            working_dir,
+            mode_context,
+            SubAgentControl::disconnected_for_test(),
         )
     }
 
@@ -13281,9 +13375,16 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn accepts_unnamed_generic_work_subagent() {
         let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        let (notification_tx, mut notifications) = mpsc::unbounded_channel();
+        let mut rt = runtime_in_mode_with_control(
+            worktree.path(),
+            ModeContext::Work {
+                branch_name: "task-99999-x".to_string(),
+                base_branch: "main".to_string(),
+                worktree_path: worktree.path().to_string_lossy().to_string(),
+            },
+            Arc::new(SubAgentControl::new(notification_tx)),
+        );
 
         let result = rt
             .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
@@ -13310,10 +13411,14 @@ mod work_subagent_cwd_guard_tests {
             other => panic!("expected SpawnAgentsComplete, got {other:?}"),
         }
 
-        let request = spawn_rx
+        let SubAgentControlNotification::Spawn(request) = notifications
             .try_recv()
-            .expect("generic Work sub-agent request should be sent");
+            .expect("generic Work sub-agent request should be sent")
+        else {
+            panic!("expected spawn notification");
+        };
         assert_eq!(request.spec.mode, SubAgentMode::Work);
+        let request = *request;
         assert_eq!(request.spec.agent_name, None);
         assert_eq!(request.spec.persona, None);
         assert_eq!(request.spec.model_id, "test-model");
@@ -13322,9 +13427,16 @@ mod work_subagent_cwd_guard_tests {
     #[tokio::test]
     async fn accepts_parallel_work_subagents_in_and_across_spawn_calls() {
         let worktree = TempDir::new().expect("worktree tempdir");
-        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(4);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+        let (notification_tx, mut notifications) = mpsc::unbounded_channel();
+        let mut rt = runtime_in_mode_with_control(
+            worktree.path(),
+            ModeContext::Work {
+                branch_name: "task-99999-x".to_string(),
+                base_branch: "main".to_string(),
+                worktree_path: worktree.path().to_string_lossy().to_string(),
+            },
+            Arc::new(SubAgentControl::new(notification_tx)),
+        );
 
         let work_task = |task: &str| SubAgentTask {
             task: task.to_string(),
@@ -13362,9 +13474,13 @@ mod work_subagent_cwd_guard_tests {
         }
 
         let requests: Vec<_> = std::iter::repeat_with(|| {
-            spawn_rx
+            let SubAgentControlNotification::Spawn(request) = notifications
                 .try_recv()
                 .expect("each Work task should emit a spawn request")
+            else {
+                panic!("expected spawn notification");
+            };
+            *request
         })
         .take(3)
         .collect();
@@ -13374,7 +13490,7 @@ mod work_subagent_cwd_guard_tests {
         assert_eq!(requests[0].spec.task, "implement API");
         assert_eq!(requests[1].spec.task, "implement UI");
         assert_eq!(requests[2].spec.task, "write integration tests");
-        assert!(spawn_rx.try_recv().is_err());
+        assert!(notifications.try_recv().is_err());
     }
 
     /// An `agent_type` that matches no discovered agent is rejected before any
@@ -13493,7 +13609,7 @@ mod work_subagent_cwd_guard_tests {
                     "got: {message}"
                 );
             }
-            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+            other => panic!("expected admission-boundary ToolComplete, got {other:?}"),
         }
     }
 
@@ -13521,9 +13637,9 @@ mod work_subagent_cwd_guard_tests {
                 let message = tool_result_text(&result);
                 assert!(!message.contains("Unknown model"), "got: {message}");
                 assert!(!message.contains("working directory"), "got: {message}");
-                assert!(message.contains("not configured"), "got: {message}");
+                assert!(message.contains("manager unavailable"), "got: {message}");
             }
-            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+            other => panic!("expected admission-boundary ToolComplete, got {other:?}"),
         }
     }
 
@@ -13551,16 +13667,16 @@ mod work_subagent_cwd_guard_tests {
             Some(Event::ToolComplete { result, .. }) => {
                 let message = tool_result_text(&result);
                 assert!(!message.contains("working directory"), "got: {message}");
-                assert!(message.contains("not configured"), "got: {message}");
+                assert!(message.contains("manager unavailable"), "got: {message}");
             }
-            other => panic!("expected missing-channel ToolComplete, got {other:?}"),
+            other => panic!("expected admission-boundary ToolComplete, got {other:?}"),
         }
     }
 
     /// `agent_type` resolves against the catalog frozen on the runtime, not a
     /// fresh filesystem scan (REQ-AG-008): the worktree has no `.claude/agents`,
-    /// yet a frozen-catalog agent resolves, so we reach the missing-spawn-channel
-    /// path rather than an "Unknown `agent_type`" rejection.
+    /// yet a frozen-catalog agent resolves, so we reach the disconnected-control
+    /// boundary rather than an "Unknown `agent_type`" rejection.
     #[tokio::test]
     async fn agent_type_resolves_from_frozen_catalog_not_filesystem() {
         let worktree = TempDir::new().expect("worktree tempdir");
@@ -13598,8 +13714,8 @@ mod work_subagent_cwd_guard_tests {
                     "frozen-catalog agent should resolve despite empty filesystem, got: {msg}"
                 );
                 assert!(
-                    msg.contains("not configured"),
-                    "resolution should succeed and reach the missing-channel path, got: {msg}"
+                    msg.contains("manager unavailable"),
+                    "resolution should succeed and reach the disconnected-control boundary, got: {msg}"
                 );
             }
             other => panic!("expected ToolComplete, got {other:?}"),
@@ -13608,7 +13724,7 @@ mod work_subagent_cwd_guard_tests {
 
     /// A Work sub-agent whose `cwd` is inside the worktree is NOT rejected
     /// by the scoping guard. (It will still fail downstream because no
-    /// `spawn_tx` is wired in this test runtime, but that failure is
+    /// sub-agent control is wired in this test runtime, but that failure is
     /// distinguishable from the scoping rejection.)
     #[tokio::test]
     async fn accepts_work_subagent_cwd_inside_worktree() {
@@ -13985,6 +14101,7 @@ mod retry_timer_epoch_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         )
     }
 
@@ -14239,6 +14356,7 @@ mod fork_proposal_persist_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         );
         (rt, storage)
     }
@@ -14933,6 +15051,7 @@ mod llm_generation_guard_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         )
     }
 
@@ -15115,6 +15234,7 @@ mod tool_generation_guard_tests {
             event_rx,
             event_tx_dup,
             broadcaster,
+            SubAgentControl::disconnected_for_test(),
         )
     }
 
