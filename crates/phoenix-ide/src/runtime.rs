@@ -3835,7 +3835,14 @@ impl RuntimeManager {
                 );
                 self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
                     .await;
-                self.get_or_create(conversation_id).await?;
+                if let Err(reconstruction_error) = self.get_or_create(conversation_id).await {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id,
+                        %reconstruction_error,
+                        "Steering runtime reconstruction failed after durable admission; queued database row remains authoritative"
+                    );
+                }
             }
             break queue_position;
         };
@@ -5343,6 +5350,79 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn steering_enqueue_stays_accepted_when_post_commit_reconstruction_fails() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-enqueue-reconstruction-failure";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let _acknowledged_event_rx =
+            insert_acknowledged_idle_handle(&manager, conversation_id).await;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let enqueue = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .enqueue_steer_message(
+                        conversation_id,
+                        Event::SteerMessage {
+                            text: "durably accepted".to_string(),
+                            llm_text: None,
+                            images: Vec::new(),
+                            files: Vec::new(),
+                            message_id: "accepted-before-reconstruction".to_string(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "reconstruction-failure-fingerprint",
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        sqlx::query(
+            "UPDATE work_scopes
+             SET cwd = ?1
+             WHERE id = (
+                 SELECT work_scope_id FROM conversations WHERE id = ?2
+             )",
+        )
+        .bind("/definitely/missing/pr626-reconstruction")
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .expect("make replacement runtime construction fail");
+        barrier.wait().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), enqueue)
+            .await
+            .expect("enqueue must settle")
+            .expect("enqueue task joins")
+            .expect("durable admission remains successful");
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("durable queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accepted-before-reconstruction"]
+        );
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+    }
+
+    #[tokio::test]
     async fn committed_steering_dispatch_failure_persists_error_without_provider_request() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
@@ -6258,6 +6338,82 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_committed_skill_steering_turn() {
+        use phoenix_core::domain::db_schema::{MessageContent, SkillContent};
+        use phoenix_core::domain::skill_invocation::SkillInvocation;
+
+        let mgr = test_manager().await;
+        let conversation_id = "committed-skill-steering-turn";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        mgr.db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "/build".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-skill-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: Some(SkillInvocation {
+                        name: "build".to_string(),
+                        body: "skill body".to_string(),
+                        skill_dir: "/skills/build".to_string(),
+                    }),
+                },
+                "committed-skill-steer-fingerprint",
+            )
+            .await
+            .expect("accept skill steer");
+        let content = MessageContent::Skill(SkillContent {
+            name: "build".to_string(),
+            body: "skill body".to_string(),
+            trigger: "/build".to_string(),
+            files: Vec::new(),
+        });
+        mgr.db()
+            .commit_steering_drain(
+                conversation_id,
+                &[crate::db::Message {
+                    message_id: "committed-skill-steer".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("commit skill steering drain");
+
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load preserved conversation")
+                .state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        let (state, _, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("reconstruct committed skill steer");
+        assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
     }
 
     #[tokio::test]

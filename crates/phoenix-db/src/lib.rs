@@ -5302,7 +5302,7 @@ impl Database {
         }))
     }
 
-    /// Report whether the newest transcript row is a committed steering user
+    /// Report whether the newest transcript row is a committed steering input
     /// message whose exact queue row has already been consumed.
     ///
     /// # Errors
@@ -5317,7 +5317,7 @@ impl Database {
                    ON r.conversation_id = m.conversation_id
                   AND r.message_id = m.message_id
                  WHERE m.conversation_id = ?1
-                   AND m.message_type = 'user'
+                   AND m.message_type IN ('user', 'skill')
                    AND m.sequence_id = (
                        SELECT MAX(latest.sequence_id)
                        FROM messages latest
@@ -7607,7 +7607,7 @@ impl Database {
                              ON r.conversation_id = m.conversation_id
                             AND r.message_id = m.message_id
                            WHERE m.conversation_id = conversations.id
-                             AND m.message_type = 'user'
+                             AND m.message_type IN ('user', 'skill')
                              AND m.sequence_id = (
                                  SELECT MAX(latest.sequence_id)
                                  FROM messages latest

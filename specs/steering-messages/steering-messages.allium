@@ -179,6 +179,10 @@ rule EnqueueSteeringMessage {
         -- fence and held through channel admission. If the previously observed
         -- executor was retired, enqueue retries against the current executor
         -- before committing, so no accepted row is sent to a retired channel.
+        -- Once the append commits, durable queue admission is successful even
+        -- if executor delivery and immediate runtime reconstruction both fail.
+        -- The committed row remains authoritative and a later reconstruction
+        -- drains it; the HTTP result must not invite duplicate user intent.
 }
 
 -- REQ-STEER-002

@@ -192,12 +192,12 @@ WHEN server restarts
 THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
 AND preserve complete message history
 
-WHEN server restarts after an accepted steering batch has committed its user messages and awaiting-LLM state but before the first response settles
+WHEN server restarts after an accepted steering batch has committed its user or skill messages and awaiting-LLM state but before the first response settles
 THE SYSTEM SHALL preserve the awaiting-LLM state
 AND resume exactly one LLM request from the committed transcript
 AND SHALL settle a synchronous failure to start that request as a persisted typed error
 AND if that error cannot be persisted, SHALL retire the executor so reconnect reconstructs from unchanged database truth
-AND SHALL derive this bounded ownership from the immutable accepted steering identity, the latest transcript user message, and absence of that exact pending queue entry
+AND SHALL derive this bounded ownership from the immutable accepted steering identity, the latest transcript user or skill message, and absence of that exact pending queue entry
 AND SHALL NOT introduce a second steering lifecycle or queue authority
 
 WHEN server restarts with a conversation in `awaiting_continuation`, `recoverable_continuation_failure`, or continuation-summary `awaiting_recovery`
