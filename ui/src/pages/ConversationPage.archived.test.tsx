@@ -1232,7 +1232,7 @@ describe('ConversationPage archived read-only rendering', () => {
       options.dispatch({ type: 'sse_init', payload: tailPayload });
       options.onValidatedInit?.(tailPayload);
     });
-    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
+    expect(store.getSnapshot(slug).transcriptCoverage).toBe('tail');
 
     const preservePayload = {
       ...makeConnectionInit(conversation),

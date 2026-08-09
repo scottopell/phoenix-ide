@@ -1,3 +1,5 @@
+import { recordModuleAcquisitionFailure } from './moduleAcquisitionFailure';
+
 const NOTICE_ID = 'phoenix-module-load-notice';
 
 type PreloadErrorEvent = Event & { payload?: unknown };
@@ -45,6 +47,7 @@ export function installDeploymentModuleRecovery(options: RecoveryOptions = {}): 
 
   const handlePreloadError = (event: Event) => {
     const preloadEvent = event as PreloadErrorEvent;
+    recordModuleAcquisitionFailure();
     console.error(
       '[Phoenix] Failed to load a deployed UI module.',
       errorDetail(preloadEvent.payload),

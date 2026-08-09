@@ -1,4 +1,5 @@
 import { Component, Suspense, type ErrorInfo, type ReactNode } from 'react';
+import { isModuleAcquisitionFailure } from './moduleAcquisitionFailure';
 
 type Props = {
   children: ReactNode;
@@ -6,14 +7,17 @@ type Props = {
 };
 
 type State = {
-  failed: boolean;
+  moduleFailed: boolean;
+  unexpectedError?: unknown;
 };
 
 class LazyPanelErrorBoundary extends Component<Props, State> {
-  override state: State = { failed: false };
+  override state: State = { moduleFailed: false };
 
-  static getDerivedStateFromError(): State {
-    return { failed: true };
+  static getDerivedStateFromError(error: unknown): State {
+    return isModuleAcquisitionFailure(error)
+      ? { moduleFailed: true }
+      : { moduleFailed: false, unexpectedError: error };
   }
 
   override componentDidCatch(error: unknown, info: ErrorInfo): void {
@@ -21,8 +25,11 @@ class LazyPanelErrorBoundary extends Component<Props, State> {
   }
 
   override render(): ReactNode {
-    if (!this.state.failed) return this.props.children;
-    if (!this.props.onClose) return null;
+    if (this.state.unexpectedError !== undefined) throw this.state.unexpectedError;
+    if (!this.state.moduleFailed) return this.props.children;
+    if (!this.props.onClose) {
+      return <div className="lazy-panel-failure" role="alert">This feature could not be loaded. Reload Phoenix when ready.</div>;
+    }
 
     return (
       <div className="lazy-panel-failure" role="alert">
