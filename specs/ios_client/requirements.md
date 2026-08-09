@@ -745,9 +745,8 @@ AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
 AND only then clear the submitted draft and its review authority
-AND immediately request the persistence-fenced ordinary queue drain when that
-conversion has positively created the matching ordinary queue entry
-AND retain a typed receipt-to-entry handoff until that positive creation occurs
+AND atomically create the canonical ordinary queue entry and its receipt-typed,
+persistence-fenced drain request as one conversion transition
 AND have that drain attempt only entries covered by positive full-outbox
 persistence evidence, in durable oldest-first order, excluding server-accepted
 entries and entries with a typed in-flight attempt
@@ -779,15 +778,17 @@ changes so that no failure identifies a removed or repaired contribution
 WHEN the ProductConversation is hard-deleted or definitively not found
 THE SYSTEM SHALL invalidate every persistence-pending review payload for that
 conversation
-AND convert every receipt-to-entry handoff into an acknowledged invalidation
-tombstone
 AND remove its pending render, composer draft, plain segments, review
 authorities, and submission failures
 AND retain and retry a durable, structurally non-sendable invalidation tombstone
 for each affected payload, including after app restart, until version-fenced
 removal is acknowledged
 AND retain a permanent deleted-scope fence that rejects delayed ordinary queue
-entry creation and removes any pending drain request
+entry creation by creating or refreshing a version-fenced invalidation
+tombstone
+AND treat the lifecycle's terminal deleted state as the same fence immediately,
+before the durable fence projection is processed
+AND remove any pending or late-created drain request
 AND SHALL NOT allow a later persistence receipt to recreate a queue entry
 
 WHEN the user attempts to close a reader with unsent notes

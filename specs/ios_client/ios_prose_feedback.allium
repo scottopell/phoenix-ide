@@ -68,6 +68,9 @@ use "./ios_client_lifecycle.allium" as lifecycle
 --   outbox revision acknowledged by persistence, ordered by their durable
 --   ordinal and excluding server-accepted entries, entries with an active
 --   PostAttempt, and entries with an invalidation tombstone.
+-- review_queue_scope_is_deleted(scope) -> Boolean
+--   True when the lifecycle session is terminally deleted or a permanent
+--   DeletedReviewQueueScopeFence exists for the scope.
 
 ------------------------------------------------------------
 -- Value Types
@@ -239,16 +242,9 @@ entity ReviewOutboxInvalidationTombstone {
     local_id: String
 }
 
--- Durable receipt-to-entry handoff retained until positive ordinary queue-entry
--- creation. Terminal deletion converts it to an invalidation tombstone before
--- removing it, so a delayed enqueue cannot escape cleanup.
-entity PersistedReviewQueueHandoff {
-    persistence: ReviewOutboxPersistenceReceipt
-}
-
 -- Permanent scope fence created by definitive conversation deletion. Product
 -- conversation ids are never reused; retaining the fence rejects every delayed
--- queue-entry creation from an earlier persistence handoff.
+-- queue-entry creation from an earlier persistence operation.
 entity DeletedReviewQueueScopeFence {
     scope: queue/ConversationScope
 }
@@ -259,6 +255,7 @@ entity DeletedReviewQueueScopeFence {
 -- eligible ordinary entry in durable oldest-first order.
 entity DurableOrderedQueueDrainRequest {
     persistence: ReviewOutboxPersistenceReceipt
+    entry: queue/LocalQueueEntry
 }
 
 entity ReviewSubmissionBlock {
@@ -704,9 +701,7 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
 
     requires: exists pending
     requires: persistence.persistence_revision > 0
-    requires: not exists DeletedReviewQueueScopeFence{
-        scope: persistence.scope
-    }
+    requires: not review_queue_scope_is_deleted(persistence.scope)
     requires: review_authority_failures(pending.draft) = empty_list
     requires: persistence.payload_fingerprint = message_payload_fingerprint(
         persistence.scope,
@@ -715,15 +710,20 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
         pending.draft.images
     )
 
-    ensures: queue/UserSendsMessage(
-        persistence.scope,
-        persistence.local_id,
-        render_composer_draft(pending.draft),
-        pending.draft.images
-    )
-    ensures: PersistedReviewQueueHandoff.created(
-        persistence: persistence
-    )
+    ensures:
+        let entry = queue/LocalQueueEntry.created(
+            scope: persistence.scope,
+            local_id: persistence.local_id,
+            text: render_composer_draft(pending.draft),
+            images: pending.draft.images,
+            status: queue/pending,
+            accepted_by_server: false,
+            visible: true
+        )
+        DurableOrderedQueueDrainRequest.created(
+            persistence: persistence,
+            entry: entry
+        )
     ensures: pending.draft.images = empty_list
     ensures:
         for segment in pending.draft.plain_segments:
@@ -737,48 +737,52 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
         )
         not exists pending.render
         not exists pending
+
+    @guidance
+        -- Receipt conversion is one reducer transition: create the canonical
+        -- ordinary queue projection of the already-durable payload and bind its
+        -- drain request to that exact entry. It performs no second enqueue or
+        -- unfenced outbox write.
 }
 
-rule PersistedReviewQueueEntryCreationRequestsOrderedDrain {
-    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-004, REQ-IOS-021
+rule DeletedScopeRejectsLateOrdinaryQueueEntryWithoutTombstone {
+    -- REQ-IOS-005, REQ-IOS-021
     when: entry: queue/LocalQueueEntry.created
 
-    let handoff = PersistedReviewQueueHandoff{
-        persistence: ReviewOutboxPersistenceReceipt{
-            scope: entry.scope,
-            local_id: entry.local_id
-        }
-    }
-
-    let persistence = handoff.persistence
-
-    requires: exists handoff
-    requires: exists persistence
-    requires: persistence.persistence_revision > 0
-    requires: not exists DeletedReviewQueueScopeFence{scope: entry.scope}
+    requires: review_queue_scope_is_deleted(entry.scope)
     requires: not exists ReviewOutboxInvalidationTombstone{
         scope: entry.scope,
         local_id: entry.local_id
     }
-    requires: persistence.payload_fingerprint = message_payload_fingerprint(
-        entry.scope,
-        entry.local_id,
-        entry.text,
-        entry.images
-    )
 
-    ensures: DurableOrderedQueueDrainRequest.created(
-        persistence: persistence
-    )
-    ensures: not exists handoff
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: entry.scope,
+            local_id: entry.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
+        not exists entry
 }
 
-rule DeletedScopeRejectsLateOrdinaryQueueEntry {
+rule DeletedScopeRejectsLateOrdinaryQueueEntryWithTombstone {
     -- REQ-IOS-005, REQ-IOS-021
     when: entry: queue/LocalQueueEntry.created
 
-    requires: exists DeletedReviewQueueScopeFence{scope: entry.scope}
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
 
+    requires: review_queue_scope_is_deleted(entry.scope)
+    requires: exists tombstone
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
     ensures: not exists entry
 }
 
@@ -786,9 +790,7 @@ rule PersistenceFencedOrderedDrainStartsEligibleEntries {
     -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-004, REQ-IOS-021
     when: request: DurableOrderedQueueDrainRequest.created
 
-    requires: not exists DeletedReviewQueueScopeFence{
-        scope: request.persistence.scope
-    }
+    requires: not review_queue_scope_is_deleted(request.persistence.scope)
 
     ensures:
         for entry in durable_sendable_entries_oldest_first(
@@ -796,6 +798,15 @@ rule PersistenceFencedOrderedDrainStartsEligibleEntries {
         ):
             queue/SendPostStarted(entry: entry)
         not exists request
+}
+
+rule DeletedScopeRetiresLateDrainRequest {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: request: DurableOrderedQueueDrainRequest.created
+
+    requires: review_queue_scope_is_deleted(request.persistence.scope)
+
+    ensures: not exists request
 }
 
 rule InvalidAuthorityRejectsPersistedReviewReceipt {
@@ -879,17 +890,6 @@ rule TerminalDeletionClearsReviewDraftState {
 
     ensures:
         DeletedReviewQueueScopeFence.created(scope: trigger.session.scope)
-        for handoff in PersistedReviewQueueHandoffs
-            where persistence.scope = trigger.session.scope:
-            let handoff_tombstone = ReviewOutboxInvalidationTombstone.created(
-                scope: handoff.persistence.scope,
-                local_id: handoff.persistence.local_id
-            )
-            ReviewOutboxPersistenceInvalidated(
-                scope: handoff_tombstone.scope,
-                local_id: handoff_tombstone.local_id
-            )
-            not exists handoff
         for request in DurableOrderedQueueDrainRequests
             where persistence.scope = trigger.session.scope:
             not exists request
@@ -961,12 +961,21 @@ invariant DeletedReviewQueueScopeFencesAreUnique {
             a != b implies a.scope != b.scope
 }
 
+invariant DrainRequestMatchesItsDurableEntry {
+    for request in DurableOrderedQueueDrainRequests:
+        request.entry.scope = request.persistence.scope
+        and request.entry.local_id = request.persistence.local_id
+        and request.persistence.payload_fingerprint = message_payload_fingerprint(
+            request.entry.scope,
+            request.entry.local_id,
+            request.entry.text,
+            request.entry.images
+        )
+}
+
 invariant DeletedReviewQueueScopesOwnNoSendableReviewState {
     for fence in DeletedReviewQueueScopeFences:
         not exists PersistencePendingReviewQueueEntry{scope: fence.scope}
-        and not PersistedReviewQueueHandoffs.any(
-            handoff => handoff.persistence.scope = fence.scope
-        )
         and not DurableOrderedQueueDrainRequests.any(
             request => request.persistence.scope = fence.scope
         )

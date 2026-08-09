@@ -28,12 +28,12 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - Persistence-pending review messages remain optimistically visible, structurally non-sendable, and retryable on later delivery triggers.
 - Connectivity, valid init, foreground, and turn-completion triggers retry pending persistence; every retry and receipt conversion revalidates review authority.
 - Authority-evidence changes immediately revalidate pending persistence; invalid authority unlocks the draft with typed failures without waiting for another delivery trigger.
-- Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; positive ordinary-entry creation after valid persistence enters the persistence-fenced drain in durable oldest-first order.
+- Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; valid persistence atomically creates the canonical ordinary entry and its receipt-typed oldest-first drain request.
 - POST attempts have typed in-flight ownership that is released on success, definitive rejection, or transport interruption before automatic redelivery can select the entry again.
 - Authoritative reconciliation also releases an active POST attempt, and retry clears prior server-acceptance evidence before re-entering the drain.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
-- Hard-delete/not-found cleanup removes drafts, pending renders, and authority; converts receipt-to-entry handoffs to acknowledged-removal tombstones; and retains a permanent fence against delayed queue creation.
+- Hard-delete/not-found cleanup removes drafts, pending renders, and authority; treats terminal lifecycle state as an immediate fence; version-fenced-invalidates delayed queue entries; and retires late drain requests.
 - The leaf queue separates reader fidelity from session-scoped note composition.
 
 ## Out of scope
