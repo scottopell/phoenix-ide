@@ -1018,197 +1018,151 @@ async fn test_browser_eval_syntax_error() {
 // TDD: browser_wait_for_selector tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_wait_for_selector_immediate() {
-    require_chrome!();
-
-    // Element exists immediately
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body><div id="exists">I exist</div></body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-wait-immediate");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(json!({"selector": "#exists"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Wait failed: {}", result.output());
-    assert!(
-        result.output().contains("found") || result.output().contains("visible"),
-        "Should indicate element found: {}",
-        result.output()
+async fn reset_wait_fixture(ctx: &ToolContext, body: &str, setup: &str) {
+    let expression = format!(
+        r"(() => {{
+            for (const timer of window.waitFixtureTimers || []) clearTimeout(timer);
+            window.waitFixtureTimers = [];
+            document.body.innerHTML = {body};
+            document.body.tabIndex = -1;
+            document.body.focus();
+            {setup}
+            return true;
+        }})()",
+        body = serde_json::to_string(body).expect("fixture HTML should serialize")
     );
-
-    shutdown_test(manager, server).await;
+    let reset = BrowserEvalTool
+        .run(json!({"expression": expression}), ctx.clone())
+        .await;
+    assert!(
+        reset.is_success() && reset.output().contains("true"),
+        "wait fixture reset failed: {}",
+        reset.output()
+    );
 }
 
 #[tokio::test]
-async fn test_wait_for_selector_delayed() {
+#[allow(clippy::too_many_lines)]
+async fn wait_regressions_share_one_browser_fixture() {
     require_chrome!();
 
-    // Element appears after 500ms
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body>
-            <div id="container"></div>
-            <script>
-                setTimeout(() => {
-                    document.getElementById('container').innerHTML = '<span class="delayed">Appeared!</span>';
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
+        "<!DOCTYPE html><html><head><title>Wait Test</title></head><body></body></html>",
     )
     .await;
+    let (ctx, manager) = test_context("test-wait-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let navigation = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            navigation.is_success(),
+            "wait fixture navigation failed: {}",
+            navigation.output()
+        );
+        let wait_tool = BrowserWaitForSelectorTool;
+        let eval_tool = BrowserEvalTool;
 
-    let (ctx, manager) = test_context("test-wait-delayed");
+        reset_wait_fixture(&ctx, "<div id='exists'>I exist</div>", "").await;
+        let immediate = wait_tool
+            .run(json!({"selector": "#exists"}), ctx.clone())
+            .await;
+        assert!(
+            immediate.is_success()
+                && (immediate.output().contains("found")
+                    || immediate.output().contains("visible")),
+            "immediate selector wait failed: {}",
+            immediate.output()
+        );
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(
-            json!({"selector": ".delayed", "timeout": "5s"}),
-            ctx.clone(),
+        reset_wait_fixture(
+            &ctx,
+            "<div id='container'></div>",
+            "window.waitFixtureTimers.push(setTimeout(() => { document.getElementById('container').innerHTML = '<span class=\"delayed\">Appeared!</span>'; }, 500));",
         )
         .await;
+        let delayed = wait_tool
+            .run(
+                json!({"selector": ".delayed", "timeout": "5s"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(delayed.is_success(), "delayed wait failed: {}", delayed.output());
+        let delayed_present = eval_tool
+            .run(
+                json!({"expression": "document.querySelector('.delayed')?.textContent === 'Appeared!'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            delayed_present.is_success() && delayed_present.output().contains("true"),
+            "delayed wait returned before insertion: {}",
+            delayed_present.output()
+        );
 
-    assert!(result.is_success(), "Wait failed: {}", result.output());
+        reset_wait_fixture(&ctx, "<div id='only-this'>Nothing else coming</div>", "").await;
+        let timeout = wait_tool
+            .run(
+                json!({"selector": "#never-exists", "timeout": "200ms"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(!timeout.is_success(), "absent selector unexpectedly succeeded");
+        assert!(
+            timeout.output().to_lowercase().contains("timeout")
+                || timeout.output().to_lowercase().contains("not found"),
+            "timeout error was unclear: {}",
+            timeout.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_timeout() {
-    require_chrome!();
-
-    // Element never appears
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body><div id="only-this">Nothing else coming</div></body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-wait-timeout");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(
-            json!({"selector": "#never-exists", "timeout": "200ms"}),
-            ctx.clone(),
+        reset_wait_fixture(
+            &ctx,
+            "<div id='target' style='display:none'>Hidden initially</div>",
+            "window.waitFixtureTimers.push(setTimeout(() => { document.getElementById('target').style.display = 'block'; }, 500));",
         )
         .await;
+        let visible = wait_tool
+            .run(
+                json!({"selector": "#target", "visible": true, "timeout": "5s"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(visible.is_success(), "visible wait failed: {}", visible.output());
+        let display = eval_tool
+            .run(
+                json!({"expression": "getComputedStyle(document.getElementById('target')).display === 'block'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            display.is_success() && display.output().contains("true"),
+            "visible wait returned while target was hidden: {}",
+            display.output()
+        );
 
-    assert!(!result.is_success(), "Should have timed out");
-    assert!(
-        result.output().to_lowercase().contains("timeout")
-            || result.output().to_lowercase().contains("not found"),
-        "Should mention timeout: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_hidden_then_visible() {
-    require_chrome!();
-
-    // Element exists but is hidden, then becomes visible
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body>
-            <div id="target" style="display: none;">Hidden initially</div>
-            <script>
-                setTimeout(() => {
-                    document.getElementById('target').style.display = 'block';
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
-    )
+        reset_wait_fixture(&ctx, "", "").await;
+        let invalid = wait_tool
+            .run(json!({"selector": "###invalid[[["}), ctx.clone())
+            .await;
+        assert!(!invalid.is_success(), "invalid selector unexpectedly succeeded");
+        assert!(
+            invalid.output().to_lowercase().contains("invalid")
+                || invalid.output().to_lowercase().contains("error")
+                || invalid.output().to_lowercase().contains("syntax"),
+            "selector parse error was unclear: {}",
+            invalid.output()
+        );
+        assert!(
+            !invalid.output().to_lowercase().contains("timeout"),
+            "invalid selector was misreported as timeout: {}",
+            invalid.output()
+        );
+    })
     .await;
 
-    let (ctx, manager) = test_context("test-wait-visible");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-
-    // With visible: true, should wait for element to be visible
-    let result = wait_tool
-        .run(
-            json!({"selector": "#target", "visible": true, "timeout": "5s"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(
-        result.is_success(),
-        "Wait for visible failed: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_invalid_selector() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body></body></html>").await;
-    let (ctx, manager) = test_context("test-wait-invalid");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(json!({"selector": "###invalid[[["}), ctx.clone())
-        .await;
-
-    assert!(!result.is_success(), "Should fail on invalid selector");
-    assert!(
-        result.output().to_lowercase().contains("invalid")
-            || result.output().to_lowercase().contains("error")
-            || result.output().to_lowercase().contains("syntax"),
-        "Should mention invalid selector: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser selector-wait regression scenario");
 }
 
 // ============================================================================
