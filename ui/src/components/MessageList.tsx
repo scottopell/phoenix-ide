@@ -1089,9 +1089,6 @@ function MessageListImpl({
     const target = pending.memberMessageId
       ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
       : row.querySelector('.message') ?? row;
-    if (pending.memberMessageId && target !== row) {
-      target.scrollIntoView({ block: 'nearest' });
-    }
     highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
     pulseTimerRef.current = window.setTimeout(() => {
@@ -1128,7 +1125,12 @@ function MessageListImpl({
       key: unit.key,
       ...(memberMessageId ? { memberMessageId } : {}),
     };
-    transcriptRef.current?.scrollToIndex(unitIndex, 'start');
+    if (memberMessageId) {
+      const targetSelector = `#message-${CSS.escape(memberMessageId)}, [data-message-id="${CSS.escape(memberMessageId)}"]`;
+      transcriptRef.current?.scrollToIndex(unitIndex, 'start', 0, targetSelector);
+    } else {
+      transcriptRef.current?.scrollToIndex(unitIndex, 'start');
+    }
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 

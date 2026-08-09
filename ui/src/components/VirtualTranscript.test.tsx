@@ -224,6 +224,38 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('positions an intra-row target through the transcript executor', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={[{ id: 'group', label: 'Group', height: 200 }]}
+        getKey={(item) => item.id}
+        estimatedExtent={200}
+        overscan={0}
+        initialTail={false}
+        renderItem={(item) => (
+          <div data-height={item.height}>
+            <div data-member="first">First</div>
+            <div data-member="second">Second</div>
+          </div>
+        )}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    const row = screen.getByText('First').closest('[data-virtual-index]') as HTMLElement;
+    const second = screen.getByText('Second');
+    vi.spyOn(row, 'getBoundingClientRect').mockReturnValue({ top: 20 } as DOMRect);
+    vi.spyOn(second, 'getBoundingClientRect').mockReturnValue({ top: 80 } as DOMRect);
+
+    act(() => ref.current?.scrollToIndex(0, 'start', 0, '[data-member="second"]'));
+
+    expect(scrollTopOf(scroller)).toBe(60);
+  });
+
   it('compensates scrollTop when a measured row above the top-edge anchor resizes', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
