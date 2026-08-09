@@ -3343,6 +3343,14 @@ where
     async fn prepare_immediate_steering_drain(
         &mut self,
     ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        if self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?
+            .is_some_and(|turn| !turn.materialized)
+        {
+            return Ok(None);
+        }
         let projection_guard = if let Some(gate) = self.steering_projection_gate.clone() {
             let guard = gate.lock_owned().await;
             self.steering_queue = self
@@ -3404,6 +3412,14 @@ where
         is_error_dismissal: bool,
     ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
         if !self.is_steering_drain_hook(old_state, is_error_dismissal) {
+            return Ok(None);
+        }
+        if self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?
+            .is_some_and(|turn| !turn.materialized)
+        {
             return Ok(None);
         }
 
@@ -12160,6 +12176,61 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
         assert!(storage.get_steering_queue(conversation_id).is_empty());
         assert!(rt.llm_task_handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_defers_steering_drain_until_accepted_direct_turn_materializes() {
+        let conversation_id = "startup-direct-before-steering";
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![mk_entry("steer-after-direct", "second")],
+        );
+        storage.set_unmaterialized_active_direct_turn(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(41),
+            generation: 0,
+        });
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup defers queued steering");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::NotNeeded);
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_steering_notification_defers_until_accepted_direct_turn_materializes() {
+        let conversation_id = "idle-direct-before-steering";
+        let entry = mk_entry("steer-after-direct", "second");
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, ConvState::Idle, vec![]);
+        storage.set_steering_queue(conversation_id, vec![entry.clone()]);
+        storage.set_unmaterialized_active_direct_turn(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(42),
+            generation: 0,
+        });
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(mk_steer_event(
+            &entry.message_id,
+            entry.llm_text.as_deref().unwrap_or(&entry.text),
+        ))
+        .await
+        .expect("idle notification defers queued steering");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        let durable_queue = storage.get_steering_queue(conversation_id);
+        assert_eq!(durable_queue.len(), 1);
+        assert_eq!(durable_queue[0].message_id, entry.message_id);
+        assert_eq!(durable_queue[0].text, entry.text);
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.llm_task_handle.is_none());
     }
 
     #[tokio::test]

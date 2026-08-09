@@ -533,7 +533,7 @@ pub struct InMemoryStorage {
     preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
-    active_direct_turn: Mutex<Option<crate::runtime::traits::ActiveDirectTurn>>,
+    active_direct_turn: Mutex<Option<crate::runtime::traits::LoadedActiveDirectTurn>>,
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -729,7 +729,22 @@ impl InMemoryStorage {
     }
 
     pub fn set_active_direct_turn(&self, active: Option<crate::runtime::traits::ActiveDirectTurn>) {
-        *self.active_direct_turn.lock().unwrap() = active;
+        *self.active_direct_turn.lock().unwrap() =
+            active.map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
+                active,
+                materialized: true,
+            });
+    }
+
+    pub fn set_unmaterialized_active_direct_turn(
+        &self,
+        active: crate::runtime::traits::ActiveDirectTurn,
+    ) {
+        *self.active_direct_turn.lock().unwrap() =
+            Some(crate::runtime::traits::LoadedActiveDirectTurn {
+                active,
+                materialized: false,
+            });
     }
 
     pub fn recorded_settle_active_direct_turn_calls(
@@ -970,15 +985,7 @@ impl MessageStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
     ) -> Result<Option<crate::runtime::traits::LoadedActiveDirectTurn>, String> {
-        Ok(self
-            .active_direct_turn
-            .lock()
-            .unwrap()
-            .clone()
-            .map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
-                active,
-                materialized: true,
-            }))
+        Ok(self.active_direct_turn.lock().unwrap().clone())
     }
 
     async fn settle_active_direct_turn(

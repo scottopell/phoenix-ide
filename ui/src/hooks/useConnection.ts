@@ -159,6 +159,8 @@ interface UseConnectionOptions {
   getTranscriptGeneration?: () => number | null;
   /** Called only after an init has passed runtime validation and stream identity checks. */
   onValidatedInit?: (payload: InitPayload) => void;
+  /** Called when a validated live event transfers one steering identity to server authority. */
+  onValidatedSteeringQueued?: (messageId: string) => void;
 }
 
 function buildStreamUrl(
@@ -225,6 +227,7 @@ export function useConnection({
   getLastAppliedEventSeq,
   getTranscriptGeneration,
   onValidatedInit,
+  onValidatedSteeringQueued,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -257,6 +260,7 @@ export function useConnection({
   const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
   const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
   const onValidatedInitRef = useRef(onValidatedInit);
+  const onValidatedSteeringQueuedRef = useRef(onValidatedSteeringQueued);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -277,6 +281,10 @@ export function useConnection({
   useEffect(() => {
     onValidatedInitRef.current = onValidatedInit;
   }, [onValidatedInit]);
+
+  useEffect(() => {
+    onValidatedSteeringQueuedRef.current = onValidatedSteeringQueued;
+  }, [onValidatedSteeringQueued]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -689,6 +697,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            onValidatedSteeringQueuedRef.current?.(res.data.message.message_id);
             stampedDispatch({
               type: 'sse_steer_message_queued',
               sequenceId: res.data.sequence_id,

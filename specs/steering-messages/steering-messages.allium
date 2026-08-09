@@ -475,6 +475,13 @@ surface SteeringQueueApi {
         -- so it cannot be stranded behind a queue that error dismissal does not
         -- drain. Admission for unrelated conversations remains independent.
 
+    @guarantee AcceptedDirectTurnPrecedesStartupDrain
+        -- When an accepted direct turn has not yet materialized its authoritative
+        -- user message, startup recovery and live idle notifications leave the
+        -- durable steering queue untouched. The direct-turn worker materializes
+        -- that accepted turn first; the ordinary turn-end hook then drains the
+        -- queued steering batch in durable FIFO order.
+
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
         -- of two points: turn-end (entering idle) or mid-turn (entering

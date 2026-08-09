@@ -641,6 +641,7 @@ function ConversationPageContent({
       ? atomRef.current.transcriptGeneration
       : null,
     onValidatedInit: (payload) => {
+      reconcileAuthoritative(payload.steeringMessages.map((message) => message.message_id));
       setArchiveStatusConfirmedConversationId(payload.conversation.id);
       historyGenerationRef.current += 1;
       dispatchHistoryExpansion({
@@ -652,6 +653,9 @@ function ConversationPageContent({
         },
         hasEarlierHistory: transcriptCoverageAfterInit(atomRef.current, payload) === 'tail',
       });
+    },
+    onValidatedSteeringQueued: (messageId) => {
+      reconcileAuthoritative([messageId]);
     },
   });
 

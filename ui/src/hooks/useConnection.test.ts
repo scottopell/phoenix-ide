@@ -387,7 +387,12 @@ describe('useConnection epoch stamping (task 08683)', () => {
 
   it('dispatches renderable steering deltas and stores live quota snapshots', () => {
     const captured: SSEAction[] = [];
-    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch: (action) => captured.push(action) }));
+    const onValidatedSteeringQueued = vi.fn();
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch: (action) => captured.push(action),
+      onValidatedSteeringQueued,
+    }));
     const es = FakeEventSource.instances[0]!;
 
     act(() => {
@@ -417,6 +422,8 @@ describe('useConnection epoch stamping (task 08683)', () => {
     expect(captured).toContainEqual(expect.objectContaining({
       type: 'sse_steer_message_cancelled', messageId: 'external-1', epoch: 1,
     }));
+    expect(onValidatedSteeringQueued).toHaveBeenCalledOnce();
+    expect(onValidatedSteeringQueued).toHaveBeenCalledWith('external-1');
     expect(getCodexQuotaSnapshot()?.primary?.used_percent).toBe(12);
   });
 
