@@ -14,6 +14,27 @@ use std::path::PathBuf;
 #[folder = "../../ui/dist"]
 struct Assets;
 
+const REVALIDATE: &str = "no-cache";
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+fn index_response(content: String) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, REVALIDATE)
+        .body(Body::from(content))
+        .unwrap()
+}
+
+fn asset_response(content: Vec<u8>, mime: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, IMMUTABLE)
+        .body(Body::from(content))
+        .unwrap()
+}
+
 /// Serve embedded static files, with filesystem fallback for development
 pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
@@ -21,11 +42,7 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     // Try embedded assets first
     if let Some(content) = Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(content.data.to_vec()))
-            .unwrap();
+        return asset_response(content.data.to_vec(), mime.as_ref());
     }
 
     // Fallback to filesystem in development
@@ -33,11 +50,7 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     if fs_path.exists() {
         if let Ok(content) = std::fs::read(&fs_path) {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
-                .body(Body::from(content))
-                .unwrap();
+            return asset_response(content, mime.as_ref());
         }
     }
 
@@ -85,7 +98,7 @@ pub async fn serve_service_worker() -> impl IntoResponse {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/javascript")
-            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CACHE_CONTROL, REVALIDATE)
             .body(Body::from(content.data.to_vec()))
             .unwrap();
     }
@@ -97,7 +110,7 @@ pub async fn serve_service_worker() -> impl IntoResponse {
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/javascript")
-                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CACHE_CONTROL, REVALIDATE)
                 .body(Body::from(content))
                 .unwrap();
         }
@@ -109,13 +122,39 @@ pub async fn serve_service_worker() -> impl IntoResponse {
         .unwrap()
 }
 
-/// Get the index.html content (embedded or from filesystem)
-pub fn get_index_html() -> Option<String> {
-    // Try embedded first
-    if let Some(content) = Assets::get("index.html") {
-        return String::from_utf8(content.data.to_vec()).ok();
+/// Get the index.html response (embedded or from filesystem).
+pub fn get_index_response() -> Option<Response<Body>> {
+    let content = if let Some(content) = Assets::get("index.html") {
+        String::from_utf8(content.data.to_vec()).ok()?
+    } else {
+        std::fs::read_to_string("ui/dist/index.html").ok()?
+    };
+
+    Some(index_response(content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spa_entry_point_revalidates() {
+        let response = index_response("<!doctype html>".to_string());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], REVALIDATE);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
     }
 
-    // Fallback to filesystem
-    std::fs::read_to_string("ui/dist/index.html").ok()
+    #[test]
+    fn content_addressed_assets_are_immutable() {
+        let response = asset_response(b"body {}".to_vec(), "text/css");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], IMMUTABLE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/css");
+    }
 }
