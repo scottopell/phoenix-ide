@@ -109,7 +109,11 @@ describe('tool results fixture scenarios', () => {
     expect(resultFor(data.messages, 'shell-empty')?.content.content).toBe('');
     expect(resultFor(data.messages, 'shell-error')?.content.is_error).toBe(true);
     expect(resultFor(data.messages, 'shell-long')?.content.content?.split('\n')).toHaveLength(20);
-    expect(resultFor(data.messages, 'shell-truncated')?.content.content?.length).toBeGreaterThan(5_000);
+    expect(resultFor(data.messages, 'shell-truncated')?.content.content?.split('\n')).toHaveLength(21);
+    expect(resultFor(data.messages, 'shell-truncated')?.message.display_data).toMatchObject({
+      returned_line_count: 21,
+      remaining_line_count: 0,
+    });
     expect(resultFor(data.messages, 'shell-truncated')?.content.content).not.toContain('more chars)');
     expect(resultFor(data.messages, 'shell-proposal')?.message.display_data).toMatchObject({ fork_proposal_id: 'fixture-fork-proposal' });
     expect(resultFor(data.messages, 'shell-unknown')?.content.content).toContain('unknown tool renderer');
@@ -159,7 +163,7 @@ describe('tool results fixture scenarios', () => {
       'discover-keyword-empty': 'No relevant files found',
       'discover-keyword-raw': '--',
       'discover-read-short': 'deterministicFixtureLine1',
-      'discover-read-long': 'fixture long line 24',
+      'discover-read-long': 'fixture long line 21',
       'discover-read-range': 'MessageComponents excerpt 711',
       'discover-read-eof': 'EOF excerpt 501',
       'discover-read-long-lines': 'wrap me please',
@@ -167,9 +171,9 @@ describe('tool results fixture scenarios', () => {
     });
     expect(resultFor(messages, 'discover-read-long')?.message.display_data).toMatchObject({
       type: 'read_file',
-      returned_line_count: 24,
+      returned_line_count: 21,
       total_line_count: 100,
-      remaining_line_count: 76,
+      remaining_line_count: 79,
     });
     expect(resultFor(messages, 'discover-read-empty')?.content.content).toBe('');
     expect(resultFor(messages, 'discover-read-error')?.content.is_error).toBe(true);
