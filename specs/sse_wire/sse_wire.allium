@@ -588,11 +588,13 @@ rule MessageUpdatedBroadcast {
             stream.last_delivered_seq = seq
 
     @guidance
-        -- message_updated is only meaningful after the corresponding
+        -- message_updated is only directly applicable after the corresponding
         -- message event has been delivered (or is present in the init
-        -- snapshot). A client that receives message_updated before
-        -- message treats it as a silent no-op
-        -- (SseMessageUpdatedUnknownTarget in conversation_atom.allium).
+        -- snapshot). A client that receives message_updated first must not
+        -- fail: it may treat the update as a silent no-op
+        -- (SseMessageUpdatedUnknownTarget in conversation_atom.allium), or
+        -- retain it by message id and apply it if the identity-bearing message
+        -- arrives later on the same stream.
 }
 
 ------------------------------------------------------------

@@ -185,7 +185,10 @@ pub fn create_router(state: AppState) -> Router {
             get(browser_view_ws_handler),
         )
         // User actions (REQ-API-004)
-        .route("/api/conversations/:id/chat", post(send_chat))
+        .route(
+            "/api/conversations/:id/chat",
+            post(send_chat).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        )
         .route(
             "/api/conversations/:id/attachments",
             post(upload_conversation_attachments)

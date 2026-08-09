@@ -1905,6 +1905,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::notify_agent_done()),
         ),
 
@@ -3924,6 +3925,37 @@ mod tests {
                 thoughts: "inspect".to_string(),
             }),
         )
+    }
+
+    #[test]
+    fn rejecting_task_approval_broadcasts_idle_before_agent_done() {
+        let state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--review.md".to_string(),
+            title: "Review".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Check the result".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskApprovalDecided {
+                outcome: TaskApprovalOutcome::Rejected,
+            },
+        )
+        .expect("task rejection transitions");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        let state_change = result
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::NotifyStateChange))
+            .expect("idle state is broadcast");
+        let agent_done = result
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::NotifyAgentDone))
+            .expect("turn completion is broadcast");
+        assert!(state_change < agent_done);
     }
 
     #[test]
