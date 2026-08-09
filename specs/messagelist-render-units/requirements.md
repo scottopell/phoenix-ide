@@ -96,6 +96,11 @@ WHEN a `system`-type message has empty or absent `content.text`
 THE SYSTEM SHALL skip it (emit no unit)
 AND log a `console.debug` recording the skipped `message_id`
 
+WHEN a `system`-type message has `display_data.hidden = true`
+THE SYSTEM SHALL skip it (emit no unit)
+AND SHALL preserve the active agent run and tool-only grouping adjacency
+AND log a `console.debug` recording the skipped `message_id` with `reason: 'hidden_system'`
+
 WHEN a message has a `message_type` not recognized by the construction
 function
 THE SYSTEM SHALL skip it

@@ -144,6 +144,11 @@ function hasNonEmptyText(msg: Message): boolean {
   return typeof content?.text === 'string' && content.text.length > 0;
 }
 
+function isHiddenSystemMessage(msg: Message): boolean {
+  const displayData = msg.display_data as { hidden?: unknown } | undefined;
+  return displayData?.hidden === true;
+}
+
 function debug(summary: string, fields: Record<string, unknown>): void {
   console.debug(`[renderUnits] ${summary}`, fields);
 }
@@ -269,7 +274,12 @@ export function buildHistoricalUnits(
       inAgentRun = true;
       i++;
     } else if (type === 'system') {
-      if (hasNonEmptyText(msg)) {
+      if (isHiddenSystemMessage(msg)) {
+        debug('skipped hidden system', {
+          message_id: msg.message_id,
+          reason: 'hidden_system',
+        });
+      } else if (hasNonEmptyText(msg)) {
         historicalUnits.push({ kind: 'system', key: msg.message_id, message: msg });
       } else {
         debug('skipped empty system', {

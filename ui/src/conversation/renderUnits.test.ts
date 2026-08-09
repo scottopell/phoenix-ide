@@ -278,6 +278,23 @@ describe('buildRenderUnits', () => {
       ]);
     });
 
+    it('does not split a visible tool group on a hidden system message', () => {
+      const hidden = { ...systemMsg('hidden-system', 'internal marker'), display_data: { hidden: true } };
+      const out = buildHistoricalUnits({
+        messages: [
+          agentMsg('hidden-a', [toolUseBlock('hidden-use-a')]),
+          hidden,
+          agentMsg('hidden-b', [toolUseBlock('hidden-use-b')]),
+        ],
+        pendingMessages: [],
+      });
+
+      expect(out.historicalUnits).toHaveLength(1);
+      expect(out.historicalUnits[0]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[0]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected one visible group');
+      expect(out.historicalUnits[0].members.map((member) => member.key)).toEqual(['hidden-a', 'hidden-b']);
+    });
+
     it('bounds physical groups and keeps singleton overflow in the stable group variant', () => {
       const messages = Array.from({ length: 9 }, (_, index) =>
         agentMsg(`bounded-${index + 1}`, [toolUseBlock(`bounded-use-${index + 1}`)]));

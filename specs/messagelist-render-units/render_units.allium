@@ -28,17 +28,19 @@
 -- Value Types
 ------------------------------------------------------------
 
--- A persisted message as seen by the transform. The transform inspects
--- message_type to dispatch; content is consulted only to extract text
--- (for system) or tool_use_id (for tool results) and is otherwise
--- treated opaquely.
+-- A persisted message as seen by the transform. The transform dispatches on
+-- message_type and owns the minimum typed classifications needed for physical
+-- render-unit construction; detailed content remains renderer-owned.
 value Message {
     message_id: String
     sequence_id: Integer
     message_type: String
-    -- Opaque to the transform unless message_type is 'system' (text) or
-    -- 'tool' (tool_use_id). The agent renderer reads content blocks
-    -- itself; the transform does not.
+    -- agent-only: true exactly when content is non-empty and every block is a
+    -- non-think tool_use block.
+    is_non_think_tool_only: Boolean?
+    -- system-only: hidden messages have no visible render unit and do not form
+    -- a physical grouping boundary.
+    is_hidden: Boolean?
 }
 
 -- A client-queued message awaiting server reflection. Sourced from
@@ -259,6 +261,20 @@ rule EmitAgentTurnUnit {
         -- Subsequent EmitToolResultIntoActiveAgent firings populate the map.
 }
 
+-- Hidden system messages have no physical unit and do not break the agent run.
+rule SkipHiddenSystem {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: current_message_type(b) = "system"
+    requires: current_message(b).is_hidden = true
+
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
+    ensures: b.position = b.position + 1
+}
+
 -- System message with non-empty text → system unit. Does NOT break the
 -- agent run (a system note between agent turns is part of the same
 -- run for header-suppression purposes).
@@ -269,6 +285,7 @@ rule EmitSystemUnitWithText {
     requires: b.position < len(b.messages)
     requires: current_message_type(b) = "system"
     requires: current_message_has_text(b)
+    requires: current_message(b).is_hidden != true
 
     ensures: b.historical = append(b.historical, system_unit(current_message(b)))
     ensures: b.in_agent_run = b.in_agent_run
@@ -285,6 +302,7 @@ rule SkipEmptySystem {
     requires: b.position < len(b.messages)
     requires: current_message_type(b) = "system"
     requires: not current_message_has_text(b)
+    requires: current_message(b).is_hidden != true
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
@@ -408,8 +426,10 @@ rule WalkComplete {
 -- turn has non-empty content consisting exclusively of non-think tool calls.
 -- The group key is its first member's key; members retain invocation order,
 -- tool-result ownership, source identity, and isFirstInTurn. Singleton runs
--- remain agent_turn units. Any other historical unit breaks the run, so prose,
--- think, system, user, skill, and pending content retain visible ordering.
+-- remain one-member group units so appends preserve component identity. Any
+-- other visible historical unit breaks the run, so prose,
+-- think, visible system, user, skill, and pending content retain visible
+-- ordering. Hidden system messages emit no unit and do not split a run.
 --
 -- Pending queued messages → pending_user HISTORICAL units, in input
 -- order, appended at the END of b.historical. Each unit's key is
@@ -432,6 +452,8 @@ rule AppendPendingHistoricalUnits {
         -- group_tool_only_agent_turns(units, boundaries) partitions each
         -- boundary-delimited adjacent run of
         -- tool-only agent_turn units into bounded groups of at most eight with
+        -- Tool-only classification is member.source_message.is_non_think_tool_only;
+        -- hidden system messages never entered units during the message walk.
         -- { kind: tool_only_agent_turn_group,
         --   key: first(run).key,
         --   source_message_id: first(run).source_message_id,
