@@ -3108,10 +3108,6 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
-        if will_settle_active_direct_turn {
-            self.settle_turn_span();
-        }
-
         Ok(generated_events)
     }
 
@@ -3254,7 +3250,7 @@ where
             settlement.terminal.variant_name(),
             settlement.state.variant_name(),
         );
-        match self
+        let result = match self
             .storage
             .settle_active_direct_turn(&settlement)
             .instrument(span.clone())
@@ -3272,7 +3268,11 @@ where
                 self.reconcile_failed_direct_turn_settlement(settlement, terminal, error, span)
                     .await
             }
+        };
+        if result.is_ok() {
+            self.settle_turn_span();
         }
+        result
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4611,19 +4611,41 @@ where
                             }
                         })
                 });
+                let settlement_span = self.active_direct_turn.as_ref().map(|turn| {
+                    let terminal = direct_turn_terminal
+                        .as_ref()
+                        .expect("active direct turn has terminal settlement");
+                    let parent = self
+                        .turn_span
+                        .clone()
+                        .unwrap_or_else(tracing::Span::current);
+                    crate::logging::continuation_direct_turn_settlement_span(
+                        &parent,
+                        &self.context.conversation_id,
+                        turn.turn_id.0,
+                        turn.generation,
+                        terminal.variant_name(),
+                        self.state.variant_name(),
+                        &operation_id,
+                    )
+                });
                 let continuation_result = if let Some(turn) = self.active_direct_turn.as_ref() {
+                    let settlement = crate::runtime::traits::ContinuationDirectTurnSettlement {
+                        turn: (**turn).clone(),
+                        terminal: direct_turn_terminal
+                            .clone()
+                            .expect("active direct turn has terminal settlement"),
+                        operation_id: operation_id.clone(),
+                        message: message.clone(),
+                        state: self.state.clone(),
+                        state_updated_at: self.state_updated_at,
+                    };
                     self.storage
-                        .settle_continuation_direct_turn(
-                            &crate::runtime::traits::ContinuationDirectTurnSettlement {
-                                turn: (**turn).clone(),
-                                terminal: direct_turn_terminal
-                                    .clone()
-                                    .expect("active direct turn has terminal settlement"),
-                                operation_id: operation_id.clone(),
-                                message: message.clone(),
-                                state: self.state.clone(),
-                                state_updated_at: self.state_updated_at,
-                            },
+                        .settle_continuation_direct_turn(&settlement)
+                        .instrument(
+                            settlement_span
+                                .clone()
+                                .expect("direct-turn settlement has telemetry span"),
                         )
                         .await
                 } else {
@@ -4638,9 +4660,25 @@ where
                         .await
                 };
                 let continuation_outcome = match continuation_result {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        if let Some(span) = &settlement_span {
+                            span.record(
+                                "outcome",
+                                match outcome {
+                                    crate::db::ContinuationCommitOutcome::Applied => "committed",
+                                    crate::db::ContinuationCommitOutcome::Duplicate => "duplicate",
+                                    crate::db::ContinuationCommitOutcome::Stale => "stale",
+                                },
+                            );
+                            span.record("commit_probe", "not_needed");
+                        }
+                        outcome
+                    }
                     Err(first_error) => {
-                        let reconciled = if let (Some(turn), Some(terminal)) = (
+                        if let Some(span) = &settlement_span {
+                            span.record("error.message", first_error.as_str());
+                        }
+                        let reconciliation = if let (Some(turn), Some(terminal)) = (
                             self.active_direct_turn.as_ref(),
                             direct_turn_terminal.as_ref(),
                         ) {
@@ -4655,8 +4693,12 @@ where
                                         state_updated_at: self.state_updated_at,
                                     },
                                 )
+                                .instrument(
+                                    settlement_span
+                                        .clone()
+                                        .expect("direct-turn settlement has telemetry span"),
+                                )
                                 .await
-                                .ok()
                         } else {
                             self.storage
                                 .commit_continuation(
@@ -4667,15 +4709,45 @@ where
                                     self.state_updated_at,
                                 )
                                 .await
-                                .ok()
-                        }
-                        .filter(|outcome| {
-                            matches!(
-                                outcome,
-                                crate::db::ContinuationCommitOutcome::Applied
-                                    | crate::db::ContinuationCommitOutcome::Duplicate
-                            )
-                        });
+                        };
+                        let reconciled = match reconciliation {
+                            Ok(
+                                outcome @ (crate::db::ContinuationCommitOutcome::Applied
+                                | crate::db::ContinuationCommitOutcome::Duplicate),
+                            ) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record(
+                                        "outcome",
+                                        match outcome {
+                                            crate::db::ContinuationCommitOutcome::Applied => {
+                                                "reconciled_committed"
+                                            }
+                                            crate::db::ContinuationCommitOutcome::Duplicate => {
+                                                "reconciled_duplicate"
+                                            }
+                                            crate::db::ContinuationCommitOutcome::Stale => {
+                                                unreachable!()
+                                            }
+                                        },
+                                    );
+                                    span.record("commit_probe", "retry");
+                                }
+                                Some(outcome)
+                            }
+                            Ok(crate::db::ContinuationCommitOutcome::Stale) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record("commit_probe", "retry_stale");
+                                }
+                                None
+                            }
+                            Err(probe_error) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record("commit_probe", "retry_failed");
+                                    span.record("probe.error.message", probe_error.as_str());
+                                }
+                                None
+                            }
+                        };
                         if let Some(outcome) = reconciled {
                             outcome
                         } else {
@@ -4689,6 +4761,11 @@ where
                                     ConvState::ContextExhausted { .. }
                                         | ConvState::RecoverableContinuationFailure { .. }
                                 ) {
+                                    if let Some(span) = &settlement_span {
+                                        span.record("outcome", "durable_terminal_observed");
+                                        span.record("commit_probe", "state_read");
+                                        span.record("durable_state", snapshot.state.variant_name());
+                                    }
                                     self.state = snapshot.state;
                                     self.state_updated_at = snapshot.state_updated_at;
                                     let _ = self.broadcast_tx.send_seq(|sequence_id| {
@@ -4717,7 +4794,7 @@ where
                             self.state = ConvState::RecoverableContinuationFailure { failure };
                             self.state_updated_at = Utc::now();
                             if let Some(turn) = self.active_direct_turn.as_deref() {
-                                self.storage
+                                let recovery_result = self.storage
                                     .settle_active_direct_turn(
                                         &crate::runtime::traits::ActiveDirectTurnSettlement {
                                             turn: turn.clone(),
@@ -4728,10 +4805,28 @@ where
                                             state_updated_at: self.state_updated_at,
                                         },
                                     )
-                                    .await?;
+                                    .instrument(
+                                        settlement_span
+                                            .clone()
+                                            .expect("direct-turn settlement has telemetry span"),
+                                    )
+                                    .await;
+                                if let Err(recovery_error) = recovery_result {
+                                    if let Some(span) = &settlement_span {
+                                        span.record("outcome", "recovery_settlement_failed");
+                                        span.record("probe.error.message", recovery_error.as_str());
+                                        span.record("otel.status_code", "ERROR");
+                                    }
+                                    return Err(recovery_error);
+                                }
+                                if let Some(span) = &settlement_span {
+                                    span.record("outcome", "recovery_state_committed");
+                                    span.record("commit_probe", "fallback_settlement");
+                                }
                                 self.active_direct_turn = None;
                                 self.pending_direct_turn_terminal = None;
                                 self.direct_turn_cancellation_initiated = false;
+                                self.settle_turn_span();
                             } else {
                                 self.storage
                                     .update_state(
@@ -4769,6 +4864,9 @@ where
                         self.active_direct_turn = None;
                         self.pending_direct_turn_terminal = None;
                         self.direct_turn_cancellation_initiated = false;
+                        if used_direct_turn_settlement {
+                            self.settle_turn_span();
+                        }
                     }
                     crate::db::ContinuationCommitOutcome::Duplicate
                     | crate::db::ContinuationCommitOutcome::Stale => {
@@ -4788,6 +4886,9 @@ where
                         self.state = persisted.state;
                         self.state_updated_at = persisted.state_updated_at;
                         if continuation_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            if used_direct_turn_settlement {
+                                self.settle_turn_span();
+                            }
                             let _ = self.broadcast_tx.send_message(message);
                             drop(reserved_range);
                             let _ =
@@ -9618,6 +9719,31 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn direct_turn_settlement_closes_completed_turn_span_immediately() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::Idle;
+        rt.turn_span = Some(tracing::info_span!("completed-direct-turn"));
+
+        rt.settle_pending_direct_turn(
+            crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(10),
+                generation: 0,
+            },
+            Box::new(crate::runtime::traits::ActiveDirectTurnTerminal::Completed),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rt.turn_span.is_none(),
+            "queued steering must open a new trace after settlement"
+        );
+    }
+
+    #[tokio::test]
     async fn active_direct_turn_completes_after_final_llm_outcome() {
         let (mut rt, storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -10129,6 +10255,7 @@ mod authoritative_user_message_effect_tests {
             summary: summary.clone(),
         };
         rt.state_updated_at = Utc::now();
+        rt.turn_span = Some(tracing::info_span!("continuation-direct-turn"));
         storage
             .update_state(
                 &rt.context.conversation_id,
@@ -10160,6 +10287,7 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(settlements[0].operation_id, operation_id);
         assert_eq!(settlements[0].state, rt.state);
         assert!(rt.active_direct_turn.is_none());
+        assert!(rt.turn_span.is_none());
         assert!(matches!(
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::ContextExhausted { .. })

@@ -187,6 +187,48 @@ pub(crate) fn direct_turn_settlement_span(
     terminal_kind: &str,
     target_state: &str,
 ) -> tracing::Span {
+    direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "state",
+    )
+}
+
+pub(crate) fn continuation_direct_turn_settlement_span(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    operation_id: &str,
+) -> tracing::Span {
+    let span = direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "continuation",
+    );
+    span.record("operation_id", operation_id);
+    span
+}
+
+fn direct_turn_settlement_span_for_path(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    settlement_path: &str,
+) -> tracing::Span {
     tracing::info_span!(
         target: "phoenix_ide::otel",
         parent: parent,
@@ -196,6 +238,8 @@ pub(crate) fn direct_turn_settlement_span(
         generation,
         terminal_kind,
         target_state,
+        settlement_path,
+        operation_id = tracing::field::Empty,
         outcome = tracing::field::Empty,
         commit_probe = tracing::field::Empty,
         durable_state = tracing::field::Empty,
@@ -522,6 +566,18 @@ mod tests {
             settlement.record("error.message", "database is locked");
             settlement.record("otel.status_code", "ERROR");
             drop(settlement);
+            let continuation_settlement = continuation_direct_turn_settlement_span(
+                &turn,
+                "continuation-settlement-conversation-123",
+                266,
+                1,
+                "failed",
+                "ContextExhausted",
+                "continuation-operation-123",
+            );
+            continuation_settlement.record("outcome", "reconciled_duplicate");
+            continuation_settlement.record("commit_probe", "retry");
+            drop(continuation_settlement);
             drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
@@ -571,7 +627,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 9);
+        assert_eq!(spans.len(), 10);
         assert_eq!(
             spans
                 .iter()
@@ -584,6 +640,7 @@ mod tests {
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "direct_turn.settle",
                 "direct_turn.settle",
                 "conversation.turn",
                 "llm.request"
@@ -624,6 +681,10 @@ mod tests {
             "failed_still_owed",
             "still_owed",
             "database is locked",
+            "state",
+            "continuation",
+            "continuation-operation-123",
+            "reconciled_duplicate",
         ] {
             assert!(
                 encoded.contains(required),

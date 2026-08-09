@@ -4172,26 +4172,40 @@ async fn cancel_active_direct_turn(
     state: &AppState,
     conversation_id: &str,
 ) -> Result<bool, AppError> {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
-    let Some(turn) = repo
-        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
-            conversation_id.to_string(),
-        ))
-        .await
-        .map_err(|error| AppError::Internal(error.to_string()))?
-    else {
+    let Some(turn) = load_active_direct_turn_authority(state, conversation_id).await? else {
         return Ok(false);
     };
-    let span = tracing::Span::current();
-    span.record("turn_id", turn.id.0);
-    span.record("generation", turn.generation);
+    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
     repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
-        turn_id: turn.id,
+        turn_id: turn.turn_id,
         expected_generation: turn.generation,
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
     Ok(true)
+}
+
+async fn load_active_direct_turn_authority(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, AppError> {
+    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let turn = repo
+        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let Some(turn) = turn else {
+        return Ok(None);
+    };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
+    Ok(Some(crate::runtime::traits::ActiveDirectTurn {
+        turn_id: turn.id,
+        generation: turn.generation,
+    }))
 }
 
 fn record_cancel_outcome(
@@ -4372,6 +4386,10 @@ async fn cancel_conversation_inner(
         ))));
     }
 
+    let direct_turn_present = load_active_direct_turn_authority(&state, &id)
+        .await?
+        .is_some();
+
     state
         .runtime
         .send_event(
@@ -4388,7 +4406,11 @@ async fn cancel_conversation_inner(
         &id,
         &effective_state,
         "runtime_cancel_requested",
-        "not_checked",
+        if direct_turn_present {
+            "observed"
+        } else {
+            "absent"
+        },
     );
 
     Ok(Json(CancelResponse {
