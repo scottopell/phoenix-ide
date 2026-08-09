@@ -1978,6 +1978,7 @@ rule ModeChangeNotification {
 rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
+    requires: not committed_steering_turn_awaiting_first_response(conversation)
     requires: conversation.core_status not in {
         awaiting_continuation,
         recoverable_continuation_failure
@@ -1985,6 +1986,21 @@ rule ServerRestartOrdinaryConversation {
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = idle
+}
+
+rule ServerRestartCommittedSteeringTurn {
+    when: ServerRestarted(conversation)
+    requires: conversation.core_status = llm_requesting
+    requires: committed_steering_turn_awaiting_first_response(conversation)
+    ensures: conversation.core_status = previous(conversation.core_status)
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- The bounded owner is true only when the latest transcript row is a
+        -- user message with an immutable accepted-steering identity and that
+        -- exact message is absent from the pending queue. The first provider
+        -- response changes the transcript tail and ends this exception. No
+        -- steering lifecycle or second queue authority is introduced.
 }
 
 rule ServerRestartPendingContinuation {

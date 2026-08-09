@@ -175,6 +175,10 @@ rule EnqueueSteeringMessage {
         -- SteerMessageQueued and deliver Event::SteerMessage to the executor.
         -- A failed append persists neither row and publishes no success event or
         -- HTTP success.
+        -- Runtime ownership is revalidated after acquiring the queue projection
+        -- fence and held through channel admission. If the previously observed
+        -- executor was retired, enqueue retries against the current executor
+        -- before committing, so no accepted row is sent to a retired channel.
 }
 
 -- REQ-STEER-002
@@ -233,12 +237,20 @@ rule DrainOnIdleEntry {
         -- synchronous failure is reduced from LlmRequesting into a persisted
         -- typed Error. The committed messages remain and the deleted queue rows
         -- are neither recreated nor redrained.
+        -- Starting this drained batch as a new user turn resets the parent
+        -- tool-cycle budget before RequestLlm; a mid-turn drain does not reset
+        -- the existing turn's budget.
         --
         -- Startup routes the durable queue through this same reducer arm. A
         -- matching pre-transaction message is a typed legacy partial and is
         -- consumed without duplication. A mismatched identity or stale batch
         -- fails once, leaves the durable queue intact, and stops that runtime so
         -- a later reconstruction retries from database truth.
+        -- Once the transaction has committed LlmRequesting and removed the
+        -- exact queue row, the immutable acceptance identity plus the latest
+        -- transcript user message form bounded restart ownership until the
+        -- first provider response changes the transcript tail. Recovery resumes
+        -- one request without adding a steering lifecycle or queue authority.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
@@ -318,6 +330,10 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         -- performs no publication or dispatch and is not retried while holding
         -- the projection fence. The runtime exits; its successor reconstructs
         -- the untouched batch from database truth.
+        -- If the transaction commits but the deferred RequestLlm cannot start,
+        -- that synchronous failure is reduced through the same persisted typed
+        -- Error path as a turn-end steering drain. The committed messages remain
+        -- and the exact drained queue rows remain absent.
 }
 
 -- REQ-STEER-003
@@ -511,6 +527,16 @@ surface SteeringQueueApi {
         -- entries are persisted to the transcript BEFORE the LLM task is
         -- spawned (inline drain + deferred RequestLlm in the executor), so the
         -- in-flight LLM call deterministically observes the steered messages.
+        -- The drain preserves the existing turn's tool-cycle budget. A
+        -- synchronous failure to start the deferred request settles as a
+        -- durable typed Error after the atomic drain commit.
+
+    @guarantee CommittedTurnRestartRecovery
+        -- A committed drain awaiting its first provider response resumes one
+        -- LLM request after reconstruction. The immutable acceptance identity,
+        -- latest transcript user message, and absence of that exact pending
+        -- queue row are the bounded evidence. The first provider response ends
+        -- this exception; no second queue authority or steering lifecycle exists.
 
     @guarantee EnqueueDuringDrainPreserved
         -- A steering message enqueued while a drain is in progress is not lost.

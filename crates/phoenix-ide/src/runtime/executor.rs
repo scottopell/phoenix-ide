@@ -3325,8 +3325,12 @@ where
         drop(projection_guard);
 
         if let Some(effect) = deferred_request_llm {
-            if let Some(gen_event) = self.execute_effect(effect).await? {
-                generated_events.push(gen_event);
+            match self.execute_effect(effect).await {
+                Ok(Some(gen_event)) => generated_events.push(gen_event),
+                Ok(None) => {}
+                Err(error) => {
+                    generated_events.push(self.steering_dispatch_failure_event(error));
+                }
             }
         }
         Ok(())
@@ -5384,6 +5388,7 @@ where
     ) -> Result<Option<Event>, String> {
         match post_commit {
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
+                self.parent_tool_cycle_count = 0;
                 let _ = self
                     .broadcast_tx
                     .send_seq(|sequence_id| SseEvent::StateChange {
@@ -5397,27 +5402,29 @@ where
                 }
                 match self.dispatch_llm_request().await {
                     Ok(event) => Ok(event),
-                    Err(error) => {
-                        tracing::error!(
-                            conversation_id = %self.context.conversation_id,
-                            %error,
-                            "Steering drain committed but LLM dispatch failed"
-                        );
-                        let attempt = match self.state {
-                            ConvState::LlmRequesting { attempt } => attempt,
-                            _ => 1,
-                        };
-                        Ok(Some(Event::LlmError {
-                            message: error,
-                            error_kind: crate::db::ErrorKind::InvalidRequest,
-                            attempt,
-                            recovery_in_progress: false,
-                            resets_at: None,
-                        }))
-                    }
+                    Err(error) => Ok(Some(self.steering_dispatch_failure_event(error))),
                 }
             }
             SteeringDrainPostCommit::ContinueExistingLlm => Ok(None),
+        }
+    }
+
+    fn steering_dispatch_failure_event(&self, error: String) -> Event {
+        tracing::error!(
+            conversation_id = %self.context.conversation_id,
+            %error,
+            "Steering drain committed but LLM dispatch failed"
+        );
+        let attempt = match self.state {
+            ConvState::LlmRequesting { attempt } => attempt,
+            _ => 1,
+        };
+        Event::LlmError {
+            message: error,
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            attempt,
+            recovery_in_progress: false,
+            resets_at: None,
         }
     }
 
@@ -13229,6 +13236,87 @@ mod steer_drain_detector_tests {
             rt.recovery_disposition,
             RuntimeRecoveryDisposition::Continue
         );
+    }
+
+    #[tokio::test]
+    async fn new_turn_steering_drain_resets_parent_cycle_budget() {
+        let conversation_id = "conv-steering-new-turn-cycle-budget";
+        let entry = mk_entry("fresh-turn", "fresh turn");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![entry.clone()],
+        );
+        rt.parent_tool_cycle_cap = 1;
+        rt.parent_tool_cycle_count = 1;
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(Event::SteeringQueueChanged)
+            .await
+            .expect("fresh steering turn starts within a fresh cycle budget");
+
+        assert_eq!(rt.parent_tool_cycle_count, 1);
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mid_turn_dispatch_failure_preserves_drain_and_persists_error() {
+        let conversation_id = "conv-mid-turn-dispatch-failure";
+        let entry = mk_entry("mid-turn-steer", "accepted mid turn");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            mk_tool_executing(),
+            vec![entry.clone()],
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::RequestLlm);
+        let generated = rt
+            .apply_transition_result(result)
+            .await
+            .expect("mid-turn drain commit succeeds before dispatch");
+        assert_eq!(generated.len(), 1, "dispatch failure must become one event");
+        for event in generated {
+            rt.process_event(event)
+                .await
+                .expect("dispatch failure settles through the reducer");
+        }
+
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("settled state"),
+            ConvState::Error {
+                message: "Persisted effort 'high' is not supported by model 'test-model'"
+                    .to_string(),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            }
+        );
+        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert!(rt.llm_task_handle.is_none());
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

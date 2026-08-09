@@ -192,11 +192,17 @@ WHEN server restarts
 THE SYSTEM SHALL restore ordinary interrupted conversations to idle state
 AND preserve complete message history
 
+WHEN server restarts after an accepted steering batch has committed its user messages and awaiting-LLM state but before the first response settles
+THE SYSTEM SHALL preserve the awaiting-LLM state
+AND resume exactly one LLM request from the committed transcript
+AND SHALL derive this bounded ownership from the immutable accepted steering identity, the latest transcript user message, and absence of that exact pending queue entry
+AND SHALL NOT introduce a second steering lifecycle or queue authority
+
 WHEN server restarts with a conversation in `awaiting_continuation`, `recoverable_continuation_failure`, or continuation-summary `awaiting_recovery`
 THE SYSTEM SHALL preserve the durable continuation operation identity and recovery state
 AND materialize the pending continuation operation at startup
 
-**Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
+**Rationale:** Users expect their conversation history to survive server restarts. Ordinary interrupted turns resume from idle so users can re-send their last message. An already-accepted steering turn cannot safely be resent after its queue row has been atomically consumed, so its immutable acceptance and transcript evidence provide a narrow restart owner until the first response settles. Durable continuation operations retain their identity and explicit recovery path so restart cannot duplicate or strand compaction.
 
 ---
 

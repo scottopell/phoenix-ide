@@ -5302,6 +5302,41 @@ impl Database {
         }))
     }
 
+    /// Report whether the newest transcript row is a committed steering user
+    /// message whose exact queue row has already been consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the lookup fails.
+    pub async fn has_committed_steering_turn(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM messages m
+                 JOIN steering_acceptance_receipts r
+                   ON r.conversation_id = m.conversation_id
+                  AND r.message_id = m.message_id
+                 WHERE m.conversation_id = ?1
+                   AND m.message_type = 'user'
+                   AND m.sequence_id = (
+                       SELECT MAX(latest.sequence_id)
+                       FROM messages latest
+                       WHERE latest.conversation_id = m.conversation_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM steering_messages queued
+                       WHERE queued.conversation_id = m.conversation_id
+                         AND queued.message_id = m.message_id
+                   )
+             )",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Remove one steering entry and report whether this call removed a row.
     /// The boolean is the publication fence for cancellation SSE: an
     /// idempotent retry succeeds but must not announce a second mutation.
@@ -7564,6 +7599,26 @@ impl Database {
                              AND t.owns_conversation = 1
                              AND t.canonical_message_id IS NOT NULL
                              AND t.terminal_kind IS NULL
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM messages m
+                           JOIN steering_acceptance_receipts r
+                             ON r.conversation_id = m.conversation_id
+                            AND r.message_id = m.message_id
+                           WHERE m.conversation_id = conversations.id
+                             AND m.message_type = 'user'
+                             AND m.sequence_id = (
+                                 SELECT MAX(latest.sequence_id)
+                                 FROM messages latest
+                                 WHERE latest.conversation_id = m.conversation_id
+                             )
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM steering_messages queued
+                                 WHERE queued.conversation_id = m.conversation_id
+                                   AND queued.message_id = m.message_id
+                             )
                        )
                    )
                )",
@@ -14595,6 +14650,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!db.has_committed_steering_turn("drain-ok").await.unwrap());
         let next_state = ConvState::LlmRequesting { attempt: 1 };
         let state_updated_at = Utc::now();
 
@@ -14639,6 +14695,20 @@ mod tests {
                 .unwrap(),
             Some(SteeringAcceptanceFingerprint::LegacyUnknown)
         );
+        assert!(db.has_committed_steering_turn("drain-ok").await.unwrap());
+
+        db.add_message(
+            "first-response",
+            "drain-ok",
+            &MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::text(
+                "settled",
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db.has_committed_steering_turn("drain-ok").await.unwrap());
     }
 
     #[tokio::test]
