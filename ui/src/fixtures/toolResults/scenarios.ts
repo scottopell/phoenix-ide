@@ -69,12 +69,12 @@ function toolMessage(
 }
 
 const fixtureImageMediaType = 'image/svg+xml';
-const fixtureImageData = 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjQwIiB2aWV3Qm94PSIwIDAgNjQwIDI0MCI+PHJlY3Qgd2lkdGg9IjY0MCIgaGVpZ2h0PSIyNDAiIHJ4PSIxOCIgZmlsbD0iIzExMTgyNyIvPjxyZWN0IHg9IjI0IiB5PSIyNCIgd2lkdGg9IjU5MiIgaGVpZ2h0PSIxOTIiIHJ4PSIxMiIgZmlsbD0iIzFmMjkzNyIgc3Ryb2tlPSIjNjBhNWZhIiBzdHJva2Utd2lkdGg9IjMiLz48Y2lyY2xlIGN4PSI1OCIgY3k9IjU4IiByPSI5IiBmaWxsPSIjMjJjNTVlIi8+PHRleHQgeD0iODIiIHk9IjY2IiBmaWxsPSIjZjlmYWZiIiBmb250LWZhbWlseT0ibW9ub3NwYWNlIiBmb250LXNpemU9IjI0Ij50b29sIHJlc3VsdCBpbWFnZSBmaXh0dXJlPC90ZXh0Pjx0ZXh0IHg9IjQ0IiB5PSIxMjQiIGZpbGw9IiM5M2M1ZmQiIGZvbnQtZmFtaWx5PSJtb25vc3BhY2UiIGZvbnQtc2l6ZT0iMTgiPnR5cGVkIGltYWdlcyDigKIgZGlzcGxheV9kYXRhIOKAoiBsZWdhY3kgSlNPTjwvdGV4dD48cGF0aCBkPSJNNDQgMTc0IEwxNTAgMTQyIEwyMzIgMTg1IEwzMzIgMTEyIEw0MzAgMTY2IEw1OTYgOTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2E3OGJmYSIgc3Ryb2tlLXdpZHRoPSI2Ii8+PC9zdmc+';
+const fixtureImageData = 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxIiBoZWlnaHQ9IjEiPjxyZWN0IHdpZHRoPSIxIiBoZWlnaHQ9IjEiLz48L3N2Zz4=';
 const longToolText = Array.from({ length: 20 }, (_, index) => `line ${index + 1}: deterministic long fixture output`).join('\n');
 const veryLongToolText = Array.from({ length: 18 }, (_, index) => `capture ${index + 1}: browser profile raw text fallback sample`).join('\n');
 const overLimitFileText = Array.from(
-  { length: 140 },
-  (_, index) => `${String(index + 1).padStart(3, '0')}\tconst rendererFixtureLine${index + 1} = "${'x'.repeat(32)}";`,
+  { length: 21 },
+  (_, index) => `${index + 1}\tconst rendererFixtureLine${index + 1} = true;`,
 ).join('\n');
 
 function bashLines(lines: string[]) {
@@ -119,7 +119,7 @@ const shellMessages: Message[] = [
     { type: 'tool_use', id: 'shell-key', name: 'browser_key_press', input: { key: 'Enter', modifiers: ['ctrl'], method: 'cdp' } },
     { type: 'tool_use', id: 'shell-resize', name: 'browser_resize', input: { width: 390, height: 844, timeout: '5s' } },
     { type: 'tool_use', id: 'shell-question', name: 'ask_user_question', input: { questions: [{ header: 'Renderer', question: 'Which tool-result family should we refine next?', options: [{ label: 'Execution', description: 'Bash, tmux, and patch results' }, { label: 'Browser', description: 'Console and profile results' }], multiSelect: false }] } },
-    { type: 'tool_use', id: 'shell-truncated', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/oversized-fixture.ts', offset: 1, limit: 140 } },
+    { type: 'tool_use', id: 'shell-truncated', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/oversized-fixture.ts', offset: 1, limit: 21 } },
     { type: 'tool_use', id: 'shell-proposal', name: 'propose_task', input: { title: 'Refine structured tool-result rendering', priority: 'p2', body: 'Use the executable fixture matrix to replace generic JSON fallbacks.' } },
     { type: 'tool_use', id: 'shell-unknown', name: 'custom_fixture_tool', input: { payload: 'unknown renderer fallback', mode: 'raw' } },
   ]),
@@ -140,7 +140,7 @@ const shellMessages: Message[] = [
   toolMessage(8, 'shell-resize', 'Viewport resized to 390 × 844.', { display_data: { duration_ms: 19 } }),
   toolMessage(9, 'shell-question', 'Selected Execution.', { display_data: { duration_ms: 2_100 } }),
   toolMessage(10, 'shell-truncated', overLimitFileText, {
-    display_data: { ...readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 140, 1, 140, 140, 140), duration_ms: 35 },
+    display_data: { ...readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 21, 1, 21, 21, 21), duration_ms: 35 },
   }),
   toolMessage(11, 'shell-proposal', 'Task fork proposal prepared for review.', {
     display_data: { duration_ms: 28, fork_proposal_id: 'fixture-fork-proposal' },
@@ -286,7 +286,7 @@ const discoveryMessages: Message[] = [
     { type: 'tool_use', id: 'discover-keyword-empty', name: 'keyword_search', input: { query: 'missing thing', search_terms: ['missing thing'] } },
     { type: 'tool_use', id: 'discover-keyword-raw', name: 'keyword_search', input: { query: 'llm unavailable raw fallback', search_terms: ['llm unavailable', 'raw fallback'] } },
     { type: 'tool_use', id: 'discover-read-short', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/scenarios.ts', offset: 1, limit: 12 } },
-    { type: 'tool_use', id: 'discover-read-long', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/oversized-fixture.ts', offset: 1, limit: 24 } },
+    { type: 'tool_use', id: 'discover-read-long', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/oversized-fixture.ts', offset: 1, limit: 21 } },
     { type: 'tool_use', id: 'discover-read-range', name: 'read_file', input: { path: 'ui/src/components/MessageComponents.tsx', offset: 711, limit: 16 } },
     { type: 'tool_use', id: 'discover-read-eof', name: 'read_file', input: { path: 'tasks/example.md', offset: 498, limit: 20 } },
     { type: 'tool_use', id: 'discover-read-long-lines', name: 'read_file', input: { path: 'docs/very-long-line.txt', offset: 1, limit: 3 } },
@@ -314,7 +314,7 @@ const discoveryMessages: Message[] = [
     'ui/src/components/BrowserProfileResponseView.tsx:23:  "run_scenario",',
   ].join('\n')),
   toolMessage(9, 'discover-read-short', Array.from({ length: 12 }, (_, index) => `${index + 1}\tconst deterministicFixtureLine${index + 1} = true;`).join('\n'), { display_data: readFileDisplayData('ui/src/fixtures/toolResults/scenarios.ts', 1, 12, 1, 12, 12, 30) }),
-  toolMessage(10, 'discover-read-long', `${Array.from({ length: 24 }, (_, index) => `${index + 1}\tfixture long line ${index + 1}`).join('\n')}\n\n[76 more lines not shown (total: 100 lines)]`, { display_data: readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 24, 1, 24, 24, 100) }),
+  toolMessage(10, 'discover-read-long', `${Array.from({ length: 21 }, (_, index) => `${index + 1}\tfixture long line ${index + 1}`).join('\n')}\n\n[79 more lines not shown (total: 100 lines)]`, { display_data: readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 21, 1, 21, 21, 100) }),
   toolMessage(11, 'discover-read-range', Array.from({ length: 16 }, (_, index) => `${711 + index}\tMessageComponents excerpt ${711 + index}`).join('\n'), { display_data: readFileDisplayData('ui/src/components/MessageComponents.tsx', 711, 16, 711, 726, 16, 2762) }),
   toolMessage(12, 'discover-read-eof', Array.from({ length: 4 }, (_, index) => `${498 + index}\tEOF excerpt ${498 + index}`).join('\n'), { display_data: readFileDisplayData('tasks/example.md', 498, 20, 498, 501, 4, 501) }),
   toolMessage(13, 'discover-read-long-lines', [
