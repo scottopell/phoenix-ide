@@ -6,7 +6,9 @@ import { pathToFileURL } from "node:url";
 
 export const PROJECTION_START = "<!-- phoenix-roadmap:projection:start -->";
 export const PROJECTION_END = "<!-- phoenix-roadmap:projection:end -->";
-const REDUCED_THROUGH = /<!-- phoenix-roadmap:reduced-through:(\d+) -->/;
+const MAX_UPDATE_BYTES = 2_000;
+const MAX_WORKSTREAMS = 12;
+const MAX_ISSUE_BODY_BYTES = 65_536;
 
 const UPDATE_FENCE = /```phoenix-roadmap-update\s*\n([\s\S]*?)\n```/g;
 const SECTION_ORDER = [
@@ -23,7 +25,9 @@ function requiredLine(value, field) {
   if (typeof value !== "string" || value.trim() === "" || /[\r\n]/.test(value)) {
     throw new Error(`${field} must be a non-empty single-line string`);
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (trimmed.length > 200) throw new Error(`${field} must be at most 200 characters`);
+  return trimmed;
 }
 
 function optionalText(value, field) {
@@ -32,12 +36,14 @@ function optionalText(value, field) {
   if (value.includes(PROJECTION_START) || value.includes(PROJECTION_END)) {
     throw new Error(`${field} contains a reserved projection marker`);
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (trimmed.length > 800) throw new Error(`${field} must be at most 800 characters`);
+  return trimmed;
 }
 
 function validateEvidence(value) {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw new Error("evidence must contain at least one link");
+  if (!Array.isArray(value) || value.length === 0 || value.length > 5) {
+    throw new Error("evidence must contain between one and five links");
   }
   return value.map((item, index) => {
     if (item === null || typeof item !== "object" || Array.isArray(item)) {
@@ -49,6 +55,7 @@ function validateEvidence(value) {
     if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
       throw new Error(`evidence[${index}].url must use http or https`);
     }
+    if (url.length > 500) throw new Error(`evidence[${index}].url must be at most 500 characters`);
     return { label, url: parsed.toString() };
   });
 }
@@ -56,6 +63,9 @@ function validateEvidence(value) {
 export function validateUpdate(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("update must be an object");
+  }
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_UPDATE_BYTES) {
+    throw new Error(`update must be at most ${MAX_UPDATE_BYTES} UTF-8 bytes`);
   }
   if (value.kind !== "workstream-update" || value.version !== 1) {
     throw new Error("update must have kind workstream-update and version 1");
@@ -71,8 +81,12 @@ export function validateUpdate(value) {
   if (!Number.isSafeInteger(order) || order < 0) {
     throw new Error("order must be a non-negative integer");
   }
-  if (!Array.isArray(value.blocked_by) || value.blocked_by.some((item) => typeof item !== "string" || item.trim() === "" || /[\r\n]/.test(item))) {
-    throw new Error("blocked_by must be an array of non-empty single-line strings");
+  if (
+    !Array.isArray(value.blocked_by) ||
+    value.blocked_by.length > 5 ||
+    value.blocked_by.some((item) => typeof item !== "string" || item.trim() === "" || item.length > 200 || /[\r\n]/.test(item))
+  ) {
+    throw new Error("blocked_by must contain at most five non-empty single-line strings of at most 200 characters");
   }
 
   return {
@@ -91,14 +105,12 @@ export function validateUpdate(value) {
   };
 }
 
-export function updatesFromComments(comments, triggerCommentId) {
+export function updatesFromComments(comments) {
   const latest = new Map();
   const ordered = [...comments]
     .filter(
       (comment) =>
         Number.isSafeInteger(comment.id) &&
-        comment.id <= triggerCommentId &&
-        comment.created_at === comment.updated_at &&
         TRUSTED_ASSOCIATIONS.has(comment.author_association),
     )
     .sort((left, right) => left.id - right.id);
@@ -120,6 +132,10 @@ export function updatesFromComments(comments, triggerCommentId) {
         console.warn(`Ignoring invalid roadmap update in comment ${comment.id}: ${error.message}`);
       }
     }
+  }
+
+  if (latest.size > MAX_WORKSTREAMS) {
+    throw new Error(`roadmap supports at most ${MAX_WORKSTREAMS} current workstreams`);
   }
 
   return [...latest.values()].sort((left, right) => {
@@ -151,14 +167,18 @@ function renderUpdate(update, open) {
   return `<details${open ? " open" : ""}>\n<summary><strong>${markdownText(update.title)}</strong> — ${markdownText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
-export function renderProjection(updates, triggerComment) {
+export function renderRoadmap(updates, event) {
+  const eventTime = event.comment.updated_at ?? event.comment.created_at;
   const lines = [
+    "# Phoenix delivery roadmap",
+    "",
+    "One-request orientation for current Phoenix delivery. This entire body is generated from trusted structured comments; do not edit it manually.",
+    "",
     PROJECTION_START,
-    `<!-- phoenix-roadmap:reduced-through:${triggerComment.id} -->`,
     "",
     "## Current roadmap",
     "",
-    `_Reduced through agent comment at ${triggerComment.created_at}_`,
+    `_Reduced after agent comment ${event.action} at ${eventTime}_`,
   ];
 
   for (const [section, heading] of SECTION_ORDER) {
@@ -171,22 +191,21 @@ export function renderProjection(updates, triggerComment) {
   if (updates.length === 0) {
     lines.push("", "_No valid agent updates have been appended yet._");
   }
-  lines.push("", PROJECTION_END);
-  return lines.join("\n");
-}
-
-export function replaceProjection(body, projection) {
-  const current = String(body ?? "");
-  const start = current.indexOf(PROJECTION_START);
-  const end = current.indexOf(PROJECTION_END);
-  if (start === -1 && end === -1) {
-    return current.trim() === "" ? projection : `${projection}\n\n${current}`;
+  lines.push(
+    "",
+    PROJECTION_END,
+    "",
+    "## Roadmap rules",
+    "",
+    "- ProductConversation is the primary P0 program.",
+    "- Independent P0 repairs may proceed when they do not destabilize that critical path.",
+    "- Requirements remain in specs/Allium; decisions in ADRs; review state in PRs; shipped reality on `main`.",
+  );
+  const body = lines.join("\n");
+  if (Buffer.byteLength(body, "utf8") > MAX_ISSUE_BODY_BYTES) {
+    throw new Error(`generated roadmap exceeds GitHub's ${MAX_ISSUE_BODY_BYTES}-byte Issue body limit`);
   }
-  if (start === -1 || end === -1 || end < start) {
-    throw new Error("roadmap Issue body has unmatched projection markers");
-  }
-  const after = end + PROJECTION_END.length;
-  return `${current.slice(0, start)}${projection}${current.slice(after)}`;
+  return body;
 }
 
 async function githubResponse(path, token, options = {}) {
@@ -208,31 +227,13 @@ async function githubRequest(path, token, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
-async function replaceIssueProjection(owner, repo, issueNumber, projection, triggerCommentId, token) {
-  const path = `/repos/${owner}/${repo}/issues/${issueNumber}`;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    const response = await githubResponse(path, token);
-    if (!response.ok) throw new Error(`GitHub GET ${path}: ${response.status} ${await response.text()}`);
-    const etag = response.headers.get("etag");
-    if (!etag) throw new Error("GitHub Issue response lacks an ETag required for safe replacement");
-    const issue = await response.json();
-    const alreadyReducedThrough = Number(issue.body?.match(REDUCED_THROUGH)?.[1] ?? 0);
-    if (alreadyReducedThrough > triggerCommentId) {
-      return { skipped: "a newer agent comment is already projected" };
-    }
-    const body = replaceProjection(issue.body, projection);
-    if (body === issue.body) return { changed: false };
-
-    const patched = await githubResponse(path, token, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", "If-Match": etag },
-      body: JSON.stringify({ body }),
-    });
-    if (patched.status === 412) continue;
-    if (!patched.ok) throw new Error(`GitHub PATCH ${path}: ${patched.status} ${await patched.text()}`);
-    return { changed: true };
-  }
-  throw new Error("roadmap Issue changed during all three conditional replacement attempts");
+async function replaceIssueBody(owner, repo, issueNumber, body, token) {
+  await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+  return { changed: true };
 }
 
 async function listComments(owner, repo, issueNumber, token) {
@@ -245,22 +246,24 @@ async function listComments(owner, repo, issueNumber, token) {
 }
 
 export async function run({ event, configuredIssueNumber, token }) {
-  if (event.action !== "created" || event.issue?.pull_request) return { skipped: "not a created Issue comment" };
+  if (!["created", "edited", "deleted"].includes(event.action) || event.issue?.pull_request) {
+    return { skipped: "not a supported Issue comment event" };
+  }
   if (event.issue?.number !== configuredIssueNumber) return { skipped: "not the configured roadmap Issue" };
-  if (!Number.isSafeInteger(event.comment?.id) || !event.comment?.created_at) throw new Error("event lacks an immutable triggering comment identity");
+  if (!Number.isSafeInteger(event.comment?.id) || !event.comment?.created_at) throw new Error("event lacks a triggering comment identity");
   if (!TRUSTED_ASSOCIATIONS.has(event.comment.author_association)) {
     return { skipped: "triggering author is not trusted" };
   }
-  if (updatesFromComments([event.comment], event.comment.id).length === 0) {
+  if (event.action === "created" && updatesFromComments([event.comment]).length === 0) {
     return { skipped: "triggering comment contains no valid roadmap update" };
   }
 
   const [owner, repo] = event.repository.full_name.split("/");
   const comments = await listComments(owner, repo, configuredIssueNumber, token);
-  const updates = updatesFromComments(comments, event.comment.id);
-  const projection = renderProjection(updates, event.comment);
+  const updates = updatesFromComments(comments);
+  const body = renderRoadmap(updates, event);
   return {
-    ...(await replaceIssueProjection(owner, repo, configuredIssueNumber, projection, event.comment.id, token)),
+    ...(await replaceIssueBody(owner, repo, configuredIssueNumber, body, token)),
     updates: updates.length,
   };
 }

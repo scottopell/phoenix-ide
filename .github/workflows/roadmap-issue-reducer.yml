@@ -2,7 +2,7 @@ name: Reduce roadmap Issue
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited, deleted]
 
 permissions:
   contents: read
@@ -17,7 +17,8 @@ jobs:
     if: >-
       github.event.issue.pull_request == null &&
       vars.PHOENIX_ROADMAP_ISSUE_NUMBER != '' &&
-      github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER)
+      github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
