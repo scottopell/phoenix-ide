@@ -242,6 +242,12 @@ jobs:
           fetch-depth: 0
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - name: Test roadmap Issue reducer
+        run: node --test scripts/roadmap-issue-reducer.test.mjs
       - name: ./dev.py check (task)
         run: ./dev.py check --lanes task
 
