@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -14,6 +14,7 @@ import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { canShowCommissionReviewViewer } from './commissionReviewViewerPrecedence';
 import { ConversationNavStack } from '../components/ConversationNavStack';
+import { RecoverableLazyPanel } from '../RecoverableLazyPanel';
 import {
   historyMergeEventCursorFloor,
   initialHistoryExpansionState,
@@ -1881,7 +1882,7 @@ function ConversationPageContent({
       const prs = openFileState;
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <FileViewer
               filePath={prs.path}
               rootDir={prs.rootDir}
@@ -1891,14 +1892,14 @@ function ConversationPageContent({
               focus={prs.focus}
               inline
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
     if (paneDiffOpen && conversationId) {
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <ConversationDiffViewer
               conversationId={conversationId}
               target={diffTarget}
@@ -1907,42 +1908,42 @@ function ConversationPageContent({
               onSendNotes={handleSendNotes}
               inline
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
     if (browserViewerOpen && conversationId) {
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <BrowserViewPanel
               conversationId={conversationId}
               onClose={handleCloseBrowserView}
               inline
               takeover
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
     if (inspectViewerOpen && inspectSlot) {
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <ProcessInspectorPanel
               handleId={inspectSlot.handleId}
               conversationId={conversationId}
               onClose={handleCloseInspector}
               inline
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
     if (messageViewerOpen && messageSlot) {
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <MessageViewer
               sequenceId={messageSlot.sequenceId}
               messages={viewableMessages}
@@ -1950,21 +1951,21 @@ function ConversationPageContent({
               onSendNotes={handleSendNotes}
               inline
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
     if (commissionReviewViewerOpen && commissionReviewSlot) {
       return (
         <div id="app">
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <CommissionReviewViewer
               sequenceId={commissionReviewSlot.requestSequenceId}
               messages={viewableMessages}
               onClose={handleCloseMessageViewer}
               inline
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         </div>
       );
     }
@@ -2043,7 +2044,7 @@ function ConversationPageContent({
           }
         }}
       />
-      <Suspense fallback={null}>
+      <RecoverableLazyPanel>
         <TerminalPanel
           scope={{ kind: 'conversation', conversationId: conversationId! }}
           height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
@@ -2057,7 +2058,7 @@ function ConversationPageContent({
           showError={showError}
           onSendSelectionToDraft={handleSendTerminalSelection}
         />
-      </Suspense>
+      </RecoverableLazyPanel>
     </>
   ) : null;
 
@@ -2297,12 +2298,12 @@ function ConversationPageContent({
       ) : convStateForChildren.type === 'awaiting_recovery' ? (
         <>
         {credentialStatus && (
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <CredentialHelperPanel
               active={true}
               onDismiss={() => void refreshModels().catch(() => {})}
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         )}
         <RenderProfiler id="InputArea">
         <ConnectedInputArea
@@ -2403,7 +2404,7 @@ function ConversationPageContent({
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
-          <Suspense fallback={null}>
+          <RecoverableLazyPanel>
             <CredentialHelperPanel
               active={showAuthPanel}
               onDismiss={() => {
@@ -2411,7 +2412,7 @@ function ConversationPageContent({
                 void refreshModels().catch(() => {});
               }}
             />
-          </Suspense>
+          </RecoverableLazyPanel>
         )}
         {routePrefix !== '/global' && (
           <ExploreOnboardingBanner
@@ -2504,7 +2505,7 @@ function ConversationPageContent({
             </button>
           </div>
           <div className="mobile-terminal-sheet-content">
-            <Suspense fallback={null}>
+            <RecoverableLazyPanel>
               <TerminalPanel
                 scope={{ kind: 'conversation', conversationId: conversationId! }}
                 height={window.innerHeight}
@@ -2520,14 +2521,14 @@ function ConversationPageContent({
                 onSendSelectionToDraft={handleSendTerminalSelection}
                 onStatusChange={setTerminalStatus}
               />
-            </Suspense>
+            </RecoverableLazyPanel>
           </div>
         </div>
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <TaskApprovalReader
             title={atom.phase.title}
             priority={atom.phase.priority}
@@ -2539,10 +2540,10 @@ function ConversationPageContent({
             onReject={handleRejectTask}
             onSendFeedback={handleTaskFeedback}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {atom.phase.type === 'awaiting_commission_review_approval' && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <CommissionReviewApproval
             brief={atom.phase.brief}
             focus={atom.phase.focus}
@@ -2550,19 +2551,19 @@ function ConversationPageContent({
             onApprove={handleApproveCommissionReview}
             onReject={handleRejectCommissionReview}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
 
       <Toast messages={toasts} onDismiss={dismissToast} />
 
       {/* First task welcome modal */}
       {showFirstTaskWelcome && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <FirstTaskWelcome
             visible={showFirstTaskWelcome}
             onClose={() => setShowFirstTaskWelcome(false)}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
 
 
@@ -2582,7 +2583,7 @@ function ConversationPageContent({
           FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
           the exact file the user was viewing. */}
       {!isDesktop && openFileState && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <FileViewer
             filePath={openFileState.path}
             rootDir={openFileState.rootDir}
@@ -2591,12 +2592,12 @@ function ConversationPageContent({
             patchContext={openFileState.patchContext ?? undefined}
             focus={openFileState.focus}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {/* Fullscreen diff takeover: dismissible review surface above app chrome.
           Pane presentation remains available for intentional split-pane callers. */}
       {fullscreenDiffOpen && conversationId && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <ConversationDiffViewer
             conversationId={conversationId}
             target={diffTarget}
@@ -2605,10 +2606,10 @@ function ConversationPageContent({
             onSendNotes={handleSendNotes}
             takeover
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {paneDiffOpen && !showSplitPaneViewer && conversationId && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <ConversationDiffViewer
             conversationId={conversationId}
             target={diffTarget}
@@ -2616,34 +2617,34 @@ function ConversationPageContent({
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {/* Browser view overlay: same fallback role as the diff overlay above
           — mobile, narrow desktop, or any case where the split pane is
           unavailable. REQ-BT-018. */}
       {browserViewerOpen && !showSplitPaneViewer && conversationId && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <div className="browser-view-overlay">
             <BrowserViewPanel
               conversationId={conversationId}
               onClose={handleCloseBrowserView}
             />
           </div>
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {/* Process inspector overlay: mobile, narrow desktop, or any case where
           the split pane is unavailable (REQ-PINSP-007). */}
       {inspectViewerOpen && inspectSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <ProcessInspectorPanel
             handleId={inspectSlot.handleId}
             conversationId={conversationId}
             onClose={handleCloseInspector}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {messageViewerOpen && messageSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <MessageViewer
             sequenceId={messageSlot.sequenceId}
             messages={viewableMessages}
@@ -2653,10 +2654,10 @@ function ConversationPageContent({
             canTogglePresentation={isWideDesktop}
             onPresentationChange={viewerSlot.setPresentation}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {commissionReviewViewerOpen && commissionReviewSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
+        <RecoverableLazyPanel>
           <CommissionReviewViewer
             sequenceId={commissionReviewSlot.requestSequenceId}
             messages={viewableMessages}
@@ -2665,7 +2666,7 @@ function ConversationPageContent({
             canTogglePresentation={isWideDesktop}
             onPresentationChange={viewerSlot.setPresentation}
           />
-        </Suspense>
+        </RecoverableLazyPanel>
       )}
       {showSplitPaneViewer && (
         <>
@@ -2706,7 +2707,7 @@ function ConversationPageContent({
             }}
           />
           <div className="conversation-viewer-pane">
-            <Suspense fallback={null}>
+            <RecoverableLazyPanel>
               {paneDiffOpen && conversationId ? (
                 <ConversationDiffViewer
                   conversationId={conversationId}
@@ -2764,7 +2765,7 @@ function ConversationPageContent({
                   inline
                 />
               ) : null}
-            </Suspense>
+            </RecoverableLazyPanel>
           </div>
         </>
       )}
@@ -2787,7 +2788,7 @@ function ForkReviewOverlay() {
   if (!proposal || proposal.status !== 'pending') return null;
   const proposalId = proposal.id;
   return (
-    <Suspense fallback={null}>
+    <RecoverableLazyPanel>
       <ForkProposalReview
         proposal={proposal}
         onApprove={() => fork.approve(proposalId)}
@@ -2795,6 +2796,6 @@ function ForkReviewOverlay() {
         onRequestChanges={(note) => fork.requestChanges(proposalId, note)}
         onClose={fork.closeReview}
       />
-    </Suspense>
+    </RecoverableLazyPanel>
   );
 }

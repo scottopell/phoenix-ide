@@ -27,10 +27,15 @@ fn index_response(content: String) -> Response<Body> {
 }
 
 fn asset_response(content: Vec<u8>, mime: &str) -> Response<Body> {
+    let cache_control = if mime == "application/javascript" || mime == "text/javascript" {
+        REVALIDATE
+    } else {
+        IMMUTABLE
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
-        .header(header::CACHE_CONTROL, IMMUTABLE)
+        .header(header::CACHE_CONTROL, cache_control)
         .body(Body::from(content))
         .unwrap()
 }
@@ -151,10 +156,19 @@ mod tests {
 
     #[test]
     fn content_addressed_assets_are_immutable() {
-        let response = asset_response(b"export {};".to_vec(), "text/javascript");
+        let response = asset_response(b"body {}".to_vec(), "text/css");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], IMMUTABLE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/css");
+    }
+
+    #[test]
+    fn rewritten_javascript_chunks_revalidate() {
+        let response = asset_response(b"export {};".to_vec(), "text/javascript");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], REVALIDATE);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/javascript");
     }
 }
