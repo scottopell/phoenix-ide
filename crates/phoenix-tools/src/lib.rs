@@ -782,6 +782,13 @@ pub struct WritingConversationTools {
 }
 
 impl WritingConversationTools {
+    const NAMES: [&'static str; 4] = [
+        "search_conversations",
+        "read_conversation",
+        "query_database",
+        "send_conversation_message",
+    ];
+
     /// # Errors
     ///
     /// Returns an error when any capability is supplied in the wrong named slot.
@@ -797,13 +804,7 @@ impl WritingConversationTools {
             &query_database,
             &send_conversation_message,
         ];
-        let expected = [
-            "search_conversations",
-            "read_conversation",
-            "query_database",
-            "send_conversation_message",
-        ];
-        for (tool, expected_name) in tools.iter().zip(expected) {
+        for (tool, expected_name) in tools.iter().zip(Self::NAMES) {
             if tool.name() != expected_name {
                 return Err(format!(
                     "writing conversation tool must be {expected_name}, got {}",
@@ -1067,10 +1068,23 @@ impl ToolRegistry {
         Self::new_with_options(false, agents, model_ids)
     }
 
-    #[must_use]
-    pub fn with_writing_conversation_tools(mut self, tools: WritingConversationTools) -> Self {
+    /// # Errors
+    ///
+    /// Returns an error when the registry already contains any writing capability.
+    pub fn try_with_writing_conversation_tools(
+        mut self,
+        tools: WritingConversationTools,
+    ) -> Result<Self, String> {
+        if let Some(duplicate) = WritingConversationTools::NAMES
+            .iter()
+            .find(|name| self.tools.iter().any(|tool| tool.name() == **name))
+        {
+            return Err(format!(
+                "tool registry already contains writing capability {duplicate}"
+            ));
+        }
         self.tools.extend(tools.into_tools());
-        self
+        Ok(self)
     }
 
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
@@ -1251,6 +1265,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            "test tool".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    fn writing_tools() -> WritingConversationTools {
+        WritingConversationTools::new(
+            Arc::new(NamedTool("search_conversations")),
+            Arc::new(NamedTool("read_conversation")),
+            Arc::new(NamedTool("query_database")),
+            Arc::new(NamedTool("send_conversation_message")),
+        )
+        .unwrap()
+    }
+
     /// The whole point of `ToolOutput` being an enum: `::success` carries any
     /// string — including error-shaped text — and is still structurally a
     /// success. There is no field to flip and no constructor that yields a
@@ -1327,6 +1372,23 @@ mod tests {
             .err()
             .unwrap()
             .contains("writing conversation tool must be search_conversations"));
+    }
+
+    #[test]
+    fn writing_conversation_tools_cannot_be_attached_twice() {
+        let registry = ToolRegistry { tools: Vec::new() }
+            .try_with_writing_conversation_tools(writing_tools())
+            .unwrap();
+
+        let error = registry
+            .try_with_writing_conversation_tools(writing_tools())
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error,
+            "tool registry already contains writing capability search_conversations"
+        );
     }
 
     #[test]

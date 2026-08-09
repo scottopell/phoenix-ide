@@ -3150,7 +3150,7 @@ impl RuntimeManager {
                                 registry
                             };
                         (
-                            registry.with_writing_conversation_tools(writing_tools),
+                            registry.try_with_writing_conversation_tools(writing_tools)?,
                             None,
                         )
                     }
@@ -3165,7 +3165,7 @@ impl RuntimeManager {
                             )
                             .with_propose_task()
                             .with_commission_review()
-                            .with_writing_conversation_tools(writing_tools),
+                            .try_with_writing_conversation_tools(writing_tools)?,
                             None,
                         )
                     }

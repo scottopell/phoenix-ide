@@ -1598,7 +1598,9 @@ impl ToolExecutor for ToolRegistryExecutor {
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec())
                 .with_commission_review();
         if let Some(tools) = self.writing_tools.clone() {
-            registry = registry.with_writing_conversation_tools(tools);
+            registry = registry
+                .try_with_writing_conversation_tools(tools)
+                .expect("fresh Work registry has no global writing capabilities");
         }
         self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");

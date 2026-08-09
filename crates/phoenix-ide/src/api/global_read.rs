@@ -660,11 +660,11 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
             if !c.images.is_empty() {
                 tracing::debug!(
                     n = c.images.len(),
-                    "coordinator read_conversation: dropping user-message images — image recall is unsupported",
+                    "read_conversation: dropping user-message images — image recall is unsupported",
                 );
                 let _ = write!(
                     text,
-                    "\n[{} image(s) attached to this message are not shown — Coordinator reads text only]",
+                    "\n[{} image(s) attached to this message are not shown — read_conversation returns text only]",
                     c.images.len()
                 );
             }
@@ -682,10 +682,10 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
                 tracing::debug!(
                     tool_use_id = %c.tool_use_id,
                     n = c.images.len(),
-                    "coordinator read_conversation: dropping tool-result images — image recall is unsupported",
+                    "read_conversation: dropping tool-result images — image recall is unsupported",
                 );
                 format!(
-                    "{}\n[{} image(s) in this tool result are not shown — Coordinator reads text only]",
+                    "{}\n[{} image(s) in this tool result are not shown — read_conversation returns text only]",
                     c.content,
                     c.images.len()
                 )
@@ -1117,8 +1117,8 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        message_id_fragment, parse_conv_handle, split_fragment, GlobalMessageTargetError,
-        GlobalReadService,
+        message_id_fragment, parse_conv_handle, render_full_message_text, split_fragment,
+        GlobalMessageTargetError, GlobalReadService,
     };
     use phoenix_db::retrieval::Fts5Retriever;
     use std::sync::Arc;
@@ -1133,6 +1133,32 @@ mod tests {
             GlobalMessageTargetError::SubAgentRejected.to_string(),
             "a sub-agent conversation cannot receive cross-conversation messages; message its parent conversation instead"
         );
+    }
+
+    #[test]
+    fn transcript_image_placeholder_is_caller_neutral() {
+        let mut content = phoenix_core::domain::db_schema::UserContent::new("text");
+        content
+            .images
+            .push(phoenix_core::domain::db_schema::ImageData {
+                data: "encoded".to_string(),
+                media_type: "image/png".to_string(),
+            });
+        let message = crate::db::Message {
+            message_id: "message".to_string(),
+            conversation_id: "conversation".to_string(),
+            sequence_id: 1,
+            message_type: phoenix_core::domain::db_schema::MessageType::User,
+            content: phoenix_core::domain::db_schema::MessageContent::User(content),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let rendered = render_full_message_text(&message);
+
+        assert!(rendered.contains("read_conversation returns text only"));
+        assert!(!rendered.contains("Coordinator reads text only"));
     }
 
     #[test]
