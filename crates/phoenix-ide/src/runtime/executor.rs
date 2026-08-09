@@ -2225,7 +2225,22 @@ where
             let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
                 false
             } else {
-                self.resume_interrupted_llm_request().await
+                match self.resume_interrupted_llm_request().await {
+                    Ok(failed) => failed,
+                    Err(settlement_error) => {
+                        tracing::error!(
+                            %settlement_error,
+                            "Failed to settle resumed LLM dispatch error; retiring runtime for reconstruction"
+                        );
+                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                            sequence_id: seq,
+                            error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                                "resume the LLM request",
+                            ),
+                        });
+                        return;
+                    }
+                }
             };
             if !resume_failed {
                 if let Some((job_id, claim)) = self.startup_creation_completion.take() {
@@ -5419,25 +5434,14 @@ where
         }
     }
 
-    async fn resume_interrupted_llm_request(&mut self) -> bool {
+    async fn resume_interrupted_llm_request(&mut self) -> Result<bool, String> {
         match self.execute_effect(Effect::RequestLlm).await {
-            Ok(_) => false,
+            Ok(_) => Ok(false),
             Err(error) => {
                 tracing::error!(%error, "Failed to resume LLM request");
                 let failure = self.llm_dispatch_failure_event(error);
-                if let Err(settlement_error) = self.process_event(failure).await {
-                    tracing::error!(
-                        %settlement_error,
-                        "Failed to settle resumed LLM dispatch error"
-                    );
-                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
-                        sequence_id: seq,
-                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                            "resume the LLM request",
-                        ),
-                    });
-                }
-                true
+                self.process_event(failure).await?;
+                Ok(true)
             }
         }
     }
@@ -13344,7 +13348,9 @@ mod steer_drain_detector_tests {
         rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
 
         assert!(
-            rt.resume_interrupted_llm_request().await,
+            rt.resume_interrupted_llm_request()
+                .await
+                .expect("dispatch failure settles"),
             "synchronous recovery dispatch failure must be reported"
         );
 
@@ -13362,6 +13368,32 @@ mod steer_drain_detector_tests {
         );
         assert_eq!(rt.state, expected);
         assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_steering_recovery_settlement_failure_retires_runtime() {
+        let conversation_id = "conv-steering-recovery-settlement-failure";
+        let initial_state = ConvState::LlmRequesting { attempt: 1 };
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, initial_state.clone(), Vec::new());
+        storage
+            .update_state(conversation_id, &initial_state, Utc::now())
+            .await
+            .expect("seed durable recovery state");
+        storage.set_fail_state_update(true);
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), rt.run())
+            .await
+            .expect("failed settlement must retire the runtime");
+
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("unchanged durable recovery state"),
+            initial_state
+        );
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

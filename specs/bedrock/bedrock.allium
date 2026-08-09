@@ -2003,6 +2003,9 @@ rule ServerRestartCommittedSteeringTurn {
         -- A synchronous failure to start the resumed request is reduced through
         -- LlmErrors into the persisted non-retryable Error branch; it is not
         -- left as a busy LlmRequesting row without a provider task.
+        -- If persisting that Error fails, the executor exits and releases its
+        -- runtime handle so reconnect reconstructs from the unchanged database
+        -- owner. It never remains live and busy without a provider task.
 }
 
 rule ServerRestartPendingContinuation {

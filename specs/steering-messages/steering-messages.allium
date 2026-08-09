@@ -253,6 +253,8 @@ rule DrainOnIdleEntry {
         -- one request without adding a steering lifecycle or queue authority.
         -- A synchronous failure to start that recovered request is reduced into
         -- the same persisted typed Error used by live drain dispatch failures.
+        -- If Error persistence fails, the executor retires so reconnect can
+        -- reconstruct from the unchanged database owner.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
@@ -541,6 +543,7 @@ surface SteeringQueueApi {
         -- this exception; no second queue authority or steering lifecycle exists.
         -- A synchronous recovery dispatch failure settles as a durable typed
         -- Error rather than leaving LlmRequesting without a provider task.
+        -- A failed Error write retires the runtime for database reconstruction.
 
     @guarantee EnqueueDuringDrainPreserved
         -- A steering message enqueued while a drain is in progress is not lost.
