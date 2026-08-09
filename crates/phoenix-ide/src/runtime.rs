@@ -3130,7 +3130,7 @@ impl RuntimeManager {
                             available_model_ids.clone(),
                             ExploreToolPolicy::from_platform(&self.platform),
                         ),
-                        writing_tools,
+                        Some(writing_tools),
                     ),
                     ConvMode::Direct => {
                         // Full tool suite for Direct mode. `propose_task` (the
@@ -3149,7 +3149,10 @@ impl RuntimeManager {
                             } else {
                                 registry
                             };
-                        (registry.with_tools(writing_tools), Vec::new())
+                        (
+                            registry.with_writing_conversation_tools(writing_tools),
+                            None,
+                        )
                     }
                     ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                         // Full tool suite plus `propose_task` (non-blocking fork
@@ -3162,8 +3165,8 @@ impl RuntimeManager {
                             )
                             .with_propose_task()
                             .with_commission_review()
-                            .with_tools(writing_tools),
-                            Vec::new(),
+                            .with_writing_conversation_tools(writing_tools),
+                            None,
                         )
                     }
                 };

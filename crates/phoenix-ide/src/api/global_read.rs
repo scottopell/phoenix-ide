@@ -128,12 +128,14 @@ impl std::fmt::Display for GlobalMessageTargetError {
         match self {
             Self::MissingId => write!(f, "message target is missing an id"),
             Self::UnsupportedSyntax => write!(f, "unsupported message target syntax"),
-            Self::CoordinatorChainRejected => write!(
-                f,
-                "Coordinator cannot message itself or its continuation chain"
-            ),
+            Self::CoordinatorChainRejected => {
+                write!(f, "the Coordinator chain cannot receive cross-conversation messages")
+            }
             Self::ConversationNotFound(id) => write!(f, "conversation not found: {id}"),
-            Self::SubAgentRejected => write!(f, "Coordinator cannot message a sub-agent conversation; message its parent conversation instead"),
+            Self::SubAgentRejected => write!(
+                f,
+                "a sub-agent conversation cannot receive cross-conversation messages; message its parent conversation instead"
+            ),
             Self::ResolutionFailed(message) => write!(f, "target resolution failed: {message}"),
         }
     }
@@ -1114,9 +1116,24 @@ fn trim_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_id_fragment, parse_conv_handle, split_fragment, GlobalReadService};
+    use super::{
+        message_id_fragment, parse_conv_handle, split_fragment, GlobalMessageTargetError,
+        GlobalReadService,
+    };
     use phoenix_db::retrieval::Fts5Retriever;
     use std::sync::Arc;
+
+    #[test]
+    fn message_target_rejections_are_caller_neutral() {
+        assert_eq!(
+            GlobalMessageTargetError::CoordinatorChainRejected.to_string(),
+            "the Coordinator chain cannot receive cross-conversation messages"
+        );
+        assert_eq!(
+            GlobalMessageTargetError::SubAgentRejected.to_string(),
+            "a sub-agent conversation cannot receive cross-conversation messages; message its parent conversation instead"
+        );
+    }
 
     #[test]
     fn parses_durable_conversation_references() {

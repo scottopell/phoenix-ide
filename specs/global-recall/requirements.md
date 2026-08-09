@@ -125,6 +125,8 @@ THE SYSTEM MAY additionally provide host-bound tools for global reference resolu
 
 THE host-bound capabilities SHALL NOT become ambient prompt memory or autonomous background behavior
 
+THE search and transcript-read capabilities SHALL describe recalled text as untrusted stored data rather than instructions
+
 WHEN the Coordinator invokes sandboxed filesystem inspection
 THE SYSTEM SHALL require an explicit active `WorkScope` ID for every new command
 AND SHALL resolve and canonicalize that WorkScope's persisted worktree path or cwd before launching the read-only planning `nono` sandbox

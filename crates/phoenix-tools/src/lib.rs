@@ -773,6 +773,63 @@ pub trait Tool: Send + Sync {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput;
 }
 
+#[derive(Clone)]
+pub struct WritingConversationTools {
+    search_conversations: Arc<dyn Tool>,
+    read_conversation: Arc<dyn Tool>,
+    query_database: Arc<dyn Tool>,
+    send_conversation_message: Arc<dyn Tool>,
+}
+
+impl WritingConversationTools {
+    /// # Errors
+    ///
+    /// Returns an error when any capability is supplied in the wrong named slot.
+    pub fn new(
+        search_conversations: Arc<dyn Tool>,
+        read_conversation: Arc<dyn Tool>,
+        query_database: Arc<dyn Tool>,
+        send_conversation_message: Arc<dyn Tool>,
+    ) -> Result<Self, String> {
+        let tools = [
+            &search_conversations,
+            &read_conversation,
+            &query_database,
+            &send_conversation_message,
+        ];
+        let expected = [
+            "search_conversations",
+            "read_conversation",
+            "query_database",
+            "send_conversation_message",
+        ];
+        for (tool, expected_name) in tools.iter().zip(expected) {
+            if tool.name() != expected_name {
+                return Err(format!(
+                    "writing conversation tool must be {expected_name}, got {}",
+                    tool.name()
+                ));
+            }
+        }
+        Ok(Self {
+            search_conversations,
+            read_conversation,
+            query_database,
+            send_conversation_message,
+        })
+    }
+
+    pub fn into_tools(self) -> impl Iterator<Item = Arc<dyn Tool>> {
+        [
+            self.search_conversations,
+            self.read_conversation,
+            self.query_database,
+            self.send_conversation_message,
+        ]
+        .into_iter()
+    }
+}
+
 /// Collection of tools available to conversations
 ///
 /// Stateless - tools are singletons, all per-call context via `ToolContext`
@@ -1010,10 +1067,9 @@ impl ToolRegistry {
         Self::new_with_options(false, agents, model_ids)
     }
 
-    /// Add host-bound tools assembled by the application.
     #[must_use]
-    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.tools.extend(tools);
+    pub fn with_writing_conversation_tools(mut self, tools: WritingConversationTools) -> Self {
+        self.tools.extend(tools.into_tools());
         self
     }
 
@@ -1256,6 +1312,21 @@ mod tests {
         ExploreToolPolicy {
             bash: ExploreBashCapability::Unavailable,
         }
+    }
+
+    #[test]
+    fn writing_conversation_tools_reject_misordered_capabilities() {
+        let result = WritingConversationTools::new(
+            Arc::new(ThinkTool),
+            Arc::new(ReadFileTool),
+            Arc::new(SearchTool),
+            Arc::new(AskUserQuestionTool),
+        );
+
+        assert!(result
+            .err()
+            .unwrap()
+            .contains("writing conversation tool must be search_conversations"));
     }
 
     #[test]
