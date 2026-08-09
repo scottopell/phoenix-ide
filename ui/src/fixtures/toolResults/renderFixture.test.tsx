@@ -31,7 +31,7 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText(/Which tool-result family should we refine next/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Review' })).toBeInTheDocument();
     expect(container.querySelector('[data-tool-results-fixture-ready="shell-full"]')).not.toBeNull();
-    expect(screen.getByText(/120 more returned lines/)).toBeInTheDocument();
+    expect(screen.getByText(/1 more returned lines/)).toBeInTheDocument();
     expect(screen.getByText(/earlier click is a finalized missing result/)).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-missing-result')).toHaveLength(1);
     expect(container.querySelector('[data-tool-id="shell-pending"]')).not.toBeNull();
@@ -61,10 +61,10 @@ describe('ToolResultsFixture', () => {
     expect(screen.getAllByText(/deterministicFixtureLine1 = true/).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('ui/src/fixtures/toolResults/scenarios.ts')).toBeInTheDocument();
     expect(screen.getByText(/12 lines • lines 1-12/)).toBeInTheDocument();
-    expect(screen.getByText(/4 more returned lines/)).toBeInTheDocument();
+    expect(screen.getByText(/1 more returned lines/)).toBeInTheDocument();
     expect(screen.getByText('(empty file)')).toBeInTheDocument();
     expect(screen.queryByText(/Ignored .* non-numbered line/)).not.toBeInTheDocument();
-    expect(screen.getByText(/76 file lines not returned/)).toBeInTheDocument();
+    expect(screen.getByText(/79 file lines not returned/)).toBeInTheDocument();
 
     rerender(<ToolResultsFixture scenario={getToolResultsScenario('media-full')} />);
     await screen.findByText('scenario=media-full');

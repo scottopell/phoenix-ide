@@ -9,7 +9,7 @@ Build the smallest correct change from a verified failure model. Repository guid
 
 ## The loop
 
-1. **Orient.** Verify the worktree and `git status`. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
+1. **Orient.** Verify the worktree and `git status`. Read the generated body of GitHub Issue #651 for current delivery context. Locate the owning crate/UI component, nearby tests, and feature spec. Search before reading large files.
 2. **Model.** State the user-visible failure, violated invariant, and boundary that should own the fix. Do not edit from a symptom alone.
 3. **Trace.** Follow the path end to end where relevant: UI/state → API/SSE → runtime/state machine → persistence/provider/tool. Read existing tests and history around the seam.
 4. **Regress.** Add or identify the narrowest test that can falsify the hypothesis. Reproduce first when practical.
@@ -33,6 +33,20 @@ Read [references/development-loop.md](references/development-loop.md) for comman
 - Commit completed units on the owned branch. Do not leave finished work as a long-lived dirty tree.
 
 These are compact reminders, not replacements for `AGENTS.md` or normative specs.
+
+## Report an owned workstream
+
+Use the roadmap only for work substantial enough that another agent needs to know its owner, blocker, or next step. Do not post routine edits, transient test failures, or leaf tasks already clear from an active parent workstream.
+
+1. Fetch Issue #651 by its known number; do not discover it with GitHub search. If GitHub is unavailable, continue from specs, ADRs, taskmd, PR data already available locally, and `main`; state that roadmap context could not be verified.
+2. Read the generated body and the first comment, which defines the current schema, limits, and allowed sections.
+3. Choose one stable kebab-case `workstream` identifier. Reuse it for every later update; a new valid comment supersedes the prior projection for that identifier.
+4. Report only facts your workstream owns: state, owner, blockers, next concrete step, evidence links, and concise context. Portfolio priority and critical-path ordering require coordinator direction; do not infer them from local importance.
+5. Post a comment consisting only of one exact `phoenix-roadmap-update` fenced JSON object. Do not add surrounding prose or edit the generated Issue body.
+6. Poll the Issue body with a bounded wait until its `phoenix-roadmap:snapshot-through` marker is at least the new comment ID. For an update, also require the projected entry to link to that source comment. If the reducer workflow finishes without those conditions, report the comment URL and mismatch; do not treat the immediately cached body as final.
+7. Append a replacement when material state, owner, blocker, or next step changes. When the workstream completes or is abandoned, append the retirement record defined by the first Issue comment. It must identify the current projected source comment and be posted by that same GitHub author. Verify both that the snapshot marker includes the retirement comment and that the entry disappears.
+
+Keep detailed plans in their existing authorities and link them. The roadmap should answer “what is active, who owns it, what blocks it, and what happens next?” without becoming a second spec, task database, or PR mirror.
 
 ## Reasoning about async test completion
 

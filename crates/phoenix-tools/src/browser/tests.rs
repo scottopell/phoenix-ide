@@ -350,128 +350,86 @@ async fn test_browser_eval_local() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_eval_inner_text_not_undefined() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r"<!DOCTYPE html>
-        <html>
-        <head><title>InnerText Test</title></head>
-        <body><p>Hello from innerText</p></body>
-        </html>",
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-eval-innertext");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.body.innerText"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of text: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("Hello from innerText"),
-        "Expected page text, got: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_eval_inner_html_slice_not_undefined() {
+async fn dom_eval_regressions_share_one_browser_fixture() {
     require_chrome!();
 
     let server = TestServer::start(
         r#"<!DOCTYPE html>
-        <html><head><title>Slice Test</title></head>
-        <body><div id="content">Slice test content</div></body>
+        <html><head><title>DOM Eval Test</title></head>
+        <body><div id="content">Hello from innerText</div></body>
         </html>"#,
     )
     .await;
 
-    let (ctx, manager) = test_context("test-eval-htmlslice");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+    let (ctx, manager) = test_context("test-dom-eval-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav_result = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            nav_result.is_success(),
+            "fixture navigation failed: {}",
+            nav_result.output()
+        );
 
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
-            ctx.clone(),
-        )
-        .await;
+        let eval_tool = BrowserEvalTool;
 
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of HTML: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("content") || result.output().len() > 10,
-        "Expected HTML content, got: {}",
-        result.output()
-    );
+        let inner_text = eval_tool
+            .run(
+                json!({"expression": "document.body.innerText"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_text.is_success(),
+            "innerText eval failed: {}",
+            inner_text.output()
+        );
+        assert!(
+            !inner_text.output().contains("undefined")
+                && inner_text.output().contains("Hello from innerText"),
+            "innerText regression: {}",
+            inner_text.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
+        let inner_html = eval_tool
+            .run(
+                json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_html.is_success(),
+            "innerHTML.slice eval failed: {}",
+            inner_html.output()
+        );
+        assert!(
+            !inner_html.output().contains("undefined") && inner_html.output().contains("content"),
+            "innerHTML.slice regression: {}",
+            inner_html.output()
+        );
 
-#[tokio::test]
-async fn test_eval_json_stringify_dom_not_undefined() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html><head><title>JSON Test</title></head>
-        <body><p id="msg">test content</p></body>
-        </html>"#,
-    )
+        let json_dom = eval_tool
+            .run(
+                json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            json_dom.is_success(),
+            "JSON.stringify DOM eval failed: {}",
+            json_dom.output()
+        );
+        assert!(
+            !json_dom.output().contains("undefined") && json_dom.output().contains("bodyText"),
+            "JSON.stringify DOM regression: {}",
+            json_dom.output()
+        );
+    })
     .await;
-
-    let (ctx, manager) = test_context("test-eval-jsonstringify");
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let eval_tool = BrowserEvalTool;
-    // This is the exact pattern from the bug report
-    let result = eval_tool
-        .run(
-            json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Eval failed: {}", result.output());
-    assert!(
-        !result.output().contains("undefined"),
-        "Got undefined instead of JSON: {}",
-        result.output()
-    );
-    assert!(
-        result.output().contains("bodyText"),
-        "Expected JSON with bodyText key, got: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
+    outcome.expect("DOM eval regression scenario");
 }
 
 #[tokio::test]
@@ -1060,855 +1018,477 @@ async fn test_browser_eval_syntax_error() {
 // TDD: browser_wait_for_selector tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_wait_for_selector_immediate() {
-    require_chrome!();
-
-    // Element exists immediately
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body><div id="exists">I exist</div></body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-wait-immediate");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(json!({"selector": "#exists"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Wait failed: {}", result.output());
-    assert!(
-        result.output().contains("found") || result.output().contains("visible"),
-        "Should indicate element found: {}",
-        result.output()
+async fn reset_wait_fixture(ctx: &ToolContext, body: &str, setup: &str) {
+    let expression = format!(
+        r"(() => {{
+            for (const timer of window.waitFixtureTimers || []) clearTimeout(timer);
+            window.waitFixtureTimers = [];
+            document.body.innerHTML = {body};
+            document.body.tabIndex = -1;
+            document.body.focus();
+            {setup}
+            return true;
+        }})()",
+        body = serde_json::to_string(body).expect("fixture HTML should serialize")
     );
-
-    shutdown_test(manager, server).await;
+    let reset = BrowserEvalTool
+        .run(json!({"expression": expression}), ctx.clone())
+        .await;
+    assert!(
+        reset.is_success() && reset.output().contains("true"),
+        "wait fixture reset failed: {}",
+        reset.output()
+    );
 }
 
 #[tokio::test]
-async fn test_wait_for_selector_delayed() {
+#[allow(clippy::too_many_lines)]
+async fn wait_regressions_share_one_browser_fixture() {
     require_chrome!();
 
-    // Element appears after 500ms
     let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body>
-            <div id="container"></div>
-            <script>
-                setTimeout(() => {
-                    document.getElementById('container').innerHTML = '<span class="delayed">Appeared!</span>';
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
+        "<!DOCTYPE html><html><head><title>Wait Test</title></head><body></body></html>",
     )
     .await;
+    let (ctx, manager) = test_context("test-wait-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let navigation = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            navigation.is_success(),
+            "wait fixture navigation failed: {}",
+            navigation.output()
+        );
+        let wait_tool = BrowserWaitForSelectorTool;
+        let eval_tool = BrowserEvalTool;
 
-    let (ctx, manager) = test_context("test-wait-delayed");
+        reset_wait_fixture(&ctx, "<div id='exists'>I exist</div>", "").await;
+        let immediate = wait_tool
+            .run(json!({"selector": "#exists"}), ctx.clone())
+            .await;
+        assert!(
+            immediate.is_success()
+                && (immediate.output().contains("found")
+                    || immediate.output().contains("visible")),
+            "immediate selector wait failed: {}",
+            immediate.output()
+        );
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(
-            json!({"selector": ".delayed", "timeout": "5s"}),
-            ctx.clone(),
+        reset_wait_fixture(
+            &ctx,
+            "<div id='container'></div>",
+            "window.waitFixtureTimers.push(setTimeout(() => { document.getElementById('container').innerHTML = '<span class=\"delayed\">Appeared!</span>'; }, 500));",
         )
         .await;
+        let delayed = wait_tool
+            .run(
+                json!({"selector": ".delayed", "timeout": "5s"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(delayed.is_success(), "delayed wait failed: {}", delayed.output());
+        let delayed_present = eval_tool
+            .run(
+                json!({"expression": "document.querySelector('.delayed')?.textContent === 'Appeared!'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            delayed_present.is_success() && delayed_present.output().contains("true"),
+            "delayed wait returned before insertion: {}",
+            delayed_present.output()
+        );
 
-    assert!(result.is_success(), "Wait failed: {}", result.output());
+        reset_wait_fixture(&ctx, "<div id='only-this'>Nothing else coming</div>", "").await;
+        let timeout = wait_tool
+            .run(
+                json!({"selector": "#never-exists", "timeout": "200ms"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(!timeout.is_success(), "absent selector unexpectedly succeeded");
+        assert!(
+            timeout.output().to_lowercase().contains("timeout")
+                || timeout.output().to_lowercase().contains("not found"),
+            "timeout error was unclear: {}",
+            timeout.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_timeout() {
-    require_chrome!();
-
-    // Element never appears
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body><div id="only-this">Nothing else coming</div></body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-wait-timeout");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(
-            json!({"selector": "#never-exists", "timeout": "200ms"}),
-            ctx.clone(),
+        reset_wait_fixture(
+            &ctx,
+            "<div id='target' style='display:none'>Hidden initially</div>",
+            "window.waitFixtureTimers.push(setTimeout(() => { document.getElementById('target').style.display = 'block'; }, 500));",
         )
         .await;
+        let visible = wait_tool
+            .run(
+                json!({"selector": "#target", "visible": true, "timeout": "5s"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(visible.is_success(), "visible wait failed: {}", visible.output());
+        let display = eval_tool
+            .run(
+                json!({"expression": "getComputedStyle(document.getElementById('target')).display === 'block'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            display.is_success() && display.output().contains("true"),
+            "visible wait returned while target was hidden: {}",
+            display.output()
+        );
 
-    assert!(!result.is_success(), "Should have timed out");
-    assert!(
-        result.output().to_lowercase().contains("timeout")
-            || result.output().to_lowercase().contains("not found"),
-        "Should mention timeout: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_hidden_then_visible() {
-    require_chrome!();
-
-    // Element exists but is hidden, then becomes visible
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Wait Test</title></head>
-        <body>
-            <div id="target" style="display: none;">Hidden initially</div>
-            <script>
-                setTimeout(() => {
-                    document.getElementById('target').style.display = 'block';
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
-    )
+        reset_wait_fixture(&ctx, "", "").await;
+        let invalid = wait_tool
+            .run(json!({"selector": "###invalid[[["}), ctx.clone())
+            .await;
+        assert!(!invalid.is_success(), "invalid selector unexpectedly succeeded");
+        assert!(
+            invalid.output().to_lowercase().contains("invalid")
+                || invalid.output().to_lowercase().contains("error")
+                || invalid.output().to_lowercase().contains("syntax"),
+            "selector parse error was unclear: {}",
+            invalid.output()
+        );
+        assert!(
+            !invalid.output().to_lowercase().contains("timeout"),
+            "invalid selector was misreported as timeout: {}",
+            invalid.output()
+        );
+    })
     .await;
 
-    let (ctx, manager) = test_context("test-wait-visible");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-
-    // With visible: true, should wait for element to be visible
-    let result = wait_tool
-        .run(
-            json!({"selector": "#target", "visible": true, "timeout": "5s"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(
-        result.is_success(),
-        "Wait for visible failed: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_wait_for_selector_invalid_selector() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body></body></html>").await;
-    let (ctx, manager) = test_context("test-wait-invalid");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let wait_tool = BrowserWaitForSelectorTool;
-    let result = wait_tool
-        .run(json!({"selector": "###invalid[[["}), ctx.clone())
-        .await;
-
-    assert!(!result.is_success(), "Should fail on invalid selector");
-    assert!(
-        result.output().to_lowercase().contains("invalid")
-            || result.output().to_lowercase().contains("error")
-            || result.output().to_lowercase().contains("syntax"),
-        "Should mention invalid selector: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser selector-wait regression scenario");
 }
 
 // ============================================================================
 // TDD: browser_click tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_click_button() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <button id="btn" onclick="document.getElementById('result').textContent = 'clicked'">Click me</button>
-            <div id="result">not clicked</div>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-button");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
+async fn reset_click_fixture(ctx: &ToolContext, body: &str, setup: &str) {
+    let expression = format!(
+        r"(() => {{ for (const timer of window.clickFixtureTimers || []) clearTimeout(timer); window.clickFixtureTimers = []; history.replaceState(null, '', location.pathname); document.body.innerHTML = {body}; window.clickCount = 0; {setup} return true; }})()",
+        body = serde_json::to_string(body).expect("fixture HTML should serialize")
+    );
+    let result = BrowserEvalTool
+        .run(json!({"expression": expression}), ctx.clone())
         .await;
-
-    // Click the button
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#btn"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify the click worked
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
     assert!(
-        result.output().contains("clicked"),
-        "Button click didn't work: {}",
+        result.is_success() && result.output().contains("true"),
+        "click fixture reset failed: {}",
         result.output()
     );
-
-    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
-async fn test_click_link() {
+#[allow(clippy::too_many_lines)]
+async fn click_regressions_share_one_browser_fixture() {
     require_chrome!();
+    let server = TestServer::start("<!doctype html><html><body></body></html>").await;
+    let (ctx, manager) = test_context("test-click-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav = BrowserNavigateTool.run(json!({"url": url}), ctx.clone()).await;
+        assert!(nav.is_success(), "click fixture navigation failed: {}", nav.output());
+        let click = BrowserClickTool;
+        let eval = BrowserEvalTool;
 
-    let server = TestServer::start(
-        r##"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <a id="link" href="#clicked">Click this link</a>
-        </body>
-        </html>"##,
-    )
-    .await;
+        reset_click_fixture(&ctx, "<button id='btn'>Click</button>", "document.getElementById('btn').onclick = () => window.clickCount += 1;").await;
+        let button = click.run(json!({"selector":"#btn"}), ctx.clone()).await;
+        assert!(button.is_success(), "button click failed: {}", button.output());
+        let count = eval.run(json!({"expression":"window.clickCount === 1"}), ctx.clone()).await;
+        assert!(count.is_success() && count.output().contains("true"), "button handler did not fire: {}", count.output());
 
-    let (ctx, manager) = test_context("test-click-link");
+        reset_click_fixture(&ctx, "<a id='link' href='#clicked'>Link</a>", "").await;
+        let link = click.run(json!({"selector":"#link"}), ctx.clone()).await;
+        assert!(link.is_success(), "link click failed: {}", link.output());
+        let hash = eval.run(json!({"expression":"location.hash === '#clicked'"}), ctx.clone()).await;
+        assert!(hash.is_success() && hash.output().contains("true"), "link did not navigate: {}", hash.output());
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+        reset_click_fixture(&ctx, "<div>No target</div>", "").await;
+        let missing = click.run(json!({"selector":"#nonexistent"}), ctx.clone()).await;
+        assert!(!missing.is_success(), "missing click target unexpectedly succeeded");
+        assert!(
+            missing.output().to_lowercase().contains("not found")
+                || missing.output().to_lowercase().contains("no element")
+                || missing.output().to_lowercase().contains("could not find"),
+            "missing click target error was unclear: {}",
+            missing.output()
+        );
 
-    // Click the link
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#link"}), ctx.clone())
-        .await;
+        reset_click_fixture(&ctx, "<input type='checkbox' id='check'>", "").await;
+        let checkbox = click.run(json!({"selector":"#check"}), ctx.clone()).await;
+        assert!(checkbox.is_success(), "checkbox click failed: {}", checkbox.output());
+        let checked = eval.run(json!({"expression":"document.getElementById('check').checked === true"}), ctx.clone()).await;
+        assert!(checked.is_success() && checked.output().contains("true"), "checkbox did not toggle: {}", checked.output());
 
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify URL changed
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "window.location.hash"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("clicked"),
-        "Link click didn't navigate: {}",
-        result.output()
-    );
-
+        reset_click_fixture(&ctx, "<div id='container'></div>", "window.clickFixtureTimers.push(setTimeout(() => { const b=document.createElement('button'); b.id='delayed-btn'; b.onclick=()=>window.clickCount+=1; document.getElementById('container').appendChild(b); }, 500));").await;
+        let delayed = click.run(json!({"selector":"#delayed-btn","wait":true,"timeout":"5s"}), ctx.clone()).await;
+        assert!(delayed.is_success(), "delayed click failed: {}", delayed.output());
+        let delayed_count = eval.run(json!({"expression":"window.clickCount === 1 && !!document.getElementById('delayed-btn')"}), ctx.clone()).await;
+        assert!(delayed_count.is_success() && delayed_count.output().contains("true"), "wait click returned without clicking delayed target: {}", delayed_count.output());
+    }).await;
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_element_not_found() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body><div>No buttons here</div></body></html>").await;
-    let (ctx, manager) = test_context("test-click-not-found");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#nonexistent"}), ctx.clone())
-        .await;
-
-    assert!(!result.is_success(), "Should fail when element not found");
-    assert!(
-        result.output().to_lowercase().contains("not found")
-            || result.output().to_lowercase().contains("no element")
-            || result.output().to_lowercase().contains("could not find"),
-        "Should mention element not found: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_checkbox() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <input type="checkbox" id="check" />
-            <label for="check">Check me</label>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-checkbox");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Verify unchecked initially
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('check').checked"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(result.output().contains("false"), "Should start unchecked");
-
-    // Click the checkbox
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#check"}), ctx.clone())
-        .await;
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify checked
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('check').checked"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        result.output().contains("true"),
-        "Checkbox should be checked: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_with_wait() {
-    require_chrome!();
-
-    // Element appears after delay
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <div id="container"></div>
-            <div id="result">waiting</div>
-            <script>
-                setTimeout(() => {
-                    const btn = document.createElement('button');
-                    btn.id = 'delayed-btn';
-                    btn.textContent = 'Click me';
-                    btn.onclick = () => document.getElementById('result').textContent = 'success';
-                    document.getElementById('container').appendChild(btn);
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-wait");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Click with wait - should wait for element to appear
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(
-            json!({"selector": "#delayed-btn", "wait": true, "timeout": "5s"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(
-        result.is_success(),
-        "Click with wait failed: {}",
-        result.output()
-    );
-
-    // Verify click worked
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        result.output().contains("success"),
-        "Click didn't work: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser click regression scenario");
 }
 
 // ============================================================================
 // TDD: browser_type tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_type_in_input() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-input");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type into input
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
+async fn reset_type_fixture(ctx: &ToolContext) {
+    let reset = BrowserEvalTool
         .run(
-            json!({"selector": "#input", "text": "Hello World"}),
+            json!({"expression": r"(() => {
+                for (const id of ['input', 'textarea', 'clear-input', 'append-input', 'special-input', 'password']) {
+                    const element = document.getElementById(id);
+                    element.value = '';
+                    element.setSelectionRange(0, 0);
+                    element.blur();
+                }
+                document.getElementById('clear-input').value = 'existing text';
+                document.getElementById('append-input').value = 'Hello ';
+                document.getElementById('mirror').textContent = '';
+                window.typeEvents = { input: 0, change: 0 };
+                document.body.focus();
+                return true;
+            })()"}),
             ctx.clone(),
         )
         .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
     assert!(
-        result.output().contains("Hello World"),
-        "Input value wrong: {}",
-        result.output()
+        reset.is_success() && reset.output().contains("true"),
+        "type fixture reset failed: {}",
+        reset.output()
     );
-
-    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
-async fn test_type_in_textarea() {
+#[allow(clippy::too_many_lines)]
+async fn type_regressions_share_one_browser_fixture() {
     require_chrome!();
 
     let server = TestServer::start(
         r#"<!DOCTYPE html>
         <html>
         <head><title>Type Test</title></head>
-        <body>
+        <body tabindex="-1">
+            <input type="text" id="input" />
             <textarea id="textarea"></textarea>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-textarea");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type multiline text
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#textarea", "text": "Line 1\nLine 2\nLine 3"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('textarea').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Line 1") && result.output().contains("Line 2"),
-        "Textarea value wrong: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_triggers_react_events() {
-    require_chrome!();
-
-    // Simulates React-like behavior: tracks input via event listeners
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
+            <input type="text" id="clear-input" value="existing text" />
+            <input type="text" id="append-input" value="Hello " />
+            <input type="text" id="special-input" />
+            <input type="password" id="password" />
             <div id="mirror"></div>
             <script>
+                window.typeEvents = { input: 0, change: 0 };
                 const input = document.getElementById('input');
-                const mirror = document.getElementById('mirror');
-                
-                // React-style: only updates on input event
-                input.addEventListener('input', (e) => {
-                    mirror.textContent = 'Value: ' + e.target.value;
+                input.addEventListener('input', (event) => {
+                    window.typeEvents.input += 1;
+                    document.getElementById('mirror').textContent = 'Value: ' + event.target.value;
                 });
+                input.addEventListener('change', () => window.typeEvents.change += 1);
             </script>
         </body>
         </html>"#,
     )
     .await;
 
-    let (ctx, manager) = test_context("test-type-react");
+    let (ctx, manager) = test_context("test-type-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let navigation = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            navigation.is_success(),
+            "type fixture navigation failed: {}",
+            navigation.output()
+        );
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+        let type_tool = BrowserTypeTool;
+        let eval_tool = BrowserEvalTool;
 
-    // Type into input - should trigger input events
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "React test"}),
-            ctx.clone(),
-        )
-        .await;
+        reset_type_fixture(&ctx).await;
+        let input = type_tool
+            .run(
+                json!({"selector": "#input", "text": "Hello World"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(input.is_success(), "input typing failed: {}", input.output());
+        let input_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('input').value === 'Hello World'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            input_value.is_success() && input_value.output().contains("true"),
+            "input value wrong: {}",
+            input_value.output()
+        );
 
-    assert!(result.is_success(), "Type failed: {}", result.output());
+        reset_type_fixture(&ctx).await;
+        let textarea = type_tool
+            .run(
+                json!({"selector": "#textarea", "text": "Line 1\nLine 2\nLine 3"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            textarea.is_success(),
+            "textarea typing failed: {}",
+            textarea.output()
+        );
+        let textarea_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('textarea').value === 'Line 1\\nLine 2\\nLine 3'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            textarea_value.is_success() && textarea_value.output().contains("true"),
+            "textarea value wrong: {}",
+            textarea_value.output()
+        );
 
-    // Verify event handler was triggered
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('mirror').textContent"}),
-            ctx.clone(),
-        )
-        .await;
+        reset_type_fixture(&ctx).await;
+        let events = type_tool
+            .run(
+                json!({"selector": "#input", "text": "React test"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(events.is_success(), "event typing failed: {}", events.output());
+        let event_state = eval_tool
+            .run(
+                json!({"expression": "({ mirror: document.getElementById('mirror').textContent, inputEvents: window.typeEvents.input, changeEvents: window.typeEvents.change })"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            event_state.is_success()
+                && event_state.output().contains("Value: React test")
+                && event_state.output().contains("inputEvents")
+                && !event_state.output().contains("inputEvents\":0"),
+            "React-style input event was not dispatched: {}",
+            event_state.output()
+        );
 
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("React test"),
-        "React-style event not triggered: {}",
-        result.output()
-    );
+        reset_type_fixture(&ctx).await;
+        let clear = type_tool
+            .run(
+                json!({"selector": "#clear-input", "text": "new text", "clear": true}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(clear.is_success(), "clear typing failed: {}", clear.output());
+        let clear_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('clear-input').value === 'new text'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            clear_value.is_success() && clear_value.output().contains("true"),
+            "clear did not replace the existing value: {}",
+            clear_value.output()
+        );
 
-    shutdown_test(manager, server).await;
-}
+        reset_type_fixture(&ctx).await;
+        let append = type_tool
+            .run(
+                json!({"selector": "#append-input", "text": "World"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(append.is_success(), "append typing failed: {}", append.output());
+        let append_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('append-input').value === 'Hello World'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            append_value.is_success() && append_value.output().contains("true"),
+            "typing did not append: {}",
+            append_value.output()
+        );
 
-#[tokio::test]
-async fn test_type_with_clear() {
-    require_chrome!();
+        reset_type_fixture(&ctx).await;
+        let missing = type_tool
+            .run(
+                json!({"selector": "#nonexistent", "text": "hello"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(!missing.is_success(), "missing selector unexpectedly succeeded");
+        assert!(
+            missing.output().to_lowercase().contains("not found")
+                || missing.output().to_lowercase().contains("no element")
+                || missing.output().to_lowercase().contains("could not find"),
+            "missing selector error was unclear: {}",
+            missing.output()
+        );
 
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" value="existing text" />
-        </body>
-        </html>"#,
-    )
+        reset_type_fixture(&ctx).await;
+        let special_text = "Test <>&\"' special!@#$%";
+        let special = type_tool
+            .run(
+                json!({"selector": "#special-input", "text": special_text}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            special.is_success(),
+            "special-character typing failed: {}",
+            special.output()
+        );
+        let special_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('special-input').value === `Test <>&\\\"' special!@#$%`"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            special_value.is_success() && special_value.output().contains("true"),
+            "special characters were corrupted: {}",
+            special_value.output()
+        );
+
+        reset_type_fixture(&ctx).await;
+        let password = type_tool
+            .run(
+                json!({"selector": "#password", "text": "secret123"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            password.is_success(),
+            "password typing failed: {}",
+            password.output()
+        );
+        let password_value = eval_tool
+            .run(
+                json!({"expression": "document.getElementById('password').type === 'password' && document.getElementById('password').value === 'secret123'"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            password_value.is_success() && password_value.output().contains("true"),
+            "password field behavior changed: {}",
+            password_value.output()
+        );
+    })
     .await;
 
-    let (ctx, manager) = test_context("test-type-clear");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type with clear option - should replace existing text
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "new text", "clear": true}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify old text is gone
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("new text") && !result.output().contains("existing"),
-        "Clear didn't work: {}",
-        result.output()
-    );
-
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_append() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" value="Hello " />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-append");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type without clear - should append
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(json!({"selector": "#input", "text": "World"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify text was appended
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("Hello World") || result.output().contains("Hello  World"),
-        "Append didn't work: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_element_not_found() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body><div>No inputs here</div></body></html>").await;
-    let (ctx, manager) = test_context("test-type-not-found");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#nonexistent", "text": "hello"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(!result.is_success(), "Should fail when element not found");
-    assert!(
-        result.output().to_lowercase().contains("not found")
-            || result.output().to_lowercase().contains("no element")
-            || result.output().to_lowercase().contains("could not find"),
-        "Should mention element not found: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_special_characters() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="text" id="input" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-special");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type special characters
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#input", "text": "Test <>&\"' special!@#$%"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('input').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("<>&"),
-        "Special chars not typed: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_type_password_field() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Type Test</title></head>
-        <body>
-            <input type="password" id="password" />
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-type-password");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Type into password field
-    let type_tool = BrowserTypeTool;
-    let result = type_tool
-        .run(
-            json!({"selector": "#password", "text": "secret123"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success(), "Type failed: {}", result.output());
-
-    // Verify value (password fields still have value attribute)
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('password').value"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("secret123"),
-        "Password not typed: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser type regression scenario");
 }
 
 // ============================================================================
@@ -1977,13 +1557,28 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         <html>
         <head><title>Modifier Key Test</title></head>
         <body>
-            <div id="result">none</div>
+            <input id="target" />
             <script>
+              window.keyEvents = [];
               window.addEventListener('keydown', function(e) {
-                if (e.ctrlKey && e.key === 'k') {
-                  document.getElementById('result').textContent = 'ctrl+k';
-                }
+                window.keyEvents.push({
+                  type: e.type,
+                  key: e.key,
+                  code: e.code,
+                  ctrlKey: e.ctrlKey,
+                  trusted: e.isTrusted
+                });
               }, true);
+              window.addEventListener('keyup', function(e) {
+                window.keyEvents.push({
+                  type: e.type,
+                  key: e.key,
+                  code: e.code,
+                  ctrlKey: e.ctrlKey,
+                  trusted: e.isTrusted
+                });
+              }, true);
+              document.getElementById('target').focus();
             </script>
         </body>
         </html>"#,
@@ -2003,14 +1598,35 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
 
     let eval_result = BrowserEvalTool
         .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
+            json!({"expression": "({ events: window.keyEvents, inputValue: document.getElementById('target').value })"}),
             ctx.clone(),
         )
         .await;
     assert!(
-        eval_result.output().contains("ctrl+k"),
-        "Ctrl+K capture listener not fired: {}",
+        eval_result.is_success(),
+        "post-chord eval failed: {}",
         eval_result.output()
+    );
+    let output = eval_result.output();
+    assert!(
+        output.contains("keydown") && output.contains("keyup"),
+        "Ctrl+K event lifecycle missing: {output}"
+    );
+    assert!(
+        output.contains("\"key\": \"k\"") && output.contains("\"code\": \"KeyK\""),
+        "Ctrl+K event identity wrong: {output}"
+    );
+    assert!(
+        output.contains("\"ctrlKey\": true") && output.contains("\"trusted\": true"),
+        "Ctrl+K modifier/trust wrong: {output}"
+    );
+    assert!(
+        !output.contains("Unidentified") && !output.contains("Numpad"),
+        "Ctrl+K emitted a phantom native key: {output}"
+    );
+    assert!(
+        output.contains("\"inputValue\": \"\""),
+        "Ctrl+K inserted text into the focused input: {output}"
     );
 
     shutdown_test(manager, server).await;

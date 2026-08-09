@@ -1,0 +1,34 @@
+name: Reduce roadmap Issue
+
+on:
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reduce:
+    if: >-
+      github.event.issue.pull_request == null &&
+      vars.PHOENIX_ROADMAP_ISSUE_NUMBER != '' &&
+      github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    concurrency:
+      group: roadmap-issue-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - name: Validate reducer
+        run: node --test scripts/roadmap-issue-reducer.test.mjs
+      - name: Reduce agent updates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PHOENIX_ROADMAP_ISSUE_NUMBER: ${{ vars.PHOENIX_ROADMAP_ISSUE_NUMBER }}
+        run: node scripts/roadmap-issue-reducer.mjs

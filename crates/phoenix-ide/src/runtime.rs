@@ -3213,12 +3213,25 @@ impl RuntimeManager {
                     agent_catalog.clone(),
                 )
             } else {
-                let registry = match conv.conv_mode {
-                    ConvMode::Explore { .. } => ToolRegistry::explore(
-                        &context.tasks_dir_name,
-                        agent_catalog.to_vec(),
-                        available_model_ids.clone(),
-                        ExploreToolPolicy::from_platform(&self.platform),
+                let global_read = crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                );
+                let send_chat =
+                    Arc::new(crate::send_chat_service::SendChatApplicationService::new(
+                        self.db.clone(),
+                        self.clone(),
+                    ));
+                let writing_tools = crate::coordinator_tools::writing_tools(global_read, send_chat);
+                let (registry, upgrade_writing_tools) = match conv.conv_mode {
+                    ConvMode::Explore { .. } => (
+                        ToolRegistry::explore(
+                            &context.tasks_dir_name,
+                            agent_catalog.to_vec(),
+                            available_model_ids.clone(),
+                            ExploreToolPolicy::from_platform(&self.platform),
+                        ),
+                        Some(writing_tools),
                     ),
                     ConvMode::Direct => {
                         // Full tool suite for Direct mode. `propose_task` (the
@@ -3229,21 +3242,33 @@ impl RuntimeManager {
                             agent_catalog.to_vec(),
                             available_model_ids.clone(),
                         );
-                        if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
-                            .is_some()
-                        {
-                            registry.with_propose_task().with_commission_review()
-                        } else {
-                            registry
-                        }
+                        let registry =
+                            if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
+                                .is_some()
+                            {
+                                registry.with_propose_task().with_commission_review()
+                            } else {
+                                registry
+                            };
+                        (
+                            registry.try_with_writing_conversation_tools(writing_tools)?,
+                            None,
+                        )
                     }
                     ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                         // Full tool suite plus `propose_task` (non-blocking fork
                         // proposal — REQ-PROJ-036). Work/Branch always sit on git
                         // history, so the tool is always offered.
-                        ToolRegistry::direct(agent_catalog.to_vec(), available_model_ids.clone())
+                        (
+                            ToolRegistry::direct(
+                                agent_catalog.to_vec(),
+                                available_model_ids.clone(),
+                            )
                             .with_propose_task()
                             .with_commission_review()
+                            .try_with_writing_conversation_tools(writing_tools)?,
+                            None,
+                        )
                     }
                 };
                 ToolRegistryExecutor::with_mcp(
@@ -3252,6 +3277,7 @@ impl RuntimeManager {
                     agent_catalog.clone(),
                     Arc::from(available_model_ids.clone()),
                 )
+                .with_writing_tools(upgrade_writing_tools)
             }
         };
 

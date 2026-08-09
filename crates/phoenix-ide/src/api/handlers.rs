@@ -3,7 +3,7 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
+use super::assets::{get_index_response, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
@@ -73,6 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 
 async fn trajectory_export_handler(
     State(state): State<AppState>,
@@ -1108,8 +1109,8 @@ fn conv_requires_action(conv: &crate::db::Conversation) -> bool {
 
 /// Serve the SPA index.html for all client-side routes
 async fn serve_spa() -> impl IntoResponse {
-    match get_index_html() {
-        Some(content) => Html(content).into_response(),
+    match get_index_response() {
+        Some(response) => response,
         None => (
             StatusCode::NOT_FOUND,
             Html(
@@ -4195,6 +4196,9 @@ async fn cancel_active_direct_turn(
     else {
         return Ok(None);
     };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
     let materialization = turn.materialization.clone();
     repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
         turn_id: turn.id,
@@ -4205,10 +4209,82 @@ async fn cancel_active_direct_turn(
     Ok(Some(materialization))
 }
 
+async fn load_active_direct_turn_authority(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, AppError> {
+    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let turn = repo
+        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let Some(turn) = turn else {
+        return Ok(None);
+    };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
+    Ok(Some(crate::runtime::traits::ActiveDirectTurn {
+        turn_id: turn.id,
+        generation: turn.generation,
+    }))
+}
+
+fn record_cancel_outcome(
+    conversation_id: &str,
+    observed_state: &ConvState,
+    outcome: &'static str,
+    direct_turn_action: &'static str,
+) {
+    let span = tracing::Span::current();
+    span.record("observed_state", observed_state.variant_name());
+    span.record("outcome", outcome);
+    span.record("direct_turn_action", direct_turn_action);
+    tracing::info!(
+        conv_id = %conversation_id,
+        observed_state = observed_state.variant_name(),
+        outcome,
+        direct_turn_action,
+        "Conversation cancel resolved"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+) -> Result<Json<CancelResponse>, AppError> {
+    let span = crate::logging::conversation_cancel_span(&id);
+    let result = cancel_conversation_inner(state, id)
+        .instrument(span.clone())
+        .await;
+    if let Err(error) = &result {
+        let (outcome, is_server_error) = match error {
+            AppError::Conflict(_) => ("rejected_state", false),
+            AppError::NotFound(_) => ("not_found", false),
+            AppError::BadRequest(_)
+            | AppError::TypedBadRequest { .. }
+            | AppError::Forbidden(_)
+            | AppError::UnprocessableEntity(_) => ("request_error", false),
+            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+        };
+        span.record("outcome", outcome);
+        if is_server_error {
+            span.record("otel.status_code", "ERROR");
+            tracing::warn!(parent: &span, error = ?error, "Conversation cancel failed");
+        } else {
+            tracing::info!(parent: &span, error = ?error, outcome, "Conversation cancel rejected");
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cancel_conversation_inner(
+    state: AppState,
+    id: String,
 ) -> Result<Json<CancelResponse>, AppError> {
     // Provisioning cancellation is DB-owned because no conversation runtime
     // owns that lifecycle yet.
@@ -4246,6 +4322,12 @@ async fn cancel_conversation(
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
             .await;
         state.runtime.kick_creation_worker();
+        record_cancel_outcome(
+            &id,
+            &conversation.state,
+            "creation_cancelled",
+            "not_applicable",
+        );
         return Ok(Json(CancelResponse {
             ok: true,
             no_op: false,
@@ -4257,6 +4339,7 @@ async fn cancel_conversation(
         .effective_conversation_state(&id)
         .await
         .unwrap_or_else(|| conversation.state.clone());
+    tracing::Span::current().record("observed_state", effective_state.variant_name());
 
     if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
@@ -4279,6 +4362,12 @@ async fn cancel_conversation(
                 .map_err(|error| {
                     AppError::Internal(format!("failed to send cancel event: {error}"))
                 })?;
+            record_cancel_outcome(
+                &id,
+                &effective_state,
+                "runtime_cancel_requested_after_turn_cancel",
+                "cancelled",
+            );
             return Ok(Json(CancelResponse {
                 ok: true,
                 no_op: false,
@@ -4318,6 +4407,20 @@ async fn cancel_conversation(
                 "cancel no-op: conversation has nothing in flight"
             );
         }
+        record_cancel_outcome(
+            &id,
+            &effective_state,
+            if cancelled_direct_turn.is_some() {
+                "direct_turn_cancelled"
+            } else {
+                "no_op"
+            },
+            if cancelled_direct_turn.is_some() {
+                "cancelled"
+            } else {
+                "absent"
+            },
+        );
         return Ok(Json(CancelResponse {
             ok: true,
             no_op: cancelled_direct_turn.is_none(),
@@ -4334,6 +4437,20 @@ async fn cancel_conversation(
         ))));
     }
 
+    let direct_turn_action = match load_active_direct_turn_authority(&state, &id).await {
+        Ok(Some(_)) => "observed",
+        Ok(None) => "absent",
+        Err(error) => {
+            tracing::warn!(
+                conv_id = %id,
+                ?error,
+                "Active direct-turn lookup failed while enriching cancellation telemetry"
+            );
+            "lookup_failed"
+        }
+    };
+    tracing::Span::current().record("direct_turn_action", direct_turn_action);
+
     state
         .runtime
         .send_event(
@@ -4344,7 +4461,18 @@ async fn cancel_conversation(
             },
         )
         .await
-        .map_err(AppError::BadRequest)?;
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to dispatch conversation cancellation: {error}"
+            ))
+        })?;
+
+    record_cancel_outcome(
+        &id,
+        &effective_state,
+        "runtime_cancel_requested",
+        direct_turn_action,
+    );
 
     Ok(Json(CancelResponse {
         ok: true,
@@ -7668,8 +7796,8 @@ async fn serve_share_page(
             AppError::NotFound("Share link not found or has been revoked".to_string())
         })?;
 
-    match get_index_html() {
-        Some(content) => Ok(Html(content).into_response()),
+    match get_index_response() {
+        Some(response) => Ok(response),
         None => Ok((
             StatusCode::NOT_FOUND,
             Html(

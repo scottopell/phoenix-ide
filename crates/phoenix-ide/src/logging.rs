@@ -158,10 +158,98 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.stream.init"),
     ("phoenix_ide::otel", "browser.conversation_open"),
     ("phoenix_ide::otel", "conversation.runtime.materialize"),
+    ("phoenix_ide::otel", "conversation.cancel"),
     ("phoenix_ide::otel", "conversation.turn"),
+    ("phoenix_ide::otel", "direct_turn.settle"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
 ];
+
+pub(crate) fn conversation_cancel_span(conversation_id: &str) -> tracing::Span {
+    tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "conversation.cancel",
+        conv_id = %conversation_id,
+        observed_state = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        direct_turn_action = tracing::field::Empty,
+        turn_id = tracing::field::Empty,
+        generation = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+}
+
+pub(crate) fn direct_turn_settlement_span(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+) -> tracing::Span {
+    direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "state",
+    )
+}
+
+pub(crate) fn continuation_direct_turn_settlement_span(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    operation_id: &str,
+) -> tracing::Span {
+    let span = direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "continuation",
+    );
+    span.record("operation_id", operation_id);
+    span
+}
+
+fn direct_turn_settlement_span_for_path(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    settlement_path: &str,
+) -> tracing::Span {
+    tracing::info_span!(
+        target: "phoenix_ide::otel",
+        parent: parent,
+        "direct_turn.settle",
+        conv_id = %conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        settlement_path,
+        operation_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        commit_probe = tracing::field::Empty,
+        durable_state = tracing::field::Empty,
+        active_turn_present = tracing::field::Empty,
+        turn_still_active = tracing::field::Empty,
+        error.message = tracing::field::Empty,
+        probe.error.message = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+}
 
 fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && OTEL_SPANS.contains(&(meta.target(), meta.name()))
@@ -433,6 +521,11 @@ mod tests {
                 operation = "branch_and_work_change",
             );
             drop(pr_refresh);
+            let cancel = conversation_cancel_span("cancel-conversation-123");
+            cancel.record("observed_state", "LlmRequesting");
+            cancel.record("outcome", "runtime_cancel_requested");
+            cancel.record("direct_turn_action", "not_checked");
+            drop(cancel);
             drop(http);
             let stream_init = tracing::info_span!(
                 target: "phoenix_ide::otel",
@@ -452,6 +545,40 @@ mod tests {
             drop(stream_init);
             drop(runtime_materialize);
             drop(browser_open);
+            let turn = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "conversation.turn",
+                conv_id = "settlement-conversation-123",
+            );
+            let settlement = direct_turn_settlement_span(
+                &turn,
+                "settlement-conversation-123",
+                265,
+                0,
+                "completed",
+                "Idle",
+            );
+            settlement.record("outcome", "failed_still_owed");
+            settlement.record("commit_probe", "still_owed");
+            settlement.record("durable_state", "LlmRequesting");
+            settlement.record("active_turn_present", true);
+            settlement.record("turn_still_active", true);
+            settlement.record("error.message", "database is locked");
+            settlement.record("otel.status_code", "ERROR");
+            drop(settlement);
+            let continuation_settlement = continuation_direct_turn_settlement_span(
+                &turn,
+                "continuation-settlement-conversation-123",
+                266,
+                1,
+                "failed",
+                "ContextExhausted",
+                "continuation-operation-123",
+            );
+            continuation_settlement.record("outcome", "reconciled_duplicate");
+            continuation_settlement.record("commit_probe", "retry");
+            drop(continuation_settlement);
+            drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -500,7 +627,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 6);
+        assert_eq!(spans.len(), 10);
         assert_eq!(
             spans
                 .iter()
@@ -508,10 +635,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "pr_status.refresh",
+                "conversation.cancel",
                 "http",
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "direct_turn.settle",
+                "direct_turn.settle",
+                "conversation.turn",
                 "llm.request"
             ]
         );
@@ -544,6 +675,22 @@ mod tests {
             );
         }
         let encoded = format!("{spans:?}");
+        for required in [
+            "cancel-conversation-123",
+            "settlement-conversation-123",
+            "failed_still_owed",
+            "still_owed",
+            "database is locked",
+            "state",
+            "continuation",
+            "continuation-operation-123",
+            "reconciled_duplicate",
+        ] {
+            assert!(
+                encoded.contains(required),
+                "missing exported telemetry attribute {required}"
+            );
+        }
         for forbidden in [
             "PAYLOAD_SENTINEL",
             "DELTA_SENTINEL",

@@ -2225,7 +2225,7 @@ where
             let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
                 false
             } else {
-                match self.resume_interrupted_llm_request().await {
+                match Box::pin(self.resume_interrupted_llm_request()).await {
                     Ok(failed) => failed,
                     Err(settlement_error) => {
                         tracing::error!(
@@ -2740,7 +2740,9 @@ where
             state_updated_at: self.state_updated_at,
             presentation_mode: self.state.presentation_mode().to_string(),
         });
-        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+        Box::pin(self.execute_effect(Effect::RequestLlm))
+            .await
+            .map(|_| ())
     }
 
     async fn process_acknowledged_event(
@@ -2789,8 +2791,13 @@ where
                 }
             )
         {
+            let turn_id = self.active_direct_turn.as_ref().map(|turn| turn.turn_id.0);
+            let generation = self.active_direct_turn.as_ref().map(|turn| turn.generation);
             tracing::debug!(
                 conv_id = %self.context.conversation_id,
+                turn_id = ?turn_id,
+                generation = ?generation,
+                terminal_settlement_pending = self.pending_direct_turn_terminal.is_some(),
                 "absorbing user cancellation delivered after runtime became idle"
             );
             return Ok(());
@@ -3024,6 +3031,8 @@ where
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        let will_settle_active_direct_turn =
+            self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -3048,8 +3057,6 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::CommitSteeringDrain { .. }));
-            let will_settle_active_direct_turn =
-                self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
             if !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_active_direct_turn
@@ -3061,7 +3068,9 @@ where
             // The turn's trace ends when the conversation stops working —
             // including the transient Idle of a steering drain, where the
             // queued message legitimately starts a new turn (and span).
-            self.settle_turn_span();
+            if !will_settle_active_direct_turn {
+                self.settle_turn_span();
+            }
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
@@ -3184,7 +3193,7 @@ where
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(effect, Effect::PersistState);
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
-                let effect_result = self.execute_effect(effect).await;
+                let effect_result = Box::pin(self.execute_effect(effect)).await;
                 let effect_result = match effect_result {
                     Ok(effect_result) => effect_result,
                     Err(error) if is_state_persist || is_steering_drain => {
@@ -3241,7 +3250,6 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
-
         Ok(generated_events)
     }
 
@@ -3284,7 +3292,7 @@ where
             }
             let is_authoritative_persist =
                 matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-            if let Some(gen_event) = self.execute_effect(effect).await? {
+            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
                 generated_events.push(gen_event);
             }
             if is_authoritative_persist && self.direct_turn_materialization_aborted {
@@ -3314,7 +3322,7 @@ where
             self.state_updated_at = Utc::now();
         }
         for effect in drain_result.effects {
-            match self.execute_effect(effect).await {
+            match Box::pin(self.execute_effect(effect)).await {
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
@@ -3331,7 +3339,7 @@ where
         drop(projection_guard);
 
         if let Some(effect) = deferred_request_llm {
-            match self.execute_effect(effect).await {
+            match Box::pin(self.execute_effect(effect)).await {
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
@@ -3351,38 +3359,7 @@ where
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.take(),
         ) {
-            let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
-                turn,
-                terminal: terminal.as_ref().clone(),
-                state: self.state.clone(),
-                state_updated_at: self.state_updated_at,
-            };
-            if let Err(error) = self.storage.settle_active_direct_turn(&settlement).await {
-                let snapshot = self
-                    .storage
-                    .get_state_snapshot(&self.context.conversation_id)
-                    .await?;
-                let active = self
-                    .storage
-                    .load_active_direct_turn(&self.context.conversation_id)
-                    .await?;
-                let committed = snapshot.state == settlement.state
-                    && active
-                        .as_ref()
-                        .is_none_or(|loaded| loaded.active != settlement.turn);
-                if committed {
-                    self.state = snapshot.state;
-                    self.state_updated_at = snapshot.state_updated_at;
-                    self.active_direct_turn = None;
-                    self.direct_turn_cancellation_initiated = false;
-                } else {
-                    self.pending_direct_turn_terminal = Some(terminal);
-                    return Err(error);
-                }
-            } else {
-                self.active_direct_turn = None;
-                self.direct_turn_cancellation_initiated = false;
-            }
+            self.settle_pending_direct_turn(turn, terminal).await?;
         } else {
             self.storage
                 .update_state(
@@ -3521,6 +3498,227 @@ where
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
         entering_idle || entering_llm_requesting_from_tool_round
+    }
+
+    async fn settle_pending_direct_turn(
+        &mut self,
+        turn: crate::runtime::traits::ActiveDirectTurn,
+        terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
+    ) -> Result<(), String> {
+        let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
+            turn,
+            terminal: terminal.as_ref().clone(),
+            state: self.state.clone(),
+            state_updated_at: self.state_updated_at,
+        };
+        let parent = self
+            .turn_span
+            .clone()
+            .unwrap_or_else(tracing::Span::current);
+        let span = crate::logging::direct_turn_settlement_span(
+            &parent,
+            &self.context.conversation_id,
+            settlement.turn.turn_id.0,
+            settlement.turn.generation,
+            settlement.terminal.variant_name(),
+            settlement.state.variant_name(),
+        );
+        let result = match self
+            .storage
+            .settle_active_direct_turn(&settlement)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(()) => {
+                span.record("outcome", "committed");
+                span.record("commit_probe", "not_needed");
+                self.active_direct_turn = None;
+                self.direct_turn_cancellation_initiated = false;
+                Ok(())
+            }
+            Err(error) => {
+                span.record("error.message", error.as_str());
+                self.reconcile_failed_direct_turn_settlement(settlement, terminal, error, span)
+                    .await
+            }
+        };
+        if result.is_ok() {
+            self.settle_turn_span();
+        }
+        result
+    }
+
+    async fn try_reconcile_durable_continuation_terminal(
+        &mut self,
+        snapshot: crate::runtime::traits::PersistedStateSnapshot,
+        settlement_span: Option<tracing::Span>,
+    ) -> bool {
+        if !matches!(
+            &snapshot.state,
+            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
+        ) {
+            return false;
+        }
+        let authority_reconciled = if let Some(turn) = self.active_direct_turn.as_deref() {
+            let probe_span = settlement_span
+                .clone()
+                .unwrap_or_else(tracing::Span::current);
+            match self
+                .storage
+                .load_active_direct_turn(&self.context.conversation_id)
+                .instrument(probe_span)
+                .await
+            {
+                Ok(active) => {
+                    let turn_still_active =
+                        active.as_ref().is_some_and(|loaded| loaded.active == *turn);
+                    if let Some(span) = &settlement_span {
+                        span.record("active_turn_present", active.is_some());
+                        span.record("turn_still_active", turn_still_active);
+                    }
+                    !turn_still_active
+                }
+                Err(probe_error) => {
+                    if let Some(span) = &settlement_span {
+                        span.record("probe.error.message", probe_error.as_str());
+                        span.record("commit_probe", "turn_read_failed");
+                    }
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if !authority_reconciled {
+            return false;
+        }
+        if let Some(span) = &settlement_span {
+            span.record("outcome", "durable_terminal_reconciled");
+            span.record("commit_probe", "state_and_turn_read");
+            span.record("durable_state", snapshot.state.variant_name());
+        }
+        self.state = snapshot.state;
+        self.state_updated_at = snapshot.state_updated_at;
+        self.active_direct_turn = None;
+        self.pending_direct_turn_terminal = None;
+        self.direct_turn_cancellation_initiated = false;
+        self.settle_turn_span();
+        let _ = self
+            .broadcast_tx
+            .send_seq(|sequence_id| SseEvent::StateChange {
+                sequence_id,
+                state: self.state.clone(),
+                state_updated_at: self.state_updated_at,
+                presentation_mode: self.state.presentation_mode().to_string(),
+            });
+        true
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn reconcile_failed_direct_turn_settlement(
+        &mut self,
+        settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
+        terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
+        error: String,
+        span: tracing::Span,
+    ) -> Result<(), String> {
+        let snapshot = match self
+            .storage
+            .get_state_snapshot(&self.context.conversation_id)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(probe_error) => {
+                span.record("outcome", "commit_probe_failed");
+                span.record("commit_probe", "state_read_failed");
+                span.record("probe.error.message", probe_error.as_str());
+                span.record("otel.status_code", "ERROR");
+                tracing::error!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    settlement_error = %error,
+                    probe_error = %probe_error,
+                    "Direct-turn settlement failed and commit probe could not read conversation state"
+                );
+                return Err(probe_error);
+            }
+        };
+        span.record("durable_state", snapshot.state.variant_name());
+        let active = match self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(active) => active,
+            Err(probe_error) => {
+                span.record("outcome", "commit_probe_failed");
+                span.record("commit_probe", "turn_read_failed");
+                span.record("probe.error.message", probe_error.as_str());
+                span.record("otel.status_code", "ERROR");
+                tracing::error!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    settlement_error = %error,
+                    probe_error = %probe_error,
+                    "Direct-turn settlement failed and commit probe could not read active turn"
+                );
+                return Err(probe_error);
+            }
+        };
+        let turn_still_active = active
+            .as_ref()
+            .is_some_and(|loaded| loaded.active == settlement.turn);
+        span.record("active_turn_present", active.is_some());
+        span.record("turn_still_active", turn_still_active);
+        let committed = snapshot.state == settlement.state
+            && active
+                .as_ref()
+                .is_none_or(|loaded| loaded.active != settlement.turn);
+        if committed {
+            span.record("outcome", "reconciled_committed");
+            span.record("commit_probe", "committed");
+            tracing::warn!(
+                parent: &span,
+                conv_id = %self.context.conversation_id,
+                turn_id = settlement.turn.turn_id.0,
+                generation = settlement.turn.generation,
+                terminal_kind = settlement.terminal.variant_name(),
+                settlement_error = %error,
+                "Direct-turn settlement returned an error after commit; reconciled committed state"
+            );
+            self.state = snapshot.state;
+            self.state_updated_at = snapshot.state_updated_at;
+            self.active_direct_turn = None;
+            self.direct_turn_cancellation_initiated = false;
+            return Ok(());
+        }
+
+        span.record("outcome", "failed_still_owed");
+        span.record("commit_probe", "still_owed");
+        span.record("otel.status_code", "ERROR");
+        tracing::error!(
+            parent: &span,
+            conv_id = %self.context.conversation_id,
+            turn_id = settlement.turn.turn_id.0,
+            generation = settlement.turn.generation,
+            terminal_kind = settlement.terminal.variant_name(),
+            target_state = settlement.state.variant_name(),
+            durable_state = snapshot.state.variant_name(),
+            active_turn_present = active.is_some(),
+            turn_still_active,
+            settlement_error = %error,
+            "Direct-turn settlement failed before commit; terminal obligation remains owed"
+        );
+        self.pending_direct_turn_terminal = Some(terminal);
+        Err(error)
     }
 
     /// If the current state transition is a steering-queue drain hook point and
@@ -4735,19 +4933,41 @@ where
                             }
                         })
                 });
+                let settlement_span = self.active_direct_turn.as_ref().map(|turn| {
+                    let terminal = direct_turn_terminal
+                        .as_ref()
+                        .expect("active direct turn has terminal settlement");
+                    let parent = self
+                        .turn_span
+                        .clone()
+                        .unwrap_or_else(tracing::Span::current);
+                    crate::logging::continuation_direct_turn_settlement_span(
+                        &parent,
+                        &self.context.conversation_id,
+                        turn.turn_id.0,
+                        turn.generation,
+                        terminal.variant_name(),
+                        self.state.variant_name(),
+                        &operation_id,
+                    )
+                });
                 let continuation_result = if let Some(turn) = self.active_direct_turn.as_ref() {
+                    let settlement = crate::runtime::traits::ContinuationDirectTurnSettlement {
+                        turn: (**turn).clone(),
+                        terminal: direct_turn_terminal
+                            .clone()
+                            .expect("active direct turn has terminal settlement"),
+                        operation_id: operation_id.clone(),
+                        message: message.clone(),
+                        state: self.state.clone(),
+                        state_updated_at: self.state_updated_at,
+                    };
                     self.storage
-                        .settle_continuation_direct_turn(
-                            &crate::runtime::traits::ContinuationDirectTurnSettlement {
-                                turn: (**turn).clone(),
-                                terminal: direct_turn_terminal
-                                    .clone()
-                                    .expect("active direct turn has terminal settlement"),
-                                operation_id: operation_id.clone(),
-                                message: message.clone(),
-                                state: self.state.clone(),
-                                state_updated_at: self.state_updated_at,
-                            },
+                        .settle_continuation_direct_turn(&settlement)
+                        .instrument(
+                            settlement_span
+                                .clone()
+                                .expect("direct-turn settlement has telemetry span"),
                         )
                         .await
                 } else {
@@ -4762,9 +4982,25 @@ where
                         .await
                 };
                 let continuation_outcome = match continuation_result {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        if let Some(span) = &settlement_span {
+                            span.record(
+                                "outcome",
+                                match outcome {
+                                    crate::db::ContinuationCommitOutcome::Applied => "committed",
+                                    crate::db::ContinuationCommitOutcome::Duplicate => "duplicate",
+                                    crate::db::ContinuationCommitOutcome::Stale => "stale",
+                                },
+                            );
+                            span.record("commit_probe", "not_needed");
+                        }
+                        outcome
+                    }
                     Err(first_error) => {
-                        let reconciled = if let (Some(turn), Some(terminal)) = (
+                        if let Some(span) = &settlement_span {
+                            span.record("error.message", first_error.as_str());
+                        }
+                        let reconciliation = if let (Some(turn), Some(terminal)) = (
                             self.active_direct_turn.as_ref(),
                             direct_turn_terminal.as_ref(),
                         ) {
@@ -4779,8 +5015,12 @@ where
                                         state_updated_at: self.state_updated_at,
                                     },
                                 )
+                                .instrument(
+                                    settlement_span
+                                        .clone()
+                                        .expect("direct-turn settlement has telemetry span"),
+                                )
                                 .await
-                                .ok()
                         } else {
                             self.storage
                                 .commit_continuation(
@@ -4791,15 +5031,45 @@ where
                                     self.state_updated_at,
                                 )
                                 .await
-                                .ok()
-                        }
-                        .filter(|outcome| {
-                            matches!(
-                                outcome,
-                                crate::db::ContinuationCommitOutcome::Applied
-                                    | crate::db::ContinuationCommitOutcome::Duplicate
-                            )
-                        });
+                        };
+                        let reconciled = match reconciliation {
+                            Ok(
+                                outcome @ (crate::db::ContinuationCommitOutcome::Applied
+                                | crate::db::ContinuationCommitOutcome::Duplicate),
+                            ) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record(
+                                        "outcome",
+                                        match outcome {
+                                            crate::db::ContinuationCommitOutcome::Applied => {
+                                                "reconciled_committed"
+                                            }
+                                            crate::db::ContinuationCommitOutcome::Duplicate => {
+                                                "reconciled_duplicate"
+                                            }
+                                            crate::db::ContinuationCommitOutcome::Stale => {
+                                                unreachable!()
+                                            }
+                                        },
+                                    );
+                                    span.record("commit_probe", "retry");
+                                }
+                                Some(outcome)
+                            }
+                            Ok(crate::db::ContinuationCommitOutcome::Stale) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record("commit_probe", "retry_stale");
+                                }
+                                None
+                            }
+                            Err(probe_error) => {
+                                if let Some(span) = &settlement_span {
+                                    span.record("commit_probe", "retry_failed");
+                                    span.record("probe.error.message", probe_error.as_str());
+                                }
+                                None
+                            }
+                        };
                         if let Some(outcome) = reconciled {
                             outcome
                         } else {
@@ -4808,24 +5078,12 @@ where
                                 .get_state_snapshot(&self.context.conversation_id)
                                 .await
                             {
-                                if matches!(
-                                    &snapshot.state,
-                                    ConvState::ContextExhausted { .. }
-                                        | ConvState::RecoverableContinuationFailure { .. }
-                                ) {
-                                    self.state = snapshot.state;
-                                    self.state_updated_at = snapshot.state_updated_at;
-                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                        SseEvent::StateChange {
-                                            sequence_id,
-                                            state: self.state.clone(),
-                                            state_updated_at: self.state_updated_at,
-                                            presentation_mode: self
-                                                .state
-                                                .presentation_mode()
-                                                .to_string(),
-                                        }
-                                    });
+                                if Box::pin(self.try_reconcile_durable_continuation_terminal(
+                                    snapshot,
+                                    settlement_span.clone(),
+                                ))
+                                .await
+                                {
                                     return Ok(None);
                                 }
                             }
@@ -4841,7 +5099,7 @@ where
                             self.state = ConvState::RecoverableContinuationFailure { failure };
                             self.state_updated_at = Utc::now();
                             if let Some(turn) = self.active_direct_turn.as_deref() {
-                                self.storage
+                                let recovery_result = self.storage
                                     .settle_active_direct_turn(
                                         &crate::runtime::traits::ActiveDirectTurnSettlement {
                                             turn: turn.clone(),
@@ -4852,10 +5110,28 @@ where
                                             state_updated_at: self.state_updated_at,
                                         },
                                     )
-                                    .await?;
+                                    .instrument(
+                                        settlement_span
+                                            .clone()
+                                            .expect("direct-turn settlement has telemetry span"),
+                                    )
+                                    .await;
+                                if let Err(recovery_error) = recovery_result {
+                                    if let Some(span) = &settlement_span {
+                                        span.record("outcome", "recovery_settlement_failed");
+                                        span.record("probe.error.message", recovery_error.as_str());
+                                        span.record("otel.status_code", "ERROR");
+                                    }
+                                    return Err(recovery_error);
+                                }
+                                if let Some(span) = &settlement_span {
+                                    span.record("outcome", "recovery_state_committed");
+                                    span.record("commit_probe", "fallback_settlement");
+                                }
                                 self.active_direct_turn = None;
                                 self.pending_direct_turn_terminal = None;
                                 self.direct_turn_cancellation_initiated = false;
+                                self.settle_turn_span();
                             } else {
                                 self.storage
                                     .update_state(
@@ -4893,6 +5169,9 @@ where
                         self.active_direct_turn = None;
                         self.pending_direct_turn_terminal = None;
                         self.direct_turn_cancellation_initiated = false;
+                        if used_direct_turn_settlement {
+                            self.settle_turn_span();
+                        }
                     }
                     crate::db::ContinuationCommitOutcome::Duplicate
                     | crate::db::ContinuationCommitOutcome::Stale => {
@@ -4912,6 +5191,9 @@ where
                         self.state = persisted.state;
                         self.state_updated_at = persisted.state_updated_at;
                         if continuation_outcome == crate::db::ContinuationCommitOutcome::Duplicate {
+                            if used_direct_turn_settlement {
+                                self.settle_turn_span();
+                            }
                             let _ = self.broadcast_tx.send_message(message);
                             drop(reserved_range);
                             let _ =
@@ -9868,6 +10150,31 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn direct_turn_settlement_closes_completed_turn_span_immediately() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::Idle;
+        rt.turn_span = Some(tracing::info_span!("completed-direct-turn"));
+
+        rt.settle_pending_direct_turn(
+            crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(10),
+                generation: 0,
+            },
+            Box::new(crate::runtime::traits::ActiveDirectTurnTerminal::Completed),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rt.turn_span.is_none(),
+            "queued steering must open a new trace after settlement"
+        );
+    }
+
+    #[tokio::test]
     async fn active_direct_turn_completes_after_final_llm_outcome() {
         let (mut rt, storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -10364,6 +10671,103 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn durable_terminal_probe_reconciles_direct_turn_and_closes_trace() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "durable-terminal-reconcile".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(14),
+            generation: 0,
+        }));
+        rt.turn_span = Some(tracing::info_span!("durable-terminal-direct-turn"));
+        rt.state = terminal_state.clone();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &terminal_state,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "durable summary".to_string(),
+        })
+        .await
+        .expect("durable terminal state and released authority prove settlement");
+
+        assert_eq!(rt.state, terminal_state);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(rt.turn_span.is_none());
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_probe_settles_authority_that_is_still_active() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "durable-terminal-active-authority".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(15),
+            generation: 0,
+        };
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn.clone()));
+        rt.turn_span = Some(tracing::info_span!("still-active-direct-turn"));
+        rt.state = terminal_state.clone();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &terminal_state,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "durable summary".to_string(),
+        })
+        .await
+        .expect("active authority must be terminalized by recovery");
+
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.turn_span.is_none());
+        assert_eq!(
+            storage.recorded_settle_active_direct_turn_calls()[0].turn,
+            turn
+        );
+    }
+
+    #[tokio::test]
     async fn continuation_commit_settles_active_direct_turn_atomically_before_broadcast() {
         let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -10379,6 +10783,7 @@ mod authoritative_user_message_effect_tests {
             summary: summary.clone(),
         };
         rt.state_updated_at = Utc::now();
+        rt.turn_span = Some(tracing::info_span!("continuation-direct-turn"));
         storage
             .update_state(
                 &rt.context.conversation_id,
@@ -10410,6 +10815,7 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(settlements[0].operation_id, operation_id);
         assert_eq!(settlements[0].state, rt.state);
         assert!(rt.active_direct_turn.is_none());
+        assert!(rt.turn_span.is_none());
         assert!(matches!(
             storage.get_current_state(&rt.context.conversation_id),
             Some(ConvState::ContextExhausted { .. })

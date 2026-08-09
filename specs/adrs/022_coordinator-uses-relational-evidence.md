@@ -1,6 +1,6 @@
 # ADR-022: The Coordinator uses bounded relational evidence
 
-- **Status:** Accepted
+- **Status:** Partially superseded by ADR-027
 - **Date:** 2026-07-21
 - **Supersedes:** ADR-021's decision to retain the inferred open-work projection
 - **Affects:** REQ-GR-001–005, REQ-GR-007–011A

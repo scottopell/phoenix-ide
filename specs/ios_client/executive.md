@@ -2,7 +2,8 @@
 
 ## Current Status
 
-Initial implementation. The app lives in `ios/PhoenixMobile/` (SwiftUI,
+The native companion implementation is shipped on `main`. The app lives in
+`ios/PhoenixMobile/` (SwiftUI,
 iOS 17+, no third-party dependencies; Xcode project generated via XcodeGen
 from `project.yml` — see `ios/README.md` for build instructions).
 
@@ -50,6 +51,33 @@ on-device build and an airplane-mode queue/drain test pass.
 | REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
 | REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
 | REQ-IOS-018 advisory nudges | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
+| REQ-IOS-019 grounding/files | Not started; blocked by ProductConversation migration (`tasks/04009-p2-blocked--ios-vnext-grounding-files.md`) |
+| REQ-IOS-020 prose reader | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
+| REQ-IOS-021 prose comments | Lifecycle specified in `ios_prose_feedback.allium`; implementation planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
+
+## Planned iOS vNext Program
+
+iOS vNext migrates the native client to the ProductConversation aggregate and
+then expands its presentation surfaces systematically. The entire program is
+blocked until ProductConversation History/delete and the stable client-facing
+aggregate contract are on `main`; no section is ready for implementation
+against the transcript-row model.
+
+| Section | Status | Task |
+|---|---|---|
+| Program completion owner | Blocked | `tasks/04011-p1-blocked--ios-vnext-productconversation-expansion.md` |
+| ProductConversation migration | Blocked | `tasks/04004-p1-blocked--ios-vnext-productconversation-migration.md` |
+| Deterministic rendering fixture harness | Blocked | `tasks/04005-p1-blocked--ios-vnext-rendering-fixture-harness.md` |
+| Conversation status and actions | Blocked | `tasks/04006-p2-blocked--ios-vnext-conversation-status-actions.md` |
+| Tool-output rendering | Blocked | `tasks/04007-p2-blocked--ios-vnext-tool-output-rendering.md` |
+| Markdown rendering | Blocked | `tasks/04008-p2-blocked--ios-vnext-markdown-rendering.md` |
+| Grounding and file browsing | Blocked | `tasks/04009-p2-blocked--ios-vnext-grounding-files.md` |
+| Prose reader and comments | Blocked | `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
+
+These are umbrella section owners, not broad implementation instructions.
+After the ProductConversation gate clears, each section is decomposed into
+numbered, independently reviewable leaf tasks backed by requirements and
+deterministic fixture/test evidence.
 
 ## Known Gaps / Future Work
 
@@ -64,12 +92,18 @@ on-device build and an airplane-mode queue/drain test pass.
   wired via swipe).
 - Task approval and question answering are resolvable in-app; commission
   review approval renders as a generic needs-action card and resolves from
-  the web UI — the remaining ConversationAction case, mechanical via the
-  TaskApprovalCard/QuestionCard recipe.
+  the web UI. Complete state/action coverage belongs to the blocked iOS vNext
+  status/actions section.
 - Question responses omit option previews and per-answer notes
   (annotations); the server accepts answers without them.
-- Markdown rendering is inline-only (no fenced code blocks or tables).
+- Markdown rendering is inline-only (no fenced code blocks or tables); the
+  blocked iOS vNext Markdown section owns the comprehensive pass.
 - Native tool renderers cover `bash` and `think` only; all other tools
-  (patch, browser, keyword_search, tmux, …) hit the generic JSON cards.
+  (patch, browser, keyword_search, tmux, …) hit the generic JSON cards. The
+  blocked iOS vNext tool-output section owns the renderer catalog and queue.
+- Grounding/file browsing and the prose reader/commenting interface
+  (`REQ-IOS-019` through `REQ-IOS-021`) are not implemented in the native
+  client; their blocked iOS vNext sections depend on the ProductConversation
+  migration and base deterministic fixture harness.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).

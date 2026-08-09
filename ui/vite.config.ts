@@ -73,6 +73,12 @@ function shikiLangPrune(): Plugin {
   return {
     name: 'shiki-lang-prune',
     apply: 'build',
+    augmentChunkHash(chunkInfo) {
+      if (!chunkInfo.facadeModuleId || !GRAMMAR_RE.test(chunkInfo.facadeModuleId)) {
+        return undefined;
+      }
+      return `shiki-lang-prune:${Array.from(SHIKI_KEEP_LANGS).sort().join(',')}`;
+    },
     generateBundle(_options, bundle) {
       // langId per grammar chunk, by output fileName.
       const grammarLang = new Map<string, string>();
