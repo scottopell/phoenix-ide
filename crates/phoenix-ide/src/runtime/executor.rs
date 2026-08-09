@@ -2168,7 +2168,7 @@ where
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
+            if let Err(e) = Box::pin(self.execute_effect(Effect::RequestLlm)).await {
                 tracing::error!(error = %e, "Failed to resume LLM request");
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
@@ -2665,7 +2665,9 @@ where
             state_updated_at: self.state_updated_at,
             presentation_mode: self.state.presentation_mode().to_string(),
         });
-        self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+        Box::pin(self.execute_effect(Effect::RequestLlm))
+            .await
+            .map(|_| ())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3054,7 +3056,7 @@ where
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(effect, Effect::PersistState);
-                let effect_result = self.execute_effect(effect).await;
+                let effect_result = Box::pin(self.execute_effect(effect)).await;
                 let effect_result = match effect_result {
                     Ok(effect_result) => effect_result,
                     Err(error) if is_state_persist => {
@@ -3149,7 +3151,7 @@ where
             }
             let is_authoritative_persist =
                 matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-            if let Some(gen_event) = self.execute_effect(effect).await? {
+            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
                 generated_events.push(gen_event);
             }
             if is_authoritative_persist && self.direct_turn_materialization_aborted {
@@ -3184,13 +3186,13 @@ where
             }
         }
         for effect in drain_result.effects {
-            if let Some(gen_event) = self.execute_effect(effect).await? {
+            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
                 generated_events.push(gen_event);
             }
         }
 
         if let Some(effect) = deferred_request_llm {
-            if let Some(gen_event) = self.execute_effect(effect).await? {
+            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
                 generated_events.push(gen_event);
             }
         }
@@ -3273,6 +3275,72 @@ where
             self.settle_turn_span();
         }
         result
+    }
+
+    async fn try_reconcile_durable_continuation_terminal(
+        &mut self,
+        snapshot: crate::runtime::traits::PersistedStateSnapshot,
+        settlement_span: Option<tracing::Span>,
+    ) -> bool {
+        if !matches!(
+            &snapshot.state,
+            ConvState::ContextExhausted { .. } | ConvState::RecoverableContinuationFailure { .. }
+        ) {
+            return false;
+        }
+        let authority_reconciled = if let Some(turn) = self.active_direct_turn.as_deref() {
+            let probe_span = settlement_span
+                .clone()
+                .unwrap_or_else(tracing::Span::current);
+            match self
+                .storage
+                .load_active_direct_turn(&self.context.conversation_id)
+                .instrument(probe_span)
+                .await
+            {
+                Ok(active) => {
+                    let turn_still_active =
+                        active.as_ref().is_some_and(|loaded| loaded.active == *turn);
+                    if let Some(span) = &settlement_span {
+                        span.record("active_turn_present", active.is_some());
+                        span.record("turn_still_active", turn_still_active);
+                    }
+                    !turn_still_active
+                }
+                Err(probe_error) => {
+                    if let Some(span) = &settlement_span {
+                        span.record("probe.error.message", probe_error.as_str());
+                        span.record("commit_probe", "turn_read_failed");
+                    }
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if !authority_reconciled {
+            return false;
+        }
+        if let Some(span) = &settlement_span {
+            span.record("outcome", "durable_terminal_reconciled");
+            span.record("commit_probe", "state_and_turn_read");
+            span.record("durable_state", snapshot.state.variant_name());
+        }
+        self.state = snapshot.state;
+        self.state_updated_at = snapshot.state_updated_at;
+        self.active_direct_turn = None;
+        self.pending_direct_turn_terminal = None;
+        self.direct_turn_cancellation_initiated = false;
+        self.settle_turn_span();
+        let _ = self
+            .broadcast_tx
+            .send_seq(|sequence_id| SseEvent::StateChange {
+                sequence_id,
+                state: self.state.clone(),
+                state_updated_at: self.state_updated_at,
+                presentation_mode: self.state.presentation_mode().to_string(),
+            });
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4756,29 +4824,12 @@ where
                                 .get_state_snapshot(&self.context.conversation_id)
                                 .await
                             {
-                                if matches!(
-                                    &snapshot.state,
-                                    ConvState::ContextExhausted { .. }
-                                        | ConvState::RecoverableContinuationFailure { .. }
-                                ) {
-                                    if let Some(span) = &settlement_span {
-                                        span.record("outcome", "durable_terminal_observed");
-                                        span.record("commit_probe", "state_read");
-                                        span.record("durable_state", snapshot.state.variant_name());
-                                    }
-                                    self.state = snapshot.state;
-                                    self.state_updated_at = snapshot.state_updated_at;
-                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                        SseEvent::StateChange {
-                                            sequence_id,
-                                            state: self.state.clone(),
-                                            state_updated_at: self.state_updated_at,
-                                            presentation_mode: self
-                                                .state
-                                                .presentation_mode()
-                                                .to_string(),
-                                        }
-                                    });
+                                if Box::pin(self.try_reconcile_durable_continuation_terminal(
+                                    snapshot,
+                                    settlement_span.clone(),
+                                ))
+                                .await
+                                {
                                     return Ok(None);
                                 }
                             }
@@ -10237,6 +10288,103 @@ mod authoritative_user_message_effect_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_probe_reconciles_direct_turn_and_closes_trace() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "durable-terminal-reconcile".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(14),
+            generation: 0,
+        }));
+        rt.turn_span = Some(tracing::info_span!("durable-terminal-direct-turn"));
+        rt.state = terminal_state.clone();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &terminal_state,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "durable summary".to_string(),
+        })
+        .await
+        .expect("durable terminal state and released authority prove settlement");
+
+        assert_eq!(rt.state, terminal_state);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(rt.turn_span.is_none());
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_probe_settles_authority_that_is_still_active() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "durable-terminal-active-authority".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(15),
+            generation: 0,
+        };
+        let terminal_state = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn.clone()));
+        rt.turn_span = Some(tracing::info_span!("still-active-direct-turn"));
+        rt.state = terminal_state.clone();
+        storage
+            .update_state(
+                &rt.context.conversation_id,
+                &terminal_state,
+                rt.state_updated_at,
+            )
+            .await
+            .unwrap();
+        storage.set_fail_continuation_commit(true);
+
+        rt.execute_effect(Effect::ContinuationCommit {
+            request,
+            summary: "durable summary".to_string(),
+        })
+        .await
+        .expect("active authority must be terminalized by recovery");
+
+        assert!(matches!(
+            rt.state,
+            ConvState::RecoverableContinuationFailure { .. }
+        ));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.turn_span.is_none());
+        assert_eq!(
+            storage.recorded_settle_active_direct_turn_calls()[0].turn,
+            turn
+        );
     }
 
     #[tokio::test]

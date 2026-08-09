@@ -4386,9 +4386,19 @@ async fn cancel_conversation_inner(
         ))));
     }
 
-    let direct_turn_present = load_active_direct_turn_authority(&state, &id)
-        .await?
-        .is_some();
+    let direct_turn_action = match load_active_direct_turn_authority(&state, &id).await {
+        Ok(Some(_)) => "observed",
+        Ok(None) => "absent",
+        Err(error) => {
+            tracing::warn!(
+                conv_id = %id,
+                ?error,
+                "Active direct-turn lookup failed while enriching cancellation telemetry"
+            );
+            "lookup_failed"
+        }
+    };
+    tracing::Span::current().record("direct_turn_action", direct_turn_action);
 
     state
         .runtime
@@ -4400,17 +4410,17 @@ async fn cancel_conversation_inner(
             },
         )
         .await
-        .map_err(AppError::BadRequest)?;
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to dispatch conversation cancellation: {error}"
+            ))
+        })?;
 
     record_cancel_outcome(
         &id,
         &effective_state,
         "runtime_cancel_requested",
-        if direct_turn_present {
-            "observed"
-        } else {
-            "absent"
-        },
+        direct_turn_action,
     );
 
     Ok(Json(CancelResponse {
