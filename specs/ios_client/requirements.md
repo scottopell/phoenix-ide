@@ -82,6 +82,11 @@ WHEN the same entry would be sent concurrently
 THE SYSTEM SHALL prevent overlapping in-flight sends of that entry
 WHETHER delivery is owned by an open conversation or a persisted-queue sweep
 
+WHEN a delivery attempt succeeds, is definitively rejected, or is interrupted
+at the transport layer
+THE SYSTEM SHALL release that entry's typed in-flight attempt before a later
+drain may select it again
+
 **Rationale:** The server deduplicates on `message_id`, making at-least-once
 delivery converge to exactly-once. Aggressive retrying is then free of
 duplicate-message risk.
@@ -734,9 +739,10 @@ version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
 AND only then clear the submitted draft and its review authority
 AND immediately request the persistence-fenced ordinary queue drain when that
-conversion succeeds
+conversion has positively created the matching ordinary queue entry
 AND have that drain attempt only entries covered by positive full-outbox
-persistence evidence, in durable oldest-first order
+persistence evidence, in durable oldest-first order, excluding server-accepted
+entries and entries with a typed in-flight attempt
 
 WHEN authority becomes invalid while persistence is pending or in flight
 THE SYSTEM SHALL detect the authority-evidence change without waiting for

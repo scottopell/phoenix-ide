@@ -66,7 +66,8 @@ use "./ios_client_lifecycle.allium" as lifecycle
 -- durable_sendable_entries_oldest_first(persistence)
 --   Returns only ordinary pending queue entries included in the exact full
 --   outbox revision acknowledged by persistence, ordered by their durable
---   ordinal and excluding entries with an active post or invalidation tombstone.
+--   ordinal and excluding server-accepted entries, entries with an active
+--   PostAttempt, and entries with an invalidation tombstone.
 
 ------------------------------------------------------------
 -- Value Types
@@ -238,9 +239,10 @@ entity ReviewOutboxInvalidationTombstone {
     local_id: String
 }
 
--- One-shot request whose receipt-typed field makes an unpersisted entry
--- ineligible by construction. The drain consumes this request after starting
--- every eligible ordinary entry in durable oldest-first order.
+-- One-shot request created only after the receipt-converted ordinary entry is
+-- positively created. Its receipt-typed field makes an unpersisted entry
+-- ineligible by construction. The drain consumes it after starting every
+-- eligible ordinary entry in durable oldest-first order.
 entity DurableOrderedQueueDrainRequest {
     persistence: ReviewOutboxPersistenceReceipt
 }
@@ -702,9 +704,6 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
         render_composer_draft(pending.draft),
         pending.draft.images
     )
-    ensures: DurableOrderedQueueDrainRequest.created(
-        persistence: persistence
-    )
     ensures: pending.draft.images = empty_list
     ensures:
         for segment in pending.draft.plain_segments:
@@ -718,6 +717,33 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
         )
         not exists pending.render
         not exists pending
+}
+
+rule PersistedReviewQueueEntryCreationRequestsOrderedDrain {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-004, REQ-IOS-021
+    when: entry: queue/LocalQueueEntry.created
+
+    let persistence = ReviewOutboxPersistenceReceipt{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
+
+    requires: exists persistence
+    requires: persistence.persistence_revision > 0
+    requires: not exists ReviewOutboxInvalidationTombstone{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
+    requires: persistence.payload_fingerprint = message_payload_fingerprint(
+        entry.scope,
+        entry.local_id,
+        entry.text,
+        entry.images
+    )
+
+    ensures: DurableOrderedQueueDrainRequest.created(
+        persistence: persistence
+    )
 }
 
 rule PersistenceFencedOrderedDrainStartsEligibleEntries {
