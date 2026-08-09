@@ -128,8 +128,7 @@ pub enum EvictionReason {
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
-    /// A one-shot steering wake found no durable work, or a committed
-    /// `LlmRequesting` state needs the ordinary runtime reconstruction path.
+    /// A one-shot steering wake found no durable work and its idle runtime can retire.
     SteeringReconciliation,
 }
 
@@ -138,6 +137,7 @@ pub(crate) enum SteeringWakeOutcome {
     Applied,
     NothingToDrain,
     Conflict,
+    DispatchFailed,
 }
 
 #[derive(Debug)]
@@ -3631,38 +3631,26 @@ impl RuntimeManager {
             return Ok(SteeringWakeOutcome::NothingToDrain);
         }
 
-        if let Err(error) = self
-            .send_event(conversation_id, Event::SteeringQueueChanged)
-            .await
-        {
-            let conversation = self
-                .db
-                .get_conversation(conversation_id)
-                .await
-                .map_err(|db_error| db_error.to_string())?;
-            if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
-                self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
-                    .await;
-                self.get_or_create(conversation_id).await?;
-                return Ok(SteeringWakeOutcome::Applied);
-            }
-            return Err(error);
-        }
+        self.send_event(conversation_id, Event::SteeringQueueChanged)
+            .await?;
 
         let _projection_guard = self.lock_steering_projection(conversation_id).await;
         let state = self
             .effective_conversation_state(conversation_id)
             .await
             .ok_or_else(|| "steering wake lost its conversation state".to_string())?;
-        if state.is_busy() {
-            return Ok(SteeringWakeOutcome::Applied);
-        }
-        if self
+        let has_pending = self
             .db
             .has_steering_entries(conversation_id)
             .await
-            .map_err(|error| error.to_string())?
-        {
+            .map_err(|error| error.to_string())?;
+        if state.is_busy() {
+            return Ok(SteeringWakeOutcome::Applied);
+        }
+        if matches!(state, ConvState::Error { .. }) {
+            return Ok(SteeringWakeOutcome::DispatchFailed);
+        }
+        if has_pending {
             return Ok(SteeringWakeOutcome::Conflict);
         }
 
@@ -3932,7 +3920,23 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
-        if matches!(conv.state, ConvState::LlmRequesting { .. }) {
+        if matches!(conv.state, ConvState::LlmRequesting { .. })
+            && self
+                .db
+                .get_conversation_creation_job_for_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some_and(|job| {
+                    matches!(
+                        job.protocol.status,
+                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                                ..
+                            }
+                    )
+                })
+        {
             return Ok((conv.state, row_state_updated_at, false));
         }
 
@@ -4957,7 +4961,6 @@ mod scope_liveness_tests {
 
     struct RecordingLlm {
         requests: std::sync::atomic::AtomicUsize,
-        started: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -4968,7 +4971,6 @@ mod scope_liveness_tests {
         ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
             self.requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.started.notify_one();
             Ok(phoenix_llm::LlmResponse {
                 content: Vec::new(),
                 end_turn: true,
@@ -5122,18 +5124,26 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn committed_steering_dispatch_failure_reconstructs_one_llm_request() {
+    async fn committed_steering_dispatch_failure_persists_error_without_provider_request() {
         let llm = Arc::new(RecordingLlm {
             requests: std::sync::atomic::AtomicUsize::new(0),
-            started: tokio::sync::Notify::new(),
         });
         let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
-        let conversation_id = "steering-post-commit-recovery";
+        let conversation_id = "steering-post-commit-error";
         manager
             .db()
             .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
             .await
             .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_model_and_effort(
+                conversation_id,
+                "claude-sonnet-5",
+                Some(phoenix_core::domain::llm_types::ModelEffort::High),
+            )
+            .await
+            .expect("persist unsupported effort");
         manager
             .db()
             .append_steering_entry(
@@ -5152,57 +5162,17 @@ mod scope_liveness_tests {
             .await
             .expect("seed queue");
 
-        let mut acknowledged_event_rx =
-            insert_acknowledged_idle_handle(&manager, conversation_id).await;
-
-        let wake = {
-            let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.wake_deferred_steering(conversation_id).await })
-        };
-        let (event, acknowledgement) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            acknowledged_event_rx.recv(),
-        )
-        .await
-        .expect("wake reaches runtime in time")
-        .expect("wake reaches runtime");
-        assert!(matches!(event, Event::SteeringQueueChanged));
-
-        manager
-            .db()
-            .add_message(
-                "committed-steer",
-                conversation_id,
-                &crate::db::MessageContent::user("accepted once"),
-                None,
-                None,
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                manager.wake_deferred_steering(conversation_id),
             )
             .await
-            .expect("materialize accepted steer");
-        manager
-            .db()
-            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
-            .await
-            .expect("persist requesting state");
-        assert!(manager
-            .db()
-            .remove_steering_entry(conversation_id, "committed-steer")
-            .await
-            .expect("remove committed queue row"));
-        acknowledgement
-            .send(Err("injected post-commit dispatch failure".to_string()))
-            .expect("return dispatch failure");
-
-        assert_eq!(
-            wake.await
-                .expect("wake task joins")
-                .expect("ordinary recovery reconstructs runtime"),
-            SteeringWakeOutcome::Applied
+            .expect("wake settles")
+            .expect("dispatch failure is typed"),
+            SteeringWakeOutcome::DispatchFailed
         );
-        tokio::time::timeout(std::time::Duration::from_secs(10), llm.started.notified())
-            .await
-            .expect("recovered LLM request starts");
-        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(manager
             .db()
             .get_steering_queue(conversation_id)
@@ -5220,6 +5190,19 @@ mod scope_liveness_tests {
                 .count(),
             1
         );
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("conversation")
+                .state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(manager.try_get_handle(conversation_id).await.is_some());
     }
 
     #[tokio::test]

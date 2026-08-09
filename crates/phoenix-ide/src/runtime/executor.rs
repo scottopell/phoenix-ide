@@ -3414,7 +3414,10 @@ where
         } else {
             StartupSteeringDrainOutcome::ResumeLlm
         };
-        self.apply_transition_result(result).await?;
+        let generated_events = self.apply_transition_result(result).await?;
+        for generated_event in generated_events {
+            Box::pin(self.process_event(generated_event)).await?;
+        }
         drop(projection_guard);
         Ok(outcome)
     }
@@ -5355,20 +5358,22 @@ where
                 match self.dispatch_llm_request().await {
                     Ok(event) => Ok(event),
                     Err(error) => {
-                        self.recovery_disposition =
-                            RuntimeRecoveryDisposition::RecreateFromDatabase;
                         tracing::error!(
                             conversation_id = %self.context.conversation_id,
                             %error,
                             "Steering drain committed but LLM dispatch failed"
                         );
-                        let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
-                            sequence_id,
-                            error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                                "start the queued steering turn",
-                            ),
-                        });
-                        Err(error)
+                        let attempt = match self.state {
+                            ConvState::LlmRequesting { attempt } => attempt,
+                            _ => 1,
+                        };
+                        Ok(Some(Event::LlmError {
+                            message: error,
+                            error_kind: crate::db::ErrorKind::InvalidRequest,
+                            attempt,
+                            recovery_in_progress: false,
+                            resets_at: None,
+                        }))
                     }
                 }
             }
@@ -13142,7 +13147,7 @@ mod steer_drain_detector_tests {
     }
 
     #[tokio::test]
-    async fn post_commit_dispatch_failure_preserves_drain_and_requests_reconstruction() {
+    async fn post_commit_dispatch_failure_preserves_drain_and_persists_error() {
         let conversation_id = "conv-post-commit-dispatch-failure";
         let entry = mk_entry("accepted-steer", "accepted once");
         let (mut rt, storage) = build_runtime_with_state_and_queue(
@@ -13153,12 +13158,9 @@ mod steer_drain_detector_tests {
         rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
         rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
 
-        let error = rt
-            .process_event(Event::SteeringQueueChanged)
+        rt.process_event(Event::SteeringQueueChanged)
             .await
-            .expect_err("unsupported persisted effort fails before LLM task spawn");
-
-        assert!(error.contains("Persisted effort"));
+            .expect("dispatch failure becomes a reducer-owned error");
         assert_eq!(
             storage
                 .get_all_messages(conversation_id)
@@ -13174,12 +13176,18 @@ mod steer_drain_detector_tests {
                 .get_state(conversation_id)
                 .await
                 .expect("committed state"),
-            ConvState::LlmRequesting { attempt: 1 }
+            ConvState::Error {
+                message: "Persisted effort 'high' is not supported by model 'test-model'"
+                    .to_string(),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            }
         );
+        assert!(matches!(rt.state, ConvState::Error { .. }));
         assert!(rt.llm_task_handle.is_none());
         assert_eq!(
             rt.recovery_disposition,
-            RuntimeRecoveryDisposition::RecreateFromDatabase
+            RuntimeRecoveryDisposition::Continue
         );
     }
 

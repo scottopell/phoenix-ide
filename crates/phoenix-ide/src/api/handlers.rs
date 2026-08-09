@@ -4298,6 +4298,12 @@ async fn cancel_conversation(
                         ),
                     )));
                 }
+                Ok(crate::runtime::SteeringWakeOutcome::DispatchFailed) => {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Deferred steering committed, but its LLM request could not start",
+                        "steering_wake_dispatch_failed",
+                    ))));
+                }
                 Err(error) => {
                     return Err(AppError::Internal(format!(
                         "failed to wake steering queue: {error}"
