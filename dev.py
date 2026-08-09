@@ -1438,6 +1438,24 @@ def _dir_size_bytes(path: Path) -> int:
     return 0
 
 
+def _record_span_artifact_size(span, *, event_name: str, path: Path, attribute_prefix: str) -> dict:
+    """Measure a bounded artifact tree outside the timed span and annotate it."""
+    resolved = path.resolve()
+    exists = resolved.exists()
+    size_bytes = _dir_size_bytes(resolved) if exists else 0
+    attributes = {
+        f"{attribute_prefix}.path": _display_path(resolved),
+        f"{attribute_prefix}.exists": exists,
+        f"{attribute_prefix}.size_bytes": size_bytes,
+    }
+    if hasattr(span, "add_event"):
+        try:
+            span.add_event(event_name, attributes)
+        except Exception:
+            pass
+    return attributes
+
+
 def _registry_snapshot() -> list[tuple[str, int]]:
     """`(worktree_path, pid)` for every dev-server registry record, read before
     `reap_orphans` mutates the registry so DB pruning can still resolve hashes
@@ -1784,16 +1802,22 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         raise
     finally:
         finished_at = time.monotonic()
-        lock_wait = lock_timer.finish(finished_at)
-        _finish_dev_span(span, {
+        attributes = {
             "build.elapsed_seconds": max(0.0, finished_at - started_at),
-            "cargo.lock_wait_seconds": lock_wait,
+            "cargo.lock_wait_seconds": lock_timer.finish(finished_at),
             "process.exit_code": returncode,
-        }, failed=returncode != 0)
+        }
+        attributes.update(_record_span_artifact_size(
+            span,
+            event_name="build.artifact_size",
+            path=ROOT / "target",
+            attribute_prefix="build.artifact",
+        ))
+        _finish_dev_span(span, attributes, failed=returncode != 0)
 
 
-def build_rust(release: bool = True):
-    """Build the Rust backend."""
+def build_rust(release: bool = False):
+    """Build the Rust backend for local development by default."""
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
     # In dev mode Vite serves assets, so an empty dir is fine.
     (UI_DIR / "dist").mkdir(exist_ok=True)
@@ -2145,16 +2169,16 @@ def cmd_up(
     print(f"  Hash: {get_worktree_hash()}, Port offsets: Phoenix +{phoenix_offset}, Vite +{vite_offset}")
     print()
     
-    build_rust(release=True)
+    build_rust()
 
     # Seed before Phoenix starts so the seeder remains the only database writer.
-    # The release binary is already built, so seed can run its canonical
+    # The debug binary is already built, so seed can run its canonical
     # migrate-only path without rebuilding.
     if not no_seed:
-        cmd_seed(quiet_if_populated=True, build=False)
+        cmd_seed(quiet_if_populated=True, build=False, release=False)
         print()
 
-    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    phoenix_tls = start_phoenix(port=phoenix_port, release=False, tls=tls)
     vite_tls = start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
     api_scheme = "https" if phoenix_tls else "http"
     ui_scheme = "https" if vite_tls else "http"
@@ -2240,10 +2264,10 @@ def _title_from_slug(slug: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
 
 
-def _migrate_seed_database(*, build: bool) -> None:
+def _migrate_seed_database(*, build: bool, release: bool) -> None:
     if build:
-        build_rust(release=True)
-    binary = ROOT / "target" / "release" / "phoenix_ide"
+        build_rust(release=release)
+    binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
     env = os.environ.copy()
@@ -2256,7 +2280,9 @@ def _migrate_seed_database(*, build: bool) -> None:
     )
 
 
-def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
+def cmd_seed(
+    quiet_if_populated: bool = False, *, build: bool = True, release: bool = False
+) -> None:
     """Populate the dev DB with representative conversations.
 
     Runs offline after the Phoenix binary applies the canonical Rust migration
@@ -3123,7 +3149,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
     direct_mode = {"mode": "Direct"}
     explore_mode = {"mode": "Explore"}
 
-    _migrate_seed_database(build=build)
+    _migrate_seed_database(build=build, release=release)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -3605,10 +3631,10 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
         phoenix_port, _ = select_dev_ports(phoenix_port, vite_port)
     vite_was_running = vite_pid is not None
 
-    build_rust(release=True)
+    build_rust()
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
-    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    phoenix_tls = start_phoenix(port=phoenix_port, release=False, tls=tls)
     api_scheme = "https" if phoenix_tls else "http"
 
     if vite_was_running:
@@ -4704,6 +4730,10 @@ def _cargo_check_active(active: set[str]) -> bool:
     return bool(active & _CARGO_CHECK_LANES)
 
 
+def _verification_cargo_env() -> dict[str, str]:
+    return {"CARGO_INCREMENTAL": "0"}
+
+
 def _finish_check_step_span(
     span,
     *,
@@ -4725,6 +4755,17 @@ def _finish_check_step_span(
     elif _CHECK_PROFILE is not None:
         attributes.update({"cpu.provenance": "unavailable"})
     _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
+
+
+def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
+    if not name.startswith("cargo "):
+        return None
+    target_dir = env.get("CARGO_TARGET_DIR")
+    if target_dir:
+        return Path(target_dir)
+    if lane == "rust":
+        return ROOT / "target"
+    return None
 
 
 def cmd_check(
@@ -4965,13 +5006,22 @@ def cmd_check(
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
         )
+        artifact_attributes = {}
+        artifact_dir = _check_step_artifact_dir(lane, name, env)
+        if artifact_dir is not None:
+            artifact_attributes = _record_span_artifact_size(
+                span,
+                event_name="check.artifact_size",
+                path=artifact_dir,
+                attribute_prefix="check.artifact",
+            )
         _finish_check_step_span(
             span,
             elapsed=elapsed,
             timed_out=timed_out,
             lock_wait=lock_wait,
             returncode=rc,
-            cpu_attributes=cpu_attributes,
+            cpu_attributes=(cpu_attributes or {}) | artifact_attributes,
             end_time=finished_wall_ns,
         )
         if profile_work and _CHECK_PROFILE is not None:

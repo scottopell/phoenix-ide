@@ -20,7 +20,11 @@ def load_devpy():
 
 
 class FakeSpan:
-    pass
+    def __init__(self):
+        self.events = []
+
+    def add_event(self, name, attributes):
+        self.events.append((name, attributes))
 
 
 class FakeTracing:
@@ -447,17 +451,47 @@ class DevTracingTests(unittest.TestCase):
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
             mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(self.dev, "_dir_size_bytes", return_value=4096) as dir_size,
             mock.patch("builtins.print"),
         ):
             self.dev._run_cargo_build(["cargo", "build", "--release"], ROOT, "release")
 
         self.assertEqual("dev.build", tracing.started[0][0])
         self.assertEqual({"build.profile": "release"}, tracing.started[0][1])
-        _, attributes, failed, _ = tracing.finished[0]
+        span, attributes, failed, _ = tracing.finished[0]
         self.assertFalse(failed)
         self.assertEqual(6.0, attributes["build.elapsed_seconds"])
         self.assertEqual(2.0, attributes["cargo.lock_wait_seconds"])
         self.assertEqual(0, attributes["process.exit_code"])
+        self.assertEqual(4096, attributes["build.artifact.size_bytes"])
+        self.assertTrue(attributes["build.artifact.exists"])
+        self.assertEqual("build.artifact_size", span.events[0][0])
+        self.assertEqual(4096, span.events[0][1]["build.artifact.size_bytes"])
+        dir_size.assert_called_once_with((ROOT / "target").resolve())
+
+    def test_record_span_artifact_size_returns_zero_when_directory_missing(self):
+        span = FakeSpan()
+
+        attributes = self.dev._record_span_artifact_size(
+            span,
+            event_name="check.artifact_size",
+            path=ROOT / "target" / "missing-dir-for-test",
+            attribute_prefix="check.artifact",
+        )
+
+        self.assertFalse(attributes["check.artifact.exists"])
+        self.assertEqual(0, attributes["check.artifact.size_bytes"])
+        self.assertEqual("check.artifact_size", span.events[0][0])
+
+    def test_check_step_artifact_dir_uses_cargo_target_dir_when_present(self):
+        self.assertEqual(
+            Path("/tmp/clippy-target"),
+            self.dev._check_step_artifact_dir(
+                "clippy", "cargo clippy", {"CARGO_TARGET_DIR": "/tmp/clippy-target"}
+            ),
+        )
+        self.assertEqual(ROOT / "target", self.dev._check_step_artifact_dir("rust", "cargo test", {}))
+        self.assertIsNone(self.dev._check_step_artifact_dir("ui", "eslint", {}))
 
     def test_cargo_build_interrupt_terminates_and_waits_for_child(self):
         class InterruptingStream:
@@ -475,6 +509,7 @@ class DevTracingTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="4\t/target\n")),
             mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0]),
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -491,6 +526,7 @@ class DevTracingTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="4\t/target\n")),
             mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0, 12.0]),
             mock.patch("builtins.print"),
         ):
@@ -512,6 +548,10 @@ class DevTracingTests(unittest.TestCase):
             timed_out=True,
             lock_wait=2.25,
             returncode=1,
+            cpu_attributes={
+                "check.artifact.size_bytes": 8192,
+                "check.artifact.exists": True,
+            },
             end_time=123_000_000,
         )
 
@@ -521,6 +561,8 @@ class DevTracingTests(unittest.TestCase):
             "check.timed_out": True,
             "cargo.lock_wait_seconds": 2.25,
             "process.exit_code": 1,
+            "check.artifact.size_bytes": 8192,
+            "check.artifact.exists": True,
         }, tracing.finished[0][1])
         self.assertTrue(tracing.finished[0][2])
         self.assertEqual(123_000_000, tracing.finished[0][3])
