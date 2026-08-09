@@ -8,7 +8,8 @@
 -- Includes: exact WorkScope, file, content-revision, and source-line binding;
 --           reader re-anchoring and discard; typed draft contributions that
 --           survive editing; attachments; submit-time revalidation with typed
---           failures; and disk-persistence acknowledgement.
+--           failures; disk-persistence acknowledgement; and acknowledged
+--           invalidation of rejected or deleted pending payloads.
 --
 -- Excludes: Markdown rendering, project-file transport, server execution, and
 --           local queue retry/reconciliation after durable enqueue (see
@@ -120,6 +121,13 @@ external entity IosProductConversation {
     live_message_target: WorkScopeIdentity?
 }
 
+-- Created whenever chat capability, live-target identity, or current file
+-- revision evidence changes for a conversation. Pending review persistence is
+-- revalidated immediately rather than waiting for another delivery trigger.
+external entity ReviewAuthorityEvidenceChange {
+    conversation: IosProductConversation
+}
+
 -- Positive evidence that the version-fenced disk writer durably stored the
 -- full visible outbox including the exact fingerprinted message payload. The
 -- ordinary queue entry is not created, and therefore cannot become sendable,
@@ -129,6 +137,23 @@ external entity ReviewOutboxPersistenceReceipt {
     local_id: String
     payload_fingerprint: String
     persistence_revision: Integer
+}
+
+-- Positive evidence that the version-fenced invalidation removed the payload
+-- and fenced every earlier or in-flight write for the same scoped local id.
+-- Only this receipt releases the durable retry tombstone.
+external entity ReviewOutboxInvalidationReceipt {
+    scope: queue/ConversationScope
+    local_id: String
+    invalidation_revision: Integer
+}
+
+-- Created when a retained tombstone is rehydrated after launch or its bounded
+-- local-storage retry delay expires. Deleted conversations therefore retain a
+-- retry path even though they no longer produce session delivery triggers.
+external entity ReviewOutboxInvalidationRetryDue {
+    scope: queue/ConversationScope
+    local_id: String
 }
 
 -- A complete user-selected replacement anchor set for one refreshed reader.
@@ -198,6 +223,15 @@ entity PersistencePendingReviewQueueEntry {
 
 entity PersistencePendingReviewRender {
     entry: PersistencePendingReviewQueueEntry
+}
+
+-- Durable, structurally non-sendable retry authority for removing one rejected
+-- or deleted payload. It survives draft and conversation-view cleanup until a
+-- ReviewOutboxInvalidationReceipt proves that no earlier write can recreate the
+-- payload.
+entity ReviewOutboxInvalidationTombstone {
+    scope: queue/ConversationScope
+    local_id: String
 }
 
 entity ReviewSubmissionBlock {
@@ -546,16 +580,46 @@ rule InvalidAuthorityStopsPendingPersistenceRetry {
 
     requires: failures != empty_list
 
-    ensures: ReviewOutboxPersistenceInvalidated(
-        scope: pending.scope,
-        local_id: pending.local_id
-    )
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: pending.scope,
+            local_id: pending.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
     ensures: ReviewSubmissionBlock.created(
         draft: pending.draft,
         failures: failures
     )
     ensures: not exists pending.render
     ensures: not exists pending
+}
+
+rule AuthorityChangeImmediatelyInvalidatesPendingPersistence {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: change: ReviewAuthorityEvidenceChange.created
+
+    ensures:
+        for pending in PersistencePendingReviewQueueEntries
+            where draft.conversation = change.conversation:
+            let failures = review_authority_failures(pending.draft)
+            if failures != empty_list:
+                let tombstone = ReviewOutboxInvalidationTombstone.created(
+                    scope: pending.scope,
+                    local_id: pending.local_id
+                )
+                ReviewOutboxPersistenceInvalidated(
+                    scope: tombstone.scope,
+                    local_id: tombstone.local_id
+                )
+                ReviewSubmissionBlock.created(
+                    draft: pending.draft,
+                    failures: failures
+                )
+                not exists pending.render
+                not exists pending
 }
 
 ------------------------------------------------------------
@@ -569,6 +633,37 @@ rule DeliveryTriggersRetryPendingReviewPersistence {
     for pending in PersistencePendingReviewQueueEntries
         where scope = trigger.session.scope:
         ensures: RetryReviewOutboxPersistence(pending: pending)
+
+    for tombstone in ReviewOutboxInvalidationTombstones
+        where scope = trigger.session.scope:
+        ensures: RetryReviewOutboxInvalidation(tombstone: tombstone)
+}
+
+rule PendingReviewInvalidationRetriesDiskRemoval {
+    -- REQ-IOS-004, REQ-IOS-021
+    when: RetryReviewOutboxInvalidation(tombstone)
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
+}
+
+rule RehydratedOrDueInvalidationRetriesDiskRemoval {
+    -- REQ-IOS-004, REQ-IOS-005, REQ-IOS-021
+    when: due: ReviewOutboxInvalidationRetryDue.created
+
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: due.scope,
+        local_id: due.local_id
+    }
+
+    requires: exists tombstone
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
 }
 
 rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
@@ -627,16 +722,36 @@ rule InvalidAuthorityRejectsPersistedReviewReceipt {
     requires: persistence.persistence_revision > 0
     requires: failures != empty_list
 
-    ensures: ReviewOutboxPersistenceInvalidated(
-        scope: persistence.scope,
-        local_id: persistence.local_id
-    )
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: persistence.scope,
+            local_id: persistence.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
     ensures: ReviewSubmissionBlock.created(
         draft: pending.draft,
         failures: failures
     )
     ensures: not exists pending.render
     ensures: not exists pending
+}
+
+rule DurableInvalidationReceiptReleasesRetryTombstone {
+    -- REQ-IOS-002, REQ-IOS-005, REQ-IOS-021
+    when: receipt: ReviewOutboxInvalidationReceipt.created
+
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: receipt.scope,
+        local_id: receipt.local_id
+    }
+
+    requires: exists tombstone
+    requires: receipt.invalidation_revision > 0
+
+    ensures: not exists tombstone
 }
 
 rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
@@ -680,9 +795,13 @@ rule TerminalDeletionClearsReviewDraftState {
             where conversation.queue_scope = trigger.session.scope:
             for pending in PersistencePendingReviewQueueEntries
                 where draft = composer:
-                ReviewOutboxPersistenceInvalidated(
+                let tombstone = ReviewOutboxInvalidationTombstone.created(
                     scope: pending.scope,
                     local_id: pending.local_id
+                )
+                ReviewOutboxPersistenceInvalidated(
+                    scope: tombstone.scope,
+                    local_id: tombstone.local_id
                 )
                 not exists pending.render
                 not exists pending
@@ -693,6 +812,12 @@ rule TerminalDeletionClearsReviewDraftState {
             if exists composer.submission_block:
                 not exists composer.submission_block
             not exists composer
+        for tombstone in ReviewOutboxInvalidationTombstones
+            where scope = trigger.session.scope:
+            ReviewOutboxPersistenceInvalidated(
+                scope: tombstone.scope,
+                local_id: tombstone.local_id
+            )
 }
 
 ------------------------------------------------------------
@@ -715,4 +840,22 @@ invariant PlainAndReviewPositionsDoNotOverlap {
     for plain in PlainDraftSegments:
         for review in ProseReviewAuthorities:
             plain.draft = review.draft implies plain.position != review.position
+}
+
+invariant ReviewInvalidationTombstonesAreUniquePerPayload {
+    for a in ReviewOutboxInvalidationTombstones:
+        for b in ReviewOutboxInvalidationTombstones:
+            a != b implies a.scope != b.scope or a.local_id != b.local_id
+}
+
+invariant InvalidatingPayloadsCannotBePendingOrSendable {
+    for tombstone in ReviewOutboxInvalidationTombstones:
+        not exists PersistencePendingReviewQueueEntry{
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        }
+        and not exists queue/LocalQueueEntry{
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        }
 }

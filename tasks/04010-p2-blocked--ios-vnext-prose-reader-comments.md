@@ -27,10 +27,11 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - The ordinary queue entry cannot become sendable until persistence evidence exists; a cleared composer is reinitialized with an editable empty plain segment.
 - Persistence-pending review messages remain optimistically visible, structurally non-sendable, and retryable on later delivery triggers.
 - Connectivity, valid init, foreground, and turn-completion triggers retry pending persistence; every retry and receipt conversion revalidates review authority.
-- Invalid authority during persistence unlocks the draft with typed failures and invalidates any durable pending payload.
+- Authority-evidence changes immediately revalidate pending persistence; invalid authority unlocks the draft with typed failures without waiting for another delivery trigger.
+- Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; ordinary delivery begins immediately after valid persistence succeeds.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
-- Hard-delete/not-found cleanup removes drafts, pending renders, retry state, authority, and any durable pending review payload.
+- Hard-delete/not-found cleanup removes drafts, pending renders, and authority while retaining an acknowledged-removal tombstone until every durable pending review payload is fenced out.
 - The leaf queue separates reader fidelity from session-scoped note composition.
 
 ## Out of scope

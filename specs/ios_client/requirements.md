@@ -729,16 +729,24 @@ AND retry its version-fenced disk write when connectivity returns, a valid init
 arrives, the app enters the foreground, or an agent turn completes
 AND revalidate every attached review authority before each retry and again
 before converting a persistence receipt into a sendable ordinary queue entry
-
-WHEN authority becomes invalid while persistence is pending or in flight
-THE SYSTEM SHALL invalidate any resulting durable outbox payload
-AND remove the persistence-pending entry
-AND unlock the draft with typed submission failures so the user can repair or
-discard affected review contributions
 AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
 AND only then clear the submitted draft and its review authority
+AND immediately begin ordinary queue delivery when that conversion succeeds
+
+WHEN authority becomes invalid while persistence is pending or in flight
+THE SYSTEM SHALL detect the authority-evidence change without waiting for
+another delivery trigger or persistence receipt
+AND invalidate any resulting durable outbox payload
+AND remove the persistence-pending entry
+AND unlock the draft with typed submission failures so the user can repair or
+discard affected review contributions
+AND retain a durable, structurally non-sendable invalidation tombstone until a
+version-fenced receipt proves that the payload is removed and no earlier or
+in-flight write can recreate it
+AND retry that tombstone after bounded local-storage failures and when durable
+client state is rehydrated after launch
 
 WHEN any review authority binding fails submission-time revalidation
 THE SYSTEM SHALL block submission without clearing or changing the draft or its
@@ -756,6 +764,9 @@ THE SYSTEM SHALL invalidate every persistence-pending review payload for that
 conversation
 AND remove its pending render, composer draft, plain segments, review
 authorities, and submission failures
+AND retain and retry a durable, structurally non-sendable invalidation tombstone
+for each affected payload, including after app restart, until version-fenced
+removal is acknowledged
 AND SHALL NOT allow a later persistence receipt to recreate a queue entry
 
 WHEN the user attempts to close a reader with unsent notes

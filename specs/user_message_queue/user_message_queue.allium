@@ -111,15 +111,17 @@ rule EnqueueLocalMessage {
 
     requires: text != "" or images != empty_list
 
-    ensures: LocalQueueEntry.created(
-        scope: scope,
-        local_id: local_id,
-        text: text,
-        images: images,
-        status: pending,
-        accepted_by_server: false,
-        visible: true
-    )
+    ensures:
+        let entry = LocalQueueEntry.created(
+            scope: scope,
+            local_id: local_id,
+            text: text,
+            images: images,
+            status: pending,
+            accepted_by_server: false,
+            visible: true
+        )
+        SendPostStarted(entry: entry)
 
     @guidance
         -- Implementation: useMessageQueue.enqueue generates `localId`, stores
