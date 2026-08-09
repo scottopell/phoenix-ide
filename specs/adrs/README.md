@@ -40,7 +40,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [026](026_workscope-owned-lifecycle-unifies-conversation-handoffs.md) | Product conversation lifecycle is separate from WorkScope resource ownership | Accepted | REQ-BED-019, REQ-BED-028, REQ-BED-029, REQ-BED-030, REQ-PROJ-004, REQ-PROJ-015, REQ-PROJ-WS-001, REQ-WL-001, REQ-WL-002, REQ-PRA-000, REQ-CHN-008, REQ-GR-001 |
 | [027](027_write-capable-product-conversations-use-global-evidence.md) | Write-capable ProductConversations use bounded global evidence | Accepted | REQ-GR-004, REQ-GR-007, REQ-GR-012 |
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
-| [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Accepted | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
+| [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
+| [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
 
 ## For agents: which decisions bind your task
 
@@ -71,7 +72,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
-| Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 029, then 028 and 026 for the companion boundary, ProductConversation, and WorkScope ownership |
+| Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
 
 ## Decision dependencies
 
@@ -108,6 +109,7 @@ ADR-000 (adopt spEARS v2 for new work)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
           └── ADR-028 (iOS companion adds read-only project context and prose review)
               └── ADR-029 (iOS companion uses session-scoped prose feedback)
+                  └── ADR-030 (iOS prose-review authority survives the composer handoff)
 ```
 
 ## Conventions

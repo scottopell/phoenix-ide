@@ -1,0 +1,352 @@
+-- allium: 3
+-- ios_prose_feedback.allium
+--
+-- Scope: The iOS prose-review handoff from session-scoped reader notes to an
+--        editable conversation draft and then to the durable local message
+--        queue.
+--
+-- Includes: exact WorkScope, file, and content-revision bindings; typed draft
+--           authority that survives editing; submit-time revalidation; safe
+--           refresh/re-anchoring; and explicit removal of a review
+--           contribution.
+--
+-- Excludes: Markdown rendering, project-file transport, server execution, and
+--           local queue retry/reconciliation after durable enqueue (see
+--           ../user_message_queue/user_message_queue.allium).
+
+use "../user_message_queue/user_message_queue.allium" as queue
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- current_content_revision(conversation, work_scope, file) -> ContentRevision?
+--   Returns the server-observed revision for the exact file in the exact
+--   attached WorkScope, or null when that content cannot be established as
+--   current.
+-- format_review_notes(file, notes) -> String
+--   Produces the REQ-PF-009 message contribution using the absolute file path,
+--   source line, exact raw line content, and note text.
+-- new_review_contribution_identity() -> ReviewContributionIdentity
+--   Produces a fresh identity for one formatted review contribution in a
+--   composer draft.
+-- append_review_contribution(text, contribution, formatted_notes) -> String
+--   Appends the formatted review contribution to editable draft text while
+--   retaining its typed contribution identity.
+-- replace_review_contribution(text, contribution, formatted_notes) -> String
+--   Atomically replaces the contribution associated with the identity while
+--   preserving unrelated draft text.
+-- remove_review_contribution(text, contribution) -> String
+--   Removes the contribution associated with the identity while preserving
+--   unrelated draft text.
+-- new_local_message_id(draft) -> String
+--   Produces the idempotency identity used by the ordinary local message queue.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value WorkScopeIdentity {
+    stable_key: String
+}
+
+value ProjectFileIdentity {
+    absolute_path: String
+}
+
+value ContentRevision {
+    token: String
+}
+
+value ReviewContributionIdentity {
+    token: String
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The client-facing projection of one ProductConversation aggregate.
+external entity IosProductConversation {
+    queue_scope: queue/ConversationScope
+    chat_capable: Boolean
+    live_message_target: WorkScopeIdentity?
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ProseReviewSession {
+    conversation: IosProductConversation
+    work_scope: WorkScopeIdentity
+    file: ProjectFileIdentity
+    content_revision: ContentRevision
+
+    notes: ProseReviewNote with session = this
+}
+
+entity ProseReviewNote {
+    session: ProseReviewSession
+    source_line: Integer
+    raw_line_content: String
+    note_text: String
+}
+
+entity ComposerDraft {
+    conversation: IosProductConversation
+    text: String
+
+    review_authorities: ProseReviewAuthority with draft = this
+    pending_enqueue: PendingReviewDraftEnqueue with draft = this
+}
+
+entity ProseReviewAuthority {
+    draft: ComposerDraft
+    contribution: ReviewContributionIdentity
+    work_scope: WorkScopeIdentity
+    file: ProjectFileIdentity
+    content_revision: ContentRevision
+}
+
+entity PendingReviewDraftEnqueue {
+    draft: ComposerDraft
+    scope: queue/ConversationScope
+    local_id: String
+}
+
+------------------------------------------------------------
+-- Rules -- reader session
+------------------------------------------------------------
+
+rule OpenEligibleProseReviewSession {
+    -- REQ-IOS-021
+    when: UserOpensProseReview(
+        conversation,
+        work_scope,
+        file,
+        content_revision
+    )
+
+    requires: conversation.chat_capable
+    requires: conversation.live_message_target = work_scope
+    requires:
+        current_content_revision(conversation, work_scope, file)
+        = content_revision
+    requires: not exists ProseReviewSession{
+        conversation: conversation,
+        work_scope: work_scope,
+        file: file
+    }
+
+    ensures: ProseReviewSession.created(
+        conversation: conversation,
+        work_scope: work_scope,
+        file: file,
+        content_revision: content_revision
+    )
+}
+
+rule AddEligibleProseReviewNote {
+    -- REQ-IOS-021
+    when: UserAddsProseReviewNote(
+        session,
+        source_line,
+        raw_line_content,
+        note_text
+    )
+
+    requires: note_text != ""
+    requires: session.conversation.chat_capable
+    requires: session.conversation.live_message_target = session.work_scope
+    requires:
+        current_content_revision(
+            session.conversation,
+            session.work_scope,
+            session.file
+        ) = session.content_revision
+
+    ensures: ProseReviewNote.created(
+        session: session,
+        source_line: source_line,
+        raw_line_content: raw_line_content,
+        note_text: note_text
+    )
+}
+
+------------------------------------------------------------
+-- Rules -- editable composer handoff
+------------------------------------------------------------
+
+rule EligibleNotesBecomeReviewBoundDraftText {
+    -- REQ-IOS-021, REQ-PF-009
+    when: UserSendsProseReviewToComposer(session, draft)
+
+    let contribution = new_review_contribution_identity()
+    let formatted_notes = format_review_notes(session.file, session.notes)
+
+    requires: draft.conversation = session.conversation
+    requires: session.notes.count > 0
+    requires: not exists draft.pending_enqueue
+    requires: session.conversation.chat_capable
+    requires: session.conversation.live_message_target = session.work_scope
+    requires:
+        current_content_revision(
+            session.conversation,
+            session.work_scope,
+            session.file
+        ) = session.content_revision
+
+    ensures: draft.text = append_review_contribution(
+        draft.text,
+        contribution,
+        formatted_notes
+    )
+    ensures: ProseReviewAuthority.created(
+        draft: draft,
+        contribution: contribution,
+        work_scope: session.work_scope,
+        file: session.file,
+        content_revision: session.content_revision
+    )
+    ensures:
+        for note in session.notes:
+            not exists note
+        not exists session
+}
+
+rule EditingDraftPreservesReviewAuthority {
+    -- REQ-IOS-021
+    when: UserEditsComposerDraft(draft, edited_text)
+
+    requires: not exists draft.pending_enqueue
+
+    ensures: draft.text = edited_text
+}
+
+rule RefreshedNotesReplaceBoundDraftContribution {
+    -- REQ-IOS-021
+    when: UserReanchorsDraftReview(authority, refreshed_session)
+
+    let formatted_notes = format_review_notes(
+        refreshed_session.file,
+        refreshed_session.notes
+    )
+
+    requires:
+        authority.draft.conversation = refreshed_session.conversation
+    requires: refreshed_session.notes.count > 0
+    requires: not exists authority.draft.pending_enqueue
+    requires: refreshed_session.conversation.chat_capable
+    requires:
+        refreshed_session.conversation.live_message_target
+        = refreshed_session.work_scope
+    requires:
+        current_content_revision(
+            refreshed_session.conversation,
+            refreshed_session.work_scope,
+            refreshed_session.file
+        ) = refreshed_session.content_revision
+
+    ensures: authority.draft.text = replace_review_contribution(
+        authority.draft.text,
+        authority.contribution,
+        formatted_notes
+    )
+    ensures: authority.work_scope = refreshed_session.work_scope
+    ensures: authority.file = refreshed_session.file
+    ensures: authority.content_revision = refreshed_session.content_revision
+    ensures:
+        for note in refreshed_session.notes:
+            not exists note
+        not exists refreshed_session
+}
+
+rule UserDiscardsBoundReviewContribution {
+    -- REQ-IOS-021
+    when: UserDiscardsDraftReview(authority)
+
+    requires: not exists authority.draft.pending_enqueue
+
+    ensures: authority.draft.text = remove_review_contribution(
+        authority.draft.text,
+        authority.contribution
+    )
+    ensures: not exists authority
+}
+
+------------------------------------------------------------
+-- Rules -- actual message submission
+------------------------------------------------------------
+
+rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-021
+    when: UserSubmitsComposerDraft(draft)
+
+    let local_id = new_local_message_id(draft)
+
+    requires: draft.text != ""
+    requires: draft.review_authorities.count > 0
+    requires: not exists draft.pending_enqueue
+    requires: draft.conversation.chat_capable
+    requires:
+        draft.review_authorities.all(authority =>
+            draft.conversation.live_message_target = authority.work_scope
+            and current_content_revision(
+                draft.conversation,
+                authority.work_scope,
+                authority.file
+            ) = authority.content_revision
+        )
+
+    ensures: queue/UserSendsMessage(
+        draft.conversation.queue_scope,
+        local_id,
+        draft.text,
+        empty_list
+    )
+    ensures: PendingReviewDraftEnqueue.created(
+        draft: draft,
+        scope: draft.conversation.queue_scope,
+        local_id: local_id
+    )
+}
+
+rule DurableQueueAcceptanceClearsDraftReviewAuthority {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-021
+    when: entry: queue/LocalQueueEntry.created
+
+    let pending_enqueue = PendingReviewDraftEnqueue{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
+
+    requires: exists pending_enqueue
+    requires: entry.text = pending_enqueue.draft.text
+
+    ensures: pending_enqueue.draft.text = ""
+    ensures:
+        for authority in pending_enqueue.draft.review_authorities:
+            not exists authority
+        not exists pending_enqueue
+}
+
+rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
+    -- REQ-IOS-021
+    when: UserSubmitsComposerDraft(draft)
+
+    requires: draft.review_authorities.count > 0
+    requires: not exists draft.pending_enqueue
+    requires:
+        not draft.conversation.chat_capable
+        or draft.review_authorities.any(authority =>
+            draft.conversation.live_message_target != authority.work_scope
+            or current_content_revision(
+                draft.conversation,
+                authority.work_scope,
+                authority.file
+            ) != authority.content_revision
+        )
+
+    ensures: ReviewBoundDraftSubmissionBlocked(draft: draft)
+}

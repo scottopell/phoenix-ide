@@ -689,8 +689,30 @@ eligible scope and current revision, or explicitly discards it
 WHEN the user chooses Send for one or more eligible notes
 THE SYSTEM SHALL format and inject them into the conversation's editable message
 input according to `REQ-PF-009`
+AND attach typed review authority to that draft for each injected note bundle,
+carrying the exact `WorkScope`, file identity, content revision, and draft
+contribution identity
 AND clear the notes and close the reader
 AND SHALL NOT deliver the notes independently of that message input
+
+WHILE the user edits a draft with attached review authority
+THE SYSTEM SHALL preserve every authority binding regardless of changes to the
+visible draft text
+
+WHEN the user submits a draft with attached review authority
+THE SYSTEM SHALL revalidate ordinary chat capability, the exact live message
+target, and the current content revision for every authority binding
+AND, when every binding remains valid, enqueue the exact editable draft through
+the ordinary durable message queue according to `REQ-IOS-002` and `REQ-IOS-003`
+AND clear the draft's review authority only after that queue has durably accepted
+the message
+
+WHEN any review authority binding fails submission-time revalidation
+THE SYSTEM SHALL block submission without clearing or changing the draft or its
+review authority
+AND explain which authority is no longer valid
+AND allow the user to refresh and re-anchor that review contribution or
+explicitly discard that contribution while preserving unrelated draft text
 
 WHEN the user attempts to close a reader with unsent notes
 THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`
@@ -702,6 +724,7 @@ according to `REQ-PF-011`
 
 **Rationale:** Session-scoped notes protect against accidental loss while the
 reader is open, then become an editable conversation draft so the user can add
-context before relying on the ordinary message-delivery contract. Live-target
-and revision binding prevent feedback from silently referring to an inaccessible
-scope or different file contents.
+context before relying on the ordinary message-delivery contract. Typed draft
+authority closes the handoff gap: text edits cannot silently erase the scope and
+revision checks that make the feedback trustworthy. The precise lifecycle is
+specified in `ios_prose_feedback.allium`.

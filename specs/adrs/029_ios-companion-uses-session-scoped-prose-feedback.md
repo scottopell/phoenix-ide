@@ -1,6 +1,6 @@
 # ADR-029: The iOS companion uses session-scoped prose feedback
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-030
 - **Date:** 2026-08-09
 - **Affects:** REQ-IOS-019, REQ-IOS-020, REQ-IOS-021
 
@@ -57,6 +57,7 @@ its bounded read-only project-context and prose-reader scope.
 
 - ADR-028, superseded by this decision.
 - ADR-026, for ProductConversation lifecycle and WorkScope ownership boundaries.
+- ADR-030 supersedes this decision's handoff-only authority boundary.
 - `specs/ios_client/requirements.md`
 - `specs/prose-feedback/requirements.md`, especially REQ-PF-009 through REQ-PF-011.
 - `specs/work-lifecycle/requirements.md`, especially REQ-WL-002 and REQ-WL-002b.

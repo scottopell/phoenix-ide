@@ -53,7 +53,7 @@ on-device build and an airplane-mode queue/drain test pass.
 | REQ-IOS-018 advisory nudges | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
 | REQ-IOS-019 grounding/files | Not started; blocked by ProductConversation migration (`tasks/04009-p2-blocked--ios-vnext-grounding-files.md`) |
 | REQ-IOS-020 prose reader | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
-| REQ-IOS-021 prose comments | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
+| REQ-IOS-021 prose comments | Lifecycle specified in `ios_prose_feedback.allium`; implementation planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
 
 ## Planned iOS vNext Program
 
