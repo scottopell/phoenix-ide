@@ -362,70 +362,74 @@ async fn dom_eval_regressions_share_one_browser_fixture() {
     .await;
 
     let (ctx, manager) = test_context("test-dom-eval-regressions");
-    let nav_result = BrowserNavigateTool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-    assert!(
-        nav_result.is_success(),
-        "fixture navigation failed: {}",
-        nav_result.output()
-    );
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav_result = BrowserNavigateTool
+            .run(json!({"url": url}), ctx.clone())
+            .await;
+        assert!(
+            nav_result.is_success(),
+            "fixture navigation failed: {}",
+            nav_result.output()
+        );
 
-    let eval_tool = BrowserEvalTool;
+        let eval_tool = BrowserEvalTool;
 
-    let inner_text = eval_tool
-        .run(
-            json!({"expression": "document.body.innerText"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        inner_text.is_success(),
-        "innerText eval failed: {}",
-        inner_text.output()
-    );
-    assert!(
-        !inner_text.output().contains("undefined")
-            && inner_text.output().contains("Hello from innerText"),
-        "innerText regression: {}",
-        inner_text.output()
-    );
+        let inner_text = eval_tool
+            .run(
+                json!({"expression": "document.body.innerText"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_text.is_success(),
+            "innerText eval failed: {}",
+            inner_text.output()
+        );
+        assert!(
+            !inner_text.output().contains("undefined")
+                && inner_text.output().contains("Hello from innerText"),
+            "innerText regression: {}",
+            inner_text.output()
+        );
 
-    let inner_html = eval_tool
-        .run(
-            json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        inner_html.is_success(),
-        "innerHTML.slice eval failed: {}",
-        inner_html.output()
-    );
-    assert!(
-        !inner_html.output().contains("undefined") && inner_html.output().contains("content"),
-        "innerHTML.slice regression: {}",
-        inner_html.output()
-    );
+        let inner_html = eval_tool
+            .run(
+                json!({"expression": "document.body.innerHTML.slice(0, 200)"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            inner_html.is_success(),
+            "innerHTML.slice eval failed: {}",
+            inner_html.output()
+        );
+        assert!(
+            !inner_html.output().contains("undefined") && inner_html.output().contains("content"),
+            "innerHTML.slice regression: {}",
+            inner_html.output()
+        );
 
-    let json_dom = eval_tool
-        .run(
-            json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        json_dom.is_success(),
-        "JSON.stringify DOM eval failed: {}",
-        json_dom.output()
-    );
-    assert!(
-        !json_dom.output().contains("undefined") && json_dom.output().contains("bodyText"),
-        "JSON.stringify DOM regression: {}",
-        json_dom.output()
-    );
-
+        let json_dom = eval_tool
+            .run(
+                json!({"expression": "JSON.stringify({bodyText: document.body.innerText})"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(
+            json_dom.is_success(),
+            "JSON.stringify DOM eval failed: {}",
+            json_dom.output()
+        );
+        assert!(
+            !json_dom.output().contains("undefined") && json_dom.output().contains("bodyText"),
+            "JSON.stringify DOM regression: {}",
+            json_dom.output()
+        );
+    })
+    .await;
     shutdown_test(manager, server).await;
+    outcome.expect("DOM eval regression scenario");
 }
 
 #[tokio::test]
