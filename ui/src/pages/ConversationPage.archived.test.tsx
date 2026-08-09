@@ -98,6 +98,10 @@ function useConnectedConnection(options: ConnectionOptions) {
   return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
 }
 
+function useManuallyDrivenConnection() {
+  return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
+}
+
 const hooksMockState = vi.hoisted(() => ({
   useConnection: vi.fn(),
 }));
@@ -1187,6 +1191,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('keeps cached history provisional until authoritative SSE init replaces it', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const cachedConversation = makeConversation({ transcript_generation: 7 });
     const authoritativeMessage = {
       ...catchUpMessage,
@@ -1218,6 +1223,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('preserves lazy older-history availability across cursor reconnect', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const conversation = makeConversation();
     const { store } = renderPage(conversation);
     await screen.findByText('keep this history visible');
@@ -1247,6 +1253,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('loads older history lazily from REST after SSE reports tail coverage', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const newest = { ...catchUpMessage, sequence_id: 2 } as Message;
     vi.mocked(api.getConversation).mockResolvedValue({
       conversation: makeConversation(),
