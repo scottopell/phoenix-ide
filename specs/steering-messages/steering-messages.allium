@@ -484,9 +484,11 @@ surface SteeringQueueApi {
 
     @guarantee CancelledDirectTurnReleasesDeferredSteering
         -- Cancelling an unmaterialized direct turn while its conversation is
-        -- idle wakes the executor after durable cancellation. The executor
-        -- reloads queue authority and submits the exact durable batch to the
-        -- ordinary reducer-owned drain transaction.
+        -- idle checks for durable deferred steering, then awaits an executor
+        -- wake after durable cancellation. The executor reloads queue authority
+        -- and submits the exact durable batch to the ordinary reducer-owned
+        -- drain transaction. A failed wake is reported so an idempotent cancel
+        -- retry can attempt the same DB-derived repair.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one

@@ -4284,17 +4284,17 @@ async fn cancel_conversation(
                 no_op: false,
             }));
         }
-        if matches!(
-            cancelled_direct_turn,
-            Some(phoenix_workflow::Materialization::Unmaterialized)
-        ) && matches!(effective_state, ConvState::Idle)
+        if matches!(effective_state, ConvState::Idle)
+            && state
+                .runtime
+                .db()
+                .has_steering_entries(&id)
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?
         {
-            let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
-                AppError::Internal(format!("failed to wake steering queue: {error}"))
-            })?;
-            handle
-                .event_tx
-                .send(Event::SteeringQueueChanged)
+            state
+                .runtime
+                .send_event(&id, Event::SteeringQueueChanged)
                 .await
                 .map_err(|error| {
                     AppError::Internal(format!("failed to wake steering queue: {error}"))
@@ -11569,6 +11569,14 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("load active turn");
         assert!(active.is_none());
+        assert!(
+            state
+                .runtime
+                .try_get_handle("c-pending-turn")
+                .await
+                .is_none(),
+            "cancelling with no deferred steering must not create an idle runtime"
+        );
     }
 
     #[tokio::test]
@@ -11662,6 +11670,78 @@ pub(crate) mod hard_delete_cascade_tests {
         })
         .await
         .expect("deferred steering drains after cancellation");
+    }
+
+    #[tokio::test]
+    async fn retrying_cancel_repairs_failed_deferred_steering_wake() {
+        let state = make_test_state().await;
+        let conversation_id = "c-retry-cancel-wake";
+        state
+            .db
+            .create_conversation(conversation_id, "pending", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, conversation_id).await;
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "survive failed wake".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "retry-deferred-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        state
+            .db
+            .update_steering_queue(conversation_id, std::slice::from_ref(&entry))
+            .await
+            .expect("persist steering queue");
+
+        let first_cancellation = cancel_active_direct_turn(&state, conversation_id)
+            .await
+            .expect("commit direct-turn cancellation");
+        assert!(matches!(
+            first_cancellation,
+            Some(phoenix_workflow::Materialization::Unmaterialized)
+        ));
+        assert!(
+            state
+                .runtime
+                .try_get_handle(conversation_id)
+                .await
+                .is_none(),
+            "simulated first attempt stopped before waking a runtime"
+        );
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+                .await
+                .expect("idempotent cancel retry wakes deferred steering");
+
+        assert!(response.ok);
+        assert!(response.no_op, "the direct turn was already terminal");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let queue_empty = !state
+                    .db
+                    .has_steering_entries(conversation_id)
+                    .await
+                    .expect("check steering queue");
+                let message_persisted = state
+                    .db
+                    .get_messages(conversation_id)
+                    .await
+                    .expect("load messages")
+                    .iter()
+                    .any(|message| message.message_id == entry.message_id);
+                if queue_empty && message_persisted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel retry repairs deferred steering wake");
     }
 
     #[tokio::test]

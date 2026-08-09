@@ -5475,6 +5475,21 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Report whether a conversation has any durable pending steering work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn has_steering_entries(&self, conversation_id: &str) -> DbResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM steering_messages WHERE conversation_id = ?1)",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Load a conversation's pending steering queue (FIFO) from the normalized
     /// tables, rehydrating each entry's attachments and skill invocation.
     ///
