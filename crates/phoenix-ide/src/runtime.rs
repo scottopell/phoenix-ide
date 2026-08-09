@@ -140,6 +140,12 @@ pub(crate) enum SteeringWakeOutcome {
     DispatchFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcknowledgedEventOutcome {
+    Settled,
+    SteeringWake(SteeringWakeOutcome),
+}
+
 #[derive(Debug)]
 pub struct TaskApprovalHandoffRequest {
     pub parent_conversation_id: String,
@@ -341,8 +347,10 @@ enum BashLifecycleBridgeAction {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub acknowledged_event_tx:
-        mpsc::Sender<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -3605,6 +3613,16 @@ impl RuntimeManager {
         conversation_id: &str,
         event: Event,
     ) -> Result<(), String> {
+        self.send_acknowledged_event(conversation_id, event)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_acknowledged_event(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<AcknowledgedEventOutcome, String> {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -3622,6 +3640,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<SteeringWakeOutcome, String> {
+        let _acceptance_guard = self.lock_message_acceptance(conversation_id).await;
         if !self
             .db
             .has_steering_entries(conversation_id)
@@ -3631,32 +3650,17 @@ impl RuntimeManager {
             return Ok(SteeringWakeOutcome::NothingToDrain);
         }
 
-        self.send_event(conversation_id, Event::SteeringQueueChanged)
-            .await?;
-
-        let _projection_guard = self.lock_steering_projection(conversation_id).await;
-        let state = self
-            .effective_conversation_state(conversation_id)
-            .await
-            .ok_or_else(|| "steering wake lost its conversation state".to_string())?;
-        let has_pending = self
-            .db
-            .has_steering_entries(conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if state.is_busy() {
-            return Ok(SteeringWakeOutcome::Applied);
+        let AcknowledgedEventOutcome::SteeringWake(outcome) = self
+            .send_acknowledged_event(conversation_id, Event::SteeringQueueChanged)
+            .await?
+        else {
+            return Err("steering wake received a non-steering acknowledgement".to_string());
+        };
+        if outcome == SteeringWakeOutcome::NothingToDrain {
+            self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+                .await;
         }
-        if matches!(state, ConvState::Error { .. }) {
-            return Ok(SteeringWakeOutcome::DispatchFailed);
-        }
-        if has_pending {
-            return Ok(SteeringWakeOutcome::Conflict);
-        }
-
-        self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
-            .await;
-        Ok(SteeringWakeOutcome::NothingToDrain)
+        Ok(outcome)
     }
 
     pub async fn send_event_and_wait_for_state(
@@ -3676,6 +3680,7 @@ impl RuntimeManager {
         ack_rx
             .await
             .map_err(|_| "runtime stopped before event settled".to_string())?
+            .map(|_| ())
     }
 
     pub async fn admit_continuation_retry(
@@ -3707,6 +3712,7 @@ impl RuntimeManager {
         ack_rx
             .await
             .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?
+            .map(|_| ())
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -4987,6 +4993,24 @@ mod scope_liveness_tests {
         requests: std::sync::atomic::AtomicUsize,
     }
 
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for FailingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Err(phoenix_llm::LlmError::invalid_request(
+                "unrelated direct dispatch failed",
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
     #[async_trait::async_trait]
     impl phoenix_llm::LlmService for RecordingLlm {
         async fn complete(
@@ -5021,10 +5045,26 @@ mod scope_liveness_tests {
         )
     }
 
+    async fn test_manager_with_failing_llm() -> RuntimeManager {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(FailingLlm))),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        )
+    }
+
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)> {
+    ) -> mpsc::Receiver<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -5227,6 +5267,96 @@ mod scope_liveness_tests {
             }
         ));
         assert!(manager.try_get_handle(conversation_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn steering_wake_does_not_claim_an_unrelated_dispatch_failure() {
+        let manager = Arc::new(test_manager_with_failing_llm().await);
+        let conversation_id = "steering-unrelated-dispatch-error";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .get_or_create(conversation_id)
+            .await
+            .expect("start idle runtime");
+        manager
+            .send_event(
+                conversation_id,
+                Event::UserCancel {
+                    reason: Some("startup readiness fence".to_string()),
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                },
+            )
+            .await
+            .expect("wait for runtime startup");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "still pending".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "pending-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "pending-steer-fingerprint",
+            )
+            .await
+            .expect("seed queue after runtime startup");
+
+        manager
+            .send_event(
+                conversation_id,
+                Event::UserMessage {
+                    text: "unrelated direct turn".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "unrelated-direct".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .expect("settle unrelated dispatch failure");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    manager.effective_conversation_state(conversation_id).await,
+                    Some(ConvState::Error { .. })
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unrelated provider failure reaches Error");
+
+        assert_eq!(
+            manager
+                .wake_deferred_steering(conversation_id)
+                .await
+                .expect("wake acknowledgement"),
+            SteeringWakeOutcome::Conflict
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("pending queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending-steer"]
+        );
     }
 
     #[tokio::test]

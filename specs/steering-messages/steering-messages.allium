@@ -494,8 +494,13 @@ surface SteeringQueueApi {
         -- Applied reloads queue authority and submits the exact durable batch to
         -- the ordinary reducer-owned drain transaction. Conflict reports that
         -- durable queue work could not be reconciled with the current state.
+        -- The wake holds the conversation admission gate through the executor
+        -- acknowledgement that carries this settlement. A surviving durable row
+        -- yields Conflict even when an unrelated turn has entered Error, so
+        -- aggregate runtime state cannot impersonate a steering result.
         -- DispatchFailed reports that the batch committed but the LLM could not
-        -- start; the reducer-owned Error state is durable and visible.
+        -- start; the reducer-owned Error state is durable and visible, and the
+        -- exact drained rows are absent from the queue.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one

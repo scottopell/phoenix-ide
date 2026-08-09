@@ -15,8 +15,8 @@
 
 use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
-    SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
-    TaskApprovalHandoffRequest,
+    AcknowledgedEventOutcome, SseBroadcaster, SseEvent, SteeringWakeOutcome, SubAgentCancelRequest,
+    SubAgentSpawnRequest, TaskApprovalHandoffData, TaskApprovalHandoffRequest,
 };
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
@@ -1728,8 +1728,10 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx:
-        mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    acknowledged_event_rx: mpsc::Receiver<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -2126,7 +2128,10 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        receiver: mpsc::Receiver<(
+            Event,
+            tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+        )>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
         self
@@ -2306,7 +2311,7 @@ where
 
             tokio::select! {
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
-                    let result = self.process_event(event).await;
+                    let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
@@ -2730,6 +2735,41 @@ where
             presentation_mode: self.state.presentation_mode().to_string(),
         });
         self.execute_effect(Effect::RequestLlm).await.map(|_| ())
+    }
+
+    async fn process_acknowledged_event(
+        &mut self,
+        event: Event,
+    ) -> Result<AcknowledgedEventOutcome, String> {
+        if !matches!(&event, Event::SteeringQueueChanged) {
+            self.process_event(event).await?;
+            return Ok(AcknowledgedEventOutcome::Settled);
+        }
+
+        if self.context.is_sub_agent {
+            return Ok(AcknowledgedEventOutcome::SteeringWake(
+                SteeringWakeOutcome::Conflict,
+            ));
+        }
+
+        if matches!(self.state, ConvState::Idle) {
+            self.process_event(Event::SteeringQueueChanged).await?;
+        }
+        let has_pending = !self
+            .storage
+            .load_steering_entries(&self.context.conversation_id)
+            .await?
+            .is_empty();
+        let outcome = if has_pending {
+            SteeringWakeOutcome::Conflict
+        } else if matches!(self.state, ConvState::LlmRequesting { .. }) {
+            SteeringWakeOutcome::Applied
+        } else if matches!(self.state, ConvState::Error { .. }) {
+            SteeringWakeOutcome::DispatchFailed
+        } else {
+            SteeringWakeOutcome::NothingToDrain
+        };
+        Ok(AcknowledgedEventOutcome::SteeringWake(outcome))
     }
 
     #[allow(clippy::too_many_lines)]
