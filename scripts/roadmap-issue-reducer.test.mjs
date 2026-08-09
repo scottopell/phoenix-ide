@@ -106,11 +106,25 @@ test("schema bounds each update before it can poison future reductions", () => {
   assert.throws(() => validateUpdate(update({ section: "whatever" })), /unknown section/);
 });
 
-test("workstream count is bounded", () => {
+test("workstream overflow is deterministically omitted without wedging reduction", () => {
   const comments = Array.from({ length: 13 }, (_, index) =>
-    comment(index + 1, fenced(update({ workstream: `stream-${index}` }))),
+    comment(index + 1, fenced(update({ workstream: `stream-${index}`, order: index }))),
   );
-  assert.throws(() => updatesFromComments(comments), /at most 12/);
+  const result = updatesFromComments(comments);
+  assert.equal(result.length, 12);
+  assert.deepEqual(result.map(({ workstream }) => workstream), Array.from({ length: 12 }, (_, index) => `stream-${index}`));
+});
+
+test("evidence URL uses its dedicated 500-character limit", () => {
+  const longUrl = `https://example.test/${"x".repeat(470)}`;
+  assert.equal(validateUpdate(update({ evidence: [{ label: "long", url: longUrl }] })).evidence[0].url.length > 200, true);
+});
+
+test("context HTML is escaped inside details markup", () => {
+  const source = comment(1, fenced(update({ context: "</details><strong>escape me</strong>" })));
+  const body = renderRoadmap(updatesFromComments([source]), event("created", source));
+  assert.doesNotMatch(body, /> <\/details>/);
+  assert.match(body, /\\<\/details\\>/);
 });
 
 test("created and edited events rebuild the reducer-owned body", async () => {
@@ -163,10 +177,17 @@ test("deleted update rebuilds from remaining live comments", async () => {
     new Response(JSON.stringify({}), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => responses.shift();
+  const requests = [];
+  globalThis.fetch = async (_url, options = {}) => {
+    requests.push(options);
+    return responses.shift();
+  };
   try {
     const result = await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1 });
+    const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
+    assert.match(body, /Reduced after trusted agent comment deletion/);
+    assert.doesNotMatch(body, new RegExp(deleted.updated_at));
   } finally {
     globalThis.fetch = originalFetch;
   }

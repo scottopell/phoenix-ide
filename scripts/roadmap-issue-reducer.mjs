@@ -30,6 +30,15 @@ function requiredLine(value, field) {
   return trimmed;
 }
 
+function requiredUrl(value, field) {
+  if (typeof value !== "string" || value.trim() === "" || /[\r\n]/.test(value)) {
+    throw new Error(`${field} must be a non-empty single-line string`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length > 500) throw new Error(`${field} must be at most 500 characters`);
+  return trimmed;
+}
+
 function optionalText(value, field) {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value !== "string") throw new Error(`${field} must be a string`);
@@ -50,12 +59,11 @@ function validateEvidence(value) {
       throw new Error(`evidence[${index}] must be an object`);
     }
     const label = requiredLine(item.label, `evidence[${index}].label`);
-    const url = requiredLine(item.url, `evidence[${index}].url`);
+    const url = requiredUrl(item.url, `evidence[${index}].url`);
     const parsed = new URL(url);
     if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
       throw new Error(`evidence[${index}].url must use http or https`);
     }
-    if (url.length > 500) throw new Error(`evidence[${index}].url must be at most 500 characters`);
     return { label, url: parsed.toString() };
   });
 }
@@ -134,11 +142,7 @@ export function updatesFromComments(comments) {
     }
   }
 
-  if (latest.size > MAX_WORKSTREAMS) {
-    throw new Error(`roadmap supports at most ${MAX_WORKSTREAMS} current workstreams`);
-  }
-
-  return [...latest.values()].sort((left, right) => {
+  const orderedUpdates = [...latest.values()].sort((left, right) => {
     const sectionOrder =
       SECTION_ORDER.findIndex(([key]) => key === left.section) -
       SECTION_ORDER.findIndex(([key]) => key === right.section);
@@ -146,6 +150,10 @@ export function updatesFromComments(comments) {
     if (left.order !== right.order) return left.order - right.order;
     return left.workstream < right.workstream ? -1 : left.workstream > right.workstream ? 1 : 0;
   });
+  if (orderedUpdates.length > MAX_WORKSTREAMS) {
+    console.warn(`Roadmap has ${orderedUpdates.length} workstreams; projecting the first ${MAX_WORKSTREAMS} by explicit roadmap order`);
+  }
+  return orderedUpdates.slice(0, MAX_WORKSTREAMS);
 }
 
 function markdownText(value) {
@@ -158,7 +166,7 @@ function renderEvidence(evidence) {
 
 function renderContext(context) {
   if (!context) return "";
-  return `\n\nAgent context:\n\n${context.split("\n").map((line) => `> ${line}`).join("\n")}`;
+  return `\n\nAgent context:\n\n${context.split("\n").map((line) => `> ${markdownText(line)}`).join("\n")}`;
 }
 
 function renderUpdate(update, open) {
@@ -168,7 +176,10 @@ function renderUpdate(update, open) {
 }
 
 export function renderRoadmap(updates, event) {
-  const eventTime = event.comment.updated_at ?? event.comment.created_at;
+  const reductionLabel =
+    event.action === "deleted"
+      ? "_Reduced after trusted agent comment deletion_"
+      : `_Reduced after agent comment ${event.action} at ${event.comment.updated_at ?? event.comment.created_at}_`;
   const lines = [
     "# Phoenix delivery roadmap",
     "",
@@ -178,7 +189,7 @@ export function renderRoadmap(updates, event) {
     "",
     "## Current roadmap",
     "",
-    `_Reduced after agent comment ${event.action} at ${eventTime}_`,
+    reductionLabel,
   ];
 
   for (const [section, heading] of SECTION_ORDER) {
