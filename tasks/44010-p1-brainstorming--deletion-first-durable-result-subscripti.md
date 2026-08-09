@@ -2,197 +2,296 @@
 
 ## Status
 
-Design snapshot only. Not approved for implementation. Expected to evolve through review.
+Brainstorming only. No production implementation is approved.
 
-PR #621 and its adapter stack were closed after the investigation showed that both the legacy wake system and the proposed wake-contract foundation create competing wake-specific authorities. Closing those PRs does not approve this replacement plan.
+This task replaces its original design snapshot. The earlier proposal to delete durable direct-turn authority and replace it with a new conversation-input admission model is superseded by the P0 ProductConversation direction. Existing durable direct-turn authority remains part of the execution model.
 
-## Product contract under review
+GitHub Project coordination item: **Wake redesign — explicit durable-result subscriptions** in [Phoenix Product Delivery](https://github.com/users/scottopell/projects/1).
 
-Preserve only:
+## Goal
 
-- Enrollment is explicit through one tagged `wait_until`; ordinary resource creation never enrolls.
-- Bash, TmuxWindow, and Subagent can produce typed terminal results without agent polling.
-- One explicit wait produces one correlated durable result.
-- A busy conversation stores the result without starting a competing turn.
-- Cancelling the wait suppresses automatic continuation but does not kill the underlying resource or discard its eventual result.
-- A Bash resource lost across Phoenix restart produces a typed restart-loss result.
-- A Phoenix-managed tmux window may survive restart and be re-observed.
-- Automatic continuation, if retained, uses only existing durable direct-turn/runtime admission.
+Delete the legacy wake-specific lifecycle while preserving these product journeys:
 
-Do not preserve deadlines, expiry, delivery-owner transfer, generic wake conditions, wake-specific admission, implicit enrollment, wake-specific UI lifecycle, or compatibility for unresolved legacy obligations unless later evidence proves one necessary.
+- waits are explicit; ordinary Bash, tmux, and subagent use never enrolls implicitly;
+- Bash, tmux, and subagent terminal results arrive without polling;
+- one explicit subscription produces one correlated durable result;
+- busy conversations remain safe;
+- cancellation suppresses automatic continuation without killing the resource;
+- Bash restart loss is typed;
+- tmux may survive Phoenix restart and be re-probed;
+- subagent result truth remains in the existing child/parent state machines;
+- any retained automatic continuation enters only through existing durable direct-turn/runtime admission;
+- ProductConversation Close can settle pending subscriptions through one typed operation.
 
-## Proposed single-authority map
+Optimize for the least production code and the fewest overlapping authorities.
 
-- Subscription intent and durable observation/delivery: existing generic workflow rows.
-- Bash terminal truth: `BashHandleRegistry` / `Handle`.
-- TmuxWindow terminal truth: `TmuxRegistry` plus the OS tmux process.
-- Subagent terminal truth: existing conversation/subagent state machine.
-- Correlated durable conversation message and exact replay: existing direct-turn materialization.
-- Busy behavior and optional continuation: existing conversation admission and durable direct-turn admission.
-- Transcript, SSE, and UI: derived projections only.
+## Governing design rule
 
-No wake-specific component may own resource lifecycle, conversation state, or runtime admission.
+Use the fewest authorities that still represent genuinely different facts. No two authorities may answer the same semantic question.
 
-## Options reviewed
+## Accepted authority map
 
-### A. Adapt the legacy wake system downward
+| Fact | Authority |
+|---|---|
+| ProductConversation identity and continuation membership | topology-derived root plus `continued_in_conv_id` |
+| Open/History lifecycle and whether new delivery is allowed | ProductConversation lifecycle and root-scoped Close authority |
+| Conversation execution meaning | existing conversation state machine and persisted `ConvState` |
+| Accepted turn identity and runtime ownership | existing durable direct-turn authority |
+| Resource ownership and retirement | WorkScope plus each resource owner's typed retirement operation |
+| Bash terminal truth | `BashHandleRegistry` / handle tombstone |
+| tmux terminal truth | tmux registry plus OS tmux |
+| Subagent terminal truth and parent fan-in | existing child and parent state machines |
+| Subscription observation, terminal result, and delivery disposition | reduced durable-result subscription mechanism designed by this task |
+| Transcript content | canonical persisted messages |
+| UI and SSE | post-commit projections only |
 
-Rejected as the likely end-state. It retains the legacy repository, worker, profile, recovery heuristics, and wake vocabulary while translating generic workflow facts into a second semantic system.
+ProductConversation owns the complete Close journey. Each subsystem owns one typed operation and its evidence.
 
-### B. Replace legacy wake with a smaller wake aggregate
+## ProductConversation integration contract
 
-Potentially correct, but rejected as a separate repository/authority. A tiny state description may remain useful for reasoning, but generic workflow attempts, observations, receipts, deliveries, and suppression already encode it.
+The ProductConversation owner accepted this contract for settlement PR 2:
 
-### C. Typed durable result subscriptions
+1. Committing the active root-scoped Close obligation closes admission for every new conversation delivery to that ProductConversation.
+2. Close admission and result delivery serialize at one durable transaction boundary. Commit order decides the race.
+3. ProductConversation exposes a typed delivery-admission decision derived from existing lifecycle authority, conceptually:
+   - `Open`
+   - `ClosedByClose(close_attempt_id)`
+   - `History`
+4. Wake must consume that typed decision. It must not interpret individual Close phases.
+5. A result suppressed during Close remains suppressed if Close is later cancelled.
+6. ProductConversation PR 2 owns cross-domain orchestration and acceptance tests.
+7. Wake owns one exact-ID, idempotent settlement operation and remains authoritative for its result and delivery evidence.
+8. WorkScope retirement—not subscription cancellation—stops or removes resources.
 
-Current recommendation. This is one fixed profile with a tagged target and tagged result, not a generic pub/sub or provider framework.
-
-Candidate target shape:
+### Race examples
 
 ```text
-WaitTarget:
-  Bash(handle)
-  TmuxWindow(server_token, window)
-  Subagent(conversation)
+Result delivery commits before Close
+  -> result is delivered into the transcript
+  -> Close preserves it
+
+Close commits before result delivery
+  -> terminal resource result is recorded
+  -> conversation delivery is suppressed permanently
+
+Close is later cancelled
+  -> suppressed result is not replayed into the reopened conversation
 ```
 
-Candidate result shape:
+## Minimal subscription contract
+
+The subscription mechanism must represent these facts structurally:
 
 ```text
-WaitResult:
-  BashExited(...)
-  BashKilled(...)
-  BashLostOnPhoenixRestart
-  TmuxCompleted(...)
-  TmuxGone(...)
-  SubagentCompleted(...)
-  SubagentFailed(...)
+subscription identity
+resource identity and correlation
+one typed terminal result
+one delivery disposition
 ```
 
-## Component disposition under review
+Conceptual delivery dispositions:
 
-### Delete
+```text
+Delivered { message_id }
+SuppressedByLifecycle { close_attempt_id }
+```
 
-- `crates/phoenix-db/src/workflow/wake.rs`
-- `crates/phoenix-ide/src/runtime/wake.rs` and `WakeWorker`
-- `crates/phoenix-workflow/src/wake_profile.rs`
-- `WakeRegistrar` and production wake registrar wiring
-- Legacy wake-specific delivery-message and recovery-tail logic
-- Wake-specific runtime admission and auto-resume heuristics
-- Implicit tmux wake registration
-- PR #621's `wake_contract` model, repository, and migration; the PR is closed and unmerged
+The result and its delivery are different facts:
 
-### Retain as existing authorities
+```text
+result:
+  BashExited(status = 0)
 
-- Generic workflow attempts, observations, receipts, deliveries, runtime-acceptance status, and suppression
-- Direct-turn durable message materialization and replay
-- Conversation admission mutex / existing durable runtime admission
-- Bash, tmux, and subagent lifecycle authorities
+delivery:
+  SuppressedByLifecycle(close_attempt_id = 17)
+```
 
-### Retain only as thin resource adapters
+Suppressing delivery must never erase the terminal result or terminate the resource.
 
-- Bash lifecycle event -> typed result observation
-- Tmux lifecycle/reprobe -> typed result observation
-- Subagent terminal transition -> typed result observation
+## Resource adapters
 
-### Derive as projections
+### Bash
 
-- Transcript representation
-- SSE/UI status
-- Any inspection API
+- Validate explicit handle ownership when subscribing.
+- Observe terminal truth from the Bash registry/tombstone.
+- Represent Phoenix restart loss as a typed result; do not attempt process recovery.
+- Do not register subscriptions from ordinary background Bash execution.
 
-## Rough code-size hypothesis
+### tmux
 
-Measured source sizes:
+- Validate durable server/window identity when subscribing.
+- Re-probe OS tmux after Phoenix restart.
+- Do not register subscriptions from ordinary `tmux_run` execution.
 
-- Legacy DB wake implementation: 8,622 total LOC; production code ends near line 5,127.
-- Legacy runtime wake implementation: 1,501 total LOC; production code ends near line 732.
-- Legacy wake profile: 507 LOC.
-- Unmerged #621 model: 1,542 LOC.
-- Unmerged #621 repository: 2,688 total LOC, approximately 1,500 production LOC.
+### Subagent
 
-Hypothesis:
+- Observe existing child/parent result authority.
+- Do not create a subagent registry, second result store, or second fan-in path.
+- Integrate with ProductConversation Close through the existing typed subagent settlement boundary.
 
-- Delete approximately 6,000-7,000 existing production LOC.
-- Avoid merging approximately 3,000 additional production LOC from #621.
-- Add approximately 900-1,500 production LOC for one fixed subscription profile and three thin adapters.
-- Expected net reduction from current production: approximately 5,000 LOC.
+## Close-facing operation
 
-These estimates require a source-level implementation plan before approval.
+Wake must expose one typed operation conceptually equivalent to:
 
-## Proposed hard-cut migration
+```text
+settle_pending_deliveries_for_close(
+  product_conversation_root,
+  close_attempt_id,
+) -> WakeSettlementEvidence
+```
 
-The user explicitly permits dropping or manually cancelling unresolved legacy obligations. No compatibility bridge, dual write, dual read, or translation migration is required.
+Requirements:
 
-1. Freeze implicit registration and remove the remaining tmux implicit producer.
-2. Cancel/drop any unresolved legacy obligations ad hoc before schema removal.
-3. Delete the legacy wake runtime authority and wiring.
-4. Delete legacy wake persistence/model/schema and recovery projections.
-5. Add one narrow durable-result subscription profile using generic workflow primitives.
-6. Add Bash durable-result delivery with automatic continuation disabled.
-7. Prove delivery/replay/busy/cancellation/restart-loss behavior.
-8. Separately consider continuation through existing direct-turn admission.
-9. Add TmuxWindow and Subagent adapters only if each remains thin.
+- exact-ID based;
+- idempotent;
+- settles each pending delivery once;
+- records typed lifecycle suppression evidence;
+- triggers no automatic continuation;
+- does not terminate the resource;
+- is safe across retry and Phoenix restart;
+- does not copy Close phase state into wake records.
 
-At every step, identify which authority disappears. Never run old and new writers together.
+ProductConversation records only exact-attempt orchestration evidence that wake settlement succeeded or failed. Wake remains authoritative for underlying result and delivery facts.
 
-## Smallest proposed end-to-end slice
+## Existing machinery to preserve
 
-Bash durable delivery only; no automatic continuation:
+- Generic durable workflows own execution attempts, observations, receipts, deliveries, and delivery suppression.
+- Existing direct-turn machinery owns accepted runtime turn identity, exact replay, materialization, and runtime ownership.
+- Existing runtime admission owns busy serialization and any automatic continuation.
+- Existing resource authorities own terminal truth.
 
-1. Start a background Bash handle.
-2. Explicitly call `wait_until` for that handle.
-3. Return the conversation to Idle.
-4. Bash exits.
-5. Bash lifecycle authority records one typed generic workflow observation.
-6. Generic workflow creates one durable delivery.
-7. Existing direct-turn materialization writes one correlated conversation message.
-8. If the conversation is busy, no competing turn starts.
+The implementation may use a narrow typed durable-workflow profile or existing profile seam, but it must not create a new lifecycle repository merely to rename wake.
 
-Required proof:
+## Required deletions
 
-- Ordinary Bash never enrolls.
-- Unauthorized/missing handles reject registration.
-- One exit creates one result; replay creates no duplicate.
-- Crash between observation and message materialization recovers exactly once.
-- Busy conversation retains the result without continuation.
-- Wait cancellation does not kill Bash or discard the eventual result.
-- Wait cancellation suppresses automatic continuation.
-- Phoenix restart produces typed Bash restart loss.
+The final cutover must remove or retire:
+
+- implicit wake registration;
+- `WakeRepository` as a parallel lifecycle authority;
+- `WakeWorker` and wake-specific recovery/admission;
+- wake-specific deadlines and expiry arbitration unless a current requirement proves they are needed;
+- cancellation-versus-terminal ownership arbitration;
+- delivery-owner transfer;
+- wake-specific runtime admission;
+- compatibility bridges and dual writes;
+- legacy unresolved obligations, which may be dropped or manually cancelled;
+- wake-specific UI lifecycle state when canonical result/delivery projections replace it.
+
+Legacy wake deletion is owned by this workstream and must not disappear during ProductConversation development.
+
+## Explicit non-goals
+
+This task does not own:
+
+- ProductConversation Open/History policy;
+- Close phases or whole-conversation orchestration;
+- WorkScope retirement;
+- stopping resources during Close;
+- steering cancellation policy;
+- Closing/History UI design;
+- direct-turn redesign or cleanup;
+- parallel Work-subagent lifecycle architecture;
+- a generic cancellation framework;
+- compatibility for unresolved legacy wake rows.
+
+## Smallest delivery sequence
+
+Implementation should begin only after ProductConversation's settlement integration seam is stable enough to consume.
+
+Proposed sequence:
+
+1. Prove the typed ProductConversation delivery-admission check and transaction ordering required by PR 2.
+2. Define the minimal typed subscription result and delivery disposition.
+3. Define the exact-ID Close settlement operation.
+4. Implement one Bash delivery-only slice with no automatic continuation.
+5. Prove idle, busy, Close-wins, delivery-wins, retry, and restart behavior.
+6. Delete the corresponding legacy wake path rather than dual-writing.
+7. Add tmux using OS reprobe.
+8. Integrate subagent through existing result/fan-in authority.
+9. Add automatic continuation only if it remains small and enters exclusively through existing durable direct-turn/runtime admission.
+10. Delete all remaining legacy wake machinery and projections.
+
+Every implementation phase must remove or permanently bypass a legacy authority. No phase may leave two writable lifecycle representations.
+
+## Required evidence
+
+### Enrollment
+
+- Ordinary Bash, tmux, and subagent execution creates no subscription.
+- Explicit wait creates exactly one subscription for one owned resource identity.
+
+### Delivery
+
+- One terminal observation produces one typed result.
+- Exact replay does not duplicate result or conversation message.
+- A busy conversation does not start a competing turn.
+- Any automatic continuation uses existing durable admission.
+
+### Close races
+
+- Delivery commit before Close produces one delivered transcript result.
+- Close commit before delivery records the result and suppresses delivery.
+- Suppression remains final after Close cancellation.
+- Close retry settles the same exact subscription once.
+- Suppression does not stop the resource.
+- WorkScope retirement later stops/removes owned resources.
+
+### Restart
+
+- Bash restart loss is typed.
+- A surviving tmux window is re-probed and can produce its terminal result.
+- A subagent result remains owned by existing child/parent state machines.
+- Restart never infers delivery from timing or polling.
+
+### Projections
+
+- SSE/UI publish only after commit.
+- Reconnect converges from durable result and delivery facts.
+- ProductConversation presentation owns whether suppressed evidence is visible during Closing or History.
 
 ## Stop gates
 
-Stop and redesign if any slice requires:
+Stop and re-ground if implementation requires:
 
-- a wake-specific worker;
-- a second runtime-admission path;
-- duplicated resource lifecycle state;
-- dual writes or a translation bridge;
-- a generic provider/subscription framework;
-- delivery-owner transfer;
-- polling;
-- broad UI lifecycle state.
+- another wake/subscription lifecycle aggregate and repository;
+- a second direct-turn or conversation admission authority;
+- wake code interpreting individual Close phases;
+- subscription cancellation terminating resources;
+- a subagent result registry or second fan-in path;
+- dual writes or compatibility translation between legacy and replacement wake;
+- timing, polling, or worker order as a correctness mechanism;
+- a durable child ledger or unrelated scheduler;
+- broad direct-turn cleanup before the P0 ProductConversation stack stabilizes.
 
-## Open review questions
+## Dependencies and timing
 
-- Can direct-turn materialization accept a non-user-originated typed result without weakening direct-turn identity or user-message invariants?
-- Can generic workflow delivery target existing direct-turn admission directly, or is one narrow profile-specific reducer event required?
-- What is the exact durable correlation key: registering tool-use ID, workflow ID, or a typed pair?
-- Does cancellation need a persisted policy bit, generic delivery suppression, or both?
-- Can Bash restart loss be produced deterministically at startup without a wake-specific scanner?
-- Can tmux completion be event-driven with one startup reprobe rather than recurring polling?
-- Can Subagent terminal observation attach to the existing `PersistSubAgentResults` transaction without duplicating terminal truth?
-- Which legacy tables and API surfaces contain historical data that should be dropped versus retained only for audit?
+P0 ProductConversation always wins scheduling conflicts.
 
-## Evidence anchors
+This P1 work may proceed during ProductConversation PR 2 development when the typed delivery-admission and subsystem-settlement seams are stable. Otherwise it begins immediately after the P0 lifecycle stack is stable. ProductConversation must not depend on this redesign to land its foundation.
 
-- Generic workflow durability: `WorkflowRepository::begin_attempt`, `record_observation`, `WorkflowTx::resolve_deliveries_exact`.
-- Direct-turn durability: `claim_authoritative_turn`, `materialize_authoritative_user_message`.
-- Busy authority: `RuntimeManager::conversation_admission`.
-- Bash truth: `BashHandleRegistry`, `Handle::transition_to_terminal`.
-- Tmux truth: `TmuxRegistry`, deterministic socket/server token, startup reprobe.
-- Subagent truth: state-machine terminal transitions and `PersistSubAgentResults`.
+## Current source anchors
 
-## Non-goals
+Legacy wake machinery:
 
-No implementation, schema migration, production cancellation, deployment, UI, combinators, generic providers, or ownership transfer is authorized by this task snapshot.
+- `crates/phoenix-db/src/workflow/wake.rs`
+- `crates/phoenix-ide/src/runtime/wake.rs`
+- `crates/phoenix-workflow/src/wake_profile.rs`
+
+Existing durable workflow and direct-turn seams:
+
+- `crates/phoenix-db/src/workflow.rs`
+- `crates/phoenix-db/src/workflow/direct_turn.rs`
+- `crates/phoenix-ide/src/runtime/direct_turn_worker.rs`
+- `crates/phoenix-ide/src/runtime.rs`
+- `crates/phoenix-ide/src/runtime/executor.rs`
+- `crates/phoenix-workflow/src/types.rs`
+
+Resource authorities:
+
+- `crates/phoenix-tools/src/bash/registry.rs`
+- `crates/phoenix-tools/src/tmux/registry.rs`
+- existing subagent/conversation state-machine result effects
+
+## Approval boundary
+
+This document is a planning contract, not implementation approval. Before implementation, verify the landed ProductConversation settlement seam and convert this brainstorming task into an approved executable plan with exact symbols, migration/deletion sequence, and focused tests.
