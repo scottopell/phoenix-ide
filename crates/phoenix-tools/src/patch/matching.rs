@@ -97,8 +97,12 @@ pub(super) fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpe
     )
 }
 
+fn candidate_search_is_oversized(content_bytes: usize, anchor_bytes: usize) -> bool {
+    content_bytes > MAX_CANDIDATE_FILE_BYTES || anchor_bytes > MAX_CANDIDATE_ANCHOR_BYTES
+}
+
 fn anchor_not_found_diagnostics(content: &str, old_text: &str) -> AnchorNotFoundDiagnostics {
-    if content.len() > MAX_CANDIDATE_FILE_BYTES || old_text.len() > MAX_CANDIDATE_ANCHOR_BYTES {
+    if candidate_search_is_oversized(content.len(), old_text.len()) {
         return AnchorNotFoundDiagnostics {
             candidates: Vec::new(),
         };
@@ -732,15 +736,19 @@ mod tests {
     }
 
     #[test]
-    fn oversized_inputs_skip_candidate_search() {
-        let content = "x".repeat(MAX_CANDIDATE_FILE_BYTES + 1);
-        let MatchError::NotFound(diagnostics) =
-            find_unique_match(&content, "missing anchor").unwrap_err()
-        else {
-            panic!("expected not found");
-        };
-
-        assert!(diagnostics.candidates.is_empty());
+    fn candidate_search_size_limits_are_strict_and_cover_both_inputs() {
+        assert!(!candidate_search_is_oversized(
+            MAX_CANDIDATE_FILE_BYTES,
+            MAX_CANDIDATE_ANCHOR_BYTES,
+        ));
+        assert!(candidate_search_is_oversized(
+            MAX_CANDIDATE_FILE_BYTES + 1,
+            0,
+        ));
+        assert!(candidate_search_is_oversized(
+            0,
+            MAX_CANDIDATE_ANCHOR_BYTES + 1,
+        ));
     }
 
     #[test]
