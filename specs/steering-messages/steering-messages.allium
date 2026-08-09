@@ -482,6 +482,12 @@ surface SteeringQueueApi {
         -- that accepted turn first; the ordinary turn-end hook then drains the
         -- queued steering batch in durable FIFO order.
 
+    @guarantee CancelledDirectTurnReleasesDeferredSteering
+        -- Cancelling an unmaterialized direct turn while its conversation is
+        -- idle wakes the executor after durable cancellation. The executor
+        -- reloads queue authority and submits the exact durable batch to the
+        -- ordinary reducer-owned drain transaction.
+
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
         -- of two points: turn-end (entering idle) or mid-turn (entering

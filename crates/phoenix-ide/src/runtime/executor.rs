@@ -2790,6 +2790,19 @@ where
                     return Ok(());
                 }
             }
+            Event::SteeringQueueChanged => {
+                if matches!(self.state, ConvState::Idle) && !self.context.is_sub_agent {
+                    let Some((drain_event, projection_guard)) =
+                        Box::pin(self.prepare_immediate_steering_drain()).await?
+                    else {
+                        return Ok(());
+                    };
+                    immediate_drain_guard = projection_guard;
+                    drain_event
+                } else {
+                    return Ok(());
+                }
+            }
             event => event,
         };
 

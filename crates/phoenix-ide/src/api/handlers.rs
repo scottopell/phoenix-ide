@@ -4184,7 +4184,7 @@ async fn cancel_wake(
 async fn cancel_active_direct_turn(
     state: &AppState,
     conversation_id: &str,
-) -> Result<bool, AppError> {
+) -> Result<Option<phoenix_workflow::Materialization>, AppError> {
     let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
     let Some(turn) = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -4193,15 +4193,16 @@ async fn cancel_active_direct_turn(
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
+    let materialization = turn.materialization.clone();
     repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
         turn_id: turn.id,
         expected_generation: turn.generation,
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
-    Ok(true)
+    Ok(Some(materialization))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4283,7 +4284,23 @@ async fn cancel_conversation(
                 no_op: false,
             }));
         }
-        if !cancelled_direct_turn {
+        if matches!(
+            cancelled_direct_turn,
+            Some(phoenix_workflow::Materialization::Unmaterialized)
+        ) && matches!(effective_state, ConvState::Idle)
+        {
+            let handle = state.runtime.get_or_create(&id).await.map_err(|error| {
+                AppError::Internal(format!("failed to wake steering queue: {error}"))
+            })?;
+            handle
+                .event_tx
+                .send(Event::SteeringQueueChanged)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!("failed to wake steering queue: {error}"))
+                })?;
+        }
+        if cancelled_direct_turn.is_none() {
             tracing::debug!(
                 conv_id = %id,
                 state = effective_state.variant_name(),
@@ -4292,7 +4309,7 @@ async fn cancel_conversation(
         }
         return Ok(Json(CancelResponse {
             ok: true,
-            no_op: !cancelled_direct_turn,
+            no_op: cancelled_direct_turn.is_none(),
         }));
     }
 
@@ -11552,6 +11569,99 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("load active turn");
         assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_unmaterialized_direct_turn_wakes_deferred_steering() {
+        let state = make_test_state().await;
+        let conversation_id = "c-cancel-direct-wakes-steering";
+        state
+            .db
+            .create_conversation(conversation_id, "pending", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, conversation_id).await;
+        let handle = state
+            .runtime
+            .get_or_create(conversation_id)
+            .await
+            .expect("materialize idle runtime");
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "run after cancellation".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "deferred-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        state
+            .db
+            .update_steering_queue(conversation_id, std::slice::from_ref(&entry))
+            .await
+            .expect("persist steering queue");
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send((
+                Event::SteerMessage {
+                    text: entry.text.clone(),
+                    llm_text: entry.llm_text.clone(),
+                    images: entry.images.clone(),
+                    files: entry.files.clone(),
+                    message_id: entry.message_id.clone(),
+                    user_agent: entry.user_agent.clone(),
+                    skill_invocation: entry.skill_invocation.clone(),
+                },
+                ack_tx,
+            ))
+            .await
+            .expect("notify runtime of queued steering");
+        ack_rx
+            .await
+            .expect("runtime acknowledges steering notification")
+            .expect("steering notification defers cleanly");
+        assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
+        assert_eq!(
+            state
+                .db
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("load deferred queue")
+                .len(),
+            1
+        );
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+                .await
+                .expect("cancel pending direct turn");
+
+        assert!(response.ok);
+        assert!(!response.no_op);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let queue_empty = state
+                    .db
+                    .get_steering_queue(conversation_id)
+                    .await
+                    .expect("load steering queue")
+                    .is_empty();
+                let message_persisted = state
+                    .db
+                    .get_messages(conversation_id)
+                    .await
+                    .expect("load messages")
+                    .iter()
+                    .any(|message| message.message_id == entry.message_id);
+                if queue_empty && message_persisted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred steering drains after cancellation");
     }
 
     #[tokio::test]
