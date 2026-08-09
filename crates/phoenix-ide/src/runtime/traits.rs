@@ -39,6 +39,16 @@ pub enum ActiveDirectTurnTerminal {
     Failed { reason: String },
 }
 
+impl ActiveDirectTurnTerminal {
+    pub(crate) const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveDirectTurnSettlement {
     pub turn: ActiveDirectTurn,
