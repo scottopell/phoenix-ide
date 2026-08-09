@@ -1258,6 +1258,13 @@ async fn click_regressions_share_one_browser_fixture() {
         reset_click_fixture(&ctx, "<div>No target</div>", "").await;
         let missing = click.run(json!({"selector":"#nonexistent"}), ctx.clone()).await;
         assert!(!missing.is_success(), "missing click target unexpectedly succeeded");
+        assert!(
+            missing.output().to_lowercase().contains("not found")
+                || missing.output().to_lowercase().contains("no element")
+                || missing.output().to_lowercase().contains("could not find"),
+            "missing click target error was unclear: {}",
+            missing.output()
+        );
 
         reset_click_fixture(&ctx, "<input type='checkbox' id='check'>", "").await;
         let checkbox = click.run(json!({"selector":"#check"}), ctx.clone()).await;
