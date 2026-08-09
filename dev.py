@@ -4641,18 +4641,29 @@ def _vitest_check_command() -> list[str]:
 def _run_check_lane(
     name: str,
     lane,
-    execution_lock: threading.Lock,
     results: list,
     results_lock: threading.Lock,
 ) -> None:
     started = time.monotonic()
     try:
-        with execution_lock:
-            lane()
+        lane()
     except BaseException as exc:
         detail = "".join(traceback.format_exception(exc))
         with results_lock:
             results.append((f"{name} lane", 1, time.monotonic() - started, detail))
+
+
+def _run_check_threads_sequentially(
+    threads: list[threading.Thread],
+    timeout: float,
+) -> list[threading.Thread]:
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            return [thread]
+    return []
 
 
 
@@ -4707,7 +4718,6 @@ def cmd_check(
 
     results = _CheckResults()  # (name, returncode, elapsed, output)
     results_lock = threading.Lock()
-    execution_lock = threading.Lock()
     t_start = time.monotonic()
 
     # Per-step kill-and-fail budget. 600s covers cold `cargo test compile`
@@ -5758,31 +5768,18 @@ def cmd_check(
     threads = [
         threading.Thread(
             target=_run_check_lane,
-            args=(name, _lane(fn), execution_lock, results, results_lock),
+            args=(name, _lane(fn), results, results_lock),
             name=name,
         )
         for name, fn in _lane_targets
         if name in active
     ]
-    # daemon=True so a hung lane does not block interpreter shutdown after
-    # we report it as failed and call sys.exit(1). Non-daemon threads cause
-    # Python to wait at exit, defeating the hung-lane detection below.
-    # run_step's subprocess.run already enforces CHECK_TIMEOUT per step via
-    # SIGKILL on the child; daemon=True covers the case where a lane is
-    # wedged in Python (not in a subprocess) past LANE_JOIN_TIMEOUT.
-    for t in threads:
-        t.daemon = True
-        t.start()
-    # Per-thread join budget must cover the longest *lane*, not a single step.
-    # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
-    # so we cap join at 6×CHECK_TIMEOUT + 30s. After joining we still verify
-    # the thread actually finished — Thread.join() returning after a timeout
-    # does not imply the thread is done, so a still-alive lane is recorded
-    # as an explicit failure rather than silently dropped from results.
+    # Each lane starts only after its predecessor finishes. A lane wedged in
+    # Python therefore cannot leave every later lane parked on a lock or multiply
+    # the join timeout. daemon=True lets the interpreter exit after recording the
+    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
     LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
-    for t in threads:
-        t.join(timeout=LANE_JOIN_TIMEOUT)
-    stuck = [t for t in threads if t.is_alive()]
+    stuck = _run_check_threads_sequentially(threads, LANE_JOIN_TIMEOUT)
     # Stop the live renderer before any direct printing below (hung-lane
     # lines, failure dumps, summary) — plain mode's close() is a no-op.
     reporter.close()

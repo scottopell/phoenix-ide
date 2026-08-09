@@ -137,15 +137,12 @@ class CheckPlanTests(unittest.TestCase):
                 self.dev._vitest_check_command(),
             )
 
-    def test_check_lanes_share_one_execution_lock(self):
-        lock = mock.MagicMock()
+    def test_check_lane_runs_and_records_no_failure(self):
         lane = mock.Mock()
         results = []
 
-        self.dev._run_check_lane("rust", lane, lock, results, threading.Lock())
+        self.dev._run_check_lane("rust", lane, results, threading.Lock())
 
-        lock.__enter__.assert_called_once_with()
-        lock.__exit__.assert_called_once()
         lane.assert_called_once_with()
         self.assertEqual([], results)
 
@@ -155,7 +152,6 @@ class CheckPlanTests(unittest.TestCase):
         self.dev._run_check_lane(
             "clippy",
             mock.Mock(side_effect=PermissionError("incremental target is protected")),
-            threading.Lock(),
             results,
             threading.Lock(),
         )
@@ -165,6 +161,32 @@ class CheckPlanTests(unittest.TestCase):
         self.assertEqual("clippy lane", name)
         self.assertEqual(1, returncode)
         self.assertIn("PermissionError: incremental target is protected", detail)
+
+    def test_hung_lane_does_not_start_queued_lanes(self):
+        first = mock.MagicMock()
+        first.is_alive.return_value = True
+        second = mock.MagicMock()
+
+        stuck = self.dev._run_check_threads_sequentially([first, second], 0.01)
+
+        first.start.assert_called_once_with()
+        first.join.assert_called_once_with(timeout=0.01)
+        second.start.assert_not_called()
+        self.assertEqual([first], stuck)
+
+    def test_check_threads_start_in_sequence(self):
+        first = mock.MagicMock()
+        first.is_alive.return_value = False
+        second = mock.MagicMock()
+        second.is_alive.return_value = False
+
+        stuck = self.dev._run_check_threads_sequentially([first, second], 1)
+
+        first.start.assert_called_once_with()
+        first.join.assert_called_once_with(timeout=1)
+        second.start.assert_called_once_with()
+        second.join.assert_called_once_with(timeout=1)
+        self.assertEqual([], stuck)
 
     def test_ci_lane_inventory_covers_every_devpy_lane_once(self):
         self.assertEqual([], self.dev._ci_lane_inventory_errors())
