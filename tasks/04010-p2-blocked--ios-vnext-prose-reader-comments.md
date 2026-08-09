@@ -2,7 +2,7 @@
 
 ## Outcome
 
-Provide a focused Markdown/prose reading surface with durable, understandable review comments.
+Satisfy `REQ-IOS-020` and `REQ-IOS-021` with a focused Markdown/prose reading surface and durable, understandable review comments.
 
 ## Dependencies
 
@@ -10,7 +10,7 @@ Blocked by ProductConversation migration, Markdown rendering, grounding/files, a
 
 ## Scope
 
-Catalog reader navigation, readable typography, line/block anchoring, draft notes, send/retry/discard behavior, and return-to-conversation flow. Then create numbered leaf tasks for independently reviewable reader and commenting behaviors.
+Catalog reader navigation, readable typography, line/block anchoring, draft notes, send/retry/discard behavior, and return-to-conversation flow. Then create numbered requirement-backed leaf tasks for independently reviewable reader and commenting behaviors. Each component leaf task adds its deterministic fixtures to the base harness.
 
 ## Acceptance
 

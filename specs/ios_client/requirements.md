@@ -9,9 +9,10 @@ conversations, and composing messages while offline — so that a network gap
 blank screen.
 
 The iOS client is a deliberately simplified companion to the web UI: it
-covers conversations, messages, tool activity, and sending. Server-side
-capabilities that require a live interactive channel (terminal, diff
-viewer, chains, file browser) are out of scope.
+covers conversations, messages, tool activity, sending, read-only project
+context, and prose review. Server-side capabilities that require a live
+interactive channel or general editing environment (terminal, diff viewer,
+chains, and file editing) are out of scope.
 
 ## Requirements
 
@@ -608,3 +609,69 @@ on a run occurring.
 **Rationale:** Opportunistic refresh can provide useful advisory awareness
 without becoming part of the correctness model. iOS controls the refresh
 cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative.
+
+---
+
+### REQ-IOS-019: Inspect Conversation Grounding and Project Files
+
+WHEN the user opens a conversation's grounding surface
+THE SYSTEM SHALL show the project and working context attached to that
+conversation
+AND distinguish unavailable, loading, stale, empty, and failed context
+
+WHEN the user browses a supported project file
+THE SYSTEM SHALL treat its path as a server-side location
+AND fetch and display the file's contents without offering phone-local file
+actions
+
+WHEN file contents cannot be fetched
+THE SYSTEM SHALL preserve any already-visible contents with a stale indicator
+OR show an explicit unavailable or error state
+AND SHALL NOT present an empty document as a successful load
+
+**Rationale:** Mobile decisions often depend on the files and project state the
+agent is using. Read-only server-backed context provides that evidence without
+pretending the phone owns the server's filesystem.
+
+---
+
+### REQ-IOS-020: Read Project Prose Comfortably
+
+WHEN the user opens a supported Markdown or prose file
+THE SYSTEM SHALL render a dedicated reading surface with readable typography,
+document navigation, and intentional presentations for common Markdown
+structures
+
+WHEN the document contains unsupported or malformed markup
+THE SYSTEM SHALL preserve the source text in a legible fallback rather than
+omit it
+
+WHEN the user returns to the conversation
+THE SYSTEM SHALL preserve enough reading position and file identity to make
+the transition understandable
+
+**Rationale:** Reviewing plans, specifications, and other prose on a phone
+requires a reading surface rather than a transcript card or raw-file dump.
+
+---
+
+### REQ-IOS-021: Comment on Project Prose Reliably
+
+WHEN the user creates a comment on a supported prose location
+THE SYSTEM SHALL keep the referenced file and source location understandable
+AND preserve the draft before attempting delivery
+
+WHEN comment delivery fails transiently
+THE SYSTEM SHALL keep the draft visible with Retry and Discard affordances
+AND SHALL NOT lose it when the reader is closed or the app restarts
+
+WHEN the user leaves a reader with unsent comments
+THE SYSTEM SHALL require successful delivery or explicit discard
+
+WHEN the referenced prose has changed enough that the original location cannot
+be identified safely
+THE SYSTEM SHALL surface the stale anchor and require the user to re-anchor or
+discard the comment
+
+**Rationale:** Mobile review is only useful when feedback survives unreliable
+connectivity and still points to an understandable part of the document.

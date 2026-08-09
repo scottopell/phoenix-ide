@@ -51,6 +51,9 @@ on-device build and an airplane-mode queue/drain test pass.
 | REQ-IOS-016 question answering | `QuestionCard.swift`, `QuestionAnswers` encoder (tested), respond/dismiss actions |
 | REQ-IOS-017 coordinator access | `AppModel.openCoordinator`, list globe entry + row badge |
 | REQ-IOS-018 advisory nudges | `AttentionMonitor` (diff tested), `BackgroundRefresh`, `NotificationRouter` |
+| REQ-IOS-019 grounding/files | Not started; blocked by ProductConversation migration (`tasks/04009-p2-blocked--ios-vnext-grounding-files.md`) |
+| REQ-IOS-020 prose reader | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
+| REQ-IOS-021 prose comments | Not started; planned under `tasks/04010-p2-blocked--ios-vnext-prose-reader-comments.md` |
 
 ## Planned iOS vNext Program
 
@@ -98,8 +101,9 @@ deterministic fixture/test evidence.
 - Native tool renderers cover `bash` and `think` only; all other tools
   (patch, browser, keyword_search, tmux, …) hit the generic JSON cards. The
   blocked iOS vNext tool-output section owns the renderer catalog and queue.
-- Grounding/file browsing and the prose reader/commenting interface are not
-  implemented in the native client; their blocked iOS vNext sections depend
-  on the ProductConversation migration and deterministic fixture harness.
+- Grounding/file browsing and the prose reader/commenting interface
+  (`REQ-IOS-019` through `REQ-IOS-021`) are not implemented in the native
+  client; their blocked iOS vNext sections depend on the ProductConversation
+  migration and base deterministic fixture harness.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).
