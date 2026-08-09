@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -139,12 +140,31 @@ class CheckPlanTests(unittest.TestCase):
     def test_check_lanes_share_one_execution_lock(self):
         lock = mock.MagicMock()
         lane = mock.Mock()
+        results = []
 
-        self.dev._run_check_lane(lane, lock)
+        self.dev._run_check_lane("rust", lane, lock, results, threading.Lock())
 
         lock.__enter__.assert_called_once_with()
         lock.__exit__.assert_called_once()
         lane.assert_called_once_with()
+        self.assertEqual([], results)
+
+    def test_check_lane_exception_records_failure(self):
+        results = []
+
+        self.dev._run_check_lane(
+            "clippy",
+            mock.Mock(side_effect=PermissionError("incremental target is protected")),
+            threading.Lock(),
+            results,
+            threading.Lock(),
+        )
+
+        self.assertEqual(1, len(results))
+        name, returncode, _elapsed, detail = results[0]
+        self.assertEqual("clippy lane", name)
+        self.assertEqual(1, returncode)
+        self.assertIn("PermissionError: incremental target is protected", detail)
 
     def test_ci_lane_inventory_covers_every_devpy_lane_once(self):
         self.assertEqual([], self.dev._ci_lane_inventory_errors())

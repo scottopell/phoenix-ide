@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -4637,9 +4638,21 @@ def _vitest_check_command() -> list[str]:
     ]
 
 
-def _run_check_lane(lane, execution_lock: threading.Lock) -> None:
-    with execution_lock:
-        lane()
+def _run_check_lane(
+    name: str,
+    lane,
+    execution_lock: threading.Lock,
+    results: list,
+    results_lock: threading.Lock,
+) -> None:
+    started = time.monotonic()
+    try:
+        with execution_lock:
+            lane()
+    except BaseException as exc:
+        detail = "".join(traceback.format_exception(exc))
+        with results_lock:
+            results.append((f"{name} lane", 1, time.monotonic() - started, detail))
 
 
 
@@ -4952,8 +4965,8 @@ def cmd_check(
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
         scratch dir under target/, and the staleness step diffs that scratch
         export against the committed tree. The committed tree is therefore
-        frozen for the whole check — the tsc, vitest, eslint, and ast-grep
-        lanes read it concurrently with no ordering dependency on this lane.
+        frozen for the whole check, so later UI and source-validation lanes
+        read a stable committed tree without an ordering dependency on codegen.
         `test_cmd` excludes `export_bindings` (the codegen step just ran
         them — no lost coverage). `compile_cmd`/`test_cmd`/the thread cap are
         computed once in cmd_check and closed over here.
@@ -4994,9 +5007,8 @@ def cmd_check(
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
 
-        Both run on the same source tree and need no build artifact, so
-        bundling them into one thread avoids spending a parallel slot on
-        a sub-second stylelint pass. Each emits its own result entry.
+        Both run on the same source tree and need no build artifact, so they
+        remain one lane with separate result entries.
         """
         run_step("eslint", ["pnpm", "run", "lint"], UI_DIR)
         run_step("stylelint", ["pnpm", "run", "lint:css"], UI_DIR)
@@ -5020,25 +5032,12 @@ def cmd_check(
         and an isolated temp DB, then runs a battery of scripted conversations
         through the same HTTP/SSE surface phoenix-client.py uses.
 
-        Target-lock sharing with lane_rust. run.py's `cargo build --bin
-        phoenix_ide` and lane_rust's cargo invocations share the one workspace
-        target dir, whose exclusive lock serializes all builds. The `--bin`
-        artifact is NOT a cheap link riding on lane_rust's output: clippy emits
-        only check-mode .rmeta, and `cargo test --no-run` emits cfg(test)
-        harness binaries under deps/ — neither produces target/debug/phoenix_ide,
-        so this build does a full non-test crate codegen + link. Only the
-        external dependency crates are reused.
-
-        The overlap that keeps this lane inside lane_rust's wall-clock shadow
-        comes from nextest, not artifact reuse: `cargo nextest run` splits
-        build from run and releases the target lock for the run phase, so this
-        bin build proceeds in parallel with the test run. On the plain
-        `cargo test` fallback (no nextest installed) the run phase holds the
-        lock end-to-end, so this build serializes after it and adds a full
-        bin codegen to the tail of the critical path — the fallback is slower
-        by design, not broken. clippy no longer contends here: it runs in
-        lane_clippy with its own CARGO_TARGET_DIR, so the only builds on the
-        shared workspace lock are lane_rust's test compile and this bin build.
+        run.py's `cargo build --bin phoenix_ide` reuses normal-target external
+        dependencies but is not a cheap link from test output: `cargo test
+        --no-run` emits cfg(test) harnesses under deps/ rather than
+        target/debug/phoenix_ide. The serialized execution policy therefore
+        makes this full non-test codegen and link an explicit E2E cost after the
+        Rust lane, while Clippy remains isolated in its own target directory.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
@@ -5628,8 +5627,8 @@ def cmd_check(
             """Diff the scratch ts-rs export against committed ui/src/generated/.
 
             A mismatch means the developer's Rust types and the committed TS
-            don't line up. Recorded (not aborted) so the rest of the lane and
-            the parallel phase still run and every failure lands in one pass.
+            don't line up. Recorded without aborting so the rest of the lane
+            still runs and every failure lands in one pass.
             """
             step, t0 = "codegen-stale", time.monotonic()
             reporter.step_start("rust", step)
@@ -5759,7 +5758,7 @@ def cmd_check(
     threads = [
         threading.Thread(
             target=_run_check_lane,
-            args=(_lane(fn), execution_lock),
+            args=(name, _lane(fn), execution_lock, results, results_lock),
             name=name,
         )
         for name, fn in _lane_targets
