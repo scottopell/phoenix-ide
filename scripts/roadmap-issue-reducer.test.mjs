@@ -84,6 +84,13 @@ test("roadmap-update examples nested in larger fences are not live updates", () 
   assert.deepEqual(updatesFromComments([comment(1, nested)]), []);
 });
 
+test("roadmap-update fences with surrounding or hidden content are not live", () => {
+  const live = fenced(update());
+  assert.deepEqual(updatesFromComments([comment(1, `Prose\n${live}`)]), []);
+  assert.deepEqual(updatesFromComments([comment(2, `<!--\n${live}\n-->`)]), []);
+  assert.deepEqual(updatesFromComments([comment(3, `<pre>\n${live}\n</pre>`)]), []);
+});
+
 test("untrusted comments and invalid replacements are ignored", () => {
   const untrusted = comment(2, fenced(update({ state: "Ready" })), { author_association: "NONE" });
   const invalid = comment(3, fenced(update({ evidence: [] })));
@@ -136,6 +143,14 @@ test("context HTML is escaped inside details markup", () => {
   const body = renderRoadmap(updatesFromComments([source]));
   assert.doesNotMatch(body, /> <\/details>/);
   assert.match(body, /\\<\/details\\>/);
+});
+
+test("summary fields use HTML entity escaping", () => {
+  const source = comment(1, fenced(update({ title: "<!-- title", state: "<ready> & done" })));
+  const body = renderRoadmap(updatesFromComments([source]));
+  assert.match(body, /&lt;!-- title/);
+  assert.match(body, /&lt;ready&gt; &amp; done/);
+  assert.doesNotMatch(body, /<summary><strong><!--/);
 });
 
 test("created and edited events rebuild the reducer-owned body", async () => {

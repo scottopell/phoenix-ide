@@ -113,31 +113,8 @@ export function validateUpdate(value) {
 }
 
 function updatePayloads(markdown) {
-  const payloads = [];
-  const lines = String(markdown ?? "").split(/\r?\n/);
-  let enclosingFence = null;
-  let updateLines = null;
-
-  for (const line of lines) {
-    const opening = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
-    if (enclosingFence === null) {
-      if (!opening) continue;
-      const [fence, info] = [opening[1], opening[2].trim()];
-      enclosingFence = { character: fence[0], length: fence.length };
-      updateLines = fence === "```" && info === "phoenix-roadmap-update" ? [] : null;
-      continue;
-    }
-
-    const closing = line.match(/^\s*(`{3,}|~{3,})\s*$/)?.[1];
-    if (closing?.[0] === enclosingFence.character && closing.length >= enclosingFence.length) {
-      if (updateLines !== null) payloads.push(updateLines.join("\n"));
-      enclosingFence = null;
-      updateLines = null;
-      continue;
-    }
-    if (updateLines !== null) updateLines.push(line);
-  }
-  return payloads;
+  const match = String(markdown ?? "").match(/^```phoenix-roadmap-update\r?\n([\s\S]*?)\r?\n```\s*$/);
+  return match ? [match[1]] : [];
 }
 
 export function updatesFromComments(comments) {
@@ -187,6 +164,15 @@ function markdownText(value) {
   return value.replaceAll("\\", "\\\\").replace(/([`*_{}\[\]<>])/g, "\\$1");
 }
 
+function htmlText(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function renderEvidence(evidence) {
   return evidence.map(({ label, url }) => `[${markdownText(label)}](${url})`).join(" · ");
 }
@@ -199,7 +185,7 @@ function renderContext(context) {
 function renderUpdate(update, open) {
   const blockers = update.blocked_by.length === 0 ? "None" : update.blocked_by.map(markdownText).join(" · ");
   const sourceLabel = `@${update.source.author} update`;
-  return `<details${open ? " open" : ""}>\n<summary><strong>${markdownText(update.title)}</strong> — ${markdownText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
+  return `<details${open ? " open" : ""}>\n<summary><strong>${htmlText(update.title)}</strong> — ${htmlText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
 export function renderRoadmap(updates) {
