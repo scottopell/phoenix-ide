@@ -22,8 +22,10 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - A note that cannot be re-anchored can be discarded individually while other reader notes remain intact.
 - Send formats notes into a structural editable conversation contribution that owns both text and exact scope/file/revision authority, then clears the reader notes and closes the reader.
 - Composer edits preserve each retained review contribution's authority; removal deletes its text and authority together without disturbing unrelated text or images.
+- Independently editable plain segments can be inserted before, between, or after review contributions.
 - Actual message submission revalidates every binding, preserves staged images in the same outbox entry, and clears the draft only after positive disk-persistence evidence.
 - The ordinary queue entry cannot become sendable until persistence evidence exists; a cleared composer is reinitialized with an editable empty plain segment.
+- Persistence-pending review messages remain optimistically visible, structurally non-sendable, and retryable on later delivery triggers.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
 - The leaf queue separates reader fidelity from session-scoped note composition.

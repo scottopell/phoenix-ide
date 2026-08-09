@@ -39,8 +39,15 @@ use "../user_message_queue/user_message_queue.allium" as queue
 --   source line, exact raw line content, and note text.
 -- new_review_contribution_identity() -> ReviewContributionIdentity
 --   Produces a fresh identity for one formatted review contribution.
--- next_draft_position(draft) -> Integer
+-- next_draft_position(draft) -> DraftPosition
 --   Returns an unused position after every retained plain or review segment.
+-- first_draft_position() -> DraftPosition
+--   Returns the initial position in an empty composer.
+-- draft_has_position(draft, position) -> Boolean
+--   True when a retained plain or review segment occupies position.
+-- inserted_draft_position(draft, after_position) -> DraftPosition
+--   Returns a fresh ordered position immediately after after_position, without
+--   changing the relative order of any retained segment.
 -- render_composer_draft(draft) -> String
 --   Joins plain segments and review authorities by position into the exact
 --   user-visible message text. No second stored text representation exists.
@@ -73,6 +80,10 @@ value ContentRevision {
 
 value ReviewContributionIdentity {
     token: String
+}
+
+value DraftPosition {
+    order_key: String
 }
 
 value ReanchoredNoteAnchor {
@@ -152,13 +163,13 @@ entity ComposerDraft {
 
     plain_segments: PlainDraftSegment with draft = this
     review_authorities: ProseReviewAuthority with draft = this
-    pending_enqueue: PendingReviewDraftEnqueue with draft = this
+    persistence_pending: PersistencePendingReviewQueueEntry with draft = this
     submission_block: ReviewSubmissionBlock with draft = this
 }
 
 entity PlainDraftSegment {
     draft: ComposerDraft
-    position: Integer
+    position: DraftPosition
     text: String
 }
 
@@ -166,7 +177,7 @@ entity PlainDraftSegment {
 -- Removing this entity removes both; editing text retains the bindings.
 entity ProseReviewAuthority {
     draft: ComposerDraft
-    position: Integer
+    position: DraftPosition
     contribution: ReviewContributionIdentity
     text: String
     work_scope: WorkScopeIdentity
@@ -174,10 +185,18 @@ entity ProseReviewAuthority {
     content_revision: ContentRevision
 }
 
-entity PendingReviewDraftEnqueue {
+-- A visible optimistic queue entry that cannot be delivered. Only a matching
+-- ReviewOutboxPersistenceReceipt converts it into the ordinary sendable queue.
+entity PersistencePendingReviewQueueEntry {
     draft: ComposerDraft
     scope: queue/ConversationScope
     local_id: String
+
+    render: PersistencePendingReviewRender with entry = this
+}
+
+entity PersistencePendingReviewRender {
+    entry: PersistencePendingReviewQueueEntry
 }
 
 entity ReviewSubmissionBlock {
@@ -344,7 +363,7 @@ rule ComposerDraftCreated {
         )
         PlainDraftSegment.created(
             draft: draft,
-            position: 0,
+            position: first_draft_position(),
             text: initial_text
         )
 }
@@ -358,7 +377,7 @@ rule EligibleNotesBecomeReviewBoundDraftContribution {
 
     requires: draft.conversation = session.conversation
     requires: session.notes.count > 0
-    requires: not exists draft.pending_enqueue
+    requires: not exists draft.persistence_pending
     requires: session.conversation.chat_capable
     requires: session.conversation.live_message_target = session.work_scope
     requires:
@@ -387,9 +406,23 @@ rule EligibleNotesBecomeReviewBoundDraftContribution {
 rule UserEditsPlainDraftSegment {
     when: UserEditsPlainDraftSegment(segment, edited_text)
 
-    requires: not exists segment.draft.pending_enqueue
+    requires: not exists segment.draft.persistence_pending
 
     ensures: segment.text = edited_text
+}
+
+rule UserInsertsPlainDraftSegment {
+    when: UserInsertsPlainDraftSegment(draft, after_position, text)
+
+    requires: not is_blank(text)
+    requires: not exists draft.persistence_pending
+    requires: draft_has_position(draft, after_position)
+
+    ensures: PlainDraftSegment.created(
+        draft: draft,
+        position: inserted_draft_position(draft, after_position),
+        text: text
+    )
 }
 
 rule UserEditsReviewContributionText {
@@ -397,7 +430,7 @@ rule UserEditsReviewContributionText {
     when: UserEditsReviewContribution(authority, edited_text)
 
     requires: not is_blank(edited_text)
-    requires: not exists authority.draft.pending_enqueue
+    requires: not exists authority.draft.persistence_pending
 
     ensures: authority.text = edited_text
 }
@@ -406,7 +439,7 @@ rule UserStagesComposerImages {
     -- REQ-IOS-015, REQ-IOS-021
     when: UserStagesComposerImages(draft, images)
 
-    requires: not exists draft.pending_enqueue
+    requires: not exists draft.persistence_pending
 
     ensures: draft.images = images
 }
@@ -423,7 +456,7 @@ rule RefreshedNotesReplaceBoundDraftContribution {
     requires:
         authority.draft.conversation = refreshed_session.conversation
     requires: refreshed_session.notes.count > 0
-    requires: not exists authority.draft.pending_enqueue
+    requires: not exists authority.draft.persistence_pending
     requires: refreshed_session.conversation.chat_capable
     requires:
         refreshed_session.conversation.live_message_target
@@ -452,7 +485,7 @@ rule UserDiscardsBoundReviewContribution {
 
     let draft = authority.draft
 
-    requires: not exists authority.draft.pending_enqueue
+    requires: not exists authority.draft.persistence_pending
 
     ensures: not exists draft.submission_block
     ensures: not exists authority
@@ -471,7 +504,7 @@ rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
 
     requires: not is_blank(message_text) or draft.images != empty_list
     requires: draft.review_authorities.count > 0
-    requires: not exists draft.pending_enqueue
+    requires: not exists draft.persistence_pending
     requires: not exists draft.submission_block
     requires: review_authority_failures(draft) = empty_list
 
@@ -481,10 +514,24 @@ rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
         text: message_text,
         images: draft.images
     )
-    ensures: PendingReviewDraftEnqueue.created(
-        draft: draft,
-        scope: draft.conversation.queue_scope,
-        local_id: local_id
+    ensures:
+        let pending = PersistencePendingReviewQueueEntry.created(
+            draft: draft,
+            scope: draft.conversation.queue_scope,
+            local_id: local_id
+        )
+        PersistencePendingReviewRender.created(entry: pending)
+}
+
+rule PersistencePendingReviewQueueRetriesDiskWrite {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: RetryReviewOutboxPersistence(pending)
+
+    ensures: PersistReviewDraftMessage(
+        scope: pending.scope,
+        local_id: pending.local_id,
+        text: render_composer_draft(pending.draft),
+        images: pending.draft.images
     )
 }
 
@@ -492,38 +539,39 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
     -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
     when: persistence: ReviewOutboxPersistenceReceipt.created
 
-    let pending_enqueue = PendingReviewDraftEnqueue{
+    let pending = PersistencePendingReviewQueueEntry{
         scope: persistence.scope,
         local_id: persistence.local_id
     }
 
-    requires: exists pending_enqueue
+    requires: exists pending
     requires: persistence.persistence_revision > 0
     requires: persistence.payload_fingerprint = message_payload_fingerprint(
         persistence.scope,
         persistence.local_id,
-        render_composer_draft(pending_enqueue.draft),
-        pending_enqueue.draft.images
+        render_composer_draft(pending.draft),
+        pending.draft.images
     )
 
     ensures: queue/UserSendsMessage(
         persistence.scope,
         persistence.local_id,
-        render_composer_draft(pending_enqueue.draft),
-        pending_enqueue.draft.images
+        render_composer_draft(pending.draft),
+        pending.draft.images
     )
-    ensures: pending_enqueue.draft.images = empty_list
+    ensures: pending.draft.images = empty_list
     ensures:
-        for segment in pending_enqueue.draft.plain_segments:
+        for segment in pending.draft.plain_segments:
             not exists segment
-        for authority in pending_enqueue.draft.review_authorities:
+        for authority in pending.draft.review_authorities:
             not exists authority
         PlainDraftSegment.created(
-            draft: pending_enqueue.draft,
-            position: 0,
+            draft: pending.draft,
+            position: first_draft_position(),
             text: ""
         )
-        not exists pending_enqueue
+        not exists pending.render
+        not exists pending
 }
 
 rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
@@ -533,7 +581,7 @@ rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
     let failures = review_authority_failures(draft)
 
     requires: draft.review_authorities.count > 0
-    requires: not exists draft.pending_enqueue
+    requires: not exists draft.persistence_pending
     requires: not exists draft.submission_block
     requires: failures != empty_list
 

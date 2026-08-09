@@ -706,6 +706,11 @@ THE SYSTEM SHALL preserve that contribution's authority binding with its text
 AND SHALL NOT represent the text and authority as independently removable data
 AND treat a whitespace-only contribution as ineligible retained review text
 
+WHEN the user adds unrelated context before, between, or after retained review
+contributions
+THE SYSTEM SHALL represent that context as independently editable plain draft
+segments at the user's selected positions
+
 WHEN the user explicitly removes a review contribution
 THE SYSTEM SHALL remove its text and authority together
 AND preserve unrelated draft text and attachments
@@ -718,6 +723,9 @@ all staged image attachments through one ordinary durable message-queue entry
 according to `REQ-IOS-002`, `REQ-IOS-003`, and `REQ-IOS-015`
 AND SHALL NOT create a sendable ordinary queue entry before that message is
 durably persisted
+AND, while persistence is pending or has failed, show one optimistic
+persistence-pending queue entry that is structurally non-sendable
+AND retry its version-fenced disk write on later delivery triggers
 AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
