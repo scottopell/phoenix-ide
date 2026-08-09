@@ -1468,7 +1468,7 @@ async fn test_click_with_wait() {
 async fn reset_type_fixture(ctx: &ToolContext) {
     let reset = BrowserEvalTool
         .run(
-            json!({"expression": r#"(() => {
+            json!({"expression": r"(() => {
                 for (const id of ['input', 'textarea', 'clear-input', 'append-input', 'special-input', 'password']) {
                     const element = document.getElementById(id);
                     element.value = '';
@@ -1481,7 +1481,7 @@ async fn reset_type_fixture(ctx: &ToolContext) {
                 window.typeEvents = { input: 0, change: 0 };
                 document.body.focus();
                 return true;
-            })()"#}),
+            })()"}),
             ctx.clone(),
         )
         .await;
