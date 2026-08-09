@@ -73,6 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 
 async fn trajectory_export_handler(
     State(state): State<AppState>,
@@ -4181,6 +4182,9 @@ async fn cancel_active_direct_turn(
     else {
         return Ok(false);
     };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
     repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
         turn_id: turn.id,
         expected_generation: turn.generation,
@@ -4190,10 +4194,59 @@ async fn cancel_active_direct_turn(
     Ok(true)
 }
 
+fn record_cancel_outcome(
+    conversation_id: &str,
+    observed_state: &ConvState,
+    outcome: &'static str,
+    direct_turn_action: &'static str,
+) {
+    let span = tracing::Span::current();
+    span.record("observed_state", observed_state.variant_name());
+    span.record("outcome", outcome);
+    span.record("direct_turn_action", direct_turn_action);
+    tracing::info!(
+        conv_id = %conversation_id,
+        observed_state = observed_state.variant_name(),
+        outcome,
+        direct_turn_action,
+        "Conversation cancel resolved"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+) -> Result<Json<CancelResponse>, AppError> {
+    let span = crate::logging::conversation_cancel_span(&id);
+    let result = cancel_conversation_inner(state, id)
+        .instrument(span.clone())
+        .await;
+    if let Err(error) = &result {
+        let (outcome, is_server_error) = match error {
+            AppError::Conflict(_) => ("rejected_state", false),
+            AppError::NotFound(_) => ("not_found", false),
+            AppError::BadRequest(_)
+            | AppError::TypedBadRequest { .. }
+            | AppError::Forbidden(_)
+            | AppError::UnprocessableEntity(_) => ("request_error", false),
+            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+        };
+        span.record("outcome", outcome);
+        if is_server_error {
+            span.record("otel.status_code", "ERROR");
+            tracing::warn!(parent: &span, error = ?error, "Conversation cancel failed");
+        } else {
+            tracing::info!(parent: &span, error = ?error, outcome, "Conversation cancel rejected");
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cancel_conversation_inner(
+    state: AppState,
+    id: String,
 ) -> Result<Json<CancelResponse>, AppError> {
     // Provisioning cancellation is DB-owned because no conversation runtime
     // owns that lifecycle yet.
@@ -4231,6 +4284,12 @@ async fn cancel_conversation(
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
             .await;
         state.runtime.kick_creation_worker();
+        record_cancel_outcome(
+            &id,
+            &conversation.state,
+            "creation_cancelled",
+            "not_applicable",
+        );
         return Ok(Json(CancelResponse {
             ok: true,
             no_op: false,
@@ -4242,6 +4301,7 @@ async fn cancel_conversation(
         .effective_conversation_state(&id)
         .await
         .unwrap_or_else(|| conversation.state.clone());
+    tracing::Span::current().record("observed_state", effective_state.variant_name());
 
     if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
@@ -4264,6 +4324,12 @@ async fn cancel_conversation(
                 .map_err(|error| {
                     AppError::Internal(format!("failed to send cancel event: {error}"))
                 })?;
+            record_cancel_outcome(
+                &id,
+                &effective_state,
+                "runtime_cancel_requested_after_turn_cancel",
+                "cancelled",
+            );
             return Ok(Json(CancelResponse {
                 ok: true,
                 no_op: false,
@@ -4276,6 +4342,20 @@ async fn cancel_conversation(
                 "cancel no-op: conversation has nothing in flight"
             );
         }
+        record_cancel_outcome(
+            &id,
+            &effective_state,
+            if cancelled_direct_turn {
+                "direct_turn_cancelled"
+            } else {
+                "no_op"
+            },
+            if cancelled_direct_turn {
+                "cancelled"
+            } else {
+                "absent"
+            },
+        );
         return Ok(Json(CancelResponse {
             ok: true,
             no_op: !cancelled_direct_turn,
@@ -4303,6 +4383,13 @@ async fn cancel_conversation(
         )
         .await
         .map_err(AppError::BadRequest)?;
+
+    record_cancel_outcome(
+        &id,
+        &effective_state,
+        "runtime_cancel_requested",
+        "not_checked",
+    );
 
     Ok(Json(CancelResponse {
         ok: true,

@@ -2679,8 +2679,13 @@ where
                 }
             )
         {
+            let turn_id = self.active_direct_turn.as_ref().map(|turn| turn.turn_id.0);
+            let generation = self.active_direct_turn.as_ref().map(|turn| turn.generation);
             tracing::debug!(
                 conv_id = %self.context.conversation_id,
+                turn_id = ?turn_id,
+                generation = ?generation,
+                terminal_settlement_pending = self.pending_direct_turn_terminal.is_some(),
                 "absorbing user cancellation delivered after runtime became idle"
             );
             return Ok(());
@@ -2902,6 +2907,8 @@ where
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        let will_settle_active_direct_turn =
+            self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -2922,8 +2929,6 @@ where
             let will_drain_from_idle = matches!(self.state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
-            let will_settle_active_direct_turn =
-                self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
             if !will_drain_from_idle && !will_settle_active_direct_turn {
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
@@ -2932,7 +2937,9 @@ where
             // The turn's trace ends when the conversation stops working —
             // including the transient Idle of a steering drain, where the
             // queued message legitimately starts a new turn (and span).
-            self.settle_turn_span();
+            if !will_settle_active_direct_turn {
+                self.settle_turn_span();
+            }
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
@@ -3101,6 +3108,9 @@ where
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
+        if will_settle_active_direct_turn {
+            self.settle_turn_span();
+        }
 
         Ok(generated_events)
     }
@@ -3200,38 +3210,7 @@ where
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.take(),
         ) {
-            let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
-                turn,
-                terminal: terminal.as_ref().clone(),
-                state: self.state.clone(),
-                state_updated_at: self.state_updated_at,
-            };
-            if let Err(error) = self.storage.settle_active_direct_turn(&settlement).await {
-                let snapshot = self
-                    .storage
-                    .get_state_snapshot(&self.context.conversation_id)
-                    .await?;
-                let active = self
-                    .storage
-                    .load_active_direct_turn(&self.context.conversation_id)
-                    .await?;
-                let committed = snapshot.state == settlement.state
-                    && active
-                        .as_ref()
-                        .is_none_or(|loaded| loaded.active != settlement.turn);
-                if committed {
-                    self.state = snapshot.state;
-                    self.state_updated_at = snapshot.state_updated_at;
-                    self.active_direct_turn = None;
-                    self.direct_turn_cancellation_initiated = false;
-                } else {
-                    self.pending_direct_turn_terminal = Some(terminal);
-                    return Err(error);
-                }
-            } else {
-                self.active_direct_turn = None;
-                self.direct_turn_cancellation_initiated = false;
-            }
+            self.settle_pending_direct_turn(turn, terminal).await?;
         } else {
             self.storage
                 .update_state(
@@ -3250,6 +3229,157 @@ where
             });
         }
         Ok(None)
+    }
+
+    async fn settle_pending_direct_turn(
+        &mut self,
+        turn: crate::runtime::traits::ActiveDirectTurn,
+        terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
+    ) -> Result<(), String> {
+        let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
+            turn,
+            terminal: terminal.as_ref().clone(),
+            state: self.state.clone(),
+            state_updated_at: self.state_updated_at,
+        };
+        let parent = self
+            .turn_span
+            .clone()
+            .unwrap_or_else(tracing::Span::current);
+        let span = crate::logging::direct_turn_settlement_span(
+            &parent,
+            &self.context.conversation_id,
+            settlement.turn.turn_id.0,
+            settlement.turn.generation,
+            settlement.terminal.variant_name(),
+            settlement.state.variant_name(),
+        );
+        match self
+            .storage
+            .settle_active_direct_turn(&settlement)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(()) => {
+                span.record("outcome", "committed");
+                span.record("commit_probe", "not_needed");
+                self.active_direct_turn = None;
+                self.direct_turn_cancellation_initiated = false;
+                Ok(())
+            }
+            Err(error) => {
+                span.record("error.message", error.as_str());
+                self.reconcile_failed_direct_turn_settlement(settlement, terminal, error, span)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn reconcile_failed_direct_turn_settlement(
+        &mut self,
+        settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
+        terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
+        error: String,
+        span: tracing::Span,
+    ) -> Result<(), String> {
+        let snapshot = match self
+            .storage
+            .get_state_snapshot(&self.context.conversation_id)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(probe_error) => {
+                span.record("outcome", "commit_probe_failed");
+                span.record("commit_probe", "state_read_failed");
+                span.record("probe.error.message", probe_error.as_str());
+                span.record("otel.status_code", "ERROR");
+                tracing::error!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    settlement_error = %error,
+                    probe_error = %probe_error,
+                    "Direct-turn settlement failed and commit probe could not read conversation state"
+                );
+                return Err(probe_error);
+            }
+        };
+        span.record("durable_state", snapshot.state.variant_name());
+        let active = match self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .instrument(span.clone())
+            .await
+        {
+            Ok(active) => active,
+            Err(probe_error) => {
+                span.record("outcome", "commit_probe_failed");
+                span.record("commit_probe", "turn_read_failed");
+                span.record("probe.error.message", probe_error.as_str());
+                span.record("otel.status_code", "ERROR");
+                tracing::error!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    settlement_error = %error,
+                    probe_error = %probe_error,
+                    "Direct-turn settlement failed and commit probe could not read active turn"
+                );
+                return Err(probe_error);
+            }
+        };
+        let turn_still_active = active
+            .as_ref()
+            .is_some_and(|loaded| loaded.active == settlement.turn);
+        span.record("active_turn_present", active.is_some());
+        span.record("turn_still_active", turn_still_active);
+        let committed = snapshot.state == settlement.state
+            && active
+                .as_ref()
+                .is_none_or(|loaded| loaded.active != settlement.turn);
+        if committed {
+            span.record("outcome", "reconciled_committed");
+            span.record("commit_probe", "committed");
+            tracing::warn!(
+                parent: &span,
+                conv_id = %self.context.conversation_id,
+                turn_id = settlement.turn.turn_id.0,
+                generation = settlement.turn.generation,
+                terminal_kind = settlement.terminal.variant_name(),
+                settlement_error = %error,
+                "Direct-turn settlement returned an error after commit; reconciled committed state"
+            );
+            self.state = snapshot.state;
+            self.state_updated_at = snapshot.state_updated_at;
+            self.active_direct_turn = None;
+            self.direct_turn_cancellation_initiated = false;
+            return Ok(());
+        }
+
+        span.record("outcome", "failed_still_owed");
+        span.record("commit_probe", "still_owed");
+        span.record("otel.status_code", "ERROR");
+        tracing::error!(
+            parent: &span,
+            conv_id = %self.context.conversation_id,
+            turn_id = settlement.turn.turn_id.0,
+            generation = settlement.turn.generation,
+            terminal_kind = settlement.terminal.variant_name(),
+            target_state = settlement.state.variant_name(),
+            durable_state = snapshot.state.variant_name(),
+            active_turn_present = active.is_some(),
+            turn_still_active,
+            settlement_error = %error,
+            "Direct-turn settlement failed before commit; terminal obligation remains owed"
+        );
+        self.pending_direct_turn_terminal = Some(terminal);
+        Err(error)
     }
 
     /// If the current state transition is a steering-queue drain hook point and
