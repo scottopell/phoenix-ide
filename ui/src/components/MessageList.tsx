@@ -53,6 +53,7 @@ import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useCo
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
+  findHistoricalUnitLocationByMessageId,
   buildTailUnits,
   agentTurnsInHistoricalUnit,
   type HistoricalUnit,
@@ -1058,7 +1059,11 @@ function MessageListImpl({
   // A navigation jump has one positioning owner: VirtualTranscript. The selected
   // key remains pending until its virtualized row mounts, at which point the row
   // ref applies presentation-only highlighting without moving the scroller.
-  const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
+  const pendingPulseRef = useRef<{
+    conversationId: string | undefined;
+    key: string;
+    memberMessageId?: string;
+  } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
   const pulseTimerRef = useRef(0);
 
@@ -1081,7 +1086,9 @@ function MessageListImpl({
     ) return;
     pendingPulseRef.current = null;
     clearHighlight();
-    const target = row.querySelector('.message') ?? row;
+    const target = pending.memberMessageId
+      ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
+      : row.querySelector('.message') ?? row;
     highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
     pulseTimerRef.current = window.setTimeout(() => {
@@ -1108,12 +1115,16 @@ function MessageListImpl({
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
 
-  const scrollToUnitIndex = useCallback((unitIndex: number) => {
+  const scrollToUnitIndex = useCallback((unitIndex: number, memberMessageId?: string) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
     dispatchScrollEvent({ type: 'navigationJumped' });
     clearHighlight();
-    pendingPulseRef.current = { conversationId, key: unit.key };
+    pendingPulseRef.current = {
+      conversationId,
+      key: unit.key,
+      ...(memberMessageId ? { memberMessageId } : {}),
+    };
     transcriptRef.current?.scrollToIndex(unitIndex, 'start');
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
@@ -1131,11 +1142,11 @@ function MessageListImpl({
   }, []);
 
   const scrollToMessageId = useCallback((messageId: string) => {
-    const index = findUnitIndexByMessageId(messageId);
-    if (index < 0) return false;
-    scrollToUnitIndex(index);
+    const location = findHistoricalUnitLocationByMessageId(historicalUnits, messageId);
+    if (!location) return false;
+    scrollToUnitIndex(location.unitIndex, location.memberMessageId);
     return true;
-  }, [findUnitIndexByMessageId, scrollToUnitIndex]);
+  }, [historicalUnits, scrollToUnitIndex]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
@@ -1224,7 +1235,12 @@ function MessageListImpl({
             if (unit) {
               dispatchScrollEvent({ type: 'navigationJumped' });
               clearHighlight();
-              pendingPulseRef.current = { conversationId, key: unit.key };
+              const location = findHistoricalUnitLocationByMessageId(historicalUnits, command.targetMessageId);
+              pendingPulseRef.current = {
+                conversationId,
+                key: unit.key,
+                ...(location ? { memberMessageId: location.memberMessageId } : {}),
+              };
               if (effect.viewportStartOffset === undefined) {
                 transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
               } else {

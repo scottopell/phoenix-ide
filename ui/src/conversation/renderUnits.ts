@@ -93,20 +93,34 @@ export function findHistoricalUnitIndexByMessageId(
   historicalUnits: readonly HistoricalUnit[],
   messageId: string,
 ): number {
-  return historicalUnits.findIndex((unit) => {
-    const agentTurns = unit.kind === 'agent_turn'
-      ? [unit]
-      : unit.kind === 'tool_only_agent_turn_group'
-        ? unit.members
-        : [];
-    if (agentTurns.some((member) => (
-      member.agent.message_id === messageId
-      || Array.from(member.toolResultsByUseId.values()).some((message) => message.message_id === messageId)
-    ))) return true;
-    return 'message' in unit
-      && 'message_id' in unit.message
-      && unit.message.message_id === messageId;
-  });
+  return findHistoricalUnitLocationByMessageId(historicalUnits, messageId)?.unitIndex ?? -1;
+}
+
+export interface HistoricalUnitLocation {
+  unitIndex: number;
+  unitKey: string;
+  memberMessageId: string;
+}
+
+export function findHistoricalUnitLocationByMessageId(
+  historicalUnits: readonly HistoricalUnit[],
+  messageId: string,
+): HistoricalUnitLocation | null {
+  for (let unitIndex = 0; unitIndex < historicalUnits.length; unitIndex += 1) {
+    const unit = historicalUnits[unitIndex]!;
+    for (const member of agentTurnsInHistoricalUnit(unit)) {
+      if (
+        member.agent.message_id === messageId
+        || Array.from(member.toolResultsByUseId.values()).some((result) => result.message_id === messageId)
+      ) {
+        return { unitIndex, unitKey: unit.key, memberMessageId: member.agent.message_id };
+      }
+    }
+    if ('message' in unit && 'message_id' in unit.message && unit.message.message_id === messageId) {
+      return { unitIndex, unitKey: unit.key, memberMessageId: messageId };
+    }
+  }
+  return null;
 }
 
 export interface TailBuildInputs {
@@ -193,18 +207,15 @@ function groupToolOnlyAgentTurns(
   const run: AgentTurnUnit[] = [];
 
   const flushRun = () => {
-    while (run.length > 0) {
-      const members = run.splice(0, MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP);
-      if (members.length === 1) {
-        grouped.push(members[0]!);
-      } else {
-        grouped.push({
-          kind: 'tool_only_agent_turn_group',
-          key: members[0]!.key,
-          members,
-        });
-      }
+    for (let start = 0; start < run.length; start += MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP) {
+      const members = run.slice(start, start + MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP);
+      grouped.push({
+        kind: 'tool_only_agent_turn_group',
+        key: members[0]!.key,
+        members,
+      });
     }
+    run.length = 0;
   };
 
   for (const unit of units) {

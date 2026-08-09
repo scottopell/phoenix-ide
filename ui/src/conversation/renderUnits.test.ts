@@ -10,6 +10,7 @@ import {
   buildRenderUnits,
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
+  findHistoricalUnitLocationByMessageId,
   SUB_AGENT_STATUS_KEY,
   type AgentTurnUnit,
   type HistoricalUnit,
@@ -268,16 +269,16 @@ describe('buildRenderUnits', () => {
 
       expect(out.historicalUnits.map((unit) => unit.kind)).toEqual([
         'user',
-        'agent_turn',
+        'tool_only_agent_turn_group',
         'system',
         'tool_only_agent_turn_group',
         'agent_turn',
         'agent_turn',
-        'agent_turn',
+        'tool_only_agent_turn_group',
       ]);
     });
 
-    it('bounds physical groups and keeps singleton overflow as an agent turn', () => {
+    it('bounds physical groups and keeps singleton overflow in the stable group variant', () => {
       const messages = Array.from({ length: 9 }, (_, index) =>
         agentMsg(`bounded-${index + 1}`, [toolUseBlock(`bounded-use-${index + 1}`)]));
 
@@ -287,7 +288,9 @@ describe('buildRenderUnits', () => {
       expect(out.historicalUnits[0]?.kind).toBe('tool_only_agent_turn_group');
       if (out.historicalUnits[0]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected bounded group');
       expect(out.historicalUnits[0].members).toHaveLength(8);
-      expect(out.historicalUnits[1]?.kind).toBe('agent_turn');
+      expect(out.historicalUnits[1]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[1]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected stable singleton group');
+      expect(out.historicalUnits[1].members).toHaveLength(1);
     });
 
     it('does not merge newly prepended history across a preserved page boundary', () => {
@@ -309,6 +312,18 @@ describe('buildRenderUnits', () => {
       expect(out.historicalUnits.every((unit) => unit.kind === 'tool_only_agent_turn_group')).toBe(true);
     });
 
+    it('keeps the same unit kind and key when a singleton gains an adjacent tool turn', () => {
+      const first = agentMsg('stable-a', [toolUseBlock('stable-use-a')]);
+      const singleton = buildHistoricalUnits({ messages: [first], pendingMessages: [] });
+      const promoted = buildHistoricalUnits({
+        messages: [first, agentMsg('stable-b', [toolUseBlock('stable-use-b')])],
+        pendingMessages: [],
+      });
+
+      expect(singleton.historicalUnits[0]).toMatchObject({ kind: 'tool_only_agent_turn_group', key: 'stable-a' });
+      expect(promoted.historicalUnits[0]).toMatchObject({ kind: 'tool_only_agent_turn_group', key: 'stable-a' });
+    });
+
     it('resolves every grouped member and result to the shared virtual row', () => {
       const out = buildRenderUnits({
         messages: [
@@ -327,6 +342,12 @@ describe('buildRenderUnits', () => {
       expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 't1')).toBe(1);
       expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'a2')).toBe(1);
       expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 't2')).toBe(1);
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'a2')).toEqual({
+        unitIndex: 1,
+        unitKey: 'a1',
+        memberMessageId: 'a2',
+      });
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 't2')?.memberMessageId).toBe('a2');
     });
   });
 

@@ -761,8 +761,9 @@ describe('inline tool timers', () => {
       convState: { type: 'idle' },
       streamingHandle: null,
     });
-    const initialTurn = initialUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
-    if (!initialTurn || initialTurn.kind !== 'agent_turn') throw new Error('missing initial agent turn');
+    const initialUnit = initialUnits.historicalUnits.find((u) => u.kind === 'tool_only_agent_turn_group');
+    const initialTurn = initialUnit?.kind === 'tool_only_agent_turn_group' ? initialUnit.members[0] : undefined;
+    if (!initialTurn) throw new Error('missing initial agent turn');
 
     const { rerender } = render(
       <MemoryRouter>
@@ -789,8 +790,9 @@ describe('inline tool timers', () => {
       convState: { type: 'idle' },
       streamingHandle: null,
     });
-    const liveTurn = liveUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
-    if (!liveTurn || liveTurn.kind !== 'agent_turn') throw new Error('missing live agent turn');
+    const liveUnit = liveUnits.historicalUnits.find((u) => u.kind === 'tool_only_agent_turn_group');
+    const liveTurn = liveUnit?.kind === 'tool_only_agent_turn_group' ? liveUnit.members[0] : undefined;
+    if (!liveTurn) throw new Error('missing live agent turn');
 
     rerender(
       <MemoryRouter>
@@ -945,12 +947,12 @@ describe('inline tool timers', () => {
 
   it('preserves retry audit metadata in a collapsed tool group', () => {
     mockDensity = 'compact';
-    const first = { ...agentMessage('agent-retry-a', [
+    const first = agentMessage('agent-retry-a', [
       { type: 'tool_use', id: 'retry-read', name: 'read_file', input: { path: 'a.md' } },
-    ], 2), display_data: { retry_count: 2 } };
-    const second = agentMessage('agent-retry-b', [
+    ], 2);
+    const second = { ...agentMessage('agent-retry-b', [
       { type: 'tool_use', id: 'retry-search', name: 'search', input: { pattern: 'needle' } },
-    ], 3);
+    ], 3), display_data: { retry_count: 2 } };
 
     render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
       { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
@@ -958,6 +960,7 @@ describe('inline tool timers', () => {
     ]} /></MemoryRouter>);
 
     expect(screen.getByText('retried 2x')).toBeInTheDocument();
+    expect(screen.getByText('retried 2x').closest('.compact-tool-card')).toHaveTextContent('search');
   });
 
   it('preserves the vertical detailed rendering for a tool-only group in full density', () => {
@@ -978,6 +981,7 @@ describe('inline tool timers', () => {
     );
 
     expect(document.querySelectorAll('.message.agent')).toHaveLength(2);
+    expect(document.querySelectorAll('.tool-only-agent-turn-group-member')).toHaveLength(2);
     expect(document.querySelectorAll('.tool-block')).toHaveLength(2);
     expect(document.querySelector('.compact-tool-strip')).toBeNull();
   });

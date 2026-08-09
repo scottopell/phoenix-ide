@@ -79,16 +79,14 @@ THE SYSTEM SHALL NOT emit a standalone unit for it
 AND SHALL attach it to the preceding `agent_turn` unit's
 `toolResultsByUseId` map keyed by the result's `tool_use_id`
 
-WHEN two or more adjacent `agent_turn` units contain only non-`think` tool calls
+WHEN one or more adjacent `agent_turn` units contain only non-`think` tool calls
 THE SYSTEM SHALL partition that run into `tool_only_agent_turn_group` historical units of at most eight members, each keyed by its first member
+AND SHALL use the group variant for a one-member run so appending an adjacent tool turn preserves the renderer's identity and interaction state
 AND SHALL retain the ordered member units with each member's source identity, `toolResultsByUseId`, and `isFirstInTurn` intact
 
 WHEN older history is prepended
 THE SYSTEM SHALL preserve a grouping boundary before the previously loaded first historical unit
 SO THAT acquisition cannot merge that existing physical row into an older group or change its stable key, measured extent, or mounted interaction state
-
-WHEN such a run contains only one `agent_turn`
-THE SYSTEM SHALL retain the original `agent_turn` unit
 
 WHEN user, skill, pending-user, visible system, assistant prose, or `think` content occurs
 THE SYSTEM SHALL terminate any tool-only grouping boundary before that content
@@ -142,7 +140,8 @@ manifesting here is still a UI-side recoverable skip, not a render-
 time error)
 
 WHEN lookup targets an agent message or owned tool-result message inside a `tool_only_agent_turn_group`
-THE SYSTEM SHALL resolve the target to the containing group's historical-unit index
+THE SYSTEM SHALL resolve both the containing group's historical-unit index and the matched member's agent-message identity
+AND SHALL position and highlight the matched member or compact card rather than the group's first member
 AND SHALL retain the member's canonical tool-result ownership rather than copying results into a group-level parallel map
 
 **Rationale:** Keeping tool results in a `Map<string, Message>` built at

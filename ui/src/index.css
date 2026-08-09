@@ -360,6 +360,10 @@ body.app-viewport-active #root {
   grid-column: 1 / -1;
 }
 
+.tool-only-agent-turn-group-member:not(:last-child) {
+  padding-bottom: 8px;
+}
+
 .compact-tool-card {
   display: flex;
   flex-direction: column;

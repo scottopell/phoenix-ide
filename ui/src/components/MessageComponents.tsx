@@ -721,10 +721,12 @@ function CompactToolStripImpl({
             className={classNames}
             onClick={() => onExpand(item.toolId)}
             data-sequence-id={item.ownerMessage.sequence_id}
+            data-message-id={item.ownerMessage.message_id}
             aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
           >
             <span className="compact-tool-card-header">
               <span className="compact-tool-card-name">{item.name}</span>
+              <AgentRetryBadge message={item.ownerMessage} />
               <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
             </span>
             {isCompactBash ? (
@@ -887,7 +889,6 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                 {formatMessageTime(first.agent.created_at)}
               </span>
             )}
-            <AgentRetryBadge message={first.agent} />
             <span className="message-header-actions">
               <MessageCopyButton message={first.agent} title="Copy Phoenix message" />
             </span>
@@ -900,9 +901,11 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
     );
   }
 
-  return members.map((member, index) => (
-    <AgentMessage
-      key={member.key}
+  return (
+    <div className="tool-only-agent-turn-group-details">
+      {members.map((member, index) => (
+        <div className="tool-only-agent-turn-group-member" key={member.key}>
+          <AgentMessage
       message={member.agent}
       toolResults={member.toolResultsByUseId}
       liveBashProgress={liveBashProgress}
@@ -919,8 +922,11 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
       {...(revealRequest ? { revealRequest } : {})}
       {...(activeHighlight ? { activeHighlight } : {})}
       {...(onRevealHandled ? { onRevealHandled } : {})}
-    />
-  ));
+          />
+        </div>
+      ))}
+    </div>
+  );
 });
 
 export const AgentMessage = memo(AgentMessageImpl);

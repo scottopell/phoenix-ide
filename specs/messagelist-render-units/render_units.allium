@@ -107,8 +107,10 @@ enum SkipReason {
 
 -- A historical render unit. Kind-discriminated; agent_turn carries the
 -- tool-result map and the pre-computed isFirstInTurn flag. A
--- tool_only_agent_turn_group carries an ordered bounded segment of two to
--- eight adjacent agent_turn members; each member retains those same owned fields.
+-- tool_only_agent_turn_group carries an ordered bounded segment of one to
+-- eight adjacent agent_turn members; groups of one retain the same group variant
+-- so live appends preserve component identity and expansion state. Each member
+-- retains those same owned fields.
 entity HistoricalUnit {
     kind: HistoricalKind
     key: String
@@ -134,6 +136,8 @@ entity TailUnit {
 entity Builder {
     messages: List<Message>
     pending_messages: List<QueuedMessage>
+    -- Stable row keys before which history acquisition must not merge groups.
+    group_boundaries_before_keys: Set<String>
     conv_state: ConvState
     is_streaming: Boolean
     streaming_handle: StreamingHandle?
@@ -420,18 +424,20 @@ rule AppendPendingHistoricalUnits {
 
     requires: b.phase = "pending_append"
 
-    ensures: b.historical = concat(group_tool_only_agent_turns(b.historical), pending_historical_units_in_order(b.pending_messages))
+    ensures: b.historical = concat(group_tool_only_agent_turns(b.historical, b.group_boundaries_before_keys), pending_historical_units_in_order(b.pending_messages))
     ensures: b.phase = "tail_assembly"
 
     @guidance
         -- pending_historical_units_in_order(qs):
-        -- group_tool_only_agent_turns(units) partitions each adjacent run of
+        -- group_tool_only_agent_turns(units, boundaries) partitions each
+        -- boundary-delimited adjacent run of
         -- tool-only agent_turn units into bounded groups of at most eight with
         -- { kind: tool_only_agent_turn_group,
         --   key: first(run).key,
         --   source_message_id: first(run).source_message_id,
         --   members: run }.
-        -- A run of one remains its original agent_turn unit.
+        -- A run of one remains a one-member tool_only_agent_turn_group so
+        -- appending an adjacent tool turn does not change the unit variant.
         --
         -- History acquisition inserts an explicit grouping boundary before
         -- the previously loaded first historical unit, preserving that row's
@@ -561,7 +567,7 @@ invariant ToolOnlyGroupsAreStructural {
             for u in b.historical:
                 u.kind = "tool_only_agent_turn_group" implies
                     u.members != null and
-                    len(u.members) >= 2 and
+                    len(u.members) >= 1 and
                     len(u.members) <= 8 and
                     u.key = first(u.members).key
                     -- Every member has kind agent_turn. Grouped member agent
@@ -644,13 +650,13 @@ invariant PositionAdvancesMonotonically {
         and (b.phase != "walking" implies b.position = len(b.messages))
 }
 
--- Every emitted historical unit corresponds to exactly one input
--- message. The kind/type alignment is part of the predicate:
--- agent_turn ↔ agent, user ↔ user, skill ↔ skill, system ↔ system.
+-- Every leaf historical unit corresponds to exactly one input message.
+-- A tool-only group corresponds to its ordered one-to-eight agent_turn members,
+-- and every member independently satisfies the leaf source predicate.
 invariant EveryHistoricalUnitHasSource {
     for b in Builders:
         for u in b.historical:
-            b.phase = "done" implies historical_unit_has_source(b, u)
+            b.phase = "done" implies historical_unit_or_members_have_sources(b, u)
 }
 
 -- Unit keys are unique across the complete physical list. Pending and
