@@ -181,8 +181,11 @@ rule EnqueueSteeringMessage {
         -- before committing, so no accepted row is sent to a retired channel.
         -- Once the append commits, durable queue admission is successful even
         -- if executor delivery and immediate runtime reconstruction both fail.
-        -- The committed row remains authoritative and a later reconstruction
-        -- drains it; the HTTP result must not invite duplicate user intent.
+        -- The runtime makes one bounded reconstruction retry. If that also
+        -- fails, it releases the preserved broadcaster so connected clients
+        -- reconnect and retry ordinary runtime construction. The committed row
+        -- remains authoritative; the HTTP result must not invite duplicate
+        -- user intent.
 }
 
 -- REQ-STEER-002

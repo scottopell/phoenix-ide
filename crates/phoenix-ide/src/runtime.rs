@@ -730,7 +730,6 @@ impl SseBroadcaster {
         Self::from_sender(tx, initial_last_seq)
     }
 
-    #[cfg(test)]
     fn same_channel(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
     }
@@ -3827,6 +3826,7 @@ impl RuntimeManager {
                 .map_err(|e| format!("Failed to send steer message: {e}"));
             drop(runtimes);
             if let Err(error) = send_result {
+                let stale_broadcaster = handle.broadcast_tx.clone();
                 tracing::warn!(
                     conversation_id,
                     message_id,
@@ -3840,7 +3840,11 @@ impl RuntimeManager {
                         conversation_id,
                         message_id,
                         %reconstruction_error,
-                        "Steering runtime reconstruction failed after durable admission; queued database row remains authoritative"
+                        "Steering runtime reconstruction failed after durable admission; scheduling one bounded retry"
+                    );
+                    self.schedule_steering_reconstruction_retry(
+                        conversation_id.to_string(),
+                        stale_broadcaster,
                     );
                 }
             }
@@ -3854,6 +3858,57 @@ impl RuntimeManager {
         );
 
         Ok(())
+    }
+
+    fn schedule_steering_reconstruction_retry(
+        self: &Arc<Self>,
+        conversation_id: String,
+        stale_broadcaster: SseBroadcaster,
+    ) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Err(error) = manager.get_or_create(&conversation_id).await {
+                let released = manager
+                    .release_failed_steering_reconstruction_broadcaster(
+                        &conversation_id,
+                        &stale_broadcaster,
+                    )
+                    .await;
+                tracing::warn!(
+                    conversation_id,
+                    %error,
+                    released_stale_broadcaster = released,
+                    "Bounded steering runtime reconstruction retry failed"
+                );
+            }
+        });
+    }
+
+    async fn release_failed_steering_reconstruction_broadcaster(
+        &self,
+        conversation_id: &str,
+        expected: &SseBroadcaster,
+    ) -> bool {
+        let creations = self.runtime_creations.lock().await;
+        if creations.contains_key(conversation_id) {
+            return false;
+        }
+        let runtimes = self.runtimes.read().await;
+        if runtimes.contains_key(conversation_id) {
+            return false;
+        }
+        let mut reservations = self.evicted_broadcasters.write().await;
+        let is_expected = reservations
+            .get(conversation_id)
+            .is_some_and(|current| current.same_channel(expected));
+        if is_expected {
+            reservations.remove(conversation_id);
+        }
+        drop(reservations);
+        drop(runtimes);
+        drop(creations);
+        is_expected
     }
 
     /// Subscribe to conversation updates.
@@ -5360,6 +5415,12 @@ mod scope_liveness_tests {
             .expect("create conversation");
         let _acknowledged_event_rx =
             insert_acknowledged_idle_handle(&manager, conversation_id).await;
+        let mut stale_events = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("closed runtime handle")
+            .broadcast_tx
+            .subscribe();
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         manager
@@ -5420,6 +5481,13 @@ mod scope_liveness_tests {
             vec!["accepted-before-reconstruction"]
         );
         assert!(manager.try_get_handle(conversation_id).await.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+                stale_events.recv().await
+            {}
+        })
+        .await
+        .expect("bounded retry failure must close the stale broadcaster");
     }
 
     #[tokio::test]
