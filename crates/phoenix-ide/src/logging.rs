@@ -348,8 +348,9 @@ impl PreparedLogConfig {
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
 pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
-    let tracer_provider = match trace_exporter_from_env()? {
+    let tracer_provider = match trace_exporter_from_env(|name| std::env::var_os(name))? {
         TraceExporter::None => None,
+        #[cfg(feature = "datadog-tracing")]
         TraceExporter::Datadog => Some(init_datadog_provider()),
         TraceExporter::Otlp => Some(init_otlp_provider()?),
     };
@@ -527,24 +528,30 @@ fn phoenix_span_limits() -> SpanLimits {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TraceExporter {
     None,
+    #[cfg(feature = "datadog-tracing")]
     Datadog,
     Otlp,
 }
 
-fn trace_exporter_from_env() -> std::io::Result<TraceExporter> {
-    match std::env::var("PHOENIX_TRACE_EXPORTER") {
-        Ok(value) => parse_explicit_trace_exporter(&value),
-        Err(std::env::VarError::NotPresent) => Ok(datadog_auto_exporter_from_env()),
-        Err(std::env::VarError::NotUnicode(_)) => invalid_input(
-            "PHOENIX_TRACE_EXPORTER must be valid UTF-8 (expected none, datadog, or otlp)",
-        ),
+fn trace_exporter_from_env(
+    mut env_var_os: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> std::io::Result<TraceExporter> {
+    match env_var_os("PHOENIX_TRACE_EXPORTER") {
+        Some(value) => parse_explicit_trace_exporter(&value),
+        None => datadog_auto_exporter_from_env(env_var_os),
     }
 }
 
-fn parse_explicit_trace_exporter(value: &str) -> std::io::Result<TraceExporter> {
+fn parse_explicit_trace_exporter(value: &std::ffi::OsStr) -> std::io::Result<TraceExporter> {
+    let value = value.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PHOENIX_TRACE_EXPORTER must be valid UTF-8 (expected none, datadog, or otlp)",
+        )
+    })?;
     match value.trim().to_ascii_lowercase().as_str() {
         "none" => Ok(TraceExporter::None),
-        "datadog" => Ok(TraceExporter::Datadog),
+        "datadog" => datadog_exporter(),
         "otlp" => Ok(TraceExporter::Otlp),
         other => invalid_input(format!(
             "invalid PHOENIX_TRACE_EXPORTER={other:?}; expected none, datadog, or otlp"
@@ -552,21 +559,37 @@ fn parse_explicit_trace_exporter(value: &str) -> std::io::Result<TraceExporter> 
     }
 }
 
-fn datadog_auto_exporter_from_env() -> TraceExporter {
+fn datadog_auto_exporter_from_env(
+    mut env_var_os: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> std::io::Result<TraceExporter> {
     if env_var_is_false("DD_TRACE_ENABLED") {
-        return TraceExporter::None;
+        return Ok(TraceExporter::None);
     }
 
     if env_var_is_true("DD_TRACE_ENABLED")
-        || std::env::var_os("DD_TRACE_AGENT_URL").is_some()
-        || std::env::var_os("DD_AGENT_HOST").is_some()
+        || env_var_os("DD_TRACE_AGENT_URL").is_some()
+        || env_var_os("DD_AGENT_HOST").is_some()
     {
-        TraceExporter::Datadog
+        datadog_exporter()
     } else {
-        TraceExporter::None
+        Ok(TraceExporter::None)
     }
 }
 
+fn datadog_exporter() -> std::io::Result<TraceExporter> {
+    #[cfg(feature = "datadog-tracing")]
+    {
+        Ok(TraceExporter::Datadog)
+    }
+    #[cfg(not(feature = "datadog-tracing"))]
+    {
+        invalid_input(
+            "Datadog trace export requested, but this Phoenix build omits datadog-tracing support; rebuild with --features datadog-tracing or choose PHOENIX_TRACE_EXPORTER=otlp|none",
+        )
+    }
+}
+
+#[cfg(feature = "datadog-tracing")]
 fn init_datadog_provider() -> SdkTracerProvider {
     let mut dd_config_builder = datadog_opentelemetry::configuration::Config::builder();
     if std::env::var("DD_SERVICE").is_err() {
@@ -1201,42 +1224,94 @@ mod tests {
     #[test]
     fn explicit_trace_exporter_values_parse() {
         assert_eq!(
-            parse_explicit_trace_exporter("none").unwrap(),
+            parse_explicit_trace_exporter(std::ffi::OsStr::new("none")).unwrap(),
             TraceExporter::None
         );
+        let datadog = parse_explicit_trace_exporter(std::ffi::OsStr::new(" DATADOG "));
+        #[cfg(feature = "datadog-tracing")]
+        assert_eq!(datadog.unwrap(), TraceExporter::Datadog);
+        #[cfg(not(feature = "datadog-tracing"))]
+        assert!(datadog
+            .unwrap_err()
+            .to_string()
+            .contains("omits datadog-tracing support"));
         assert_eq!(
-            parse_explicit_trace_exporter(" DATADOG ").unwrap(),
-            TraceExporter::Datadog
-        );
-        assert_eq!(
-            parse_explicit_trace_exporter("otlp").unwrap(),
+            parse_explicit_trace_exporter(std::ffi::OsStr::new("otlp")).unwrap(),
             TraceExporter::Otlp
         );
     }
 
     #[test]
     fn invalid_explicit_trace_exporter_is_rejected() {
-        let err = parse_explicit_trace_exporter("jaeger").unwrap_err();
+        let err = parse_explicit_trace_exporter(std::ffi::OsStr::new("jaeger")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("PHOENIX_TRACE_EXPORTER"));
+    }
+
+    #[test]
+    fn non_utf8_trace_exporter_is_rejected() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let err = parse_explicit_trace_exporter(&std::ffi::OsString::from_vec(vec![0xff]))
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("valid UTF-8"));
+        }
+    }
+
+    #[test]
+    fn explicit_datadog_errors_clearly_when_support_is_not_compiled() {
+        let result = parse_explicit_trace_exporter(std::ffi::OsStr::new("datadog"));
+        #[cfg(feature = "datadog-tracing")]
+        assert_eq!(result.unwrap(), TraceExporter::Datadog);
+        #[cfg(not(feature = "datadog-tracing"))]
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("omits datadog-tracing support"));
     }
 
     #[test]
     fn unset_trace_exporter_preserves_datadog_auto_opt_in() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         without_trace_export_env(|| {
-            assert_eq!(trace_exporter_from_env().unwrap(), TraceExporter::None);
+            assert_eq!(
+                trace_exporter_from_env(|name| std::env::var_os(name)).unwrap(),
+                TraceExporter::None
+            );
 
             std::env::set_var("DD_TRACE_ENABLED", "true");
-            assert_eq!(trace_exporter_from_env().unwrap(), TraceExporter::Datadog);
+            let result = trace_exporter_from_env(|name| std::env::var_os(name));
+            #[cfg(feature = "datadog-tracing")]
+            assert_eq!(result.unwrap(), TraceExporter::Datadog);
+            #[cfg(not(feature = "datadog-tracing"))]
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("omits datadog-tracing support"));
             std::env::remove_var("DD_TRACE_ENABLED");
 
             std::env::set_var("DD_TRACE_AGENT_URL", "http://localhost:8126");
-            assert_eq!(trace_exporter_from_env().unwrap(), TraceExporter::Datadog);
+            let result = trace_exporter_from_env(|name| std::env::var_os(name));
+            #[cfg(feature = "datadog-tracing")]
+            assert_eq!(result.unwrap(), TraceExporter::Datadog);
+            #[cfg(not(feature = "datadog-tracing"))]
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("omits datadog-tracing support"));
             std::env::remove_var("DD_TRACE_AGENT_URL");
 
             std::env::set_var("DD_AGENT_HOST", "localhost");
-            assert_eq!(trace_exporter_from_env().unwrap(), TraceExporter::Datadog);
+            let result = trace_exporter_from_env(|name| std::env::var_os(name));
+            #[cfg(feature = "datadog-tracing")]
+            assert_eq!(result.unwrap(), TraceExporter::Datadog);
+            #[cfg(not(feature = "datadog-tracing"))]
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("omits datadog-tracing support"));
         });
     }
 
@@ -1247,7 +1322,10 @@ mod tests {
             std::env::set_var("PHOENIX_TRACE_EXPORTER", "none");
             std::env::set_var("DD_TRACE_ENABLED", "true");
             std::env::set_var("DD_TRACE_AGENT_URL", "http://localhost:8126");
-            assert_eq!(trace_exporter_from_env().unwrap(), TraceExporter::None);
+            assert_eq!(
+                trace_exporter_from_env(|name| std::env::var_os(name)).unwrap(),
+                TraceExporter::None
+            );
         });
     }
 

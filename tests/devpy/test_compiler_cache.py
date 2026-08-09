@@ -46,7 +46,28 @@ class CompilerCacheTests(unittest.TestCase):
         selected, env = self.configure(installed={"kache", "sccache"})
         self.assertEqual("sccache", selected)
         self.assertEqual("sccache", env["RUSTC_WRAPPER"])
-        self.assertEqual("20G", env["SCCACHE_CACHE_SIZE"])
+        self.assertEqual("10G", env["SCCACHE_CACHE_SIZE"])
+
+    def test_sccache_limit_warning_reports_running_server_mismatch(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"max_cache_size": 21474836480}',
+            stderr="",
+        )
+        with mock.patch.object(self.dev.subprocess, "run", return_value=completed):
+            warning = self.dev._sccache_limit_warning()
+
+        self.assertIn("20.0 GiB", warning)
+        self.assertIn("restart sccache", warning)
+
+    def test_sccache_limit_warning_accepts_effective_limit(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"max_cache_size": 10737418240}',
+            stderr="",
+        )
+        with mock.patch.object(self.dev.subprocess, "run", return_value=completed):
+            self.assertIsNone(self.dev._sccache_limit_warning())
 
     def test_auto_uses_kache_when_sccache_is_unavailable(self):
         selected, env = self.configure(installed={"kache"})

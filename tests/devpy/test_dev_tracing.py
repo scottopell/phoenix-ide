@@ -452,6 +452,7 @@ class DevTracingTests(unittest.TestCase):
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
             mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
             mock.patch.object(self.dev, "_dir_size_bytes", return_value=4096) as dir_size,
+            mock.patch.object(Path, "exists", return_value=True),
             mock.patch("builtins.print"),
         ):
             self.dev._run_cargo_build(["cargo", "build", "--release"], ROOT, "release")
@@ -467,9 +468,11 @@ class DevTracingTests(unittest.TestCase):
         self.assertTrue(attributes["build.artifact.exists"])
         self.assertEqual("build.artifact_size", span.events[0][0])
         self.assertEqual(4096, span.events[0][1]["build.artifact.size_bytes"])
-        dir_size.assert_called_once_with((ROOT / "target").resolve())
+        dir_size.assert_called_once_with((ROOT / "target" / "release").resolve())
 
     def test_record_span_artifact_size_returns_zero_when_directory_missing(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
         span = FakeSpan()
 
         attributes = self.dev._record_span_artifact_size(
@@ -485,13 +488,28 @@ class DevTracingTests(unittest.TestCase):
 
     def test_check_step_artifact_dir_uses_cargo_target_dir_when_present(self):
         self.assertEqual(
-            Path("/tmp/clippy-target"),
+            Path("/tmp/clippy-target/debug"),
             self.dev._check_step_artifact_dir(
                 "clippy", "cargo clippy", {"CARGO_TARGET_DIR": "/tmp/clippy-target"}
             ),
         )
-        self.assertEqual(ROOT / "target", self.dev._check_step_artifact_dir("rust", "cargo test", {}))
+        self.assertEqual(
+            ROOT / "target" / "debug",
+            self.dev._check_step_artifact_dir("rust", "cargo test", {}),
+        )
         self.assertIsNone(self.dev._check_step_artifact_dir("ui", "eslint", {}))
+
+    def test_artifact_measurement_is_skipped_without_active_tracing(self):
+        self.dev._DEV_TRACING = None
+        with mock.patch.object(self.dev, "_dir_size_bytes") as dir_size:
+            attributes = self.dev._record_span_artifact_size(
+                self.dev._NOOP_SPAN,
+                event_name="build.artifact_size",
+                path=ROOT / "target" / "debug",
+                attribute_prefix="build.artifact",
+            )
+        self.assertEqual({}, attributes)
+        dir_size.assert_not_called()
 
     def test_cargo_build_interrupt_terminates_and_waits_for_child(self):
         class InterruptingStream:

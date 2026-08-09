@@ -1440,6 +1440,8 @@ def _dir_size_bytes(path: Path) -> int:
 
 def _record_span_artifact_size(span, *, event_name: str, path: Path, attribute_prefix: str) -> dict:
     """Measure a bounded artifact tree outside the timed span and annotate it."""
+    if span is _NOOP_SPAN or _DEV_TRACING is None:
+        return {}
     resolved = path.resolve()
     exists = resolved.exists()
     size_bytes = _dir_size_bytes(resolved) if exists else 0
@@ -1810,7 +1812,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         attributes.update(_record_span_artifact_size(
             span,
             event_name="build.artifact_size",
-            path=ROOT / "target",
+            path=cwd / "target" / profile,
             attribute_prefix="build.artifact",
         ))
         _finish_dev_span(span, attributes, failed=returncode != 0)
@@ -4666,8 +4668,31 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
             return "none"
     elif backend == "sccache":
-        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+        os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
     return backend
+
+
+def _sccache_limit_warning(binary: str = "sccache") -> str | None:
+    try:
+        result = subprocess.run(
+            [binary, "--show-stats", "--stats-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return f"sccache limit unavailable: {(result.stderr or result.stdout).strip()}"
+        actual = int(json.loads(result.stdout)["max_cache_size"])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        return f"sccache limit unavailable: {error}"
+    requested = 10 * 1024**3
+    if actual != requested:
+        return (
+            f"running sccache server limit is {actual / 1024**3:.1f} GiB, not the "
+            "requested 10 GiB; restart sccache to apply SCCACHE_CACHE_SIZE"
+        )
+    return None
 
 
 _CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
@@ -4758,13 +4783,11 @@ def _finish_check_step_span(
 
 
 def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
-    if not name.startswith("cargo "):
-        return None
-    target_dir = env.get("CARGO_TARGET_DIR")
-    if target_dir:
-        return Path(target_dir)
-    if lane == "rust":
-        return ROOT / "target"
+    if lane == "clippy" and name == "cargo clippy":
+        target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
+        return target_dir / "debug"
+    if lane == "rust" and name == "cargo test":
+        return ROOT / "target" / "debug"
     return None
 
 
@@ -5559,6 +5582,9 @@ def cmd_check(
     selected_compiler_cache = None
     if cargo_active:
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+        if selected_compiler_cache == "sccache":
+            if warning := _sccache_limit_warning():
+                reporter.info(warning)
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["compiler_cache"] = selected_compiler_cache
     if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
@@ -7166,6 +7192,10 @@ def check_systemd_available() -> bool:
         return False
 
 
+def _production_cargo_feature_args() -> list[str]:
+    return ["--features", "phoenix-ide/datadog-tracing"]
+
+
 def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
     """Build the production binary from the invoking checkout's exact HEAD."""
     result = subprocess.run(
@@ -7230,7 +7260,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
-    cargo_cmd = ["cargo", "build", "--release"]
+    cargo_cmd = ["cargo", "build", "--release", *_production_cargo_feature_args()]
     if target:
         print(f"Building Rust ({target}, release)...")
         cargo_cmd += ["--target", target]
