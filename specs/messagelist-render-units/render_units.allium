@@ -98,6 +98,7 @@ enum TailKind {
 -- emits at console.debug carrying its reason; the set is closed.
 enum SkipReason {
     empty_system
+    hidden_system
     orphan_tool
     unknown_type
     missing_tool_use_id
@@ -273,6 +274,10 @@ rule SkipHiddenSystem {
     ensures: b.in_agent_run = b.in_agent_run
     ensures: b.active_agent_turn = b.active_agent_turn
     ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=current_message(b).message_id,
+        --           reason=hidden_system).
 }
 
 -- System message with non-empty text → system unit. Does NOT break the
@@ -523,7 +528,7 @@ rule AppendStreamingTailUnit {
     requires: b.phase = "tail_assembly"
     requires: b.is_streaming = true
     requires: b.streaming_handle != null
-    requires: not b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
+    requires: not historical_agent_members(b.historical).any(u => u.key = b.streaming_handle.key)
 
     ensures: b.tail = append(b.tail, streaming_unit(b.streaming_handle))
     ensures: b.phase = "tail_assembly"
@@ -539,7 +544,7 @@ rule SkipStreamingWhenFinalized {
     requires: b.phase = "tail_assembly"
     requires: b.is_streaming = true
     requires: b.streaming_handle != null
-    requires: b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
+    requires: historical_agent_members(b.historical).any(u => u.key = b.streaming_handle.key)
 
     ensures: b.tail = b.tail
     ensures: b.phase = "tail_assembly"
@@ -624,19 +629,14 @@ invariant EveryToolMessageAccountedFor {
                 implies tool_message_accounted_for(b, m)
 }
 
--- isFirstInTurn is true for the first agent_turn after any
--- user/skill (or the start of the list); false for any agent_turn
--- whose immediate predecessor in b.historical is another agent_turn.
---
--- `agent_turn_first_in_turn_predecessor_aligned(b, u)` is an opaque
--- predicate that asserts u.is_first_in_turn = (predecessor of u in
--- b.historical is not an agent_turn). Encoded as a helper because the
--- dialect doesn't support positional indexing into lists.
+-- isFirstInTurn is true for the first agent-turn leaf after any user/skill
+-- boundary (or the start of the list) and false for continuation leaves. The
+-- helper flattens standalone agent_turn units and ordered group members before
+-- checking each leaf's predecessor and precomputed flag.
 invariant FirstInTurnReflectsPriorRun {
     for b in Builders:
-        for u in b.historical:
-            b.phase = "done" and u.kind = "agent_turn"
-                implies agent_turn_first_in_turn_predecessor_aligned(b, u)
+        b.phase = "done" implies
+            flattened_agent_turns_have_aligned_first_in_turn(b.historical)
 }
 
 -- Tail units appear after all historical units in any rendered

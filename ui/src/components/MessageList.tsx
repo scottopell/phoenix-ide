@@ -1089,6 +1089,9 @@ function MessageListImpl({
     const target = pending.memberMessageId
       ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
       : row.querySelector('.message') ?? row;
+    if (pending.memberMessageId && target !== row) {
+      target.scrollIntoView({ block: 'nearest' });
+    }
     highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
     pulseTimerRef.current = window.setTimeout(() => {

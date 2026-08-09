@@ -953,6 +953,8 @@ describe('MessageList', () => {
 
   it('highlights the exact grouped member targeted by message id', () => {
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
     const first = { ...makeMessage(1, 'agent'), content: [{ type: 'tool_use', id: 'group-use-1', name: 'read_file', input: { path: 'one' } }] } as Message;
     const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'group-use-2', name: 'search', input: { pattern: 'two' } }] } as Message;
     const { container } = render(withConvContext(
@@ -971,6 +973,7 @@ describe('MessageList', () => {
     expect(listRef.current?.scrollToMessageId(second.message_id)).toBe(true);
     expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(0, 'start');
     expect(container.querySelector(`#message-${second.message_id}`)).toHaveClass('jump-highlight');
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
     expect(container.querySelector(`#message-${first.message_id}`)).not.toHaveClass('jump-highlight');
   });
 
