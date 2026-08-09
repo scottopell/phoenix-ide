@@ -162,13 +162,14 @@ export function updatesFromComments(comments) {
       if (record.recordType === "retirement") {
         const retirement = validateRetirement(value);
         const current = latest.get(retirement.workstream);
+        const retirementAuthor = comment.user?.login ?? "unknown";
         if (
-          current?.source.id === retirement.supersedes_comment_id &&
-          current.source.author === (comment.user?.login ?? "unknown")
+          current === undefined ||
+          (current.source.id <= retirement.supersedes_comment_id && current.source.author === retirementAuthor)
         ) {
           latest.delete(retirement.workstream);
         } else {
-          console.warn(`Ignoring retirement in comment ${comment.id}: current source ID and author must match`);
+          console.warn(`Ignoring retirement in comment ${comment.id}: it must supersede the same author's current source`);
         }
         continue;
       }

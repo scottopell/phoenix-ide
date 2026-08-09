@@ -91,14 +91,23 @@ test("retirement has a minimal exact schema bound to a source comment", () => {
   );
 });
 
-test("retirement requires the current source comment ID and author", () => {
+test("retirement requires the same author and cannot retire a newer source", () => {
   const current = comment(1, fenced(update()), { user: { login: "owner" } });
-  const wrongId = comment(2, retired("ios-vnext", 99), { user: { login: "owner" } });
-  const wrongAuthor = comment(3, retired("ios-vnext", 1), { user: { login: "other" } });
-  const matching = comment(4, retired("ios-vnext", 1), { user: { login: "owner" } });
-  assert.equal(updatesFromComments([current, wrongId]).length, 1);
+  const wrongAuthor = comment(2, retired("ios-vnext", 1), { user: { login: "other" } });
+  const newer = comment(3, fenced(update({ state: "Newer" })), { user: { login: "owner" } });
+  const staleRetirement = comment(4, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const matching = comment(5, retired("ios-vnext", 3), { user: { login: "owner" } });
   assert.equal(updatesFromComments([current, wrongAuthor]).length, 1);
-  assert.equal(updatesFromComments([current, matching]).length, 0);
+  assert.equal(updatesFromComments([current, newer, staleRetirement])[0].state, "Newer");
+  assert.equal(updatesFromComments([current, newer, matching]).length, 0);
+});
+
+test("retirement remains authoritative if its superseded source disappears", () => {
+  const older = comment(1, fenced(update({ state: "Older" })), { user: { login: "owner" } });
+  const retiredCurrent = comment(3, retired("ios-vnext", 2), { user: { login: "owner" } });
+
+  assert.equal(updatesFromComments([older, retiredCurrent]).length, 0);
+  assert.equal(updatesFromComments([retiredCurrent]).length, 0);
 });
 
 test("edited comments remain current instead of silently deleting a workstream", () => {
