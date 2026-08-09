@@ -79,6 +79,7 @@ enum HistoricalKind {
     user
     skill
     agent_turn
+    tool_only_agent_turn_group
     system
     pending_user
 }
@@ -105,7 +106,9 @@ enum SkipReason {
 ------------------------------------------------------------
 
 -- A historical render unit. Kind-discriminated; agent_turn carries the
--- tool-result map and the pre-computed isFirstInTurn flag.
+-- tool-result map and the pre-computed isFirstInTurn flag. A
+-- tool_only_agent_turn_group carries an ordered maximal run of at least two
+-- agent_turn members; each member retains those same owned fields.
 entity HistoricalUnit {
     kind: HistoricalKind
     key: String
@@ -113,6 +116,8 @@ entity HistoricalUnit {
     -- agent_turn-only fields:
     tool_results_by_use_id: Map<String, Message>?
     is_first_in_turn: Boolean?
+    -- tool_only_agent_turn_group-only field:
+    members: List<HistoricalUnit>?
 }
 
 -- A tail render unit. Always rendered, never collapsed by the window.
@@ -394,6 +399,14 @@ rule WalkComplete {
 -- Rules — pending append (phase = pending_append)
 ------------------------------------------------------------
 
+-- Before pending messages append, maximal adjacent runs of at least two
+-- tool-only agent turns become one structural historical unit. A tool-only
+-- turn has non-empty content consisting exclusively of non-think tool calls.
+-- The group key is its first member's key; members retain invocation order,
+-- tool-result ownership, source identity, and isFirstInTurn. Singleton runs
+-- remain agent_turn units. Any other historical unit breaks the run, so prose,
+-- think, system, user, skill, and pending content retain visible ordering.
+--
 -- Pending queued messages → pending_user HISTORICAL units, in input
 -- order, appended at the END of b.historical. Each unit's key is
 -- q.local_id, which equals the eventual server-echoed message_id at
@@ -407,10 +420,19 @@ rule AppendPendingHistoricalUnits {
 
     requires: b.phase = "pending_append"
 
-    ensures: b.historical = concat(b.historical, pending_historical_units_in_order(b.pending_messages))
+    ensures: b.historical = concat(group_tool_only_agent_turns(b.historical), pending_historical_units_in_order(b.pending_messages))
     ensures: b.phase = "tail_assembly"
 
     @guidance
+        -- pending_historical_units_in_order(qs):
+        -- group_tool_only_agent_turns(units) replaces each maximal adjacent
+        -- run of two or more tool-only agent_turn units with
+        -- { kind: tool_only_agent_turn_group,
+        --   key: first(run).key,
+        --   source_message_id: first(run).source_message_id,
+        --   members: run }.
+        -- A run of one remains its original agent_turn unit.
+        --
         -- pending_historical_units_in_order(qs):
         --   for q in qs (input order):
         --     emit { kind: pending_user, key: q.local_id, message: q }
@@ -526,6 +548,23 @@ rule AssemblyComplete {
 
 -- The historical list never contains a unit whose source message is a
 -- tool message. Tool messages live inside agent_turn.tool_results_by_use_id.
+-- Tool-only groups are physical render units rather than presentation metadata
+-- attached to several independently measured rows. Member ownership remains
+-- canonical, and member/result message-id lookup resolves to the group's index.
+invariant ToolOnlyGroupsAreStructural {
+    for b in Builders:
+        b.phase = "done" implies
+            for u in b.historical:
+                u.kind = "tool_only_agent_turn_group" implies
+                    u.members != null and
+                    len(u.members) >= 2 and
+                    u.key = first(u.members).key
+                    -- Every member has kind agent_turn. Grouped member agent
+                    -- messages and owned tool-result messages resolve to this
+                    -- group's physical index; each member retains its
+                    -- canonical result map.
+}
+
 invariant NoStandaloneToolUnit {
     for b in Builders:
         b.phase = "done" implies

@@ -573,6 +573,33 @@ describe('buildConversationSearchProjection', () => {
     expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
   });
 
+  it('keeps grouped member search sources unique while targeting the shared virtual row', () => {
+    const member = (key: string, toolId: string, path: string) => ({
+      kind: 'agent_turn' as const,
+      key,
+      isFirstInTurn: key === 'group-a',
+      agent: agentMsg(key, [
+        { type: 'tool_use' as const, id: toolId, name: 'read_file', input: { path } },
+      ]),
+      toolResultsByUseId: new Map(),
+    });
+    const units: RenderUnit[] = [{
+      kind: 'tool_only_agent_turn_group',
+      key: 'group-a',
+      members: [member('group-a', 'read-a', 'same-needle-a.ts'), member('group-b', 'read-b', 'same-needle-b.ts')],
+    }];
+
+    const projection = buildConversationSearchProjection(units, 'same-needle', { density: 'compact' });
+
+    expect(projection.matches).toHaveLength(2);
+    expect(new Set(projection.matches.map((match) => match.target.sourceId)).size).toBe(2);
+    expect(projection.matches.every((match) => match.target.kind === 'unit-text' && match.target.unitKey === 'group-a')).toBe(true);
+    expect(projection.sources.map((source) => source.revealTarget)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'tool-use-input', toolUseId: 'read-a' }),
+      expect.objectContaining({ kind: 'tool-use-input', toolUseId: 'read-b' }),
+    ]));
+  });
+
   it('searches complete keyword-search hits in compact display mode', () => {
     const units: RenderUnit[] = [{
       kind: 'agent_turn',

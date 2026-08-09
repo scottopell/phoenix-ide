@@ -32,7 +32,7 @@ function resultFor(messages: Message[], id: string) {
   return toolResults(messages).find(({ content }) => content.tool_use_id === id);
 }
 
-const expectedFamilies: ToolResultsScenarioFamily[] = ['shell', 'execution', 'discovery', 'media', 'profiling', 'subagents'];
+const expectedFamilies: ToolResultsScenarioFamily[] = ['shell', 'execution', 'discovery', 'media', 'profiling', 'grid', 'subagents'];
 
 const expectedIds = expectedFamilies.flatMap((family) => [`${family}-full`, `${family}-compact`]);
 
@@ -74,6 +74,7 @@ describe('tool results fixture scenarios', () => {
       discovery: [],
       media: [],
       profiling: ['profile-run-missing'],
+      grid: [],
       subagents: [],
     };
 
@@ -206,6 +207,20 @@ describe('tool results fixture scenarios', () => {
     expect(profileError?.content.is_error).toBe(true);
     expect(profileError?.message).not.toHaveProperty('display_data');
     expect(resultFor(messages, 'profile-generic')?.content.content).toContain('browser profile raw text fallback');
+  });
+
+  it('covers consecutive one-tool messages for structural compact-grid rendering', () => {
+    const messages = familyData('grid').messages;
+    const oneToolAgentMessages = messages.filter((message) => (
+      message.message_type === 'agent'
+      && Array.isArray(message.content)
+      && message.content.length === 1
+      && message.content[0]?.type === 'tool_use'
+    ));
+    expect(oneToolAgentMessages).toHaveLength(6);
+    expect(toolUses(messages).map(({ name }) => name)).toEqual([
+      'read_file', 'search', 'read_file', 'keyword_search', 'bash', 'read_file',
+    ]);
   });
 
   it('uses tasks-shaped spawn_agents input and persists success/failure/timeout outcomes', () => {

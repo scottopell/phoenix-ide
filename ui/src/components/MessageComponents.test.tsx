@@ -2,7 +2,7 @@ import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -885,6 +885,57 @@ describe('inline tool timers', () => {
 
     expect(screen.queryByText('result not received')).not.toBeInTheDocument();
   });
+  it('renders consecutive tool-only agent messages in one compact grid and expands exact detail', () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-grid-a', [
+      { type: 'tool_use', id: 'grid-read', name: 'read_file', input: { path: 'a.md' } },
+      { type: 'tool_use', id: 'grid-search', name: 'search', input: { pattern: 'needle' } },
+    ], 2);
+    const second = agentMessage('agent-grid-b', [
+      { type: 'tool_use', id: 'grid-keyword', name: 'keyword_search', input: { query: 'tool grid' } },
+      { type: 'tool_use', id: 'grid-bash', name: 'bash', input: { cmd: 'pnpm test' } },
+    ], 3);
+    const members = [
+      { kind: 'agent_turn' as const, key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn' as const, key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ];
+    Element.prototype.scrollIntoView = vi.fn();
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={members} /></MemoryRouter>);
+
+    const strip = screen.getByRole('list', { name: 'Tool calls' });
+    expect(strip.querySelectorAll('.compact-tool-card')).toHaveLength(4);
+    expect(strip.querySelector('.compact-tool-card.wide')).toHaveTextContent('bash');
+
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+
+    expect(screen.queryByRole('list', { name: 'Tool calls' })).not.toBeInTheDocument();
+    expect(document.querySelector('[data-tool-id="grid-read"]')).not.toBeNull();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it('preserves the vertical detailed rendering for a tool-only group in full density', () => {
+    const first = agentMessage('agent-full-a', [
+      { type: 'tool_use', id: 'full-read', name: 'read_file', input: { path: 'a.md' } },
+    ], 2);
+    const second = agentMessage('agent-full-b', [
+      { type: 'tool_use', id: 'full-search', name: 'search', input: { pattern: 'needle' } },
+    ], 3);
+
+    render(
+      <MemoryRouter>
+        <ToolOnlyAgentTurnGroup members={[
+          { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+          { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+        ]} />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelectorAll('.message.agent')).toHaveLength(2);
+    expect(document.querySelectorAll('.tool-block')).toHaveLength(2);
+    expect(document.querySelector('.compact-tool-strip')).toBeNull();
+  });
+
   it('renders compact bash cards with identity, final status+duration, and output tail from existing results', () => {
     mockDensity = 'compact';
     const agent = agentMessage('agent-compact-bash', [

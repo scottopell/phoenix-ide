@@ -37,6 +37,7 @@ import {
   UserMessage,
   QueuedUserMessage,
   AgentMessage,
+  ToolOnlyAgentTurnGroup,
   type AgentTextRevealRequest,
   type ConversationHighlight,
   SubAgentStatus,
@@ -53,6 +54,7 @@ import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
   buildTailUnits,
+  agentTurnsInHistoricalUnit,
   type HistoricalUnit,
   type TailUnit,
   type RenderUnit,
@@ -212,6 +214,24 @@ function LiveAgentTurn({ slug, message, ...props }: Omit<React.ComponentProps<ty
   return <AgentMessage message={message} liveBashProgress={liveBashProgress} {...props} />;
 }
 
+function LiveToolOnlyAgentTurnGroup({
+  slug,
+  members,
+  ...props
+}: Omit<React.ComponentProps<typeof ToolOnlyAgentTurnGroup>, 'liveBashProgress' | 'members'> & {
+  slug: string | null;
+  members: Extract<HistoricalUnit, { kind: 'tool_only_agent_turn_group' }>['members'];
+}) {
+  const toolUseIds = useMemo(
+    () => members.flatMap((member) => (Array.isArray(member.agent.content) ? member.agent.content : [])
+      .filter((block) => block.type === 'tool_use' && block.name === 'bash')
+      .flatMap((block) => block.id ? [block.id] : [])),
+    [members],
+  );
+  const liveBashProgress = useLiveBashProgressForToolIds(slug, toolUseIds);
+  return <ToolOnlyAgentTurnGroup members={members} liveBashProgress={liveBashProgress} {...props} />;
+}
+
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
@@ -276,6 +296,23 @@ function renderHistoricalUnit(
           activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
+          isLatestAgentMessage={isLatestAgentMessage}
+          unitKey={unit.key}
+          {...(revealRequest ? { revealRequest } : {})}
+          {...(activeHighlight ? { activeHighlight } : {})}
+          {...(onRevealHandled ? { onRevealHandled } : {})}
+        />
+      );
+    case 'tool_only_agent_turn_group':
+      return (
+        <LiveToolOnlyAgentTurnGroup
+          slug={slug}
+          members={unit.members}
+          onOpenFile={onOpenFile}
+          onOpenCommissionReview={onOpenCommissionReview}
+          filePathRootDir={filePathRootDir}
+          workScopeKey={workScopeKey}
+          activeToolUseId={activeToolUseId}
           isLatestAgentMessage={isLatestAgentMessage}
           unitKey={unit.key}
           {...(revealRequest ? { revealRequest } : {})}
@@ -494,9 +531,7 @@ function MessageListImpl({
       streamingHandle,
       endsInAgentRun,
       finalizedAgentKeys: new Set(
-        historicalUnits
-          .filter((unit) => unit.kind === 'agent_turn')
-          .map((unit) => unit.key),
+        historicalUnits.flatMap((unit) => agentTurnsInHistoricalUnit(unit).map((member) => member.key)),
       ),
     }),
     [convState, streamingHandle, endsInAgentRun, historicalUnits],
@@ -510,7 +545,9 @@ function MessageListImpl({
   const latestAgentKey = useMemo(() => {
     for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
       const unit = historicalUnits[i];
-      if (unit?.kind === 'agent_turn') return unit.key;
+      if (!unit) continue;
+      const members = agentTurnsInHistoricalUnit(unit);
+      if (members.length > 0) return members[members.length - 1]!.key;
     }
     return null;
   }, [historicalUnits]);
@@ -1062,7 +1099,8 @@ function MessageListImpl({
   );
 
   const messageIdForHistoricalUnit = useCallback((unit: HistoricalUnit): string | null => {
-    if (unit.kind === 'agent_turn') return unit.agent.message_id;
+    const firstAgentTurn = agentTurnsInHistoricalUnit(unit)[0];
+    if (firstAgentTurn) return firstAgentTurn.agent.message_id;
     if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
     return null;
   }, []);
@@ -1343,7 +1381,9 @@ function MessageListImpl({
           onCancelSteering,
           workScopeKey,
           activeToolUseId,
-          unit.kind === 'agent_turn' && unit.key === latestAgentKey,
+          unit.kind !== 'sub_agent_status'
+            && unit.kind !== 'streaming_agent'
+            && agentTurnsInHistoricalUnit(unit).some((member) => member.key === latestAgentKey),
           pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (

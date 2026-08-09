@@ -21,6 +21,7 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
+import type { AgentTurnUnit } from '../conversation/renderUnits';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -697,6 +698,7 @@ function CompactToolStripImpl({
           item.isSubAgent ? 'subagents' : '',
           item.isError ? 'error' : '',
           !item.hasResult ? 'pending' : '',
+          item.name === 'bash' ? 'wide' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError
@@ -787,6 +789,7 @@ interface AgentMessageProps {
    * renders in its full non-collapsed form.
    */
   forceExpandedText?: boolean;
+  forceExpandedTools?: boolean;
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
@@ -794,9 +797,116 @@ interface AgentMessageProps {
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
+interface ToolOnlyAgentTurnGroupProps {
+  members: readonly AgentTurnUnit[];
+  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
+  onOpenFile?: AgentMessageProps['onOpenFile'];
+  onOpenCommissionReview?: AgentMessageProps['onOpenCommissionReview'];
+  filePathRootDir?: string | undefined;
+  workScopeKey?: string | undefined;
+  activeToolUseId?: string | undefined;
+  isLatestAgentMessage?: boolean;
+  unitKey?: string;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: ConversationHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
+}
+
+export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
+  members,
+  liveBashProgress = {},
+  onOpenFile,
+  onOpenCommissionReview,
+  filePathRootDir,
+  workScopeKey,
+  activeToolUseId,
+  isLatestAgentMessage = false,
+  unitKey,
+  revealRequest = null,
+  activeHighlight = null,
+  onRevealHandled,
+}: ToolOnlyAgentTurnGroupProps) {
+  const { density } = useDensity();
+  const [expanded, setExpanded] = useState(false);
+  const pendingScrollToolIdRef = useRef<string | null>(null);
+  const items = useMemo(
+    () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
+    [liveBashProgress, members],
+  );
+
+  const expand = useCallback((toolId: string) => {
+    pendingScrollToolIdRef.current = toolId || null;
+    setExpanded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const toolId = pendingScrollToolIdRef.current;
+    pendingScrollToolIdRef.current = null;
+    if (!toolId) return;
+    document.querySelector(`[data-tool-id="${CSS.escape(toolId)}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [expanded]);
+
+  useEffect(() => {
+    if (density !== 'compact' || expanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
+    pendingScrollToolIdRef.current = 'toolUseId' in revealRequest.revealTarget
+      ? revealRequest.revealTarget.toolUseId
+      : null;
+    setExpanded(true);
+  }, [density, expanded, revealRequest]);
+
+  if (density === 'compact' && !expanded) {
+    const first = members[0];
+    return (
+      <div
+        id={first ? `message-${first.agent.message_id}` : undefined}
+        className="message agent compact-tool-group"
+        data-sequence-id={first?.agent.sequence_id}
+      >
+        {first?.isFirstInTurn && (
+          <div className="message-header">
+            <span className="message-sender">Phoenix</span>
+            {first.agent.created_at && (
+              <span className="message-time" title={new Date(first.agent.created_at).toLocaleString()}>
+                {formatMessageTime(first.agent.created_at)}
+              </span>
+            )}
+          </div>
+        )}
+        <div className="message-content">
+          <CompactToolStrip items={items} onExpand={expand} />
+        </div>
+      </div>
+    );
+  }
+
+  return members.map((member, index) => (
+    <AgentMessage
+      key={member.key}
+      message={member.agent}
+      toolResults={member.toolResultsByUseId}
+      liveBashProgress={liveBashProgress}
+      onOpenFile={onOpenFile}
+      onOpenCommissionReview={onOpenCommissionReview}
+      filePathRootDir={filePathRootDir}
+      workScopeKey={workScopeKey}
+      activeToolUseId={activeToolUseId}
+      forceExpandedTools={expanded}
+      isFirstInTurn={member.isFirstInTurn}
+      forceExpandedText={isLatestAgentMessage && index === members.length - 1}
+      isLatestAgentMessage={isLatestAgentMessage && index === members.length - 1}
+      {...(unitKey !== undefined ? { unitKey } : {})}
+      {...(revealRequest ? { revealRequest } : {})}
+      {...(activeHighlight ? { activeHighlight } : {})}
+      {...(onRevealHandled ? { onRevealHandled } : {})}
+    />
+  ));
+});
+
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -845,7 +955,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
 
   // Compact mode collapses tools only when there is at least one strip item;
   // a turn of pure prose / think asides has nothing to collapse.
-  const collapseTools = compact && !toolsExpanded && toolStripItems.length > 0;
+  const collapseTools = compact && !forceExpandedTools && !toolsExpanded && toolStripItems.length > 0;
 
   useEffect(() => {
     if (!compact || toolsExpanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;

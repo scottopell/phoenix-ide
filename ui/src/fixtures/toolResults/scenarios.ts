@@ -495,6 +495,23 @@ const profilingMessages: Message[] = [
   ]),
 ];
 
+const gridMessages: Message[] = [
+  userMessage(1, 'Show consecutive one-tool agent messages in a compact responsive grid.'),
+  agentMessage(2, [{ type: 'tool_use', id: 'grid-read-a', name: 'read_file', input: { path: 'ui/src/components/MessageList.tsx' } }]),
+  toolMessage(3, 'grid-read-a', '120 lines', { display_data: { duration_ms: 15 } }),
+  agentMessage(4, [{ type: 'tool_use', id: 'grid-search-a', name: 'search', input: { pattern: 'agent_turn', path: 'ui/src' } }]),
+  toolMessage(5, 'grid-search-a', '18 matches in 4 files', { display_data: { duration_ms: 22 } }),
+  agentMessage(6, [{ type: 'tool_use', id: 'grid-read-b', name: 'read_file', input: { path: 'ui/src/conversation/renderUnits.ts' } }]),
+  toolMessage(7, 'grid-read-b', '341 lines', { display_data: { duration_ms: 12 } }),
+  agentMessage(8, [{ type: 'tool_use', id: 'grid-keyword-a', name: 'keyword_search', input: { query: 'compact tool grid render units', search_terms: ['compact grid', 'tool-only run'] } }]),
+  toolMessage(9, 'grid-keyword-a', '3 relevant files', { display_data: { duration_ms: 31 } }),
+  agentMessage(10, [{ type: 'tool_use', id: 'grid-bash-a', name: 'bash', input: { cmd: 'pnpm vitest run src/conversation/renderUnits.test.ts' } }]),
+  toolMessage(11, 'grid-bash-a', JSON.stringify({ status: 'exited', exit_code: 0, duration_ms: 1840, lines: [{ offset: 1, bytes: '37 tests passed' }] })),
+  agentMessage(12, [{ type: 'text', text: 'Prose breaks the compact grid so conversation order remains explicit.' }]),
+  agentMessage(13, [{ type: 'tool_use', id: 'grid-read-after-prose', name: 'read_file', input: { path: 'specs/conversation-ui/requirements.md' } }]),
+  toolMessage(14, 'grid-read-after-prose', '566 lines', { display_data: { duration_ms: 19 } }),
+];
+
 const subagentMessages: Message[] = [
   userMessage(1, 'Show the spawn_agents summary renderer with corrected task-shaped input and deterministic outcomes.'),
   agentMessage(2, [
@@ -527,6 +544,8 @@ export const toolResultsScenarios = [
   { id: 'media-compact', title: 'Media renderers — compact', description: 'Media-oriented renderers in compact density.', density: 'compact', family: 'media' },
   { id: 'profiling-full', title: 'Profiling renderers — full', description: 'browser_profile structured actions plus blocked/error/missing/generic states.', density: 'full', family: 'profiling' },
   { id: 'profiling-compact', title: 'Profiling renderers — compact', description: 'browser_profile family with compact transcript chrome.', density: 'compact', family: 'profiling' },
+  { id: 'grid-full', title: 'Consecutive tool calls — full', description: 'The compact-grid source messages rendered at full fidelity for parity.', density: 'full', family: 'grid' },
+  { id: 'grid-compact', title: 'Consecutive tool calls — compact grid', description: 'Consecutive one-tool agent messages share a responsive compact grid while bash spans the row.', density: 'compact', family: 'grid' },
   { id: 'subagents-full', title: 'Sub-agent summary — full', description: 'Persistent spawn_agents summary block in full density.', density: 'full', family: 'subagents' },
   { id: 'subagents-compact', title: 'Sub-agent summary — compact', description: 'Persistent spawn_agents summary block in compact density.', density: 'compact', family: 'subagents' },
 ] as const satisfies readonly ToolResultsScenario[];
@@ -545,6 +564,7 @@ const messagesByFamily = {
   discovery: discoveryMessages,
   media: mediaMessages,
   profiling: profilingMessages,
+  grid: gridMessages,
   subagents: subagentMessages,
 } as const satisfies Record<ToolResultsScenario['family'], Message[]>;
 

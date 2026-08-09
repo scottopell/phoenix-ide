@@ -498,7 +498,9 @@ THE SYSTEM SHALL render every message at full fidelity, identical to a conversat
 
 WHEN density is `compact`
 THE SYSTEM SHALL collapse each agent turn's tool calls into a single inline pill strip, one pill per tool call in invocation order, reusing the conversation's pill styling and tool-type colors
-AND for bash tool calls, preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
+AND SHALL render maximal consecutive runs of tool-only agent messages from the same agent run as one responsive grid so lightweight tool cards share a row when space permits
+AND SHALL reduce the grid column count as available width narrows without horizontal page overflow
+AND for bash tool calls, span the available grid width and preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
 AND for bash tool calls, render a bounded inline output tail from the best available live or final structured bash output, including a visible truncation indication when older output has fallen out of the bounded tail
 AND render every assistant text block in full without truncation or folding
 AND render user messages at full fidelity
@@ -506,6 +508,7 @@ AND treat density as a presentation choice only, not as permission to omit assis
 
 WHEN a collapsed tool-call pill is clicked
 THE SYSTEM SHALL reveal the full detail for that tool call and bring it into view
+AND SHALL preserve the ordering and full-detail rendering of every other tool call in the grouped run
 
 THE SYSTEM SHALL NOT hide any content without a visible click-to-expand affordance
 AND SHALL NOT discard any content as a result of the active density

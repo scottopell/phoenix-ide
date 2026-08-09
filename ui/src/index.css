@@ -351,9 +351,13 @@ body.app-viewport-active #root {
 /* Compact density — per-turn tool summary cards. */
 .compact-tool-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
   gap: 6px;
   margin: 6px 0;
+}
+
+.compact-tool-card.wide {
+  grid-column: 1 / -1;
 }
 
 .compact-tool-card {
