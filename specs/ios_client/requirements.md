@@ -87,6 +87,13 @@ at the transport layer
 THE SYSTEM SHALL release that entry's typed in-flight attempt before a later
 drain may select it again
 
+WHEN authoritative history reconciles an entry before its delivery callback
+THE SYSTEM SHALL release the same in-flight attempt as part of reconciliation
+
+WHEN the user retries a failed or recoverable-inconsistency entry
+THE SYSTEM SHALL clear its prior server-acceptance evidence before returning it
+to the persistence-fenced drain
+
 **Rationale:** The server deduplicates on `message_id`, making at-least-once
 delivery converge to exactly-once. Aggressive retrying is then free of
 duplicate-message risk.
@@ -740,6 +747,7 @@ including that exact entry, is durable
 AND only then clear the submitted draft and its review authority
 AND immediately request the persistence-fenced ordinary queue drain when that
 conversion has positively created the matching ordinary queue entry
+AND retain a typed receipt-to-entry handoff until that positive creation occurs
 AND have that drain attempt only entries covered by positive full-outbox
 persistence evidence, in durable oldest-first order, excluding server-accepted
 entries and entries with a typed in-flight attempt
@@ -771,11 +779,15 @@ changes so that no failure identifies a removed or repaired contribution
 WHEN the ProductConversation is hard-deleted or definitively not found
 THE SYSTEM SHALL invalidate every persistence-pending review payload for that
 conversation
+AND convert every receipt-to-entry handoff into an acknowledged invalidation
+tombstone
 AND remove its pending render, composer draft, plain segments, review
 authorities, and submission failures
 AND retain and retry a durable, structurally non-sendable invalidation tombstone
 for each affected payload, including after app restart, until version-fenced
 removal is acknowledged
+AND retain a permanent deleted-scope fence that rejects delayed ordinary queue
+entry creation and removes any pending drain request
 AND SHALL NOT allow a later persistence receipt to recreate a queue entry
 
 WHEN the user attempts to close a reader with unsent notes

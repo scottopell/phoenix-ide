@@ -210,6 +210,7 @@ rule RetryFailedMessage {
     requires: entry.status = failed or entry.status = recoverable_inconsistency
 
     ensures: entry.status = pending
+    ensures: entry.accepted_by_server = false
 }
 
 rule DismissLocalMessage {
@@ -233,12 +234,17 @@ rule AuthoritativeHistoryObserved {
 rule AuthoritativeMessageReconcilesQueueEntry {
     when: ServerHistoryContains(msg, entry)
 
+    let attempt = PostAttempt{entry: entry}
+
     requires: msg.scope = entry.scope
     requires: authoritative_message_matches_entry(msg, entry)
     requires: entry.status = pending or entry.status = steering_queued or entry.status = recoverable_inconsistency
 
     ensures: entry.status = reconciled
     ensures: entry.visible = false
+    ensures:
+        if exists attempt:
+            not exists attempt
 
     @guidance
         -- Reconciliation compares the submitted id with both exact

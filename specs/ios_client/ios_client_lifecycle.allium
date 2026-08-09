@@ -493,6 +493,8 @@ rule HardDeletionEventReceived {
     ensures: not exists session.delivery_owner
     ensures: not exists session.retry_window
     ensures:
+        for attempt in queue/PostAttempts where entry.scope = session.scope:
+            not exists attempt
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
     ensures: ConversationClientStateDeletionOccurrence.created(session: session)
@@ -510,6 +512,8 @@ rule HardDeletionConfirmedWhileConnecting {
     ensures: not exists session.delivery_owner
     ensures: not exists session.retry_window
     ensures:
+        for attempt in queue/PostAttempts where entry.scope = session.scope:
+            not exists attempt
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
     ensures: ConversationClientStateDeletionOccurrence.created(session: session)
@@ -564,5 +568,9 @@ invariant DeletedSessionsOwnNoLocalState {
             and not exists session.cache
             and not exists session.delivery_owner
             and not exists session.retry_window
+            and not exists queue/LocalQueueEntry{scope: session.scope}
+            and not queue/PostAttempts.any(
+                attempt => attempt.entry.scope = session.scope
+            )
         )
 }

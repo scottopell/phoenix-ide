@@ -30,9 +30,10 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - Authority-evidence changes immediately revalidate pending persistence; invalid authority unlocks the draft with typed failures without waiting for another delivery trigger.
 - Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; positive ordinary-entry creation after valid persistence enters the persistence-fenced drain in durable oldest-first order.
 - POST attempts have typed in-flight ownership that is released on success, definitive rejection, or transport interruption before automatic redelivery can select the entry again.
+- Authoritative reconciliation also releases an active POST attempt, and retry clears prior server-acceptance evidence before re-entering the drain.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
-- Hard-delete/not-found cleanup removes drafts, pending renders, and authority while retaining an acknowledged-removal tombstone until every durable pending review payload is fenced out.
+- Hard-delete/not-found cleanup removes drafts, pending renders, and authority; converts receipt-to-entry handoffs to acknowledged-removal tombstones; and retains a permanent fence against delayed queue creation.
 - The leaf queue separates reader fidelity from session-scoped note composition.
 
 ## Out of scope
