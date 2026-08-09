@@ -1268,7 +1268,9 @@ describe('ConversationPage archived read-only rendering', () => {
       options.onValidatedInit?.(payload);
     });
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Load older messages' }));
+    expect(store.getSnapshot(slug).transcriptCoverage).toBe('tail');
+    expect(screen.getByTestId('history-has-older')).toHaveTextContent('yes');
+    fireEvent.click(screen.getByRole('button', { name: 'Load older messages' }));
 
     await waitFor(() => expect(api.getConversation).toHaveBeenCalledWith(conversationId));
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
