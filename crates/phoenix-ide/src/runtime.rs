@@ -3922,20 +3922,8 @@ impl RuntimeManager {
 
         if matches!(conv.state, ConvState::LlmRequesting { .. })
             && self
-                .db
-                .get_conversation_creation_job_for_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_some_and(|job| {
-                    matches!(
-                        job.protocol.status,
-                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
-                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
-                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
-                                ..
-                            }
-                    )
-                })
+                .has_persisted_llm_request_owner(conversation_id)
+                .await?
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -4028,6 +4016,42 @@ impl RuntimeManager {
             resume_state_updated_at,
             decision.needs_auto_continue,
         ))
+    }
+
+    async fn has_persisted_llm_request_owner(&self, conversation_id: &str) -> Result<bool, String> {
+        let active_creation_job =
+            self.db
+                .get_conversation_creation_job_for_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some_and(|job| {
+                    matches!(
+                    job.protocol.status,
+                    phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                        | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                        | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                            ..
+                        }
+                )
+                });
+        if active_creation_job {
+            return Ok(true);
+        }
+
+        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|e| e.to_string())
+            .map(|turn| {
+                turn.is_some_and(|turn| {
+                    matches!(
+                        turn.materialization,
+                        phoenix_workflow::Materialization::Materialized { .. }
+                    )
+                })
+            })
     }
 
     /// Get the database handle
@@ -5747,6 +5771,113 @@ mod scope_liveness_tests {
             state,
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_materialized_active_direct_turn() {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+
+        let mgr = test_manager().await;
+        let conversation_id = "materialized-direct-turn";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                text: "resume me".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "direct-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "resume me".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        let repo = WorkflowRepository::new(mgr.db().pool().clone());
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("direct-message").expect("client key"),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().expect("encode payload"),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .expect("accept direct turn");
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected newly accepted turn")
+        };
+        let workflow_id = repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .expect("load workflow id")
+            .expect("workflow exists");
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(30),
+            })
+            .await
+            .expect("claim direct turn");
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority: claim.authority.expect("claim authority"),
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .expect("materialize direct turn");
+
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load reset conversation")
+                .state,
+            ConvState::LlmRequesting { .. }
+        ));
+
+        let (state, _state_updated_at, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("reconstruct runtime state");
+        assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
     }
 
