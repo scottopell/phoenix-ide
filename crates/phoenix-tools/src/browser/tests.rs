@@ -1557,13 +1557,28 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         <html>
         <head><title>Modifier Key Test</title></head>
         <body>
-            <div id="result">none</div>
+            <input id="target" />
             <script>
+              window.keyEvents = [];
               window.addEventListener('keydown', function(e) {
-                if (e.ctrlKey && e.key === 'k') {
-                  document.getElementById('result').textContent = 'ctrl+k';
-                }
+                window.keyEvents.push({
+                  type: e.type,
+                  key: e.key,
+                  code: e.code,
+                  ctrlKey: e.ctrlKey,
+                  trusted: e.isTrusted
+                });
               }, true);
+              window.addEventListener('keyup', function(e) {
+                window.keyEvents.push({
+                  type: e.type,
+                  key: e.key,
+                  code: e.code,
+                  ctrlKey: e.ctrlKey,
+                  trusted: e.isTrusted
+                });
+              }, true);
+              document.getElementById('target').focus();
             </script>
         </body>
         </html>"#,
@@ -1583,14 +1598,35 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
 
     let eval_result = BrowserEvalTool
         .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
+            json!({"expression": "({ events: window.keyEvents, inputValue: document.getElementById('target').value })"}),
             ctx.clone(),
         )
         .await;
     assert!(
-        eval_result.output().contains("ctrl+k"),
-        "Ctrl+K capture listener not fired: {}",
+        eval_result.is_success(),
+        "post-chord eval failed: {}",
         eval_result.output()
+    );
+    let output = eval_result.output();
+    assert!(
+        output.contains("keydown") && output.contains("keyup"),
+        "Ctrl+K event lifecycle missing: {output}"
+    );
+    assert!(
+        output.contains("\"key\": \"k\"") && output.contains("\"code\": \"KeyK\""),
+        "Ctrl+K event identity wrong: {output}"
+    );
+    assert!(
+        output.contains("\"ctrlKey\": true") && output.contains("\"trusted\": true"),
+        "Ctrl+K modifier/trust wrong: {output}"
+    );
+    assert!(
+        !output.contains("Unidentified") && !output.contains("Numpad"),
+        "Ctrl+K emitted a phantom native key: {output}"
+    );
+    assert!(
+        output.contains("\"inputValue\": \"\""),
+        "Ctrl+K inserted text into the focused input: {output}"
     );
 
     shutdown_test(manager, server).await;
