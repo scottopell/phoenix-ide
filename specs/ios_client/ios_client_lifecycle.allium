@@ -117,6 +117,16 @@ entity RetryWindow {
     delay_attempt: Integer
 }
 
+-- One-shot typed occurrences consumed by queue specializations such as prose
+-- review persistence. Their creation is the shared lifecycle integration seam.
+entity QueueDeliveryTriggerOccurrence {
+    session: IosConversationSession
+}
+
+entity ConversationClientStateDeletionOccurrence {
+    session: IosConversationSession
+}
+
 ------------------------------------------------------------
 -- Rules -- ownership and app lifecycle
 ------------------------------------------------------------
@@ -263,6 +273,7 @@ rule AppForegroundsOnline {
     requires: NetworkPathAvailable()
 
     ensures: session.state = connecting
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
 rule AppForegroundsOffline {
@@ -273,6 +284,17 @@ rule AppForegroundsOffline {
     requires: not NetworkPathAvailable()
 
     ensures: session.state = offline
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
+}
+
+rule AppForegroundRetainedSessionTriggersQueueDelivery {
+    -- REQ-IOS-004: persistence retry is independent of an open live view.
+    when: AppForegrounded(session)
+
+    requires: session.state != deleted
+    requires: not session.view_open or session.state != dormant
+
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
 ------------------------------------------------------------
@@ -297,6 +319,17 @@ rule NetworkPathRestored {
     requires: session.view_open
 
     ensures: session.state = connecting
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
+}
+
+rule NetworkRestoredOutsideOpenOfflineSessionTriggersQueueDelivery {
+    -- REQ-IOS-004: retained sessions and persisted sweeps also retry.
+    when: NetworkBecameAvailable(session)
+
+    requires: session.state != deleted
+    requires: session.state != offline or not session.view_open
+
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
 rule StreamFailedBeforeInit {
@@ -370,6 +403,7 @@ rule ValidInitAccepted {
     )
     ensures: session.cache.durable_message_ceiling = init.pending_anchor_sequence_id
     ensures: session.cache.synced = true
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
     ensures:
         if not init.pending_truncated:
             PendingEventsReducedThroughSharedSequenceGuard(
@@ -427,6 +461,7 @@ rule TurnCompletionCommitsObservedTranscript {
 
     ensures: session.sequence_floor = event_sequence
     ensures: session.cache.durable_message_ceiling = event_sequence
+    ensures: QueueDeliveryTriggerOccurrence.created(session: session)
 }
 
 rule StaleOrDuplicateEventDiscarded {
@@ -460,6 +495,7 @@ rule HardDeletionEventReceived {
     ensures:
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
+    ensures: ConversationClientStateDeletionOccurrence.created(session: session)
 }
 
 rule HardDeletionConfirmedWhileConnecting {
@@ -476,6 +512,7 @@ rule HardDeletionConfirmedWhileConnecting {
     ensures:
         for entry in queue/LocalQueueEntries where scope = session.scope:
             not exists entry
+    ensures: ConversationClientStateDeletionOccurrence.created(session: session)
 }
 
 ------------------------------------------------------------

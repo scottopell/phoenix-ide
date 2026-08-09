@@ -15,6 +15,7 @@
 --           ../user_message_queue/user_message_queue.allium).
 
 use "../user_message_queue/user_message_queue.allium" as queue
+use "./ios_client_lifecycle.allium" as lifecycle
 
 ------------------------------------------------------------
 -- Helpers
@@ -527,12 +528,47 @@ rule PersistencePendingReviewQueueRetriesDiskWrite {
     -- REQ-IOS-002, REQ-IOS-021
     when: RetryReviewOutboxPersistence(pending)
 
+    requires: review_authority_failures(pending.draft) = empty_list
+
     ensures: PersistReviewDraftMessage(
         scope: pending.scope,
         local_id: pending.local_id,
         text: render_composer_draft(pending.draft),
         images: pending.draft.images
     )
+}
+
+rule InvalidAuthorityStopsPendingPersistenceRetry {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: RetryReviewOutboxPersistence(pending)
+
+    let failures = review_authority_failures(pending.draft)
+
+    requires: failures != empty_list
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: pending.scope,
+        local_id: pending.local_id
+    )
+    ensures: ReviewSubmissionBlock.created(
+        draft: pending.draft,
+        failures: failures
+    )
+    ensures: not exists pending.render
+    ensures: not exists pending
+}
+
+------------------------------------------------------------
+-- Rules -- automatic persistence retry triggers
+------------------------------------------------------------
+
+rule DeliveryTriggersRetryPendingReviewPersistence {
+    -- REQ-IOS-004, REQ-IOS-021
+    when: trigger: lifecycle/QueueDeliveryTriggerOccurrence.created
+
+    for pending in PersistencePendingReviewQueueEntries
+        where scope = trigger.session.scope:
+        ensures: RetryReviewOutboxPersistence(pending: pending)
 }
 
 rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
@@ -546,6 +582,7 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
 
     requires: exists pending
     requires: persistence.persistence_revision > 0
+    requires: review_authority_failures(pending.draft) = empty_list
     requires: persistence.payload_fingerprint = message_payload_fingerprint(
         persistence.scope,
         persistence.local_id,
@@ -574,6 +611,34 @@ rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
         not exists pending
 }
 
+rule InvalidAuthorityRejectsPersistedReviewReceipt {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: persistence: ReviewOutboxPersistenceReceipt.created
+
+    let pending = PersistencePendingReviewQueueEntry{
+        scope: persistence.scope,
+        local_id: persistence.local_id
+    }
+
+    requires: exists pending
+
+    let failures = review_authority_failures(pending.draft)
+
+    requires: persistence.persistence_revision > 0
+    requires: failures != empty_list
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: persistence.scope,
+        local_id: persistence.local_id
+    )
+    ensures: ReviewSubmissionBlock.created(
+        draft: pending.draft,
+        failures: failures
+    )
+    ensures: not exists pending.render
+    ensures: not exists pending
+}
+
 rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
     -- REQ-IOS-021
     when: UserSubmitsComposerDraft(draft)
@@ -595,6 +660,39 @@ rule UserAcknowledgesReviewSubmissionBlock {
     when: UserAcknowledgesReviewSubmissionBlock(block)
 
     ensures: not exists block
+}
+
+------------------------------------------------------------
+-- Rules -- terminal conversation deletion
+------------------------------------------------------------
+
+rule TerminalDeletionClearsReviewDraftState {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: trigger: lifecycle/ConversationClientStateDeletionOccurrence.created
+
+    ensures:
+        for reader in ProseReviewSessions
+            where conversation.queue_scope = trigger.session.scope:
+            for note in reader.notes:
+                not exists note
+            not exists reader
+        for composer in ComposerDrafts
+            where conversation.queue_scope = trigger.session.scope:
+            for pending in PersistencePendingReviewQueueEntries
+                where draft = composer:
+                ReviewOutboxPersistenceInvalidated(
+                    scope: pending.scope,
+                    local_id: pending.local_id
+                )
+                not exists pending.render
+                not exists pending
+            for segment in composer.plain_segments:
+                not exists segment
+            for authority in composer.review_authorities:
+                not exists authority
+            if exists composer.submission_block:
+                not exists composer.submission_block
+            not exists composer
 }
 
 ------------------------------------------------------------

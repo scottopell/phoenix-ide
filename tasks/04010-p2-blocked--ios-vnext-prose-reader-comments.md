@@ -26,8 +26,11 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - Actual message submission revalidates every binding, preserves staged images in the same outbox entry, and clears the draft only after positive disk-persistence evidence.
 - The ordinary queue entry cannot become sendable until persistence evidence exists; a cleared composer is reinitialized with an editable empty plain segment.
 - Persistence-pending review messages remain optimistically visible, structurally non-sendable, and retryable on later delivery triggers.
+- Connectivity, valid init, foreground, and turn-completion triggers retry pending persistence; every retry and receipt conversion revalidates review authority.
+- Invalid authority during persistence unlocks the draft with typed failures and invalidates any durable pending payload.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
+- Hard-delete/not-found cleanup removes drafts, pending renders, retry state, authority, and any durable pending review payload.
 - The leaf queue separates reader fidelity from session-scoped note composition.
 
 ## Out of scope

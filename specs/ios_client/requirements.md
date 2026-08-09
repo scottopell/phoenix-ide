@@ -725,7 +725,16 @@ AND SHALL NOT create a sendable ordinary queue entry before that message is
 durably persisted
 AND, while persistence is pending or has failed, show one optimistic
 persistence-pending queue entry that is structurally non-sendable
-AND retry its version-fenced disk write on later delivery triggers
+AND retry its version-fenced disk write when connectivity returns, a valid init
+arrives, the app enters the foreground, or an agent turn completes
+AND revalidate every attached review authority before each retry and again
+before converting a persistence receipt into a sendable ordinary queue entry
+
+WHEN authority becomes invalid while persistence is pending or in flight
+THE SYSTEM SHALL invalidate any resulting durable outbox payload
+AND remove the persistence-pending entry
+AND unlock the draft with typed submission failures so the user can repair or
+discard affected review contributions
 AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
@@ -741,6 +750,13 @@ AND allow the user to refresh and re-anchor that review contribution or
 explicitly discard that contribution while preserving unrelated draft text
 AND clear or recompute the displayed failure set whenever review authority
 changes so that no failure identifies a removed or repaired contribution
+
+WHEN the ProductConversation is hard-deleted or definitively not found
+THE SYSTEM SHALL invalidate every persistence-pending review payload for that
+conversation
+AND remove its pending render, composer draft, plain segments, review
+authorities, and submission failures
+AND SHALL NOT allow a later persistence receipt to recreate a queue entry
 
 WHEN the user attempts to close a reader with unsent notes
 THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`
