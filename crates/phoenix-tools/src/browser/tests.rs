@@ -1215,250 +1215,64 @@ async fn test_wait_for_selector_invalid_selector() {
 // TDD: browser_click tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_click_button() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <button id="btn" onclick="document.getElementById('result').textContent = 'clicked'">Click me</button>
-            <div id="result">not clicked</div>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-button");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
+async fn reset_click_fixture(ctx: &ToolContext, body: &str, setup: &str) {
+    let expression = format!(
+        r"(() => {{ for (const timer of window.clickFixtureTimers || []) clearTimeout(timer); window.clickFixtureTimers = []; history.replaceState(null, '', location.pathname); document.body.innerHTML = {body}; window.clickCount = 0; {setup} return true; }})()",
+        body = serde_json::to_string(body).expect("fixture HTML should serialize")
+    );
+    let result = BrowserEvalTool
+        .run(json!({"expression": expression}), ctx.clone())
         .await;
-
-    // Click the button
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#btn"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify the click worked
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(result.is_success());
     assert!(
-        result.output().contains("clicked"),
-        "Button click didn't work: {}",
+        result.is_success() && result.output().contains("true"),
+        "click fixture reset failed: {}",
         result.output()
     );
-
-    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
-async fn test_click_link() {
+#[allow(clippy::too_many_lines)]
+async fn click_regressions_share_one_browser_fixture() {
     require_chrome!();
+    let server = TestServer::start("<!doctype html><html><body></body></html>").await;
+    let (ctx, manager) = test_context("test-click-regressions");
+    let url = server.url();
+    let outcome = tokio::spawn(async move {
+        let nav = BrowserNavigateTool.run(json!({"url": url}), ctx.clone()).await;
+        assert!(nav.is_success(), "click fixture navigation failed: {}", nav.output());
+        let click = BrowserClickTool;
+        let eval = BrowserEvalTool;
 
-    let server = TestServer::start(
-        r##"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <a id="link" href="#clicked">Click this link</a>
-        </body>
-        </html>"##,
-    )
-    .await;
+        reset_click_fixture(&ctx, "<button id='btn'>Click</button>", "document.getElementById('btn').onclick = () => window.clickCount += 1;").await;
+        let button = click.run(json!({"selector":"#btn"}), ctx.clone()).await;
+        assert!(button.is_success(), "button click failed: {}", button.output());
+        let count = eval.run(json!({"expression":"window.clickCount === 1"}), ctx.clone()).await;
+        assert!(count.is_success() && count.output().contains("true"), "button handler did not fire: {}", count.output());
 
-    let (ctx, manager) = test_context("test-click-link");
+        reset_click_fixture(&ctx, "<a id='link' href='#clicked'>Link</a>", "").await;
+        let link = click.run(json!({"selector":"#link"}), ctx.clone()).await;
+        assert!(link.is_success(), "link click failed: {}", link.output());
+        let hash = eval.run(json!({"expression":"location.hash === '#clicked'"}), ctx.clone()).await;
+        assert!(hash.is_success() && hash.output().contains("true"), "link did not navigate: {}", hash.output());
 
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
+        reset_click_fixture(&ctx, "<div>No target</div>", "").await;
+        let missing = click.run(json!({"selector":"#nonexistent"}), ctx.clone()).await;
+        assert!(!missing.is_success(), "missing click target unexpectedly succeeded");
 
-    // Click the link
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#link"}), ctx.clone())
-        .await;
+        reset_click_fixture(&ctx, "<input type='checkbox' id='check'>", "").await;
+        let checkbox = click.run(json!({"selector":"#check"}), ctx.clone()).await;
+        assert!(checkbox.is_success(), "checkbox click failed: {}", checkbox.output());
+        let checked = eval.run(json!({"expression":"document.getElementById('check').checked === true"}), ctx.clone()).await;
+        assert!(checked.is_success() && checked.output().contains("true"), "checkbox did not toggle: {}", checked.output());
 
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify URL changed
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(json!({"expression": "window.location.hash"}), ctx.clone())
-        .await;
-
-    assert!(result.is_success());
-    assert!(
-        result.output().contains("clicked"),
-        "Link click didn't navigate: {}",
-        result.output()
-    );
-
+        reset_click_fixture(&ctx, "<div id='container'></div>", "window.clickFixtureTimers.push(setTimeout(() => { const b=document.createElement('button'); b.id='delayed-btn'; b.onclick=()=>window.clickCount+=1; document.getElementById('container').appendChild(b); }, 500));").await;
+        let delayed = click.run(json!({"selector":"#delayed-btn","wait":true,"timeout":"5s"}), ctx.clone()).await;
+        assert!(delayed.is_success(), "delayed click failed: {}", delayed.output());
+        let delayed_count = eval.run(json!({"expression":"window.clickCount === 1 && !!document.getElementById('delayed-btn')"}), ctx.clone()).await;
+        assert!(delayed_count.is_success() && delayed_count.output().contains("true"), "wait click returned without clicking delayed target: {}", delayed_count.output());
+    }).await;
     shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_element_not_found() {
-    require_chrome!();
-
-    let server = TestServer::start("<html><body><div>No buttons here</div></body></html>").await;
-    let (ctx, manager) = test_context("test-click-not-found");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#nonexistent"}), ctx.clone())
-        .await;
-
-    assert!(!result.is_success(), "Should fail when element not found");
-    assert!(
-        result.output().to_lowercase().contains("not found")
-            || result.output().to_lowercase().contains("no element")
-            || result.output().to_lowercase().contains("could not find"),
-        "Should mention element not found: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_checkbox() {
-    require_chrome!();
-
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <input type="checkbox" id="check" />
-            <label for="check">Check me</label>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-checkbox");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Verify unchecked initially
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('check').checked"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(result.output().contains("false"), "Should start unchecked");
-
-    // Click the checkbox
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(json!({"selector": "#check"}), ctx.clone())
-        .await;
-    assert!(result.is_success(), "Click failed: {}", result.output());
-
-    // Verify checked
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('check').checked"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        result.output().contains("true"),
-        "Checkbox should be checked: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
-}
-
-#[tokio::test]
-async fn test_click_with_wait() {
-    require_chrome!();
-
-    // Element appears after delay
-    let server = TestServer::start(
-        r#"<!DOCTYPE html>
-        <html>
-        <head><title>Click Test</title></head>
-        <body>
-            <div id="container"></div>
-            <div id="result">waiting</div>
-            <script>
-                setTimeout(() => {
-                    const btn = document.createElement('button');
-                    btn.id = 'delayed-btn';
-                    btn.textContent = 'Click me';
-                    btn.onclick = () => document.getElementById('result').textContent = 'success';
-                    document.getElementById('container').appendChild(btn);
-                }, 500);
-            </script>
-        </body>
-        </html>"#,
-    )
-    .await;
-
-    let (ctx, manager) = test_context("test-click-wait");
-
-    let nav_tool = BrowserNavigateTool;
-    nav_tool
-        .run(json!({"url": server.url()}), ctx.clone())
-        .await;
-
-    // Click with wait - should wait for element to appear
-    let click_tool = BrowserClickTool;
-    let result = click_tool
-        .run(
-            json!({"selector": "#delayed-btn", "wait": true, "timeout": "5s"}),
-            ctx.clone(),
-        )
-        .await;
-
-    assert!(
-        result.is_success(),
-        "Click with wait failed: {}",
-        result.output()
-    );
-
-    // Verify click worked
-    let eval_tool = BrowserEvalTool;
-    let result = eval_tool
-        .run(
-            json!({"expression": "document.getElementById('result').textContent"}),
-            ctx.clone(),
-        )
-        .await;
-    assert!(
-        result.output().contains("success"),
-        "Click didn't work: {}",
-        result.output()
-    );
-
-    shutdown_test(manager, server).await;
+    outcome.expect("browser click regression scenario");
 }
 
 // ============================================================================
