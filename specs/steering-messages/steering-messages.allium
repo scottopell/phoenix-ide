@@ -251,6 +251,8 @@ rule DrainOnIdleEntry {
         -- transcript user message form bounded restart ownership until the
         -- first provider response changes the transcript tail. Recovery resumes
         -- one request without adding a steering lifecycle or queue authority.
+        -- A synchronous failure to start that recovered request is reduced into
+        -- the same persisted typed Error used by live drain dispatch failures.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
@@ -537,6 +539,8 @@ surface SteeringQueueApi {
         -- latest transcript user message, and absence of that exact pending
         -- queue row are the bounded evidence. The first provider response ends
         -- this exception; no second queue authority or steering lifecycle exists.
+        -- A synchronous recovery dispatch failure settles as a durable typed
+        -- Error rather than leaving LlmRequesting without a provider task.
 
     @guarantee EnqueueDuringDrainPreserved
         -- A steering message enqueued while a drain is in progress is not lost.

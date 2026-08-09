@@ -2224,17 +2224,8 @@ where
             }
             let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
                 false
-            } else if let Err(error) = self.execute_effect(Effect::RequestLlm).await {
-                tracing::error!(%error, "Failed to resume LLM request");
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
-                    sequence_id: seq,
-                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                        "resume the LLM request",
-                    ),
-                });
-                true
             } else {
-                false
+                self.resume_interrupted_llm_request().await
             };
             if !resume_failed {
                 if let Some((job_id, claim)) = self.startup_creation_completion.take() {
@@ -3329,7 +3320,7 @@ where
                 Ok(Some(gen_event)) => generated_events.push(gen_event),
                 Ok(None) => {}
                 Err(error) => {
-                    generated_events.push(self.steering_dispatch_failure_event(error));
+                    generated_events.push(self.llm_dispatch_failure_event(error));
                 }
             }
         }
@@ -5402,18 +5393,18 @@ where
                 }
                 match self.dispatch_llm_request().await {
                     Ok(event) => Ok(event),
-                    Err(error) => Ok(Some(self.steering_dispatch_failure_event(error))),
+                    Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
                 }
             }
             SteeringDrainPostCommit::ContinueExistingLlm => Ok(None),
         }
     }
 
-    fn steering_dispatch_failure_event(&self, error: String) -> Event {
+    fn llm_dispatch_failure_event(&self, error: String) -> Event {
         tracing::error!(
             conversation_id = %self.context.conversation_id,
             %error,
-            "Steering drain committed but LLM dispatch failed"
+            "LLM dispatch failed before starting a provider task"
         );
         let attempt = match self.state {
             ConvState::LlmRequesting { attempt } => attempt,
@@ -5425,6 +5416,29 @@ where
             attempt,
             recovery_in_progress: false,
             resets_at: None,
+        }
+    }
+
+    async fn resume_interrupted_llm_request(&mut self) -> bool {
+        match self.execute_effect(Effect::RequestLlm).await {
+            Ok(_) => false,
+            Err(error) => {
+                tracing::error!(%error, "Failed to resume LLM request");
+                let failure = self.llm_dispatch_failure_event(error);
+                if let Err(settlement_error) = self.process_event(failure).await {
+                    tracing::error!(
+                        %settlement_error,
+                        "Failed to settle resumed LLM dispatch error"
+                    );
+                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "resume the LLM request",
+                        ),
+                    });
+                }
+                true
+            }
         }
     }
 
@@ -13316,6 +13330,37 @@ mod steer_drain_detector_tests {
             }
         );
         assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_steering_recovery_dispatch_failure_persists_error() {
+        let conversation_id = "conv-steering-recovery-dispatch-failure";
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            Vec::new(),
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+
+        assert!(
+            rt.resume_interrupted_llm_request().await,
+            "synchronous recovery dispatch failure must be reported"
+        );
+
+        let expected = ConvState::Error {
+            message: "Persisted effort 'high' is not supported by model 'test-model'".to_string(),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("settled recovery state"),
+            expected
+        );
+        assert_eq!(rt.state, expected);
         assert!(rt.llm_task_handle.is_none());
     }
 
