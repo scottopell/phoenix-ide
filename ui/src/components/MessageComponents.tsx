@@ -338,8 +338,8 @@ function SkillToolBlock({
 
 // =====================================================================// User Message Components
 // =====================================================================
-function MessageCopyButton({ message, title }: { message: Message; title: string }) {
-  const markdown = getMessageMarkdown(message);
+function MessageCopyButton({ message, title, text }: { message: Message; title: string; text?: string }) {
+  const markdown = text ?? getMessageMarkdown(message);
   if (markdown.trim() === '') return null;
 
   return (
@@ -714,34 +714,49 @@ function CompactToolStripImpl({
         const ariaStatus = item.finalStatus ?? statusLabel;
         const ariaSummary = item.outputTail ?? summary;
         const isCompactBash = item.name === 'bash';
+        const isFirstCardForOwner = i === 0
+          || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id;
         return (
-          <button
+          <div
             key={item.toolId || `${item.name}-${i}`}
-            type="button"
             className={classNames}
-            onClick={() => onExpand(item.toolId)}
             data-sequence-id={item.ownerMessage.sequence_id}
             data-message-id={item.ownerMessage.message_id}
-            aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
           >
-            <span className="compact-tool-card-header">
-              <span className="compact-tool-card-name">{item.name}</span>
-              <AgentRetryBadge message={item.ownerMessage} />
-              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
-            </span>
-            {isCompactBash ? (
-              <>
-                <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
-                  {item.commandIdentity ?? item.inputSummary}
-                </span>
-                <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
-                  {item.outputTail ?? '(no output)'}
-                </span>
-              </>
-            ) : (
-              <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            <button
+              type="button"
+              className="compact-tool-card-expand"
+              onClick={() => onExpand(item.toolId)}
+              aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
+            >
+              <span className="compact-tool-card-header">
+                <span className="compact-tool-card-name">{item.name}</span>
+                {isFirstCardForOwner && <AgentRetryBadge message={item.ownerMessage} />}
+                <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
+              </span>
+              {isCompactBash ? (
+                <>
+                  <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
+                    {item.commandIdentity ?? item.inputSummary}
+                  </span>
+                  <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
+                    {item.outputTail ?? '(no output)'}
+                  </span>
+                </>
+              ) : (
+                <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+              )}
+            </button>
+            {isFirstCardForOwner && (
+              <span className="compact-tool-owner-copy message-mobile-copy-row">
+                <MessageCopyButton
+                  message={item.ownerMessage}
+                  title="Copy Phoenix message"
+                  text={getToolOnlyMessageCopy(item.ownerMessage)}
+                />
+              </span>
             )}
-          </button>
+          </div>
         );
       })}
     </div>
@@ -813,6 +828,13 @@ interface ToolOnlyAgentTurnGroupProps {
   revealRequest?: AgentTextRevealRequest | null;
   activeHighlight?: ConversationHighlight | null;
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
+}
+
+function getToolOnlyMessageCopy(message: Message): string {
+  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  return blocks.flatMap((block) => block.type === 'tool_use'
+    ? [`${block.name}\n\n\`\`\`json\n${JSON.stringify(block.input, null, 2)}\n\`\`\``]
+    : []).join('\n\n');
 }
 
 function AgentRetryBadge({ message }: { message: Message }) {
@@ -889,9 +911,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                 {formatMessageTime(first.agent.created_at)}
               </span>
             )}
-            <span className="message-header-actions">
-              <MessageCopyButton message={first.agent} title="Copy Phoenix message" />
-            </span>
+
           </div>
         )}
         <div className="message-content">

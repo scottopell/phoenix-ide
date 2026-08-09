@@ -378,11 +378,31 @@ body.app-viewport-active #root {
   cursor: pointer;
 }
 
+.compact-tool-card-expand {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.compact-tool-owner-copy {
+  align-self: flex-end;
+  margin: 0;
+}
+
 .compact-tool-card:hover {
   background: var(--border-color);
 }
 
-.compact-tool-card:focus-visible {
+.compact-tool-card-expand:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }

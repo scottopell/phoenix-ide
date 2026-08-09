@@ -908,13 +908,29 @@ describe('inline tool timers', () => {
     const strip = screen.getByRole('list', { name: 'Tool calls' });
     expect(strip.querySelectorAll('.compact-tool-card')).toHaveLength(4);
     expect(strip.querySelector('.compact-tool-card.wide')).toHaveTextContent('bash');
-    expect(screen.getByRole('button', { name: /keyword_search:.*expand tool detail/i })).toHaveAttribute('data-sequence-id', '3');
+    expect(screen.getByRole('button', { name: /keyword_search:.*expand tool detail/i }).closest('.compact-tool-card')).toHaveAttribute('data-sequence-id', '3');
+    expect(strip.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(2);
 
     fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
 
     expect(screen.queryByRole('list', { name: 'Tool calls' })).not.toBeInTheDocument();
     expect(document.querySelector('[data-tool-id="grid-read"]')).not.toBeNull();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it('renders response-level retry metadata once when one message owns multiple tools', () => {
+    mockDensity = 'compact';
+    const owner = { ...agentMessage('agent-retry-multi', [
+      { type: 'tool_use', id: 'retry-multi-read', name: 'read_file', input: { path: 'a.md' } },
+      { type: 'tool_use', id: 'retry-multi-search', name: 'search', input: { pattern: 'needle' } },
+    ], 2), display_data: { retry_count: 1 } };
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: true },
+    ]} /></MemoryRouter>);
+
+    expect(screen.getAllByText('retried 1x')).toHaveLength(1);
+    expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
   });
 
   it('routes a grouped compact card context menu to its owning message', async () => {
