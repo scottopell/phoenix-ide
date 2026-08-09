@@ -605,6 +605,13 @@ async fn lookup_durable_steering_replay(
         return Ok(Some(SendChatOutcome::QueuedAsSteering));
     }
     if let Some(outcome) = lookup_persisted_message_replay(db, req).await? {
+        if let Some(receipt) = db
+            .get_steering_acceptance_fingerprint(&req.conversation_id, &req.message_id)
+            .await
+            .map_err(|error| map_db_internal_error(&error))?
+        {
+            validate_steering_fingerprint(&receipt, request_fingerprint)?;
+        }
         return Ok(Some(outcome));
     }
     let Some(receipt) = db
@@ -1185,6 +1192,56 @@ mod tests {
         let mut changed = req;
         changed.expansion_policy = MessageExpansionPolicy::LiteralText;
 
+        assert!(matches!(
+            lookup_durable_steering_replay(
+                &db,
+                &changed,
+                &super::request_fingerprint(&changed).unwrap(),
+            )
+            .await,
+            Err(SendChatServiceError::IdempotencyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drained_steering_receipt_rejects_changed_expansion_policy() {
+        let req = request();
+        let db = db_with_conversation(&req.conversation_id).await;
+        let fingerprint = super::request_fingerprint(&req).unwrap();
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: req.text.clone(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: req.message_id.clone(),
+            user_agent: req.user_agent.clone(),
+            skill_invocation: None,
+        };
+        db.append_steering_entry(&req.conversation_id, &entry, &fingerprint)
+            .await
+            .unwrap();
+        db.add_message(
+            &req.message_id,
+            &req.conversation_id,
+            &crate::db::MessageContent::user(&req.text),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .remove_steering_entry(&req.conversation_id, &req.message_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            lookup_durable_steering_replay(&db, &req, &fingerprint)
+                .await
+                .unwrap(),
+            Some(SendChatOutcome::AlreadyPersisted)
+        );
+
+        let mut changed = req;
+        changed.expansion_policy = MessageExpansionPolicy::LiteralText;
         assert!(matches!(
             lookup_durable_steering_replay(
                 &db,
