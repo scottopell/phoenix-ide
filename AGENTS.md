@@ -66,6 +66,22 @@ ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_cl
 ## Working in this repo
 *How you—developer or agent—operate day to day. Workflow, not artifact rules.*
 
+### Delivery Roadmap
+
+GitHub Issue [#651](https://github.com/scottopell/phoenix-ide/issues/651) is the central cross-machine orientation view for active delivery. At the start of development work, read its generated body before relying on local task or PR context alone.
+
+The roadmap is a coordination authority only: it answers what is active, owned, blocked, and next. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent must append a replacement roadmap update.
+
+When you own a workstream represented on the roadmap:
+
+- report only facts about your workstream; do not rewrite another owner's entry or independently reorder the portfolio;
+- use one stable `workstream` identifier across replacement updates;
+- append a new structured comment when its material state, blocker, owner, or next step changes, including completion or abandonment;
+- link detailed evidence instead of copying plans into the roadmap;
+- verify that the generated Issue body reflects the comment you posted.
+
+The reducer owns the Issue body; never edit it manually. The first Issue comment owns the current comment schema and limits. Use the `phoenix-development` skill for the posting procedure.
+
 ### Task Tracking
 
 **Create tasks with `taskmd new` — do not write task files directly.**
