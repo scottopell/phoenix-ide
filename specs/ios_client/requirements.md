@@ -733,7 +733,10 @@ AND preserve every draft segment, attachment, and review authority until a
 version-fenced disk write positively establishes that the full visible outbox,
 including that exact entry, is durable
 AND only then clear the submitted draft and its review authority
-AND immediately begin ordinary queue delivery when that conversion succeeds
+AND immediately request the persistence-fenced ordinary queue drain when that
+conversion succeeds
+AND have that drain attempt only entries covered by positive full-outbox
+persistence evidence, in durable oldest-first order
 
 WHEN authority becomes invalid while persistence is pending or in flight
 THE SYSTEM SHALL detect the authority-evidence change without waiting for

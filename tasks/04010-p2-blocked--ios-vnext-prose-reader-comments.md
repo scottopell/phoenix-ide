@@ -28,7 +28,7 @@ Catalog reader navigation, readable typography, line/block anchoring, live-targe
 - Persistence-pending review messages remain optimistically visible, structurally non-sendable, and retryable on later delivery triggers.
 - Connectivity, valid init, foreground, and turn-completion triggers retry pending persistence; every retry and receipt conversion revalidates review authority.
 - Authority-evidence changes immediately revalidate pending persistence; invalid authority unlocks the draft with typed failures without waiting for another delivery trigger.
-- Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; ordinary delivery begins immediately after valid persistence succeeds.
+- Invalid authority and hard deletion retain a durable, non-sendable invalidation tombstone across retry and restart until version-fenced removal is acknowledged; valid persistence enters the persistence-fenced ordinary drain in durable oldest-first order.
 - Failed submit-time revalidation preserves the draft and emits typed failures per affected contribution, then clears stale failures when authority is repaired or removed.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
 - Hard-delete/not-found cleanup removes drafts, pending renders, and authority while retaining an acknowledged-removal tombstone until every durable pending review payload is fenced out.
