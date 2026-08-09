@@ -7,6 +7,7 @@ import {
   renderRoadmap,
   run,
   updatesFromComments,
+  validateRetirement,
   validateUpdate,
 } from "./roadmap-issue-reducer.mjs";
 
@@ -45,6 +46,10 @@ function fenced(value) {
   return `\`\`\`phoenix-roadmap-update\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
+function retired(workstream = "ios-vnext") {
+  return `\`\`\`phoenix-roadmap-retirement\n${JSON.stringify({ kind: "workstream-retirement", version: 1, workstream }, null, 2)}\n\`\`\``;
+}
+
 function event(action, trigger) {
   return {
     action,
@@ -64,6 +69,27 @@ test("latest valid current comment wins per workstream", () => {
   assert.equal(result[0].state, "Blocked");
   assert.equal(result[0].source.id, 2);
   assert.equal(result[0].source.author, "ios-agent");
+});
+
+test("retirement removes the prior workstream and a later update can reactivate it", () => {
+  const comments = [
+    comment(1, fenced(update())),
+    comment(2, retired()),
+  ];
+  assert.deepEqual(updatesFromComments(comments), []);
+  assert.equal(updatesFromComments([...comments, comment(3, fenced(update({ state: "Restarted" })))])[0].state, "Restarted");
+});
+
+test("retirement has a minimal exact schema", () => {
+  assert.deepEqual(validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext" }), {
+    kind: "workstream-retirement",
+    version: 1,
+    workstream: "ios-vnext",
+  });
+  assert.throws(
+    () => validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext", state: "Done" }),
+    /only kind, version, and workstream/,
+  );
 });
 
 test("edited comments remain current instead of silently deleting a workstream", () => {

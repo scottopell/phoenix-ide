@@ -67,6 +67,14 @@ function validateEvidence(value) {
   });
 }
 
+function validateWorkstream(value) {
+  const workstream = requiredLine(value, "workstream");
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(workstream)) {
+    throw new Error("workstream must be a lowercase kebab-case identifier");
+  }
+  return workstream;
+}
+
 export function validateUpdate(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("update must be an object");
@@ -78,10 +86,7 @@ export function validateUpdate(value) {
     throw new Error("update must have kind workstream-update and version 1");
   }
 
-  const workstream = requiredLine(value.workstream, "workstream");
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(workstream)) {
-    throw new Error("workstream must be a lowercase kebab-case identifier");
-  }
+  const workstream = validateWorkstream(value.workstream);
   const section = requiredLine(value.section, "section");
   if (!VALID_SECTIONS.has(section)) throw new Error(`unknown section: ${section}`);
   const order = value.order ?? 100;
@@ -112,9 +117,23 @@ export function validateUpdate(value) {
   };
 }
 
-function updatePayloads(markdown) {
-  const match = String(markdown ?? "").match(/^```phoenix-roadmap-update\r?\n([\s\S]*?)\r?\n```\s*$/);
-  return match ? [match[1]] : [];
+export function validateRetirement(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("retirement must be an object");
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== "kind,version,workstream") {
+    throw new Error("retirement must contain only kind, version, and workstream");
+  }
+  if (value.kind !== "workstream-retirement" || value.version !== 1) {
+    throw new Error("retirement must have kind workstream-retirement and version 1");
+  }
+  return { kind: value.kind, version: value.version, workstream: validateWorkstream(value.workstream) };
+}
+
+function roadmapPayload(markdown) {
+  const match = String(markdown ?? "").match(/^```phoenix-roadmap-(update|retirement)\r?\n([\s\S]*?)\r?\n```\s*$/);
+  return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
 export function updatesFromComments(comments) {
@@ -128,21 +147,27 @@ export function updatesFromComments(comments) {
     .sort((left, right) => left.id - right.id);
 
   for (const comment of ordered) {
-    for (const payload of updatePayloads(comment.body)) {
-      try {
-        const update = validateUpdate(JSON.parse(payload));
-        latest.set(update.workstream, {
-          ...update,
-          source: {
-            id: comment.id,
-            url: comment.html_url,
-            author: comment.user?.login ?? "unknown",
-            created_at: comment.created_at,
-          },
-        });
-      } catch (error) {
-        console.warn(`Ignoring invalid roadmap update in comment ${comment.id}: ${error.message}`);
+    const record = roadmapPayload(comment.body);
+    if (!record) continue;
+    try {
+      const value = JSON.parse(record.payload);
+      if (record.recordType === "retirement") {
+        const retirement = validateRetirement(value);
+        latest.delete(retirement.workstream);
+        continue;
       }
+      const update = validateUpdate(value);
+      latest.set(update.workstream, {
+        ...update,
+        source: {
+          id: comment.id,
+          url: comment.html_url,
+          author: comment.user?.login ?? "unknown",
+          created_at: comment.created_at,
+        },
+      });
+    } catch (error) {
+      console.warn(`Ignoring invalid roadmap record in comment ${comment.id}: ${error.message}`);
     }
   }
 

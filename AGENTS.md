@@ -68,7 +68,7 @@ ios/             # Native iOS client (SwiftUI, offline-first; spec: specs/ios_cl
 
 ### Delivery Roadmap
 
-GitHub Issue [#651](https://github.com/scottopell/phoenix-ide/issues/651) is the central cross-machine orientation view for active delivery. At the start of development work, read its generated body before relying on local task or PR context alone.
+GitHub Issue [#651](https://github.com/scottopell/phoenix-ide/issues/651) is the central cross-machine orientation view for active delivery. At the start of development work, read its generated body before relying on local task or PR context alone. If GitHub is unavailable, continue from the domain authorities below and report that roadmap context could not be verified.
 
 The roadmap is a coordination authority only: it answers what is active, owned, blocked, and next. It does not replace the authorities for requirements (specs/Allium), decisions (ADRs), repository task status (taskmd filenames), review state (PRs), or shipped behavior (`main`). When the roadmap conflicts with one of those authorities, the domain authority wins and the owning agent must append a replacement roadmap update.
 
@@ -76,7 +76,8 @@ When you own a workstream represented on the roadmap:
 
 - report only facts about your workstream; do not rewrite another owner's entry or independently reorder the portfolio;
 - use one stable `workstream` identifier across replacement updates;
-- append a new structured comment when its material state, blocker, owner, or next step changes, including completion or abandonment;
+- append a new structured update when its material state, blocker, owner, or next step changes;
+- append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
 - link detailed evidence instead of copying plans into the roadmap;
 - verify that the generated Issue body reflects the comment you posted.
 

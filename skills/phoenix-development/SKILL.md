@@ -38,13 +38,13 @@ These are compact reminders, not replacements for `AGENTS.md` or normative specs
 
 Use the roadmap only for work substantial enough that another agent needs to know its owner, blocker, or next step. Do not post routine edits, transient test failures, or leaf tasks already clear from an active parent workstream.
 
-1. Fetch Issue #651 by its known number; do not discover it with GitHub search.
+1. Fetch Issue #651 by its known number; do not discover it with GitHub search. If GitHub is unavailable, continue from specs, ADRs, taskmd, PR data already available locally, and `main`; state that roadmap context could not be verified.
 2. Read the generated body and the first comment, which defines the current schema, limits, and allowed sections.
 3. Choose one stable kebab-case `workstream` identifier. Reuse it for every later update; a new valid comment supersedes the prior projection for that identifier.
 4. Report only facts your workstream owns: state, owner, blockers, next concrete step, evidence links, and concise context. Portfolio priority and critical-path ordering require coordinator direction; do not infer them from local importance.
 5. Post a comment consisting only of one exact `phoenix-roadmap-update` fenced JSON object. Do not add surrounding prose or edit the generated Issue body.
-6. Re-fetch the Issue body and verify the projected entry. Report the comment URL and any mismatch.
-7. Append a replacement when material state, owner, blocker, or next step changes. Completion or abandonment also requires a replacement; do not leave an active-looking stale entry.
+6. Poll the Issue body with a bounded wait until the projected entry links to the new source comment. If the reducer workflow finishes without that projection, report the comment URL and mismatch; do not treat the immediately cached body as final.
+7. Append a replacement when material state, owner, blocker, or next step changes. When the workstream completes or is abandoned, append the retirement record defined by the first Issue comment and verify that the entry disappears.
 
 Keep detailed plans in their existing authorities and link them. The roadmap should answer “what is active, who owns it, what blocks it, and what happens next?” without becoming a second spec, task database, or PR mirror.
 
