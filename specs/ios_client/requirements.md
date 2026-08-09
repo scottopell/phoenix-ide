@@ -667,12 +667,26 @@ requires a reading surface rather than a transcript card or raw-file dump.
 
 ### REQ-IOS-021: Comment on Project Prose Reliably
 
-WHEN the user creates a note on a supported prose location
-THE SYSTEM SHALL keep the server-side file path, source line, raw line content,
-and note understandable
+WHEN a chat-capable conversation's reader displays current contents from the
+exact `WorkScope` that is the server-declared live message target
+THE SYSTEM SHALL enable note creation
+AND bind every note to that exact `WorkScope`, file identity, content revision,
+source line, raw line content, and note text
 AND maintain the note in memory while that file's reader remains open
 
-WHEN the user chooses Send for one or more notes
+WHEN ordinary chat is unavailable
+OR the selected `WorkScope` is not the live message target
+OR the displayed file contents are stale
+THE SYSTEM SHALL keep the prose readable but disable note creation and Send
+AND explain why feedback is unavailable
+
+WHEN a note's bound scope stops being the live message target
+OR its bound content revision stops matching the current file revision
+THE SYSTEM SHALL keep the note visible within the open reader session
+AND disable Send until the user refreshes and re-anchors the note against the
+eligible scope and current revision, or explicitly discards it
+
+WHEN the user chooses Send for one or more eligible notes
 THE SYSTEM SHALL format and inject them into the conversation's editable message
 input according to `REQ-PF-009`
 AND clear the notes and close the reader
@@ -688,4 +702,6 @@ according to `REQ-PF-011`
 
 **Rationale:** Session-scoped notes protect against accidental loss while the
 reader is open, then become an editable conversation draft so the user can add
-context before relying on the ordinary message-delivery contract.
+context before relying on the ordinary message-delivery contract. Live-target
+and revision binding prevent feedback from silently referring to an inaccessible
+scope or different file contents.

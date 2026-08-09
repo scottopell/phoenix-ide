@@ -10,12 +10,14 @@ Blocked by ProductConversation migration, Markdown rendering, grounding/files, a
 
 ## Scope
 
-Catalog reader navigation, readable typography, line/block anchoring, in-memory notes, Send-to-composer formatting, discard confirmation, and return-to-conversation flow. Then create numbered requirement-backed leaf tasks for independently reviewable reader and commenting behaviors. Reuse `REQ-PF-009` through `REQ-PF-011` rather than creating a second delivery lifecycle. Each component leaf task adds its deterministic fixtures to the base harness.
+Catalog reader navigation, readable typography, line/block anchoring, live-target and content-revision eligibility, in-memory notes, Send-to-composer formatting, discard confirmation, and return-to-conversation flow. Then create numbered requirement-backed leaf tasks for independently reviewable reader and commenting behaviors. Reuse `REQ-PF-009` through `REQ-PF-011` rather than creating a second delivery lifecycle. Each component leaf task adds its deterministic fixtures to the base harness.
 
 ## Acceptance
 
 - Supported server file contents open in a readable native surface.
 - Comment anchors remain understandable across supported Markdown structures.
+- Notes bind to the exact live-target `WorkScope`, file identity, and current content revision; other scopes, stale content, and conversations that reject chat remain read-only.
+- A target or revision change keeps in-session notes visible but disables Send until refresh/re-anchor or explicit discard.
 - Send formats notes into the editable conversation composer, clears them, and closes the reader.
 - Closing with unsent notes requires Cancel or explicit Discard; reopening starts with zero notes.
 - The leaf queue separates reader fidelity from session-scoped note composition.
