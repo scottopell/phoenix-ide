@@ -69,6 +69,19 @@ class CompilerCacheTests(unittest.TestCase):
         with mock.patch.object(self.dev.subprocess, "run", return_value=completed):
             self.assertIsNone(self.dev._sccache_limit_warning())
 
+    def test_sccache_limit_warning_honors_explicit_limit(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"max_cache_size": 21474836480}',
+            stderr="",
+        )
+        with mock.patch.object(self.dev.subprocess, "run", return_value=completed):
+            self.assertIsNone(self.dev._sccache_limit_warning("20G"))
+
+    def test_sccache_limit_warning_reports_invalid_config(self):
+        warning = self.dev._sccache_limit_warning("twenty gigs")
+        self.assertIn("unsupported cache size", warning)
+
     def test_auto_uses_kache_when_sccache_is_unavailable(self):
         selected, env = self.configure(installed={"kache"})
         self.assertEqual("kache", selected)

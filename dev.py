@@ -1438,7 +1438,14 @@ def _dir_size_bytes(path: Path) -> int:
     return 0
 
 
-def _record_span_artifact_size(span, *, event_name: str, path: Path, attribute_prefix: str) -> dict:
+def _record_span_artifact_size(
+    span,
+    *,
+    event_name: str,
+    path: Path,
+    attribute_prefix: str,
+    event_time: int | None = None,
+) -> dict:
     """Measure a bounded artifact tree outside the timed span and annotate it."""
     if span is _NOOP_SPAN or _DEV_TRACING is None:
         return {}
@@ -1452,7 +1459,7 @@ def _record_span_artifact_size(span, *, event_name: str, path: Path, attribute_p
     }
     if hasattr(span, "add_event"):
         try:
-            span.add_event(event_name, attributes)
+            span.add_event(event_name, attributes, timestamp=event_time)
         except Exception:
             pass
     return attributes
@@ -1804,6 +1811,7 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         raise
     finally:
         finished_at = time.monotonic()
+        finished_wall_ns = time.time_ns()
         attributes = {
             "build.elapsed_seconds": max(0.0, finished_at - started_at),
             "cargo.lock_wait_seconds": lock_timer.finish(finished_at),
@@ -1814,8 +1822,14 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
             event_name="build.artifact_size",
             path=cwd / "target" / profile,
             attribute_prefix="build.artifact",
+            event_time=finished_wall_ns,
         ))
-        _finish_dev_span(span, attributes, failed=returncode != 0)
+        _finish_dev_span(
+            span,
+            attributes,
+            failed=returncode != 0,
+            end_time=finished_wall_ns,
+        )
 
 
 def build_rust(release: bool = False):
@@ -4672,8 +4686,20 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
     return backend
 
 
-def _sccache_limit_warning(binary: str = "sccache") -> str | None:
+def _parse_cache_size(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)B?\s*", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"unsupported cache size {value!r}")
+    exponent = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}[match.group(2).upper()]
+    return int(match.group(1)) * 1024**exponent
+
+
+def _sccache_limit_warning(
+    expected: str | None = None, binary: str = "sccache"
+) -> str | None:
+    expected = expected or os.environ.get("SCCACHE_CACHE_SIZE", "10G")
     try:
+        requested = _parse_cache_size(expected)
         result = subprocess.run(
             [binary, "--show-stats", "--stats-format", "json"],
             capture_output=True,
@@ -4686,11 +4712,10 @@ def _sccache_limit_warning(binary: str = "sccache") -> str | None:
         actual = int(json.loads(result.stdout)["max_cache_size"])
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         return f"sccache limit unavailable: {error}"
-    requested = 10 * 1024**3
     if actual != requested:
         return (
-            f"running sccache server limit is {actual / 1024**3:.1f} GiB, not the "
-            "requested 10 GiB; restart sccache to apply SCCACHE_CACHE_SIZE"
+            f"running sccache server limit is {actual / 1024**3:.1f} GiB, not "
+            f"the requested {expected}; restart sccache to apply SCCACHE_CACHE_SIZE"
         )
     return None
 
@@ -4757,6 +4782,16 @@ def _cargo_check_active(active: set[str]) -> bool:
 
 def _verification_cargo_env() -> dict[str, str]:
     return {"CARGO_INCREMENTAL": "0"}
+
+
+def _clippy_invocation(package_flags: list[str]) -> tuple[list[str], dict[str, str]]:
+    return (
+        ["cargo", "clippy", *package_flags, "--all-targets", "--", "-D", "warnings"],
+        {
+            "CARGO_TARGET_DIR": str(ROOT / "target" / "clippy"),
+            **_verification_cargo_env(),
+        },
+    )
 
 
 def _finish_check_step_span(
@@ -5037,6 +5072,7 @@ def cmd_check(
                 event_name="check.artifact_size",
                 path=artifact_dir,
                 attribute_prefix="check.artifact",
+                event_time=finished_wall_ns,
             )
         _finish_check_step_span(
             span,

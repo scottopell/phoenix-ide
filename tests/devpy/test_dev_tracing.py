@@ -23,8 +23,8 @@ class FakeSpan:
     def __init__(self):
         self.events = []
 
-    def add_event(self, name, attributes):
-        self.events.append((name, attributes))
+    def add_event(self, name, attributes, timestamp=None):
+        self.events.append((name, attributes, timestamp))
 
 
 class FakeTracing:
@@ -451,6 +451,7 @@ class DevTracingTests(unittest.TestCase):
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
             mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(self.dev.time, "time_ns", return_value=1_700_000_000_000_000_000),
             mock.patch.object(self.dev, "_dir_size_bytes", return_value=4096) as dir_size,
             mock.patch.object(Path, "exists", return_value=True),
             mock.patch("builtins.print"),
@@ -468,6 +469,8 @@ class DevTracingTests(unittest.TestCase):
         self.assertTrue(attributes["build.artifact.exists"])
         self.assertEqual("build.artifact_size", span.events[0][0])
         self.assertEqual(4096, span.events[0][1]["build.artifact.size_bytes"])
+        self.assertEqual(1_700_000_000_000_000_000, span.events[0][2])
+        self.assertEqual(1_700_000_000_000_000_000, tracing.finished[0][3])
         dir_size.assert_called_once_with((ROOT / "target" / "release").resolve())
 
     def test_record_span_artifact_size_returns_zero_when_directory_missing(self):

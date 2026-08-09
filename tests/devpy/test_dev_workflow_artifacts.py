@@ -66,6 +66,24 @@ class DevWorkflowArtifactTests(unittest.TestCase):
     def test_verification_cargo_environment_disables_incremental(self):
         self.assertEqual({"CARGO_INCREMENTAL": "0"}, self.dev._verification_cargo_env())
 
+    def test_clippy_lane_invocation_isolated_and_non_incremental(self):
+        command, env = self.dev._clippy_invocation(["-p", "phoenix-core"])
+        self.assertEqual(
+            [
+                "cargo",
+                "clippy",
+                "-p",
+                "phoenix-core",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            command,
+        )
+        self.assertEqual(str(self.dev.ROOT / "target" / "clippy"), env["CARGO_TARGET_DIR"])
+        self.assertEqual("0", env["CARGO_INCREMENTAL"])
+
     def test_clippy_second_run_detects_new_denied_lint(self):
         with tempfile.TemporaryDirectory(prefix="phoenix-clippy-cache-") as directory:
             crate = Path(directory)
