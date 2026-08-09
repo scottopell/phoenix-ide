@@ -37,7 +37,7 @@ This remains a desired P1 product feature. It is blocked until the ProductConver
 - ProductConversation Close settles parallel children through one typed operation.
 - Sequential Work-child behavior remains valid.
 - Overlapping sibling write attempts cannot silently overwrite or interleave changes, including writes performed through bash or Git rather than patch.
-- A child terminal outcome persisted before Phoenix restart is reconstructed and delivered after restart when the parent has not yet accepted it.
+- After restart, a pending wake contract delivers a persisted child terminal cause only when that cause occurred before the contract deadline; it expires when durable terminal state occurred only after the deadline, and otherwise treats the handle as forgotten, as required by REQ-SA-009.
 
 ## Timing
 

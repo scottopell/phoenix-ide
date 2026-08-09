@@ -169,7 +169,7 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the parent's writable environment directly: the parent worktree for Work/Branch, or the parent cwd for Direct. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -185,7 +185,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model; Explore sub-agents may run in parallel. Work: full tool suite, inherits the parent model, and runs one at a time per parent. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the parent's writable environment directly: the parent worktree for Work/Branch, or the parent cwd for Direct. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
+                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model; Explore sub-agents may run in parallel. Work: full tool suite, inherits the parent model, and runs one at a time per parent. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
             },
             "model": {
                 "type": "string",
@@ -482,8 +482,9 @@ mod tests {
         let description = tool.description();
 
         for expected in [
-            "parent worktree for Work/Branch",
-            "parent cwd for Direct",
+            "omitted or blank cwd inherits the parent cwd",
+            "Work/Branch overrides stay within the parent worktree",
+            "Direct overrides are unscoped",
             "does not create a separate child worktree",
             "merge child changes",
         ] {
