@@ -672,6 +672,8 @@ exact `WorkScope` that is the server-declared live message target
 THE SYSTEM SHALL enable note creation
 AND bind every note to that exact `WorkScope`, file identity, content revision,
 source line, raw line content, and note text
+AND create the note only when the source line exists in that bound revision and
+its exact raw content matches the displayed anchor
 AND maintain the note in memory while that file's reader remains open
 
 WHEN ordinary chat is unavailable
@@ -685,32 +687,43 @@ OR its bound content revision stops matching the current file revision
 THE SYSTEM SHALL keep the note visible within the open reader session
 AND disable Send until the user refreshes and re-anchors the note against the
 eligible scope and current revision, or explicitly discards it
+AND, when refreshing, replace every retained note's source line and raw content
+as one validated re-anchor operation before updating the session revision
 
 WHEN the user chooses Send for one or more eligible notes
 THE SYSTEM SHALL format and inject them into the conversation's editable message
 input according to `REQ-PF-009`
-AND attach typed review authority to that draft for each injected note bundle,
-carrying the exact `WorkScope`, file identity, content revision, and draft
-contribution identity
+AND represent each injected note bundle as one structural draft contribution
+that owns both its editable formatted text and typed authority carrying the exact
+`WorkScope`, file identity, content revision, and contribution identity
 AND clear the notes and close the reader
 AND SHALL NOT deliver the notes independently of that message input
 
-WHILE the user edits a draft with attached review authority
-THE SYSTEM SHALL preserve every authority binding regardless of changes to the
-visible draft text
+WHILE the user edits a retained review contribution
+THE SYSTEM SHALL preserve that contribution's authority binding with its text
+AND SHALL NOT represent the text and authority as independently removable data
+
+WHEN the user explicitly removes a review contribution
+THE SYSTEM SHALL remove its text and authority together
+AND preserve unrelated draft text and attachments
 
 WHEN the user submits a draft with attached review authority
 THE SYSTEM SHALL revalidate ordinary chat capability, the exact live message
 target, and the current content revision for every authority binding
-AND, when every binding remains valid, enqueue the exact editable draft through
-the ordinary durable message queue according to `REQ-IOS-002` and `REQ-IOS-003`
-AND clear the draft's review authority only after that queue has durably accepted
-the message
+AND, when every binding remains valid, enqueue the exact rendered draft text and
+all staged image attachments through one ordinary durable message-queue entry
+according to `REQ-IOS-002`, `REQ-IOS-003`, and `REQ-IOS-015`
+AND preserve every draft segment, attachment, and review authority until a
+version-fenced disk write positively establishes that the full visible outbox,
+including that exact entry, is durable
+AND only then clear the submitted draft and its review authority
 
 WHEN any review authority binding fails submission-time revalidation
 THE SYSTEM SHALL block submission without clearing or changing the draft or its
 review authority
-AND explain which authority is no longer valid
+AND identify every invalid review contribution with a typed reason distinguishing
+unavailable chat, a changed live target, unavailable content, and a changed
+content revision
 AND allow the user to refresh and re-anchor that review contribution or
 explicitly discard that contribution while preserving unrelated draft text
 

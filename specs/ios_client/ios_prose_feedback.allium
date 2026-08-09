@@ -1,14 +1,14 @@
 -- allium: 3
 -- ios_prose_feedback.allium
 --
--- Scope: The iOS prose-review handoff from session-scoped reader notes to an
---        editable conversation draft and then to the durable local message
---        queue.
+-- Scope: The iOS prose-review lifecycle from session-scoped reader notes to
+--        structurally identified composer contributions and then to the
+--        durable local message queue.
 --
--- Includes: exact WorkScope, file, and content-revision bindings; typed draft
---           authority that survives editing; submit-time revalidation; safe
---           refresh/re-anchoring; and explicit removal of a review
---           contribution.
+-- Includes: exact WorkScope, file, content-revision, and source-line binding;
+--           reader re-anchoring and discard; typed draft contributions that
+--           survive editing; attachments; submit-time revalidation with typed
+--           failures; and disk-persistence acknowledgement.
 --
 -- Excludes: Markdown rendering, project-file transport, server execution, and
 --           local queue retry/reconciliation after durable enqueue (see
@@ -24,21 +24,30 @@ use "../user_message_queue/user_message_queue.allium" as queue
 --   Returns the server-observed revision for the exact file in the exact
 --   attached WorkScope, or null when that content cannot be established as
 --   current.
+-- line_content_at(conversation, work_scope, file, revision, source_line) -> String?
+--   Returns the exact raw line at the one-based source line for the bound
+--   revision, or null when the anchor does not exist.
+-- reader_reanchors_are_exact(session, revision, anchors) -> Boolean
+--   True only when anchors form a one-to-one mapping for every session note,
+--   every source line exists in revision, and every supplied raw line equals
+--   line_content_at for that source line.
+-- reanchored_source_line(anchors, note) -> Integer
+-- reanchored_raw_line_content(anchors, note) -> String
+--   Return the validated replacement anchor fields for the note.
 -- format_review_notes(file, notes) -> String
 --   Produces the REQ-PF-009 message contribution using the absolute file path,
 --   source line, exact raw line content, and note text.
 -- new_review_contribution_identity() -> ReviewContributionIdentity
---   Produces a fresh identity for one formatted review contribution in a
---   composer draft.
--- append_review_contribution(text, contribution, formatted_notes) -> String
---   Appends the formatted review contribution to editable draft text while
---   retaining its typed contribution identity.
--- replace_review_contribution(text, contribution, formatted_notes) -> String
---   Atomically replaces the contribution associated with the identity while
---   preserving unrelated draft text.
--- remove_review_contribution(text, contribution) -> String
---   Removes the contribution associated with the identity while preserving
---   unrelated draft text.
+--   Produces a fresh identity for one formatted review contribution.
+-- next_draft_position(draft) -> Integer
+--   Returns an unused position after every retained plain or review segment.
+-- render_composer_draft(draft) -> String
+--   Joins plain segments and review authorities by position into the exact
+--   user-visible message text. No second stored text representation exists.
+-- review_authority_failures(draft) -> List<ReviewAuthorityFailure>
+--   Returns typed failures for every review authority that cannot submit. Each
+--   result identifies its contribution and one of: chat unavailable, live
+--   target changed, content unavailable, or content revision changed.
 -- new_local_message_id(draft) -> String
 --   Produces the idempotency identity used by the ordinary local message queue.
 
@@ -62,6 +71,28 @@ value ReviewContributionIdentity {
     token: String
 }
 
+value ReanchoredNoteAnchor {
+    note: ProseReviewNote
+    source_line: Integer
+    raw_line_content: String
+}
+
+value ReviewAuthorityFailure {
+    contribution: ReviewContributionIdentity
+    reason: ReviewAuthorityFailureReason
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ReviewAuthorityFailureReason {
+    chat_unavailable
+    | live_target_changed
+    | content_unavailable
+    | content_revision_changed
+}
+
 ------------------------------------------------------------
 -- External Entities
 ------------------------------------------------------------
@@ -71,6 +102,21 @@ external entity IosProductConversation {
     queue_scope: queue/ConversationScope
     chat_capable: Boolean
     live_message_target: WorkScopeIdentity?
+}
+
+-- Positive evidence that the version-fenced disk writer durably stored the
+-- full visible outbox including entry. In-memory LocalQueueEntry creation is
+-- not sufficient evidence.
+external entity PersistedLocalQueueEntry {
+    entry: queue/LocalQueueEntry
+    persistence_revision: Integer
+}
+
+-- A complete user-selected replacement anchor set for one refreshed reader.
+external entity ReaderReanchorRequest {
+    session: ProseReviewSession
+    refreshed_revision: ContentRevision
+    anchors: List<ReanchoredNoteAnchor>
 }
 
 ------------------------------------------------------------
@@ -95,15 +141,26 @@ entity ProseReviewNote {
 
 entity ComposerDraft {
     conversation: IosProductConversation
-    text: String
+    images: List<queue/ImageData>
 
+    plain_segments: PlainDraftSegment with draft = this
     review_authorities: ProseReviewAuthority with draft = this
     pending_enqueue: PendingReviewDraftEnqueue with draft = this
 }
 
+entity PlainDraftSegment {
+    draft: ComposerDraft
+    position: Integer
+    text: String
+}
+
+-- The formatted review text and its authority are one structural contribution.
+-- Removing this entity removes both; editing text retains the bindings.
 entity ProseReviewAuthority {
     draft: ComposerDraft
+    position: Integer
     contribution: ReviewContributionIdentity
+    text: String
     work_scope: WorkScopeIdentity
     file: ProjectFileIdentity
     content_revision: ContentRevision
@@ -113,6 +170,11 @@ entity PendingReviewDraftEnqueue {
     draft: ComposerDraft
     scope: queue/ConversationScope
     local_id: String
+}
+
+entity ReviewSubmissionBlock {
+    draft: ComposerDraft
+    failures: List<ReviewAuthorityFailure>
 }
 
 ------------------------------------------------------------
@@ -157,6 +219,7 @@ rule AddEligibleProseReviewNote {
     )
 
     requires: note_text != ""
+    requires: source_line > 0
     requires: session.conversation.chat_capable
     requires: session.conversation.live_message_target = session.work_scope
     requires:
@@ -165,6 +228,14 @@ rule AddEligibleProseReviewNote {
             session.work_scope,
             session.file
         ) = session.content_revision
+    requires:
+        line_content_at(
+            session.conversation,
+            session.work_scope,
+            session.file,
+            session.content_revision,
+            source_line
+        ) = raw_line_content
 
     ensures: ProseReviewNote.created(
         session: session,
@@ -174,11 +245,97 @@ rule AddEligibleProseReviewNote {
     )
 }
 
+rule ReaderNotesReanchorToCurrentRevision {
+    -- REQ-IOS-021
+    when: request: ReaderReanchorRequest.created
+
+    requires: request.session.notes.count > 0
+    requires: request.session.conversation.chat_capable
+    requires:
+        request.session.conversation.live_message_target
+        = request.session.work_scope
+    requires:
+        current_content_revision(
+            request.session.conversation,
+            request.session.work_scope,
+            request.session.file
+        ) = request.refreshed_revision
+    requires: reader_reanchors_are_exact(
+        request.session,
+        request.refreshed_revision,
+        request.anchors
+    )
+
+    ensures: request.session.content_revision = request.refreshed_revision
+    ensures:
+        for note in request.session.notes:
+            note.source_line = reanchored_source_line(request.anchors, note)
+            note.raw_line_content = reanchored_raw_line_content(
+                request.anchors,
+                note
+            )
+}
+
+rule EmptyReaderClosesImmediately {
+    -- REQ-IOS-021, REQ-PF-011
+    when: UserRequestsCloseProseReview(session)
+
+    requires: session.notes.count = 0
+
+    ensures: not exists session
+}
+
+rule ReaderWithNotesRequiresDiscardConfirmation {
+    -- REQ-IOS-021, REQ-PF-010
+    when: UserRequestsCloseProseReview(session)
+
+    requires: session.notes.count > 0
+
+    ensures: ReaderDiscardConfirmationRequired(session: session)
+}
+
+rule CancellingReaderDiscardPreservesSession {
+    -- REQ-IOS-021, REQ-PF-010
+    when: UserCancelsReaderDiscard(session)
+
+    requires: session.notes.count > 0
+
+    ensures: ProseReviewRemainsOpen(session: session)
+}
+
+rule ConfirmingReaderDiscardClearsSession {
+    -- REQ-IOS-021, REQ-PF-010, REQ-PF-011
+    when: UserConfirmsReaderDiscard(session)
+
+    ensures:
+        for note in session.notes:
+            not exists note
+        not exists session
+}
+
 ------------------------------------------------------------
--- Rules -- editable composer handoff
+-- Rules -- composer structure and handoff
 ------------------------------------------------------------
 
-rule EligibleNotesBecomeReviewBoundDraftText {
+rule ComposerDraftCreated {
+    when: ComposerDraftNeeded(conversation, initial_text, images)
+
+    requires: not exists ComposerDraft{conversation: conversation}
+
+    ensures:
+        let draft = ComposerDraft.created(
+            conversation: conversation,
+            images: images
+        )
+        if initial_text != "":
+            PlainDraftSegment.created(
+                draft: draft,
+                position: 0,
+                text: initial_text
+            )
+}
+
+rule EligibleNotesBecomeReviewBoundDraftContribution {
     -- REQ-IOS-021, REQ-PF-009
     when: UserSendsProseReviewToComposer(session, draft)
 
@@ -197,14 +354,11 @@ rule EligibleNotesBecomeReviewBoundDraftText {
             session.file
         ) = session.content_revision
 
-    ensures: draft.text = append_review_contribution(
-        draft.text,
-        contribution,
-        formatted_notes
-    )
     ensures: ProseReviewAuthority.created(
         draft: draft,
+        position: next_draft_position(draft),
         contribution: contribution,
+        text: formatted_notes,
         work_scope: session.work_scope,
         file: session.file,
         content_revision: session.content_revision
@@ -215,13 +369,31 @@ rule EligibleNotesBecomeReviewBoundDraftText {
         not exists session
 }
 
-rule EditingDraftPreservesReviewAuthority {
+rule UserEditsPlainDraftSegment {
+    when: UserEditsPlainDraftSegment(segment, edited_text)
+
+    requires: not exists segment.draft.pending_enqueue
+
+    ensures: segment.text = edited_text
+}
+
+rule UserEditsReviewContributionText {
     -- REQ-IOS-021
-    when: UserEditsComposerDraft(draft, edited_text)
+    when: UserEditsReviewContribution(authority, edited_text)
+
+    requires: edited_text != ""
+    requires: not exists authority.draft.pending_enqueue
+
+    ensures: authority.text = edited_text
+}
+
+rule UserStagesComposerImages {
+    -- REQ-IOS-015, REQ-IOS-021
+    when: UserStagesComposerImages(draft, images)
 
     requires: not exists draft.pending_enqueue
 
-    ensures: draft.text = edited_text
+    ensures: draft.images = images
 }
 
 rule RefreshedNotesReplaceBoundDraftContribution {
@@ -248,11 +420,7 @@ rule RefreshedNotesReplaceBoundDraftContribution {
             refreshed_session.file
         ) = refreshed_session.content_revision
 
-    ensures: authority.draft.text = replace_review_contribution(
-        authority.draft.text,
-        authority.contribution,
-        formatted_notes
-    )
+    ensures: authority.text = formatted_notes
     ensures: authority.work_scope = refreshed_session.work_scope
     ensures: authority.file = refreshed_session.file
     ensures: authority.content_revision = refreshed_session.content_revision
@@ -268,10 +436,6 @@ rule UserDiscardsBoundReviewContribution {
 
     requires: not exists authority.draft.pending_enqueue
 
-    ensures: authority.draft.text = remove_review_contribution(
-        authority.draft.text,
-        authority.contribution
-    )
     ensures: not exists authority
 }
 
@@ -280,30 +444,22 @@ rule UserDiscardsBoundReviewContribution {
 ------------------------------------------------------------
 
 rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
-    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-021
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
     when: UserSubmitsComposerDraft(draft)
 
     let local_id = new_local_message_id(draft)
+    let message_text = render_composer_draft(draft)
 
-    requires: draft.text != ""
+    requires: message_text != "" or draft.images != empty_list
     requires: draft.review_authorities.count > 0
     requires: not exists draft.pending_enqueue
-    requires: draft.conversation.chat_capable
-    requires:
-        draft.review_authorities.all(authority =>
-            draft.conversation.live_message_target = authority.work_scope
-            and current_content_revision(
-                draft.conversation,
-                authority.work_scope,
-                authority.file
-            ) = authority.content_revision
-        )
+    requires: review_authority_failures(draft) = empty_list
 
     ensures: queue/UserSendsMessage(
         draft.conversation.queue_scope,
         local_id,
-        draft.text,
-        empty_list
+        message_text,
+        draft.images
     )
     ensures: PendingReviewDraftEnqueue.created(
         draft: draft,
@@ -312,20 +468,25 @@ rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
     )
 }
 
-rule DurableQueueAcceptanceClearsDraftReviewAuthority {
-    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-021
-    when: entry: queue/LocalQueueEntry.created
+rule DurableQueuePersistenceClearsDraftReviewAuthority {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
+    when: persistence: PersistedLocalQueueEntry.created
 
+    let entry = persistence.entry
     let pending_enqueue = PendingReviewDraftEnqueue{
         scope: entry.scope,
         local_id: entry.local_id
     }
 
     requires: exists pending_enqueue
-    requires: entry.text = pending_enqueue.draft.text
+    requires: persistence.persistence_revision > 0
+    requires: entry.text = render_composer_draft(pending_enqueue.draft)
+    requires: entry.images = pending_enqueue.draft.images
 
-    ensures: pending_enqueue.draft.text = ""
+    ensures: pending_enqueue.draft.images = empty_list
     ensures:
+        for segment in pending_enqueue.draft.plain_segments:
+            not exists segment
         for authority in pending_enqueue.draft.review_authorities:
             not exists authority
         not exists pending_enqueue
@@ -335,18 +496,42 @@ rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
     -- REQ-IOS-021
     when: UserSubmitsComposerDraft(draft)
 
+    let failures = review_authority_failures(draft)
+
     requires: draft.review_authorities.count > 0
     requires: not exists draft.pending_enqueue
-    requires:
-        not draft.conversation.chat_capable
-        or draft.review_authorities.any(authority =>
-            draft.conversation.live_message_target != authority.work_scope
-            or current_content_revision(
-                draft.conversation,
-                authority.work_scope,
-                authority.file
-            ) != authority.content_revision
-        )
+    requires: failures != empty_list
 
-    ensures: ReviewBoundDraftSubmissionBlocked(draft: draft)
+    ensures: ReviewSubmissionBlock.created(
+        draft: draft,
+        failures: failures
+    )
+}
+
+rule UserAcknowledgesReviewSubmissionBlock {
+    when: UserAcknowledgesReviewSubmissionBlock(block)
+
+    ensures: not exists block
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant PlainDraftSegmentPositionsAreUnique {
+    for a in PlainDraftSegments:
+        for b in PlainDraftSegments:
+            a != b and a.draft = b.draft implies a.position != b.position
+}
+
+invariant ReviewContributionPositionsAreUnique {
+    for a in ProseReviewAuthorities:
+        for b in ProseReviewAuthorities:
+            a != b and a.draft = b.draft implies a.position != b.position
+}
+
+invariant PlainAndReviewPositionsDoNotOverlap {
+    for plain in PlainDraftSegments:
+        for review in ProseReviewAuthorities:
+            plain.draft = review.draft implies plain.position != review.position
 }
