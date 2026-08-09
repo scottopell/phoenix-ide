@@ -1,0 +1,20 @@
+.lazy-panel-failure {
+  min-height: 100%;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  text-align: center;
+}
+
+.lazy-panel-failure__close {
+  justify-self: center;
+  padding: 6px 10px;
+  color: white;
+  background: var(--accent-blue, #2563eb);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}

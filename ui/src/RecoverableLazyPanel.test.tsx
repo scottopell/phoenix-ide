@@ -46,6 +46,26 @@ describe('RecoverableLazyPanel', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it('resets failure state when the active viewer identity changes', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    recordModuleAcquisitionFailure();
+    const { rerender } = render(
+      <RecoverableLazyPanel key="viewer-a">
+        <BrokenPanel />
+      </RecoverableLazyPanel>,
+    );
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+
+    rerender(
+      <RecoverableLazyPanel key="viewer-b">
+        <div>second viewer loaded</div>
+      </RecoverableLazyPanel>,
+    );
+
+    expect(screen.getByText('second viewer loaded')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('lets ordinary component failures reach the visible root fallback', () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
 

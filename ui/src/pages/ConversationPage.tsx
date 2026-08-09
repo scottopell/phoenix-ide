@@ -1526,6 +1526,19 @@ function ConversationPageContent({
 
   const handleCloseActiveViewer = proseSlot ? handleCloseFileViewer : viewerSlot.close;
 
+  const activeViewerIdentity = useMemo(() => {
+    const slot = viewerSlot.slot;
+    switch (slot.kind) {
+      case 'prose': return `prose:${slot.file.rootDir}:${slot.file.path}`;
+      case 'diff': return `diff:${slot.presentation}:${slot.target}`;
+      case 'browser': return 'browser';
+      case 'inspect': return `inspect:${slot.handleId}`;
+      case 'message': return `message:${slot.sequenceId}`;
+      case 'commission-review': return `commission-review:${slot.requestSequenceId}`;
+      case 'none': return 'none';
+    }
+  }, [viewerSlot.slot]);
+
   // Task 02672: terminal selection → composer draft.
   // TerminalPanel fires this when the user presses Cmd/Ctrl+Shift+L with
   // text selected. We fence the selection so it stays distinguishable from
@@ -2709,7 +2722,7 @@ function ConversationPageContent({
             }}
           />
           <div className="conversation-viewer-pane">
-            <RecoverableLazyPanel onClose={handleCloseActiveViewer}>
+            <RecoverableLazyPanel key={activeViewerIdentity} onClose={handleCloseActiveViewer}>
               {paneDiffOpen && conversationId ? (
                 <ConversationDiffViewer
                   conversationId={conversationId}

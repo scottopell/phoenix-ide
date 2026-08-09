@@ -1,4 +1,5 @@
 import { recordModuleAcquisitionFailure } from './moduleAcquisitionFailure';
+import './deploymentModuleRecovery.css';
 
 const NOTICE_ID = 'phoenix-module-load-notice';
 

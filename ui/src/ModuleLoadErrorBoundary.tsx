@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import './ModuleLoadErrorBoundary.css';
 
 type Props = {
   children: ReactNode;

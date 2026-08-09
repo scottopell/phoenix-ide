@@ -1,5 +1,6 @@
 import { Component, Suspense, type ErrorInfo, type ReactNode } from 'react';
 import { isModuleAcquisitionFailure } from './moduleAcquisitionFailure';
+import './RecoverableLazyPanel.css';
 
 type Props = {
   children: ReactNode;
