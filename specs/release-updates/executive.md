@@ -30,4 +30,4 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 - controller-mode tests across launchd, systemd, and bare Linux in `tests/devpy/`
 - Rust release identity and approval-binding tests in `api::release_updates::tests`
 - `ReleaseUpdatePanel.test.tsx` covers immutable preview, explicit approval, remote denial, unreadable status, verified rollback, and rollback failure
-- `./dev.py check` validates all repository lanes, including musl cross-compilation and generated TypeScript freshness
+- `./dev.py check` validates local repository lanes and generated TypeScript freshness; normal Linux CI checks x86_64-musl compatibility, and release CI builds both Linux musl targets

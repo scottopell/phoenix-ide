@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -3774,9 +3775,9 @@ def _classify_network_env() -> None:
 # `desc` feeds the --pretty renderer and `check --lanes` validation errors.
 _LANE_DEFS = [
     # (name, inputs, desc)
-    ("rust", {"RUST"}, "codegen + cargo test (+ musl smoke on macOS)"),
+    ("rust", {"RUST"}, "codegen + cargo test"),
     ("cargo-fmt", {"RUST"}, "cargo fmt --check"),
-    ("clippy", {"RUST"}, "cargo clippy --all-targets (own target dir)"),
+    ("clippy", {"RUST"}, "cargo clippy --all-targets (bounded non-incremental target)"),
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
@@ -4611,6 +4612,59 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
 
 _CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
+_CHECK_CPU_BUDGET = 4
+
+
+def _check_cpu_budget() -> int:
+    return max(1, min(_CHECK_CPU_BUDGET, os.cpu_count() or 1))
+
+def _clippy_check_env(root: Path = ROOT) -> dict[str, str]:
+    return {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TARGET_DIR": str(root / "target" / "clippy"),
+    }
+
+def _prepare_clippy_check_target(root: Path = ROOT) -> None:
+    incremental = root / "target" / "clippy" / "debug" / "incremental"
+    if incremental.is_dir():
+        shutil.rmtree(incremental)
+
+
+
+def _vitest_check_command() -> list[str]:
+    return [
+        "pnpm", "exec", "vitest", "run",
+        "--maxWorkers", str(_check_cpu_budget()),
+    ]
+
+
+def _run_check_lane(
+    name: str,
+    lane,
+    results: list,
+    results_lock: threading.Lock,
+) -> None:
+    started = time.monotonic()
+    try:
+        lane()
+    except BaseException as exc:
+        detail = "".join(traceback.format_exception(exc))
+        with results_lock:
+            results.append((f"{name} lane", 1, time.monotonic() - started, detail))
+
+
+def _run_check_threads_sequentially(
+    threads: list[threading.Thread],
+    timeout: float,
+) -> list[threading.Thread]:
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            return [thread]
+    return []
+
 
 
 def _cargo_check_active(active: set[str]) -> bool:
@@ -4647,7 +4701,7 @@ def cmd_check(
     compiler_cache: str | None = None,
     profile_work: bool = False,
 ):
-    """Run lint, format check, tests, and task validation in parallel.
+    """Run lint, format checks, tests, and task validation within one worker budget.
 
     `lanes` is an optional comma-separated lane subset (CI splits the check
     across runners with it); gating still applies within the subset unless
@@ -4686,6 +4740,9 @@ def cmd_check(
     reporter = _make_reporter(pretty, active, skipped)
     if lanes is not None:
         reporter.info(f"lane filter: [{', '.join(sorted(active | set(skipped)))}]")
+    reporter.info(
+        f"check execution: one lane at a time; child worker budget: {_check_cpu_budget()}"
+    )
     if skipped:
         ran = ", ".join(sorted(active))
         reporter.info(f"incremental gating: running [{ran}]")
@@ -4750,6 +4807,9 @@ def cmd_check(
         env = dict(node_env()) if Path(cwd) == UI_DIR else os.environ.copy()
         env["CARGO_TERM_COLOR"] = "never"
         env["NO_COLOR"] = "1"
+        budget = str(_check_cpu_budget())
+        env["CARGO_BUILD_JOBS"] = budget
+        env["RAYON_NUM_THREADS"] = budget
         env.pop("FORCE_COLOR", None)
         env.pop("CLICOLOR_FORCE", None)
         if env_extra:
@@ -4892,14 +4952,10 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: test compile → codegen export → staleness diff →
-        test run → [musl smoke check].
+        """Rust lane: test compile → codegen export → staleness diff → test run.
 
-        The musl smoke check is **macOS-only and conditional** on the
-        `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
-        runs on Linux (clippy already covers the same surface there).
-        Expect the timing breakdown to be missing the musl line on Linux
-        and on macOS hosts without the cross toolchain installed.
+        Linux-musl compatibility is checked once per commit by CI rather than
+        generating a separate cross-target artifact tree in every macOS worktree.
 
         vite build is intentionally NOT run here. `#[derive(Embed)]` in
         crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
@@ -4919,8 +4975,8 @@ def cmd_check(
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
         scratch dir under target/, and the staleness step diffs that scratch
         export against the committed tree. The committed tree is therefore
-        frozen for the whole check — the tsc, vitest, eslint, and ast-grep
-        lanes read it concurrently with no ordering dependency on this lane.
+        frozen for the whole check, so later UI and source-validation lanes
+        read a stable committed tree without an ordering dependency on codegen.
         `test_cmd` excludes `export_bindings` (the codegen step just ran
         them — no lost coverage). `compile_cmd`/`test_cmd`/the thread cap are
         computed once in cmd_check and closed over here.
@@ -4938,48 +4994,31 @@ def cmd_check(
             if rc == 0:
                 codegen_stale_step()
         run_step("cargo test", test_cmd)
-        if sys.platform == "darwin":
-            # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
-            # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
-            # See task 60001 for installing musl-cross-make on this machine.
-            # (--target musl has its own fingerprint namespace, so it neither
-            # disturbs nor is disturbed by the host-target steps around it.)
-            if shutil.which("x86_64-linux-musl-gcc"):
-                run_step("cargo check musl", [
-                    "cargo", "check", "--target", "x86_64-unknown-linux-musl",
-                ])
-            else:
-                reporter.step_skipped("rust", "cargo check musl",
-                                      "x86_64-linux-musl-gcc not on PATH; see task 60001")
 
     def lane_clippy():
-        """Clippy in its own target dir so it runs fully parallel to lane_rust.
+        """Clippy in a bounded, non-incremental target directory.
 
-        `cargo clippy` builds workspace crates through clippy-driver
-        (RUSTC_WORKSPACE_WRAPPER), which carries a different fingerprint than the
-        normal-rustc build lane_rust/codegen produce. Sharing one target dir
-        would (a) make the two builds thrash each other's workspace fingerprints
-        and (b) serialize them on cargo's exclusive target lock. A dedicated
-        CARGO_TARGET_DIR sidesteps both, so clippy overlaps the test build/run
-        instead of tailing it. Dependency compiles in the fresh dir are served
-        by sccache (CI); the workspace check itself is cheap and rebuilds each
-        run (this dir is outside rust-cache's saved target/).
+        Sharing lane_rust's target makes clippy-driver churn normal-rustc
+        fingerprints and forces the following test build to repair them. The
+        separate directory prevents that duplicate work. Incremental output is
+        disabled because it retains a large fine-grained artifact tree, rewrites
+        hundreds of megabytes on warm checks, and has served stale local lints.
         """
         # Scope to the changed crate(s)+rdeps when gating narrowed it; otherwise
         # lint the whole workspace. `-p` flags go before `--`. `--all-targets`
         # lints test/bench/example targets too, so test code is gated the same
         # as library code (a pedantic violation in a #[cfg(test)] module fails
         # CI); it composes with `-p` so the changed-crate scope still applies.
+        _prepare_clippy_check_target()
         run_step("cargo clippy",
                  ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
-                 env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy")})
+                 env_extra=_clippy_check_env())
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
 
-        Both run on the same source tree and need no build artifact, so
-        bundling them into one thread avoids spending a parallel slot on
-        a sub-second stylelint pass. Each emits its own result entry.
+        Both run on the same source tree and need no build artifact, so they
+        remain one lane with separate result entries.
         """
         run_step("eslint", ["pnpm", "run", "lint"], UI_DIR)
         run_step("stylelint", ["pnpm", "run", "lint:css"], UI_DIR)
@@ -5003,25 +5042,12 @@ def cmd_check(
         and an isolated temp DB, then runs a battery of scripted conversations
         through the same HTTP/SSE surface phoenix-client.py uses.
 
-        Target-lock sharing with lane_rust. run.py's `cargo build --bin
-        phoenix_ide` and lane_rust's cargo invocations share the one workspace
-        target dir, whose exclusive lock serializes all builds. The `--bin`
-        artifact is NOT a cheap link riding on lane_rust's output: clippy emits
-        only check-mode .rmeta, and `cargo test --no-run` emits cfg(test)
-        harness binaries under deps/ — neither produces target/debug/phoenix_ide,
-        so this build does a full non-test crate codegen + link. Only the
-        external dependency crates are reused.
-
-        The overlap that keeps this lane inside lane_rust's wall-clock shadow
-        comes from nextest, not artifact reuse: `cargo nextest run` splits
-        build from run and releases the target lock for the run phase, so this
-        bin build proceeds in parallel with the test run. On the plain
-        `cargo test` fallback (no nextest installed) the run phase holds the
-        lock end-to-end, so this build serializes after it and adds a full
-        bin codegen to the tail of the critical path — the fallback is slower
-        by design, not broken. clippy no longer contends here: it runs in
-        lane_clippy with its own CARGO_TARGET_DIR, so the only builds on the
-        shared workspace lock are lane_rust's test compile and this bin build.
+        run.py's `cargo build --bin phoenix_ide` reuses normal-target external
+        dependencies but is not a cheap link from test output: `cargo test
+        --no-run` emits cfg(test) harnesses under deps/ rather than
+        target/debug/phoenix_ide. The serialized execution policy therefore
+        makes this full non-test codegen and link an explicit E2E cost after the
+        Rust lane, while Clippy remains isolated in its own target directory.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
@@ -5540,7 +5566,7 @@ def cmd_check(
             mem_cap = max(1, int(mem_gib // 1.5))
         except (ValueError, OSError, AttributeError):
             mem_cap = cpus
-        test_threads = max(2, min(cpus - 1, mem_cap))
+        test_threads = min(_check_cpu_budget(), max(1, min(cpus - 1, mem_cap)))
         if test_threads < cpus:
             try:
                 load1, load5, load15 = os.getloadavg()
@@ -5611,8 +5637,8 @@ def cmd_check(
             """Diff the scratch ts-rs export against committed ui/src/generated/.
 
             A mismatch means the developer's Rust types and the committed TS
-            don't line up. Recorded (not aborted) so the rest of the lane and
-            the parallel phase still run and every failure lands in one pass.
+            don't line up. Recorded without aborting so the rest of the lane
+            still runs and every failure lands in one pass.
             """
             step, t0 = "codegen-stale", time.monotonic()
             reporter.step_start("rust", step)
@@ -5650,7 +5676,7 @@ def cmd_check(
                 results.append((step, rc, elapsed, detail))
             reporter.step_done("rust", step, rc, elapsed)
 
-    reporter.banner("\nRunning checks in parallel...\n")
+    reporter.banner("\nRunning checks within the shared worker budget...\n")
 
     def _lane(fn):
         """Wrap a lane body with reporter lifecycle and trace events."""
@@ -5725,7 +5751,11 @@ def cmd_check(
         # `pnpm exec tsc --noEmit` silently misses them.
         ("tsc", lambda: run_step("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         ("ui-lint", lane_ui_lint),
-        ("vitest", lambda: run_step("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
+        ("vitest", lambda: run_step(
+            "vitest",
+            _vitest_check_command(),
+            UI_DIR,
+        )),
         ("cargo-fmt", lane_cargo_fmt),
         ("task", lane_task),
         ("ast-grep", check_ast_grep),
@@ -5735,27 +5765,21 @@ def cmd_check(
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
     ]
-    threads = [threading.Thread(target=_lane(fn), name=name)
-               for name, fn in _lane_targets if name in active]
-    # daemon=True so a hung lane does not block interpreter shutdown after
-    # we report it as failed and call sys.exit(1). Non-daemon threads cause
-    # Python to wait at exit, defeating the hung-lane detection below.
-    # run_step's subprocess.run already enforces CHECK_TIMEOUT per step via
-    # SIGKILL on the child; daemon=True covers the case where a lane is
-    # wedged in Python (not in a subprocess) past LANE_JOIN_TIMEOUT.
-    for t in threads:
-        t.daemon = True
-        t.start()
-    # Per-thread join budget must cover the longest *lane*, not a single step.
-    # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
-    # so we cap join at 6×CHECK_TIMEOUT + 30s. After joining we still verify
-    # the thread actually finished — Thread.join() returning after a timeout
-    # does not imply the thread is done, so a still-alive lane is recorded
-    # as an explicit failure rather than silently dropped from results.
+    threads = [
+        threading.Thread(
+            target=_run_check_lane,
+            args=(name, _lane(fn), results, results_lock),
+            name=name,
+        )
+        for name, fn in _lane_targets
+        if name in active
+    ]
+    # Each lane starts only after its predecessor finishes. A lane wedged in
+    # Python therefore cannot leave every later lane parked on a lock or multiply
+    # the join timeout. daemon=True lets the interpreter exit after recording the
+    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
     LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
-    for t in threads:
-        t.join(timeout=LANE_JOIN_TIMEOUT)
-    stuck = [t for t in threads if t.is_alive()]
+    stuck = _run_check_threads_sequentially(threads, LANE_JOIN_TIMEOUT)
     # Stop the live renderer before any direct printing below (hung-lane
     # lines, failure dumps, summary) — plain mode's close() is a no-op.
     reporter.close()
@@ -5785,6 +5809,8 @@ def cmd_check(
             "active_lanes": sorted(active),
             "compiler_cache": selected_compiler_cache,
             "rust_test_threads": test_threads if "rust" in active else None,
+            "check_execution": "serialized",
+            "check_worker_budget": _check_cpu_budget(),
         })
     for message in profile_messages:
         print(f"  i  {message}")
@@ -6546,7 +6572,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
     "rust": ["cargo test (compile)", "codegen export", "codegen-stale diff",
-             "cargo test (run)", "cargo check musl (macOS, optional)"],
+             "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],
     "ui-lint": ["eslint", "stylelint"],
