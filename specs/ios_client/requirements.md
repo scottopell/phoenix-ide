@@ -9,9 +9,10 @@ conversations, and composing messages while offline — so that a network gap
 blank screen.
 
 The iOS client is a deliberately simplified companion to the web UI: it
-covers conversations, messages, tool activity, and sending. Server-side
-capabilities that require a live interactive channel (terminal, diff
-viewer, chains, file browser) are out of scope.
+covers conversations, messages, tool activity, sending, read-only project
+context, and prose review. Server-side capabilities that require a live
+interactive channel or general editing environment (terminal, diff viewer,
+chains, and file editing) are out of scope.
 
 ## Requirements
 
@@ -80,6 +81,18 @@ AND treat any resend of the same entry as safe
 WHEN the same entry would be sent concurrently
 THE SYSTEM SHALL prevent overlapping in-flight sends of that entry
 WHETHER delivery is owned by an open conversation or a persisted-queue sweep
+
+WHEN a delivery attempt succeeds, is definitively rejected, or is interrupted
+at the transport layer
+THE SYSTEM SHALL release that entry's typed in-flight attempt before a later
+drain may select it again
+
+WHEN authoritative history reconciles an entry before its delivery callback
+THE SYSTEM SHALL release the same in-flight attempt as part of reconciliation
+
+WHEN the user retries a failed or recoverable-inconsistency entry
+THE SYSTEM SHALL clear its prior server-acceptance evidence before returning it
+to the persistence-fenced drain
 
 **Rationale:** The server deduplicates on `message_id`, making at-least-once
 delivery converge to exactly-once. Aggressive retrying is then free of
@@ -608,3 +621,187 @@ on a run occurring.
 **Rationale:** Opportunistic refresh can provide useful advisory awareness
 without becoming part of the correctness model. iOS controls the refresh
 cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative.
+
+---
+
+### REQ-IOS-019: Inspect Conversation Grounding and Project Files
+
+WHEN the user opens a conversation's grounding surface
+THE SYSTEM SHALL show every attached `WorkScope` that provides project or
+working context for that conversation
+AND identify each context root by its exact attached `WorkScope`
+AND bind context selection, file navigation, and displayed contents to that
+exact scope
+AND SHALL NOT collapse different attached scopes into one implicit project root
+AND distinguish unavailable, loading, stale, empty, and failed context
+
+WHEN the user browses a supported project file
+THE SYSTEM SHALL treat its path as a server-side location
+AND fetch and display the file's contents without offering phone-local file
+actions
+AND SHALL NOT offer an action whose effect is to open or reveal the path on the
+server host's desktop
+
+WHEN file contents cannot be fetched
+THE SYSTEM SHALL preserve already-visible contents with a stale indicator only
+when those contents belong to the same exact attached `WorkScope` and requested
+file identity
+OR show an explicit unavailable or error state
+AND SHALL NOT present an empty document as a successful load
+AND SHALL NOT retain another scope's or file's contents under the requested
+file's selection
+
+**Rationale:** Mobile decisions often depend on the files and project state the
+agent is using. Read-only server-backed context provides that evidence without
+pretending the phone owns the server's filesystem.
+
+---
+
+### REQ-IOS-020: Read Project Prose Comfortably
+
+WHEN the user opens a supported Markdown or prose file
+THE SYSTEM SHALL render a dedicated reading surface with readable typography,
+document navigation, and intentional presentations for common Markdown
+structures
+
+WHEN the document contains unsupported or malformed markup
+THE SYSTEM SHALL preserve the source text in a legible fallback rather than
+omit it
+
+WHEN the user returns to the conversation
+THE SYSTEM SHALL preserve enough reading position and file identity to make
+the transition understandable
+
+**Rationale:** Reviewing plans, specifications, and other prose on a phone
+requires a reading surface rather than a transcript card or raw-file dump.
+
+---
+
+### REQ-IOS-021: Comment on Project Prose Reliably
+
+WHEN a chat-capable conversation's reader displays current contents from the
+exact `WorkScope` that is the server-declared live message target
+THE SYSTEM SHALL enable note creation
+AND bind every note to that exact `WorkScope`, file identity, content revision,
+source line, raw line content, and note text
+AND create the note only when the source line exists in that bound revision and
+its exact raw content matches the displayed anchor
+AND maintain the note in memory while that file's reader remains open
+
+WHEN ordinary chat is unavailable
+OR the selected `WorkScope` is not the live message target
+OR the displayed file contents are stale
+THE SYSTEM SHALL keep the prose readable but disable note creation and Send
+AND explain why feedback is unavailable
+
+WHEN a note's bound scope stops being the live message target
+OR its bound content revision stops matching the current file revision
+THE SYSTEM SHALL keep the note visible within the open reader session
+AND disable Send until the user refreshes and re-anchors the note against the
+eligible scope and current revision, or explicitly discards it
+AND, when refreshing, replace every retained note's source line and raw content
+as one validated re-anchor operation before updating the session revision
+AND allow any note that cannot be re-anchored to be individually discarded
+without removing other notes from the open reader session
+
+WHEN the user chooses Send for one or more eligible notes
+THE SYSTEM SHALL format and inject them into the conversation's editable message
+input according to `REQ-PF-009`
+AND represent each injected note bundle as one structural draft contribution
+that owns both its editable formatted text and typed authority carrying the exact
+`WorkScope`, file identity, content revision, and contribution identity
+AND clear the notes and close the reader
+AND SHALL NOT deliver the notes independently of that message input
+
+WHILE the user edits a retained review contribution
+THE SYSTEM SHALL preserve that contribution's authority binding with its text
+AND SHALL NOT represent the text and authority as independently removable data
+AND treat a whitespace-only contribution as ineligible retained review text
+
+WHEN the user adds unrelated context before, between, or after retained review
+contributions
+THE SYSTEM SHALL represent that context as independently editable plain draft
+segments at the user's selected positions
+
+WHEN the user explicitly removes a review contribution
+THE SYSTEM SHALL remove its text and authority together
+AND preserve unrelated draft text and attachments
+
+WHEN the user submits a draft with attached review authority
+THE SYSTEM SHALL revalidate ordinary chat capability, the exact live message
+target, and the current content revision for every authority binding
+AND, when every binding remains valid, enqueue the exact rendered draft text and
+all staged image attachments through one ordinary durable message-queue entry
+according to `REQ-IOS-002`, `REQ-IOS-003`, and `REQ-IOS-015`
+AND SHALL NOT create a sendable ordinary queue entry before that message is
+durably persisted
+AND, while persistence is pending or has failed, show one optimistic
+persistence-pending queue entry that is structurally non-sendable
+AND retry its version-fenced disk write when connectivity returns, a valid init
+arrives, the app enters the foreground, or an agent turn completes
+AND revalidate every attached review authority before each retry and again
+before converting a persistence receipt into a sendable ordinary queue entry
+AND preserve every draft segment, attachment, and review authority until a
+version-fenced disk write positively establishes that the full visible outbox,
+including that exact entry, is durable
+AND only then clear the submitted draft and its review authority
+AND atomically create the canonical ordinary queue entry and its receipt-typed,
+persistence-fenced drain request as one conversion transition
+AND have that drain attempt only entries covered by positive full-outbox
+persistence evidence, in durable oldest-first order, excluding server-accepted
+entries and entries with a typed in-flight attempt
+
+WHEN authority becomes invalid while persistence is pending or in flight
+THE SYSTEM SHALL detect the authority-evidence change without waiting for
+another delivery trigger or persistence receipt
+AND invalidate any resulting durable outbox payload
+AND remove the persistence-pending entry
+AND unlock the draft with typed submission failures so the user can repair or
+discard affected review contributions
+AND retain a durable, structurally non-sendable invalidation tombstone until a
+version-fenced receipt proves that the payload is removed and no earlier or
+in-flight write can recreate it
+AND retry that tombstone after bounded local-storage failures and when durable
+client state is rehydrated after launch
+
+WHEN any review authority binding fails submission-time revalidation
+THE SYSTEM SHALL block submission without clearing or changing the draft or its
+review authority
+AND identify every invalid review contribution with a typed reason distinguishing
+unavailable chat, a changed live target, unavailable content, and a changed
+content revision
+AND allow the user to refresh and re-anchor that review contribution or
+explicitly discard that contribution while preserving unrelated draft text
+AND clear or recompute the displayed failure set whenever review authority
+changes so that no failure identifies a removed or repaired contribution
+
+WHEN the ProductConversation is hard-deleted or definitively not found
+THE SYSTEM SHALL invalidate every persistence-pending review payload for that
+conversation
+AND remove its pending render, composer draft, plain segments, review
+authorities, and submission failures
+AND retain and retry a durable, structurally non-sendable invalidation tombstone
+for each affected payload, including after app restart, until version-fenced
+removal is acknowledged
+AND retain a permanent deleted-scope fence that rejects delayed ordinary queue
+entry creation by creating or refreshing a version-fenced invalidation
+tombstone
+AND treat the lifecycle's terminal deleted state as the same fence immediately,
+before the durable fence projection is processed
+AND remove any pending or late-created drain request
+AND SHALL NOT allow a later persistence receipt to recreate a queue entry
+
+WHEN the user attempts to close a reader with unsent notes
+THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`
+
+WHEN the reader closes after Send or Discard
+THE SYSTEM SHALL NOT persist its notes
+AND reopening the file SHALL start a fresh review session with zero notes
+according to `REQ-PF-011`
+
+**Rationale:** Session-scoped notes protect against accidental loss while the
+reader is open, then become an editable conversation draft so the user can add
+context before relying on the ordinary message-delivery contract. Typed draft
+authority closes the handoff gap: text edits cannot silently erase the scope and
+revision checks that make the feedback trustworthy. The precise lifecycle is
+specified in `ios_prose_feedback.allium`.

@@ -133,6 +133,7 @@ rule PostUsesLocalIdAsMessageId {
     when: SendPostStarted(entry)
 
     requires: entry.status = pending
+    requires: not exists PostAttempt{entry: entry}
 
     ensures: PostAttempt.created(entry: entry, message_id: entry.local_id)
 
@@ -145,30 +146,62 @@ rule PostUsesLocalIdAsMessageId {
 rule PostAcceptedAsSteeringQueued {
     when: SendPostSucceeded(entry, steering)
 
+    let attempt = PostAttempt{entry: entry}
+
     requires: entry.status = pending
     requires: steering
+    requires: exists attempt
 
     ensures: entry.accepted_by_server = true
     ensures: entry.status = steering_queued
+    ensures: not exists attempt
 }
 
 rule PostAcceptedAsPendingReflection {
     when: SendPostSucceeded(entry, steering)
 
+    let attempt = PostAttempt{entry: entry}
+
     requires: entry.status = pending
     requires: not steering
+    requires: exists attempt
 
     ensures: entry.accepted_by_server = true
     ensures: entry.status = pending
+    ensures: not exists attempt
 }
 
-rule PostFailedIsRetryable {
+rule PendingPostFailedIsRetryable {
     when: SendPostFailed(entry)
 
-    requires: entry.status = pending or entry.status = steering_queued
+    let attempt = PostAttempt{entry: entry}
+
+    requires: entry.status = pending
+    requires: exists attempt
 
     ensures: entry.status = failed
     ensures: FailedRender.created(entry: entry)
+    ensures: not exists attempt
+}
+
+rule SteeringQueuedMessageFailedIsRetryable {
+    when: SendPostFailed(entry)
+
+    requires: entry.status = steering_queued
+
+    ensures: entry.status = failed
+    ensures: FailedRender.created(entry: entry)
+}
+
+rule TransportInterruptedPostRemainsPending {
+    when: SendPostTransportInterrupted(entry)
+
+    let attempt = PostAttempt{entry: entry}
+
+    requires: entry.status = pending
+    requires: exists attempt
+
+    ensures: not exists attempt
 }
 
 rule RetryFailedMessage {
@@ -177,6 +210,7 @@ rule RetryFailedMessage {
     requires: entry.status = failed or entry.status = recoverable_inconsistency
 
     ensures: entry.status = pending
+    ensures: entry.accepted_by_server = false
 }
 
 rule DismissLocalMessage {
@@ -200,12 +234,17 @@ rule AuthoritativeHistoryObserved {
 rule AuthoritativeMessageReconcilesQueueEntry {
     when: ServerHistoryContains(msg, entry)
 
+    let attempt = PostAttempt{entry: entry}
+
     requires: msg.scope = entry.scope
     requires: authoritative_message_matches_entry(msg, entry)
     requires: entry.status = pending or entry.status = steering_queued or entry.status = recoverable_inconsistency
 
     ensures: entry.status = reconciled
     ensures: entry.visible = false
+    ensures:
+        if exists attempt:
+            not exists attempt
 
     @guidance
         -- Reconciliation compares the submitted id with both exact
@@ -307,6 +346,12 @@ invariant RenderedUserMessagesAreUnionWithoutDuplicates {
 invariant LocalStorageScopedByConversation {
     for entry in LocalQueueEntries:
         entry.scope.conversation_id != ""
+}
+
+invariant AtMostOneActivePostPerQueueEntry {
+    for a in PostAttempts:
+        for b in PostAttempts:
+            a != b implies a.entry != b.entry
 }
 
 invariant AcceptedMessagesDoNotRemainSilentPendingForever {

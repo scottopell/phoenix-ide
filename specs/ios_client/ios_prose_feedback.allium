@@ -1,0 +1,995 @@
+-- allium: 3
+-- ios_prose_feedback.allium
+--
+-- Scope: The iOS prose-review lifecycle from session-scoped reader notes to
+--        structurally identified composer contributions and then to the
+--        durable local message queue.
+--
+-- Includes: exact WorkScope, file, content-revision, and source-line binding;
+--           reader re-anchoring and discard; typed draft contributions that
+--           survive editing; attachments; submit-time revalidation with typed
+--           failures; disk-persistence acknowledgement; and acknowledged
+--           invalidation of rejected or deleted pending payloads.
+--
+-- Excludes: Markdown rendering, project-file transport, server execution, and
+--           local queue retry/reconciliation after durable enqueue (see
+--           ../user_message_queue/user_message_queue.allium).
+
+use "../user_message_queue/user_message_queue.allium" as queue
+use "./ios_client_lifecycle.allium" as lifecycle
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- current_content_revision(conversation, work_scope, file) -> ContentRevision?
+--   Returns the server-observed revision for the exact file in the exact
+--   attached WorkScope, or null when that content cannot be established as
+--   current.
+-- line_content_at(conversation, work_scope, file, revision, source_line) -> String?
+--   Returns the exact raw line at the one-based source line for the bound
+--   revision, or null when the anchor does not exist.
+-- reader_reanchors_are_exact(session, revision, anchors) -> Boolean
+--   True only when anchors form a one-to-one mapping for every session note,
+--   every source line exists in revision, and every supplied raw line equals
+--   line_content_at for that source line.
+-- reanchored_source_line(anchors, note) -> Integer
+-- reanchored_raw_line_content(anchors, note) -> String
+--   Return the validated replacement anchor fields for the note.
+-- format_review_notes(file, notes) -> String
+--   Produces the REQ-PF-009 message contribution using the absolute file path,
+--   source line, exact raw line content, and note text.
+-- new_review_contribution_identity() -> ReviewContributionIdentity
+--   Produces a fresh identity for one formatted review contribution.
+-- next_draft_position(draft) -> DraftPosition
+--   Returns an unused position after every retained plain or review segment.
+-- first_draft_position() -> DraftPosition
+--   Returns the initial position in an empty composer.
+-- draft_has_position(draft, position) -> Boolean
+--   True when a retained plain or review segment occupies position.
+-- inserted_draft_position(draft, after_position) -> DraftPosition
+--   Returns a fresh ordered position immediately after after_position, without
+--   changing the relative order of any retained segment.
+-- render_composer_draft(draft) -> String
+--   Joins plain segments and review authorities by position into the exact
+--   user-visible message text. No second stored text representation exists.
+-- is_blank(text) -> Boolean
+--   True when text contains no non-whitespace characters.
+-- message_payload_fingerprint(scope, local_id, text, images) -> String
+--   Produces one deterministic identity for the complete queue payload.
+-- review_authority_failures(draft) -> List<ReviewAuthorityFailure>
+--   Returns typed failures for every review authority that cannot submit. Each
+--   result identifies its contribution and one of: chat unavailable, live
+--   target changed, content unavailable, or content revision changed.
+-- new_local_message_id(draft) -> String
+--   Produces the idempotency identity used by the ordinary local message queue.
+-- durable_sendable_entries_oldest_first(persistence)
+--   Returns only ordinary pending queue entries included in the exact full
+--   outbox revision acknowledged by persistence, ordered by their durable
+--   ordinal and excluding server-accepted entries, entries with an active
+--   PostAttempt, and entries with an invalidation tombstone.
+-- review_queue_scope_is_deleted(scope) -> Boolean
+--   True when the lifecycle session is terminally deleted or a permanent
+--   DeletedReviewQueueScopeFence exists for the scope.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value WorkScopeIdentity {
+    stable_key: String
+}
+
+value ProjectFileIdentity {
+    absolute_path: String
+}
+
+value ContentRevision {
+    token: String
+}
+
+value ReviewContributionIdentity {
+    token: String
+}
+
+value DraftPosition {
+    order_key: String
+}
+
+value ReanchoredNoteAnchor {
+    note: ProseReviewNote
+    source_line: Integer
+    raw_line_content: String
+}
+
+value ReviewAuthorityFailure {
+    contribution: ReviewContributionIdentity
+    reason: ReviewAuthorityFailureReason
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum ReviewAuthorityFailureReason {
+    chat_unavailable
+    | live_target_changed
+    | content_unavailable
+    | content_revision_changed
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The client-facing projection of one ProductConversation aggregate.
+external entity IosProductConversation {
+    queue_scope: queue/ConversationScope
+    chat_capable: Boolean
+    live_message_target: WorkScopeIdentity?
+}
+
+-- Created whenever chat capability, live-target identity, or current file
+-- revision evidence changes for a conversation. Pending review persistence is
+-- revalidated immediately rather than waiting for another delivery trigger.
+external entity ReviewAuthorityEvidenceChange {
+    conversation: IosProductConversation
+}
+
+-- Positive evidence that the version-fenced disk writer durably stored the
+-- full visible outbox including the exact fingerprinted message payload. The
+-- ordinary queue entry is not created, and therefore cannot become sendable,
+-- before this receipt exists.
+external entity ReviewOutboxPersistenceReceipt {
+    scope: queue/ConversationScope
+    local_id: String
+    payload_fingerprint: String
+    persistence_revision: Integer
+}
+
+-- Positive evidence that the version-fenced invalidation removed the payload
+-- and fenced every earlier or in-flight write for the same scoped local id.
+-- Only this receipt releases the durable retry tombstone.
+external entity ReviewOutboxInvalidationReceipt {
+    scope: queue/ConversationScope
+    local_id: String
+    invalidation_revision: Integer
+}
+
+-- Created when a retained tombstone is rehydrated after launch or its bounded
+-- local-storage retry delay expires. Deleted conversations therefore retain a
+-- retry path even though they no longer produce session delivery triggers.
+external entity ReviewOutboxInvalidationRetryDue {
+    scope: queue/ConversationScope
+    local_id: String
+}
+
+-- A complete user-selected replacement anchor set for one refreshed reader.
+external entity ReaderReanchorRequest {
+    session: ProseReviewSession
+    refreshed_revision: ContentRevision
+    anchors: List<ReanchoredNoteAnchor>
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ProseReviewSession {
+    conversation: IosProductConversation
+    work_scope: WorkScopeIdentity
+    file: ProjectFileIdentity
+    content_revision: ContentRevision
+
+    notes: ProseReviewNote with session = this
+}
+
+entity ProseReviewNote {
+    session: ProseReviewSession
+    source_line: Integer
+    raw_line_content: String
+    note_text: String
+}
+
+entity ComposerDraft {
+    conversation: IosProductConversation
+    images: List<queue/ImageData>
+
+    plain_segments: PlainDraftSegment with draft = this
+    review_authorities: ProseReviewAuthority with draft = this
+    persistence_pending: PersistencePendingReviewQueueEntry with draft = this
+    submission_block: ReviewSubmissionBlock with draft = this
+}
+
+entity PlainDraftSegment {
+    draft: ComposerDraft
+    position: DraftPosition
+    text: String
+}
+
+-- The formatted review text and its authority are one structural contribution.
+-- Removing this entity removes both; editing text retains the bindings.
+entity ProseReviewAuthority {
+    draft: ComposerDraft
+    position: DraftPosition
+    contribution: ReviewContributionIdentity
+    text: String
+    work_scope: WorkScopeIdentity
+    file: ProjectFileIdentity
+    content_revision: ContentRevision
+}
+
+-- A visible optimistic queue entry that cannot be delivered. Only a matching
+-- ReviewOutboxPersistenceReceipt converts it into the ordinary sendable queue.
+entity PersistencePendingReviewQueueEntry {
+    draft: ComposerDraft
+    scope: queue/ConversationScope
+    local_id: String
+
+    render: PersistencePendingReviewRender with entry = this
+}
+
+entity PersistencePendingReviewRender {
+    entry: PersistencePendingReviewQueueEntry
+}
+
+-- Durable, structurally non-sendable retry authority for removing one rejected
+-- or deleted payload. It survives draft and conversation-view cleanup until a
+-- ReviewOutboxInvalidationReceipt proves that no earlier write can recreate the
+-- payload.
+entity ReviewOutboxInvalidationTombstone {
+    scope: queue/ConversationScope
+    local_id: String
+}
+
+-- Permanent scope fence created by definitive conversation deletion. Product
+-- conversation ids are never reused; retaining the fence rejects every delayed
+-- queue-entry creation from an earlier persistence operation.
+entity DeletedReviewQueueScopeFence {
+    scope: queue/ConversationScope
+}
+
+-- One-shot request created only after the receipt-converted ordinary entry is
+-- positively created. Its receipt-typed field makes an unpersisted entry
+-- ineligible by construction. The drain consumes it after starting every
+-- eligible ordinary entry in durable oldest-first order.
+entity DurableOrderedQueueDrainRequest {
+    persistence: ReviewOutboxPersistenceReceipt
+    entry: queue/LocalQueueEntry
+}
+
+entity ReviewSubmissionBlock {
+    draft: ComposerDraft
+    failures: List<ReviewAuthorityFailure>
+}
+
+------------------------------------------------------------
+-- Rules -- reader session
+------------------------------------------------------------
+
+rule OpenEligibleProseReviewSession {
+    -- REQ-IOS-021
+    when: UserOpensProseReview(
+        conversation,
+        work_scope,
+        file,
+        content_revision
+    )
+
+    requires: conversation.chat_capable
+    requires: conversation.live_message_target = work_scope
+    requires:
+        current_content_revision(conversation, work_scope, file)
+        = content_revision
+    requires: not exists ProseReviewSession{
+        conversation: conversation,
+        work_scope: work_scope,
+        file: file
+    }
+
+    ensures: ProseReviewSession.created(
+        conversation: conversation,
+        work_scope: work_scope,
+        file: file,
+        content_revision: content_revision
+    )
+}
+
+rule AddEligibleProseReviewNote {
+    -- REQ-IOS-021
+    when: UserAddsProseReviewNote(
+        session,
+        source_line,
+        raw_line_content,
+        note_text
+    )
+
+    requires: note_text != ""
+    requires: source_line > 0
+    requires: session.conversation.chat_capable
+    requires: session.conversation.live_message_target = session.work_scope
+    requires:
+        current_content_revision(
+            session.conversation,
+            session.work_scope,
+            session.file
+        ) = session.content_revision
+    requires:
+        line_content_at(
+            session.conversation,
+            session.work_scope,
+            session.file,
+            session.content_revision,
+            source_line
+        ) = raw_line_content
+
+    ensures: ProseReviewNote.created(
+        session: session,
+        source_line: source_line,
+        raw_line_content: raw_line_content,
+        note_text: note_text
+    )
+}
+
+rule ReaderNotesReanchorToCurrentRevision {
+    -- REQ-IOS-021
+    when: request: ReaderReanchorRequest.created
+
+    requires: request.session.notes.count > 0
+    requires: request.session.conversation.chat_capable
+    requires:
+        request.session.conversation.live_message_target
+        = request.session.work_scope
+    requires:
+        current_content_revision(
+            request.session.conversation,
+            request.session.work_scope,
+            request.session.file
+        ) = request.refreshed_revision
+    requires: reader_reanchors_are_exact(
+        request.session,
+        request.refreshed_revision,
+        request.anchors
+    )
+
+    ensures: request.session.content_revision = request.refreshed_revision
+    ensures:
+        for note in request.session.notes:
+            note.source_line = reanchored_source_line(request.anchors, note)
+            note.raw_line_content = reanchored_raw_line_content(
+                request.anchors,
+                note
+            )
+}
+
+rule UserDiscardsIndividualReaderNote {
+    -- REQ-IOS-021
+    when: UserDiscardsProseReviewNote(note)
+
+    ensures: not exists note
+}
+
+rule EmptyReaderClosesImmediately {
+    -- REQ-IOS-021, REQ-PF-011
+    when: UserRequestsCloseProseReview(session)
+
+    requires: session.notes.count = 0
+
+    ensures: not exists session
+}
+
+rule ReaderWithNotesRequiresDiscardConfirmation {
+    -- REQ-IOS-021, REQ-PF-010
+    when: UserRequestsCloseProseReview(session)
+
+    requires: session.notes.count > 0
+
+    ensures: ReaderDiscardConfirmationRequired(session: session)
+}
+
+rule CancellingReaderDiscardPreservesSession {
+    -- REQ-IOS-021, REQ-PF-010
+    when: UserCancelsReaderDiscard(session)
+
+    requires: session.notes.count > 0
+
+    ensures: ProseReviewRemainsOpen(session: session)
+}
+
+rule ConfirmingReaderDiscardClearsSession {
+    -- REQ-IOS-021, REQ-PF-010, REQ-PF-011
+    when: UserConfirmsReaderDiscard(session)
+
+    ensures:
+        for note in session.notes:
+            not exists note
+        not exists session
+}
+
+------------------------------------------------------------
+-- Rules -- composer structure and handoff
+------------------------------------------------------------
+
+rule ComposerDraftCreated {
+    when: ComposerDraftNeeded(conversation, initial_text, images)
+
+    requires: not exists ComposerDraft{conversation: conversation}
+
+    ensures:
+        let draft = ComposerDraft.created(
+            conversation: conversation,
+            images: images
+        )
+        PlainDraftSegment.created(
+            draft: draft,
+            position: first_draft_position(),
+            text: initial_text
+        )
+}
+
+rule EligibleNotesBecomeReviewBoundDraftContribution {
+    -- REQ-IOS-021, REQ-PF-009
+    when: UserSendsProseReviewToComposer(session, draft)
+
+    let contribution = new_review_contribution_identity()
+    let formatted_notes = format_review_notes(session.file, session.notes)
+
+    requires: draft.conversation = session.conversation
+    requires: session.notes.count > 0
+    requires: not exists draft.persistence_pending
+    requires: session.conversation.chat_capable
+    requires: session.conversation.live_message_target = session.work_scope
+    requires:
+        current_content_revision(
+            session.conversation,
+            session.work_scope,
+            session.file
+        ) = session.content_revision
+
+    ensures: ProseReviewAuthority.created(
+        draft: draft,
+        position: next_draft_position(draft),
+        contribution: contribution,
+        text: formatted_notes,
+        work_scope: session.work_scope,
+        file: session.file,
+        content_revision: session.content_revision
+    )
+    ensures: not exists draft.submission_block
+    ensures:
+        for note in session.notes:
+            not exists note
+        not exists session
+}
+
+rule UserEditsPlainDraftSegment {
+    when: UserEditsPlainDraftSegment(segment, edited_text)
+
+    requires: not exists segment.draft.persistence_pending
+
+    ensures: segment.text = edited_text
+}
+
+rule UserInsertsPlainDraftSegment {
+    when: UserInsertsPlainDraftSegment(draft, after_position, text)
+
+    requires: not is_blank(text)
+    requires: not exists draft.persistence_pending
+    requires: draft_has_position(draft, after_position)
+
+    ensures: PlainDraftSegment.created(
+        draft: draft,
+        position: inserted_draft_position(draft, after_position),
+        text: text
+    )
+}
+
+rule UserEditsReviewContributionText {
+    -- REQ-IOS-021
+    when: UserEditsReviewContribution(authority, edited_text)
+
+    requires: not is_blank(edited_text)
+    requires: not exists authority.draft.persistence_pending
+
+    ensures: authority.text = edited_text
+}
+
+rule UserStagesComposerImages {
+    -- REQ-IOS-015, REQ-IOS-021
+    when: UserStagesComposerImages(draft, images)
+
+    requires: not exists draft.persistence_pending
+
+    ensures: draft.images = images
+}
+
+rule RefreshedNotesReplaceBoundDraftContribution {
+    -- REQ-IOS-021
+    when: UserReanchorsDraftReview(authority, refreshed_session)
+
+    let formatted_notes = format_review_notes(
+        refreshed_session.file,
+        refreshed_session.notes
+    )
+
+    requires:
+        authority.draft.conversation = refreshed_session.conversation
+    requires: refreshed_session.notes.count > 0
+    requires: not exists authority.draft.persistence_pending
+    requires: refreshed_session.conversation.chat_capable
+    requires:
+        refreshed_session.conversation.live_message_target
+        = refreshed_session.work_scope
+    requires:
+        current_content_revision(
+            refreshed_session.conversation,
+            refreshed_session.work_scope,
+            refreshed_session.file
+        ) = refreshed_session.content_revision
+
+    ensures: authority.text = formatted_notes
+    ensures: authority.work_scope = refreshed_session.work_scope
+    ensures: authority.file = refreshed_session.file
+    ensures: authority.content_revision = refreshed_session.content_revision
+    ensures: not exists authority.draft.submission_block
+    ensures:
+        for note in refreshed_session.notes:
+            not exists note
+        not exists refreshed_session
+}
+
+rule UserDiscardsBoundReviewContribution {
+    -- REQ-IOS-021
+    when: UserDiscardsDraftReview(authority)
+
+    let draft = authority.draft
+
+    requires: not exists authority.draft.persistence_pending
+
+    ensures: not exists draft.submission_block
+    ensures: not exists authority
+}
+
+------------------------------------------------------------
+-- Rules -- actual message submission
+------------------------------------------------------------
+
+rule ValidReviewBoundDraftRequestsOrdinaryMessageEnqueue {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
+    when: UserSubmitsComposerDraft(draft)
+
+    let local_id = new_local_message_id(draft)
+    let message_text = render_composer_draft(draft)
+
+    requires: not is_blank(message_text) or draft.images != empty_list
+    requires: draft.review_authorities.count > 0
+    requires: not exists draft.persistence_pending
+    requires: not exists draft.submission_block
+    requires: review_authority_failures(draft) = empty_list
+
+    ensures: PersistReviewDraftMessage(
+        scope: draft.conversation.queue_scope,
+        local_id: local_id,
+        text: message_text,
+        images: draft.images
+    )
+    ensures:
+        let pending = PersistencePendingReviewQueueEntry.created(
+            draft: draft,
+            scope: draft.conversation.queue_scope,
+            local_id: local_id
+        )
+        PersistencePendingReviewRender.created(entry: pending)
+}
+
+rule PersistencePendingReviewQueueRetriesDiskWrite {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: RetryReviewOutboxPersistence(pending)
+
+    requires: review_authority_failures(pending.draft) = empty_list
+
+    ensures: PersistReviewDraftMessage(
+        scope: pending.scope,
+        local_id: pending.local_id,
+        text: render_composer_draft(pending.draft),
+        images: pending.draft.images
+    )
+}
+
+rule InvalidAuthorityStopsPendingPersistenceRetry {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: RetryReviewOutboxPersistence(pending)
+
+    let failures = review_authority_failures(pending.draft)
+
+    requires: failures != empty_list
+
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: pending.scope,
+            local_id: pending.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
+    ensures: ReviewSubmissionBlock.created(
+        draft: pending.draft,
+        failures: failures
+    )
+    ensures: not exists pending.render
+    ensures: not exists pending
+}
+
+rule AuthorityChangeImmediatelyInvalidatesPendingPersistence {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: change: ReviewAuthorityEvidenceChange.created
+
+    ensures:
+        for pending in PersistencePendingReviewQueueEntries
+            where draft.conversation = change.conversation:
+            let failures = review_authority_failures(pending.draft)
+            if failures != empty_list:
+                let tombstone = ReviewOutboxInvalidationTombstone.created(
+                    scope: pending.scope,
+                    local_id: pending.local_id
+                )
+                ReviewOutboxPersistenceInvalidated(
+                    scope: tombstone.scope,
+                    local_id: tombstone.local_id
+                )
+                ReviewSubmissionBlock.created(
+                    draft: pending.draft,
+                    failures: failures
+                )
+                not exists pending.render
+                not exists pending
+}
+
+------------------------------------------------------------
+-- Rules -- automatic persistence retry triggers
+------------------------------------------------------------
+
+rule DeliveryTriggersRetryPendingReviewPersistence {
+    -- REQ-IOS-004, REQ-IOS-021
+    when: trigger: lifecycle/QueueDeliveryTriggerOccurrence.created
+
+    for pending in PersistencePendingReviewQueueEntries
+        where scope = trigger.session.scope:
+        ensures: RetryReviewOutboxPersistence(pending: pending)
+
+    for tombstone in ReviewOutboxInvalidationTombstones
+        where scope = trigger.session.scope:
+        ensures: RetryReviewOutboxInvalidation(tombstone: tombstone)
+}
+
+rule PendingReviewInvalidationRetriesDiskRemoval {
+    -- REQ-IOS-004, REQ-IOS-021
+    when: RetryReviewOutboxInvalidation(tombstone)
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
+}
+
+rule RehydratedOrDueInvalidationRetriesDiskRemoval {
+    -- REQ-IOS-004, REQ-IOS-005, REQ-IOS-021
+    when: due: ReviewOutboxInvalidationRetryDue.created
+
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: due.scope,
+        local_id: due.local_id
+    }
+
+    requires: exists tombstone
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
+}
+
+rule DurableQueuePersistenceCreatesSendableEntryAndClearsDraft {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-015, REQ-IOS-021
+    when: persistence: ReviewOutboxPersistenceReceipt.created
+
+    let pending = PersistencePendingReviewQueueEntry{
+        scope: persistence.scope,
+        local_id: persistence.local_id
+    }
+
+    requires: exists pending
+    requires: persistence.persistence_revision > 0
+    requires: not review_queue_scope_is_deleted(persistence.scope)
+    requires: review_authority_failures(pending.draft) = empty_list
+    requires: persistence.payload_fingerprint = message_payload_fingerprint(
+        persistence.scope,
+        persistence.local_id,
+        render_composer_draft(pending.draft),
+        pending.draft.images
+    )
+
+    ensures:
+        let entry = queue/LocalQueueEntry.created(
+            scope: persistence.scope,
+            local_id: persistence.local_id,
+            text: render_composer_draft(pending.draft),
+            images: pending.draft.images,
+            status: queue/pending,
+            accepted_by_server: false,
+            visible: true
+        )
+        DurableOrderedQueueDrainRequest.created(
+            persistence: persistence,
+            entry: entry
+        )
+    ensures: pending.draft.images = empty_list
+    ensures:
+        for segment in pending.draft.plain_segments:
+            not exists segment
+        for authority in pending.draft.review_authorities:
+            not exists authority
+        PlainDraftSegment.created(
+            draft: pending.draft,
+            position: first_draft_position(),
+            text: ""
+        )
+        not exists pending.render
+        not exists pending
+
+    @guidance
+        -- Receipt conversion is one reducer transition: create the canonical
+        -- ordinary queue projection of the already-durable payload and bind its
+        -- drain request to that exact entry. It performs no second enqueue or
+        -- unfenced outbox write.
+}
+
+rule DeletedScopeRejectsLateOrdinaryQueueEntryWithoutTombstone {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: entry: queue/LocalQueueEntry.created
+
+    requires: review_queue_scope_is_deleted(entry.scope)
+    requires: not exists ReviewOutboxInvalidationTombstone{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
+
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: entry.scope,
+            local_id: entry.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
+        not exists entry
+}
+
+rule DeletedScopeRejectsLateOrdinaryQueueEntryWithTombstone {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: entry: queue/LocalQueueEntry.created
+
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: entry.scope,
+        local_id: entry.local_id
+    }
+
+    requires: review_queue_scope_is_deleted(entry.scope)
+    requires: exists tombstone
+
+    ensures: ReviewOutboxPersistenceInvalidated(
+        scope: tombstone.scope,
+        local_id: tombstone.local_id
+    )
+    ensures: not exists entry
+}
+
+rule PersistenceFencedOrderedDrainStartsEligibleEntries {
+    -- REQ-IOS-002, REQ-IOS-003, REQ-IOS-004, REQ-IOS-021
+    when: request: DurableOrderedQueueDrainRequest.created
+
+    requires: not review_queue_scope_is_deleted(request.persistence.scope)
+
+    ensures:
+        for entry in durable_sendable_entries_oldest_first(
+            request.persistence
+        ):
+            queue/SendPostStarted(entry: entry)
+        not exists request
+}
+
+rule DeletedScopeRetiresLateDrainRequest {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: request: DurableOrderedQueueDrainRequest.created
+
+    requires: review_queue_scope_is_deleted(request.persistence.scope)
+
+    ensures: not exists request
+}
+
+rule InvalidAuthorityRejectsPersistedReviewReceipt {
+    -- REQ-IOS-002, REQ-IOS-021
+    when: persistence: ReviewOutboxPersistenceReceipt.created
+
+    let pending = PersistencePendingReviewQueueEntry{
+        scope: persistence.scope,
+        local_id: persistence.local_id
+    }
+
+    requires: exists pending
+
+    let failures = review_authority_failures(pending.draft)
+
+    requires: persistence.persistence_revision > 0
+    requires: failures != empty_list
+
+    ensures:
+        let tombstone = ReviewOutboxInvalidationTombstone.created(
+            scope: persistence.scope,
+            local_id: persistence.local_id
+        )
+        ReviewOutboxPersistenceInvalidated(
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        )
+    ensures: ReviewSubmissionBlock.created(
+        draft: pending.draft,
+        failures: failures
+    )
+    ensures: not exists pending.render
+    ensures: not exists pending
+}
+
+rule DurableInvalidationReceiptReleasesRetryTombstone {
+    -- REQ-IOS-002, REQ-IOS-005, REQ-IOS-021
+    when: receipt: ReviewOutboxInvalidationReceipt.created
+
+    let tombstone = ReviewOutboxInvalidationTombstone{
+        scope: receipt.scope,
+        local_id: receipt.local_id
+    }
+
+    requires: exists tombstone
+    requires: receipt.invalidation_revision > 0
+
+    ensures: not exists tombstone
+}
+
+rule InvalidReviewBoundDraftSubmissionIsNonDestructive {
+    -- REQ-IOS-021
+    when: UserSubmitsComposerDraft(draft)
+
+    let failures = review_authority_failures(draft)
+
+    requires: draft.review_authorities.count > 0
+    requires: not exists draft.persistence_pending
+    requires: not exists draft.submission_block
+    requires: failures != empty_list
+
+    ensures: ReviewSubmissionBlock.created(
+        draft: draft,
+        failures: failures
+    )
+}
+
+rule UserAcknowledgesReviewSubmissionBlock {
+    when: UserAcknowledgesReviewSubmissionBlock(block)
+
+    ensures: not exists block
+}
+
+------------------------------------------------------------
+-- Rules -- terminal conversation deletion
+------------------------------------------------------------
+
+rule TerminalDeletionClearsReviewDraftState {
+    -- REQ-IOS-005, REQ-IOS-021
+    when: trigger: lifecycle/ConversationClientStateDeletionOccurrence.created
+
+    ensures:
+        DeletedReviewQueueScopeFence.created(scope: trigger.session.scope)
+        for request in DurableOrderedQueueDrainRequests
+            where persistence.scope = trigger.session.scope:
+            not exists request
+        for reader in ProseReviewSessions
+            where conversation.queue_scope = trigger.session.scope:
+            for note in reader.notes:
+                not exists note
+            not exists reader
+        for composer in ComposerDrafts
+            where conversation.queue_scope = trigger.session.scope:
+            for pending in PersistencePendingReviewQueueEntries
+                where draft = composer:
+                let pending_tombstone = ReviewOutboxInvalidationTombstone.created(
+                    scope: pending.scope,
+                    local_id: pending.local_id
+                )
+                ReviewOutboxPersistenceInvalidated(
+                    scope: pending_tombstone.scope,
+                    local_id: pending_tombstone.local_id
+                )
+                not exists pending.render
+                not exists pending
+            for segment in composer.plain_segments:
+                not exists segment
+            for authority in composer.review_authorities:
+                not exists authority
+            if exists composer.submission_block:
+                not exists composer.submission_block
+            not exists composer
+        for tombstone in ReviewOutboxInvalidationTombstones
+            where scope = trigger.session.scope:
+            ReviewOutboxPersistenceInvalidated(
+                scope: tombstone.scope,
+                local_id: tombstone.local_id
+            )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant PlainDraftSegmentPositionsAreUnique {
+    for a in PlainDraftSegments:
+        for b in PlainDraftSegments:
+            a != b and a.draft = b.draft implies a.position != b.position
+}
+
+invariant ReviewContributionPositionsAreUnique {
+    for a in ProseReviewAuthorities:
+        for b in ProseReviewAuthorities:
+            a != b and a.draft = b.draft implies a.position != b.position
+}
+
+invariant PlainAndReviewPositionsDoNotOverlap {
+    for plain in PlainDraftSegments:
+        for review in ProseReviewAuthorities:
+            plain.draft = review.draft implies plain.position != review.position
+}
+
+invariant ReviewInvalidationTombstonesAreUniquePerPayload {
+    for a in ReviewOutboxInvalidationTombstones:
+        for b in ReviewOutboxInvalidationTombstones:
+            a != b implies a.scope != b.scope or a.local_id != b.local_id
+}
+
+invariant DeletedReviewQueueScopeFencesAreUnique {
+    for a in DeletedReviewQueueScopeFences:
+        for b in DeletedReviewQueueScopeFences:
+            a != b implies a.scope != b.scope
+}
+
+invariant DrainRequestMatchesItsDurableEntry {
+    for request in DurableOrderedQueueDrainRequests:
+        request.entry.scope = request.persistence.scope
+        and request.entry.local_id = request.persistence.local_id
+        and request.persistence.payload_fingerprint = message_payload_fingerprint(
+            request.entry.scope,
+            request.entry.local_id,
+            request.entry.text,
+            request.entry.images
+        )
+}
+
+invariant DeletedReviewQueueScopesOwnNoSendableReviewState {
+    for fence in DeletedReviewQueueScopeFences:
+        not exists PersistencePendingReviewQueueEntry{scope: fence.scope}
+        and not DurableOrderedQueueDrainRequests.any(
+            request => request.persistence.scope = fence.scope
+        )
+        and not exists queue/LocalQueueEntry{scope: fence.scope}
+}
+
+invariant InvalidatingPayloadsCannotBePendingOrSendable {
+    for tombstone in ReviewOutboxInvalidationTombstones:
+        not exists PersistencePendingReviewQueueEntry{
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        }
+        and not exists queue/LocalQueueEntry{
+            scope: tombstone.scope,
+            local_id: tombstone.local_id
+        }
+}
