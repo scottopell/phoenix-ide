@@ -818,7 +818,7 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 // ============================================================================
 
 use crate::db::Database;
-use crate::tools::ToolRegistry;
+use crate::tools::{Tool, ToolRegistry};
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
@@ -1441,6 +1441,7 @@ pub struct ToolRegistryExecutor {
     /// Empty for sub-agents.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     model_ids: Arc<[String]>,
+    writing_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl ToolRegistryExecutor {
@@ -1456,6 +1457,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
+            writing_tools: Vec::new(),
         }
     }
 
@@ -1473,7 +1475,14 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             model_ids,
+            writing_tools: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_writing_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.writing_tools = tools;
+        self
     }
 
     /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
@@ -1587,8 +1596,67 @@ impl ToolExecutor for ToolRegistryExecutor {
         // agent_type enum the executor resolves against (REQ-AG-008).
         self.swap_registry(
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec())
-                .with_commission_review(),
+                .with_commission_review()
+                .with_tools(self.writing_tools.clone()),
         );
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
+    }
+}
+
+#[cfg(test)]
+mod tool_registry_executor_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    struct WritingMarker;
+
+    #[async_trait]
+    impl Tool for WritingMarker {
+        fn name(&self) -> &'static str {
+            "writing_marker"
+        }
+
+        fn description(&self) -> String {
+            "test marker".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn explore_upgrade_preserves_host_bound_writing_tools() {
+        let executor = ToolRegistryExecutor::builtin_only(
+            ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &phoenix_core::platform::PlatformCapability::None {
+                        details: "test".to_string(),
+                    },
+                ),
+            ),
+            Arc::from(Vec::new()),
+        )
+        .with_writing_tools(vec![Arc::new(WritingMarker)]);
+
+        assert!(!executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "writing_marker"));
+        executor.upgrade_to_work_mode();
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "writing_marker"));
     }
 }

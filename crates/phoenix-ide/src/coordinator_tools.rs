@@ -11,21 +11,25 @@ use crate::tools::{
 };
 use phoenix_core::domain::bash_types::{BashInvocation, BashSpawnTarget};
 
+pub(crate) fn writing_tools(
+    service: GlobalReadService,
+    send_chat: Arc<SendChatApplicationService>,
+) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(SearchConversations(service.clone())),
+        Arc::new(ReadConversation(service.clone())),
+        Arc::new(QueryDatabase(service.clone())),
+        Arc::new(SendConversationMessage { service, send_chat }),
+    ]
+}
+
 pub(crate) fn tools(
     service: GlobalReadService,
     send_chat: Arc<SendChatApplicationService>,
     explore_policy: ExploreToolPolicy,
 ) -> Vec<Arc<dyn Tool>> {
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(SearchConversations(service.clone())),
-        Arc::new(ReadConversation(service.clone())),
-        Arc::new(QueryDatabase(service.clone())),
-        Arc::new(ResolveReference(service.clone())),
-        Arc::new(SendConversationMessage {
-            service: service.clone(),
-            send_chat,
-        }),
-    ];
+    let mut tools = writing_tools(service.clone(), send_chat);
+    tools.insert(3, Arc::new(ResolveReference(service.clone())));
     if explore_policy.has_sandboxed_bash() {
         tools.push(Arc::new(ExplicitCwdSandboxedBash(service)));
     }
@@ -276,7 +280,7 @@ impl Tool for SendConversationMessage {
     }
 
     fn description(&self) -> String {
-        "Coordinator-only delivery tool. Send one user message to another conversation by durable target reference (@work, @conv, app-local link, or conversation id). Never target the Coordinator chain itself.".to_string()
+        "Send one user message to another conversation by durable target reference (@work, @conv, app-local link, or conversation id). Never target this conversation, a sub-agent, or the Coordinator chain.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -315,6 +319,16 @@ impl Tool for SendConversationMessage {
             }
         };
         let conversation_id = target.conversation_id;
+        if conversation_id == ctx.conversation_id {
+            return encode_message_output(&SendConversationMessageOutput::Rejected {
+                target: Some(parsed.target),
+                conversation_id: Some(conversation_id),
+                message_id: parsed.message_id,
+                reason_code: "self_target_rejected",
+                message: "send_conversation_message cannot target its originating conversation"
+                    .to_string(),
+            });
+        }
         let request = SendChatRequest {
             conversation_id: conversation_id.clone(),
             text: parsed.message,
@@ -358,11 +372,11 @@ impl Tool for SendConversationMessage {
             },
         };
         tracing::info!(
-            origin_coordinator_id = %ctx.conversation_id,
+            origin_conversation_id = %ctx.conversation_id,
             resolved_target_id = %conversation_id,
             message_id = %parsed.message_id,
             outcome = output.kind(),
-            "Coordinator message action committed"
+            "Cross-conversation message action committed"
         );
         encode_message_output(&output)
     }
@@ -441,6 +455,53 @@ mod tests {
         }
     }
 
+    fn context(conversation_id: &str) -> ToolContext {
+        ToolContext::new_without_filesystem(
+            CancellationToken::new(),
+            conversation_id.to_string(),
+            Arc::new(crate::tools::BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+        )
+    }
+
+    fn tool_names(tools: &[Arc<dyn Tool>]) -> Vec<String> {
+        tools.iter().map(|tool| tool.name().to_string()).collect()
+    }
+
+    async fn application_tools() -> (Vec<Arc<dyn Tool>>, Vec<Arc<dyn Tool>>) {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let runtime = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let service = GlobalReadService::new(db, retriever);
+        let send_chat = Arc::new(SendChatApplicationService::new(
+            runtime.db().clone(),
+            runtime,
+        ));
+        (
+            writing_tools(service.clone(), send_chat.clone()),
+            tools(
+                service,
+                send_chat,
+                ExploreToolPolicy::from_platform(
+                    &phoenix_core::platform::PlatformCapability::None {
+                        details: "test".to_string(),
+                    },
+                ),
+            ),
+        )
+    }
+
     async fn tool_and_context() -> (ExplicitCwdSandboxedBash, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coordinator-bash.db");
@@ -450,16 +511,73 @@ mod tests {
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let tool = ExplicitCwdSandboxedBash(GlobalReadService::new(db, retriever));
-        let context = ToolContext::new_without_filesystem(
-            CancellationToken::new(),
-            "coordinator".to_string(),
-            Arc::new(crate::tools::BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(NoLlm),
-            phoenix_terminal::ActiveTerminals::new(),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-        );
+        let context = context("coordinator");
         (tool, context)
+    }
+
+    #[tokio::test]
+    async fn writing_tools_share_four_coordinator_capabilities_without_reference_resolution() {
+        let (writing, coordinator) = application_tools().await;
+
+        assert_eq!(
+            tool_names(&writing),
+            vec![
+                "search_conversations",
+                "read_conversation",
+                "query_database",
+                "send_conversation_message"
+            ]
+        );
+        assert_eq!(
+            tool_names(&coordinator),
+            vec![
+                "search_conversations",
+                "read_conversation",
+                "query_database",
+                "resolve_reference",
+                "send_conversation_message"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_conversation_message_rejects_self_before_dispatch() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin", "origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let runtime = Arc::new(crate::runtime::RuntimeManager::new(
+            db.clone(),
+            Arc::new(phoenix_llm::ModelRegistry::new_empty()),
+            phoenix_core::platform::PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(crate::tools::mcp::McpClientManager::new()),
+            None,
+        ));
+        let tool = SendConversationMessage {
+            service: GlobalReadService::new(db.clone(), retriever),
+            send_chat: Arc::new(SendChatApplicationService::new(db.clone(), runtime)),
+        };
+        let message_id = uuid::Uuid::new_v4().to_string();
+
+        let output = tool
+            .run(
+                json!({
+                    "target": "origin",
+                    "message": "do not enqueue this",
+                    "message_id": message_id,
+                }),
+                context("origin"),
+            )
+            .await;
+
+        assert!(output.is_success());
+        let body: Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(body["outcome"], "rejected");
+        assert_eq!(body["reason_code"], "self_target_rejected");
+        assert!(db.get_messages("origin").await.unwrap().is_empty());
     }
 
     #[tokio::test]

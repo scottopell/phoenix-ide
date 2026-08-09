@@ -1010,6 +1010,13 @@ impl ToolRegistry {
         Self::new_with_options(false, agents, model_ids)
     }
 
+    /// Add host-bound tools assembled by the application.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     /// Add `propose_task` to a writing-mode registry (Work, Branch, or
     /// Direct-in-a-git-repo), where it serves as the non-blocking fork
     /// proposal (REQ-PROJ-033/036). Unlike Explore, the writing modes keep
