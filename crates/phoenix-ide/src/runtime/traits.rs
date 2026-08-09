@@ -818,7 +818,7 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 // ============================================================================
 
 use crate::db::Database;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, WritingConversationTools};
 use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
@@ -1441,6 +1441,7 @@ pub struct ToolRegistryExecutor {
     /// Empty for sub-agents.
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     model_ids: Arc<[String]>,
+    writing_tools: Option<WritingConversationTools>,
 }
 
 impl ToolRegistryExecutor {
@@ -1456,6 +1457,7 @@ impl ToolRegistryExecutor {
             mcp_manager: None,
             agent_catalog,
             model_ids: Arc::from(Vec::new()),
+            writing_tools: None,
         }
     }
 
@@ -1473,7 +1475,14 @@ impl ToolRegistryExecutor {
             mcp_manager: Some(manager),
             agent_catalog,
             model_ids,
+            writing_tools: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_writing_tools(mut self, tools: Option<WritingConversationTools>) -> Self {
+        self.writing_tools = tools;
+        self
     }
 
     /// Replace the inner `ToolRegistry` (e.g., after Explore -> Work mode transition).
@@ -1585,10 +1594,82 @@ impl ToolExecutor for ToolRegistryExecutor {
     fn upgrade_to_work_mode(&self) {
         // Reuse the frozen catalog so the upgraded registry advertises the same
         // agent_type enum the executor resolves against (REQ-AG-008).
-        self.swap_registry(
+        let mut registry =
             ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec())
-                .with_commission_review(),
-        );
+                .with_commission_review();
+        if let Some(tools) = self.writing_tools.clone() {
+            registry = registry
+                .try_with_writing_conversation_tools(tools)
+                .expect("fresh Work registry has no global writing capabilities");
+        }
+        self.swap_registry(registry);
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
+    }
+}
+
+#[cfg(test)]
+mod tool_registry_executor_tests {
+    use super::*;
+    use crate::tools::{Tool, ToolContext, ToolOutput};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    struct NamedMarker(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedMarker {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn description(&self) -> String {
+            "test marker".to_string()
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
+            ToolOutput::success("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn explore_upgrade_preserves_host_bound_writing_tools() {
+        let executor = ToolRegistryExecutor::builtin_only(
+            ToolRegistry::explore(
+                "tasks",
+                Vec::new(),
+                Vec::new(),
+                crate::tools::ExploreToolPolicy::from_platform(
+                    &phoenix_core::platform::PlatformCapability::None {
+                        details: "test".to_string(),
+                    },
+                ),
+            ),
+            Arc::from(Vec::new()),
+        )
+        .with_writing_tools(Some(
+            WritingConversationTools::new(
+                Arc::new(NamedMarker("search_conversations")),
+                Arc::new(NamedMarker("read_conversation")),
+                Arc::new(NamedMarker("query_database")),
+                Arc::new(NamedMarker("send_conversation_message")),
+            )
+            .unwrap(),
+        ));
+
+        assert!(!executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "search_conversations"));
+        executor.upgrade_to_work_mode();
+        assert!(executor
+            .definitions()
+            .await
+            .iter()
+            .any(|definition| definition.name == "search_conversations"));
     }
 }
