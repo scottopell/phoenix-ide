@@ -67,6 +67,14 @@ function validateEvidence(value) {
   });
 }
 
+function validateWorkstream(value) {
+  const workstream = requiredLine(value, "workstream");
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(workstream)) {
+    throw new Error("workstream must be a lowercase kebab-case identifier");
+  }
+  return workstream;
+}
+
 export function validateUpdate(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("update must be an object");
@@ -78,10 +86,7 @@ export function validateUpdate(value) {
     throw new Error("update must have kind workstream-update and version 1");
   }
 
-  const workstream = requiredLine(value.workstream, "workstream");
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(workstream)) {
-    throw new Error("workstream must be a lowercase kebab-case identifier");
-  }
+  const workstream = validateWorkstream(value.workstream);
   const section = requiredLine(value.section, "section");
   if (!VALID_SECTIONS.has(section)) throw new Error(`unknown section: ${section}`);
   const order = value.order ?? 100;
@@ -112,9 +117,31 @@ export function validateUpdate(value) {
   };
 }
 
-function updatePayloads(markdown) {
-  const match = String(markdown ?? "").match(/^```phoenix-roadmap-update\r?\n([\s\S]*?)\r?\n```\s*$/);
-  return match ? [match[1]] : [];
+export function validateRetirement(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("retirement must be an object");
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== "kind,supersedes_comment_id,version,workstream") {
+    throw new Error("retirement must contain only kind, version, workstream, and supersedes_comment_id");
+  }
+  if (value.kind !== "workstream-retirement" || value.version !== 1) {
+    throw new Error("retirement must have kind workstream-retirement and version 1");
+  }
+  if (!Number.isSafeInteger(value.supersedes_comment_id) || value.supersedes_comment_id <= 0) {
+    throw new Error("supersedes_comment_id must be a positive integer");
+  }
+  return {
+    kind: value.kind,
+    version: value.version,
+    workstream: validateWorkstream(value.workstream),
+    supersedes_comment_id: value.supersedes_comment_id,
+  };
+}
+
+function roadmapPayload(markdown) {
+  const match = String(markdown ?? "").match(/^```phoenix-roadmap-(update|retirement)\r?\n([\s\S]*?)\r?\n```\s*$/);
+  return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
 export function updatesFromComments(comments) {
@@ -128,21 +155,36 @@ export function updatesFromComments(comments) {
     .sort((left, right) => left.id - right.id);
 
   for (const comment of ordered) {
-    for (const payload of updatePayloads(comment.body)) {
-      try {
-        const update = validateUpdate(JSON.parse(payload));
-        latest.set(update.workstream, {
-          ...update,
-          source: {
-            id: comment.id,
-            url: comment.html_url,
-            author: comment.user?.login ?? "unknown",
-            created_at: comment.created_at,
-          },
-        });
-      } catch (error) {
-        console.warn(`Ignoring invalid roadmap update in comment ${comment.id}: ${error.message}`);
+    const record = roadmapPayload(comment.body);
+    if (!record) continue;
+    try {
+      const value = JSON.parse(record.payload);
+      if (record.recordType === "retirement") {
+        const retirement = validateRetirement(value);
+        const current = latest.get(retirement.workstream);
+        const retirementAuthor = comment.user?.login ?? "unknown";
+        if (
+          current === undefined ||
+          (current.source.id <= retirement.supersedes_comment_id && current.source.author === retirementAuthor)
+        ) {
+          latest.delete(retirement.workstream);
+        } else {
+          console.warn(`Ignoring retirement in comment ${comment.id}: it must supersede the same author's current source`);
+        }
+        continue;
       }
+      const update = validateUpdate(value);
+      latest.set(update.workstream, {
+        ...update,
+        source: {
+          id: comment.id,
+          url: comment.html_url,
+          author: comment.user?.login ?? "unknown",
+          created_at: comment.created_at,
+        },
+      });
+    } catch (error) {
+      console.warn(`Ignoring invalid roadmap record in comment ${comment.id}: ${error.message}`);
     }
   }
 
@@ -188,13 +230,14 @@ function renderUpdate(update, open) {
   return `<details${open ? " open" : ""}>\n<summary><strong>${htmlText(update.title)}</strong> — ${htmlText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
-export function renderRoadmap(updates) {
+export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
   const lines = [
     "# Phoenix delivery roadmap",
     "",
     "One-request orientation for current Phoenix delivery. This entire body is generated from trusted structured comments; do not edit it manually.",
     "",
     PROJECTION_START,
+    `<!-- phoenix-roadmap:snapshot-through:${snapshotThroughCommentId} -->`,
     "",
     "## Current roadmap",
     "",
@@ -276,8 +319,12 @@ export async function run({ event, configuredIssueNumber, token }) {
   }
   const [owner, repo] = event.repository.full_name.split("/");
   const comments = await listComments(owner, repo, configuredIssueNumber, token);
+  const trustedCommentIds = comments
+    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+    .map((comment) => comment.id);
+  const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
   const updates = updatesFromComments(comments);
-  const body = renderRoadmap(updates);
+  const body = renderRoadmap(updates, snapshotThroughCommentId);
   return {
     ...(await replaceIssueBody(owner, repo, configuredIssueNumber, body, token)),
     updates: updates.length,

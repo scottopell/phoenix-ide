@@ -7,6 +7,7 @@ import {
   renderRoadmap,
   run,
   updatesFromComments,
+  validateRetirement,
   validateUpdate,
 } from "./roadmap-issue-reducer.mjs";
 
@@ -45,6 +46,10 @@ function fenced(value) {
   return `\`\`\`phoenix-roadmap-update\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
+function retired(workstream = "ios-vnext", supersedesCommentId = 1) {
+  return `\`\`\`phoenix-roadmap-retirement\n${JSON.stringify({ kind: "workstream-retirement", version: 1, workstream, supersedes_comment_id: supersedesCommentId }, null, 2)}\n\`\`\``;
+}
+
 function event(action, trigger) {
   return {
     action,
@@ -64,6 +69,45 @@ test("latest valid current comment wins per workstream", () => {
   assert.equal(result[0].state, "Blocked");
   assert.equal(result[0].source.id, 2);
   assert.equal(result[0].source.author, "ios-agent");
+});
+
+test("retirement removes the prior workstream and a later update can reactivate it", () => {
+  const comments = [
+    comment(1, fenced(update())),
+    comment(2, retired()),
+  ];
+  assert.deepEqual(updatesFromComments(comments), []);
+  assert.equal(updatesFromComments([...comments, comment(3, fenced(update({ state: "Restarted" })))])[0].state, "Restarted");
+});
+
+test("retirement has a minimal exact schema bound to a source comment", () => {
+  assert.deepEqual(
+    validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42 }),
+    { kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42 },
+  );
+  assert.throws(
+    () => validateRetirement({ kind: "workstream-retirement", version: 1, workstream: "ios-vnext", supersedes_comment_id: 42, state: "Done" }),
+    /only kind, version, workstream, and supersedes_comment_id/,
+  );
+});
+
+test("retirement requires the same author and cannot retire a newer source", () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const wrongAuthor = comment(2, retired("ios-vnext", 1), { user: { login: "other" } });
+  const newer = comment(3, fenced(update({ state: "Newer" })), { user: { login: "owner" } });
+  const staleRetirement = comment(4, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const matching = comment(5, retired("ios-vnext", 3), { user: { login: "owner" } });
+  assert.equal(updatesFromComments([current, wrongAuthor]).length, 1);
+  assert.equal(updatesFromComments([current, newer, staleRetirement])[0].state, "Newer");
+  assert.equal(updatesFromComments([current, newer, matching]).length, 0);
+});
+
+test("retirement remains authoritative if its superseded source disappears", () => {
+  const older = comment(1, fenced(update({ state: "Older" })), { user: { login: "owner" } });
+  const retiredCurrent = comment(3, retired("ios-vnext", 2), { user: { login: "owner" } });
+
+  assert.equal(updatesFromComments([older, retiredCurrent]).length, 0);
+  assert.equal(updatesFromComments([retiredCurrent]).length, 0);
 });
 
 test("edited comments remain current instead of silently deleting a workstream", () => {
@@ -115,6 +159,7 @@ test("roadmap has fixed section and explicit order with verbatim context", () =>
   assert.match(body, new RegExp(PROJECTION_START));
   assert.match(body, new RegExp(PROJECTION_END));
   assert.match(body, /This entire body is generated.*do not edit it manually/);
+  assert.match(body, /<!-- phoenix-roadmap:snapshot-through:0 -->/);
 });
 
 test("schema bounds each update before it can poison future reductions", () => {
