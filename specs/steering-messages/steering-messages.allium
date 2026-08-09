@@ -474,9 +474,10 @@ surface SteeringQueueApi {
         -- idempotent retry of an already-absent id emits no second event.
 
     @guarantee DirectSendTransparency
-        -- When a message is sent while the conversation is idle, { steering: false }
-        -- is returned and the message enters the normal bedrock delivery path.
-        -- No SteerMessageQueued event is emitted.
+        -- When a message is sent while the conversation is idle, no durable
+        -- steering row is pending, and no durable direct-turn owner is active,
+        -- { steering: false } is returned and the message enters the normal
+        -- bedrock delivery path. No SteerMessageQueued event is emitted.
 
     @guarantee PersistenceBeforeResponse
         -- In all cases that mutate the queue (enqueue, cancel), the DB reflects

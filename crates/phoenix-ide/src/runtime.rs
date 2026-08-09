@@ -3890,25 +3890,40 @@ impl RuntimeManager {
         conversation_id: &str,
         expected: &SseBroadcaster,
     ) -> bool {
-        let creations = self.runtime_creations.lock().await;
-        if creations.contains_key(conversation_id) {
-            return false;
+        loop {
+            let mut in_flight_result = {
+                let creations = self.runtime_creations.lock().await;
+                if let Some(result_tx) = creations.get(conversation_id) {
+                    Some(result_tx.subscribe())
+                } else {
+                    let runtimes = self.runtimes.read().await;
+                    if runtimes.contains_key(conversation_id) {
+                        return false;
+                    }
+                    let mut reservations = self.evicted_broadcasters.write().await;
+                    let is_expected = reservations
+                        .get(conversation_id)
+                        .is_some_and(|current| current.same_channel(expected));
+                    if is_expected {
+                        reservations.remove(conversation_id);
+                    }
+                    return is_expected;
+                }
+            }
+            .expect("in-flight result exists when runtime construction is active");
+
+            let construction_succeeded = loop {
+                if let Some(result) = in_flight_result.borrow().clone() {
+                    break result.is_ok();
+                }
+                if in_flight_result.changed().await.is_err() {
+                    break false;
+                }
+            };
+            if construction_succeeded {
+                return false;
+            }
         }
-        let runtimes = self.runtimes.read().await;
-        if runtimes.contains_key(conversation_id) {
-            return false;
-        }
-        let mut reservations = self.evicted_broadcasters.write().await;
-        let is_expected = reservations
-            .get(conversation_id)
-            .is_some_and(|current| current.same_channel(expected));
-        if is_expected {
-            reservations.remove(conversation_id);
-        }
-        drop(reservations);
-        drop(runtimes);
-        drop(creations);
-        is_expected
     }
 
     /// Subscribe to conversation updates.
@@ -5488,6 +5503,56 @@ mod scope_liveness_tests {
         })
         .await
         .expect("bounded retry failure must close the stale broadcaster");
+    }
+
+    #[tokio::test]
+    async fn failed_steering_reconstruction_waits_for_concurrent_construction() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-release-concurrent-construction";
+        let stale_broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut stale_events = stale_broadcaster.subscribe();
+        let (result_tx, _result_rx) = watch::channel(None);
+        manager
+            .runtime_creations
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), result_tx.clone());
+
+        let release = {
+            let manager = Arc::clone(&manager);
+            let stale_broadcaster = stale_broadcaster.clone();
+            tokio::spawn(async move {
+                manager
+                    .release_failed_steering_reconstruction_broadcaster(
+                        conversation_id,
+                        &stale_broadcaster,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !release.is_finished(),
+            "release responsibility must wait for the concurrent construction"
+        );
+
+        {
+            let mut creations = manager.runtime_creations.lock().await;
+            result_tx.send_replace(Some(Err("persistent construction failure".to_string())));
+            creations.remove(conversation_id);
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), release)
+                .await
+                .expect("release must settle after construction failure")
+                .expect("release task joins")
+        );
+        drop(stale_broadcaster);
+        assert!(matches!(
+            stale_events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[tokio::test]

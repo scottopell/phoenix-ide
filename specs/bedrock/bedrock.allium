@@ -1969,6 +1969,24 @@ rule ModeChangeNotification {
     ensures: SyntheticMessageInjected(conversation, about: mode_changed)
 }
 
+------------------------------------------------------------
+-- Helpers (pure predicates referenced by restart rules)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; restart rules call this
+-- predicate by bare identifier. This block defines its complete semantics.
+--
+--   committed_steering_turn_awaiting_first_response(
+--       conversation: Conversation
+--   ) -> Boolean
+--       True iff conversation.core_status = llm_requesting, the latest
+--       transcript row is a user or skill message carrying an immutable
+--       accepted-steering identity, and the pending steering queue contains no
+--       row with that exact identity. A provider response, tool row, system row,
+--       or other later transcript row makes the predicate false. Acceptance
+--       identity alone is insufficient: the qualifying transcript tail and
+--       exact queue-row absence are both required.
+
 -- REQ-BED-007: Persist state before effects (cross-cutting)
 -- Every rule that changes status implicitly requires state persistence
 -- before side effects execute.
