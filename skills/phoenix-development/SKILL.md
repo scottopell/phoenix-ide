@@ -43,8 +43,8 @@ Use the roadmap only for work substantial enough that another agent needs to kno
 3. Choose one stable kebab-case `workstream` identifier. Reuse it for every later update; a new valid comment supersedes the prior projection for that identifier.
 4. Report only facts your workstream owns: state, owner, blockers, next concrete step, evidence links, and concise context. Portfolio priority and critical-path ordering require coordinator direction; do not infer them from local importance.
 5. Post a comment consisting only of one exact `phoenix-roadmap-update` fenced JSON object. Do not add surrounding prose or edit the generated Issue body.
-6. Poll the Issue body with a bounded wait until the projected entry links to the new source comment. If the reducer workflow finishes without that projection, report the comment URL and mismatch; do not treat the immediately cached body as final.
-7. Append a replacement when material state, owner, blocker, or next step changes. When the workstream completes or is abandoned, append the retirement record defined by the first Issue comment and verify that the entry disappears.
+6. Poll the Issue body with a bounded wait until its `phoenix-roadmap:snapshot-through` marker is at least the new comment ID. For an update, also require the projected entry to link to that source comment. If the reducer workflow finishes without those conditions, report the comment URL and mismatch; do not treat the immediately cached body as final.
+7. Append a replacement when material state, owner, blocker, or next step changes. When the workstream completes or is abandoned, append the retirement record defined by the first Issue comment. It must identify the current projected source comment and be posted by that same GitHub author. Verify both that the snapshot marker includes the retirement comment and that the entry disappears.
 
 Keep detailed plans in their existing authorities and link them. The roadmap should answer “what is active, who owns it, what blocks it, and what happens next?” without becoming a second spec, task database, or PR mirror.
 

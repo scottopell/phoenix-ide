@@ -122,13 +122,21 @@ export function validateRetirement(value) {
     throw new Error("retirement must be an object");
   }
   const keys = Object.keys(value).sort();
-  if (keys.join(",") !== "kind,version,workstream") {
-    throw new Error("retirement must contain only kind, version, and workstream");
+  if (keys.join(",") !== "kind,supersedes_comment_id,version,workstream") {
+    throw new Error("retirement must contain only kind, version, workstream, and supersedes_comment_id");
   }
   if (value.kind !== "workstream-retirement" || value.version !== 1) {
     throw new Error("retirement must have kind workstream-retirement and version 1");
   }
-  return { kind: value.kind, version: value.version, workstream: validateWorkstream(value.workstream) };
+  if (!Number.isSafeInteger(value.supersedes_comment_id) || value.supersedes_comment_id <= 0) {
+    throw new Error("supersedes_comment_id must be a positive integer");
+  }
+  return {
+    kind: value.kind,
+    version: value.version,
+    workstream: validateWorkstream(value.workstream),
+    supersedes_comment_id: value.supersedes_comment_id,
+  };
 }
 
 function roadmapPayload(markdown) {
@@ -153,7 +161,15 @@ export function updatesFromComments(comments) {
       const value = JSON.parse(record.payload);
       if (record.recordType === "retirement") {
         const retirement = validateRetirement(value);
-        latest.delete(retirement.workstream);
+        const current = latest.get(retirement.workstream);
+        if (
+          current?.source.id === retirement.supersedes_comment_id &&
+          current.source.author === (comment.user?.login ?? "unknown")
+        ) {
+          latest.delete(retirement.workstream);
+        } else {
+          console.warn(`Ignoring retirement in comment ${comment.id}: current source ID and author must match`);
+        }
         continue;
       }
       const update = validateUpdate(value);
@@ -213,13 +229,14 @@ function renderUpdate(update, open) {
   return `<details${open ? " open" : ""}>\n<summary><strong>${htmlText(update.title)}</strong> — ${htmlText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
-export function renderRoadmap(updates) {
+export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
   const lines = [
     "# Phoenix delivery roadmap",
     "",
     "One-request orientation for current Phoenix delivery. This entire body is generated from trusted structured comments; do not edit it manually.",
     "",
     PROJECTION_START,
+    `<!-- phoenix-roadmap:snapshot-through:${snapshotThroughCommentId} -->`,
     "",
     "## Current roadmap",
     "",
@@ -301,8 +318,12 @@ export async function run({ event, configuredIssueNumber, token }) {
   }
   const [owner, repo] = event.repository.full_name.split("/");
   const comments = await listComments(owner, repo, configuredIssueNumber, token);
+  const trustedCommentIds = comments
+    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+    .map((comment) => comment.id);
+  const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
   const updates = updatesFromComments(comments);
-  const body = renderRoadmap(updates);
+  const body = renderRoadmap(updates, snapshotThroughCommentId);
   return {
     ...(await replaceIssueBody(owner, repo, configuredIssueNumber, body, token)),
     updates: updates.length,
