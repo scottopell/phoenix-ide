@@ -906,12 +906,58 @@ describe('inline tool timers', () => {
     const strip = screen.getByRole('list', { name: 'Tool calls' });
     expect(strip.querySelectorAll('.compact-tool-card')).toHaveLength(4);
     expect(strip.querySelector('.compact-tool-card.wide')).toHaveTextContent('bash');
+    expect(screen.getByRole('button', { name: /keyword_search:.*expand tool detail/i })).toHaveAttribute('data-sequence-id', '3');
 
     fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
 
     expect(screen.queryByRole('list', { name: 'Tool calls' })).not.toBeInTheDocument();
     expect(document.querySelector('[data-tool-id="grid-read"]')).not.toBeNull();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it('routes a grouped compact card context menu to its owning message', async () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-context-a', [
+      { type: 'tool_use', id: 'context-read', name: 'read_file', input: { path: 'first.md' } },
+    ], 2);
+    const second = agentMessage('agent-context-b', [
+      { type: 'tool_use', id: 'context-search', name: 'search', input: { pattern: 'second owner' } },
+    ], 3);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <ToolOnlyAgentTurnGroup members={[
+            { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+            { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+          ]} />
+          <MessageContextMenu messages={[first, second]} />
+        </div>
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: /search:.*expand tool detail/i }), { clientX: 20, clientY: 30 });
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy as Plain Text' }));
+
+    expect(copyToClipboard).toHaveBeenCalledWith(expect.stringContaining('second owner'));
+    expect(copyToClipboard).not.toHaveBeenCalledWith(expect.stringContaining('first.md'));
+  });
+
+  it('preserves retry audit metadata in a collapsed tool group', () => {
+    mockDensity = 'compact';
+    const first = { ...agentMessage('agent-retry-a', [
+      { type: 'tool_use', id: 'retry-read', name: 'read_file', input: { path: 'a.md' } },
+    ], 2), display_data: { retry_count: 2 } };
+    const second = agentMessage('agent-retry-b', [
+      { type: 'tool_use', id: 'retry-search', name: 'search', input: { pattern: 'needle' } },
+    ], 3);
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ]} /></MemoryRouter>);
+
+    expect(screen.getByText('retried 2x')).toBeInTheDocument();
   });
 
   it('preserves the vertical detailed rendering for a tool-only group in full density', () => {

@@ -76,7 +76,10 @@ export interface BuildInputs {
 export interface HistoricalBuildInputs {
   messages: Message[];
   pendingMessages: PendingUserMessage[];
+  groupBoundariesBeforeKeys?: ReadonlySet<string>;
 }
+
+const MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP = 8;
 
 export interface HistoricalBuild {
   historicalUnits: HistoricalUnit[];
@@ -182,25 +185,31 @@ function isToolOnlyAgentTurn(unit: HistoricalUnit): unit is AgentTurnUnit {
   return unit.agent.content.every((block) => block.type === 'tool_use' && block.name !== 'think');
 }
 
-function groupToolOnlyAgentTurns(units: HistoricalUnit[]): HistoricalUnit[] {
+function groupToolOnlyAgentTurns(
+  units: HistoricalUnit[],
+  boundariesBeforeKeys: ReadonlySet<string>,
+): HistoricalUnit[] {
   const grouped: HistoricalUnit[] = [];
-  let run: AgentTurnUnit[] = [];
+  const run: AgentTurnUnit[] = [];
 
   const flushRun = () => {
-    if (run.length === 1) {
-      grouped.push(run[0]!);
-    } else if (run.length > 1) {
-      grouped.push({
-        kind: 'tool_only_agent_turn_group',
-        key: run[0]!.key,
-        members: run,
-      });
+    while (run.length > 0) {
+      const members = run.splice(0, MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP);
+      if (members.length === 1) {
+        grouped.push(members[0]!);
+      } else {
+        grouped.push({
+          kind: 'tool_only_agent_turn_group',
+          key: members[0]!.key,
+          members,
+        });
+      }
     }
-    run = [];
   };
 
   for (const unit of units) {
     if (isToolOnlyAgentTurn(unit)) {
+      if (boundariesBeforeKeys.has(unit.key)) flushRun();
       run.push(unit);
     } else {
       flushRun();
@@ -220,7 +229,7 @@ export function agentTurnsInHistoricalUnit(unit: HistoricalUnit): readonly Agent
 export function buildHistoricalUnits(
   inputs: HistoricalBuildInputs,
 ): HistoricalBuild {
-  const { messages, pendingMessages } = inputs;
+  const { messages, pendingMessages, groupBoundariesBeforeKeys = new Set() } = inputs;
 
   const historicalUnits: HistoricalUnit[] = [];
   let i = 0;
@@ -290,7 +299,10 @@ export function buildHistoricalUnits(
     historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
 
-  return { historicalUnits: groupToolOnlyAgentTurns(historicalUnits), endsInAgentRun: inAgentRun };
+  return {
+    historicalUnits: groupToolOnlyAgentTurns(historicalUnits, groupBoundariesBeforeKeys),
+    endsInAgentRun: inAgentRun,
+  };
 }
 
 export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {

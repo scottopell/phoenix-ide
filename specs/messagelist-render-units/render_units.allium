@@ -107,8 +107,8 @@ enum SkipReason {
 
 -- A historical render unit. Kind-discriminated; agent_turn carries the
 -- tool-result map and the pre-computed isFirstInTurn flag. A
--- tool_only_agent_turn_group carries an ordered maximal run of at least two
--- agent_turn members; each member retains those same owned fields.
+-- tool_only_agent_turn_group carries an ordered bounded segment of two to
+-- eight adjacent agent_turn members; each member retains those same owned fields.
 entity HistoricalUnit {
     kind: HistoricalKind
     key: String
@@ -399,8 +399,8 @@ rule WalkComplete {
 -- Rules — pending append (phase = pending_append)
 ------------------------------------------------------------
 
--- Before pending messages append, maximal adjacent runs of at least two
--- tool-only agent turns become one structural historical unit. A tool-only
+-- Before pending messages append, adjacent tool-only agent turns become
+-- structural historical units of at most eight members. A tool-only
 -- turn has non-empty content consisting exclusively of non-think tool calls.
 -- The group key is its first member's key; members retain invocation order,
 -- tool-result ownership, source identity, and isFirstInTurn. Singleton runs
@@ -425,13 +425,17 @@ rule AppendPendingHistoricalUnits {
 
     @guidance
         -- pending_historical_units_in_order(qs):
-        -- group_tool_only_agent_turns(units) replaces each maximal adjacent
-        -- run of two or more tool-only agent_turn units with
+        -- group_tool_only_agent_turns(units) partitions each adjacent run of
+        -- tool-only agent_turn units into bounded groups of at most eight with
         -- { kind: tool_only_agent_turn_group,
         --   key: first(run).key,
         --   source_message_id: first(run).source_message_id,
         --   members: run }.
         -- A run of one remains its original agent_turn unit.
+        --
+        -- History acquisition inserts an explicit grouping boundary before
+        -- the previously loaded first historical unit, preserving that row's
+        -- key, extent, and mounted interaction state.
         --
         -- pending_historical_units_in_order(qs):
         --   for q in qs (input order):
@@ -558,6 +562,7 @@ invariant ToolOnlyGroupsAreStructural {
                 u.kind = "tool_only_agent_turn_group" implies
                     u.members != null and
                     len(u.members) >= 2 and
+                    len(u.members) <= 8 and
                     u.key = first(u.members).key
                     -- Every member has kind agent_turn. Grouped member agent
                     -- messages and owned tool-result messages resolve to this

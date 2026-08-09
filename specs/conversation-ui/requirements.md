@@ -498,7 +498,7 @@ THE SYSTEM SHALL render every message at full fidelity, identical to a conversat
 
 WHEN density is `compact`
 THE SYSTEM SHALL collapse each agent turn's tool calls into a single inline pill strip, one pill per tool call in invocation order, reusing the conversation's pill styling and tool-type colors
-AND SHALL render maximal consecutive runs of tool-only agent messages from the same agent run as one responsive grid so lightweight tool cards share a row when space permits
+AND SHALL render consecutive tool-only agent messages from the same agent run in responsive grids of at most eight message members so lightweight tool cards share a row when space permits
 AND SHALL reduce the grid column count as available width narrows without horizontal page overflow
 AND for bash tool calls, span the available grid width and preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
 AND for bash tool calls, render a bounded inline output tail from the best available live or final structured bash output, including a visible truncation indication when older output has fallen out of the bounded tail

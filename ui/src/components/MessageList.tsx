@@ -501,6 +501,26 @@ function MessageListImpl({
   const transcriptRef = useRef<VirtualTranscriptHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
+  const loadedHistoryBoundaryKeysRef = useRef(new Set<string>());
+  const boundaryConversationIdRef = useRef(conversationId);
+  const previousFirstMessageIdRef = useRef<string | null>(null);
+  const previousFirstHistoricalKeyRef = useRef<string | null>(null);
+  if (boundaryConversationIdRef.current !== conversationId) {
+    boundaryConversationIdRef.current = conversationId;
+    loadedHistoryBoundaryKeysRef.current.clear();
+    previousFirstMessageIdRef.current = null;
+    previousFirstHistoricalKeyRef.current = null;
+  }
+  const firstMessageId = messages[0]?.message_id ?? null;
+  if (
+    previousFirstMessageIdRef.current !== null
+    && firstMessageId !== previousFirstMessageIdRef.current
+    && messages.some((message) => message.message_id === previousFirstMessageIdRef.current)
+    && previousFirstHistoricalKeyRef.current !== null
+  ) {
+    loadedHistoryBoundaryKeysRef.current.add(previousFirstHistoricalKeyRef.current);
+  }
+  previousFirstMessageIdRef.current = firstMessageId;
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -522,9 +542,14 @@ function MessageListImpl({
   // transition (sending → streaming → tool_executing → …) for zero visual
   // change.
   const { historicalUnits, endsInAgentRun } = useMemo(
-    () => buildHistoricalUnits({ messages, pendingMessages }),
+    () => buildHistoricalUnits({
+      messages,
+      pendingMessages,
+      groupBoundariesBeforeKeys: loadedHistoryBoundaryKeysRef.current,
+    }),
     [messages, pendingMessages],
   );
+  previousFirstHistoricalKeyRef.current = historicalUnits[0]?.key ?? null;
   const tailUnits = useMemo(
     () => buildTailUnits({
       convState,

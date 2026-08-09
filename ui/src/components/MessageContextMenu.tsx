@@ -19,6 +19,7 @@ interface MenuState {
   x: number;
   y: number;
   message: Message;
+  contentElement?: HTMLElement;
   toolContext?: ToolContext;
 }
 
@@ -62,7 +63,9 @@ export function MessageContextMenu({
         return;
       }
 
-      // Walk up from target to find .message element
+      // A compact grouped card carries the sequence id of its owning message;
+      // otherwise the nearest .message container owns the interaction.
+      const owningSequenceId = target?.closest<HTMLElement>('[data-sequence-id]')?.dataset['sequenceId'];
       let el = e.target as HTMLElement | null;
 
       // Detect tool context while walking up
@@ -97,7 +100,7 @@ export function MessageContextMenu({
       }
       if (!el) return; // Not on a message
 
-      const seqId = el.dataset['sequenceId'];
+      const seqId = owningSequenceId ?? el.dataset['sequenceId'];
       if (!seqId) return;
 
       const msg = messages.find((m) => String(m.sequence_id) === seqId);
@@ -105,7 +108,8 @@ export function MessageContextMenu({
 
       e.preventDefault();
       window.dispatchEvent(new Event(MESSAGE_CONTEXT_MENU_OPEN_EVENT));
-      const newMenu: MenuState = { x: e.clientX, y: e.clientY, message: msg };
+      const contentElement = target?.closest<HTMLElement>('[data-sequence-id]') ?? el;
+      const newMenu: MenuState = { x: e.clientX, y: e.clientY, message: msg, contentElement };
       if (toolContext) newMenu.toolContext = toolContext;
       setMenu(newMenu);
     },
@@ -186,10 +190,10 @@ export function MessageContextMenu({
   };
 
   const copyPlainText = () => {
-    const el = document.querySelector(
-      `.message[data-sequence-id="${menu.message.sequence_id}"]`
-    ) as HTMLElement | null;
-    const text = el ? getPlainText(el) : getMessageMarkdown(menu.message);
+    const el = menu.contentElement;
+    const text = el?.classList.contains('message')
+      ? getPlainText(el)
+      : el?.textContent || getMessageMarkdown(menu.message);
     void copyToClipboard(text);
     setMenu(null);
   };
@@ -201,9 +205,9 @@ export function MessageContextMenu({
   };
 
   const selectAll = () => {
-    const el = document.querySelector(
-      `.message[data-sequence-id="${menu.message.sequence_id}"] .message-content`
-    );
+    const el = menu.contentElement?.classList.contains('message')
+      ? menu.contentElement.querySelector('.message-content')
+      : menu.contentElement;
     if (el) {
       const range = document.createRange();
       range.selectNodeContents(el);

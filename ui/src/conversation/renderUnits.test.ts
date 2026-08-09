@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MockInstance } from 'vitest';
 import {
   buildRenderUnits,
+  buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
   SUB_AGENT_STATUS_KEY,
   type AgentTurnUnit,
@@ -274,6 +275,38 @@ describe('buildRenderUnits', () => {
         'agent_turn',
         'agent_turn',
       ]);
+    });
+
+    it('bounds physical groups and keeps singleton overflow as an agent turn', () => {
+      const messages = Array.from({ length: 9 }, (_, index) =>
+        agentMsg(`bounded-${index + 1}`, [toolUseBlock(`bounded-use-${index + 1}`)]));
+
+      const out = buildHistoricalUnits({ messages, pendingMessages: [] });
+
+      expect(out.historicalUnits).toHaveLength(2);
+      expect(out.historicalUnits[0]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[0]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected bounded group');
+      expect(out.historicalUnits[0].members).toHaveLength(8);
+      expect(out.historicalUnits[1]?.kind).toBe('agent_turn');
+    });
+
+    it('does not merge newly prepended history across a preserved page boundary', () => {
+      const messages = [
+        agentMsg('older-a', [toolUseBlock('older-use-a')]),
+        agentMsg('older-b', [toolUseBlock('older-use-b')]),
+        agentMsg('loaded-a', [toolUseBlock('loaded-use-a')]),
+        agentMsg('loaded-b', [toolUseBlock('loaded-use-b')]),
+      ];
+
+      const out = buildHistoricalUnits({
+        messages,
+        pendingMessages: [],
+        groupBoundariesBeforeKeys: new Set(['loaded-a']),
+      });
+
+      expect(out.historicalUnits).toHaveLength(2);
+      expect(out.historicalUnits.map((unit) => unit.key)).toEqual(['older-a', 'loaded-a']);
+      expect(out.historicalUnits.every((unit) => unit.kind === 'tool_only_agent_turn_group')).toBe(true);
     });
 
     it('resolves every grouped member and result to the shared virtual row', () => {

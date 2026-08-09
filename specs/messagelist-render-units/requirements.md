@@ -80,8 +80,12 @@ AND SHALL attach it to the preceding `agent_turn` unit's
 `toolResultsByUseId` map keyed by the result's `tool_use_id`
 
 WHEN two or more adjacent `agent_turn` units contain only non-`think` tool calls
-THE SYSTEM SHALL replace that maximal run with one `tool_only_agent_turn_group` historical unit keyed by the first member
+THE SYSTEM SHALL partition that run into `tool_only_agent_turn_group` historical units of at most eight members, each keyed by its first member
 AND SHALL retain the ordered member units with each member's source identity, `toolResultsByUseId`, and `isFirstInTurn` intact
+
+WHEN older history is prepended
+THE SYSTEM SHALL preserve a grouping boundary before the previously loaded first historical unit
+SO THAT acquisition cannot merge that existing physical row into an older group or change its stable key, measured extent, or mounted interaction state
 
 WHEN such a run contains only one `agent_turn`
 THE SYSTEM SHALL retain the original `agent_turn` unit

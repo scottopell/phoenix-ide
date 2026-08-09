@@ -720,6 +720,7 @@ function CompactToolStripImpl({
             type="button"
             className={classNames}
             onClick={() => onExpand(item.toolId)}
+            data-sequence-id={item.ownerMessage.sequence_id}
             aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
           >
             <span className="compact-tool-card-header">
@@ -812,6 +813,20 @@ interface ToolOnlyAgentTurnGroupProps {
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
+function AgentRetryBadge({ message }: { message: Message }) {
+  const displayData = message.display_data as Record<string, unknown> | undefined;
+  const retryCount = typeof displayData?.['retry_count'] === 'number' ? displayData['retry_count'] : 0;
+  if (retryCount <= 0) return null;
+  return (
+    <span
+      className="message-retry-badge"
+      title={`This response succeeded after ${retryCount} retry attempt${retryCount === 1 ? '' : 's'}.`}
+    >
+      retried {retryCount}x
+    </span>
+  );
+}
+
 export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   members,
   liveBashProgress = {},
@@ -872,6 +887,10 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                 {formatMessageTime(first.agent.created_at)}
               </span>
             )}
+            <AgentRetryBadge message={first.agent} />
+            <span className="message-header-actions">
+              <MessageCopyButton message={first.agent} title="Copy Phoenix message" />
+            </span>
           </div>
         )}
         <div className="message-content">
@@ -1140,28 +1159,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
               {formatMessageTime(timestamp)}
             </span>
           )}
-          {/* REQ-LRV-006: post-hoc retry badge. The runtime stamps
-              `display_data.retry_count` on the persisted assistant
-              message iff the turn retried (max(0, final_attempt - 1)).
-              Zero is encoded as "field absent" on the JSON, so the
-              `> 0` check doubles as a presence check. The badge is
-              the long-lived record of "this answer took N tries" once
-              the live retry suffix on the StateBar has cleared. */}
-          {(() => {
-            const dd = message.display_data as Record<string, unknown> | undefined;
-            const retryCount = typeof dd?.['retry_count'] === 'number' ? (dd['retry_count'] as number) : 0;
-            if (retryCount > 0) {
-              return (
-                <span
-                  className="message-retry-badge"
-                  title={`This response succeeded after ${retryCount} retry attempt${retryCount === 1 ? '' : 's'}.`}
-                >
-                  retried {retryCount}x
-                </span>
-              );
-            }
-            return null;
-          })()}
+          <AgentRetryBadge message={message} />
           <span className="message-header-actions">
             <MessageCopyButton message={message} title="Copy Phoenix message" />
           </span>
