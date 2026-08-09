@@ -10,7 +10,6 @@ const MAX_UPDATE_BYTES = 2_000;
 const MAX_WORKSTREAMS = 12;
 const MAX_ISSUE_BODY_BYTES = 65_536;
 
-const UPDATE_FENCE = /```phoenix-roadmap-update\s*\n([\s\S]*?)\n```/g;
 const SECTION_ORDER = [
   ["critical-path", "Critical path"],
   ["parallel-p0", "Parallel P0"],
@@ -113,6 +112,34 @@ export function validateUpdate(value) {
   };
 }
 
+function updatePayloads(markdown) {
+  const payloads = [];
+  const lines = String(markdown ?? "").split(/\r?\n/);
+  let enclosingFence = null;
+  let updateLines = null;
+
+  for (const line of lines) {
+    const opening = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+    if (enclosingFence === null) {
+      if (!opening) continue;
+      const [fence, info] = [opening[1], opening[2].trim()];
+      enclosingFence = { character: fence[0], length: fence.length };
+      updateLines = fence === "```" && info === "phoenix-roadmap-update" ? [] : null;
+      continue;
+    }
+
+    const closing = line.match(/^\s*(`{3,}|~{3,})\s*$/)?.[1];
+    if (closing?.[0] === enclosingFence.character && closing.length >= enclosingFence.length) {
+      if (updateLines !== null) payloads.push(updateLines.join("\n"));
+      enclosingFence = null;
+      updateLines = null;
+      continue;
+    }
+    if (updateLines !== null) updateLines.push(line);
+  }
+  return payloads;
+}
+
 export function updatesFromComments(comments) {
   const latest = new Map();
   const ordered = [...comments]
@@ -124,9 +151,9 @@ export function updatesFromComments(comments) {
     .sort((left, right) => left.id - right.id);
 
   for (const comment of ordered) {
-    for (const match of String(comment.body ?? "").matchAll(UPDATE_FENCE)) {
+    for (const payload of updatePayloads(comment.body)) {
       try {
-        const update = validateUpdate(JSON.parse(match[1]));
+        const update = validateUpdate(JSON.parse(payload));
         latest.set(update.workstream, {
           ...update,
           source: {
@@ -175,11 +202,7 @@ function renderUpdate(update, open) {
   return `<details${open ? " open" : ""}>\n<summary><strong>${markdownText(update.title)}</strong> — ${markdownText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
-export function renderRoadmap(updates, event) {
-  const reductionLabel =
-    event.action === "deleted"
-      ? "_Reduced after trusted agent comment deletion_"
-      : `_Reduced after agent comment ${event.action} at ${event.comment.updated_at ?? event.comment.created_at}_`;
+export function renderRoadmap(updates) {
   const lines = [
     "# Phoenix delivery roadmap",
     "",
@@ -189,7 +212,7 @@ export function renderRoadmap(updates, event) {
     "",
     "## Current roadmap",
     "",
-    reductionLabel,
+    "_Generated from the current trusted comment set._",
   ];
 
   for (const [section, heading] of SECTION_ORDER) {
@@ -265,14 +288,10 @@ export async function run({ event, configuredIssueNumber, token }) {
   if (!TRUSTED_ASSOCIATIONS.has(event.comment.author_association)) {
     return { skipped: "triggering author is not trusted" };
   }
-  if (event.action === "created" && updatesFromComments([event.comment]).length === 0) {
-    return { skipped: "triggering comment contains no valid roadmap update" };
-  }
-
   const [owner, repo] = event.repository.full_name.split("/");
   const comments = await listComments(owner, repo, configuredIssueNumber, token);
   const updates = updatesFromComments(comments);
-  const body = renderRoadmap(updates, event);
+  const body = renderRoadmap(updates);
   return {
     ...(await replaceIssueBody(owner, repo, configuredIssueNumber, body, token)),
     updates: updates.length,

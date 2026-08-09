@@ -73,6 +73,17 @@ test("edited comments remain current instead of silently deleting a workstream",
   assert.equal(updatesFromComments([edited])[0].state, "Ready");
 });
 
+test("roadmap-update examples nested in larger fences are not live updates", () => {
+  const nested = [
+    "````markdown",
+    "```phoenix-roadmap-update",
+    JSON.stringify(update()),
+    "```",
+    "````",
+  ].join("\n");
+  assert.deepEqual(updatesFromComments([comment(1, nested)]), []);
+});
+
 test("untrusted comments and invalid replacements are ignored", () => {
   const untrusted = comment(2, fenced(update({ state: "Ready" })), { author_association: "NONE" });
   const invalid = comment(3, fenced(update({ evidence: [] })));
@@ -88,12 +99,12 @@ test("roadmap has fixed section and explicit order with verbatim context", () =>
     comment(2, fenced(update({ workstream: "first", order: 10, title: "First", context: "Line one\nLine two" }))),
     comment(3, fenced(update({ workstream: "p0", section: "parallel-p0", title: "P0", order: 90 }))),
   ];
-  const body = renderRoadmap(updatesFromComments(comments), event("created", comments[2]));
+  const body = renderRoadmap(updatesFromComments(comments));
 
   assert.ok(body.indexOf("### Parallel P0") < body.indexOf("### Blocked programs"));
   assert.ok(body.indexOf("<strong>First</strong>") < body.indexOf("<strong>Later</strong>"));
   assert.match(body, /> Line one\n> Line two/);
-  assert.match(body, /_Reduced after agent comment created at 2026-08-09T16:03:00Z_/);
+  assert.match(body, /_Generated from the current trusted comment set\._/);
   assert.match(body, new RegExp(PROJECTION_START));
   assert.match(body, new RegExp(PROJECTION_END));
   assert.match(body, /This entire body is generated.*do not edit it manually/);
@@ -122,7 +133,7 @@ test("evidence URL uses its dedicated 500-character limit", () => {
 
 test("context HTML is escaped inside details markup", () => {
   const source = comment(1, fenced(update({ context: "</details><strong>escape me</strong>" })));
-  const body = renderRoadmap(updatesFromComments([source]), event("created", source));
+  const body = renderRoadmap(updatesFromComments([source]));
   assert.doesNotMatch(body, /> <\/details>/);
   assert.match(body, /\\<\/details\\>/);
 });
@@ -146,7 +157,7 @@ test("created and edited events rebuild the reducer-owned body", async () => {
       const result = await run({ event: event(action, trigger), configuredIssueNumber: 7, token: "token" });
       assert.deepEqual(result, { changed: true, updates: 1 });
       const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
-      assert.match(body, new RegExp(`comment ${action}`));
+      assert.match(body, /Generated from the current trusted comment set/);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -186,8 +197,27 @@ test("deleted update rebuilds from remaining live comments", async () => {
     const result = await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1 });
     const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
-    assert.match(body, /Reduced after trusted agent comment deletion/);
+    assert.match(body, /Generated from the current trusted comment set/);
     assert.doesNotMatch(body, new RegExp(deleted.updated_at));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("ordinary trusted comments still rebuild from the live snapshot", async () => {
+  const trigger = comment(2, "Ordinary coordination note.");
+  const remaining = comment(1, fenced(update()));
+  const responses = [
+    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 200 }),
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => responses.shift();
+  try {
+    assert.deepEqual(
+      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
+      { changed: true, updates: 1 },
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
