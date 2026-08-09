@@ -169,7 +169,7 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        "Spawn sub-agents to execute tasks. Explore sub-agents may run in parallel. Work sub-agents run one at a time per parent: include at most one Work task per call and wait for it to finish before spawning another. Each sub-agent has an independent conversation and returns its own result. Work sub-agents use the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -185,7 +185,7 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model. Work mode requires the parent to be in Work mode."
+                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model; Explore sub-agents may run in parallel. Work: full tool suite, inherits the parent model, and runs one at a time per parent. Include at most one Work task per call and wait for the active Work child to finish before spawning another. Work uses the resolved task cwd directly. An omitted or blank cwd inherits the parent cwd; Work/Branch overrides stay within the parent worktree, while Direct overrides are unscoped. Phoenix does not create a separate child worktree or merge child changes. Work mode requires a write-capable parent (Work, Branch, or Direct)."
             },
             "model": {
                 "type": "string",
@@ -468,6 +468,54 @@ mod tests {
                 !guidance.contains(provider_specific_alias),
                 "spawn_agents schema guidance should not mention provider-specific alias {provider_specific_alias:?}: {guidance}"
             );
+        }
+    }
+
+    #[test]
+    fn schema_describes_work_environment_without_advertising_parallel_work() {
+        let tool = SpawnAgentsTool::new();
+        let schema = tool.input_schema();
+        let mode_guidance = schema["properties"]["tasks"]["items"]["properties"]["mode"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        let description = tool.description();
+
+        for expected in [
+            "omitted or blank cwd inherits the parent cwd",
+            "Work/Branch overrides stay within the parent worktree",
+            "Direct overrides are unscoped",
+            "does not create a separate child worktree",
+            "merge child changes",
+        ] {
+            assert!(
+                description.contains(expected),
+                "tool description is missing {expected:?}: {description}"
+            );
+            assert!(
+                mode_guidance.contains(expected),
+                "mode guidance is missing {expected:?}: {mode_guidance}"
+            );
+        }
+        assert!(mode_guidance.contains("Work, Branch, or Direct"));
+        for expected in [
+            "Explore sub-agents may run in parallel",
+            "Work sub-agents run one at a time per parent",
+            "at most one Work task per call",
+            "wait for the active Work child to finish",
+        ] {
+            assert!(
+                description.contains(expected) || mode_guidance.contains(expected),
+                "spawn guidance is missing {expected:?}: {description}\n{mode_guidance}"
+            );
+        }
+        for unsupported_claim in [
+            "parallel with other Work sub-agents",
+            "writes are not locked",
+            "assignments should be disjoint",
+        ] {
+            assert!(!description.contains(unsupported_claim));
+            assert!(!mode_guidance.contains(unsupported_claim));
         }
     }
 
