@@ -22,6 +22,7 @@ use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -31,8 +32,14 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
+
+pub(crate) fn process_log_config() -> &'static LogConfig {
+    PROCESS_LOG_CONFIG.get_or_init(LogConfig::from_env)
+}
 
 pub(crate) fn install_fatal_diagnostic_hook() {
+    process_log_config();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         record_fatal_diagnostic(&format!("panic: {info}"));
@@ -41,11 +48,12 @@ pub(crate) fn install_fatal_diagnostic_hook() {
 }
 
 pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized)) {
-    let Some(path) = fatal_log_path() else {
+    let config = process_log_config();
+    let Some(path) = config.fatal_file.as_deref() else {
         return;
     };
-    if let Some(structured) = std::env::var_os("PHOENIX_LOG_FILE").map(PathBuf::from) {
-        match paths_alias(&structured, &path) {
+    if let Some(structured) = config.file.as_deref() {
+        match paths_alias(structured, path) {
             Ok(true) => {
                 eprintln!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE");
                 return;
@@ -57,7 +65,7 @@ pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized
             }
         }
     }
-    if let Err(error) = write_fatal_diagnostic(&path, &message.to_string()) {
+    if let Err(error) = write_fatal_diagnostic(path, &message.to_string()) {
         eprintln!("failed to write {}: {error}", path.display());
     }
 }
@@ -197,6 +205,7 @@ fn prepare_log_identity(path: &Path, private: bool) -> std::io::Result<()> {
 }
 
 /// The resolved logging destinations.
+#[derive(Clone, Debug)]
 pub struct LogConfig {
     /// Whether structured logs are written to stdout.
     pub stdout: bool,
@@ -208,7 +217,7 @@ pub struct LogConfig {
 
 /// Logging destinations whose paths were opened, checked for aliases, and
 /// proven writable before subscriber construction.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedLogConfig {
     stdout: bool,
     file: Option<PathBuf>,

@@ -55,7 +55,7 @@ class BareSupervisorUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):
             owner.dispatch({"protocol_version": 99, "action": "status"})
 
-    def test_child_stderr_always_uses_bounded_capture(self):
+    def test_child_stdout_and_stderr_share_bounded_capture(self):
         with tempfile.TemporaryDirectory() as td:
             owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
             owner.layout.direct_diagnostic.write_text("candidate failure")
@@ -71,7 +71,7 @@ class BareSupervisorUnitTests(unittest.TestCase):
                 "PHOENIX_FATAL_LOG_FILE": "/tmp/prod-fatal.log",
             }
             with mock.patch.object(supervisor.subprocess, "Popen", return_value=child) as popen, \
-                 mock.patch.object(supervisor, "start_bounded_stderr_capture", return_value=capture_thread) as capture, \
+                 mock.patch.object(supervisor, "start_bounded_output_capture", return_value=capture_thread) as capture, \
                  mock.patch.object(supervisor, "wait_for_identity", return_value=identity), \
                  mock.patch.object(supervisor, "direct_child_matches", return_value=True):
                 owner.start_child(
@@ -86,34 +86,47 @@ class BareSupervisorUnitTests(unittest.TestCase):
                 ["phoenix-ide"],
                 env=env,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-            capture.assert_called_once_with(child.stderr, owner.layout.direct_diagnostic)
+            capture.assert_called_once_with(child.stdout, owner.layout.direct_diagnostic)
             self.assertEqual("candidate failure", owner.layout.direct_diagnostic.read_text())
 
-    def test_timed_out_stderr_reader_remains_owned(self):
+    def test_timed_out_output_reader_remains_owned(self):
         owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
         reader = mock.Mock()
         reader.is_alive.return_value = True
-        owner.diagnostic_thread = reader
+        owner.output_thread = reader
 
         with self.assertRaisesRegex(
-            supervisor.SupervisorError, "stderr reader did not exit"
+            supervisor.SupervisorError, "output reader did not exit"
         ):
-            owner.finish_diagnostic_capture()
+            owner.finish_output_capture()
 
         reader.join.assert_called_once_with(timeout=1)
-        self.assertIs(reader, owner.diagnostic_thread)
+        self.assertIs(reader, owner.output_thread)
 
     def test_direct_diagnostic_capture_keeps_only_last_64_kib(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "fatal.log"
             payload = b"prefix" + b"x" * supervisor.MAX_DIRECT_DIAGNOSTIC_BYTES
 
-            supervisor.capture_bounded_stderr(io.BytesIO(payload), path)
+            supervisor.capture_bounded_output(io.BytesIO(payload), path)
 
             self.assertEqual(b"x" * supervisor.MAX_DIRECT_DIAGNOSTIC_BYTES, path.read_bytes())
+
+    def test_candidate_snapshot_survives_rollback_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            layout = supervisor.Layout(Path(td))
+            layout.direct_diagnostic.write_text("candidate loader failure")
+
+            supervisor.snapshot_candidate_diagnostic(layout, "candidate did not start")
+            layout.direct_diagnostic.write_text("rollback warning")
+
+            snapshot = layout.candidate_diagnostic.read_text()
+            self.assertIn("candidate did not start", snapshot)
+            self.assertIn("candidate loader failure", snapshot)
+            self.assertEqual("rollback warning", layout.direct_diagnostic.read_text())
 
 
 class BareTransactionTests(unittest.TestCase):
@@ -201,6 +214,7 @@ class BareTransactionTests(unittest.TestCase):
         self.assertEqual("MODE=old\n", self.layout.environment.read_text())
         self.assertEqual("a" * 40, self.layout.deployed_sha.read_text().strip())
         self.assertFalse(self.layout.active_file.exists())
+        self.assertIn("wrong identity", self.layout.candidate_diagnostic.read_text())
 
     def test_completed_transaction_cannot_be_replayed(self):
         path = self.manifest()

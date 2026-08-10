@@ -228,14 +228,16 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   is only ever derived from `LogConfig` once every configured sink is actually
   installed — the report cannot advertise a sink the subscriber isn't writing.
   stdout, the structured file, and the bounded fatal snapshot are independently
-  reported from one resolved configuration used by every launch path.
+  reported from one immutable per-process resolution used by every writer.
 - **A process-owned file has one writer.** Deployments disable the stdout sink
   and never attach a launcher descriptor to the structured log. Before tracing
   starts, the binary installs a fatal-diagnostic hook; startup errors and panics
   overwrite a separate file capped at 64 KiB. After tracing starts, panics are
   also recorded in the structured sink. The bare supervisor always drains raw
-  child stderr into a separate 64 KiB tail file, so rollback compatibility is
-  explicit and never inferred from environment variables.
+  child stdout and stderr into a separate 64 KiB tail file, so an older
+  stdout-only rollback remains observable. Before rollback starts, a failed
+  candidate is copied to its own bounded snapshot. launchd writes loader errors
+  that occur before Rust `main` to a separate OS-owned, rotated file.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

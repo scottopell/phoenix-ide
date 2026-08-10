@@ -19,8 +19,8 @@ the machine is it using right now?"
 - Demand-driven request coalescing shared with Work Scope health and process inspectors, so overlapping consumers reuse one timestamped native-process observation generation
 - On-disk locations with sizes for small owned artifacts, paths-only for large
   caches, and a stable row for the attachment store
-- The active log sinks (stdout and/or a process-owned file path) — path only,
-  never contents
+- The structured-log sinks and bounded fatal destination — paths only, never
+  contents
 - Typed managed-worktree drilldown and backend-revalidated cleanup for leftover
   Phoenix-managed worktrees
 
@@ -68,7 +68,7 @@ staying safe to open because ordinary inspection changes nothing.
 | **REQ-DEPLOY-004C:** Preserve last-good semantics across refresh failures | Implemented | On fetch failure, `fetchResources` leaves `sample` and `history` intact, marks `stale: true` when a prior sample exists, and surfaces the error as `Live data stale — …`. When no sample exists yet, the page shows the error without fabricating data. |
 | **REQ-DEPLOY-004D:** Keep deployment facts and live resource monitoring separate | Implemented | `GET /api/deployment` carries build, network, log, and locality facts without a parallel resource snapshot; `GET /api/about/resources` is the sole live CPU, memory, load, and managed-process telemetry contract; and `GET /api/deployment/disk` owns explicit disk sizing. Deployment-facts and disk refreshes re-sample only their owning endpoints, while visible-page resource observations refresh independently on their demand-driven cadence. |
 | **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Implemented | `GET /api/deployment/disk` returns `DeploymentDiskInfo` with typed `DiskSize` variants, aggregate managed-worktree sizing, and per-worktree rows with typed disposition. The UI keeps disk loading/error state separate from the live resource monitor. |
-| **REQ-DEPLOY-006:** Surface the log sinks, never the contents | Implemented | `LogInfo` reports stdout, structured-file, and bounded fatal-diagnostic destinations from `LogConfig`, and the page renders their facts only — never log contents. |
+| **REQ-DEPLOY-006:** Surface logging destinations, never their contents | Implemented | `LogInfo` reports stdout, structured-file, and bounded fatal-diagnostic destinations from one immutable process configuration, and the page renders their facts only. Bare and launchd supervisors retain bounded launcher output separately for failures that happen outside the running logger. |
 | **REQ-DEPLOY-007:** Freshness of sampled values | Implemented | `DeploymentInfo`, `DeploymentDiskInfo`, and `AboutResourcesSnapshot` all carry `sampled_at`; the UI distinguishes deployment-facts refresh, disk refresh, and continuous resource sampling rather than serving one cached omnibus snapshot. |
 | **REQ-DEPLOY-008:** Safely clean up leftover managed worktrees | Implemented | `POST /api/deployment/disk/managed-worktrees/cleanup` revalidates DB ownership, Phoenix path shape, live-conversation ownership, and mode semantics before removal; the UI offers cleanup only for typed leftover rows whose disposition allows it. |
 

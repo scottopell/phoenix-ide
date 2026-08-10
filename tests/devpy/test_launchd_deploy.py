@@ -892,7 +892,19 @@ class PreparationTests(unittest.TestCase):
         )
         self.assertEqual("false", environment["PHOENIX_LOG_STDOUT"])
         self.assertEqual("/dev/null", plist["StandardOutPath"])
-        self.assertEqual("/dev/null", plist["StandardErrorPath"])
+        self.assertEqual(
+            str(self.dev.LAUNCHD_STDERR_LOG_PATH), plist["StandardErrorPath"]
+        )
+
+    def test_newsyslog_bounds_launchd_pre_main_stderr(self):
+        config = self.dev._newsyslog_config("phoenix", "staff")
+
+        self.assertNotIn(str(self.dev.LAUNCHD_LOG_PATH), config)
+        self.assertIn(
+            f"{self.dev.LAUNCHD_STDERR_LOG_PATH}    phoenix:staff    600  2    64",
+            config,
+        )
+        self.assertIn("64    *  BJN", config)
 
 if __name__ == "__main__":
     unittest.main()

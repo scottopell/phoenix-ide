@@ -880,6 +880,7 @@ LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
 LAUNCHD_FATAL_LOG_PATH = Path.home() / ".phoenix-ide" / "prod-fatal.log"
+LAUNCHD_STDERR_LOG_PATH = Path.home() / ".phoenix-ide" / "prod-launchd-stderr.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 LAUNCHD_DEPLOY_DIR = Path.home() / ".phoenix-ide" / "deploy"
 LAUNCHD_DEPLOY_STATUS_PATH = LAUNCHD_DEPLOY_DIR / "status.json"
@@ -8464,27 +8465,31 @@ def generate_launchd_plist(
   <string>/dev/null</string>
 
   <key>StandardErrorPath</key>
-  <string>/dev/null</string>
+  <string>{LAUNCHD_STDERR_LOG_PATH}</string>
 </dict>
 </plist>
 """
 
 
-def _ensure_newsyslog_config():
-    """Install /etc/newsyslog.d/<label>.conf for prod.log rotation.
+def _newsyslog_config(user: str, group: str) -> str:
+    return (
+        f"# Installed by ./dev.py prod deploy — launchd stderr rotation.\n"
+        f"# logfilename                              [owner:group]    mode count size when  flags\n"
+        f"{LAUNCHD_STDERR_LOG_PATH}    {user}:{group}    600  2    64    *  BJN\n"
+    )
 
-    Uses copy-truncate (`c` flag) so launchd's open stdout/stderr fd stays
-    valid across rotation. Daily at midnight, 14 generations, bzip2.
-    Idempotent: skips sudo if installed file already matches desired content.
+
+def _ensure_newsyslog_config():
+    """Rotate launchd-owned pre-main diagnostics.
+
+    Replacing the old process-log rule before activation prevents two rotators
+    from ever owning prod.log. The short-lived failing process exits before the
+    launchd stderr file is renamed. Idempotent when the file already matches.
     """
     import pwd
     user = pwd.getpwuid(os.getuid()).pw_name
     group = "staff"
-    desired = (
-        f"# Installed by ./dev.py prod deploy — log rotation for phoenix-ide.\n"
-        f"# logfilename                              [owner:group]    mode count size when  flags\n"
-        f"{LAUNCHD_LOG_PATH}    {user}:{group}    644  14    *    @T00  Jc\n"
-    )
+    desired = _newsyslog_config(user, group)
     try:
         existing = NEWSYSLOG_CONF_PATH.read_text()
         if existing == desired:
@@ -8498,21 +8503,22 @@ def _ensure_newsyslog_config():
         tmp.write(desired)
         tmp_path = tmp.name
     try:
+        sudo = ["sudo"] if sys.stdin.isatty() else ["sudo", "-n"]
         result = subprocess.run(
-            ["sudo", "-n", "install", "-m", "644", "-o", "root", "-g", "wheel",
+            [*sudo, "install", "-m", "644", "-o", "root", "-g", "wheel",
              tmp_path, str(NEWSYSLOG_CONF_PATH)],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            print(f"  ✓ Log rotation installed: daily @T00, 14 generations, bzip2, copy-truncate")
+            print("  ✓ launchd stderr rotation installed: 64 KiB, 2 generations")
         else:
-            # Non-fatal: deploy proceeds without rotation. Print one-shot install command.
-            print(f"  WARN: could not install rotation config (sudo unavailable in this shell).", file=sys.stderr)
-            print(f"  To enable: sudo install -m 644 -o root -g wheel {tmp_path!s} {NEWSYSLOG_CONF_PATH}", file=sys.stderr)
-            print(f"  Or rerun `./dev.py prod deploy` from an interactive terminal.", file=sys.stderr)
-            return  # Skip cleanup so the printed path stays valid for the user
+            raise SystemExit(
+                "could not install required launchd stderr rotation; run:\n"
+                f"  sudo install -m 644 -o root -g wheel {tmp_path!s} {NEWSYSLOG_CONF_PATH}\n"
+                "then rerun ./dev.py prod deploy"
+            )
     except FileNotFoundError:
-        print(f"  WARN: sudo not found; rotation config not installed.", file=sys.stderr)
+        raise SystemExit("sudo is required once to install launchd stderr rotation")
     Path(tmp_path).unlink(missing_ok=True)
 
 

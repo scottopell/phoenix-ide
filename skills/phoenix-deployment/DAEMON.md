@@ -8,13 +8,14 @@ Applies when: Linux without systemd.
 |----------|-------|
 | Default port | 8031 |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` (structured), `prod-fatal.log` (latest process fatal diagnostic, maximum 64 KiB), and `prod-supervisor-fatal.log` (bounded direct-stderr tail, maximum 64 KiB) |
+| Logs | `~/.phoenix-ide/prod.log` (structured), `prod-fatal.log` (latest process fatal, 64 KiB), `prod-supervisor-fatal.log` (bounded direct stdout/stderr tail, 64 KiB), and `prod-supervisor-candidate-fatal.log` (last failed candidate, 64 KiB) |
 | Supervisor socket | `~/.phoenix-ide/run/supervisor.sock` |
 | Durable deploy status | `~/.phoenix-ide/deploy/status.json` |
 
 A persistent same-user supervisor directly owns Phoenix. `prod.pid` is not an authority. The owner-only Unix socket authenticates Linux peers with `SO_PEERCRED`; activation accepts only an immutable transaction ID and manifest hash.
-The supervisor fixes the three `PHOENIX_LOG_*` destinations above;
-`.phoenix-ide.env` cannot redirect structured output into discarded stdout.
+The supervisor fixes the three `PHOENIX_LOG_*` destinations above. It also
+captures combined child stdout/stderr, so an older stdout-only rollback remains
+observable without writing into the process-owned structured file.
 
 ## Configuration and deployment
 

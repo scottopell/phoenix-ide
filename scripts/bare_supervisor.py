@@ -143,6 +143,10 @@ class Layout:
     def direct_diagnostic(self) -> Path:
         return self.root / "prod-supervisor-fatal.log"
 
+    @property
+    def candidate_diagnostic(self) -> Path:
+        return self.root / "prod-supervisor-candidate-fatal.log"
+
 def proc_start_time(pid: int, proc_root: Path = Path("/proc")) -> int:
     try:
         value = (proc_root / str(pid) / "stat").read_text()
@@ -227,7 +231,7 @@ def write_text_atomic(path: Path, value: str) -> None:
     write_bytes_atomic(path, (value + "\n").encode())
 
 
-def capture_bounded_stderr(stream: BinaryIO, path: Path) -> None:
+def capture_bounded_output(stream: BinaryIO, path: Path) -> None:
     tail = bytearray()
     try:
         while chunk := stream.read(8192):
@@ -239,15 +243,26 @@ def capture_bounded_stderr(stream: BinaryIO, path: Path) -> None:
         stream.close()
 
 
-def start_bounded_stderr_capture(stream: BinaryIO, path: Path) -> threading.Thread:
+def start_bounded_output_capture(stream: BinaryIO, path: Path) -> threading.Thread:
     thread = threading.Thread(
-        target=capture_bounded_stderr,
+        target=capture_bounded_output,
         args=(stream, path),
-        name="phoenix-direct-diagnostic",
+        name="phoenix-direct-output",
         daemon=True,
     )
     thread.start()
     return thread
+
+
+def snapshot_candidate_diagnostic(layout: Layout, failure: str) -> None:
+    output = b""
+    try:
+        output = layout.direct_diagnostic.read_bytes()[-MAX_DIRECT_DIAGNOSTIC_BYTES:]
+    except FileNotFoundError:
+        pass
+    header = f"candidate failed: {failure}\n".encode()[:4096]
+    retained = output[-max(0, MAX_DIRECT_DIAGNOSTIC_BYTES - len(header)):]
+    write_bytes_atomic(layout.candidate_diagnostic, header + retained)
 
 
 def sha256(path: Path) -> str:
@@ -346,7 +361,7 @@ class Supervisor:
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
         self.child: Optional[subprocess.Popen[bytes]] = None
         self.child_identity: Optional[ChildIdentity] = None
-        self.diagnostic_thread: Optional[threading.Thread] = None
+        self.output_thread: Optional[threading.Thread] = None
         self.running = True
 
     def prepare_layout(self) -> None:
@@ -374,17 +389,17 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 self.child.kill()
                 self.child.wait(timeout=5)
-        self.finish_diagnostic_capture()
+        self.finish_output_capture()
         self.child = None
         self.child_identity = None
         write_json_atomic(self.layout.state, self.status())
 
-    def finish_diagnostic_capture(self) -> None:
-        if self.diagnostic_thread is not None:
-            self.diagnostic_thread.join(timeout=1)
-            if self.diagnostic_thread.is_alive():
-                raise SupervisorError("child stderr reader did not exit")
-            self.diagnostic_thread = None
+    def finish_output_capture(self) -> None:
+        if self.output_thread is not None:
+            self.output_thread.join(timeout=1)
+            if self.output_thread.is_alive():
+                raise SupervisorError("child output reader did not exit")
+            self.output_thread = None
 
     def stop_recorded_orphan(self, timeout: float = 10) -> None:
         if not self.layout.state.exists():
@@ -424,13 +439,13 @@ class Supervisor:
             command,
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        if self.child.stderr is None:
-            raise SupervisorError("child stderr pipe was not created")
-        self.diagnostic_thread = start_bounded_stderr_capture(
-            self.child.stderr, self.layout.direct_diagnostic
+        if self.child.stdout is None:
+            raise SupervisorError("child output pipe was not created")
+        self.output_thread = start_bounded_output_capture(
+            self.child.stdout, self.layout.direct_diagnostic
         )
         try:
             self.child_identity = wait_for_identity(self.child, expected, health_url, timeout)
@@ -542,6 +557,7 @@ class Supervisor:
                 prepared_binary.unlink(missing_ok=True)
                 prepared_environment.unlink(missing_ok=True)
             if manifest.previous_running:
+                self.layout.direct_diagnostic.unlink(missing_ok=True)
                 self.start_child(
                     [str(self.layout.binary)],
                     parse_environment(self.layout.environment),
@@ -620,6 +636,8 @@ class Supervisor:
             self.transaction_status(manifest, manifest_hash, "activating", phase="activating")
             try:
                 self.stop_child()
+                self.layout.direct_diagnostic.unlink(missing_ok=True)
+                self.layout.candidate_diagnostic.unlink(missing_ok=True)
                 commit_install(candidate_binary_install, self.layout.binary)
                 commit_install(candidate_environment_install, self.layout.environment)
                 reserved = [path for path in reserved if path.exists()]
@@ -637,6 +655,7 @@ class Supervisor:
                 self.layout.active_file.unlink(missing_ok=True)
                 return "committed"
             except Exception as activation_error:
+                snapshot_candidate_diagnostic(self.layout, str(activation_error))
                 try:
                     return self.restore_previous(
                         manifest,
@@ -728,6 +747,8 @@ class Supervisor:
             if phase in {"candidate_installed", "candidate_started"}:
                 self.stop_recorded_orphan()
                 try:
+                    self.layout.direct_diagnostic.unlink(missing_ok=True)
+                    self.layout.candidate_diagnostic.unlink(missing_ok=True)
                     self.start_child(
                         [str(self.layout.binary)],
                         parse_environment(self.layout.environment),
@@ -742,6 +763,7 @@ class Supervisor:
                     return
                 except Exception as activation_error:
                     failure = f"restart reconciliation candidate verification failed: {activation_error}"
+                    snapshot_candidate_diagnostic(self.layout, failure)
             elif phase in {"prepared", "activating", "rolling_back"}:
                 failure = status.get("failure") or f"restart reconciliation resumed from {phase}"
             else:
@@ -782,7 +804,7 @@ class Supervisor:
             self.reconcile()
             while self.running:
                 if self.child is not None and self.child.poll() is not None:
-                    self.finish_diagnostic_capture()
+                    self.finish_output_capture()
                     self.child = None
                     self.child_identity = None
                     write_json_atomic(self.layout.state, self.status())

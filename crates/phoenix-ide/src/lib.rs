@@ -625,7 +625,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // PHOENIX_LOG_FILE) and the Datadog tracer provider (DD_* env vars). The
     // handles must outlive the program so the file appender worker and the
     // tracer provider flush on shutdown; held until `main` returns.
-    let log_config = logging::LogConfig::from_env().prepare()?;
+    let log_config = logging::process_log_config().clone().prepare()?;
     let tracing_handles = logging::init(&log_config)?;
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses
