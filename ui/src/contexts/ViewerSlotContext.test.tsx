@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act, waitFor, fireEvent } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import { ViewerSlotProvider, useBrowserSessionActive, useViewerSlot } from './ViewerSlotContext';
+import { ViewerSlotProvider, useBrowserSessionActive, useViewerRestorationSettled, useViewerSlot } from './ViewerSlotContext';
 import type { ViewerSlotValue } from './ViewerSlotContext';
 import { getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
@@ -23,6 +23,12 @@ function Capture({ onCtx }: { onCtx: (ctx: ViewerSlotValue) => void }) {
 function BrowserActiveCapture({ onActive }: { onActive: (active: boolean) => void }) {
   const active = useBrowserSessionActive();
   useEffect(() => { onActive(active); }, [active, onActive]);
+  return null;
+}
+
+function RestorationCapture({ onSettled }: { onSettled: (settled: boolean) => void }) {
+  const settled = useViewerRestorationSettled();
+  useEffect(() => { onSettled(settled); }, [settled, onSettled]);
   return null;
 }
 
@@ -463,6 +469,7 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
   it('restores a stored browser viewer only after loaded session truth is active', () => {
     setLastViewer('conv-A', 'viewer=browser');
     let latest: ViewerSlotValue | null = null;
+    let restorationSettled = false;
     let setActive: ((active: boolean | undefined) => void) | null = null;
     function BrowserDestination() {
       const [active, setActiveState] = useState<boolean | undefined>(undefined);
@@ -470,6 +477,7 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
       return (
         <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={active}>
           <Capture onCtx={(ctx) => { latest = ctx; }} />
+          <RestorationCapture onSettled={(settled) => { restorationSettled = settled; }} />
         </ViewerSlotProvider>
       );
     }
@@ -489,9 +497,39 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     act(() => { fireEvent.click(getByText('enter')); });
     expect(latest!.slot.kind).toBe('none');
     expect(getLastViewer('conv-A')).toContain('viewer=browser');
+    expect(restorationSettled).toBe(false);
 
     act(() => { setActive!(true); });
     expect(latest!.slot.kind).toBe('browser');
+    expect(restorationSettled).toBe(true);
+  });
+
+  it('settles and discards a malformed stored viewer snapshot', async () => {
+    setLastViewer('conv-A', 'viewer=unknown-kind');
+    let restorationSettled = false;
+    function Destination() {
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+          <RestorationCapture onSettled={(settled) => { restorationSettled = settled; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<Destination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    await waitFor(() => expect(restorationSettled).toBe(true));
+    expect(getLastViewer('conv-A')).toBeNull();
   });
 
   it('closes a browser fall while readiness is pending, then invalidates storage when confirmed', () => {

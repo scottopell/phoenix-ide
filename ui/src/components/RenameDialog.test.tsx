@@ -1,9 +1,34 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { RenameDialog } from './RenameDialog';
+import { FocusScopeProvider, useFocusScope } from '../hooks/useFocusScope';
+
+function ScopeCapture({ onScope }: { onScope: (scope: string | null) => void }) {
+  const { activeScope } = useFocusScope();
+  useEffect(() => onScope(activeScope), [activeScope, onScope]);
+  return null;
+}
 
 describe('RenameDialog', () => {
+  it('registers a visible rename modal as the active focus scope', async () => {
+    let activeScope: string | null = null;
+    render(
+      <FocusScopeProvider>
+        <ScopeCapture onScope={(scope) => { activeScope = scope; }} />
+        <RenameDialog
+          visible
+          currentName="current-slug"
+          onRename={vi.fn()}
+          onCancel={vi.fn()}
+          error={undefined}
+        />
+      </FocusScopeProvider>,
+    );
+
+    await waitFor(() => expect(activeScope).toBe('rename-conversation'));
+  });
+
   it('does not render the AI generation button without an onGenerate handler', () => {
     render(
       <RenameDialog

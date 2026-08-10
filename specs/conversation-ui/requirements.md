@@ -129,6 +129,18 @@ THE SYSTEM SHALL begin as one compact control row
 AND SHALL expand the editable area only as its content grows up to the maximum height
 AND SHALL keep send, queue, and cancellation actions directly accessible as compact controls without reserving a second action row
 
+WHEN desktop navigation enters a live conversation whose message composer is the active interaction surface
+THE SYSTEM SHALL focus the composer after authoritative conversation state and viewer restoration settle
+AND SHALL NOT reinterpret background refresh, viewport changes, or later viewer restoration as new focus requests
+
+IF a higher focus scope, route-owned viewer, message deep-link reading target, archived state, or other interaction surface owns keyboard input
+THEN THE SYSTEM SHALL preserve that owner's focus instead of focusing the composer
+
+IF a transient conversation phase has not rendered a focusable composer
+THEN THE SYSTEM SHALL retain the navigation focus request until the same route renders one
+
+**Dependencies:** `specs/keyboard-interaction/` REQ-KB-001, REQ-KB-002A, and REQ-KB-008 define topmost interaction ownership; `specs/viewer_slot/` defines when a route-owned viewer has settled and owns the interaction surface.
+
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
 
 ---

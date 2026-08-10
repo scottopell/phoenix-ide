@@ -51,6 +51,7 @@ import {
   DraftLifecycle,
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
+import { useFocusScope } from '../hooks/useFocusScope';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
@@ -121,7 +122,7 @@ const CommissionReviewViewer = lazy(() =>
 );
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
   ForkProposalsProvider,
@@ -146,6 +147,43 @@ const XCircle = () => (
 const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
+
+type RouteFocusDisposition = 'focus' | 'defer' | 'preserve-owner';
+
+function routeFocusDisposition(state: Conversation['state']): RouteFocusDisposition {
+  if (!state) return 'preserve-owner';
+  switch (state.type) {
+    case 'idle':
+    case 'llm_requesting':
+    case 'seeded_llm_requesting':
+    case 'tool_executing':
+    case 'awaiting_sub_agents':
+    case 'cancelling_tool':
+    case 'cancelling_sub_agents':
+      return 'focus';
+    case 'error':
+      return state.error?.can_user_resume ? 'focus' : 'preserve-owner';
+    case 'awaiting_llm':
+    case 'awaiting_continuation':
+    case 'cancelling':
+    case 'provisioning':
+      return 'defer';
+    case 'recoverable_continuation_failure':
+    case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
+    case 'awaiting_user_response':
+    case 'context_exhausted':
+    case 'handed_off':
+    case 'awaiting_recovery':
+    case 'creation_failed':
+    case 'creation_cancelled':
+    case 'terminal':
+      return 'preserve-owner';
+    default:
+      state satisfies never;
+      return 'preserve-owner';
+  }
+}
 
 function prefersConversationIdRoute(routeSegment: string): boolean {
   return isUuidRouteSegment(routeSegment);
@@ -327,6 +365,8 @@ function ConversationPageContent({
   // structural — opening any viewer rewrites `?viewer=` and the others close.
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
+  const viewerRestorationSettled = useViewerRestorationSettled();
+  const { hasActiveScope } = useFocusScope();
   const slotKind = viewerSlot.slot.kind;
   const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
   const rawDiffTarget = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.target : 'workspace';
@@ -355,7 +395,6 @@ function ConversationPageContent({
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
   // on every consumer.
-  const isDesktop = useIsDesktop();
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
@@ -421,6 +460,7 @@ function ConversationPageContent({
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
+  const isDesktop = useIsDesktop();
 
   const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
@@ -435,6 +475,40 @@ function ConversationPageContent({
   const requestComposerFocus = useCallback(() => {
     setFocusToken((t) => t + 1);
   }, []);
+
+  // Route navigation is an explicit composer-focus request. Key by both route
+  // segment and authoritative id: UUID routes may canonicalize to a slug, and
+  // the final route must retain focus. Background refreshes keep the same key
+  // and therefore never steal focus.
+  const lastNavigationFocusKeyRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (!slug || !conversationId || !conversation || !archiveStatusConfirmed || !viewerRestorationSettled) return;
+    const key = `${slug}:${conversationId}`;
+    if (lastNavigationFocusKeyRef.current === key) return;
+    if (!isDesktop || isArchived || slotKind !== 'none' || viewerSlot.browserSessionActive || hasActiveScope || targetMessageId) {
+      lastNavigationFocusKeyRef.current = key;
+      return;
+    }
+    const disposition = routeFocusDisposition(atom.phase);
+    if (disposition === 'preserve-owner') {
+      lastNavigationFocusKeyRef.current = key;
+    } else if (disposition === 'focus' && inputRef.current?.focus()) {
+      lastNavigationFocusKeyRef.current = key;
+    }
+  }, [
+    isDesktop,
+    slug,
+    conversationId,
+    conversation,
+    atom.phase,
+    isArchived,
+    archiveStatusConfirmed,
+    slotKind,
+    viewerSlot.browserSessionActive,
+    viewerRestorationSettled,
+    hasActiveScope,
+    targetMessageId,
+  ]);
 
   // App state for offline support
   const { isOnline, queueOperation, removePendingOperations } = useAppMachine();
