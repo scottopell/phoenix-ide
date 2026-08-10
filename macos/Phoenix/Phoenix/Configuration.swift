@@ -298,6 +298,25 @@ enum PhoenixURLAction: Equatable {
     }
 }
 
+struct ConversationCreationPayload: Equatable {
+    let cwd: String
+    let model: String
+    let messageID: String
+
+    var dictionary: [String: Any] {
+        [
+            "cwd": cwd,
+            "model": model,
+            "text": "",
+            "message_id": messageID,
+            "images": [],
+            "files": [],
+            "mode": "direct",
+            "seed_label": "External prompt",
+        ]
+    }
+}
+
 struct VersionInfo: Codable, Equatable {
     let version: String
     let gitSHA: String

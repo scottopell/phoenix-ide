@@ -76,6 +76,22 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertNil(PhoenixURLAction(url: URL(string: "pa://new?prompt=legacy")!))
     }
 
+    func testDeepLinkCreationPayloadMatchesCurrentPhoenixContract() throws {
+        let payload = ConversationCreationPayload(
+            cwd: "/tmp",
+            model: "claude-sonnet-5",
+            messageID: "message-123"
+        ).dictionary
+        XCTAssertEqual(payload["cwd"] as? String, "/tmp")
+        XCTAssertEqual(payload["model"] as? String, "claude-sonnet-5")
+        XCTAssertEqual(payload["message_id"] as? String, "message-123")
+        XCTAssertEqual(payload["text"] as? String, "")
+        XCTAssertEqual(payload["mode"] as? String, "direct")
+        XCTAssertEqual(payload["seed_label"] as? String, "External prompt")
+        XCTAssertNotNil(payload["images"])
+        XCTAssertNotNil(payload["files"])
+    }
+
     func testAttachedAndBundledModesExposeOnlyTheirOwnConfiguration() throws {
         let attached = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://host.test")))
         XCTAssertEqual(attached.kind, .attached)
