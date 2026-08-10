@@ -8,11 +8,13 @@ Applies when: Linux without systemd.
 |----------|-------|
 | Default port | 8031 |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` |
+| Logs | `~/.phoenix-ide/prod.log` (structured), `prod-fatal.log` (latest process fatal diagnostic, maximum 64 KiB), and `prod-supervisor-fatal.log` (bounded direct-stderr tail, maximum 64 KiB) |
 | Supervisor socket | `~/.phoenix-ide/run/supervisor.sock` |
 | Durable deploy status | `~/.phoenix-ide/deploy/status.json` |
 
 A persistent same-user supervisor directly owns Phoenix. `prod.pid` is not an authority. The owner-only Unix socket authenticates Linux peers with `SO_PEERCRED`; activation accepts only an immutable transaction ID and manifest hash.
+The supervisor fixes the three `PHOENIX_LOG_*` destinations above;
+`.phoenix-ide.env` cannot redirect structured output into discarded stdout.
 
 ## Configuration and deployment
 

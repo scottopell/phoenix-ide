@@ -18,14 +18,16 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO, Optional
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024
+MAX_DIRECT_DIAGNOSTIC_BYTES = 64 * 1024
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -138,9 +140,8 @@ class Layout:
         return self.run_dir / "supervisor-state.json"
 
     @property
-    def log(self) -> Path:
-        return self.root / "prod.log"
-
+    def direct_diagnostic(self) -> Path:
+        return self.root / "prod-supervisor-fatal.log"
 
 def proc_start_time(pid: int, proc_root: Path = Path("/proc")) -> int:
     try:
@@ -202,7 +203,9 @@ def peer_uid(connection: socket.socket) -> int:
 
 def write_bytes_atomic(path: Path, value: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     with temporary.open("wb") as stream:
         os.chmod(temporary, mode)
         stream.write(value)
@@ -222,6 +225,29 @@ def write_json_atomic(path: Path, value: object) -> None:
 
 def write_text_atomic(path: Path, value: str) -> None:
     write_bytes_atomic(path, (value + "\n").encode())
+
+
+def capture_bounded_stderr(stream: BinaryIO, path: Path) -> None:
+    tail = bytearray()
+    try:
+        while chunk := stream.read(8192):
+            tail.extend(chunk)
+            if len(tail) > MAX_DIRECT_DIAGNOSTIC_BYTES:
+                del tail[:-MAX_DIRECT_DIAGNOSTIC_BYTES]
+            write_bytes_atomic(path, bytes(tail))
+    finally:
+        stream.close()
+
+
+def start_bounded_stderr_capture(stream: BinaryIO, path: Path) -> threading.Thread:
+    thread = threading.Thread(
+        target=capture_bounded_stderr,
+        args=(stream, path),
+        name="phoenix-direct-diagnostic",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def sha256(path: Path) -> str:
@@ -320,6 +346,7 @@ class Supervisor:
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
         self.child: Optional[subprocess.Popen[bytes]] = None
         self.child_identity: Optional[ChildIdentity] = None
+        self.diagnostic_thread: Optional[threading.Thread] = None
         self.running = True
 
     def prepare_layout(self) -> None:
@@ -347,9 +374,17 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 self.child.kill()
                 self.child.wait(timeout=5)
+        self.finish_diagnostic_capture()
         self.child = None
         self.child_identity = None
         write_json_atomic(self.layout.state, self.status())
+
+    def finish_diagnostic_capture(self) -> None:
+        if self.diagnostic_thread is not None:
+            self.diagnostic_thread.join(timeout=1)
+            if self.diagnostic_thread.is_alive():
+                raise SupervisorError("child stderr reader did not exit")
+            self.diagnostic_thread = None
 
     def stop_recorded_orphan(self, timeout: float = 10) -> None:
         if not self.layout.state.exists():
@@ -385,8 +420,18 @@ class Supervisor:
 
     def start_child(self, command: list[str], env: dict[str, str], expected: RuntimeIdentity, health_url: str, timeout: float) -> ChildIdentity:
         self.stop_child()
-        with self.layout.log.open("ab", buffering=0) as log:
-            self.child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+        self.child = subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if self.child.stderr is None:
+            raise SupervisorError("child stderr pipe was not created")
+        self.diagnostic_thread = start_bounded_stderr_capture(
+            self.child.stderr, self.layout.direct_diagnostic
+        )
         try:
             self.child_identity = wait_for_identity(self.child, expected, health_url, timeout)
         except BaseException:
@@ -737,6 +782,7 @@ class Supervisor:
             self.reconcile()
             while self.running:
                 if self.child is not None and self.child.poll() is not None:
+                    self.finish_diagnostic_capture()
                     self.child = None
                     self.child_identity = None
                     write_json_atomic(self.layout.state, self.status())

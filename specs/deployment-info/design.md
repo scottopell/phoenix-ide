@@ -67,9 +67,10 @@ DiskSize =                       // serde-tagged, ts-rs discriminated union
   | { kind: "absent" }           // path does not exist
   | { kind: "inline_db" }        // attachment store: bytes live inside the DB
 
-LogInfo {                        // independent sinks; both may be active
+LogInfo {                        // every configured logging destination
   stdout: boolean                // logs written to stdout (supervisor-captured)
   file:   string | null          // absolute path of the process-owned log file
+  fatal_file: string | null      // absolute path of the bounded fatal snapshot
 }
 ```
 
@@ -97,8 +98,8 @@ field. It holds the static facts:
   `ca_cert_path` from `LoadedConfig`, and `hosts` from `ConfigSource::Auto`.
 - `log: LogInfo` — the active log sinks, derived from the same `LogConfig` that
   builds the subscriber (REQ-DEPLOY-006). `LogConfig` is resolved once from
-  `PHOENIX_LOG_STDOUT` (bool, default on) and `PHOENIX_LOG_FILE` (optional path);
-  both sinks are independent and may be active together.
+  `PHOENIX_LOG_STDOUT` (bool, default on), `PHOENIX_LOG_FILE` (optional path),
+  and `PHOENIX_FATAL_LOG_FILE` (optional bounded-fatal path).
 - `locations: Vec<DiskLocation>` — the static on-disk layout. Each `DiskLocation`
   carries a `label`, an absolute `path`, and a `MeasureMode` dictating how it is
   sized at request time. The rows are: the database file (`File`); the data
@@ -216,20 +217,25 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   per-scope profiles on every page load would make a diagnostic page expensive
   and occasionally slow. `not_measured` states the omission explicitly instead of
   reporting a misleading `0`.
-- **The log sinks reflect what the logger does, not configuration it ignores.**
-  `LogInfo` is built from the same `LogConfig` that wires the subscriber, so the
-  report and the wiring share one source of truth and cannot diverge. The binary
-  writes the `PHOENIX_LOG_FILE` sink itself (a non-blocking append worker), so a
-  reported file path is always one the process genuinely writes — never a mere
+- **The log sinks reflect what logging does, not configuration it ignores.**
+  `LogInfo` is built from the same `LogConfig` that drives the subscriber and
+  bounded fatal hook, so the report and the wiring share one source of truth.
+  The binary writes the `PHOENIX_LOG_FILE` sink itself through a non-blocking
+  append worker, so a reported file path is always one the process genuinely
+  writes — never a mere
   launcher redirection the process cannot guarantee. A `PHOENIX_LOG_FILE` that
   cannot be opened aborts startup rather than degrading silently, so the report
   is only ever derived from `LogConfig` once every configured sink is actually
   installed — the report cannot advertise a sink the subscriber isn't writing.
-  stdout and file are
-  independent sinks; a deployment enables whichever it needs, or both. This is the
-  single mechanism every launch path uses (dev, launchd, daemon, and systemd when
-  configured), replacing the previous per-mode mix of shell/plist redirection and
-  journald-only capture.
+  stdout, the structured file, and the bounded fatal snapshot are independently
+  reported from one resolved configuration used by every launch path.
+- **A process-owned file has one writer.** Deployments disable the stdout sink
+  and never attach a launcher descriptor to the structured log. Before tracing
+  starts, the binary installs a fatal-diagnostic hook; startup errors and panics
+  overwrite a separate file capped at 64 KiB. After tracing starts, panics are
+  also recorded in the structured sink. The bare supervisor always drains raw
+  child stderr into a separate 64 KiB tail file, so rollback compatibility is
+  explicit and never inferred from environment variables.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

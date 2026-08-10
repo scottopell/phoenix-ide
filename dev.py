@@ -44,6 +44,7 @@ VITE_PROXY_FILE = ROOT / ".vite.proxy"
 PHOENIX_PORT_FILE = ROOT / ".phoenix.port"
 VITE_PORT_FILE = ROOT / ".vite.port"
 LOG_FILE = ROOT / "phoenix.log"
+FATAL_LOG_FILE = ROOT / "phoenix-fatal.log"
 
 # ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
 # SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
@@ -878,6 +879,7 @@ LAUNCHD_LABEL = "com.phoenix-ide.server"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
+LAUNCHD_FATAL_LOG_PATH = Path.home() / ".phoenix-ide" / "prod-fatal.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 LAUNCHD_DEPLOY_DIR = Path.home() / ".phoenix-ide" / "deploy"
 LAUNCHD_DEPLOY_STATUS_PATH = LAUNCHD_DEPLOY_DIR / "status.json"
@@ -1878,6 +1880,15 @@ def _wait_for_files(paths: list[Path], timeout: float = 8.0) -> bool:
     return all(p.exists() for p in paths)
 
 
+def _phoenix_child_stdio() -> dict[str, int]:
+    """Keep launcher-owned descriptors away from Phoenix's structured log."""
+    return {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+
+
 def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     """Start the Phoenix server."""
     global _db_lock
@@ -1900,12 +1911,9 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     # Vite dev server itself is bound loopback in passwordless mode (see
     # `_dev_bind_host`) so its proxy can't re-expose this backend to the network.
     env["PHOENIX_BIND_ADDR"] = "127.0.0.1"
-    # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
-    # JSON there directly. stdout is off so the only writer to the file is the
-    # binary's appender; the Popen redirect below only captures pre-logger /
-    # panic output as a safety net. Same PHOENIX_LOG_FILE mechanism the prod
-    # launchers use.
+    # The binary owns the structured log and a bounded latest-fatal snapshot.
     env["PHOENIX_LOG_FILE"] = str(LOG_FILE)
+    env["PHOENIX_FATAL_LOG_FILE"] = str(FATAL_LOG_FILE)
     env["PHOENIX_LOG_STDOUT"] = "false"
     phoenix_tls = maybe_enable_auto_tls(env, tls)
 
@@ -1940,27 +1948,26 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     if "RUST_LOG" not in env:
         env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
 
-    # Fresh log per restart, then append: the binary's appender and this
-    # redirect both open the file with O_APPEND, so their writes interleave
-    # safely. Truncating here (not "w" on the Popen handle) gives the
-    # fresh-per-restart behavior without a non-appending second writer.
+    # Fresh structured log per restart. The child never inherits this file, so
+    # Phoenix remains its only writer.
     LOG_FILE.write_text("")
-    with open(LOG_FILE, "a") as log:
-        proc = subprocess.Popen(
-            [str(binary)],
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        PHOENIX_PID_FILE.write_text(str(proc.pid))
+    proc = subprocess.Popen(
+        [str(binary)],
+        env=env,
+        **_phoenix_child_stdio(),
+        start_new_session=True,
+    )
+    PHOENIX_PID_FILE.write_text(str(proc.pid))
     PHOENIX_PORT_FILE.write_text(str(port) + "\n")
     register_dev_process("phoenix", proc.pid, port)
 
     # Verify it started
     time.sleep(0.5)
     if not is_process_running(proc.pid):
-        print("Phoenix failed to start. Check phoenix.log", file=sys.stderr)
+        print(
+            f"Phoenix failed to start. Check {LOG_FILE.name} and {FATAL_LOG_FILE.name}",
+            file=sys.stderr,
+        )
         PHOENIX_PID_FILE.unlink()
         _db_lock.release()
         _db_lock = None
@@ -7980,8 +7987,9 @@ def _apply_bare_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("PATH", os.environ.get("PATH", os.defpath))
     env.setdefault("PHOENIX_PORT", str(PROD_PORT))
     env.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
-    env.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
-    env.setdefault("PHOENIX_LOG_STDOUT", "false")
+    env["PHOENIX_LOG_FILE"] = str(Path.home() / ".phoenix-ide/prod.log")
+    env["PHOENIX_FATAL_LOG_FILE"] = str(Path.home() / ".phoenix-ide/prod-fatal.log")
+    env["PHOENIX_LOG_STDOUT"] = "false"
 
 
 def _prepare_installed_candidate(layout: dict[str, Path]) -> "PreparedCandidate":
@@ -8392,15 +8400,14 @@ def generate_launchd_plist(
         "PHOENIX_DB_PATH": str(PROD_DB_PATH),
         "PHOENIX_PORT": str(PROD_PORT),
         "PHOENIX_VERSION": version,
-        # Unified logging: the binary appends JSON to this file directly. stdout
-        # is off, so the plist's StandardOut/ErrorPath (same file) only carries
-        # pre-logger / panic output. newsyslog handles rotation.
-        "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
-        "PHOENIX_LOG_STDOUT": "false",
     }
     # Merge .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
     if extra_env:
         env_vars.update(extra_env)
+    # Direct streams are discarded; the binary owns both bounded file sinks.
+    env_vars["PHOENIX_LOG_FILE"] = str(LAUNCHD_LOG_PATH)
+    env_vars["PHOENIX_FATAL_LOG_FILE"] = str(LAUNCHD_FATAL_LOG_PATH)
+    env_vars["PHOENIX_LOG_STDOUT"] = "false"
     launchd_socket_port = env_vars["PHOENIX_PORT"]
 
     # XML-escape both keys and values: PATH (and arbitrary env values from
@@ -8454,10 +8461,10 @@ def generate_launchd_plist(
   <string>Interactive</string>
 
   <key>StandardOutPath</key>
-  <string>{LAUNCHD_LOG_PATH}</string>
+  <string>/dev/null</string>
 
   <key>StandardErrorPath</key>
-  <string>{LAUNCHD_LOG_PATH}</string>
+  <string>/dev/null</string>
 </dict>
 </plist>
 """
@@ -9930,4 +9937,3 @@ if __name__ == "__main__":
         _shutdown_dev_tracing(failure)
     if failed_command_exit is not None:
         sys.exit(failed_command_exit)
-

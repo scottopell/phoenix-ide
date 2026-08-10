@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -53,6 +54,66 @@ class BareSupervisorUnitTests(unittest.TestCase):
         owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
         with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):
             owner.dispatch({"protocol_version": 99, "action": "status"})
+
+    def test_child_stderr_always_uses_bounded_capture(self):
+        with tempfile.TemporaryDirectory() as td:
+            owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
+            owner.layout.direct_diagnostic.write_text("candidate failure")
+            identity = supervisor.ChildIdentity(
+                42,
+                100,
+                supervisor.RuntimeIdentity("1.0.0", "a" * 12),
+            )
+            child = mock.Mock()
+            capture_thread = mock.Mock()
+            env = {
+                "PHOENIX_LOG_FILE": "/tmp/prod.log",
+                "PHOENIX_FATAL_LOG_FILE": "/tmp/prod-fatal.log",
+            }
+            with mock.patch.object(supervisor.subprocess, "Popen", return_value=child) as popen, \
+                 mock.patch.object(supervisor, "start_bounded_stderr_capture", return_value=capture_thread) as capture, \
+                 mock.patch.object(supervisor, "wait_for_identity", return_value=identity), \
+                 mock.patch.object(supervisor, "direct_child_matches", return_value=True):
+                owner.start_child(
+                    ["phoenix-ide"],
+                    env,
+                    identity.runtime,
+                    "http://127.0.0.1:8031/api/version",
+                    1,
+                )
+
+            popen.assert_called_once_with(
+                ["phoenix-ide"],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            capture.assert_called_once_with(child.stderr, owner.layout.direct_diagnostic)
+            self.assertEqual("candidate failure", owner.layout.direct_diagnostic.read_text())
+
+    def test_timed_out_stderr_reader_remains_owned(self):
+        owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
+        reader = mock.Mock()
+        reader.is_alive.return_value = True
+        owner.diagnostic_thread = reader
+
+        with self.assertRaisesRegex(
+            supervisor.SupervisorError, "stderr reader did not exit"
+        ):
+            owner.finish_diagnostic_capture()
+
+        reader.join.assert_called_once_with(timeout=1)
+        self.assertIs(reader, owner.diagnostic_thread)
+
+    def test_direct_diagnostic_capture_keeps_only_last_64_kib(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "fatal.log"
+            payload = b"prefix" + b"x" * supervisor.MAX_DIRECT_DIAGNOSTIC_BYTES
+
+            supervisor.capture_bounded_stderr(io.BytesIO(payload), path)
+
+            self.assertEqual(b"x" * supervisor.MAX_DIRECT_DIAGNOSTIC_BYTES, path.read_bytes())
 
 
 class BareTransactionTests(unittest.TestCase):

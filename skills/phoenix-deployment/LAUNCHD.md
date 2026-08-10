@@ -9,12 +9,14 @@ Applies when: macOS. This is the only macOS production mode. `./dev.py prod depl
 | Port | 8031 |
 | Binary | `~/.phoenix-ide/phoenix-ide` |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` (stdout + stderr) |
+| Logs | `~/.phoenix-ide/prod.log` (structured) and `prod-fatal.log` (latest fatal diagnostic, maximum 64 KiB) |
 | launchd label | `com.phoenix-ide.server` |
 | plist | `~/Library/LaunchAgents/com.phoenix-ide.server.plist` |
-| Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — daily at 00:00, 14 generations, bzip2, copy-truncate (no size threshold) |
+| Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — daily at 00:00, 14 generations, bzip2, copy-truncate |
 
 The binary is ad-hoc codesigned (`codesign --sign -`) on each deploy so the OS will run it.
+The launcher fixes the three `PHOENIX_LOG_*` destinations above; `.phoenix-ide.env`
+cannot redirect structured output into launchd's discarded stdout stream.
 
 ## Transaction ownership
 

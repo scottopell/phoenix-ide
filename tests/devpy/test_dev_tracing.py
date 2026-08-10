@@ -63,6 +63,16 @@ class DevTracingTests(unittest.TestCase):
         self.dev = load_devpy()
         self.dev._DEV_TRACE_AVAILABLE = None
 
+    def test_dev_child_has_no_second_structured_log_descriptor(self):
+        self.assertEqual(
+            {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            },
+            self.dev._phoenix_child_stdio(),
+        )
+
     def test_trace_endpoint_defaults_locally_and_is_off_in_ci(self):
         self.assertEqual(
             self.dev._DEFAULT_DEV_TRACE_ENDPOINT,
