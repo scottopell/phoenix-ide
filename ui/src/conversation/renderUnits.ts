@@ -100,6 +100,7 @@ export interface HistoricalUnitLocation {
   unitIndex: number;
   unitKey: string;
   memberMessageId: string;
+  toolUseId?: string;
 }
 
 export function findHistoricalUnitLocationByMessageId(
@@ -109,11 +110,18 @@ export function findHistoricalUnitLocationByMessageId(
   for (let unitIndex = 0; unitIndex < historicalUnits.length; unitIndex += 1) {
     const unit = historicalUnits[unitIndex]!;
     for (const member of agentTurnsInHistoricalUnit(unit)) {
-      if (
-        member.agent.message_id === messageId
-        || Array.from(member.toolResultsByUseId.values()).some((result) => result.message_id === messageId)
-      ) {
+      if (member.agent.message_id === messageId) {
         return { unitIndex, unitKey: unit.key, memberMessageId: member.agent.message_id };
+      }
+      for (const [toolUseId, result] of member.toolResultsByUseId) {
+        if (result.message_id === messageId) {
+          return {
+            unitIndex,
+            unitKey: unit.key,
+            memberMessageId: member.agent.message_id,
+            toolUseId,
+          };
+        }
       }
     }
     if ('message' in unit && 'message_id' in unit.message && unit.message.message_id === messageId) {

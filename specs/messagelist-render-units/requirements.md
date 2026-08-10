@@ -145,8 +145,9 @@ manifesting here is still a UI-side recoverable skip, not a render-
 time error)
 
 WHEN lookup targets an agent message or owned tool-result message inside a `tool_only_agent_turn_group`
-THE SYSTEM SHALL resolve both the containing group's historical-unit index and the matched member's agent-message identity
-AND SHALL position and highlight the matched member or compact card rather than the group's first member
+THE SYSTEM SHALL resolve the containing group's historical-unit index and the matched member's agent-message identity
+AND for a tool result SHALL also resolve the owning `tool_use_id`
+AND SHALL position and highlight the exact matched member or tool card rather than the group's first member or first tool card
 AND SHALL retain the member's canonical tool-result ownership rather than copying results into a group-level parallel map
 
 **Rationale:** Keeping tool results in a `Map<string, Message>` built at

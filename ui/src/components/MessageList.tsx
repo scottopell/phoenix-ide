@@ -1063,6 +1063,7 @@ function MessageListImpl({
     conversationId: string | undefined;
     key: string;
     memberMessageId?: string;
+    toolUseId?: string;
   } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
   const pulseTimerRef = useRef(0);
@@ -1086,9 +1087,11 @@ function MessageListImpl({
     ) return;
     pendingPulseRef.current = null;
     clearHighlight();
-    const target = pending.memberMessageId
-      ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
-      : row.querySelector('.message') ?? row;
+    const target = pending.toolUseId
+      ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) ?? row
+      : pending.memberMessageId
+        ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
+        : row.querySelector('.message') ?? row;
     highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
     pulseTimerRef.current = window.setTimeout(() => {
@@ -1115,7 +1118,11 @@ function MessageListImpl({
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
 
-  const scrollToUnitIndex = useCallback((unitIndex: number, memberMessageId?: string) => {
+  const scrollToUnitIndex = useCallback((
+    unitIndex: number,
+    memberMessageId?: string,
+    toolUseId?: string,
+  ) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
     dispatchScrollEvent({ type: 'navigationJumped' });
@@ -1124,9 +1131,12 @@ function MessageListImpl({
       conversationId,
       key: unit.key,
       ...(memberMessageId ? { memberMessageId } : {}),
+      ...(toolUseId ? { toolUseId } : {}),
     };
-    if (memberMessageId) {
-      const targetSelector = `#message-${CSS.escape(memberMessageId)}, [data-message-id="${CSS.escape(memberMessageId)}"]`;
+    if (toolUseId || memberMessageId) {
+      const targetSelector = toolUseId
+        ? `[data-tool-id="${CSS.escape(toolUseId)}"]`
+        : `#message-${CSS.escape(memberMessageId!)}, [data-message-id="${CSS.escape(memberMessageId!)}"]`;
       transcriptRef.current?.scrollToIndex(unitIndex, 'start', 0, targetSelector);
     } else {
       transcriptRef.current?.scrollToIndex(unitIndex, 'start');
@@ -1149,7 +1159,13 @@ function MessageListImpl({
   const scrollToMessageId = useCallback((messageId: string) => {
     const location = findHistoricalUnitLocationByMessageId(historicalUnits, messageId);
     if (!location) return false;
-    scrollToUnitIndex(location.unitIndex, location.memberMessageId);
+    const unit = historicalUnits[location.unitIndex];
+    const grouped = unit?.kind === 'tool_only_agent_turn_group';
+    scrollToUnitIndex(
+      location.unitIndex,
+      grouped ? location.memberMessageId : undefined,
+      grouped ? location.toolUseId : undefined,
+    );
     return true;
   }, [historicalUnits, scrollToUnitIndex]);
 
@@ -1244,12 +1260,34 @@ function MessageListImpl({
               pendingPulseRef.current = {
                 conversationId,
                 key: unit.key,
-                ...(location ? { memberMessageId: location.memberMessageId } : {}),
+                ...(unit.kind === 'tool_only_agent_turn_group' && location
+                  ? { memberMessageId: location.memberMessageId }
+                  : {}),
+                ...(unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId
+                  ? { toolUseId: location.toolUseId }
+                  : {}),
               };
-              if (effect.viewportStartOffset === undefined) {
+              const grouped = unit.kind === 'tool_only_agent_turn_group';
+              const targetSelector = grouped && location?.toolUseId
+                ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
+                : grouped && location
+                  ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
+                  : undefined;
+              if (targetSelector) {
+                transcriptRef.current?.scrollToIndex(
+                  effect.targetIndex,
+                  effect.align,
+                  effect.viewportStartOffset,
+                  targetSelector,
+                );
+              } else if (effect.viewportStartOffset === undefined) {
                 transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
               } else {
-                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+                transcriptRef.current?.scrollToIndex(
+                  effect.targetIndex,
+                  effect.align,
+                  effect.viewportStartOffset,
+                );
               }
               pulseIfMounted(unit.key);
             }

@@ -587,7 +587,9 @@ rule AssemblyComplete {
 -- tool message. Tool messages live inside agent_turn.tool_results_by_use_id.
 -- Tool-only groups are physical render units rather than presentation metadata
 -- attached to several independently measured rows. Member ownership remains
--- canonical, and member/result message-id lookup resolves to the group's index.
+-- canonical. Member lookup resolves the group's index and member identity;
+-- result lookup additionally resolves the owning tool_use_id so navigation can
+-- target the exact compact card.
 invariant ToolOnlyGroupsAreStructural {
     for b in Builders:
         b.phase = "done" implies

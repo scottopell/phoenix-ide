@@ -329,6 +329,26 @@ describe('buildRenderUnits', () => {
       expect(out.historicalUnits.every((unit) => unit.kind === 'tool_only_agent_turn_group')).toBe(true);
     });
 
+    it('preserves distinct tool-result targets owned by one grouped member', () => {
+      const out = buildRenderUnits({
+        messages: [
+          agentMsg('multi-owner', [toolUseBlock('multi-use-a'), toolUseBlock('multi-use-b')]),
+          toolMsg('multi-result-a', 'multi-use-a'),
+          toolMsg('multi-result-b', 'multi-use-b'),
+        ],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'multi-result-a')).toMatchObject({
+        memberMessageId: 'multi-owner', toolUseId: 'multi-use-a',
+      });
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'multi-result-b')).toMatchObject({
+        memberMessageId: 'multi-owner', toolUseId: 'multi-use-b',
+      });
+    });
+
     it('keeps the same unit kind and key when a singleton gains an adjacent tool turn', () => {
       const first = agentMsg('stable-a', [toolUseBlock('stable-use-a')]);
       const singleton = buildHistoricalUnits({ messages: [first], pendingMessages: [] });
@@ -365,6 +385,7 @@ describe('buildRenderUnits', () => {
         memberMessageId: 'a2',
       });
       expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 't2')?.memberMessageId).toBe('a2');
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 't2')?.toolUseId).toBe('use-2');
     });
   });
 

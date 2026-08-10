@@ -722,6 +722,7 @@ function CompactToolStripImpl({
             className={classNames}
             data-sequence-id={item.ownerMessage.sequence_id}
             data-message-id={item.ownerMessage.message_id}
+            data-tool-id={item.toolId}
           >
             <button
               type="button"
