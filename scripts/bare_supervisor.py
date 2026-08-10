@@ -265,6 +265,14 @@ def snapshot_candidate_diagnostic(layout: Layout, failure: str) -> None:
     write_bytes_atomic(layout.candidate_diagnostic, header + retained)
 
 
+def preserve_candidate_diagnostic(layout: Layout, failure: str) -> str:
+    try:
+        snapshot_candidate_diagnostic(layout, failure)
+    except Exception as error:
+        return f"{failure}; candidate diagnostic snapshot failed: {error}"
+    return failure
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -396,9 +404,7 @@ class Supervisor:
 
     def finish_output_capture(self) -> None:
         if self.output_thread is not None:
-            self.output_thread.join(timeout=1)
-            if self.output_thread.is_alive():
-                raise SupervisorError("child output reader did not exit")
+            self.output_thread.join()
             self.output_thread = None
 
     def stop_recorded_orphan(self, timeout: float = 10) -> None:
@@ -655,12 +661,14 @@ class Supervisor:
                 self.layout.active_file.unlink(missing_ok=True)
                 return "committed"
             except Exception as activation_error:
-                snapshot_candidate_diagnostic(self.layout, str(activation_error))
+                failure = preserve_candidate_diagnostic(
+                    self.layout, str(activation_error)
+                )
                 try:
                     return self.restore_previous(
                         manifest,
                         manifest_hash,
-                        str(activation_error),
+                        failure,
                         rollback_binary,
                         rollback_environment,
                     )
@@ -669,7 +677,7 @@ class Supervisor:
                         manifest,
                         manifest_hash,
                         "activation_failed_rollback_failed",
-                        str(activation_error),
+                        failure,
                         str(rollback_error),
                     )
                     return "activation_failed_rollback_failed"
@@ -763,7 +771,7 @@ class Supervisor:
                     return
                 except Exception as activation_error:
                     failure = f"restart reconciliation candidate verification failed: {activation_error}"
-                    snapshot_candidate_diagnostic(self.layout, failure)
+                    failure = preserve_candidate_diagnostic(self.layout, failure)
             elif phase in {"prepared", "activating", "rolling_back"}:
                 failure = status.get("failure") or f"restart reconciliation resumed from {phase}"
             else:

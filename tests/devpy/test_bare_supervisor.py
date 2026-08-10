@@ -92,19 +92,15 @@ class BareSupervisorUnitTests(unittest.TestCase):
             capture.assert_called_once_with(child.stdout, owner.layout.direct_diagnostic)
             self.assertEqual("candidate failure", owner.layout.direct_diagnostic.read_text())
 
-    def test_timed_out_output_reader_remains_owned(self):
+    def test_output_reader_is_joined_without_a_timing_deadline(self):
         owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
         reader = mock.Mock()
-        reader.is_alive.return_value = True
         owner.output_thread = reader
 
-        with self.assertRaisesRegex(
-            supervisor.SupervisorError, "output reader did not exit"
-        ):
-            owner.finish_output_capture()
+        owner.finish_output_capture()
 
-        reader.join.assert_called_once_with(timeout=1)
-        self.assertIs(reader, owner.output_thread)
+        reader.join.assert_called_once_with()
+        self.assertIsNone(owner.output_thread)
 
     def test_direct_diagnostic_capture_keeps_only_last_64_kib(self):
         with tempfile.TemporaryDirectory() as td:
@@ -216,6 +212,37 @@ class BareTransactionTests(unittest.TestCase):
         self.assertFalse(self.layout.active_file.exists())
         self.assertIn("wrong identity", self.layout.candidate_diagnostic.read_text())
 
+    def test_snapshot_failure_does_not_skip_rollback(self):
+        self.layout.binary.parent.mkdir(parents=True)
+        self.layout.binary.write_text("old binary")
+        self.layout.environment.parent.mkdir(parents=True)
+        self.layout.environment.write_text("MODE=old\n")
+        self.layout.deployed_sha.write_text("a" * 40 + "\n")
+        path = self.manifest(previous=True)
+        owner = supervisor.Supervisor(self.layout)
+        owner.stop_child = mock.Mock()
+        owner.start_child = mock.Mock(side_effect=[
+            supervisor.SupervisorError("wrong identity"),
+            supervisor.ChildIdentity(
+                43,
+                101,
+                supervisor.RuntimeIdentity("1.0.0", "a" * 12),
+            ),
+        ])
+
+        with mock.patch.object(
+            supervisor,
+            "snapshot_candidate_diagnostic",
+            side_effect=OSError("filesystem unavailable"),
+        ):
+            state = owner.activate(self.transaction_id, supervisor.sha256(path))
+
+        self.assertEqual("activation_failed_rolled_back", state)
+        self.assertEqual("old binary", self.layout.binary.read_text())
+        status = __import__("json").loads(self.layout.status_file.read_text())
+        self.assertIn("wrong identity", status["failure"])
+        self.assertIn("snapshot failed", status["failure"])
+
     def test_completed_transaction_cannot_be_replayed(self):
         path = self.manifest()
         owner = supervisor.Supervisor(self.layout)
@@ -325,6 +352,47 @@ class BareTransactionTests(unittest.TestCase):
                 self.assertFalse(self.layout.active_file.exists())
                 owner.start_child.assert_called_once()
                 self.transaction.chmod(0o700)
+
+    def test_reconciliation_snapshot_failure_still_rolls_back(self):
+        self.install_previous()
+        path = self.manifest(previous=True)
+        manifest_hash = supervisor.sha256(path)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, candidate_binary, candidate_environment, *_ = (
+            owner.validated_transaction(self.transaction_id, manifest_hash)
+        )
+        self.layout.binary.write_bytes(candidate_binary.read_bytes())
+        self.layout.environment.write_bytes(candidate_environment.read_bytes())
+        supervisor.write_text_atomic(self.layout.active_file, self.transaction_id)
+        owner.transaction_status(
+            manifest,
+            manifest_hash,
+            "activating",
+            phase="candidate_installed",
+        )
+        owner.stop_recorded_orphan = mock.Mock()
+        owner.start_child = mock.Mock(side_effect=[
+            supervisor.SupervisorError("candidate invalid"),
+            supervisor.ChildIdentity(
+                43,
+                101,
+                supervisor.RuntimeIdentity("1.0.0", "a" * 12),
+            ),
+        ])
+
+        with mock.patch.object(
+            supervisor,
+            "snapshot_candidate_diagnostic",
+            side_effect=OSError("filesystem unavailable"),
+        ):
+            owner.reconcile()
+
+        status = __import__("json").loads(self.layout.status_file.read_text())
+        self.assertEqual("activation_failed_rolled_back", status["state"])
+        self.assertIn("candidate invalid", status["failure"])
+        self.assertIn("snapshot failed", status["failure"])
+        self.assertEqual("old binary", self.layout.binary.read_text())
+        self.assertFalse(self.layout.active_file.exists())
 
     def test_reboot_restarts_and_verifies_committed_runtime(self):
         self.install_previous()
