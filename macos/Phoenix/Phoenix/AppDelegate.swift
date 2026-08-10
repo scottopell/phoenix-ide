@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkey = GlobalHotkeyManager()
     let serverManager = ServerManager()
     private var cancellables = Set<AnyCancellable>()
-    private var pendingPrompts: [PendingPrompt] = []
+    private var pendingConversationID: UUID?
     private var hotkeyError: HotkeyError?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -114,7 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 origin: origin,
                 onWebViewReady: { [weak self] value in
                     self?.webView = value
-                    self?.processPendingPrompts()
+                    self?.openPendingConversation()
                 },
                 onDeployment: { [weak self] result in
                     switch result {
@@ -146,85 +146,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let action = PhoenixURLAction(url: url) else { return }
         switch action {
         case .status: showServerStatusWindow()
-        case .new(let prompt, let cwd):
+        case .conversation(let id):
+            pendingConversationID = id
             showWindow()
-            if !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                pendingPrompts.append(PendingPrompt(prompt: prompt, cwd: cwd))
-                processPendingPrompts()
-            }
+            openPendingConversation()
         case .open: showWindow()
         }
     }
 
-    private func processPendingPrompts() {
-        guard let webView, !pendingPrompts.isEmpty else { return }
-        let pending = pendingPrompts.removeFirst()
-        let cwd = NSString(string: pending.cwd ?? NSHomeDirectory()).expandingTildeInPath
-        let discoverModel = """
-        const response = await fetch('/api/models', { credentials: 'same-origin' });
-        if (!response.ok) throw new Error(`model discovery failed: ${response.status}`);
-        const models = await response.json();
-        if (!models.default) throw new Error('Phoenix has no default model configured');
-        return models.default;
-        """
-        webView.callAsyncJavaScript(
-            discoverModel,
-            arguments: [:],
-            in: nil,
-            in: .page,
-            completionHandler: { [weak self, weak webView] (result: Result<Any, Error>) in
-                guard let self, let webView else { return }
-                switch result {
-                case .success(let value):
-                    guard let model = value as? String else {
-                        NSLog("Phoenix URL handoff failed: model discovery returned no model")
-                        self.processPendingPrompts()
-                        return
-                    }
-                    let payload = ConversationCreationPayload(
-                        cwd: cwd,
-                        model: model,
-                        messageID: UUID().uuidString
-                    )
-                    self.createDeepLinkedConversation(pending, payload: payload, webView: webView)
-                case .failure(let error):
-                    NSLog("Phoenix URL handoff failed: \(error.localizedDescription)")
-                    self.processPendingPrompts()
-                }
-            }
-        )
-    }
-
-    private func createDeepLinkedConversation(
-        _ pending: PendingPrompt,
-        payload: ConversationCreationPayload,
-        webView: WKWebView
-    ) {
-        let createConversation = """
-        const response = await fetch('/api/conversations/new', {
-          method: 'POST', credentials: 'same-origin',
-          headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
-        });
-        if (!response.ok) {
-          const detail = await response.text();
-          throw new Error(`conversation create failed: ${response.status} ${detail}`);
-        }
-        const result = await response.json();
-        localStorage.setItem(`seed-draft:${result.conversation.id}`, prompt);
-        window.location.assign(`/c/${result.conversation.slug}`);
-        """
-        webView.callAsyncJavaScript(
-            createConversation,
-            arguments: ["payload": payload.dictionary, "prompt": pending.prompt],
-            in: nil,
-            in: .page,
-            completionHandler: { [weak self] (result: Result<Any, Error>) in
-                if case .failure(let error) = result {
-                    NSLog("Phoenix URL handoff failed: \(error.localizedDescription)")
-                }
-                self?.processPendingPrompts()
-            }
-        )
+    private func openPendingConversation() {
+        guard let webView, let id = pendingConversationID, let origin = serverManager.webOrigin else { return }
+        pendingConversationID = nil
+        webView.load(URLRequest(url: origin.url(path: "/c/\(id.uuidString.lowercased())")))
     }
 }
 
@@ -237,9 +170,4 @@ extension AppDelegate: NSWindowDelegate {
         sender.orderOut(nil)
         return false
     }
-}
-
-private struct PendingPrompt {
-    let prompt: String
-    let cwd: String?
 }

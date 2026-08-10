@@ -278,42 +278,20 @@ enum KeychainError: LocalizedError {
 enum PhoenixURLAction: Equatable {
     case open
     case status
-    case new(prompt: String, cwd: String?)
+    case conversation(id: UUID)
 
     init?(url: URL) {
         guard url.scheme?.lowercased() == "phoenix" else { return nil }
-        let rawAction = url.host?.isEmpty == false
-            ? url.host!
-            : url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        switch rawAction.lowercased() {
+        let action = url.host?.lowercased() ?? ""
+        switch action {
         case "", "open": self = .open
         case "status", "debug": self = .status
-        case "new":
-            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            let prompt = components?.queryItems?.first(where: { $0.name == "prompt" })?.value ?? ""
-            let cwd = components?.queryItems?.first(where: { $0.name == "cwd" })?.value
-            self = .new(prompt: prompt, cwd: cwd)
-        default: self = .open
+        case "conversation":
+            let segment = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !segment.contains("/"), let id = UUID(uuidString: segment) else { return nil }
+            self = .conversation(id: id)
+        default: return nil
         }
-    }
-}
-
-struct ConversationCreationPayload: Equatable {
-    let cwd: String
-    let model: String
-    let messageID: String
-
-    var dictionary: [String: Any] {
-        [
-            "cwd": cwd,
-            "model": model,
-            "text": "",
-            "message_id": messageID,
-            "images": [],
-            "files": [],
-            "mode": "direct",
-            "seed_label": "External prompt",
-        ]
     }
 }
 

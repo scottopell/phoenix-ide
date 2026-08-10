@@ -49,9 +49,9 @@ The packaging phase copies the executable to `Contents/Helpers/phoenix_ide`, che
 
 - `phoenix://open`
 - `phoenix://status`
-- `phoenix://new?prompt=...&cwd=...`
+- `phoenix://conversation/<uuid>`
 
-Conversation creation runs as same-origin JavaScript in WKWebView, so attached deployments reuse the ordinary Phoenix session cookie. `pa://` is intentionally not registered or accepted.
+Conversation links activate Phoenix.app and navigate the existing authenticated WebView to the UUID route. Deep links never create, mutate, or seed conversations. Invalid UUIDs, unsupported actions such as `phoenix://new`, and `pa://` links are rejected.
 
 ## Trust and origin policy
 
@@ -65,7 +65,7 @@ Run a signed Finder-launched build, not only Xcode:
 - Bundled sidecar: private history, verified loopback/non-TLS/non-socket-activated deployment, second-owner refusal, occupied-port failure, intentional restart, graceful quit, and force-stop fallback.
 - Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, and Web Inspector.
 - Failures: offline, wrong service, auth required, TLS trust failure, unknown/unmanaged/ambiguous ownership, no models, sidecar crash, missing sidecar, and hotkey conflict.
-- Deep links: Unicode, quotes, ampersands, long prompt text, and cwd.
+- Deep links: an existing conversation UUID opens in the authenticated app; malformed and unknown UUIDs do not navigate or mutate server state.
 - Security: no key/token/password/custom secret header in preferences, diagnostics, app logs, error text, or process arguments.
 
 The project intentionally retains macOS 15.0 as its deployment target until every used SwiftUI/AppKit/WebKit callback is compatibility-tested on an older target.

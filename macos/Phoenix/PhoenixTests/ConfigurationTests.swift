@@ -60,36 +60,18 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
     }
 
-    func testPhoenixURLActionsDecodeEncodedPromptAndCwd() throws {
-        var components = URLComponents(string: "phoenix://new")!
-        let longPrompt = String(repeating: "🔥 'quoted' & café ", count: 200)
-        components.queryItems = [
-            URLQueryItem(name: "prompt", value: longPrompt),
-            URLQueryItem(name: "cwd", value: "/tmp/A & B/'quoted'"),
-        ]
+    func testPhoenixURLActionsOpenExistingConversationByUUIDOnly() throws {
+        let id = try XCTUnwrap(UUID(uuidString: "66a063b4-6a90-49f5-8edc-9ffa67cffcf6"))
         XCTAssertEqual(
-            PhoenixURLAction(url: try XCTUnwrap(components.url)),
-            .new(prompt: longPrompt, cwd: "/tmp/A & B/'quoted'")
+            PhoenixURLAction(url: URL(string: "phoenix://conversation/\(id.uuidString)")!),
+            .conversation(id: id)
         )
         XCTAssertEqual(PhoenixURLAction(url: URL(string: "phoenix://status")!), .status)
         XCTAssertEqual(PhoenixURLAction(url: URL(string: "phoenix://open")!), .open)
-        XCTAssertNil(PhoenixURLAction(url: URL(string: "pa://new?prompt=legacy")!))
-    }
-
-    func testDeepLinkCreationPayloadMatchesCurrentPhoenixContract() throws {
-        let payload = ConversationCreationPayload(
-            cwd: "/tmp",
-            model: "claude-sonnet-5",
-            messageID: "message-123"
-        ).dictionary
-        XCTAssertEqual(payload["cwd"] as? String, "/tmp")
-        XCTAssertEqual(payload["model"] as? String, "claude-sonnet-5")
-        XCTAssertEqual(payload["message_id"] as? String, "message-123")
-        XCTAssertEqual(payload["text"] as? String, "")
-        XCTAssertEqual(payload["mode"] as? String, "direct")
-        XCTAssertEqual(payload["seed_label"] as? String, "External prompt")
-        XCTAssertNotNil(payload["images"])
-        XCTAssertNotNil(payload["files"])
+        XCTAssertNil(PhoenixURLAction(url: URL(string: "phoenix://conversation/not-a-uuid")!))
+        XCTAssertNil(PhoenixURLAction(url: URL(string: "phoenix://conversation/\(id)/extra")!))
+        XCTAssertNil(PhoenixURLAction(url: URL(string: "phoenix://new?prompt=unsupported")!))
+        XCTAssertNil(PhoenixURLAction(url: URL(string: "pa://conversation/\(id)")!))
     }
 
     func testAttachedAndBundledModesExposeOnlyTheirOwnConfiguration() throws {
