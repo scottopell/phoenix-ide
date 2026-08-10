@@ -452,7 +452,7 @@ class DevTracingTests(unittest.TestCase):
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
             mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
             mock.patch.object(self.dev.time, "time_ns", return_value=1_700_000_000_000_000_000),
-            mock.patch.object(self.dev, "_dir_size_bytes", return_value=4096) as dir_size,
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=4096) as dir_size,
             mock.patch.object(Path, "exists", return_value=True),
             mock.patch("builtins.print"),
         ):
@@ -467,13 +467,14 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(0, attributes["process.exit_code"])
         self.assertEqual(4096, attributes["build.artifact.size_bytes"])
         self.assertTrue(attributes["build.artifact.exists"])
+        self.assertEqual("measured", attributes["build.artifact.provenance"])
         self.assertEqual("build.artifact_size", span.events[0][0])
         self.assertEqual(4096, span.events[0][1]["build.artifact.size_bytes"])
         self.assertEqual(1_700_000_000_000_000_000, span.events[0][2])
         self.assertEqual(1_700_000_000_000_000_000, tracing.finished[0][3])
         dir_size.assert_called_once_with((ROOT / "target" / "release").resolve())
 
-    def test_record_span_artifact_size_returns_zero_when_directory_missing(self):
+    def test_record_span_artifact_size_marks_directory_absent(self):
         tracing = FakeTracing()
         self.dev._DEV_TRACING = tracing
         span = FakeSpan()
@@ -486,8 +487,27 @@ class DevTracingTests(unittest.TestCase):
         )
 
         self.assertFalse(attributes["check.artifact.exists"])
-        self.assertEqual(0, attributes["check.artifact.size_bytes"])
+        self.assertEqual("absent", attributes["check.artifact.provenance"])
+        self.assertNotIn("check.artifact.size_bytes", attributes)
         self.assertEqual("check.artifact_size", span.events[0][0])
+
+    def test_record_span_artifact_size_marks_measurement_failure_unavailable(self):
+        self.dev._DEV_TRACING = FakeTracing()
+        span = FakeSpan()
+        with (
+            mock.patch.object(Path, "exists", return_value=True),
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=None),
+        ):
+            attributes = self.dev._record_span_artifact_size(
+                span,
+                event_name="check.artifact_size",
+                path=ROOT / "target" / "debug",
+                attribute_prefix="check.artifact",
+            )
+
+        self.assertTrue(attributes["check.artifact.exists"])
+        self.assertEqual("unavailable", attributes["check.artifact.provenance"])
+        self.assertNotIn("check.artifact.size_bytes", attributes)
 
     def test_check_step_artifact_dir_uses_cargo_target_dir_when_present(self):
         self.assertEqual(
@@ -504,7 +524,7 @@ class DevTracingTests(unittest.TestCase):
 
     def test_artifact_measurement_is_skipped_without_active_tracing(self):
         self.dev._DEV_TRACING = None
-        with mock.patch.object(self.dev, "_dir_size_bytes") as dir_size:
+        with mock.patch.object(self.dev, "_measure_dir_size_bytes") as dir_size:
             attributes = self.dev._record_span_artifact_size(
                 self.dev._NOOP_SPAN,
                 event_name="build.artifact_size",
@@ -569,7 +589,7 @@ class DevTracingTests(unittest.TestCase):
             timed_out=True,
             lock_wait=2.25,
             returncode=1,
-            cpu_attributes={
+            artifact_attributes={
                 "check.artifact.size_bytes": 8192,
                 "check.artifact.exists": True,
             },
@@ -587,6 +607,26 @@ class DevTracingTests(unittest.TestCase):
         }, tracing.finished[0][1])
         self.assertTrue(tracing.finished[0][2])
         self.assertEqual(123_000_000, tracing.finished[0][3])
+
+    def test_artifact_attributes_preserve_missing_cpu_provenance(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        self.dev._CHECK_PROFILE = mock.Mock()
+        span = FakeSpan()
+
+        self.dev._finish_check_step_span(
+            span,
+            elapsed=1.0,
+            timed_out=False,
+            lock_wait=0.0,
+            returncode=0,
+            cpu_attributes=None,
+            artifact_attributes={"check.artifact.size_bytes": 8192},
+        )
+
+        attributes = tracing.finished[0][1]
+        self.assertEqual("unavailable", attributes["cpu.provenance"])
+        self.assertEqual(8192, attributes["check.artifact.size_bytes"])
 
     def test_span_recording_failure_does_not_mask_command_result(self):
         class BrokenTracing:

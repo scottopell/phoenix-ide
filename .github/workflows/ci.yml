@@ -85,8 +85,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: ./dev.py check (rust,cargo-fmt)
         run: ./dev.py check --lanes rust,cargo-fmt
-      - name: Check x86_64 Linux musl compatibility
-        run: cargo check --target x86_64-unknown-linux-musl
+      - name: Check production feature on musl
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --target x86_64-unknown-linux-musl --features phoenix_ide/datadog-tracing
 
   check-clippy:
     name: check (clippy)

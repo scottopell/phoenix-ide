@@ -69,7 +69,7 @@ ok "UI built"
 info "Building Rust ($TARGET)"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export CC_x86_64_unknown_linux_musl="x86_64-linux-musl-gcc"
-cargo build --release --features phoenix-ide/datadog-tracing --target "$TARGET" --manifest-path "$BUILD_WORKTREE/Cargo.toml"
+cargo build --release --features phoenix_ide/datadog-tracing --target "$TARGET" --manifest-path "$BUILD_WORKTREE/Cargo.toml"
 ok "Rust built"
 
 # ── copy to output ───────────────────────────────────────────────────────────

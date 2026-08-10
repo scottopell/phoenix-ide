@@ -1425,8 +1425,7 @@ def _git_worktree_bases() -> list[Path]:
     return [main_root / ".claude" / "worktrees", main_root / ".phoenix" / "worktrees"]
 
 
-def _dir_size_bytes(path: Path) -> int:
-    """Best-effort recursive size of a directory in bytes (0 on failure)."""
+def _measure_dir_size_bytes(path: Path) -> int | None:
     try:
         out = subprocess.run(
             ["du", "-sk", str(path)], capture_output=True, text=True, timeout=60
@@ -1435,7 +1434,12 @@ def _dir_size_bytes(path: Path) -> int:
             return int(out.stdout.split()[0]) * 1024
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
-    return 0
+    return None
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Best-effort recursive size of a directory in bytes (0 on failure)."""
+    return _measure_dir_size_bytes(path) or 0
 
 
 def _record_span_artifact_size(
@@ -1451,12 +1455,15 @@ def _record_span_artifact_size(
         return {}
     resolved = path.resolve()
     exists = resolved.exists()
-    size_bytes = _dir_size_bytes(resolved) if exists else 0
+    size_bytes = _measure_dir_size_bytes(resolved) if exists else None
+    provenance = "measured" if size_bytes is not None else ("unavailable" if exists else "absent")
     attributes = {
         f"{attribute_prefix}.path": _display_path(resolved),
         f"{attribute_prefix}.exists": exists,
-        f"{attribute_prefix}.size_bytes": size_bytes,
+        f"{attribute_prefix}.provenance": provenance,
     }
+    if size_bytes is not None:
+        attributes[f"{attribute_prefix}.size_bytes"] = size_bytes
     if hasattr(span, "add_event"):
         try:
             span.add_event(event_name, attributes, timestamp=event_time)
@@ -4802,6 +4809,7 @@ def _finish_check_step_span(
     lock_wait: float,
     returncode: int,
     cpu_attributes: dict | None = None,
+    artifact_attributes: dict | None = None,
     end_time: int | None = None,
 ) -> None:
     attributes = {
@@ -4814,6 +4822,8 @@ def _finish_check_step_span(
         attributes.update(cpu_attributes)
     elif _CHECK_PROFILE is not None:
         attributes.update({"cpu.provenance": "unavailable"})
+    if artifact_attributes:
+        attributes.update(artifact_attributes)
     _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
 
 
@@ -5080,7 +5090,8 @@ def cmd_check(
             timed_out=timed_out,
             lock_wait=lock_wait,
             returncode=rc,
-            cpu_attributes=(cpu_attributes or {}) | artifact_attributes,
+            cpu_attributes=cpu_attributes,
+            artifact_attributes=artifact_attributes,
             end_time=finished_wall_ns,
         )
         if profile_work and _CHECK_PROFILE is not None:
@@ -7229,7 +7240,7 @@ def check_systemd_available() -> bool:
 
 
 def _production_cargo_feature_args() -> list[str]:
-    return ["--features", "phoenix-ide/datadog-tracing"]
+    return ["--features", "phoenix_ide/datadog-tracing"]
 
 
 def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:

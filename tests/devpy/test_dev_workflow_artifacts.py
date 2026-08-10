@@ -92,6 +92,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
                 '[package]\nname = "clippy-cache-regression"\nversion = "0.1.0"\n'
                 'edition = "2021"\n\n[lints.clippy]\npedantic = "deny"\n'
             )
+            (crate / "rust-toolchain.toml").write_text((ROOT / "rust-toolchain.toml").read_text())
             source = crate / "src" / "lib.rs"
             source.write_text("#[must_use]\npub fn value() -> &'static str { \"ok\" }\n")
             env = os.environ | self.dev._verification_cargo_env()
@@ -121,11 +122,35 @@ class DevWorkflowArtifactTests(unittest.TestCase):
     def test_standard_rust_lane_no_longer_describes_local_musl(self):
         self.assertNotIn("musl", self.dev._LANE_DESCS["rust"].lower())
 
+    def test_required_ci_compiles_production_feature_for_musl(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn("sudo apt-get install -y musl-tools", workflow)
+        self.assertIn(
+            "cargo check --target x86_64-unknown-linux-musl "
+            "--features phoenix_ide/datadog-tracing",
+            workflow,
+        )
+
     def test_production_cargo_features_include_datadog(self):
         self.assertEqual(
-            ["--features", "phoenix-ide/datadog-tracing"],
+            ["--features", "phoenix_ide/datadog-tracing"],
             self.dev._production_cargo_feature_args(),
         )
+        metadata = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                *self.dev._production_cargo_feature_args(),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, metadata.returncode, metadata.stderr)
 
 
 if __name__ == "__main__":
