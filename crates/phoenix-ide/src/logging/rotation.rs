@@ -2,6 +2,7 @@ use chrono::{DateTime, Local, NaiveDate};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const RETAINED_ARCHIVES: usize = 14;
+const ROTATION_RETRY_WRITES: u16 = 1024;
 
 enum ArchiveCommand {
     Maintain {
@@ -41,6 +43,9 @@ pub(super) struct DailyRotatingFile {
     active_permissions: fs::Permissions,
     file: Option<File>,
     archive_commands: mpsc::Sender<ArchiveCommand>,
+    _rotation_lock: File,
+    rotation_disabled: bool,
+    rotation_retry_writes: u16,
 }
 
 impl DailyRotatingFile {
@@ -57,14 +62,24 @@ impl DailyRotatingFile {
         path: &Path,
         active_date: NaiveDate,
     ) -> io::Result<(Self, ArchiveWorkerGuard)> {
+        reject_non_regular_active_path(path)?;
+        validate_rotation_directory(path)?;
+        let rotation_lock = open_rotation_lock(path)?;
         let file = open_append(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(non_regular_active_path(path));
+        }
         let active_permissions = file.metadata()?.permissions();
         let active_path = path.to_path_buf();
         let worker_path = active_path.clone();
+        let worker_lock = rotation_lock.try_clone()?;
         let (commands, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("phoenix-log-archive".to_string())
-            .spawn(move || archive_worker(&worker_path, &receiver))?;
+            .spawn(move || {
+                let _lock = worker_lock;
+                archive_worker(&worker_path, &receiver);
+            })?;
         let guard = ArchiveWorkerGuard {
             commands: commands.clone(),
         };
@@ -74,6 +89,9 @@ impl DailyRotatingFile {
             active_permissions,
             file: Some(file),
             archive_commands: commands,
+            _rotation_lock: rotation_lock,
+            rotation_disabled: false,
+            rotation_retry_writes: 0,
         };
         Ok((writer, guard))
     }
@@ -87,30 +105,41 @@ impl DailyRotatingFile {
         new_date: NaiveDate,
         move_active: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        if let Some(file) = self.file.as_mut() {
-            file.flush()?;
-        }
-        drop(self.file.take());
-
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("active structured log is not open"))?
+            .flush()?;
         let archive_path = next_archive_path(&self.active_path, self.active_date)?;
+        let current = self
+            .file
+            .take()
+            .expect("active structured log checked above");
         if let Err(error) = move_active(&self.active_path, &archive_path) {
-            self.file =
-                open_append_with_permissions(&self.active_path, &self.active_permissions).ok();
+            self.file = Some(current);
             return Err(error);
         }
 
-        match open_append_with_permissions(&self.active_path, &self.active_permissions) {
+        match open_new_with_permissions(&self.active_path, &self.active_permissions) {
             Ok(file) => {
                 self.file = Some(file);
                 self.active_date = new_date;
                 self.request_maintenance(None);
                 Ok(())
             }
-            Err(error) => {
-                let _ = fs::rename(&archive_path, &self.active_path);
-                self.file =
-                    open_append_with_permissions(&self.active_path, &self.active_permissions).ok();
-                Err(error)
+            Err(create_error) => {
+                let restore_error = fs::rename(&archive_path, &self.active_path).err();
+                self.rotation_disabled = restore_error.is_some();
+                self.file = Some(current);
+                if let Some(restore_error) = restore_error {
+                    Err(io::Error::new(
+                        create_error.kind(),
+                        format!(
+                            "replacement log creation failed: {create_error}; archive restore failed: {restore_error}; rotation disabled"
+                        ),
+                    ))
+                } else {
+                    Err(create_error)
+                }
             }
         }
     }
@@ -126,12 +155,17 @@ impl DailyRotatingFile {
     }
 
     fn write_on_date(&mut self, buffer: &[u8], date: NaiveDate) -> io::Result<usize> {
-        if date != self.active_date {
-            if let Err(error) = self.rotate(date) {
-                super::record_fatal_diagnostic(&format!(
-                    "log rotation failed for {}: {error}",
-                    self.active_path.display()
-                ));
+        if !self.rotation_disabled && date != self.active_date {
+            if self.rotation_retry_writes == 0 {
+                if let Err(error) = self.rotate(date) {
+                    self.rotation_retry_writes = ROTATION_RETRY_WRITES;
+                    super::record_fatal_diagnostic(&format!(
+                        "log rotation failed for {}: {error}",
+                        self.active_path.display()
+                    ));
+                }
+            } else {
+                self.rotation_retry_writes -= 1;
             }
         }
         if self.file.is_none() {
@@ -170,6 +204,89 @@ fn open_append(path: &Path) -> io::Result<File> {
     super::open_log_append(path, None)
 }
 
+fn validate_rotation_directory(path: &Path) -> io::Result<()> {
+    let parent = parent_directory(path);
+    let metadata = fs::metadata(parent)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "log rotation parent is not a directory: {}",
+                parent.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: `geteuid` has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o002 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "log rotation directory must be process-owned and not world-writable: {}",
+                    parent.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_non_regular_active_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(non_regular_active_path(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn non_regular_active_path(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "rotating log path must be a regular file: {}",
+            path.display()
+        ),
+    )
+}
+
+fn open_rotation_lock(active_path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let (lock, lock_target) = {
+        let directory = parent_directory(active_path);
+        (File::open(directory)?, directory.to_path_buf())
+    };
+    #[cfg(not(unix))]
+    let (lock, lock_target) = {
+        let path = reserved_sibling_lock_path(active_path);
+        (super::open_log_append(&path, Some(0o600))?, path)
+    };
+    #[cfg(not(unix))]
+    if !lock.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "log rotation lock must be a regular file: {}",
+                lock_target.display()
+            ),
+        ));
+    }
+    FileExt::try_lock_exclusive(&lock).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "another process owns log rotation in {}: {error}",
+                lock_target.display()
+            ),
+        )
+    })?;
+    Ok(lock)
+}
+
 fn open_append_with_permissions(path: &Path, permissions: &fs::Permissions) -> io::Result<File> {
     #[cfg(unix)]
     let create_mode = {
@@ -179,6 +296,21 @@ fn open_append_with_permissions(path: &Path, permissions: &fs::Permissions) -> i
     #[cfg(not(unix))]
     let create_mode = None;
     let file = super::open_log_append(path, create_mode)?;
+    file.set_permissions(permissions.clone())?;
+    Ok(file)
+}
+
+fn open_new_with_permissions(path: &Path, permissions: &fs::Permissions) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options
+            .mode(permissions.mode())
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
     file.set_permissions(permissions.clone())?;
     Ok(file)
 }
@@ -200,15 +332,20 @@ fn archive_worker(active_path: &Path, commands: &mpsc::Receiver<ArchiveCommand>)
 }
 
 fn maintain_archives(active_path: &Path) -> io::Result<()> {
+    maintain_archives_with(active_path, compress_archive)
+}
+
+fn maintain_archives_with(
+    active_path: &Path,
+    mut compress: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let mut first_error = None;
     if let Err(error) = remove_stale_archive_temporaries(active_path) {
         first_error.get_or_insert(error);
     }
-    let mut failed_compression = std::collections::HashSet::new();
     for archive in find_archives(active_path)? {
         if !archive_is_compressed(&archive) {
-            if let Err(error) = compress_archive(active_path, &archive) {
-                failed_compression.insert(archive);
+            if let Err(error) = compress(active_path, &archive) {
                 first_error.get_or_insert(error);
             }
         }
@@ -221,9 +358,6 @@ fn maintain_archives(active_path: &Path) -> io::Result<()> {
         if remove_count == 0 {
             break;
         }
-        if failed_compression.contains(&archive) {
-            continue;
-        }
         match fs::remove_file(archive) {
             Ok(()) => remove_count -= 1,
             Err(error) => {
@@ -235,7 +369,7 @@ fn maintain_archives(active_path: &Path) -> io::Result<()> {
 }
 
 fn remove_stale_archive_temporaries(active_path: &Path) -> io::Result<()> {
-    let parent = active_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(active_path);
     let prefix = archive_temp_prefix(active_path);
     let mut first_error = None;
     for entry in fs::read_dir(parent)? {
@@ -246,7 +380,11 @@ fn remove_stale_archive_temporaries(active_path: &Path) -> io::Result<()> {
                 continue;
             }
         };
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(prefix.as_bytes())
+        {
             continue;
         }
         match entry.file_type() {
@@ -265,33 +403,35 @@ fn remove_stale_archive_temporaries(active_path: &Path) -> io::Result<()> {
 }
 
 fn find_archives(active_path: &Path) -> io::Result<Vec<PathBuf>> {
-    let Some(active_name) = active_path.file_name() else {
-        return Ok(Vec::new());
-    };
-    let prefix = format!("{}.", active_name.to_string_lossy());
-    let parent = active_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(active_path);
     let mut archives = Vec::new();
     for entry in fs::read_dir(parent)? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().map(|name| name.to_string_lossy()) else {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
             continue;
-        };
-        if name.strip_prefix(&prefix).is_some_and(valid_archive_suffix) {
+        }
+        let path = entry.path();
+        if archive_suffix(active_path, &path).is_some_and(valid_archive_suffix) {
             archives.push(path);
         }
     }
     Ok(archives)
 }
 
-fn valid_archive_suffix(suffix: &str) -> bool {
-    let raw = suffix.strip_suffix(".gz").unwrap_or(suffix);
-    let bytes = raw.as_bytes();
-    bytes.len() == 31
-        && bytes[..20].iter().all(u8::is_ascii_digit)
-        && bytes[20] == b'-'
-        && bytes[25] == b'-'
-        && bytes[28] == b'-'
-        && bytes[21..]
+fn archive_suffix<'a>(active_path: &Path, archive_path: &'a Path) -> Option<&'a [u8]> {
+    let active_name = active_path.file_name()?.as_encoded_bytes();
+    let archive_name = archive_path.file_name()?.as_encoded_bytes();
+    archive_name.strip_prefix(active_name)?.strip_prefix(b".")
+}
+
+fn valid_archive_suffix(suffix: &[u8]) -> bool {
+    let raw = suffix.strip_suffix(b".gz").unwrap_or(suffix);
+    raw.len() == 31
+        && raw[..20].iter().all(u8::is_ascii_digit)
+        && raw[20] == b'-'
+        && raw[25] == b'-'
+        && raw[28] == b'-'
+        && raw[21..]
             .iter()
             .copied()
             .enumerate()
@@ -299,17 +439,12 @@ fn valid_archive_suffix(suffix: &str) -> bool {
 }
 
 fn archive_generation(active_path: &Path, archive_path: &Path) -> Option<u64> {
-    let active_name = active_path.file_name()?.to_string_lossy();
-    let archive_name = archive_path.file_name()?.to_string_lossy();
-    let suffix = archive_name.strip_prefix(&format!("{active_name}."))?;
-    let raw = suffix.strip_suffix(".gz").unwrap_or(suffix);
+    let suffix = archive_suffix(active_path, archive_path)?;
+    let raw = suffix.strip_suffix(b".gz").unwrap_or(suffix);
     if !valid_archive_suffix(suffix) {
         return None;
     }
-    std::str::from_utf8(raw.as_bytes().get(..20)?)
-        .ok()?
-        .parse()
-        .ok()
+    std::str::from_utf8(raw.get(..20)?).ok()?.parse().ok()
 }
 
 fn next_archive_path(active_path: &Path, date: NaiveDate) -> io::Result<PathBuf> {
@@ -335,7 +470,7 @@ fn next_archive_path(active_path: &Path, date: NaiveDate) -> io::Result<PathBuf>
 
 fn archive_is_compressed(path: &Path) -> bool {
     path.file_name()
-        .is_some_and(|name| name.to_string_lossy().ends_with(".gz"))
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".gz"))
 }
 
 fn compress_archive(active_path: &Path, source: &Path) -> io::Result<()> {
@@ -349,7 +484,7 @@ fn compress_archive(active_path: &Path, source: &Path) -> io::Result<()> {
             format!("gzip target differs from source: {}", target.display()),
         ));
     }
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(&target);
     let mut input = open_read_nofollow(source)?;
     let source_permissions = input.metadata()?.permissions();
     let mut temporary = tempfile::Builder::new()
@@ -392,9 +527,16 @@ fn open_read_nofollow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log archive must be a regular file: {}", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 fn archive_temp_prefix(active_path: &Path) -> String {
@@ -416,6 +558,32 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+pub(super) fn reserved_sibling_lock_path(active_path: &Path) -> PathBuf {
+    path_with_suffix(active_path, ".rotation.lock")
+}
+
+pub(super) fn path_is_reserved(active_path: &Path, candidate: &Path) -> io::Result<bool> {
+    if super::paths_alias(&reserved_sibling_lock_path(active_path), candidate)? {
+        return Ok(true);
+    }
+    if !super::paths_alias(parent_directory(active_path), parent_directory(candidate))? {
+        return Ok(false);
+    }
+    if archive_suffix(active_path, candidate).is_some_and(valid_archive_suffix) {
+        return Ok(true);
+    }
+    Ok(candidate.file_name().is_some_and(|name| {
+        name.as_encoded_bytes()
+            .starts_with(archive_temp_prefix(active_path).as_bytes())
+    }))
 }
 
 #[cfg(test)]
@@ -482,6 +650,103 @@ mod tests {
     }
 
     #[test]
+    fn second_rotator_for_the_same_active_log_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("prod.log");
+        let (_writer, _guard) =
+            DailyRotatingFile::open_with_date(&active, date(2026, 8, 9)).unwrap();
+
+        let Err(error) = DailyRotatingFile::open_with_date(&active, date(2026, 8, 9)) else {
+            panic!("second rotator unexpectedly acquired the same log");
+        };
+
+        assert!(error
+            .to_string()
+            .contains("another process owns log rotation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_active_log_is_rejected() {
+        let Err(error) = DailyRotatingFile::open(Path::new("/dev/null")) else {
+            panic!("special file unexpectedly accepted for rotation");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_rotation_directory_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let active = temp.path().join("prod.log");
+
+        let Err(error) = DailyRotatingFile::open(&active) else {
+            panic!("shared directory unexpectedly accepted for rotation");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("not world-writable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_owned_rotation_directory_is_allowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let active = temp.path().join("phoenix.log");
+
+        let (_writer, _guard) = DailyRotatingFile::open(&active).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_sibling_file_cannot_enable_a_second_rotator() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let active = temp.path().join("phoenix.log");
+        let (_writer, _guard) = DailyRotatingFile::open(&active).unwrap();
+        let replaceable_sibling = path_with_suffix(&active, ".rotation.lock");
+        if let Err(error) = fs::remove_file(&replaceable_sibling) {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+        fs::write(replaceable_sibling, "replacement").unwrap();
+
+        let Err(error) = DailyRotatingFile::open(&active) else {
+            panic!("second rotator unexpectedly bypassed directory ownership");
+        };
+
+        assert!(error
+            .to_string()
+            .contains("another process owns log rotation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_ownership_is_scoped_to_the_log_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.log");
+        let second = temp.path().join("second.log");
+        let (_writer, _guard) = DailyRotatingFile::open(&first).unwrap();
+
+        let Err(error) = DailyRotatingFile::open(&second) else {
+            panic!("second rotator unexpectedly acquired the same log directory");
+        };
+
+        assert!(error
+            .to_string()
+            .contains("another process owns log rotation"));
+    }
+
+    #[test]
     fn initial_maintenance_removes_abandoned_archive_temporaries() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("prod.log");
@@ -524,25 +789,26 @@ mod tests {
     }
 
     #[test]
-    fn pruning_continues_when_compression_fails() {
+    fn pruning_enforces_retention_when_every_compression_fails() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("prod.log");
-        let failed_source = archive_path(&active, 1, date(2026, 8, 1), false);
-        fs::create_dir(&failed_source).unwrap();
-        for day in 2..=16 {
+        for day in 1..=16 {
             fs::write(
-                archive_path(&active, day.into(), date(2026, 8, day), true),
+                archive_path(&active, day.into(), date(2026, 8, day), false),
                 "archive\n",
             )
             .unwrap();
         }
 
-        assert!(maintain_archives(&active).is_err());
+        assert!(maintain_archives_with(&active, |_, _| Err(io::Error::other(
+            "injected compression failure"
+        )))
+        .is_err());
 
-        assert!(failed_source.exists());
         assert_eq!(find_archives(&active).unwrap().len(), RETAINED_ARCHIVES);
-        assert!(!archive_path(&active, 2, date(2026, 8, 2), true).exists());
-        assert!(!archive_path(&active, 3, date(2026, 8, 3), true).exists());
+        assert!(!archive_path(&active, 1, date(2026, 8, 1), false).exists());
+        assert!(!archive_path(&active, 2, date(2026, 8, 2), false).exists());
+        assert!(archive_path(&active, 3, date(2026, 8, 3), false).exists());
     }
 
     #[cfg(unix)]
@@ -638,16 +904,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replacement_log_is_created_with_preserved_mode() {
+    fn replacement_log_is_created_exclusively_with_preserved_mode() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("prod.log");
         let permissions = fs::Permissions::from_mode(0o600);
 
-        let file = open_append_with_permissions(&active, &permissions).unwrap();
+        let file = open_new_with_permissions(&active, &permissions).unwrap();
 
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            open_new_with_permissions(&active, &permissions)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 
     #[test]
@@ -671,12 +943,106 @@ mod tests {
     }
 
     #[test]
+    fn rotation_retry_backoff_is_bounded_by_written_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("prod.log");
+        let (mut writer, _guard) =
+            DailyRotatingFile::open_with_date(&active, date(2026, 8, 9)).unwrap();
+        writer.rotation_retry_writes = 2;
+
+        writer.write_on_date(b"one\n", date(2026, 8, 10)).unwrap();
+        writer.write_on_date(b"two\n", date(2026, 8, 10)).unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(writer.rotation_retry_writes, 0);
+        assert_eq!(fs::read_to_string(active).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn fatal_paths_are_rejected_from_every_rotation_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("prod.log");
+        let archive = archive_path(&active, 1, date(2026, 8, 9), false);
+        let temporary = temp
+            .path()
+            .join(format!("{}partial", archive_temp_prefix(&active)));
+
+        assert!(path_is_reserved(&active, &reserved_sibling_lock_path(&active)).unwrap());
+        assert!(path_is_reserved(&active, &archive).unwrap());
+        assert!(path_is_reserved(&active, &temporary).unwrap());
+        assert!(!path_is_reserved(&active, &temp.path().join("fatal.log")).unwrap());
+    }
+
+    #[test]
+    fn replacement_collision_restores_the_active_log_and_keeps_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("prod.log");
+        let (mut writer, _guard) =
+            DailyRotatingFile::open_with_date(&active, date(2026, 8, 9)).unwrap();
+        writer.write_all(b"old\n").unwrap();
+
+        let error = writer
+            .rotate_with_archive_move(date(2026, 8, 10), |source, target| {
+                fs::rename(source, target)?;
+                fs::write(source, "collision\n")
+            })
+            .unwrap_err();
+        writer.write_all(b"new\n").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(active).unwrap(), "old\nnew\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_with_archive_name_is_ignored_and_rejected_if_opened() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("prod.log");
+        let fifo = archive_path(&active, 1, date(2026, 8, 9), false);
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        assert!(find_archives(&active).unwrap().is_empty());
+        assert_eq!(
+            open_read_nofollow(&fifo).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_matching_preserves_non_utf8_filename_identity() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let active = PathBuf::from(OsString::from_vec(b"prod-\xff.log".to_vec()));
+        let owned = archive_path(&active, 1, date(2026, 8, 9), true);
+        let unrelated = PathBuf::from(OsString::from_vec(
+            b"prod-\xfe.log.00000000000000000002-2026-08-09.gz".to_vec(),
+        ));
+
+        assert!(archive_suffix(&active, &owned).is_some_and(valid_archive_suffix));
+        assert!(archive_suffix(&active, &unrelated).is_none());
+    }
+
+    #[test]
     fn archive_names_do_not_match_unrelated_files() {
-        assert!(valid_archive_suffix("00000000000000000001-2026-08-09"));
-        assert!(valid_archive_suffix("00000000000000000002-2026-08-09.gz"));
-        assert!(!valid_archive_suffix("0.bz2"));
-        assert!(!valid_archive_suffix("00000000000000000001-2026-08-09.tmp"));
-        assert!(!valid_archive_suffix("2026-08-09"));
-        assert!(!valid_archive_suffix("not-a-date.gz"));
+        assert!(valid_archive_suffix(b"00000000000000000001-2026-08-09"));
+        assert!(valid_archive_suffix(b"00000000000000000002-2026-08-09.gz"));
+        assert!(!valid_archive_suffix(b"0.bz2"));
+        assert!(!valid_archive_suffix(
+            b"00000000000000000001-2026-08-09.tmp"
+        ));
+        assert!(!valid_archive_suffix(b"2026-08-09"));
+        assert!(!valid_archive_suffix(b"not-a-date.gz"));
+    }
+
+    #[test]
+    fn bare_relative_log_uses_the_current_directory() {
+        assert_eq!(parent_directory(Path::new("prod.log")), Path::new("."));
     }
 }

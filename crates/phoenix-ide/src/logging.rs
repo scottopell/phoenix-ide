@@ -56,16 +56,9 @@ pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized
         return;
     };
     if let Some(structured) = config.file.as_deref() {
-        match paths_alias(structured, path) {
-            Ok(true) => {
-                eprintln!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE");
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("failed to resolve fatal diagnostic path: {error}");
-                return;
-            }
+        if let Err(error) = validate_fatal_log_path(structured, path) {
+            eprintln!("failed to resolve fatal diagnostic path: {error}");
+            return;
         }
     }
     if let Err(error) = write_fatal_diagnostic(path, &message.to_string()) {
@@ -92,6 +85,22 @@ fn paths_alias(left: &std::path::Path, right: &std::path::Path) -> std::io::Resu
         }
     }
     Ok(path_identity(left)? == path_identity(right)?)
+}
+
+fn validate_fatal_log_path(structured: &Path, fatal: &Path) -> std::io::Result<()> {
+    if paths_alias(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
+        ));
+    }
+    if rotation::path_is_reserved(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must not use a Phoenix log rotation path"),
+        ));
+    }
+    Ok(())
 }
 
 fn path_identity(path: &std::path::Path) -> std::io::Result<PathBuf> {
@@ -181,7 +190,14 @@ pub(super) fn open_log_append(path: &Path, create_mode: Option<u32>) -> std::io:
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
     }
     reject_symlink(path)?;
     let mut options = OpenOptions::new();
@@ -267,12 +283,7 @@ impl LogConfig {
 
     pub fn prepare(self) -> std::io::Result<PreparedLogConfig> {
         if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
-            if paths_alias(file, fatal)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
-                ));
-            }
+            validate_fatal_log_path(file, fatal)?;
         }
         if let Some(file) = self.file.as_deref() {
             prepare_log_identity(file, false).map_err(|error| {
@@ -297,12 +308,7 @@ impl LogConfig {
             })?;
         }
         if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
-            if paths_alias(file, fatal)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
-                ));
-            }
+            validate_fatal_log_path(file, fatal)?;
         }
         Ok(PreparedLogConfig {
             stdout: self.stdout,
@@ -1046,6 +1052,65 @@ mod tests {
         std::fs::hard_link(&original, &alias).unwrap();
 
         assert!(paths_alias(&original, &alias).unwrap());
+    }
+
+    #[test]
+    fn fatal_log_cannot_alias_the_rotation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(rotation::reserved_sibling_lock_path(&structured)),
+            file: Some(structured),
+        };
+
+        let error = config.prepare().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("rotation path"));
+    }
+
+    #[test]
+    fn fatal_log_cannot_use_the_archive_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let mut fatal = structured.as_os_str().to_os_string();
+        fatal.push(".00000000000000000001-2026-08-09");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(PathBuf::from(fatal)),
+            file: Some(structured),
+        };
+
+        assert!(config
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("rotation path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_log_directories_are_created_private_for_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("missing/nested/prod.log");
+        LogConfig {
+            stdout: false,
+            fatal_file: None,
+            file: Some(structured.clone()),
+        }
+        .prepare()
+        .unwrap();
+
+        let mode = std::fs::metadata(structured.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let (_writer, _guard) = rotation::DailyRotatingFile::open(&structured).unwrap();
     }
 
     #[test]
