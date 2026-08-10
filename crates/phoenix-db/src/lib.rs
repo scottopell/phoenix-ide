@@ -2,6 +2,7 @@
 //!
 //! Provides persistence for conversations and messages.
 
+mod close_foundation;
 mod coordinator_query;
 mod ddl;
 mod migrations;
@@ -22,6 +23,7 @@ use phoenix_core::work_scope::{
     WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
+pub use close_foundation::*;
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
 };
@@ -134,6 +136,12 @@ pub enum DbError {
     SlugExists(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Close foundation conflict: {0}")]
+    CloseFoundationConflict(String),
+    #[error("Close foundation precondition failed: {0}")]
+    CloseFoundationPrecondition(String),
+    #[error("Close foundation record not found: {0}")]
+    CloseFoundationNotFound(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
