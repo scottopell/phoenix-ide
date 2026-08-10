@@ -254,6 +254,11 @@ describe('VirtualTranscript', () => {
     act(() => ref.current?.scrollToIndex(0, 'start', 0, '[data-member="second"]'));
 
     expect(scrollTopOf(scroller)).toBe(60);
+    expect(ref.current?.physicalSnapshot(0, '[data-member="second"]')).toMatchObject({
+      targetIndex: 0,
+      targetOffset: 0,
+      targetMeasured: true,
+    });
   });
 
   it('compensates scrollTop when a measured row above the top-edge anchor resizes', () => {

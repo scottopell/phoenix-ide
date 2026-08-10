@@ -930,6 +930,7 @@ describe('inline tool timers', () => {
     ]} /></MemoryRouter>);
 
     expect(screen.getAllByText('retried 1x')).toHaveLength(1);
+    expect(screen.getByLabelText('Response retry audit')).toContainElement(screen.getByText('retried 1x'));
     expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
   });
 
@@ -976,7 +977,8 @@ describe('inline tool timers', () => {
     ]} /></MemoryRouter>);
 
     expect(screen.getByText('retried 2x')).toBeInTheDocument();
-    expect(screen.getByText('retried 2x').closest('.compact-tool-card')).toHaveTextContent('search');
+    expect(screen.getByText('retried 2x').closest('.compact-tool-group-audit')).not.toBeNull();
+    expect(screen.getByText('retried 2x').closest('.compact-tool-card')).toBeNull();
   });
 
   it('preserves the vertical detailed rendering for a tool-only group in full density', () => {

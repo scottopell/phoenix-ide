@@ -54,7 +54,7 @@ export interface VirtualTranscriptHandle {
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
-  physicalSnapshot(targetIndex?: number): VirtualTranscriptPhysicalSnapshot;
+  physicalSnapshot(targetIndex?: number, targetSelector?: string): VirtualTranscriptPhysicalSnapshot;
 }
 
 export interface VirtualTranscriptProps<T> {
@@ -132,7 +132,11 @@ function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null
   });
 }
 
-function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
+function buildPhysicalSnapshot<T>(
+  store: PhysicalStore<T>,
+  targetIndex?: number,
+  targetSelector?: string,
+): VirtualTranscriptPhysicalSnapshot {
   const visibleRange = computeVisibleRange(store);
   const baseSnapshot = {
     renderedRange: normalizeRange(store.range),
@@ -141,20 +145,35 @@ function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number)
     layoutRevision: store.revision,
   } satisfies Omit<VirtualTranscriptPhysicalSnapshot, 'targetIndex' | 'targetOffset' | 'targetMeasured'>;
   if (targetIndex === undefined) return baseSnapshot;
-  const offset = itemPhysicalOffset(store, targetIndex);
+  const key = store.keys[targetIndex] ?? '';
+  const row = store.rowElements.get(key);
+  const targetElement = targetSelector ? row?.querySelector(targetSelector) : null;
+  const rowOffset = itemPhysicalOffset(store, targetIndex);
+  const intraRowOffset = targetElement && row
+    ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
+    : targetSelector
+      ? undefined
+      : 0;
+  const offset = rowOffset === undefined || intraRowOffset === undefined
+    ? undefined
+    : rowOffset + intraRowOffset;
   return {
     ...baseSnapshot,
     targetIndex,
     targetOffset: offset === undefined ? null : offset - store.viewportTop,
-    targetMeasured: store.measuredExtents.has(store.keys[targetIndex] ?? ''),
+    targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
 
-function synchronizedPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
+function synchronizedPhysicalSnapshot<T>(
+  store: PhysicalStore<T>,
+  targetIndex?: number,
+  targetSelector?: string,
+): VirtualTranscriptPhysicalSnapshot {
   store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
   store.viewportExtent = store.scroller?.clientHeight ?? store.viewportExtent;
   recompute(store);
-  return buildPhysicalSnapshot(store, targetIndex);
+  return buildPhysicalSnapshot(store, targetIndex, targetSelector);
 }
 
 function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number): number | null {
@@ -676,10 +695,10 @@ function VirtualTranscriptInner<T>(
     layoutRevision() {
       return storeRef.current?.revision ?? 0;
     },
-    physicalSnapshot(targetIndex) {
+    physicalSnapshot(targetIndex, targetSelector) {
       const current = storeRef.current;
       return current
-        ? synchronizedPhysicalSnapshot(current, targetIndex)
+        ? synchronizedPhysicalSnapshot(current, targetIndex, targetSelector)
         : {
             renderedRange: null,
             visibleRange: null,

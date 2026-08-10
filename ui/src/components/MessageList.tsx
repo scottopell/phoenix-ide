@@ -1295,7 +1295,23 @@ function MessageListImpl({
             continuityRestoreInFlightRef.current = true;
             transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
           }
-          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(effect.targetIndex)
+          const physicalTargetSelector = effect.command.kind === 'jump_to_message'
+            ? (() => {
+                const location = findHistoricalUnitLocationByMessageId(
+                  historicalUnits,
+                  effect.command.targetMessageId,
+                );
+                const unit = historicalUnits[effect.targetIndex];
+                if (unit?.kind !== 'tool_only_agent_turn_group' || !location) return undefined;
+                return location.toolUseId
+                  ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
+                  : `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`;
+              })()
+            : undefined;
+          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(
+            effect.targetIndex,
+            physicalTargetSelector,
+          )
             ?? lastPhysicalSnapshotRef.current
             ?? { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 0, targetIndex: effect.targetIndex, targetOffset: null };
           lastPhysicalSnapshotRef.current = physicalSnapshot;

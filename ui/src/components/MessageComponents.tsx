@@ -732,7 +732,6 @@ function CompactToolStripImpl({
             >
               <span className="compact-tool-card-header">
                 <span className="compact-tool-card-name">{item.name}</span>
-                {isFirstCardForOwner && <AgentRetryBadge message={item.ownerMessage} />}
                 <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
               </span>
               {isCompactBash ? (
@@ -838,6 +837,11 @@ function getToolOnlyMessageCopy(message: Message): string {
     : []).join('\n\n');
 }
 
+function hasAgentRetries(message: Message): boolean {
+  const displayData = message.display_data as Record<string, unknown> | undefined;
+  return typeof displayData?.['retry_count'] === 'number' && displayData['retry_count'] > 0;
+}
+
 function AgentRetryBadge({ message }: { message: Message }) {
   const displayData = message.display_data as Record<string, unknown> | undefined;
   const retryCount = typeof displayData?.['retry_count'] === 'number' ? displayData['retry_count'] : 0;
@@ -917,6 +921,13 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
         )}
         <div className="message-content">
           <CompactToolStrip items={items} onExpand={expand} />
+          {members.some((member) => hasAgentRetries(member.agent)) && (
+            <div className="compact-tool-group-audit" aria-label="Response retry audit">
+              {members.filter((member) => hasAgentRetries(member.agent)).map((member) => (
+                <AgentRetryBadge key={member.key} message={member.agent} />
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );

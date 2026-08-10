@@ -398,6 +398,20 @@ body.app-viewport-active #root {
   margin: 0;
 }
 
+.compact-tool-group-audit {
+  position: sticky;
+  bottom: 4px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  width: fit-content;
+  margin: 2px 0 0 auto;
+  padding: 3px 6px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+}
+
 .compact-tool-card:hover {
   background: var(--border-color);
 }
