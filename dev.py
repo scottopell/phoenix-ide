@@ -4832,7 +4832,8 @@ def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path 
         target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
         return target_dir / "debug"
     if lane == "rust" and name == "cargo test":
-        return ROOT / "target" / "debug"
+        target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
+        return target_dir / "debug"
     return None
 
 

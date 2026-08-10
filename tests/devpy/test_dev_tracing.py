@@ -520,6 +520,12 @@ class DevTracingTests(unittest.TestCase):
             ROOT / "target" / "debug",
             self.dev._check_step_artifact_dir("rust", "cargo test", {}),
         )
+        self.assertEqual(
+            Path("/tmp/rust-target/debug"),
+            self.dev._check_step_artifact_dir(
+                "rust", "cargo test", {"CARGO_TARGET_DIR": "/tmp/rust-target"}
+            ),
+        )
         self.assertIsNone(self.dev._check_step_artifact_dir("ui", "eslint", {}))
 
     def test_artifact_measurement_is_skipped_without_active_tracing(self):
