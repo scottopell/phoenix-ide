@@ -321,7 +321,28 @@ const MIGRATIONS: &[Migration] = &[
         name: "project_conversation_work_scope_attachments",
         sql: MIGRATION_061,
     },
+    Migration {
+        version: 62,
+        name: "create_steering_acceptance_receipts",
+        sql: MIGRATION_062,
+    },
 ];
+
+const MIGRATION_062: &str = r"
+CREATE TABLE IF NOT EXISTS steering_acceptance_receipts (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    request_fingerprint TEXT,
+    PRIMARY KEY (conversation_id, message_id),
+    CHECK (request_fingerprint IS NULL OR request_fingerprint <> '')
+);
+
+INSERT OR IGNORE INTO steering_acceptance_receipts (
+    conversation_id, message_id, request_fingerprint
+)
+SELECT conversation_id, message_id, NULL
+FROM steering_messages;
+";
 
 const MIGRATION_061: &str = r"
 CREATE VIEW IF NOT EXISTS conversation_work_scope_attachments AS
@@ -3331,6 +3352,37 @@ mod tests {
                 .unwrap();
         assert_eq!(bash_owner, "scope-a");
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_062_backfills_pending_steering_identities_as_legacy_unknown() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+             CREATE TABLE steering_messages (
+                 message_id TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE
+             );
+             INSERT INTO conversations (id) VALUES ('legacy-conversation');
+             INSERT INTO steering_messages (message_id, conversation_id)
+             VALUES ('legacy-message', 'legacy-conversation');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 62).await;
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT request_fingerprint
+             FROM steering_acceptance_receipts
+             WHERE conversation_id = 'legacy-conversation'
+               AND message_id = 'legacy-message'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fingerprint, None);
     }
 
     #[tokio::test]

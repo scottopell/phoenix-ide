@@ -51,7 +51,7 @@ use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tracing::Instrument;
 
@@ -128,6 +128,22 @@ pub enum EvictionReason {
     /// Async creation finished provisioning cwd/mode/model metadata; recreate
     /// any shell runtime so it uses the provisioned conversation row.
     CreationProvisioned,
+    /// A one-shot steering wake found no durable work and its idle runtime can retire.
+    SteeringReconciliation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteeringWakeOutcome {
+    Applied,
+    NothingToDrain,
+    Conflict,
+    DispatchFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcknowledgedEventOutcome {
+    Settled,
+    SteeringWake(SteeringWakeOutcome),
 }
 
 #[derive(Debug)]
@@ -144,10 +160,51 @@ pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SteeringAcceptanceReceipt {
-    pub conversation_id: String,
-    pub request_fingerprint: String,
+#[derive(Default)]
+struct ConversationMutexGates {
+    gates: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+impl ConversationMutexGates {
+    async fn gate_for(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
+        const CLEANUP_THRESHOLD: usize = 1_024;
+        let mut gates = self.gates.lock().await;
+        if gates.len() >= CLEANUP_THRESHOLD {
+            gates.retain(|_, gate| gate.strong_count() > 0);
+        }
+        if let Some(gate) = gates.get(conversation_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        gates.insert(conversation_id.to_string(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn lock(&self, conversation_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate_for(conversation_id).await.lock_owned().await
+    }
+}
+
+#[cfg(test)]
+mod conversation_mutex_gate_tests {
+    use super::ConversationMutexGates;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn gates_are_shared_within_one_conversation_and_independent_across_conversations() {
+        let gates = ConversationMutexGates::default();
+        let first_a = gates.gate_for("conversation-a").await;
+        let second_a = gates.gate_for("conversation-a").await;
+        let conversation_b = gates.gate_for("conversation-b").await;
+
+        assert!(Arc::ptr_eq(&first_a, &second_a));
+        assert!(!Arc::ptr_eq(&first_a, &conversation_b));
+
+        let _first_guard = first_a.lock_owned().await;
+        assert!(second_a.try_lock_owned().is_err());
+
+        assert!(conversation_b.try_lock_owned().is_ok());
+    }
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
@@ -191,8 +248,15 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
-    /// Serializes legacy steering admission until the normalized queue row is visible.
-    steering_acceptance_receipts: AsyncMutex<HashMap<(String, String), SteeringAcceptanceReceipt>>,
+    #[cfg(test)]
+    steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    /// Serializes message admission per conversation while leaving unrelated
+    /// conversations independent.
+    message_acceptance: ConversationMutexGates,
+    /// Serializes the final durable queue snapshot and executor publication
+    /// with queue mutations. The database remains authoritative; this gate
+    /// only prevents a newly-started executor from observing an older snapshot.
+    steering_projection: ConversationMutexGates,
     /// Broadcasters from evicted runtimes, waiting to be inherited by a
     /// replacement runtime created by the next `get_or_create` call.
     ///
@@ -285,19 +349,19 @@ enum BashLifecycleBridgeAction {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub acknowledged_event_tx:
-        mpsc::Sender<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
     pub turn_trigger: TurnTriggerSlot,
-    /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id` counter
-    /// that every emitted [`SseEvent`] must consume (task 02675). Callers never
-    /// hand-craft a `sequence_id` — they either go through [`SseBroadcaster::send_seq`]
-    /// (which allocates the next id from the counter) or [`SseBroadcaster::send_message`]
-    /// (which passes through the DB-allocated message id and advances the counter past
-    /// it). This makes the "every SSE event carries a monotonic `sequence_id`" contract
-    /// structurally enforceable rather than a matter of caller discipline.
+    /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id`
+    /// counter. Replayable events allocate through [`SseBroadcaster::send_seq`]
+    /// or pass a DB-allocated message id through [`SseBroadcaster::send_message`];
+    /// durable live-only projections carry the current counter as an ordering
+    /// witness. Callers never hand-craft these values.
     pub broadcast_tx: SseBroadcaster,
     /// Opaque per-instance identity used by cleanup tasks to guard against
     /// removing a _replacement_ entry that was created after eviction. Each
@@ -551,7 +615,7 @@ enum RingOp {
     /// `send_seq` and for eager (non-persisted) Message broadcasts.
     Append,
     /// Broadcast without consuming reconnect replay capacity. Used for
-    /// replaceable, non-authoritative progress snapshots.
+    /// replaceable progress and durable-state-subsumed live projections.
     BroadcastOnly,
 }
 
@@ -598,8 +662,8 @@ impl Drop for ReservedBroadcastRange {
 ///    closure so the caller cannot forget to insert it. These append to
 ///    the `ReplayRing` so a reconnect mid-turn can replay them.
 ///
-/// Live bash progress is the exception: it is replaceable UI state broadcast
-/// with the current sequence witness and is intentionally not replayed.
+/// Live bash progress and durable-state-subsumed projections are exceptions:
+/// they broadcast with the current sequence witness and are not replayed.
 ///
 /// 2. **Persisted `Message` events** already carry a `message.sequence_id`
 ///    allocated by `add_message` in the DB layer. Use
@@ -618,6 +682,9 @@ impl Drop for ReservedBroadcastRange {
 #[derive(Clone)]
 pub struct SseBroadcaster {
     tx: broadcast::Sender<SseEvent>,
+    /// Identity of this in-memory cursor/replay incarnation. Changes whenever
+    /// a new broadcaster is created after replay state was lost.
+    stream_incarnation: Arc<str>,
     /// Highest `sequence_id` emitted so far for this conversation.
     /// `next_seq()` returns `fetch_add(1)` + 1 atomically; `observe_seq(s)`
     /// bumps this value up to at least `s` so message-originated ids integrate
@@ -648,6 +715,7 @@ impl SseBroadcaster {
         ring.anchor_seq = initial_last_seq;
         Self {
             tx,
+            stream_incarnation: Arc::from(uuid::Uuid::new_v4().to_string()),
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
@@ -662,7 +730,6 @@ impl SseBroadcaster {
         Self::from_sender(tx, initial_last_seq)
     }
 
-    #[cfg(test)]
     fn same_channel(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
     }
@@ -693,6 +760,10 @@ impl SseBroadcaster {
     #[allow(dead_code)]
     pub fn current_seq(&self) -> i64 {
         self.last_seq.load(Ordering::Acquire)
+    }
+
+    pub fn stream_incarnation(&self) -> &str {
+        &self.stream_incarnation
     }
 
     /// Subscribe to the SSE broadcast stream.
@@ -816,12 +887,28 @@ impl SseBroadcaster {
         self.send_with_ring(event, seq, RingOp::Append)
     }
 
+    /// Broadcast a durable-state-subsumed live projection at the current
+    /// sequence witness. It neither allocates a cursor position nor retains
+    /// its potentially large payload in the reconnect ring; authoritative init
+    /// reconstructs the represented state after a missed event.
+    pub fn send_live_projection(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        self.send_broadcast_only(build)
+    }
+
     /// Broadcast a replaceable live-progress event without consuming the
     /// reconnect ring reserved for lifecycle-critical ephemeral events.
     pub fn send_live_progress(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let witnessed_seq = self.current_seq();
+        self.send_broadcast_only(build)
+    }
+
+    /// Stamp and send a live-only event while holding the same gate used by
+    /// sequenced allocation. A later sequenced event therefore cannot allocate
+    /// and reach the channel before this event carrying the earlier witness.
+    fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        let witnessed_seq = self.last_seq.load(Ordering::Acquire);
         let event = build(witnessed_seq);
-        self.send_with_ring(event, witnessed_seq, RingOp::BroadcastOnly)
+        self.send_with_ring_raw(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -1058,11 +1145,10 @@ impl InitTranscript {
 
 /// Events sent to SSE clients.
 ///
-/// Every variant carries a `sequence_id` drawn from the conversation's single
-/// monotonic counter (task 02675). The client's `applyIfNewer` guard relies on
-/// this total order to dedup reconnect replays. Allocation is the
-/// responsibility of [`SseBroadcaster`] — do not hand-craft `sequence_id`
-/// values at call sites.
+/// Replayable variants carry a `sequence_id` drawn from the conversation's
+/// monotonic counter. Live-only projections carry the current counter as an
+/// ordering witness without allocating a replay cursor. Stamping is the
+/// responsibility of [`SseBroadcaster`] — do not hand-craft values at call sites.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum SseEvent {
@@ -1072,6 +1158,8 @@ pub enum SseEvent {
         sequence_id: i64,
         conversation: Box<EnrichedConversation>,
         transcript: InitTranscript,
+        /// Durable server-authoritative steering queue at snapshot time.
+        steering_messages: Vec<crate::state_machine::event::SteerEntry>,
         agent_working: bool,
         /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
         presentation_mode: String,
@@ -1079,6 +1167,9 @@ pub enum SseEvent {
         /// client seeds `atom.lastSequenceId` with so subsequent
         /// `applyIfNewer` checks start at the right floor.
         last_sequence_id: i64,
+        /// Identity of the in-memory replay/cursor incarnation. A changed id
+        /// tells reconnecting clients to reset ephemeral sequence state.
+        stream_incarnation: String,
         /// Current context window usage in tokens
         context_window_size: u64,
         /// Human-readable project name derived from the repo root directory name.
@@ -1242,9 +1333,8 @@ pub enum SseEvent {
         active: bool,
     },
     /// Ephemeral bounded/rate-limited live output snapshot for one in-flight
-    /// bash tool call. Replayed from the conversation ring on reconnect, keyed
-    /// by `tool_use_id` so client tool widgets can attach without parsing tool
-    /// result messages.
+    /// bash tool call. Live-only and keyed by `tool_use_id` so client tool
+    /// widgets can attach without parsing tool result messages.
     BashToolProgress {
         sequence_id: i64,
         tool_use_id: String,
@@ -1252,12 +1342,19 @@ pub enum SseEvent {
     },
     /// A steering message was accepted and queued for delivery when the
     /// conversation next reaches `Idle`. The UI uses this to show the message
-    /// with a "Queued" indicator instead of "Sending...".
+    /// with a "Queued" indicator instead of "Sending...". Live-only; init
+    /// reconstructs the authoritative durable queue.
     SteerMessageQueued {
         sequence_id: i64,
-        message_id: String,
+        message: crate::state_machine::event::SteerEntry,
         /// Zero-based position in the steering queue.
         queue_position: usize,
+    },
+    /// A queued steering message was cancelled before delivery. Live-only;
+    /// init reconstructs the authoritative durable queue.
+    SteerMessageCancelled {
+        sequence_id: i64,
+        message_id: String,
     },
     /// Codex-bridge quota snapshot. Emitted once per turn on success (parsed
     /// from `x-codex-*` response headers in `openai.rs::complete_streaming`)
@@ -1429,7 +1526,10 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
-            steering_acceptance_receipts: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
+            message_acceptance: ConversationMutexGates::default(),
+            steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
@@ -3205,14 +3305,6 @@ impl RuntimeManager {
                 None
             };
 
-        // Seed the executor's in-memory steering queue from the normalized
-        // steering_messages tables.
-        let steering_queue = self
-            .db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| e.to_string())?;
-
         let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
             &storage,
             conversation_id,
@@ -3286,7 +3378,6 @@ impl RuntimeManager {
             .with_wake_registrar(self.wake_registrar())
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
-            .with_steering_queue(steering_queue)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
             .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
@@ -3348,6 +3439,21 @@ impl RuntimeManager {
             tracing::info!(conv_id = %conversation_id, "Will auto-continue interrupted conversation");
         }
 
+        // Fence the final durable queue snapshot through live-handle
+        // publication and executor spawn. Queue mutations use the same gate,
+        // so either they commit first and this reload observes them, or the
+        // live executor is published first and receives their channel event.
+        let steering_projection_gate = self.steering_projection.gate_for(conversation_id).await;
+        let steering_projection_guard = steering_projection_gate.clone().lock_owned().await;
+        let steering_queue = self
+            .db
+            .get_steering_queue(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let runtime = runtime
+            .with_steering_queue(steering_queue)
+            .with_steering_projection_gate(steering_projection_gate);
+
         // Start runtime in background
         let conv_id = conversation_id.to_string();
         let manager_for_cleanup = Arc::clone(self);
@@ -3366,19 +3472,15 @@ impl RuntimeManager {
             identity: identity.clone(),
             state_rx: state_rx.clone(),
         };
-
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
         // losing, not-yet-spawned executor.
         {
             let mut runtimes = self.runtimes.write().await;
+            let mut reservations = self.evicted_broadcasters.write().await;
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
-                drop(runtimes);
-                self.evicted_broadcasters
-                    .write()
-                    .await
-                    .remove(conversation_id);
+                reservations.remove(conversation_id);
                 return Ok(existing);
             }
             runtimes.insert(
@@ -3392,16 +3494,10 @@ impl RuntimeManager {
                     state_rx,
                 },
             );
+            // The live handle and reservation hand-off change atomically under
+            // the same lock order used by `conversation_broadcaster`.
+            reservations.remove(conversation_id);
         }
-
-        // The live handle is now reachable, so remove the manager-owned
-        // reservation. Stream arrivals during materialization could find the
-        // reservation; arrivals after this point find the same broadcaster on
-        // the runtime handle.
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id);
 
         tokio::spawn(async move {
             runtime.run().await;
@@ -3423,6 +3519,8 @@ impl RuntimeManager {
                 );
             }
         });
+
+        drop(steering_projection_guard);
 
         Ok(handle)
     }
@@ -3455,6 +3553,31 @@ impl RuntimeManager {
         );
     }
 
+    /// Inject a fake live handle and return its event receiver so a handler
+    /// test can assert executor notifications directly.
+    #[cfg(test)]
+    pub(crate) async fn inject_handle_with_event_capture_for_test(
+        &self,
+        conv_id: &str,
+        live_state: ConvState,
+    ) -> mpsc::Receiver<Event> {
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(live_state);
+        self.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        event_rx
+    }
+
     /// Evict an active runtime so it gets recreated with fresh config on next access.
     /// Used after model upgrades to pick up the new model and context window.
     ///
@@ -3466,7 +3589,12 @@ impl RuntimeManager {
     pub async fn evict_runtime(&self, conversation_id: &str, reason: EvictionReason) {
         let old = {
             let mut runtimes = self.runtimes.write().await;
-            runtimes.remove(conversation_id)
+            let mut reservations = self.evicted_broadcasters.write().await;
+            let old = runtimes.remove(conversation_id);
+            if let Some(handle) = &old {
+                reservations.insert(conversation_id.to_string(), handle.broadcast_tx.clone());
+            }
+            old
         };
 
         // Record the cause unconditionally (even if no runtime was live): the
@@ -3479,18 +3607,11 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
-            EvictionReason::CreationProvisioned => {}
+            EvictionReason::CreationProvisioned | EvictionReason::SteeringReconciliation => {}
         }
 
         if let Some(handle) = old {
             let receivers = handle.broadcast_tx.receiver_count();
-            // Preserve broadcaster for the incoming runtime. The new runtime
-            // inherits it in get_or_create so SSE clients stay connected.
-            self.evicted_broadcasters
-                .write()
-                .await
-                .insert(conversation_id.to_string(), handle.broadcast_tx);
-
             // Signal old runtime to exit cleanly. It drops its broadcaster
             // clone on exit, completing the reference hand-off.
             let _ = handle.event_tx.send(Event::Shutdown).await;
@@ -3502,10 +3623,18 @@ impl RuntimeManager {
         }
     }
 
-    pub(crate) async fn lock_steering_acceptance(
+    pub(crate) async fn lock_message_acceptance(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), SteeringAcceptanceReceipt>> {
-        self.steering_acceptance_receipts.lock().await
+        conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.message_acceptance.lock(conversation_id).await
+    }
+
+    pub(crate) async fn lock_steering_projection(
+        &self,
+        conversation_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.steering_projection.lock(conversation_id).await
     }
 
     pub async fn send_event(
@@ -3513,13 +3642,54 @@ impl RuntimeManager {
         conversation_id: &str,
         event: Event,
     ) -> Result<(), String> {
+        self.send_acknowledged_event(conversation_id, event)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send_acknowledged_event(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<AcknowledgedEventOutcome, String> {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         handle
-            .event_tx
-            .send(event)
+            .acknowledged_event_tx
+            .send((event, ack_tx))
             .await
-            .map_err(|e| format!("Failed to send event: {e}"))
+            .map_err(|error| error.to_string())?;
+        ack_rx
+            .await
+            .map_err(|_| "runtime stopped before event settled".to_string())?
+    }
+
+    pub(crate) async fn wake_deferred_steering(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<SteeringWakeOutcome, String> {
+        let _acceptance_guard = self.lock_message_acceptance(conversation_id).await;
+        if !self
+            .db
+            .has_steering_entries(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(SteeringWakeOutcome::NothingToDrain);
+        }
+
+        let AcknowledgedEventOutcome::SteeringWake(outcome) = self
+            .send_acknowledged_event(conversation_id, Event::SteeringQueueChanged)
+            .await?
+        else {
+            return Err("steering wake received a non-steering acknowledgement".to_string());
+        };
+        if outcome == SteeringWakeOutcome::NothingToDrain {
+            self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+                .await;
+        }
+        Ok(outcome)
     }
 
     pub async fn send_event_and_wait_for_state(
@@ -3539,6 +3709,7 @@ impl RuntimeManager {
         ack_rx
             .await
             .map_err(|_| "runtime stopped before event settled".to_string())?
+            .map(|_| ())
     }
 
     pub async fn admit_continuation_retry(
@@ -3570,6 +3741,7 @@ impl RuntimeManager {
         ack_rx
             .await
             .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?
+            .map(|_| ())
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -3580,6 +3752,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
         event: Event,
+        request_fingerprint: &str,
     ) -> Result<(), String> {
         let Event::SteerMessage {
             ref text,
@@ -3594,7 +3767,7 @@ impl RuntimeManager {
             return Err("enqueue_steer_message expects Event::SteerMessage".into());
         };
 
-        // Build SteerEntry and persist before touching the executor channel (P1).
+        // Build SteerEntry and persist before touching the executor channel.
         let new_entry = crate::state_machine::event::SteerEntry {
             text: text.clone(),
             llm_text: llm_text.clone(),
@@ -3604,30 +3777,153 @@ impl RuntimeManager {
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),
         };
-        let db = self.db();
-        let mut queue = db
-            .get_steering_queue(conversation_id)
-            .await
-            .map_err(|e| format!("Failed to load steering queue for enqueue: {e}"))?;
-        queue.push(new_entry);
-        db.update_steering_queue(conversation_id, &queue)
-            .await
-            .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+        let queue_position = loop {
+            // Materialize before persistence so a newly-created executor loads
+            // the old queue rather than the entry delivered below.
+            let handle = self.get_or_create(conversation_id).await?;
+            #[cfg(test)]
+            if let Some(barrier) = self
+                .steering_enqueue_handle_barriers
+                .lock()
+                .await
+                .remove(conversation_id)
+            {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            let projection_guard = self.lock_steering_projection(conversation_id).await;
+            let runtimes = self.runtimes.read().await;
+            let handle_is_current = runtimes
+                .get(conversation_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.identity, &handle.identity));
+            if !handle_is_current {
+                drop(runtimes);
+                drop(projection_guard);
+                continue;
+            }
+
+            let queue_position = self
+                .db()
+                .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
+                .await
+                .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+            let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
+                SseEvent::SteerMessageQueued {
+                    sequence_id,
+                    message: new_entry,
+                    queue_position,
+                }
+            });
+            drop(projection_guard);
+
+            // Keep the current-runtime read guard through channel admission so
+            // eviction cannot retire this handle between commit and delivery.
+            deposit_turn_trigger(&handle);
+            let send_result = handle
+                .event_tx
+                .send(event.clone())
+                .await
+                .map_err(|e| format!("Failed to send steer message: {e}"));
+            drop(runtimes);
+            if let Err(error) = send_result {
+                let stale_broadcaster = handle.broadcast_tx.clone();
+                tracing::warn!(
+                    conversation_id,
+                    message_id,
+                    %error,
+                    "Steering executor delivery failed after commit; reconstructing from database"
+                );
+                self.evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+                    .await;
+                if let Err(reconstruction_error) = self.get_or_create(conversation_id).await {
+                    tracing::warn!(
+                        conversation_id,
+                        message_id,
+                        %reconstruction_error,
+                        "Steering runtime reconstruction failed after durable admission; scheduling one bounded retry"
+                    );
+                    self.schedule_steering_reconstruction_retry(
+                        conversation_id.to_string(),
+                        stale_broadcaster,
+                    );
+                }
+            }
+            break queue_position;
+        };
         tracing::info!(
             conversation_id,
             message_id,
-            queue_depth = queue.len(),
+            queue_depth = queue_position + 1,
             "Persisted steering message before executor delivery"
         );
 
-        // DB is durable; now update the executor's in-memory queue via channel.
-        let handle = self.get_or_create(conversation_id).await?;
-        deposit_turn_trigger(&handle);
-        handle
-            .event_tx
-            .send(event)
-            .await
-            .map_err(|e| format!("Failed to send steer message: {e}"))
+        Ok(())
+    }
+
+    fn schedule_steering_reconstruction_retry(
+        self: &Arc<Self>,
+        conversation_id: String,
+        stale_broadcaster: SseBroadcaster,
+    ) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Err(error) = manager.get_or_create(&conversation_id).await {
+                let released = manager
+                    .release_failed_steering_reconstruction_broadcaster(
+                        &conversation_id,
+                        &stale_broadcaster,
+                    )
+                    .await;
+                tracing::warn!(
+                    conversation_id,
+                    %error,
+                    released_stale_broadcaster = released,
+                    "Bounded steering runtime reconstruction retry failed"
+                );
+            }
+        });
+    }
+
+    async fn release_failed_steering_reconstruction_broadcaster(
+        &self,
+        conversation_id: &str,
+        expected: &SseBroadcaster,
+    ) -> bool {
+        loop {
+            let mut in_flight_result = {
+                let creations = self.runtime_creations.lock().await;
+                if let Some(result_tx) = creations.get(conversation_id) {
+                    Some(result_tx.subscribe())
+                } else {
+                    let runtimes = self.runtimes.read().await;
+                    if runtimes.contains_key(conversation_id) {
+                        return false;
+                    }
+                    let mut reservations = self.evicted_broadcasters.write().await;
+                    let is_expected = reservations
+                        .get(conversation_id)
+                        .is_some_and(|current| current.same_channel(expected));
+                    if is_expected {
+                        reservations.remove(conversation_id);
+                    }
+                    return is_expected;
+                }
+            }
+            .expect("in-flight result exists when runtime construction is active");
+
+            let construction_succeeded = loop {
+                if let Some(result) = in_flight_result.borrow().clone() {
+                    break result.is_ok();
+                }
+                if in_flight_result.changed().await.is_err() {
+                    break false;
+                }
+            };
+            if construction_succeeded {
+                return false;
+            }
+        }
     }
 
     /// Subscribe to conversation updates.
@@ -3697,24 +3993,22 @@ impl RuntimeManager {
         if let Some(handle) = self.try_get_handle(conversation_id).await {
             return handle.broadcast_tx;
         }
-        if let Some(broadcaster) = self
-            .evicted_broadcasters
-            .read()
-            .await
-            .get(conversation_id)
-            .cloned()
-        {
-            return broadcaster;
-        }
         let initial_last_seq = self
             .db
             .get_last_sequence_id(conversation_id)
             .await
             .unwrap_or(0);
         let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
-        self.evicted_broadcasters
-            .write()
-            .await
+        // Keep the live-handle check and reservation insertion atomic with
+        // runtime publication. Otherwise a caller can reserve a new orphan
+        // channel in the narrow gap between handle publication and reservation
+        // cleanup, stranding a cross-client event on the wrong broadcaster.
+        let runtimes = self.runtimes.read().await;
+        if let Some(handle) = runtimes.get(conversation_id) {
+            return handle.broadcast_tx.clone();
+        }
+        let mut reservations = self.evicted_broadcasters.write().await;
+        reservations
             .entry(conversation_id.to_string())
             .or_insert(candidate)
             .clone()
@@ -3773,20 +4067,8 @@ impl RuntimeManager {
 
         if matches!(conv.state, ConvState::LlmRequesting { .. })
             && self
-                .db
-                .get_conversation_creation_job_for_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_some_and(|job| {
-                    matches!(
-                        job.protocol.status,
-                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
-                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
-                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
-                                ..
-                            }
-                    )
-                })
+                .has_persisted_llm_request_owner(conversation_id)
+                .await?
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -3879,6 +4161,51 @@ impl RuntimeManager {
             resume_state_updated_at,
             decision.needs_auto_continue,
         ))
+    }
+
+    async fn has_persisted_llm_request_owner(&self, conversation_id: &str) -> Result<bool, String> {
+        let active_creation_job =
+            self.db
+                .get_conversation_creation_job_for_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some_and(|job| {
+                    matches!(
+                    job.protocol.status,
+                    phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                        | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                        | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                            ..
+                        }
+                )
+                });
+        if active_creation_job {
+            return Ok(true);
+        }
+
+        if self
+            .db
+            .has_committed_steering_turn(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
+
+        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|e| e.to_string())
+            .map(|turn| {
+                turn.is_some_and(|turn| {
+                    matches!(
+                        turn.materialization,
+                        phoenix_workflow::Materialization::Materialized { .. }
+                    )
+                })
+            })
     }
 
     /// Get the database handle
@@ -4318,6 +4645,40 @@ mod broadcaster_tests {
             b.current_seq(),
             1,
             "replaceable progress must not create replay gaps"
+        );
+    }
+
+    #[test]
+    fn durable_live_projection_broadcasts_without_sequence_or_replay_entry() {
+        let b = SseBroadcaster::new(16, 7);
+        let mut rx = b.subscribe();
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "queued".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "steer-1".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+
+        let _ = b.send_live_projection(|sequence_id| SseEvent::SteerMessageQueued {
+            sequence_id,
+            message: entry,
+            queue_position: 0,
+        });
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SseEvent::SteerMessageQueued { sequence_id: 7, .. })
+        ));
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
+        assert_eq!((anchor, truncated, highest), (7, false, 7));
+        assert!(events.is_empty());
+        assert_eq!(
+            b.current_seq(),
+            7,
+            "live projection must not create a replay gap"
         );
     }
 
@@ -4774,6 +5135,596 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    struct RecordingLlm {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for FailingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            Err(phoenix_llm::LlmError::invalid_request(
+                "unrelated direct dispatch failed",
+            ))
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl phoenix_llm::LlmService for RecordingLlm {
+        async fn complete(
+            &self,
+            _request: &phoenix_llm::LlmRequest,
+        ) -> Result<phoenix_llm::LlmResponse, phoenix_llm::LlmError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(phoenix_llm::LlmResponse {
+                content: Vec::new(),
+                end_turn: true,
+                usage: phoenix_llm::Usage::default(),
+                stream_telemetry: phoenix_llm::ProviderStreamTelemetry::non_streaming(),
+            })
+        }
+
+        fn model_id(&self) -> &'static str {
+            "claude-sonnet-5"
+        }
+    }
+
+    async fn test_manager_with_recording_llm(llm: Arc<RecordingLlm>) -> RuntimeManager {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(llm)),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        )
+    }
+
+    async fn test_manager_with_failing_llm() -> RuntimeManager {
+        let db = crate::db::Database::open_in_memory().await.expect("db");
+        RuntimeManager::new(
+            db,
+            Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(FailingLlm))),
+            PlatformCapability::None {
+                details: "test".into(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        )
+    }
+
+    async fn insert_acknowledged_idle_handle(
+        manager: &RuntimeManager,
+        conversation_id: &str,
+    ) -> mpsc::Receiver<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )> {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        acknowledged_event_rx
+    }
+
+    #[tokio::test]
+    async fn send_event_requires_runtime_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "send-event-settlement";
+        let mut acknowledged_event_rx =
+            insert_acknowledged_idle_handle(&manager, conversation_id).await;
+
+        let sender = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .send_event(conversation_id, Event::DismissError)
+                    .await
+            })
+        };
+        let (_event, acknowledgement) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acknowledged_event_rx.recv(),
+        )
+        .await
+        .expect("runtime event delivery must not hang")
+        .expect("event must reach the runtime settlement channel");
+        assert!(!sender.is_finished(), "channel admission is not success");
+        drop(acknowledgement);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), sender)
+                .await
+                .expect("runtime settlement rejection must not hang")
+                .unwrap(),
+            Err("runtime stopped before event settled".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_wake_retires_runtime_when_guarded_reload_finds_no_work() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-wake-empty-reload";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "removed during startup".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "removed-before-wake".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "empty-reload-fingerprint",
+            )
+            .await
+            .expect("seed queue");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let wake = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.wake_deferred_steering(conversation_id).await })
+        };
+
+        barrier.wait().await;
+        let projection_guard = manager.lock_steering_projection(conversation_id).await;
+        assert!(manager
+            .db()
+            .remove_steering_entry(conversation_id, "removed-before-wake")
+            .await
+            .expect("remove final queue row"));
+        drop(projection_guard);
+        barrier.wait().await;
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), wake)
+            .await
+            .expect("wake must settle")
+            .expect("wake task joins")
+            .expect("empty guarded reload is a typed outcome");
+        assert_eq!(outcome, SteeringWakeOutcome::NothingToDrain);
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert!(manager
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .expect("messages")
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("conversation")
+                .state,
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_enqueue_revalidates_runtime_after_projection_wait() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm).await);
+        let conversation_id = "steering-enqueue-handle-revalidation";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let initial = manager
+            .get_or_create(conversation_id)
+            .await
+            .expect("initial runtime");
+        let mut events = initial.broadcast_tx.subscribe();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .steering_enqueue_handle_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let enqueue = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .enqueue_steer_message(
+                        conversation_id,
+                        Event::SteerMessage {
+                            text: "survives eviction".to_string(),
+                            llm_text: None,
+                            images: Vec::new(),
+                            files: Vec::new(),
+                            message_id: "survives-eviction".to_string(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "handle-revalidation-fingerprint",
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        let projection_guard = manager.lock_steering_projection(conversation_id).await;
+        barrier.wait().await;
+        manager
+            .evict_runtime(conversation_id, EvictionReason::SteeringReconciliation)
+            .await;
+        drop(projection_guard);
+
+        enqueue
+            .await
+            .expect("enqueue joins")
+            .expect("enqueue reaches the replacement runtime");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let SseEvent::Message { message } = events.recv().await.expect("runtime event") {
+                    if message.message_id == "survives-eviction" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            delivered.is_ok(),
+            "replacement runtime must drain the steer"
+        );
+        let replacement = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("replacement runtime remains registered");
+        assert!(!Arc::ptr_eq(&initial.identity, &replacement.identity));
+        assert!(manager
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .expect("durable queue")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_enqueue_stays_accepted_when_post_commit_reconstruction_fails() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-enqueue-reconstruction-failure";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let _acknowledged_event_rx =
+            insert_acknowledged_idle_handle(&manager, conversation_id).await;
+        let mut stale_events = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("closed runtime handle")
+            .broadcast_tx
+            .subscribe();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let enqueue = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .enqueue_steer_message(
+                        conversation_id,
+                        Event::SteerMessage {
+                            text: "durably accepted".to_string(),
+                            llm_text: None,
+                            images: Vec::new(),
+                            files: Vec::new(),
+                            message_id: "accepted-before-reconstruction".to_string(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "reconstruction-failure-fingerprint",
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        sqlx::query(
+            "UPDATE work_scopes
+             SET cwd = ?1
+             WHERE id = (
+                 SELECT work_scope_id FROM conversations WHERE id = ?2
+             )",
+        )
+        .bind("/definitely/missing/pr626-reconstruction")
+        .bind(conversation_id)
+        .execute(manager.db().pool())
+        .await
+        .expect("make replacement runtime construction fail");
+        barrier.wait().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), enqueue)
+            .await
+            .expect("enqueue must settle")
+            .expect("enqueue task joins")
+            .expect("durable admission remains successful");
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("durable queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accepted-before-reconstruction"]
+        );
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+                stale_events.recv().await
+            {}
+        })
+        .await
+        .expect("bounded retry failure must close the stale broadcaster");
+    }
+
+    #[tokio::test]
+    async fn failed_steering_reconstruction_waits_for_concurrent_construction() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-release-concurrent-construction";
+        let stale_broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut stale_events = stale_broadcaster.subscribe();
+        let (result_tx, _result_rx) = watch::channel(None);
+        manager
+            .runtime_creations
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), result_tx.clone());
+
+        let release = {
+            let manager = Arc::clone(&manager);
+            let stale_broadcaster = stale_broadcaster.clone();
+            tokio::spawn(async move {
+                manager
+                    .release_failed_steering_reconstruction_broadcaster(
+                        conversation_id,
+                        &stale_broadcaster,
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !release.is_finished(),
+            "release responsibility must wait for the concurrent construction"
+        );
+
+        {
+            let mut creations = manager.runtime_creations.lock().await;
+            result_tx.send_replace(Some(Err("persistent construction failure".to_string())));
+            creations.remove(conversation_id);
+        }
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), release)
+                .await
+                .expect("release must settle after construction failure")
+                .expect("release task joins")
+        );
+        drop(stale_broadcaster);
+        assert!(matches!(
+            stale_events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_steering_dispatch_failure_persists_error_without_provider_request() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "steering-post-commit-error";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .db()
+            .update_conversation_model_and_effort(
+                conversation_id,
+                "claude-sonnet-5",
+                Some(phoenix_core::domain::llm_types::ModelEffort::High),
+            )
+            .await
+            .expect("persist unsupported effort");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "accepted once".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "post-commit-fingerprint",
+            )
+            .await
+            .expect("seed queue");
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                manager.wake_deferred_steering(conversation_id),
+            )
+            .await
+            .expect("wake settles")
+            .expect("dispatch failure is typed"),
+            SteeringWakeOutcome::DispatchFailed
+        );
+        assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(manager
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .expect("queue")
+            .is_empty());
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(conversation_id)
+                .await
+                .expect("messages")
+                .iter()
+                .filter(|message| message.message_id == "committed-steer")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            manager
+                .db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("conversation")
+                .state,
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(manager.try_get_handle(conversation_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn steering_wake_does_not_claim_an_unrelated_dispatch_failure() {
+        let manager = Arc::new(test_manager_with_failing_llm().await);
+        let conversation_id = "steering-unrelated-dispatch-error";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+            .get_or_create(conversation_id)
+            .await
+            .expect("start idle runtime");
+        manager
+            .send_event(
+                conversation_id,
+                Event::UserCancel {
+                    reason: Some("startup readiness fence".to_string()),
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                },
+            )
+            .await
+            .expect("wait for runtime startup");
+        manager
+            .db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "still pending".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "pending-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "pending-steer-fingerprint",
+            )
+            .await
+            .expect("seed queue after runtime startup");
+
+        manager
+            .send_event(
+                conversation_id,
+                Event::UserMessage {
+                    text: "unrelated direct turn".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "unrelated-direct".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            )
+            .await
+            .expect("settle unrelated dispatch failure");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    manager.effective_conversation_state(conversation_id).await,
+                    Some(ConvState::Error { .. })
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unrelated provider failure reaches Error");
+
+        assert_eq!(
+            manager
+                .wake_deferred_steering(conversation_id)
+                .await
+                .expect("wake acknowledgement"),
+            SteeringWakeOutcome::Conflict
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("pending queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pending-steer"]
+        );
     }
 
     #[tokio::test]
@@ -5235,6 +6186,64 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn runtime_startup_waits_for_steering_mutation_before_publishing_handle() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "startup-steering-fence";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "cancel before startup".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "cancel-before-startup".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "startup-test-fingerprint",
+            )
+            .await
+            .expect("seed queue");
+
+        let startup_guard = mgr.lock_steering_projection(conversation_id).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        barrier.wait().await;
+
+        assert!(mgr.try_get_handle(conversation_id).await.is_none());
+        assert!(mgr
+            .db()
+            .remove_steering_entry(conversation_id, "cancel-before-startup")
+            .await
+            .expect("delete queued row"));
+        drop(startup_guard);
+
+        materialization
+            .await
+            .expect("materialization joins")
+            .expect("materialization succeeds");
+        assert!(mgr
+            .db()
+            .get_steering_queue(conversation_id)
+            .await
+            .expect("durable queue")
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn determine_resume_state_preserves_creation_cancelled() {
         let mgr = test_manager().await;
         mgr.db()
@@ -5260,6 +6269,283 @@ mod scope_liveness_tests {
             state,
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_materialized_active_direct_turn() {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+
+        let mgr = test_manager().await;
+        let conversation_id = "materialized-direct-turn";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                text: "resume me".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "direct-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "resume me".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let conversation = ConversationAuthority(conversation_id.to_string());
+        let repo = WorkflowRepository::new(mgr.db().pool().clone());
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("direct-message").expect("client key"),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().expect("encode payload"),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .expect("accept direct turn");
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected newly accepted turn")
+        };
+        let workflow_id = repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .expect("load workflow id")
+            .expect("workflow exists");
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(30),
+            })
+            .await
+            .expect("claim direct turn");
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority: claim.authority.expect("claim authority"),
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .expect("materialize direct turn");
+
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load reset conversation")
+                .state,
+            ConvState::LlmRequesting { .. }
+        ));
+
+        let (state, _state_updated_at, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("reconstruct runtime state");
+        assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_committed_steering_turn_until_first_response() {
+        use phoenix_core::domain::db_schema::MessageContent;
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let mgr = test_manager().await;
+        let conversation_id = "committed-steering-turn";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        mgr.db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "resume accepted steer".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+                "committed-steer-fingerprint",
+            )
+            .await
+            .expect("accept steer");
+        let content = MessageContent::user("resume accepted steer");
+        mgr.db()
+            .commit_steering_drain(
+                conversation_id,
+                &[crate::db::Message {
+                    message_id: "committed-steer".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("commit steering drain");
+
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load preserved conversation")
+                .state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        let (state, _, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("reconstruct committed steer");
+        assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
+
+        mgr.db()
+            .add_message(
+                "first-response",
+                conversation_id,
+                &MessageContent::agent(vec![ContentBlock::text("response settled")]),
+                None,
+                None,
+            )
+            .await
+            .expect("persist first response");
+        mgr.db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .expect("simulate later ordinary request");
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run bounded startup reset");
+        assert_eq!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load bounded reset")
+                .state,
+            ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_committed_skill_steering_turn() {
+        use phoenix_core::domain::db_schema::{MessageContent, SkillContent};
+        use phoenix_core::domain::skill_invocation::SkillInvocation;
+
+        let mgr = test_manager().await;
+        let conversation_id = "committed-skill-steering-turn";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        mgr.db()
+            .append_steering_entry(
+                conversation_id,
+                &crate::state_machine::event::SteerEntry {
+                    text: "/build".to_string(),
+                    llm_text: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    message_id: "committed-skill-steer".to_string(),
+                    user_agent: None,
+                    skill_invocation: Some(SkillInvocation {
+                        name: "build".to_string(),
+                        body: "skill body".to_string(),
+                        skill_dir: "/skills/build".to_string(),
+                    }),
+                },
+                "committed-skill-steer-fingerprint",
+            )
+            .await
+            .expect("accept skill steer");
+        let content = MessageContent::Skill(SkillContent {
+            name: "build".to_string(),
+            body: "skill body".to_string(),
+            trigger: "/build".to_string(),
+            files: Vec::new(),
+        });
+        mgr.db()
+            .commit_steering_drain(
+                conversation_id,
+                &[crate::db::Message {
+                    message_id: "committed-skill-steer".to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    sequence_id: 1,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: None,
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }],
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await
+            .expect("commit skill steering drain");
+
+        mgr.db()
+            .reset_all_to_idle()
+            .await
+            .expect("run startup reset");
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load preserved conversation")
+                .state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        let (state, _, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("reconstruct committed skill steer");
+        assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
     }
 

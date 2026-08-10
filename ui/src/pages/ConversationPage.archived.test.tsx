@@ -66,6 +66,7 @@ type ConnectionOptions = {
   conversationId?: string;
   dispatch: (action: SSEAction) => void;
   onValidatedInit?: (payload: InitPayload) => void;
+  onValidatedSteeringQueued?: (messageId: string) => void;
 };
 
 const authoritativeConversations = new Map<string, Conversation>();
@@ -74,9 +75,11 @@ function makeConnectionInit(conversation: Conversation): InitPayload {
   return {
     conversation,
     messages: [{ ...historyMessage, conversation_id: conversation.id }],
+    steeringMessages: [],
     phase: conversation.state ?? { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
+    streamIncarnation: 'test-stream',
     lastAppliedEventSeq: 0,
     pendingAnchorSequenceId: 0,
     pendingEvents: [],
@@ -339,6 +342,43 @@ describe('ConversationPage message viewer layout', () => {
 });
 
 describe('ConversationPage message delivery reconciliation', () => {
+  it('retires local steering ownership before a cross-client cancellation can re-expose it', async () => {
+    const messageId = 'queued-then-cancelled';
+    localStorage.setItem(`phoenix:queue:${conversationId}`, JSON.stringify([{
+      localId: messageId,
+      conversationId,
+      text: 'must stay cancelled',
+      timestamp: 1,
+      status: 'steering_queued',
+      acceptedAfterEventSeq: 0,
+    }]));
+    const { store } = renderPage(makeConversation({
+      state: { type: 'llm_requesting', attempt: 1 },
+    }));
+    await screen.findByText('keep this history visible');
+
+    const connection = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
+    act(() => {
+      connection.onValidatedSteeringQueued?.(messageId);
+      store.dispatch(slug, {
+        type: 'sse_steer_message_queued',
+        sequenceId: 1,
+        message: { message_id: messageId, text: 'must stay cancelled', images: [], files: [] },
+      });
+      store.dispatch(slug, {
+        type: 'sse_steer_message_cancelled',
+        sequenceId: 2,
+        messageId,
+      });
+    });
+
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(`phoenix:queue:${conversationId}`) ?? '[]')).toEqual([]);
+    });
+    expect(screen.queryByText('must stay cancelled')).not.toBeInTheDocument();
+    expect(store.getSnapshot(slug).steeringMessages).toEqual([]);
+  });
+
   it('does not overwrite authoritative idle when SSE completes before the chat POST response', async () => {
     const response = deferred<{ queued: boolean; steering: boolean }>();
     const sendMessage = vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);

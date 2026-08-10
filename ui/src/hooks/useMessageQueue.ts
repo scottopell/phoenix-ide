@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { generateUUID } from '../utils/uuid';
-import type { FileAttachment, ImageData } from '../api';
+import type { FileAttachment, ImageData, QueuedSteeringMessage } from '../api';
 
 /**
  * A queued message is either:
@@ -36,6 +36,15 @@ export interface QueuedMessage {
   acceptedAfterEventSeq?: number;
 }
 
+/** The exact data needed to render a not-yet-delivered user bubble. */
+export interface PendingUserMessage {
+  localId: string;
+  text: string;
+  images: ImageData[];
+  files?: FileAttachment[];
+  status: MessageStatus;
+}
+
 /**
  * Derive the list of pending messages to render in the conversation:
  * queue entries with status `pending` whose `localId` has NOT yet appeared
@@ -56,6 +65,35 @@ export function derivePendingMessages(
     ) && !serverIds.has(q.localId)
       && !serverIds.has(`${q.conversationId}:${q.localId}`),
   );
+}
+
+/** Merge local optimistic bubbles with the authoritative server queue.
+ * Accepted direct turns precede the steering queue; authoritative steering
+ * entries keep durable FIFO order; not-yet-accepted local sends follow them. */
+export function deriveDisplayedPendingMessages(
+  localPendingMessages: PendingUserMessage[],
+  steeringMessages: QueuedSteeringMessage[],
+  conversationArchived: boolean,
+): PendingUserMessage[] {
+  if (conversationArchived) return [];
+  const authoritativeIds = new Set(
+    steeringMessages.map((message) => message.message_id),
+  );
+  const renderAuthoritative = (message: QueuedSteeringMessage): PendingUserMessage => ({
+    localId: message.message_id,
+    text: message.text,
+    images: message.images,
+    files: message.files,
+    status: 'steering_queued',
+  });
+  const unmatchedLocal = localPendingMessages.filter(
+    (message) => !authoritativeIds.has(message.localId),
+  );
+  return [
+    ...unmatchedLocal.filter((message) => message.status === 'accepted'),
+    ...steeringMessages.map(renderAuthoritative),
+    ...unmatchedLocal.filter((message) => message.status !== 'accepted'),
+  ];
 }
 
 /**

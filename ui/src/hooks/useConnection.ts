@@ -21,9 +21,11 @@ import {
   SseConversationHardDeletedDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseSteerMessageCancelledDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
 } from '../sseSchemas';
+import { setCodexQuota } from '../codexQuota';
 import {
   ConnectionState,
   ConnectionMachineState,
@@ -157,6 +159,8 @@ interface UseConnectionOptions {
   getTranscriptGeneration?: () => number | null;
   /** Called only after an init has passed runtime validation and stream identity checks. */
   onValidatedInit?: (payload: InitPayload) => void;
+  /** Called when a validated live event transfers one steering identity to server authority. */
+  onValidatedSteeringQueued?: (messageId: string) => void;
 }
 
 function buildStreamUrl(
@@ -191,11 +195,13 @@ function transformInitData(raw: SseInitData): InitPayload {
   return {
     conversation,
     messages,
+    steeringMessages: raw.steering_messages,
     phase,
     contextWindow: {
       used: raw.context_window_size ?? 0,
     },
     transcriptGeneration: raw.transcript_generation,
+    streamIncarnation: raw.stream_incarnation,
     lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
@@ -221,6 +227,7 @@ export function useConnection({
   getLastAppliedEventSeq,
   getTranscriptGeneration,
   onValidatedInit,
+  onValidatedSteeringQueued,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -253,6 +260,7 @@ export function useConnection({
   const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
   const getTranscriptGenerationRef = useRef(getTranscriptGeneration);
   const onValidatedInitRef = useRef(onValidatedInit);
+  const onValidatedSteeringQueuedRef = useRef(onValidatedSteeringQueued);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -273,6 +281,10 @@ export function useConnection({
   useEffect(() => {
     onValidatedInitRef.current = onValidatedInit;
   }, [onValidatedInit]);
+
+  useEffect(() => {
+    onValidatedSteeringQueuedRef.current = onValidatedSteeringQueued;
+  }, [onValidatedSteeringQueued]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -677,11 +689,6 @@ export function useConnection({
             );
           });
 
-          // Steering message queued server-side. Client already transitioned
-          // the bubble to `steering_queued` on the POST response; this event
-          // validates the payload (so a Rust-side schema change surfaces as a
-          // tsc error) and is otherwise a no-op. The bubble auto-clears when
-          // the server echoes the delivered message as a `message` event.
           on('steer_message_queued', (e) => {
             const res = parseEvent(
               SseSteerMessageQueuedDataSchema,
@@ -689,7 +696,28 @@ export function useConnection({
               'steer_message_queued',
               stampedDispatch,
             );
-            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
+            if (!res.ok) return;
+            onValidatedSteeringQueuedRef.current?.(res.data.message.message_id);
+            stampedDispatch({
+              type: 'sse_steer_message_queued',
+              sequenceId: res.data.sequence_id,
+              message: res.data.message,
+            });
+          });
+
+          on('steer_message_cancelled', (e) => {
+            const res = parseEvent(
+              SseSteerMessageCancelledDataSchema,
+              e,
+              'steer_message_cancelled',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_steer_message_cancelled',
+              sequenceId: res.data.sequence_id,
+              messageId: res.data.message_id,
+            });
           });
 
           // Codex quota snapshot (task 67003). Account-global, not
@@ -704,6 +732,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            setCodexQuota(res.data.snapshot);
             stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 

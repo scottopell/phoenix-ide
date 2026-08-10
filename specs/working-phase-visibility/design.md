@@ -268,8 +268,9 @@ handling. The current set, sourced from `SseWireEvent::event_type()`
 
 ```
 init, message, message_updated, state_change, token, agent_done,
-conversation_update, product_conversation_lifecycle, error,
-browser_session_state, steer_message_queued, rate_limit_snapshot,
+conversation_became_terminal, conversation_update, error,
+browser_session_state, bash_tool_progress, steer_message_queued,
+steer_message_cancelled, rate_limit_snapshot, work_scope_update,
 conversation_hard_deleted
 ```
 
@@ -280,6 +281,10 @@ llm_first_byte   (working-phase-visibility)
 llm_attempt      (llm-retry-visibility, sibling spec)
 ping             (server keep-alive, see "Server keep-alive observation")
 ```
+
+The normative aggregate target additionally requires explicit listeners for
+`product_conversation_lifecycle` and `continuation_boundary` when those wire
+carriers are implemented.
 
 A small `wrapHandler(eventName, fn)` helper in the SSE-client layer
 (one place, not duplicated per listener) is the recommended shape so

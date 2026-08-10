@@ -1969,6 +1969,24 @@ rule ModeChangeNotification {
     ensures: SyntheticMessageInjected(conversation, about: mode_changed)
 }
 
+------------------------------------------------------------
+-- Helpers (pure predicates referenced by restart rules)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; restart rules call this
+-- predicate by bare identifier. This block defines its complete semantics.
+--
+--   committed_steering_turn_awaiting_first_response(
+--       conversation: Conversation
+--   ) -> Boolean
+--       True iff conversation.core_status = llm_requesting, the latest
+--       transcript row is a user or skill message carrying an immutable
+--       accepted-steering identity, and the pending steering queue contains no
+--       row with that exact identity. A provider response, tool row, system row,
+--       or other later transcript row makes the predicate false. Acceptance
+--       identity alone is insufficient: the qualifying transcript tail and
+--       exact queue-row absence are both required.
+
 -- REQ-BED-007: Persist state before effects (cross-cutting)
 -- Every rule that changes status implicitly requires state persistence
 -- before side effects execute.
@@ -1978,6 +1996,7 @@ rule ModeChangeNotification {
 rule ServerRestartOrdinaryConversation {
     when: ServerRestarted(conversation)
     requires: conversation.is_busy
+    requires: not committed_steering_turn_awaiting_first_response(conversation)
     requires: conversation.core_status not in {
         awaiting_continuation,
         recoverable_continuation_failure
@@ -1985,6 +2004,26 @@ rule ServerRestartOrdinaryConversation {
     requires: conversation.parent_status != awaiting_recovery
         or conversation.recovery_resume_target = conversation_turn
     ensures: conversation.core_status = idle
+}
+
+rule ServerRestartCommittedSteeringTurn {
+    when: ServerRestarted(conversation)
+    requires: conversation.core_status = llm_requesting
+    requires: committed_steering_turn_awaiting_first_response(conversation)
+    ensures: LlmRequestDispatched(conversation) or conversation.core_status = error
+
+    @guidance
+        -- The bounded owner is true only when the latest transcript row is a
+        -- user message with an immutable accepted-steering identity and that
+        -- exact message is absent from the pending queue. The first provider
+        -- response changes the transcript tail and ends this exception. No
+        -- steering lifecycle or second queue authority is introduced.
+        -- A synchronous failure to start the resumed request is reduced through
+        -- LlmErrors into the persisted non-retryable Error branch; it is not
+        -- left as a busy LlmRequesting row without a provider task.
+        -- If persisting that Error fails, the executor exits and releases its
+        -- runtime handle so reconnect reconstructs from the unchanged database
+        -- owner. It never remains live and busy without a provider task.
 }
 
 rule ServerRestartPendingContinuation {

@@ -2,6 +2,7 @@
 import type { BashToolProgress } from "./BashToolProgress";
 import type { ErrorPresentation } from "./ErrorPresentation";
 import type { LlmAttemptReason } from "./LlmAttemptReason";
+import type { QueuedSteeringMessage } from "./QueuedSteeringMessage";
 import type { QuotaDetails } from "./QuotaDetails";
 import type { TranscriptCoverage } from "./TranscriptCoverage";
 import type { WorkScopeInventory } from "./WorkScopeInventory";
@@ -35,7 +36,11 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number, 
+messages: Array<unknown>, 
+/**
+ * Durable server-authoritative steering queue at snapshot time.
+ */
+steering_messages: Array<QueuedSteeringMessage>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, stream_incarnation: string, context_window_size: number, project_name: string | null, transcript_generation: number, 
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has
@@ -97,4 +102,4 @@ state_updated_at: string, error?: ErrorPresentation, } | { "type": "llm_first_by
  * `message` field. Kind-aware consumers can narrow against
  * `UserFacingError` (also exported by ts-rs for future use).
  */
-error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, } | { "type": "bash_tool_progress", sequence_id: number, tool_use_id: string, progress: BashToolProgress, } | { "type": "steer_message_queued", sequence_id: number, message_id: string, queue_position: number, } | { "type": "rate_limit_snapshot", sequence_id: number, snapshot: QuotaDetails, } | { "type": "work_scope_update", sequence_id: number, inventory: WorkScopeInventory, };
+error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, } | { "type": "bash_tool_progress", sequence_id: number, tool_use_id: string, progress: BashToolProgress, } | { "type": "steer_message_queued", sequence_id: number, message: QueuedSteeringMessage, queue_position: number, } | { "type": "steer_message_cancelled", sequence_id: number, message_id: string, } | { "type": "rate_limit_snapshot", sequence_id: number, snapshot: QuotaDetails, } | { "type": "work_scope_update", sequence_id: number, inventory: WorkScopeInventory, };

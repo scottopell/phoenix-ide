@@ -55,6 +55,7 @@ export type ConversationPageView = Pick<
   | 'conversation'
   | 'phase'
   | 'messages'
+  | 'steeringMessages'
   | 'contextWindow'
   | 'systemPrompt'
   | 'uiError'
@@ -72,6 +73,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'conversation',
   'phase',
   'messages',
+  'steeringMessages',
   'contextWindow',
   'systemPrompt',
   'uiError',
@@ -121,6 +123,7 @@ export function useConversationView(
       conversation: a.conversation,
       phase: a.phase,
       messages: a.messages,
+      steeringMessages: a.steeringMessages,
       contextWindow: a.contextWindow,
       systemPrompt: a.systemPrompt,
       uiError: a.uiError,

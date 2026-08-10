@@ -126,6 +126,28 @@ describe('conversation route client', () => {
   });
 });
 
+describe('steering queue client', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('encodes conversation and message ids as URL path segments', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 204 } as Response);
+
+    await api.cancelSteeringMessage('conv/one', 'message?#/two');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv%2Fone/steering-queue/message%3F%23%2Ftwo',
+      { method: 'DELETE' },
+    );
+  });
+});
+
 describe('conversation message history clients', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());

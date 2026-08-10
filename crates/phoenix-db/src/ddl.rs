@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS steering_messages (
 CREATE INDEX IF NOT EXISTS idx_steering_messages_conversation
     ON steering_messages(conversation_id, ordinal);
 
+-- Accepted steering request identities. Rows survive queue removal and are
+-- deleted with their conversation. NULL fingerprints identify pending rows
+-- accepted before request fingerprints were persisted.
+CREATE TABLE IF NOT EXISTS steering_acceptance_receipts (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    request_fingerprint TEXT,
+    PRIMARY KEY (conversation_id, message_id),
+    CHECK (request_fingerprint IS NULL OR request_fingerprint <> '')
+);
+
 CREATE TABLE IF NOT EXISTS steering_message_files (
     message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
     file_ordinal INTEGER NOT NULL,

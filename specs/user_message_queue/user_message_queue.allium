@@ -61,8 +61,19 @@ entity AuthoritativeUserMessage {
     message_id: String
 }
 
+entity AuthoritativeSteeringMessage {
+    scope: ConversationScope
+    message_id: String
+    text: String
+    images: List<ImageData>
+}
+
 entity PendingRender {
     entry: LocalQueueEntry
+}
+
+entity AuthoritativeSteeringRender {
+    entry: AuthoritativeSteeringMessage
 }
 
 entity FailedRender {
@@ -252,6 +263,22 @@ rule AuthoritativeMessageReconcilesQueueEntry {
         -- ids. It applies equally to rehydrated entries after reload.
 }
 
+rule AuthoritativeSteeringMessageReconcilesQueueEntry {
+    when: ServerSteeringQueueContains(msg, entry)
+
+    requires: msg.scope = entry.scope
+    requires: msg.message_id = entry.local_id
+    requires: entry.status = pending or entry.status = steering_queued
+
+    ensures: entry.status = reconciled
+    ensures: entry.visible = false
+
+    @guidance
+        -- Once the server queue carries the accepted message, browser-local
+        -- storage is no longer its render authority. The server entry remains
+        -- visible until cancellation or authoritative transcript delivery.
+}
+
 rule DerivePendingRender {
     when: RenderConversation(scope)
 
@@ -259,6 +286,14 @@ rule DerivePendingRender {
         for entry in LocalQueueEntries where scope = scope:
             if entry.status = pending or entry.status = steering_queued:
                 PendingRender.created(entry: entry)
+}
+
+rule DeriveAuthoritativeSteeringRender {
+    when: RenderConversation(scope)
+
+    ensures:
+        for entry in AuthoritativeSteeringMessages where scope = scope:
+            AuthoritativeSteeringRender.created(entry: entry)
 }
 
 rule DeriveFailedRender {
@@ -340,7 +375,15 @@ invariant RenderedUserMessagesAreUnionWithoutDuplicates {
     for entry in LocalQueueEntries:
         PendingRender{entry: entry} implies
             (entry.status = pending or entry.status = steering_queued)
-            and not AuthoritativeUserMessages.any(msg => authoritative_message_matches_entry(msg, entry))
+            and not AuthoritativeUserMessages.any(msg =>
+                authoritative_message_matches_entry(msg, entry))
+            and not AuthoritativeSteeringMessage{
+                scope: entry.scope,
+                message_id: entry.local_id
+            }
+
+    for msg in AuthoritativeSteeringMessages:
+        no PendingRender{entry: LocalQueueEntry{scope: msg.scope, local_id: msg.message_id}}
 }
 
 invariant LocalStorageScopedByConversation {

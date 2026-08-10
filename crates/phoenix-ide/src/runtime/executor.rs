@@ -15,8 +15,8 @@
 
 use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
-    SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
-    TaskApprovalHandoffRequest,
+    AcknowledgedEventOutcome, SseBroadcaster, SseEvent, SteeringWakeOutcome, SubAgentCancelRequest,
+    SubAgentSpawnRequest, TaskApprovalHandoffData, TaskApprovalHandoffRequest,
 };
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
@@ -27,7 +27,7 @@ use crate::state_machine::state::{
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
-    Effect, Event, StepResult,
+    Effect, Event, SteeringDrainMessage, SteeringDrainPostCommit, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
@@ -47,6 +47,13 @@ const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavai
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSteeringDrainOutcome {
+    NotNeeded,
+    StartedLlm,
+    ResumeLlm,
+}
 
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
@@ -1663,6 +1670,13 @@ enum ContinuationEffectDisposition {
     AbortRemaining,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RuntimeRecoveryDisposition {
+    #[default]
+    Continue,
+    RecreateFromDatabase,
+}
+
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
 pub struct ConversationRuntime<S, L, T>
 where
@@ -1714,8 +1728,10 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx:
-        mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    acknowledged_event_rx: mpsc::Receiver<(
+        Event,
+        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    )>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -1837,6 +1853,8 @@ where
     /// Loaded from DB at executor startup; persisted back after each enqueue
     /// or dequeue.
     steering_queue: Vec<crate::state_machine::event::SteerEntry>,
+    /// Serializes durable cancellation with the final queue read and drain.
+    steering_projection_gate: Option<Arc<tokio::sync::Mutex<()>>>,
     /// Unified liveness deadline for every waiting state — the single backstop
     /// that guarantees a waiting conversation cannot wedge forever. It is armed
     /// on entering any waiting state (`AwaitingSubAgents`, `CancellingTool`,
@@ -1882,6 +1900,7 @@ where
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     continuation_effect_disposition: ContinuationEffectDisposition,
+    recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
     /// a system message. `0` disables the cap. Read once at construction
     /// time from `PHOENIX_PARENT_TOOL_CYCLE_CAP`, with
@@ -2003,6 +2022,7 @@ where
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
             steering_queue: Vec::new(),
+            steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
             active_work_subagents: 0,
@@ -2012,6 +2032,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
+            recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_cancellation_initiated: false,
@@ -2107,7 +2128,10 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<(Event, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+        receiver: mpsc::Receiver<(
+            Event,
+            tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+        )>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
         self
@@ -2155,6 +2179,11 @@ where
         self
     }
 
+    pub fn with_steering_projection_gate(mut self, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.steering_projection_gate = Some(gate);
+        self
+    }
+
     pub fn run(self) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'static>> {
         Box::pin(self.run_inner())
     }
@@ -2163,23 +2192,62 @@ where
     async fn run_inner(mut self) {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
+        let startup_drain = match self.commit_startup_steering_queue().await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(
+                    conversation_id = %self.context.conversation_id,
+                    %error,
+                    "Startup steering drain failed; leaving durable queue intact for retry"
+                );
+                let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                    sequence_id,
+                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                        "recover queued steering messages",
+                    ),
+                });
+                return;
+            }
+        };
+
         // Check if we need to resume an interrupted operation
         // This handles crash recovery for in-flight LLM requests
         if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
         {
-            tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
-            if let Err(e) = Box::pin(self.execute_effect(Effect::RequestLlm)).await {
-                tracing::error!(error = %e, "Failed to resume LLM request");
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
-                    sequence_id: seq,
-                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                        "resume the LLM request",
-                    ),
-                });
-            } else if let Some((job_id, claim)) = self.startup_creation_completion.take() {
-                let _ = self
-                    .execute_effect(Effect::CompleteCreation { job_id, claim })
-                    .await;
+            if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
+                tracing::info!(
+                    conv_id = %self.context.conversation_id,
+                    "Startup steering drain started the LLM request"
+                );
+            } else {
+                tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
+            }
+            let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
+                false
+            } else {
+                match Box::pin(self.resume_interrupted_llm_request()).await {
+                    Ok(failed) => failed,
+                    Err(settlement_error) => {
+                        tracing::error!(
+                            %settlement_error,
+                            "Failed to settle resumed LLM dispatch error; retiring runtime for reconstruction"
+                        );
+                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                            sequence_id: seq,
+                            error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                                "resume the LLM request",
+                            ),
+                        });
+                        return;
+                    }
+                }
+            };
+            if !resume_failed {
+                if let Some((job_id, claim)) = self.startup_creation_completion.take() {
+                    let _ = self
+                        .execute_effect(Effect::CompleteCreation { job_id, claim })
+                        .await;
+                }
             }
         }
 
@@ -2236,13 +2304,20 @@ where
         //   deadline          — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery          — credential helper settlement (REQ-BED-030)
         loop {
+            if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
+                tracing::warn!(
+                    conversation_id = %self.context.conversation_id,
+                    "Exiting runtime to reconstruct an uncommitted operation from database truth"
+                );
+                return;
+            }
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
-                    let result = self.process_event(event).await;
+                    let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
@@ -2670,6 +2745,41 @@ where
             .map(|_| ())
     }
 
+    async fn process_acknowledged_event(
+        &mut self,
+        event: Event,
+    ) -> Result<AcknowledgedEventOutcome, String> {
+        if !matches!(&event, Event::SteeringQueueChanged) {
+            self.process_event(event).await?;
+            return Ok(AcknowledgedEventOutcome::Settled);
+        }
+
+        if self.context.is_sub_agent {
+            return Ok(AcknowledgedEventOutcome::SteeringWake(
+                SteeringWakeOutcome::Conflict,
+            ));
+        }
+
+        if matches!(self.state, ConvState::Idle) {
+            self.process_event(Event::SteeringQueueChanged).await?;
+        }
+        let has_pending = !self
+            .storage
+            .load_steering_entries(&self.context.conversation_id)
+            .await?
+            .is_empty();
+        let outcome = if has_pending {
+            SteeringWakeOutcome::Conflict
+        } else if matches!(self.state, ConvState::LlmRequesting { .. }) {
+            SteeringWakeOutcome::Applied
+        } else if matches!(self.state, ConvState::Error { .. }) {
+            SteeringWakeOutcome::DispatchFailed
+        } else {
+            SteeringWakeOutcome::NothingToDrain
+        };
+        Ok(AcknowledgedEventOutcome::SteeringWake(outcome))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(self.state, ConvState::Idle)
@@ -2697,47 +2807,57 @@ where
             self.parent_tool_cycle_count = 0;
         }
 
-        // Steering messages are buffered rather than fed to the state machine.
-        // They are delivered as `UserMessage` when the conversation next enters `Idle`.
-        if let Event::SteerMessage {
-            text,
-            llm_text,
-            images,
-            files,
-            message_id,
-            user_agent,
-            skill_invocation,
-        } = event
-        {
-            let entry = crate::state_machine::event::SteerEntry {
+        // A steer normally waits for the next drain hook. If channel delivery
+        // loses the race with a transition to Idle, drain it immediately so a
+        // successfully accepted prompt cannot wait for an unrelated future turn.
+        let mut immediate_drain_guard = None;
+        let event = match event {
+            Event::SteerMessage {
                 text,
                 llm_text,
                 images,
                 files,
-                message_id: message_id.clone(),
+                message_id,
                 user_agent,
                 skill_invocation,
-            };
-            self.steering_queue.push(entry);
-            let queue_position = self.steering_queue.len() - 1;
-            // Persist updated queue
-            if let Err(e) = self
-                .storage
-                .update_steering_queue(&self.context.conversation_id, &self.steering_queue)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to persist steering queue");
+            } => {
+                self.steering_queue
+                    .push(crate::state_machine::event::SteerEntry {
+                        text,
+                        llm_text,
+                        images,
+                        files,
+                        message_id,
+                        user_agent,
+                        skill_invocation,
+                    });
+                if matches!(self.state, ConvState::Idle) && !self.context.is_sub_agent {
+                    let Some((drain_event, projection_guard)) =
+                        Box::pin(self.prepare_immediate_steering_drain()).await?
+                    else {
+                        return Ok(());
+                    };
+                    immediate_drain_guard = projection_guard;
+                    drain_event
+                } else {
+                    return Ok(());
+                }
             }
-            // Notify the UI so it can show the queued indicator
-            let _ = self
-                .broadcast_tx
-                .send_seq(|seq| SseEvent::SteerMessageQueued {
-                    sequence_id: seq,
-                    message_id,
-                    queue_position,
-                });
-            return Ok(());
-        }
+            Event::SteeringQueueChanged => {
+                if matches!(self.state, ConvState::Idle) && !self.context.is_sub_agent {
+                    let Some((drain_event, projection_guard)) =
+                        Box::pin(self.prepare_immediate_steering_drain()).await?
+                    else {
+                        return Ok(());
+                    };
+                    immediate_drain_guard = projection_guard;
+                    drain_event
+                } else {
+                    return Ok(());
+                }
+            }
+            event => event,
+        };
 
         // Cancel steering: remove entry from in-memory queue.
         // DB is already updated by the cancel handler before this event arrives.
@@ -2815,6 +2935,8 @@ where
             let generated_events = self.apply_transition_result(result).await?;
             events_to_process.extend(generated_events);
         }
+
+        drop(immediate_drain_guard);
 
         Ok(())
     }
@@ -2931,7 +3053,14 @@ where
             let will_drain_from_idle = matches!(self.state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
-            if !will_drain_from_idle && !will_settle_active_direct_turn {
+            let will_commit_steering_drain = result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CommitSteeringDrain { .. }));
+            if !will_drain_from_idle
+                && !will_commit_steering_drain
+                && !will_settle_active_direct_turn
+            {
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
@@ -3048,18 +3177,26 @@ where
                     if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
             )
         });
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, is_error_dismissal) {
-            self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
-                .await?;
+        if let Some((drain_event, projection_guard)) =
+            Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
+        {
+            Box::pin(self.run_effects_with_inline_drain(
+                result.effects,
+                drain_event,
+                projection_guard,
+                &mut generated_events,
+            ))
+            .await?;
         } else {
             for effect in result.effects {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(effect, Effect::PersistState);
+                let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let effect_result = Box::pin(self.execute_effect(effect)).await;
                 let effect_result = match effect_result {
                     Ok(effect_result) => effect_result,
-                    Err(error) if is_state_persist => {
+                    Err(error) if is_state_persist || is_steering_drain => {
                         let failed_state = std::mem::replace(&mut self.state, old_state.clone());
                         self.state_updated_at = old_state_updated_at;
                         self.manage_deadline(&failed_state);
@@ -3088,8 +3225,11 @@ where
             if let Some(tx) = &self.state_watcher {
                 let _ = tx.send(self.state.clone());
             }
-            if let Some(drain_event) = self.maybe_drain_steering_queue(&self.state.clone(), false) {
+            if let Some((drain_event, projection_guard)) =
+                Box::pin(self.prepare_steering_drain(&self.state.clone(), false)).await?
+            {
                 Box::pin(self.process_event(drain_event)).await?;
+                drop(projection_guard);
             }
             return Ok(Vec::new());
         }
@@ -3121,6 +3261,7 @@ where
         &mut self,
         original_effects: Vec<Effect>,
         drain_event: Event,
+        projection_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
         let mut deferred_request_llm: Option<Effect> = None;
@@ -3168,6 +3309,7 @@ where
             Event::SteerDrainedUserMessages { entries },
         )
         .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
+        let drain_old_state_updated_at = self.state_updated_at;
         let drain_old_state = std::mem::replace(&mut self.state, drain_result.new_state);
         // Same gating as apply_transition_result: only stamp a fresh entry
         // time when the drain actually changes phase. A mid-turn drain
@@ -3178,22 +3320,31 @@ where
         // jump the elapsed counter (REQ-WPV-001).
         if self.state != drain_old_state {
             self.state_updated_at = Utc::now();
-            // Mirror apply_transition_result: publish the new state so live-state
-            // observers (e.g. effective_conversation_state) stay current after a
-            // steering drain transition (Idle → LlmRequesting is the common path).
-            if let Some(tx) = &self.state_watcher {
-                let _ = tx.send(self.state.clone());
-            }
         }
         for effect in drain_result.effects {
-            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
-                generated_events.push(gen_event);
+            match Box::pin(self.execute_effect(effect)).await {
+                Ok(Some(gen_event)) => generated_events.push(gen_event),
+                Ok(None) => {}
+                Err(error) => {
+                    self.state = drain_old_state;
+                    self.state_updated_at = drain_old_state_updated_at;
+                    return Err(error);
+                }
             }
         }
 
+        // Persistence and removal above commit queue consumption. A waiting
+        // cancellation now observes the entry absent instead of reporting
+        // success for a prompt already being delivered.
+        drop(projection_guard);
+
         if let Some(effect) = deferred_request_llm {
-            if let Some(gen_event) = Box::pin(self.execute_effect(effect)).await? {
-                generated_events.push(gen_event);
+            match Box::pin(self.execute_effect(effect)).await {
+                Ok(Some(gen_event)) => generated_events.push(gen_event),
+                Ok(None) => {}
+                Err(error) => {
+                    generated_events.push(self.llm_dispatch_failure_event(error));
+                }
             }
         }
         Ok(())
@@ -3227,6 +3378,126 @@ where
             });
         }
         Ok(None)
+    }
+
+    async fn prepare_immediate_steering_drain(
+        &mut self,
+    ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        if self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?
+            .is_some_and(|turn| !turn.materialized)
+        {
+            return Ok(None);
+        }
+        let projection_guard = if let Some(gate) = self.steering_projection_gate.clone() {
+            let guard = gate.lock_owned().await;
+            self.steering_queue = self
+                .storage
+                .load_steering_entries(&self.context.conversation_id)
+                .await?;
+            Some(guard)
+        } else {
+            None
+        };
+        if self.steering_queue.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((
+            Event::SteerDrainedUserMessages {
+                entries: std::mem::take(&mut self.steering_queue),
+            },
+            projection_guard,
+        )))
+    }
+
+    async fn commit_startup_steering_queue(
+        &mut self,
+    ) -> Result<StartupSteeringDrainOutcome, String> {
+        if self.context.is_sub_agent
+            || !matches!(
+                self.state,
+                ConvState::Idle | ConvState::LlmRequesting { .. }
+            )
+        {
+            return Ok(StartupSteeringDrainOutcome::NotNeeded);
+        }
+        let Some((event, projection_guard)) = self.prepare_immediate_steering_drain().await? else {
+            return Ok(StartupSteeringDrainOutcome::NotNeeded);
+        };
+        let result = transition(&self.state, &self.context, event)
+            .map_err(|error| format!("startup steering drain transition failed: {error:?}"))?;
+        let outcome = if result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::CommitSteeringDrain {
+                    post_commit: SteeringDrainPostCommit::StartLlmAndNotifyState,
+                    ..
+                }
+            )
+        }) {
+            StartupSteeringDrainOutcome::StartedLlm
+        } else {
+            StartupSteeringDrainOutcome::ResumeLlm
+        };
+        let generated_events = self.apply_transition_result(result).await?;
+        for generated_event in generated_events {
+            Box::pin(self.process_event(generated_event)).await?;
+        }
+        drop(projection_guard);
+        Ok(outcome)
+    }
+
+    async fn prepare_steering_drain(
+        &mut self,
+        old_state: &ConvState,
+        is_error_dismissal: bool,
+    ) -> Result<Option<(Event, Option<tokio::sync::OwnedMutexGuard<()>>)>, String> {
+        if !self.is_steering_drain_hook(old_state, is_error_dismissal) {
+            return Ok(None);
+        }
+        if self
+            .storage
+            .load_active_direct_turn(&self.context.conversation_id)
+            .await?
+            .is_some_and(|turn| !turn.materialized)
+        {
+            return Ok(None);
+        }
+
+        let projection_guard = if let Some(gate) = self.steering_projection_gate.clone() {
+            let guard = gate.lock_owned().await;
+            self.steering_queue = self
+                .storage
+                .load_steering_entries(&self.context.conversation_id)
+                .await?;
+            Some(guard)
+        } else {
+            None
+        };
+
+        Ok(self
+            .maybe_drain_steering_queue(old_state, is_error_dismissal)
+            .map(|event| (event, projection_guard)))
+    }
+
+    fn is_steering_drain_hook(&self, old_state: &ConvState, is_error_dismissal: bool) -> bool {
+        if self.context.is_sub_agent || is_error_dismissal {
+            return false;
+        }
+
+        let entering_idle =
+            !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
+        let entering_llm_requesting_from_tool_round =
+            matches!(
+                old_state,
+                ConvState::ToolExecuting { .. }
+                    | ConvState::AwaitingSubAgents { .. }
+                    | ConvState::CancellingSubAgents { .. }
+            ) && matches!(self.state, ConvState::LlmRequesting { .. });
+
+        entering_idle || entering_llm_requesting_from_tool_round
     }
 
     async fn settle_pending_direct_turn(
@@ -3453,8 +3724,8 @@ where
     /// If the current state transition is a steering-queue drain hook point and
     /// the queue is non-empty, drain all entries into a single
     /// `SteerDrainedUserMessages` event. The DB queue is NOT touched here; it
-    /// is updated later by `Effect::ClearSteeringQueueEntries` once the emitted
-    /// event is processed and all `PersistMessage` effects succeed.
+    /// is consumed only by the atomic `CommitSteeringDrain` effect emitted by
+    /// the reducer for this exact batch.
     ///
     /// Sub-agents do not have steering queues; this returns `None` for them.
     ///
@@ -3469,17 +3740,6 @@ where
         old_state: &ConvState,
         is_error_dismissal: bool,
     ) -> Option<Event> {
-        if self.context.is_sub_agent {
-            return None;
-        }
-
-        // An error dismissal enters Idle but is not a turn-end, so it must not
-        // drain (see the call site). Draining is reserved for turn-completion
-        // idle entries.
-        if is_error_dismissal {
-            return None;
-        }
-
         let entering_idle =
             !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
         let entering_llm_requesting_from_tool_round =
@@ -3490,7 +3750,7 @@ where
                     | ConvState::CancellingSubAgents { .. }
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
-        if !(entering_idle || entering_llm_requesting_from_tool_round)
+        if !self.is_steering_drain_hook(old_state, is_error_dismissal)
             || self.steering_queue.is_empty()
         {
             return None;
@@ -3505,9 +3765,6 @@ where
             mid_turn = entering_llm_requesting_from_tool_round,
             "Draining queued steering messages"
         );
-        // DB queue is updated by `Effect::ClearSteeringQueueEntries` AFTER
-        // persist effects run, so a crash mid-drain leaves the queue intact
-        // for idempotent re-drain on restart.
         Some(Event::SteerDrainedUserMessages { entries })
     }
 
@@ -4415,11 +4672,8 @@ where
                 message_id,
                 idempotent,
             } => {
-                // Idempotent path: skip if already persisted. Prevents double-
-                // insert (and seq gap) when a SteerDrainedUserMessages re-fires
-                // after crash recovery before ClearSteeringQueueEntries ran.
-                // Gated to idempotent=true so non-replayable persists pay no
-                // extra query.
+                // Idempotent recovery paths skip an already-persisted identity;
+                // ordinary message effects avoid the extra existence query.
                 if idempotent && self.storage.message_exists(&message_id).await? {
                     tracing::debug!(
                         message_id = %message_id,
@@ -5324,26 +5578,152 @@ where
                 .await
             }
 
-            Effect::ClearSteeringQueueEntries { message_ids } => {
-                if let Err(e) = self
-                    .storage
-                    .remove_steering_entries(&self.context.conversation_id, &message_ids)
-                    .await
-                {
+            Effect::CommitSteeringDrain {
+                messages,
+                post_commit,
+            } => self.commit_steering_drain(messages, post_commit).await,
+        }
+    }
+
+    async fn commit_steering_drain(
+        &mut self,
+        messages: Vec<SteeringDrainMessage>,
+        post_commit: SteeringDrainPostCommit,
+    ) -> Result<Option<Event>, String> {
+        if messages.is_empty() {
+            return Err("reducer emitted an empty steering drain commit".to_string());
+        }
+        let (reserved_range, sequences) = self
+            .broadcast_tx
+            .reserve_next_persisted_message_range(messages.len());
+        let created_at = Utc::now();
+        let committed_messages: Vec<crate::db::Message> = messages
+            .into_iter()
+            .zip(sequences)
+            .map(|(message, sequence_id)| crate::db::Message {
+                message_id: message.message_id,
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id,
+                message_type: message.content.message_type(),
+                content: message.content,
+                display_data: message.display_data,
+                usage_data: message.usage_data,
+                created_at,
+            })
+            .collect();
+
+        let statuses = match self
+            .storage
+            .commit_steering_drain(
+                &self.context.conversation_id,
+                &committed_messages,
+                &self.state,
+                self.state_updated_at,
+            )
+            .await
+        {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+                return Err(error);
+            }
+        };
+        if statuses.len() != committed_messages.len() {
+            tracing::error!(
+                conversation_id = %self.context.conversation_id,
+                message_count = committed_messages.len(),
+                status_count = statuses.len(),
+                "Steering drain storage returned an invalid post-commit status count"
+            );
+        }
+
+        for (index, message) in committed_messages.into_iter().enumerate() {
+            let status = statuses
+                .get(index)
+                .copied()
+                .unwrap_or(crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized);
+            match status {
+                crate::db::SteeringDrainMessageStatus::Inserted => {
+                    let _ = self.broadcast_tx.send_message(message);
+                }
+                crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized => {
                     tracing::warn!(
                         conversation_id = %self.context.conversation_id,
-                        message_ids = ?message_ids,
-                        error = %e,
-                        "Failed to remove drained steering entries"
+                        message_id = %message.message_id,
+                        "Recovered a legacy partially-materialized steering drain"
                     );
-                } else {
-                    tracing::info!(
-                        conversation_id = %self.context.conversation_id,
-                        message_ids = ?message_ids,
-                        "Removed drained steering entries"
-                    );
+                    let _ =
+                        self.broadcast_tx
+                            .send_reserved_seq(message.sequence_id, |sequence_id| {
+                                SseEvent::StateChange {
+                                    sequence_id,
+                                    state: self.state.clone(),
+                                    presentation_mode: self.state.presentation_mode().to_string(),
+                                    state_updated_at: self.state_updated_at,
+                                }
+                            });
                 }
-                Ok(None)
+            }
+        }
+        drop(reserved_range);
+
+        self.finish_steering_drain(post_commit).await
+    }
+
+    async fn finish_steering_drain(
+        &mut self,
+        post_commit: SteeringDrainPostCommit,
+    ) -> Result<Option<Event>, String> {
+        match post_commit {
+            SteeringDrainPostCommit::StartLlmAndNotifyState => {
+                self.parent_tool_cycle_count = 0;
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|sequence_id| SseEvent::StateChange {
+                        sequence_id,
+                        state: self.state.clone(),
+                        presentation_mode: self.state.presentation_mode().to_string(),
+                        state_updated_at: self.state_updated_at,
+                    });
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
+                match self.dispatch_llm_request().await {
+                    Ok(event) => Ok(event),
+                    Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
+                }
+            }
+            SteeringDrainPostCommit::ContinueExistingLlm => Ok(None),
+        }
+    }
+
+    fn llm_dispatch_failure_event(&self, error: String) -> Event {
+        tracing::error!(
+            conversation_id = %self.context.conversation_id,
+            %error,
+            "LLM dispatch failed before starting a provider task"
+        );
+        let attempt = match self.state {
+            ConvState::LlmRequesting { attempt } => attempt,
+            _ => 1,
+        };
+        Event::LlmError {
+            message: error,
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            attempt,
+            recovery_in_progress: false,
+            resets_at: None,
+        }
+    }
+
+    async fn resume_interrupted_llm_request(&mut self) -> Result<bool, String> {
+        match self.execute_effect(Effect::RequestLlm).await {
+            Ok(_) => Ok(false),
+            Err(error) => {
+                tracing::error!(%error, "Failed to resume LLM request");
+                let failure = self.llm_dispatch_failure_event(error);
+                self.process_event(failure).await?;
+                Ok(true)
             }
         }
     }
@@ -12099,6 +12479,19 @@ mod steer_drain_detector_tests {
         }
     }
 
+    fn mk_steer_event(id: &str, text: &str) -> Event {
+        let entry = mk_entry(id, text);
+        Event::SteerMessage {
+            text: entry.text,
+            llm_text: entry.llm_text,
+            images: entry.images,
+            files: entry.files,
+            message_id: entry.message_id,
+            user_agent: entry.user_agent,
+            skill_invocation: entry.skill_invocation,
+        }
+    }
+
     fn mk_tool_executing() -> ConvState {
         ConvState::ToolExecuting {
             current_tool: ToolCall::new(
@@ -12134,6 +12527,7 @@ mod steer_drain_detector_tests {
         Arc<InMemoryStorage>,
     ) {
         let storage = Arc::new(InMemoryStorage::new());
+        storage.set_steering_queue(conv_id, queue.clone());
         let context = ConvContext::new(conv_id, PathBuf::from("/tmp"), "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -12171,9 +12565,8 @@ mod steer_drain_detector_tests {
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
     /// entries, the executor must emit one `SteerDrainedUserMessages` carrying
-    /// all 3 entries and clear in-memory `self.steering_queue`. DB queue clear
-    /// is the `Effect::ClearSteeringQueueEntries` arm's job, covered by
-    /// `clear_steering_queue_entries_preserves_concurrent_enqueue`.
+    /// all 3 entries and clear in-memory `self.steering_queue` through the
+    /// reducer's atomic drain effect.
     /// Drain-all on entering Idle is processed INLINE: persists land before
     /// `apply_transition_result` returns. Assertion is via storage rather than
     /// `generated_events` because the drain event no longer surfaces externally.
@@ -12207,6 +12600,181 @@ mod steer_drain_detector_tests {
         // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
         // SteerDrainedUserMessages arm).
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn drain_reloads_durable_queue_and_filters_cancelled_startup_entry() {
+        let conversation_id = "conv-cancel-before-drain";
+        let stale_entry = mk_entry("cancelled", "must not be delivered");
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![stale_entry],
+        );
+        storage.set_steering_queue(conversation_id, Vec::new());
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.apply_transition_result(TransitionResult::new(ConvState::Idle))
+            .await
+            .expect("cancelled durable entry must be filtered");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::Idle));
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_after_idle_drains_immediately() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-late-steer", ConvState::Idle, vec![]);
+        storage.set_steering_queue(
+            "conv-late-steer",
+            vec![mk_entry("late-steer", "do this next")],
+        );
+
+        rt.process_event(mk_steer_event("late-steer", "do this next"))
+            .await
+            .expect("late steer must drain from idle");
+
+        let messages = storage.get_all_messages("conv-late-steer");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["late-steer"]
+        );
+        assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn startup_idle_queue_commits_before_starting_llm() {
+        let conversation_id = "startup-idle-drain";
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![mk_entry("startup", "recover")],
+        );
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup drain");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::StartedLlm);
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert!(rt.llm_task_handle.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_defers_steering_drain_until_accepted_direct_turn_materializes() {
+        let conversation_id = "startup-direct-before-steering";
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![mk_entry("steer-after-direct", "second")],
+        );
+        storage.set_unmaterialized_active_direct_turn(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(41),
+            generation: 0,
+        });
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup defers queued steering");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::NotNeeded);
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert_eq!(storage.get_steering_queue(conversation_id).len(), 1);
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_steering_notification_defers_until_accepted_direct_turn_materializes() {
+        let conversation_id = "idle-direct-before-steering";
+        let entry = mk_entry("steer-after-direct", "second");
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, ConvState::Idle, vec![]);
+        storage.set_steering_queue(conversation_id, vec![entry.clone()]);
+        storage.set_unmaterialized_active_direct_turn(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(42),
+            generation: 0,
+        });
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(mk_steer_event(
+            &entry.message_id,
+            entry.llm_text.as_deref().unwrap_or(&entry.text),
+        ))
+        .await
+        .expect("idle notification defers queued steering");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        let durable_queue = storage.get_steering_queue(conversation_id);
+        assert_eq!(durable_queue.len(), 1);
+        assert_eq!(durable_queue[0].message_id, entry.message_id);
+        assert_eq!(durable_queue[0].text, entry.text);
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_legacy_partial_commits_before_one_resume_request() {
+        use crate::runtime::traits::MessageStore;
+
+        let conversation_id = "startup-legacy-drain";
+        let entry = mk_entry("legacy", "recover");
+        let (rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![entry],
+        );
+        storage
+            .add_message(
+                "legacy",
+                conversation_id,
+                &MessageContent::user("recover"),
+                None,
+                None,
+            )
+            .await
+            .expect("legacy partial message");
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let outcome = rt
+            .commit_startup_steering_queue()
+            .await
+            .expect("startup legacy drain");
+
+        assert_eq!(outcome, StartupSteeringDrainOutcome::ResumeLlm);
+        assert_eq!(storage.get_all_messages(conversation_id).len(), 1);
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "run_inner owns the single resume request"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_steer_reloads_durable_queue_before_immediate_drain() {
+        let conversation_id = "conv-cancelled-late-steer";
+        let (rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, ConvState::Idle, vec![]);
+        let mut rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(mk_steer_event("cancelled", "must not be delivered"))
+            .await
+            .expect("cancelled late steer must be absorbed");
+
+        assert!(storage.get_all_messages(conversation_id).is_empty());
+        assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::Idle));
     }
 
     /// Task 60004: entering Idle with a non-empty steering queue must NOT
@@ -12967,18 +13535,13 @@ mod steer_drain_detector_tests {
             "queue must be preserved when no drain hook fires"
         );
         assert_eq!(rt.steering_queue[0].message_id, "keep-me");
-        // No persist call happened on this path, so storage's queue is still empty
-        // (it was never written to). The point of the assertion above is that the
-        // in-memory queue is the live source — it was not modified.
-        let _ = storage; // touch to silence unused warning
+        assert_eq!(storage.get_steering_queue("conv-intermediate").len(), 1);
     }
 
-    /// `Effect::ClearSteeringQueueEntries` removes ONLY the matching `message_ids`
-    /// from storage; concurrently-enqueued entries are preserved. Models the
-    /// enqueue-during-drain race.
+    /// The atomic drain removes only its reducer-selected identities, preserving
+    /// an entry appended after that batch was selected.
     #[tokio::test]
-    async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
-        use crate::runtime::traits::StateStore;
+    async fn atomic_steering_drain_preserves_concurrent_enqueue() {
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
@@ -12986,28 +13549,257 @@ mod steer_drain_detector_tests {
         );
         // Pre-seed storage as if drain took [p1, p2] from in-memory, then a
         // concurrent enqueue persisted [p1, p2, c1] (c1 added by enqueue).
-        storage
-            .update_steering_queue(
-                "conv-clear-effect",
-                &[
-                    mk_entry("p1", "pending-1"),
-                    mk_entry("p2", "pending-2"),
-                    mk_entry("c1", "concurrent"),
-                ],
-            )
-            .await
-            .expect("seed steering queue");
+        storage.set_steering_queue(
+            "conv-clear-effect",
+            vec![
+                mk_entry("p1", "pending-1"),
+                mk_entry("p2", "pending-2"),
+                mk_entry("c1", "concurrent"),
+            ],
+        );
 
-        // Drain only removes p1 and p2.
-        rt.execute_effect(Effect::ClearSteeringQueueEntries {
-            message_ids: vec!["p1".to_string(), "p2".to_string()],
-        })
-        .await
-        .expect("ClearSteeringQueueEntries effect must succeed");
+        let result = transition(
+            &rt.state,
+            &rt.context,
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_entry("p1", "pending-1"), mk_entry("p2", "pending-2")],
+            },
+        )
+        .expect("drain transition");
+        rt.apply_transition_result(result)
+            .await
+            .expect("atomic steering drain must succeed");
 
         let remaining = storage.get_steering_queue("conv-clear-effect");
         assert_eq!(remaining.len(), 1, "concurrent enqueue must survive drain");
         assert_eq!(remaining[0].message_id, "c1");
+        assert_eq!(
+            storage
+                .get_all_messages("conv-clear-effect")
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_steering_drain_rolls_back_without_retry_or_dispatch() {
+        let queue = vec![mk_entry("s1", "must not dispatch yet")];
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-clear-failure", ConvState::Idle, queue);
+        storage.set_steering_drain_failures(1);
+
+        let result = transition(
+            &rt.state,
+            &rt.context,
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_entry("s1", "must not dispatch yet")],
+            },
+        )
+        .expect("drain transition");
+        let error = rt
+            .apply_transition_result(result)
+            .await
+            .expect_err("failed transaction must be surfaced without an executor retry loop");
+
+        assert!(error.contains("injected steering drain failure"));
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "LLM dispatch must not happen before commit"
+        );
+        assert!(storage.get_all_messages("conv-clear-failure").is_empty());
+        assert_eq!(storage.get_steering_queue("conv-clear-failure").len(), 1);
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_dispatch_failure_preserves_drain_and_persists_error() {
+        let conversation_id = "conv-post-commit-dispatch-failure";
+        let entry = mk_entry("accepted-steer", "accepted once");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![entry.clone()],
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(Event::SteeringQueueChanged)
+            .await
+            .expect("dispatch failure becomes a reducer-owned error");
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1,
+            "the committed user message remains authoritative"
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("committed state"),
+            ConvState::Error {
+                message: "Persisted effort 'high' is not supported by model 'test-model'"
+                    .to_string(),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            }
+        );
+        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert!(rt.llm_task_handle.is_none());
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn new_turn_steering_drain_resets_parent_cycle_budget() {
+        let conversation_id = "conv-steering-new-turn-cycle-budget";
+        let entry = mk_entry("fresh-turn", "fresh turn");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::Idle,
+            vec![entry.clone()],
+        );
+        rt.parent_tool_cycle_cap = 1;
+        rt.parent_tool_cycle_count = 1;
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        rt.process_event(Event::SteeringQueueChanged)
+            .await
+            .expect("fresh steering turn starts within a fresh cycle budget");
+
+        assert_eq!(rt.parent_tool_cycle_count, 1);
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mid_turn_dispatch_failure_preserves_drain_and_persists_error() {
+        let conversation_id = "conv-mid-turn-dispatch-failure";
+        let entry = mk_entry("mid-turn-steer", "accepted mid turn");
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            mk_tool_executing(),
+            vec![entry.clone()],
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        rt = rt.with_steering_projection_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+        let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::RequestLlm);
+        let generated = rt
+            .apply_transition_result(result)
+            .await
+            .expect("mid-turn drain commit succeeds before dispatch");
+        assert_eq!(generated.len(), 1, "dispatch failure must become one event");
+        for event in generated {
+            rt.process_event(event)
+                .await
+                .expect("dispatch failure settles through the reducer");
+        }
+
+        assert_eq!(
+            storage
+                .get_all_messages(conversation_id)
+                .iter()
+                .filter(|message| message.message_id == entry.message_id)
+                .count(),
+            1
+        );
+        assert!(storage.get_steering_queue(conversation_id).is_empty());
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("settled state"),
+            ConvState::Error {
+                message: "Persisted effort 'high' is not supported by model 'test-model'"
+                    .to_string(),
+                error_kind: crate::db::ErrorKind::InvalidRequest,
+                resets_at: None,
+            }
+        );
+        assert!(matches!(rt.state, ConvState::Error { .. }));
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_steering_recovery_dispatch_failure_persists_error() {
+        let conversation_id = "conv-steering-recovery-dispatch-failure";
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            conversation_id,
+            ConvState::LlmRequesting { attempt: 1 },
+            Vec::new(),
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+
+        assert!(
+            rt.resume_interrupted_llm_request()
+                .await
+                .expect("dispatch failure settles"),
+            "synchronous recovery dispatch failure must be reported"
+        );
+
+        let expected = ConvState::Error {
+            message: "Persisted effort 'high' is not supported by model 'test-model'".to_string(),
+            error_kind: crate::db::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("settled recovery state"),
+            expected
+        );
+        assert_eq!(rt.state, expected);
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_steering_recovery_settlement_failure_retires_runtime() {
+        let conversation_id = "conv-steering-recovery-settlement-failure";
+        let initial_state = ConvState::LlmRequesting { attempt: 1 };
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue(conversation_id, initial_state.clone(), Vec::new());
+        storage
+            .update_state(conversation_id, &initial_state, Utc::now())
+            .await
+            .expect("seed durable recovery state");
+        storage.set_fail_state_update(true);
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), rt.run())
+            .await
+            .expect("failed settlement must retire the runtime");
+
+        assert_eq!(
+            storage
+                .get_state(conversation_id)
+                .await
+                .expect("unchanged durable recovery state"),
+            initial_state
+        );
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

@@ -24,7 +24,7 @@
 
 import * as v from 'valibot';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
-import type { Conversation, Message } from './api';
+import type { Conversation, Message, QueuedSteeringMessage } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
 // names for the transform-output types consumers actually want.
 import type {
@@ -43,6 +43,7 @@ import type {
   SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBrowserSessionStateData as WireBrowserSessionStateData,
   SseSteerMessageQueuedData as WireSteerMessageQueuedData,
+  SseSteerMessageCancelledData as WireSteerMessageCancelledData,
   ErrorPresentation as WireErrorPresentation,
   SseRateLimitSnapshotData as WireRateLimitSnapshotData,
   SseWorkScopeUpdateData as WireWorkScopeUpdateData,
@@ -132,6 +133,24 @@ const MessageSchema = v.pipe(
   v.transform((obj): Message => obj as unknown as Message),
 );
 
+const QueuedSteeringMessageSchema = v.pipe(
+  v.looseObject({
+    message_id: v.string(),
+    text: v.string(),
+    images: v.array(v.looseObject({
+      data: v.string(),
+      media_type: v.string(),
+    })),
+    files: v.array(v.looseObject({
+      original_name: v.string(),
+      media_type: v.string(),
+      size_bytes: v.number(),
+      stored_path: v.string(),
+    })),
+  }),
+  v.transform((obj): QueuedSteeringMessage => obj),
+);
+
 // ---------------------------------------------------------------------------
 // Event schemas. One per `addEventListener` in useConnection.ts.
 //
@@ -167,8 +186,10 @@ export const SseInitDataSchema = v.looseObject({
   transcript_generation: v.number(),
   transcript_coverage: v.picklist(['complete', 'tail', 'preserve']),
   messages: v.array(MessageSchema),
+  steering_messages: v.array(QueuedSteeringMessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),
+  stream_incarnation: v.string(),
   presentation_mode: v.string(),
   context_window_size: v.number(),
   project_name: v.nullable(v.string()),
@@ -375,9 +396,14 @@ export const SseBrowserSessionStateDataSchema = v.looseObject({
  *  position indicator on the message bubble. */
 export const SseSteerMessageQueuedDataSchema = v.looseObject({
   sequence_id: v.number(),
-  message_id: v.string(),
+  message: QueuedSteeringMessageSchema,
   queue_position: v.number(),
 }) satisfies v.GenericSchema<unknown, WireSteerMessageQueuedData>;
+
+export const SseSteerMessageCancelledDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  message_id: v.string(),
+}) satisfies v.GenericSchema<unknown, WireSteerMessageCancelledData>;
 
 /** Per-window quota state (`primary` / `secondary` slots inside QuotaDetails).
  *  `used_percent` is the only guaranteed field; `window_minutes` and
@@ -525,6 +551,7 @@ export type SseBrowserSessionStateData = v.InferOutput<
   typeof SseBrowserSessionStateDataSchema
 >;
 export type SseSteerMessageQueuedData = v.InferOutput<typeof SseSteerMessageQueuedDataSchema>;
+export type SseSteerMessageCancelledData = v.InferOutput<typeof SseSteerMessageCancelledDataSchema>;
 export type SseRateLimitSnapshotData = v.InferOutput<typeof SseRateLimitSnapshotDataSchema>;
 export type SseWorkScopeUpdateData = v.InferOutput<typeof SseWorkScopeUpdateDataSchema>;
 export type QuotaDetails = v.InferOutput<typeof QuotaDetailsSchema>;

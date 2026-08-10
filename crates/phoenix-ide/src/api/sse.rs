@@ -20,6 +20,59 @@ use tokio_stream::StreamExt;
 
 const CONVERSATION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Copy)]
+pub(crate) enum SseStreamAudience {
+    Authenticated,
+    SharedTranscript,
+}
+
+impl SseStreamAudience {
+    fn allows(self, event: &SseEvent) -> bool {
+        match self {
+            Self::Authenticated => true,
+            Self::SharedTranscript => match event {
+                SseEvent::SteerMessageQueued { .. } | SseEvent::SteerMessageCancelled { .. } => {
+                    false
+                }
+                SseEvent::Init { .. }
+                | SseEvent::Message { .. }
+                | SseEvent::MessageUpdated { .. }
+                | SseEvent::StateChange { .. }
+                | SseEvent::Token { .. }
+                | SseEvent::LlmFirstByte { .. }
+                | SseEvent::LlmAttempt { .. }
+                | SseEvent::AgentDone { .. }
+                | SseEvent::ConversationBecameTerminal { .. }
+                | SseEvent::ConversationUpdate { .. }
+                | SseEvent::Error { .. }
+                | SseEvent::ConversationHardDeleted { .. }
+                | SseEvent::BrowserSessionState { .. }
+                | SseEvent::BashToolProgress { .. }
+                | SseEvent::RateLimitSnapshot { .. }
+                | SseEvent::WorkScopeUpdate { .. } => true,
+            },
+        }
+    }
+
+    fn prepare(self, mut event: SseEvent) -> Option<SseEvent> {
+        if !self.allows(&event) {
+            return None;
+        }
+        if matches!(self, Self::SharedTranscript) {
+            if let SseEvent::Init {
+                steering_messages,
+                pending_events,
+                ..
+            } = &mut event
+            {
+                steering_messages.clear();
+                pending_events.retain(|pending| self.allows(pending));
+            }
+        }
+        Some(event)
+    }
+}
+
 /// Short-lived trace for the work required to produce the first usable SSE
 /// init item. Unlike the HTTP stream span, this ends when init is serialized
 /// and yielded, not when the long-lived `EventSource` disconnects.
@@ -97,10 +150,15 @@ pub fn sse_stream(
     init_event: SseEvent,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
     init_trace: Option<SseInitTrace>,
+    audience: SseStreamAudience,
 ) -> impl IntoResponse {
     let init = futures::stream::once(async move {
         let serialization_started = std::time::Instant::now();
-        let event = sse_event_to_axum(init_event);
+        let event = sse_event_to_axum(
+            audience
+                .prepare(init_event)
+                .expect("init is visible to every SSE audience"),
+        );
         if let Some(trace) = init_trace {
             trace.record_ms("stream.serialization_ms", serialization_started.elapsed());
             trace.record_ms("stream.time_to_init_ms", trace.started.elapsed());
@@ -121,8 +179,10 @@ pub fn sse_stream(
             }
             _ => true,
         })
-        .filter_map(|result| match result {
-            Ok(event) => Some(Ok(sse_event_to_axum(event))),
+        .filter_map(move |result| match result {
+            Ok(event) => audience
+                .prepare(event)
+                .map(|event| Ok(sse_event_to_axum(event))),
             Err(_) => None, // Lagged already closed the stream above
         });
 
@@ -177,9 +237,11 @@ mod tests {
                 sequence_id,
                 conversation,
                 transcript,
+                steering_messages,
                 agent_working,
                 presentation_mode,
                 last_sequence_id,
+                stream_incarnation,
                 context_window_size,
                 project_name,
                 pending_anchor_sequence_id,
@@ -208,9 +270,14 @@ mod tests {
                     "transcript_generation": transcript_generation,
                     "transcript_coverage": transcript_coverage,
                     "messages": enriched_msgs,
+                    "steering_messages": steering_messages
+                        .iter()
+                        .map(crate::api::wire::QueuedSteeringMessage::from)
+                        .collect::<Vec<_>>(),
                     "agent_working": agent_working,
                     "presentation_mode": presentation_mode,
                     "last_sequence_id": last_sequence_id,
+                    "stream_incarnation": stream_incarnation,
                     "context_window_size": context_window_size,
                     "project_name": project_name,
                     "pending_anchor_sequence_id": pending_anchor_sequence_id,
@@ -361,13 +428,21 @@ mod tests {
             }),
             SseEvent::SteerMessageQueued {
                 sequence_id,
-                message_id,
+                message,
                 queue_position,
             } => json!({
                 "type": "steer_message_queued",
                 "sequence_id": sequence_id,
-                "message_id": message_id,
+                "message": crate::api::wire::QueuedSteeringMessage::from(message),
                 "queue_position": queue_position,
+            }),
+            SseEvent::SteerMessageCancelled {
+                sequence_id,
+                message_id,
+            } => json!({
+                "type": "steer_message_cancelled",
+                "sequence_id": sequence_id,
+                "message_id": message_id,
             }),
             SseEvent::RateLimitSnapshot {
                 sequence_id,
@@ -519,6 +594,18 @@ mod tests {
         }
     }
 
+    fn fixture_steer_entry(message_id: &str) -> crate::state_machine::event::SteerEntry {
+        crate::state_machine::event::SteerEntry {
+            text: "queued from another client".to_string(),
+            llm_text: Some("queued from another client".to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: message_id.to_string(),
+            user_agent: Some("test-agent".to_string()),
+            skill_invocation: None,
+        }
+    }
+
     // ------------------------------------------------------------------
     // Parity tests — one per SseEvent variant
     // ------------------------------------------------------------------
@@ -533,9 +620,11 @@ mod tests {
                 fixture_user_message(),
                 fixture_agent_message_with_bash(),
             ]),
+            steering_messages: vec![fixture_steer_entry("msg-steer-init")],
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 42,
+            stream_incarnation: "test-stream".to_string(),
             context_window_size: 2048,
             project_name: Some("phoenix".to_string()),
             pending_anchor_sequence_id: 0,
@@ -543,6 +632,16 @@ mod tests {
             pending_truncated: false,
         };
         assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(
+            typed["steering_messages"][0]["message_id"],
+            "msg-steer-init"
+        );
+        assert_eq!(
+            typed["steering_messages"][0]["text"],
+            "queued from another client"
+        );
+        assert!(typed["steering_messages"][0].get("llm_text").is_none());
     }
 
     /// Init with a populated `ReplayRing` snapshot. Exercises the recursive
@@ -581,9 +680,11 @@ mod tests {
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
             transcript: crate::runtime::InitTranscript::Complete(vec![fixture_user_message()]),
+            steering_messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: 45,
+            stream_incarnation: "test-stream".to_string(),
             context_window_size: 2048,
             project_name: Some("phoenix".to_string()),
             pending_anchor_sequence_id: anchor,
@@ -626,9 +727,11 @@ mod tests {
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
             transcript: crate::runtime::InitTranscript::Complete(vec![fixture_user_message()]),
+            steering_messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: 99,
+            stream_incarnation: "test-stream".to_string(),
             context_window_size: 0,
             project_name: None,
             pending_anchor_sequence_id: 50,
@@ -970,10 +1073,88 @@ mod tests {
     fn parity_steer_message_queued() {
         let event = SseEvent::SteerMessageQueued {
             sequence_id: 22,
-            message_id: "msg-steer-1".to_string(),
+            message: fixture_steer_entry("msg-steer-1"),
             queue_position: 0,
         };
         assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_steer_message_cancelled() {
+        let event = SseEvent::SteerMessageCancelled {
+            sequence_id: 23,
+            message_id: "msg-steer-1".to_string(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn shared_audience_filters_live_steering_mutations() {
+        let queued = SseEvent::SteerMessageQueued {
+            sequence_id: 22,
+            message: fixture_steer_entry("msg-steer-1"),
+            queue_position: 0,
+        };
+        let cancelled = SseEvent::SteerMessageCancelled {
+            sequence_id: 23,
+            message_id: "msg-steer-1".to_string(),
+        };
+
+        assert!(SseStreamAudience::Authenticated
+            .prepare(queued.clone())
+            .is_some());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(queued)
+            .is_none());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(cancelled)
+            .is_none());
+        assert!(SseStreamAudience::SharedTranscript
+            .prepare(SseEvent::AgentDone { sequence_id: 24 })
+            .is_some());
+    }
+
+    #[test]
+    fn shared_audience_filters_steering_from_init_and_replay() {
+        let init = SseEvent::Init {
+            sequence_id: 24,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
+            steering_messages: vec![fixture_steer_entry("durable-steer")],
+            agent_working: true,
+            presentation_mode: "working".to_string(),
+            last_sequence_id: 24,
+            stream_incarnation: "test-stream".to_string(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 21,
+            pending_events: vec![
+                SseEvent::SteerMessageQueued {
+                    sequence_id: 22,
+                    message: fixture_steer_entry("replayed-steer"),
+                    queue_position: 0,
+                },
+                SseEvent::AgentDone { sequence_id: 24 },
+            ],
+            pending_truncated: false,
+        };
+
+        let filtered = SseStreamAudience::SharedTranscript
+            .prepare(init)
+            .expect("shared init remains visible");
+        let SseEvent::Init {
+            steering_messages,
+            pending_events,
+            ..
+        } = filtered
+        else {
+            panic!("expected init");
+        };
+
+        assert!(steering_messages.is_empty());
+        assert_eq!(pending_events.len(), 1);
+        assert!(matches!(pending_events[0], SseEvent::AgentDone { .. }));
     }
 
     // ------------------------------------------------------------------
@@ -1041,9 +1222,11 @@ mod tests {
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
             transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
+            steering_messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
             last_sequence_id: init_seq,
+            stream_incarnation: "test-stream".to_string(),
             context_window_size: 0,
             project_name: None,
             pending_anchor_sequence_id,
@@ -1138,9 +1321,11 @@ mod tests {
             conversation: Box::new(fixture_enriched_conversation()),
             transcript_generation: 1,
             transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
+            steering_messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
             last_sequence_id: init_seq,
+            stream_incarnation: "test-stream".to_string(),
             context_window_size: 0,
             project_name: None,
             pending_anchor_sequence_id: anchor,

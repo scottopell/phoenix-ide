@@ -6,7 +6,7 @@ import type { ContentBlock, Message, ToolResultContent } from '../../api';
 import type { BashToolProgress } from '../../generated/sse';
 import type { StreamingBuffer } from '../../conversation/atom';
 import type { DiffSection } from '../../contexts/ReviewNotesContext';
-import type { QueuedMessage } from '../../hooks/useMessageQueue';
+import type { PendingUserMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
 import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierreDiffMapping';
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
@@ -887,7 +887,7 @@ function skillMessageParts(message: Message): { text: string; attachments: strin
   };
 }
 
-function queuedMessageParts(message: QueuedMessage): { text: string; attachments: string[] } {
+function queuedMessageParts(message: PendingUserMessage): { text: string; attachments: string[] } {
   return { text: message.text, attachments: (message.files ?? []).map((file) => file.original_name) };
 }
 
