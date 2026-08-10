@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let serverManager = ServerManager()
     private var cancellables = Set<AnyCancellable>()
     private var pendingConversationID: UUID?
+    private var focusComposerAfterNavigation = false
     private var hotkeyError: HotkeyError?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -114,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 origin: origin,
                 onWebViewReady: { [weak self] value in
                     self?.webView = value
+                    self?.focusPendingComposer(in: value)
                     self?.openPendingConversation()
                 },
                 onDeployment: { [weak self] result in
@@ -157,7 +159,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func openPendingConversation() {
         guard let webView, let id = pendingConversationID, let origin = serverManager.webOrigin else { return }
         pendingConversationID = nil
+        focusComposerAfterNavigation = true
         webView.load(URLRequest(url: origin.url(path: "/c/\(id.uuidString.lowercased())")))
+    }
+
+    private func focusPendingComposer(in webView: WKWebView) {
+        guard focusComposerAfterNavigation else { return }
+        focusComposerAfterNavigation = false
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(webView)
+        NSApp.activate(ignoringOtherApps: true)
+        let script = """
+        (() => {
+          const focusComposer = () => {
+            const composer = document.getElementById('message-input');
+            if (!(composer instanceof HTMLTextAreaElement)) return false;
+            composer.focus();
+            return true;
+          };
+          if (focusComposer()) return;
+          const observer = new MutationObserver(() => {
+            if (focusComposer()) observer.disconnect();
+          });
+          observer.observe(document.documentElement, { childList: true, subtree: true });
+        })();
+        """
+        webView.evaluateJavaScript(script)
     }
 }
 
