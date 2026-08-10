@@ -435,17 +435,12 @@ export function ViewerSlotProvider({
       setRestorationSettledScope(scopeKey);
       return;
     }
-    if (malformed && scopeKey) {
+    if (slot.kind === 'none' && scopeKey) {
       clearLastViewer(scopeKey);
       restorationScheduledForScopeRef.current = undefined;
       setRestorationSettledScope(scopeKey);
     }
-  }, [scopeKey, slot.kind, malformed]);
-
-  const browserAutoOpenPending = browserSessionStateLoaded
-    && browserSessionActive === true
-    && slot.kind === 'none';
-  const restorationSettled = restorationSettledScope === scopeKey && !browserAutoOpenPending;
+  }, [scopeKey, slot.kind]);
 
   // REQ-VS-008 / REQ-VS-009: browser-session edges. Rising edge auto-opens the
   // browser viewer only when the slot is empty (never steals prose/diff);
@@ -461,6 +456,12 @@ export function ViewerSlotProvider({
   // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
   const edgeScopeRef = useRef(scopeKey);
+  const browserAutoOpenPending = edgeScopeRef.current === scopeKey
+    && prevActiveRef.current !== true
+    && browserSessionStateLoaded
+    && browserSessionActive === true
+    && slot.kind === 'none';
+  const restorationSettled = restorationSettledScope === scopeKey && !browserAutoOpenPending;
   const clearStoredBrowserSnapshot = useCallback((key: string | undefined) => {
     if (!key) return;
     const stored = getLastViewer(key);

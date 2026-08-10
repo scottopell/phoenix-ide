@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 
 interface ConfirmDialogProps {
   visible: boolean;
@@ -22,6 +23,7 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  useRegisterFocusScope(visible ? 'confirm-dialog' : null);
 
   useEffect(() => {
     if (visible) {

@@ -366,7 +366,8 @@ describe('ConversationPage route focus', () => {
 
     renderPage(makeConversation());
 
-    expect(await screen.findByRole('textbox')).toHaveFocus();
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
     document.body.removeChild(anchor);
   });
 
@@ -431,15 +432,15 @@ describe('ConversationPage route focus', () => {
     document.body.removeChild(anchor);
   });
 
-  it('preserves focus when authoritative init will auto-open an active browser session', async () => {
+  it('focuses the composer when an already-active browser session intentionally keeps its viewer closed', async () => {
     const anchor = document.createElement('button');
     document.body.appendChild(anchor);
     anchor.focus();
 
     renderPage(makeConversation({ browser_session_active: true }));
 
-    await screen.findByTestId('message-history');
-    expect(anchor).toHaveFocus();
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
     document.body.removeChild(anchor);
   });
 
@@ -553,7 +554,8 @@ describe('ConversationPage route focus', () => {
       });
     });
 
-    expect(await screen.findByRole('textbox')).toHaveFocus();
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
     document.body.removeChild(anchor);
   });
 });

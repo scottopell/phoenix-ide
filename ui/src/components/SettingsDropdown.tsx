@@ -9,6 +9,7 @@ import {
   useNotificationSettings,
 } from '../notifications';
 import { useDensity } from '../hooks/useDensity';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 
 type BrowserPermission = NotificationPermission | 'unsupported';
 
@@ -56,6 +57,7 @@ export function SettingsDropdown({
   compact = false,
 }: Props) {
   const [open, setOpen] = useState(false);
+  useRegisterFocusScope(open ? 'settings-dialog' : null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);

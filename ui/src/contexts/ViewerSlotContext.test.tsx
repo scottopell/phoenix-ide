@@ -532,6 +532,34 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     expect(getLastViewer('conv-A')).toBeNull();
   });
 
+  it('settles and discards an orphan stored snapshot that resolves to no viewer', async () => {
+    setLastViewer('conv-A', 'presentation=pane&file=%2Ftmp%2Fa');
+    let restorationSettled = false;
+    function Destination() {
+      return (
+        <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+          <RestorationCapture onSettled={(settled) => { restorationSettled = settled; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    function Enter() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/c/conv-A')}>enter</button>;
+    }
+    const { getByText } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="/" element={<Enter />} />
+          <Route path="/c/:slug" element={<Destination />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    act(() => { fireEvent.click(getByText('enter')); });
+    await waitFor(() => expect(restorationSettled).toBe(true));
+    expect(getLastViewer('conv-A')).toBeNull();
+  });
+
   it('closes a browser fall while readiness is pending, then invalidates storage when confirmed', () => {
     setLastViewer('conv-A', 'viewer=browser');
     let latest: ViewerSlotValue | null = null;
@@ -663,6 +691,7 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
 
   it('does not auto-open when readiness confirms a browser that was already active on entry', () => {
     let latest: ViewerSlotValue | null = null;
+    let restorationSettled = false;
     let setLoaded: ((loaded: boolean) => void) | null = null;
     function Harness() {
       const [loaded, setLoadedState] = useState(false);
@@ -674,6 +703,7 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
           browserSessionStateLoaded={loaded}
         >
           <Capture onCtx={(ctx) => { latest = ctx; }} />
+          <RestorationCapture onSettled={(settled) => { restorationSettled = settled; }} />
         </ViewerSlotProvider>
       );
     }
@@ -686,8 +716,10 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     );
 
     expect(latest!.slot.kind).toBe('none');
+    expect(restorationSettled).toBe(false);
     act(() => { setLoaded!(true); });
     expect(latest!.slot.kind).toBe('none');
+    expect(restorationSettled).toBe(true);
   });
 
   it('auto-opens when loaded session truth rises from unknown to active in the same conversation', () => {

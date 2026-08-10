@@ -13,6 +13,11 @@ import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { canShowCommissionReviewViewer } from './commissionReviewViewerPrecedence';
+import {
+  decideRouteFocus,
+  reduceRouteFocusState,
+  type RouteFocusState,
+} from './conversationRouteFocus';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyMergeEventCursorFloor,
@@ -147,43 +152,6 @@ const XCircle = () => (
 const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
-
-type RouteFocusDisposition = 'focus' | 'defer' | 'preserve-owner';
-
-function routeFocusDisposition(state: Conversation['state']): RouteFocusDisposition {
-  if (!state) return 'preserve-owner';
-  switch (state.type) {
-    case 'idle':
-    case 'llm_requesting':
-    case 'seeded_llm_requesting':
-    case 'tool_executing':
-    case 'awaiting_sub_agents':
-    case 'cancelling_tool':
-    case 'cancelling_sub_agents':
-      return 'focus';
-    case 'error':
-      return state.error?.can_user_resume ? 'focus' : 'preserve-owner';
-    case 'awaiting_llm':
-    case 'awaiting_continuation':
-    case 'cancelling':
-    case 'provisioning':
-      return 'defer';
-    case 'recoverable_continuation_failure':
-    case 'awaiting_task_approval':
-    case 'awaiting_commission_review_approval':
-    case 'awaiting_user_response':
-    case 'context_exhausted':
-    case 'handed_off':
-    case 'awaiting_recovery':
-    case 'creation_failed':
-    case 'creation_cancelled':
-    case 'terminal':
-      return 'preserve-owner';
-    default:
-      state satisfies never;
-      return 'preserve-owner';
-  }
-}
 
 function prefersConversationIdRoute(routeSegment: string): boolean {
   return isUuidRouteSegment(routeSegment);
@@ -366,7 +334,7 @@ function ConversationPageContent({
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
   const viewerRestorationSettled = useViewerRestorationSettled();
-  const { hasActiveScope } = useFocusScope();
+  const { activeScope } = useFocusScope();
   const slotKind = viewerSlot.slot.kind;
   const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
   const rawDiffTarget = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.target : 'workspace';
@@ -476,39 +444,64 @@ function ConversationPageContent({
     setFocusToken((t) => t + 1);
   }, []);
 
-  // Route navigation is an explicit composer-focus request. Key by both route
-  // segment and authoritative id: UUID routes may canonicalize to a slug, and
-  // the final route must retain focus. Background refreshes keep the same key
-  // and therefore never steal focus.
-  const lastNavigationFocusKeyRef = useRef<string | null>(null);
+  const [routeFocusState, dispatchRouteFocus] = useReducer(
+    reduceRouteFocusState,
+    { routeKey: null, decision: 'consumed' } satisfies RouteFocusState,
+  );
+  const provisionalRouteFocusKey = slug ? `route:${slug}` : null;
+  const authoritativeConversationId = resolvedRouteConversationId === conversationId
+    ? conversationId
+    : undefined;
+  const routeFocusKey = authoritativeConversationId
+    ? `conversation:${authoritativeConversationId}`
+    : provisionalRouteFocusKey;
   useLayoutEffect(() => {
-    if (!slug || !conversationId || !conversation || !archiveStatusConfirmed || !viewerRestorationSettled) return;
-    const key = `${slug}:${conversationId}`;
-    if (lastNavigationFocusKeyRef.current === key) return;
-    if (!isDesktop || isArchived || slotKind !== 'none' || viewerSlot.browserSessionActive || hasActiveScope || targetMessageId) {
-      lastNavigationFocusKeyRef.current = key;
-      return;
-    }
-    const disposition = routeFocusDisposition(atom.phase);
-    if (disposition === 'preserve-owner') {
-      lastNavigationFocusKeyRef.current = key;
-    } else if (disposition === 'focus' && inputRef.current?.focus()) {
-      lastNavigationFocusKeyRef.current = key;
-    }
+    dispatchRouteFocus({
+      type: 'route_observed',
+      ...(authoritativeConversationId && provisionalRouteFocusKey ? { continuesRouteKey: provisionalRouteFocusKey } : {}),
+      next: decideRouteFocus({
+        isDesktop,
+        routeKey: routeFocusKey,
+        routeSettled: archiveStatusConfirmed && viewerRestorationSettled,
+        browserSessionStateLoaded: archiveStatusConfirmed,
+        archived: isArchived,
+        targetMessageId,
+        activeFocusScope: activeScope,
+        viewerOwnsFocus: slotKind !== 'none',
+        composerRenders: inputRef.current !== null,
+        phase: atom.phase,
+      }),
+    });
   }, [
     isDesktop,
-    slug,
-    conversationId,
-    conversation,
-    atom.phase,
-    isArchived,
+    routeFocusKey,
+    authoritativeConversationId,
+    provisionalRouteFocusKey,
     archiveStatusConfirmed,
-    slotKind,
-    viewerSlot.browserSessionActive,
     viewerRestorationSettled,
-    hasActiveScope,
+    isArchived,
     targetMessageId,
+    activeScope,
+    slotKind,
+    atom.phase,
   ]);
+  useLayoutEffect(() => {
+    if (routeFocusState.decision !== 'focus-composer') return;
+    if (inputRef.current?.focus()) dispatchRouteFocus({ type: 'focus_applied' });
+  }, [routeFocusState]);
+  useEffect(() => {
+    if (!routeFocusKey || (routeFocusState.decision !== 'pending' && routeFocusState.routeKey !== null)) return;
+    const claimInteraction = (event: Event) => {
+      if (!event.isTrusted) return;
+      dispatchRouteFocus({ type: 'interaction_claimed', routeKey: routeFocusKey });
+    };
+    document.addEventListener('pointerdown', claimInteraction, true);
+    document.addEventListener('keydown', claimInteraction, true);
+    return () => {
+      document.removeEventListener('pointerdown', claimInteraction, true);
+      document.removeEventListener('keydown', claimInteraction, true);
+    };
+  }, [routeFocusState.decision, routeFocusState.routeKey, routeFocusKey]);
 
   // App state for offline support
   const { isOnline, queueOperation, removePendingOperations } = useAppMachine();
