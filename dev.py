@@ -45,6 +45,7 @@ PHOENIX_PORT_FILE = ROOT / ".phoenix.port"
 VITE_PORT_FILE = ROOT / ".vite.port"
 LOG_FILE = ROOT / "phoenix.log"
 FATAL_LOG_FILE = ROOT / "phoenix-fatal.log"
+LAUNCHER_LOG_FILE = ROOT / "phoenix-launcher.log"
 
 # ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
 # SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
@@ -1881,13 +1882,31 @@ def _wait_for_files(paths: list[Path], timeout: float = 8.0) -> bool:
     return all(p.exists() for p in paths)
 
 
-def _phoenix_child_stdio() -> dict[str, int]:
+def _phoenix_child_stdio(stderr=subprocess.DEVNULL) -> dict[str, object]:
     """Keep launcher-owned descriptors away from Phoenix's structured log."""
     return {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stderr": stderr,
     }
+
+
+def _start_bounded_stderr_capture() -> tuple[subprocess.Popen, object]:
+    """Capture loader and other pre-main failures without an unbounded log."""
+    capture = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "bounded_output_capture.py"),
+            str(LAUNCHER_LOG_FILE),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if capture.stdin is None:
+        raise RuntimeError("failed to open launcher diagnostic capture")
+    return capture, capture.stdin
 
 
 def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
@@ -1952,12 +1971,16 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     # Fresh structured log per restart. The child never inherits this file, so
     # Phoenix remains its only writer.
     LOG_FILE.write_text("")
-    proc = subprocess.Popen(
-        [str(binary)],
-        env=env,
-        **_phoenix_child_stdio(),
-        start_new_session=True,
-    )
+    capture, launcher_stderr = _start_bounded_stderr_capture()
+    try:
+        proc = subprocess.Popen(
+            [str(binary)],
+            env=env,
+            **_phoenix_child_stdio(launcher_stderr),
+            start_new_session=True,
+        )
+    finally:
+        launcher_stderr.close()
     PHOENIX_PID_FILE.write_text(str(proc.pid))
     PHOENIX_PORT_FILE.write_text(str(port) + "\n")
     register_dev_process("phoenix", proc.pid, port)
@@ -1966,7 +1989,8 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     time.sleep(0.5)
     if not is_process_running(proc.pid):
         print(
-            f"Phoenix failed to start. Check {LOG_FILE.name} and {FATAL_LOG_FILE.name}",
+            "Phoenix failed to start. Check "
+            f"{LOG_FILE.name}, {FATAL_LOG_FILE.name}, and {LAUNCHER_LOG_FILE.name}",
             file=sys.stderr,
         )
         PHOENIX_PID_FILE.unlink()
@@ -2138,6 +2162,7 @@ def cmd_up(
     print(f"Ready! UI: {ui_scheme}://localhost:{vite_port}")
     print(f"        API: {api_scheme}://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
+    print(f"   Launcher: {LAUNCHER_LOG_FILE}")
     if vite_tls:
         ca = phoenix_tls_ca_path()
         if ca:

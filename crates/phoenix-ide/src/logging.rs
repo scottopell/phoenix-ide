@@ -5,7 +5,7 @@
 //! - `PHOENIX_LOG_STDOUT` (bool, default `true`) — structured JSON to stdout.
 //! - `PHOENIX_LOG_FILE` (optional path) — structured JSON appended to that file,
 //!   written by the process itself via a non-blocking worker thread. The active
-//!   file keeps that exact path.
+//!   file keeps that exact path and is truncated before it can exceed 64 MiB.
 //! - `PHOENIX_FATAL_LOG_FILE` (optional path) — the latest fatal startup/runtime
 //!   diagnostic. Each event overwrites the previous one and is capped at 64 KiB.
 //!
@@ -20,7 +20,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::resource::Resource;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -32,6 +32,7 @@ use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+const MAX_STRUCTURED_LOG_BYTES: u64 = 64 * 1024 * 1024;
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
 
 pub(crate) fn process_log_config() -> &'static LogConfig {
@@ -191,6 +192,51 @@ pub(super) fn open_log_append(path: &Path, create_mode: Option<u32>) -> std::io:
             .custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
+}
+
+struct SizeBoundedLogFile {
+    file: File,
+    bytes_written: u64,
+    max_bytes: u64,
+}
+
+impl SizeBoundedLogFile {
+    fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
+        let file = open_log_append(path, None)?;
+        let mut bytes_written = file.metadata()?.len();
+        if bytes_written > max_bytes {
+            file.set_len(0)?;
+            bytes_written = 0;
+        }
+        Ok(Self {
+            file,
+            bytes_written,
+            max_bytes,
+        })
+    }
+}
+
+impl Write for SizeBoundedLogFile {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let buffer_len = u64::try_from(buffer.len()).map_err(io::Error::other)?;
+        if buffer_len > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "one structured log write exceeds its size limit",
+            ));
+        }
+        if self.bytes_written.saturating_add(buffer_len) > self.max_bytes {
+            self.file.set_len(0)?;
+            self.bytes_written = 0;
+        }
+        let written = self.file.write(buffer)?;
+        self.bytes_written += u64::try_from(written).map_err(io::Error::other)?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn prepare_log_identity(path: &Path, private: bool) -> std::io::Result<()> {
@@ -366,7 +412,7 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
 
     let (file_layer, guard) = match config.file.as_deref() {
         Some(path) => {
-            let file = open_log_append(path, None).map_err(|e| {
+            let file = SizeBoundedLogFile::open(path, MAX_STRUCTURED_LOG_BYTES).map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to open PHOENIX_LOG_FILE {}: {e}", path.display()),
@@ -1075,6 +1121,31 @@ mod tests {
         let unopenable = blocker.join("nested.log");
         assert!(open_log_append(&unopenable, None).is_err());
         let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn structured_log_truncates_before_exceeding_its_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("prod.log");
+        std::fs::write(&path, b"12345678").unwrap();
+        let mut file = SizeBoundedLogFile::open(&path, 10).unwrap();
+
+        file.write_all(b"abc").unwrap();
+        file.flush().unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn structured_log_rejects_one_write_larger_than_its_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("prod.log");
+        let mut file = SizeBoundedLogFile::open(&path, 3).unwrap();
+
+        let error = file.write_all(b"1234").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
     #[test]

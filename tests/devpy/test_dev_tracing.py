@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,28 @@ class DevTracingTests(unittest.TestCase):
             },
             self.dev._phoenix_child_stdio(),
         )
+        launcher_stderr = object()
+        self.assertIs(
+            launcher_stderr,
+            self.dev._phoenix_child_stdio(launcher_stderr)["stderr"],
+        )
+
+    def test_bounded_launcher_capture_keeps_only_the_latest_64_kib(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "launcher.log"
+            content = b"old" + (b"n" * (64 * 1024))
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "bounded_output_capture.py"),
+                    str(output),
+                ],
+                input=content,
+                check=True,
+            )
+
+            self.assertEqual(b"n" * (64 * 1024), output.read_bytes())
+            self.assertEqual(0o600, output.stat().st_mode & 0o777)
 
     def test_trace_endpoint_defaults_locally_and_is_off_in_ci(self):
         self.assertEqual(

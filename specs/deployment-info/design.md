@@ -221,8 +221,8 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   `LogInfo` is built from the same `LogConfig` that drives the subscriber and
   bounded fatal hook, so the report and the wiring share one source of truth.
   The binary writes the `PHOENIX_LOG_FILE` sink itself through a non-blocking
-  append worker, so a reported file path is always one the process genuinely
-  writes — never a mere
+  append worker with a 64 MiB hard cap, so a reported file path is always one
+  the process genuinely writes — never a mere
   launcher redirection the process cannot guarantee. A `PHOENIX_LOG_FILE` that
   cannot be opened aborts startup rather than degrading silently, so the report
   is only ever derived from `LogConfig` once every configured sink is actually
@@ -237,7 +237,9 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   child stdout and stderr into a separate 64 KiB tail file, so an older
   stdout-only rollback remains observable. Before rollback starts, a failed
   candidate is copied to its own bounded snapshot. launchd writes loader errors
-  that occur before Rust `main` to a separate OS-owned, rotated file.
+  that occur before Rust `main` to a separate OS-owned, rotated file. The
+  development launcher drains the same pre-main stderr path into a separate
+  64 KiB tail file.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

@@ -9,7 +9,7 @@ Applies when: macOS. This is the only macOS production mode. `./dev.py prod depl
 | Port | 8031 |
 | Binary | `~/.phoenix-ide/phoenix-ide` |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` (structured), `prod-fatal.log` (latest Rust fatal, maximum 64 KiB), and `prod-launchd-stderr.log` (pre-main loader errors) |
+| Logs | `~/.phoenix-ide/prod.log` (structured, maximum 64 MiB), `prod-fatal.log` (latest Rust fatal, maximum 64 KiB), and `prod-launchd-stderr.log` (pre-main loader errors) |
 | launchd label | `com.phoenix-ide.server` |
 | plist | `~/Library/LaunchAgents/com.phoenix-ide.server.plist` |
 | OS-owned rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — launchd stderr at 64 KiB with 2 generations; it never touches process-owned `prod.log` |

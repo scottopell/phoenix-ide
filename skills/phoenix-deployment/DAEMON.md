@@ -8,7 +8,7 @@ Applies when: Linux without systemd.
 |----------|-------|
 | Default port | 8031 |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` (structured), `prod-fatal.log` (latest process fatal, 64 KiB), `prod-supervisor-fatal.log` (bounded direct stdout/stderr tail, 64 KiB), and `prod-supervisor-candidate-fatal.log` (last failed candidate, 64 KiB) |
+| Logs | `~/.phoenix-ide/prod.log` (structured, maximum 64 MiB), `prod-fatal.log` (latest process fatal, 64 KiB), `prod-supervisor-fatal.log` (bounded direct stdout/stderr tail, 64 KiB), and `prod-supervisor-candidate-fatal.log` (last failed candidate, 64 KiB) |
 | Supervisor socket | `~/.phoenix-ide/run/supervisor.sock` |
 | Durable deploy status | `~/.phoenix-ide/deploy/status.json` |
 
