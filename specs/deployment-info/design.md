@@ -99,7 +99,9 @@ field. It holds the static facts:
 - `log: LogInfo` — the active log sinks, derived from the same `LogConfig` that
   builds the subscriber (REQ-DEPLOY-006). `LogConfig` is resolved once from
   `PHOENIX_LOG_STDOUT` (bool, default on), `PHOENIX_LOG_FILE` (optional path),
-  and `PHOENIX_FATAL_LOG_FILE` (optional bounded-fatal path).
+  and `PHOENIX_FATAL_LOG_FILE` (optional bounded-fatal path). The process keeps
+  the structured file at its exact active path, rotates it daily, compresses
+  closed archives, and retains 14 generations.
 - `locations: Vec<DiskLocation>` — the static on-disk layout. Each `DiskLocation`
   carries a `label`, an absolute `path`, and a `MeasureMode` dictating how it is
   sized at request time. The rows are: the database file (`File`); the data
@@ -220,9 +222,9 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
 - **The log sinks reflect what logging does, not configuration it ignores.**
   `LogInfo` is built from the same `LogConfig` that drives the subscriber and
   bounded fatal hook, so the report and the wiring share one source of truth.
-  The binary writes the `PHOENIX_LOG_FILE` sink itself through a non-blocking
-  append worker with a 64 MiB hard cap, so a reported file path is always one
-  the process genuinely writes — never a mere
+  The binary writes and rotates the `PHOENIX_LOG_FILE` sink itself through a
+  non-blocking append worker and a separate archive worker, so a reported file
+  path is always one the process genuinely writes — never a mere
   launcher redirection the process cannot guarantee. A `PHOENIX_LOG_FILE` that
   cannot be opened aborts startup rather than degrading silently, so the report
   is only ever derived from `LogConfig` once every configured sink is actually
