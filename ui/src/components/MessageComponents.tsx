@@ -808,6 +808,7 @@ interface AgentMessageProps {
    */
   forceExpandedText?: boolean;
   forceExpandedTools?: boolean;
+  visibleToolUseId?: string;
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
@@ -871,7 +872,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   onRevealHandled,
 }: ToolOnlyAgentTurnGroupProps) {
   const { density } = useDensity();
-  const [expanded, setExpanded] = useState(false);
+  const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
   const pendingScrollToolIdRef = useRef<string | null>(null);
   const items = useMemo(
     () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
@@ -880,28 +881,38 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
   const expand = useCallback((toolId: string) => {
     pendingScrollToolIdRef.current = toolId || null;
-    setExpanded(true);
+    setExpandedToolId(toolId || null);
   }, []);
 
   useEffect(() => {
-    if (!expanded) return;
+    if (!expandedToolId) return;
     const toolId = pendingScrollToolIdRef.current;
     pendingScrollToolIdRef.current = null;
     if (!toolId) return;
     document.querySelector(`[data-tool-id="${CSS.escape(toolId)}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [expanded]);
+  }, [expandedToolId]);
 
   useEffect(() => {
-    if (density !== 'compact' || expanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
-    pendingScrollToolIdRef.current = 'toolUseId' in revealRequest.revealTarget
+    if (density !== 'compact' || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
+    const toolUseId = 'toolUseId' in revealRequest.revealTarget
       ? revealRequest.revealTarget.toolUseId
       : null;
-    setExpanded(true);
-  }, [density, expanded, revealRequest]);
+    if (!toolUseId || toolUseId === expandedToolId) return;
+    pendingScrollToolIdRef.current = toolUseId;
+    setExpandedToolId(toolUseId);
+  }, [density, expandedToolId, revealRequest]);
 
-  if (density === 'compact' && !expanded) {
+  if (density === 'compact') {
     const first = members[0];
+    const compactItems = expandedToolId
+      ? items.filter((item) => item.toolId !== expandedToolId)
+      : items;
+    const expandedMemberIndex = expandedToolId
+      ? members.findIndex((member) => Array.isArray(member.agent.content)
+        && member.agent.content.some((block) => block.type === 'tool_use' && block.id === expandedToolId))
+      : -1;
+    const expandedMember = expandedMemberIndex >= 0 ? members[expandedMemberIndex] : undefined;
     return (
       <div
         id={first ? `message-${first.agent.message_id}` : undefined}
@@ -920,12 +931,34 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
           </div>
         )}
         <div className="message-content">
-          <CompactToolStrip items={items} onExpand={expand} />
+          {compactItems.length > 0 && <CompactToolStrip items={compactItems} onExpand={expand} />}
           {members.some((member) => hasAgentRetries(member.agent)) && (
             <div className="compact-tool-group-audit" aria-label="Response retry audit">
               {members.filter((member) => hasAgentRetries(member.agent)).map((member) => (
                 <AgentRetryBadge key={member.key} message={member.agent} />
               ))}
+            </div>
+          )}
+          {expandedMember && expandedToolId && (
+            <div className="compact-tool-selected-detail">
+              <AgentMessage
+                message={expandedMember.agent}
+                toolResults={expandedMember.toolResultsByUseId}
+                liveBashProgress={liveBashProgress}
+                onOpenFile={onOpenFile}
+                onOpenCommissionReview={onOpenCommissionReview}
+                filePathRootDir={filePathRootDir}
+                workScopeKey={workScopeKey}
+                activeToolUseId={activeToolUseId}
+                forceExpandedTools
+                visibleToolUseId={expandedToolId}
+                isFirstInTurn={false}
+                isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
+                {...(unitKey !== undefined ? { unitKey } : {})}
+                {...(revealRequest ? { revealRequest } : {})}
+                {...(activeHighlight ? { activeHighlight } : {})}
+                {...(onRevealHandled ? { onRevealHandled } : {})}
+              />
             </div>
           )}
         </div>
@@ -946,7 +979,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
       filePathRootDir={filePathRootDir}
       workScopeKey={workScopeKey}
       activeToolUseId={activeToolUseId}
-      forceExpandedTools={expanded}
+      forceExpandedTools
       isFirstInTurn={member.isFirstInTurn}
       forceExpandedText={isLatestAgentMessage && index === members.length - 1}
       isLatestAgentMessage={isLatestAgentMessage && index === members.length - 1}
@@ -963,7 +996,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -1220,6 +1253,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
               }
               return renderTextFragment(fragment);
             } else if (block.type === 'tool_use') {
+              if (visibleToolUseId && block.id !== visibleToolUseId) return null;
               // `think` renders as a subtle inline aside, not the full tool-block
               // shell — it's model reasoning, not an action. Collapsed by default,
               // identical in both densities.

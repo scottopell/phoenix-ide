@@ -507,8 +507,8 @@ AND render user messages at full fidelity
 AND treat density as a presentation choice only, not as permission to omit assistant prose or live tool facts available to the other density
 
 WHEN a collapsed tool-call pill is clicked
-THE SYSTEM SHALL reveal the full detail for that tool call and bring it into view
-AND SHALL preserve the ordering and full-detail rendering of every other tool call in the grouped run
+THE SYSTEM SHALL reveal only the full detail for that selected tool call and bring it into view
+AND SHALL keep every unrelated tool call in the grouped run compact, interactive, and in invocation order
 
 THE SYSTEM SHALL NOT hide any content without a visible click-to-expand affordance
 AND SHALL NOT discard any content as a result of the active density

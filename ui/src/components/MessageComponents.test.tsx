@@ -1,6 +1,6 @@
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
@@ -913,8 +913,12 @@ describe('inline tool timers', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
 
-    expect(screen.queryByRole('list', { name: 'Tool calls' })).not.toBeInTheDocument();
-    expect(document.querySelector('[data-tool-id="grid-read"]')).not.toBeNull();
+    const remainingStrip = screen.getByRole('list', { name: 'Tool calls' });
+    expect(remainingStrip.querySelectorAll('.compact-tool-card')).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: /read_file:.*expand tool detail/i })).not.toBeInTheDocument();
+    expect(within(remainingStrip).getAllByRole('button', { name: /search:.*expand tool detail/i }).length).toBeGreaterThan(0);
+    expect(document.querySelector('.compact-tool-selected-detail [data-tool-id="grid-read"]')).not.toBeNull();
+    expect(document.querySelector('.compact-tool-selected-detail [data-tool-id="grid-search"]')).toBeNull();
     expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
   });
 
