@@ -5,7 +5,8 @@
 //! - `PHOENIX_LOG_STDOUT` (bool, default `true`) — structured JSON to stdout.
 //! - `PHOENIX_LOG_FILE` (optional path) — structured JSON appended to that file,
 //!   written by the process itself via a non-blocking worker thread. The active
-//!   file keeps that exact path and is truncated before it can exceed 64 MiB.
+//!   file keeps that exact path; Phoenix rotates it daily, compresses closed
+//!   archives, and retains the newest 14 generations.
 //! - `PHOENIX_FATAL_LOG_FILE` (optional path) — the latest fatal startup/runtime
 //!   diagnostic. Each event overwrites the previous one and is capped at 64 KiB.
 //!
@@ -20,7 +21,7 @@ use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::resource::Resource;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -30,9 +31,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
+mod rotation;
+
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
-const MAX_STRUCTURED_LOG_BYTES: u64 = 64 * 1024 * 1024;
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
 
 pub(crate) fn process_log_config() -> &'static LogConfig {
@@ -54,16 +56,9 @@ pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized
         return;
     };
     if let Some(structured) = config.file.as_deref() {
-        match paths_alias(structured, path) {
-            Ok(true) => {
-                eprintln!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE");
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("failed to resolve fatal diagnostic path: {error}");
-                return;
-            }
+        if let Err(error) = validate_fatal_log_path(structured, path) {
+            eprintln!("failed to resolve fatal diagnostic path: {error}");
+            return;
         }
     }
     if let Err(error) = write_fatal_diagnostic(path, &message.to_string()) {
@@ -90,6 +85,22 @@ fn paths_alias(left: &std::path::Path, right: &std::path::Path) -> std::io::Resu
         }
     }
     Ok(path_identity(left)? == path_identity(right)?)
+}
+
+fn validate_fatal_log_path(structured: &Path, fatal: &Path) -> std::io::Result<()> {
+    if paths_alias(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
+        ));
+    }
+    if rotation::path_is_reserved(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must not use a Phoenix log rotation path"),
+        ));
+    }
+    Ok(())
 }
 
 fn path_identity(path: &std::path::Path) -> std::io::Result<PathBuf> {
@@ -179,7 +190,14 @@ pub(super) fn open_log_append(path: &Path, create_mode: Option<u32>) -> std::io:
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
     }
     reject_symlink(path)?;
     let mut options = OpenOptions::new();
@@ -192,51 +210,6 @@ pub(super) fn open_log_append(path: &Path, create_mode: Option<u32>) -> std::io:
             .custom_flags(libc::O_NOFOLLOW);
     }
     options.open(path)
-}
-
-struct SizeBoundedLogFile {
-    file: File,
-    bytes_written: u64,
-    max_bytes: u64,
-}
-
-impl SizeBoundedLogFile {
-    fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
-        let file = open_log_append(path, None)?;
-        let mut bytes_written = file.metadata()?.len();
-        if bytes_written > max_bytes {
-            file.set_len(0)?;
-            bytes_written = 0;
-        }
-        Ok(Self {
-            file,
-            bytes_written,
-            max_bytes,
-        })
-    }
-}
-
-impl Write for SizeBoundedLogFile {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let buffer_len = u64::try_from(buffer.len()).map_err(io::Error::other)?;
-        if buffer_len > self.max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "one structured log write exceeds its size limit",
-            ));
-        }
-        if self.bytes_written.saturating_add(buffer_len) > self.max_bytes {
-            self.file.set_len(0)?;
-            self.bytes_written = 0;
-        }
-        let written = self.file.write(buffer)?;
-        self.bytes_written += u64::try_from(written).map_err(io::Error::other)?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
 }
 
 fn prepare_log_identity(path: &Path, private: bool) -> std::io::Result<()> {
@@ -278,6 +251,7 @@ pub struct PreparedLogConfig {
 ///   shutdown.
 pub struct TracingHandles {
     _log_guard: Option<WorkerGuard>,
+    _archive_guard: Option<rotation::ArchiveWorkerGuard>,
     tracer_provider: Option<SdkTracerProvider>,
 }
 
@@ -309,12 +283,7 @@ impl LogConfig {
 
     pub fn prepare(self) -> std::io::Result<PreparedLogConfig> {
         if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
-            if paths_alias(file, fatal)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
-                ));
-            }
+            validate_fatal_log_path(file, fatal)?;
         }
         if let Some(file) = self.file.as_deref() {
             prepare_log_identity(file, false).map_err(|error| {
@@ -339,12 +308,7 @@ impl LogConfig {
             })?;
         }
         if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
-            if paths_alias(file, fatal)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
-                ));
-            }
+            validate_fatal_log_path(file, fatal)?;
         }
         Ok(PreparedLogConfig {
             stdout: self.stdout,
@@ -410,9 +374,9 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
             .with_filter(make_env_filter())
     });
 
-    let (file_layer, guard) = match config.file.as_deref() {
+    let (file_layer, guard, archive_guard) = match config.file.as_deref() {
         Some(path) => {
-            let file = SizeBoundedLogFile::open(path, MAX_STRUCTURED_LOG_BYTES).map_err(|e| {
+            let (file, archive_guard) = rotation::DailyRotatingFile::open(path).map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to open PHOENIX_LOG_FILE {}: {e}", path.display()),
@@ -425,9 +389,9 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
                 .with_span_list(false)
                 .with_writer(writer)
                 .with_filter(make_env_filter());
-            (Some(layer), Some(guard))
+            (Some(layer), Some(guard), Some(archive_guard))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     tracing_subscriber::registry()
@@ -436,9 +400,13 @@ pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
         .with(file_layer)
         .init();
 
+    if let Some(archive_guard) = archive_guard.as_ref() {
+        archive_guard.start_maintenance()?;
+    }
     install_panic_hook();
     Ok(TracingHandles {
         _log_guard: guard,
+        _archive_guard: archive_guard,
         tracer_provider,
     })
 }
@@ -1087,6 +1055,65 @@ mod tests {
     }
 
     #[test]
+    fn fatal_log_cannot_alias_the_rotation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(rotation::reserved_sibling_lock_path(&structured)),
+            file: Some(structured),
+        };
+
+        let error = config.prepare().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("rotation path"));
+    }
+
+    #[test]
+    fn fatal_log_cannot_use_the_archive_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let mut fatal = structured.as_os_str().to_os_string();
+        fatal.push(".00000000000000000001-2026-08-09");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(PathBuf::from(fatal)),
+            file: Some(structured),
+        };
+
+        assert!(config
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("rotation path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_log_directories_are_created_private_for_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("missing/nested/prod.log");
+        LogConfig {
+            stdout: false,
+            fatal_file: None,
+            file: Some(structured.clone()),
+        }
+        .prepare()
+        .unwrap();
+
+        let mode = std::fs::metadata(structured.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let (_writer, _guard) = rotation::DailyRotatingFile::open(&structured).unwrap();
+    }
+
+    #[test]
     fn stdout_enabled_by_truthy_values() {
         for v in ["1", "true", "on", "yes", "anything"] {
             assert!(stdout_enabled(Some(v)), "{v:?} should enable stdout");
@@ -1112,40 +1139,15 @@ mod tests {
     }
 
     #[test]
-    fn log_file_errors_when_parent_is_not_a_directory() {
+    fn rotating_file_errors_when_parent_is_not_a_directory() {
         // A requested file under a path whose parent is a regular file cannot be
         // created; init turns this Err into a startup abort (fail fast).
         let blocker =
             std::env::temp_dir().join(format!("phoenix-logging-test-{}", std::process::id()));
         std::fs::write(&blocker, b"x").unwrap();
         let unopenable = blocker.join("nested.log");
-        assert!(open_log_append(&unopenable, None).is_err());
+        assert!(rotation::DailyRotatingFile::open(&unopenable).is_err());
         let _ = std::fs::remove_file(&blocker);
-    }
-
-    #[test]
-    fn structured_log_truncates_before_exceeding_its_limit() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("prod.log");
-        std::fs::write(&path, b"12345678").unwrap();
-        let mut file = SizeBoundedLogFile::open(&path, 10).unwrap();
-
-        file.write_all(b"abc").unwrap();
-        file.flush().unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
-    }
-
-    #[test]
-    fn structured_log_rejects_one_write_larger_than_its_limit() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("prod.log");
-        let mut file = SizeBoundedLogFile::open(&path, 3).unwrap();
-
-        let error = file.write_all(b"1234").unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
     #[test]
