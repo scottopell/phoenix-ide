@@ -712,6 +712,52 @@ class PreparationTests(unittest.TestCase):
                 self.dev.launchd_prod_deploy()
             self.assertFalse(self.dev.LAUNCHD_DEPLOY_ACTIVE_PATH.exists())
 
+    def test_precondition_failure_records_typed_candidate_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            candidate = root / "built-phoenix"
+            candidate.write_bytes(b"candidate")
+            active_path = root / "deploy" / "active"
+            status_path = root / "deploy" / "status.json"
+            identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+            prepared = self.dev.PreparedCandidate(
+                binary=candidate,
+                source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
+                source_commit="abc123def456" + "0" * 28,
+                identity=identity,
+            )
+
+            def run(command, **_kwargs):
+                if "--protocol-version" in command:
+                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_LOCK_PATH", root / "deploy" / "activate.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
+                 mock.patch.object(self.dev, "LAUNCHD_INSTALL_DIR", root / "install"), \
+                 mock.patch.object(self.dev, "LAUNCHD_PLIST_PATH", root / "service.plist"), \
+                 mock.patch.object(self.dev, "PROD_SHA_PATH", root / "deployed.sha"), \
+                 mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
+                 mock.patch.object(self.dev, "capture_login_shell_path", return_value=("/bin", "test")), \
+                 mock.patch.object(self.dev, "print_launchd_path_report"), \
+                 mock.patch.object(self.dev, "_materialize_helper"), \
+                 mock.patch.object(self.dev, "_ensure_newsyslog_config", side_effect=SystemExit("sudo required")), \
+                 mock.patch.object(self.dev.subprocess, "run", side_effect=run):
+                with self.assertRaisesRegex(SystemExit, "sudo required"):
+                    self.dev.launchd_prod_deploy()
+
+            status = json.loads(status_path.read_text())
+            self.assertEqual("precondition_failed", status["state"])
+            self.assertEqual(identity.version, status["expected_version"])
+            self.assertEqual(identity.git_sha, status["expected_git_sha"])
+            self.assertFalse(active_path.exists())
+
     def test_rollback_binary_identity_mismatch_is_rejected(self):
         running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
         rollback = {"version": "1.0.0", "git_sha": "bbbbbbbbbbbb"}

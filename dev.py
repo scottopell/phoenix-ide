@@ -9138,11 +9138,18 @@ def launchd_prod_deploy(
     _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    source_kind = "published_release" if release else "local_head"
+    source_commit = None
+    release_commit = None
+    release_tag = release
+    identity: RuntimeIdentity | None = None
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "preparing",
-            "source_kind": "published_release" if release else "local_head",
-            "source_commit": None, "release_commit": None, "release_tag": release,
+            "source_kind": source_kind,
+            "source_commit": source_commit,
+            "release_commit": release_commit,
+            "release_tag": release_tag,
             "expected_version": None, "expected_git_sha": None,
             "created_at": claimed_at, "updated_at": claimed_at,
             "failure": None, "rollback_failure": None,
@@ -9308,13 +9315,13 @@ def launchd_prod_deploy(
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-             "transaction_id": transaction_id, "state": "precondition_failed",
-             "source_kind": "published_release" if release else locals().get("source_kind"),
-             "source_commit": locals().get("source_commit"),
-
-                "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
-                "expected_version": locals().get("identity", {}).get("version"),
-                "expected_git_sha": locals().get("identity", {}).get("git_sha"),
+                "transaction_id": transaction_id, "state": "precondition_failed",
+                "source_kind": source_kind,
+                "source_commit": source_commit,
+                "release_commit": release_commit,
+                "release_tag": release_tag,
+                "expected_version": identity.version if identity is not None else None,
+                "expected_git_sha": identity.git_sha if identity is not None else None,
                 "created_at": claimed_at, "updated_at": failed_at,
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
                 "rollback_failure": None,
