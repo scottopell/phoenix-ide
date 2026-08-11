@@ -5108,8 +5108,7 @@ def cmd_check(
     def lane_rust():
         """Rust lane: test compile → codegen export → staleness diff → test run.
 
-        Linux-musl compatibility is checked once per commit by CI rather than
-        generating a separate cross-target artifact tree in every macOS worktree.
+        This lane does not generate a Linux-musl cross-target artifact tree.
 
         vite build is intentionally NOT run here. `#[derive(Embed)]` in
         crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
