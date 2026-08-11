@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -43,6 +44,8 @@ VITE_PROXY_FILE = ROOT / ".vite.proxy"
 PHOENIX_PORT_FILE = ROOT / ".phoenix.port"
 VITE_PORT_FILE = ROOT / ".vite.port"
 LOG_FILE = ROOT / "phoenix.log"
+FATAL_LOG_FILE = ROOT / "phoenix-fatal.log"
+LAUNCHER_LOG_FILE = ROOT / "phoenix-launcher.log"
 
 # ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
 # SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
@@ -877,6 +880,8 @@ LAUNCHD_LABEL = "com.phoenix-ide.server"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 LAUNCHD_INSTALL_DIR = Path.home() / ".phoenix-ide"
 LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
+LAUNCHD_FATAL_LOG_PATH = Path.home() / ".phoenix-ide" / "prod-fatal.log"
+LAUNCHD_STDERR_LOG_PATH = Path.home() / ".phoenix-ide" / "prod-launchd-stderr.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 LAUNCHD_DEPLOY_DIR = Path.home() / ".phoenix-ide" / "deploy"
 LAUNCHD_DEPLOY_STATUS_PATH = LAUNCHD_DEPLOY_DIR / "status.json"
@@ -1877,6 +1882,33 @@ def _wait_for_files(paths: list[Path], timeout: float = 8.0) -> bool:
     return all(p.exists() for p in paths)
 
 
+def _phoenix_child_stdio(stderr=subprocess.DEVNULL) -> dict[str, object]:
+    """Keep launcher-owned descriptors away from Phoenix's structured log."""
+    return {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": stderr,
+    }
+
+
+def _start_bounded_stderr_capture() -> tuple[subprocess.Popen, object]:
+    """Capture loader and other pre-main failures without an unbounded log."""
+    capture = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "bounded_output_capture.py"),
+            str(LAUNCHER_LOG_FILE),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if capture.stdin is None:
+        raise RuntimeError("failed to open launcher diagnostic capture")
+    return capture, capture.stdin
+
+
 def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     """Start the Phoenix server."""
     global _db_lock
@@ -1899,12 +1931,9 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     # Vite dev server itself is bound loopback in passwordless mode (see
     # `_dev_bind_host`) so its proxy can't re-expose this backend to the network.
     env["PHOENIX_BIND_ADDR"] = "127.0.0.1"
-    # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
-    # JSON there directly. stdout is off so the only writer to the file is the
-    # binary's appender; the Popen redirect below only captures pre-logger /
-    # panic output as a safety net. Same PHOENIX_LOG_FILE mechanism the prod
-    # launchers use.
+    # The binary owns the structured log and a bounded latest-fatal snapshot.
     env["PHOENIX_LOG_FILE"] = str(LOG_FILE)
+    env["PHOENIX_FATAL_LOG_FILE"] = str(FATAL_LOG_FILE)
     env["PHOENIX_LOG_STDOUT"] = "false"
     phoenix_tls = maybe_enable_auto_tls(env, tls)
 
@@ -1939,27 +1968,31 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     if "RUST_LOG" not in env:
         env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
 
-    # Fresh log per restart, then append: the binary's appender and this
-    # redirect both open the file with O_APPEND, so their writes interleave
-    # safely. Truncating here (not "w" on the Popen handle) gives the
-    # fresh-per-restart behavior without a non-appending second writer.
+    # Fresh structured log per restart. The child never inherits this file, so
+    # Phoenix remains its only writer.
     LOG_FILE.write_text("")
-    with open(LOG_FILE, "a") as log:
+    capture, launcher_stderr = _start_bounded_stderr_capture()
+    try:
         proc = subprocess.Popen(
             [str(binary)],
             env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
+            **_phoenix_child_stdio(launcher_stderr),
             start_new_session=True,
         )
-        PHOENIX_PID_FILE.write_text(str(proc.pid))
+    finally:
+        launcher_stderr.close()
+    PHOENIX_PID_FILE.write_text(str(proc.pid))
     PHOENIX_PORT_FILE.write_text(str(port) + "\n")
     register_dev_process("phoenix", proc.pid, port)
 
     # Verify it started
     time.sleep(0.5)
     if not is_process_running(proc.pid):
-        print("Phoenix failed to start. Check phoenix.log", file=sys.stderr)
+        print(
+            "Phoenix failed to start. Check "
+            f"{LOG_FILE.name}, {FATAL_LOG_FILE.name}, and {LAUNCHER_LOG_FILE.name}",
+            file=sys.stderr,
+        )
         PHOENIX_PID_FILE.unlink()
         _db_lock.release()
         _db_lock = None
@@ -2129,6 +2162,7 @@ def cmd_up(
     print(f"Ready! UI: {ui_scheme}://localhost:{vite_port}")
     print(f"        API: {api_scheme}://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
+    print(f"   Launcher: {LAUNCHER_LOG_FILE}")
     if vite_tls:
         ca = phoenix_tls_ca_path()
         if ca:
@@ -3774,9 +3808,9 @@ def _classify_network_env() -> None:
 # `desc` feeds the --pretty renderer and `check --lanes` validation errors.
 _LANE_DEFS = [
     # (name, inputs, desc)
-    ("rust", {"RUST"}, "codegen + cargo test (+ musl smoke on macOS)"),
+    ("rust", {"RUST"}, "codegen + cargo test"),
     ("cargo-fmt", {"RUST"}, "cargo fmt --check"),
-    ("clippy", {"RUST"}, "cargo clippy --all-targets (own target dir)"),
+    ("clippy", {"RUST"}, "cargo clippy --all-targets (bounded non-incremental target)"),
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
@@ -4611,6 +4645,59 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
 
 
 _CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
+_CHECK_CPU_BUDGET = 4
+
+
+def _check_cpu_budget() -> int:
+    return max(1, min(_CHECK_CPU_BUDGET, os.cpu_count() or 1))
+
+def _clippy_check_env(root: Path = ROOT) -> dict[str, str]:
+    return {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TARGET_DIR": str(root / "target" / "clippy"),
+    }
+
+def _prepare_clippy_check_target(root: Path = ROOT) -> None:
+    incremental = root / "target" / "clippy" / "debug" / "incremental"
+    if incremental.is_dir():
+        shutil.rmtree(incremental)
+
+
+
+def _vitest_check_command() -> list[str]:
+    return [
+        "pnpm", "exec", "vitest", "run",
+        "--maxWorkers", str(_check_cpu_budget()),
+    ]
+
+
+def _run_check_lane(
+    name: str,
+    lane,
+    results: list,
+    results_lock: threading.Lock,
+) -> None:
+    started = time.monotonic()
+    try:
+        lane()
+    except BaseException as exc:
+        detail = "".join(traceback.format_exception(exc))
+        with results_lock:
+            results.append((f"{name} lane", 1, time.monotonic() - started, detail))
+
+
+def _run_check_threads_sequentially(
+    threads: list[threading.Thread],
+    timeout: float,
+) -> list[threading.Thread]:
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            return [thread]
+    return []
+
 
 
 def _cargo_check_active(active: set[str]) -> bool:
@@ -4647,7 +4734,7 @@ def cmd_check(
     compiler_cache: str | None = None,
     profile_work: bool = False,
 ):
-    """Run lint, format check, tests, and task validation in parallel.
+    """Run lint, format checks, tests, and task validation within one worker budget.
 
     `lanes` is an optional comma-separated lane subset (CI splits the check
     across runners with it); gating still applies within the subset unless
@@ -4686,6 +4773,9 @@ def cmd_check(
     reporter = _make_reporter(pretty, active, skipped)
     if lanes is not None:
         reporter.info(f"lane filter: [{', '.join(sorted(active | set(skipped)))}]")
+    reporter.info(
+        f"check execution: one lane at a time; child worker budget: {_check_cpu_budget()}"
+    )
     if skipped:
         ran = ", ".join(sorted(active))
         reporter.info(f"incremental gating: running [{ran}]")
@@ -4750,6 +4840,9 @@ def cmd_check(
         env = dict(node_env()) if Path(cwd) == UI_DIR else os.environ.copy()
         env["CARGO_TERM_COLOR"] = "never"
         env["NO_COLOR"] = "1"
+        budget = str(_check_cpu_budget())
+        env["CARGO_BUILD_JOBS"] = budget
+        env["RAYON_NUM_THREADS"] = budget
         env.pop("FORCE_COLOR", None)
         env.pop("CLICOLOR_FORCE", None)
         if env_extra:
@@ -4892,14 +4985,10 @@ def cmd_check(
         return rc
 
     def lane_rust():
-        """Rust lane: test compile → codegen export → staleness diff →
-        test run → [musl smoke check].
+        """Rust lane: test compile → codegen export → staleness diff → test run.
 
-        The musl smoke check is **macOS-only and conditional** on the
-        `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
-        runs on Linux (clippy already covers the same surface there).
-        Expect the timing breakdown to be missing the musl line on Linux
-        and on macOS hosts without the cross toolchain installed.
+        Linux-musl compatibility is checked once per commit by CI rather than
+        generating a separate cross-target artifact tree in every macOS worktree.
 
         vite build is intentionally NOT run here. `#[derive(Embed)]` in
         crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
@@ -4919,8 +5008,8 @@ def cmd_check(
         `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
         scratch dir under target/, and the staleness step diffs that scratch
         export against the committed tree. The committed tree is therefore
-        frozen for the whole check — the tsc, vitest, eslint, and ast-grep
-        lanes read it concurrently with no ordering dependency on this lane.
+        frozen for the whole check, so later UI and source-validation lanes
+        read a stable committed tree without an ordering dependency on codegen.
         `test_cmd` excludes `export_bindings` (the codegen step just ran
         them — no lost coverage). `compile_cmd`/`test_cmd`/the thread cap are
         computed once in cmd_check and closed over here.
@@ -4938,48 +5027,31 @@ def cmd_check(
             if rc == 0:
                 codegen_stale_step()
         run_step("cargo test", test_cmd)
-        if sys.platform == "darwin":
-            # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
-            # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
-            # See task 60001 for installing musl-cross-make on this machine.
-            # (--target musl has its own fingerprint namespace, so it neither
-            # disturbs nor is disturbed by the host-target steps around it.)
-            if shutil.which("x86_64-linux-musl-gcc"):
-                run_step("cargo check musl", [
-                    "cargo", "check", "--target", "x86_64-unknown-linux-musl",
-                ])
-            else:
-                reporter.step_skipped("rust", "cargo check musl",
-                                      "x86_64-linux-musl-gcc not on PATH; see task 60001")
 
     def lane_clippy():
-        """Clippy in its own target dir so it runs fully parallel to lane_rust.
+        """Clippy in a bounded, non-incremental target directory.
 
-        `cargo clippy` builds workspace crates through clippy-driver
-        (RUSTC_WORKSPACE_WRAPPER), which carries a different fingerprint than the
-        normal-rustc build lane_rust/codegen produce. Sharing one target dir
-        would (a) make the two builds thrash each other's workspace fingerprints
-        and (b) serialize them on cargo's exclusive target lock. A dedicated
-        CARGO_TARGET_DIR sidesteps both, so clippy overlaps the test build/run
-        instead of tailing it. Dependency compiles in the fresh dir are served
-        by sccache (CI); the workspace check itself is cheap and rebuilds each
-        run (this dir is outside rust-cache's saved target/).
+        Sharing lane_rust's target makes clippy-driver churn normal-rustc
+        fingerprints and forces the following test build to repair them. The
+        separate directory prevents that duplicate work. Incremental output is
+        disabled because it retains a large fine-grained artifact tree, rewrites
+        hundreds of megabytes on warm checks, and has served stale local lints.
         """
         # Scope to the changed crate(s)+rdeps when gating narrowed it; otherwise
         # lint the whole workspace. `-p` flags go before `--`. `--all-targets`
         # lints test/bench/example targets too, so test code is gated the same
         # as library code (a pedantic violation in a #[cfg(test)] module fails
         # CI); it composes with `-p` so the changed-crate scope still applies.
+        _prepare_clippy_check_target()
         run_step("cargo clippy",
                  ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
-                 env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy")})
+                 env_extra=_clippy_check_env())
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
 
-        Both run on the same source tree and need no build artifact, so
-        bundling them into one thread avoids spending a parallel slot on
-        a sub-second stylelint pass. Each emits its own result entry.
+        Both run on the same source tree and need no build artifact, so they
+        remain one lane with separate result entries.
         """
         run_step("eslint", ["pnpm", "run", "lint"], UI_DIR)
         run_step("stylelint", ["pnpm", "run", "lint:css"], UI_DIR)
@@ -5003,25 +5075,12 @@ def cmd_check(
         and an isolated temp DB, then runs a battery of scripted conversations
         through the same HTTP/SSE surface phoenix-client.py uses.
 
-        Target-lock sharing with lane_rust. run.py's `cargo build --bin
-        phoenix_ide` and lane_rust's cargo invocations share the one workspace
-        target dir, whose exclusive lock serializes all builds. The `--bin`
-        artifact is NOT a cheap link riding on lane_rust's output: clippy emits
-        only check-mode .rmeta, and `cargo test --no-run` emits cfg(test)
-        harness binaries under deps/ — neither produces target/debug/phoenix_ide,
-        so this build does a full non-test crate codegen + link. Only the
-        external dependency crates are reused.
-
-        The overlap that keeps this lane inside lane_rust's wall-clock shadow
-        comes from nextest, not artifact reuse: `cargo nextest run` splits
-        build from run and releases the target lock for the run phase, so this
-        bin build proceeds in parallel with the test run. On the plain
-        `cargo test` fallback (no nextest installed) the run phase holds the
-        lock end-to-end, so this build serializes after it and adds a full
-        bin codegen to the tail of the critical path — the fallback is slower
-        by design, not broken. clippy no longer contends here: it runs in
-        lane_clippy with its own CARGO_TARGET_DIR, so the only builds on the
-        shared workspace lock are lane_rust's test compile and this bin build.
+        run.py's `cargo build --bin phoenix_ide` reuses normal-target external
+        dependencies but is not a cheap link from test output: `cargo test
+        --no-run` emits cfg(test) harnesses under deps/ rather than
+        target/debug/phoenix_ide. The serialized execution policy therefore
+        makes this full non-test codegen and link an explicit E2E cost after the
+        Rust lane, while Clippy remains isolated in its own target directory.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
@@ -5540,7 +5599,7 @@ def cmd_check(
             mem_cap = max(1, int(mem_gib // 1.5))
         except (ValueError, OSError, AttributeError):
             mem_cap = cpus
-        test_threads = max(2, min(cpus - 1, mem_cap))
+        test_threads = min(_check_cpu_budget(), max(1, min(cpus - 1, mem_cap)))
         if test_threads < cpus:
             try:
                 load1, load5, load15 = os.getloadavg()
@@ -5611,8 +5670,8 @@ def cmd_check(
             """Diff the scratch ts-rs export against committed ui/src/generated/.
 
             A mismatch means the developer's Rust types and the committed TS
-            don't line up. Recorded (not aborted) so the rest of the lane and
-            the parallel phase still run and every failure lands in one pass.
+            don't line up. Recorded without aborting so the rest of the lane
+            still runs and every failure lands in one pass.
             """
             step, t0 = "codegen-stale", time.monotonic()
             reporter.step_start("rust", step)
@@ -5650,7 +5709,7 @@ def cmd_check(
                 results.append((step, rc, elapsed, detail))
             reporter.step_done("rust", step, rc, elapsed)
 
-    reporter.banner("\nRunning checks in parallel...\n")
+    reporter.banner("\nRunning checks within the shared worker budget...\n")
 
     def _lane(fn):
         """Wrap a lane body with reporter lifecycle and trace events."""
@@ -5725,7 +5784,11 @@ def cmd_check(
         # `pnpm exec tsc --noEmit` silently misses them.
         ("tsc", lambda: run_step("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         ("ui-lint", lane_ui_lint),
-        ("vitest", lambda: run_step("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
+        ("vitest", lambda: run_step(
+            "vitest",
+            _vitest_check_command(),
+            UI_DIR,
+        )),
         ("cargo-fmt", lane_cargo_fmt),
         ("task", lane_task),
         ("ast-grep", check_ast_grep),
@@ -5735,27 +5798,21 @@ def cmd_check(
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
     ]
-    threads = [threading.Thread(target=_lane(fn), name=name)
-               for name, fn in _lane_targets if name in active]
-    # daemon=True so a hung lane does not block interpreter shutdown after
-    # we report it as failed and call sys.exit(1). Non-daemon threads cause
-    # Python to wait at exit, defeating the hung-lane detection below.
-    # run_step's subprocess.run already enforces CHECK_TIMEOUT per step via
-    # SIGKILL on the child; daemon=True covers the case where a lane is
-    # wedged in Python (not in a subprocess) past LANE_JOIN_TIMEOUT.
-    for t in threads:
-        t.daemon = True
-        t.start()
-    # Per-thread join budget must cover the longest *lane*, not a single step.
-    # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
-    # so we cap join at 6×CHECK_TIMEOUT + 30s. After joining we still verify
-    # the thread actually finished — Thread.join() returning after a timeout
-    # does not imply the thread is done, so a still-alive lane is recorded
-    # as an explicit failure rather than silently dropped from results.
+    threads = [
+        threading.Thread(
+            target=_run_check_lane,
+            args=(name, _lane(fn), results, results_lock),
+            name=name,
+        )
+        for name, fn in _lane_targets
+        if name in active
+    ]
+    # Each lane starts only after its predecessor finishes. A lane wedged in
+    # Python therefore cannot leave every later lane parked on a lock or multiply
+    # the join timeout. daemon=True lets the interpreter exit after recording the
+    # one stuck lane; subprocess steps have their own CHECK_TIMEOUT kill budget.
     LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
-    for t in threads:
-        t.join(timeout=LANE_JOIN_TIMEOUT)
-    stuck = [t for t in threads if t.is_alive()]
+    stuck = _run_check_threads_sequentially(threads, LANE_JOIN_TIMEOUT)
     # Stop the live renderer before any direct printing below (hung-lane
     # lines, failure dumps, summary) — plain mode's close() is a no-op.
     reporter.close()
@@ -5785,6 +5842,8 @@ def cmd_check(
             "active_lanes": sorted(active),
             "compiler_cache": selected_compiler_cache,
             "rust_test_threads": test_threads if "rust" in active else None,
+            "check_execution": "serialized",
+            "check_worker_budget": _check_cpu_budget(),
         })
     for message in profile_messages:
         print(f"  i  {message}")
@@ -6546,7 +6605,7 @@ def _build_pipeline_model(with_timings: bool = False):
 # in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
 _GRAPH_LANE_STEPS = {
     "rust": ["cargo test (compile)", "codegen export", "codegen-stale diff",
-             "cargo test (run)", "cargo check musl (macOS, optional)"],
+             "cargo test (run)"],
     "clippy": ["cargo clippy --all-targets -D warnings"],
     "tsc": ["tsc -b --noEmit"],
     "ui-lint": ["eslint", "stylelint"],
@@ -7954,8 +8013,9 @@ def _apply_bare_env_defaults(env: dict[str, str]) -> None:
     env.setdefault("PATH", os.environ.get("PATH", os.defpath))
     env.setdefault("PHOENIX_PORT", str(PROD_PORT))
     env.setdefault("PHOENIX_DB_PATH", str(Path.home() / ".phoenix-ide/prod.db"))
-    env.setdefault("PHOENIX_LOG_FILE", str(Path.home() / ".phoenix-ide/prod.log"))
-    env.setdefault("PHOENIX_LOG_STDOUT", "false")
+    env["PHOENIX_LOG_FILE"] = str(Path.home() / ".phoenix-ide/prod.log")
+    env["PHOENIX_FATAL_LOG_FILE"] = str(Path.home() / ".phoenix-ide/prod-fatal.log")
+    env["PHOENIX_LOG_STDOUT"] = "false"
 
 
 def _prepare_installed_candidate(layout: dict[str, Path]) -> "PreparedCandidate":
@@ -8366,15 +8426,14 @@ def generate_launchd_plist(
         "PHOENIX_DB_PATH": str(PROD_DB_PATH),
         "PHOENIX_PORT": str(PROD_PORT),
         "PHOENIX_VERSION": version,
-        # Unified logging: the binary appends JSON to this file directly. stdout
-        # is off, so the plist's StandardOut/ErrorPath (same file) only carries
-        # pre-logger / panic output. newsyslog handles rotation.
-        "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
-        "PHOENIX_LOG_STDOUT": "false",
     }
     # Merge .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
     if extra_env:
         env_vars.update(extra_env)
+    # Direct streams are discarded; the binary owns both bounded file sinks.
+    env_vars["PHOENIX_LOG_FILE"] = str(LAUNCHD_LOG_PATH)
+    env_vars["PHOENIX_FATAL_LOG_FILE"] = str(LAUNCHD_FATAL_LOG_PATH)
+    env_vars["PHOENIX_LOG_STDOUT"] = "false"
     launchd_socket_port = env_vars["PHOENIX_PORT"]
 
     # XML-escape both keys and values: PATH (and arbitrary env values from
@@ -8428,30 +8487,34 @@ def generate_launchd_plist(
   <string>Interactive</string>
 
   <key>StandardOutPath</key>
-  <string>{LAUNCHD_LOG_PATH}</string>
+  <string>/dev/null</string>
 
   <key>StandardErrorPath</key>
-  <string>{LAUNCHD_LOG_PATH}</string>
+  <string>{LAUNCHD_STDERR_LOG_PATH}</string>
 </dict>
 </plist>
 """
 
 
-def _ensure_newsyslog_config():
-    """Install /etc/newsyslog.d/<label>.conf for prod.log rotation.
+def _newsyslog_config(user: str, group: str) -> str:
+    return (
+        f"# Installed by ./dev.py prod deploy — launchd stderr rotation.\n"
+        f"# logfilename                              [owner:group]    mode count size when  flags\n"
+        f"{LAUNCHD_STDERR_LOG_PATH}    {user}:{group}    600  2    64    *  BJN\n"
+    )
 
-    Uses copy-truncate (`c` flag) so launchd's open stdout/stderr fd stays
-    valid across rotation. Daily at midnight, 14 generations, bzip2.
-    Idempotent: skips sudo if installed file already matches desired content.
+
+def _ensure_newsyslog_config():
+    """Rotate launchd-owned pre-main diagnostics.
+
+    Replacing the old process-log rule before activation prevents two rotators
+    from ever owning prod.log. The short-lived failing process exits before the
+    launchd stderr file is renamed. Idempotent when the file already matches.
     """
     import pwd
     user = pwd.getpwuid(os.getuid()).pw_name
     group = "staff"
-    desired = (
-        f"# Installed by ./dev.py prod deploy — log rotation for phoenix-ide.\n"
-        f"# logfilename                              [owner:group]    mode count size when  flags\n"
-        f"{LAUNCHD_LOG_PATH}    {user}:{group}    644  14    *    @T00  Jc\n"
-    )
+    desired = _newsyslog_config(user, group)
     try:
         existing = NEWSYSLOG_CONF_PATH.read_text()
         if existing == desired:
@@ -8465,21 +8528,22 @@ def _ensure_newsyslog_config():
         tmp.write(desired)
         tmp_path = tmp.name
     try:
+        sudo = ["sudo"] if sys.stdin.isatty() else ["sudo", "-n"]
         result = subprocess.run(
-            ["sudo", "-n", "install", "-m", "644", "-o", "root", "-g", "wheel",
+            [*sudo, "install", "-m", "644", "-o", "root", "-g", "wheel",
              tmp_path, str(NEWSYSLOG_CONF_PATH)],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            print(f"  ✓ Log rotation installed: daily @T00, 14 generations, bzip2, copy-truncate")
+            print("  ✓ launchd stderr rotation installed: 64 KiB, 2 generations")
         else:
-            # Non-fatal: deploy proceeds without rotation. Print one-shot install command.
-            print(f"  WARN: could not install rotation config (sudo unavailable in this shell).", file=sys.stderr)
-            print(f"  To enable: sudo install -m 644 -o root -g wheel {tmp_path!s} {NEWSYSLOG_CONF_PATH}", file=sys.stderr)
-            print(f"  Or rerun `./dev.py prod deploy` from an interactive terminal.", file=sys.stderr)
-            return  # Skip cleanup so the printed path stays valid for the user
+            raise SystemExit(
+                "could not install required launchd stderr rotation; run:\n"
+                f"  sudo install -m 644 -o root -g wheel {tmp_path!s} {NEWSYSLOG_CONF_PATH}\n"
+                "then rerun ./dev.py prod deploy"
+            )
     except FileNotFoundError:
-        print(f"  WARN: sudo not found; rotation config not installed.", file=sys.stderr)
+        raise SystemExit("sudo is required once to install launchd stderr rotation")
     Path(tmp_path).unlink(missing_ok=True)
 
 
@@ -9904,4 +9968,3 @@ if __name__ == "__main__":
         _shutdown_dev_tracing(failure)
     if failed_command_exit is not None:
         sys.exit(failed_command_exit)
-

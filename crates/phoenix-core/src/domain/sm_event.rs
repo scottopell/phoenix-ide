@@ -616,6 +616,9 @@ pub enum Event {
     CancelSteerMessage {
         message_id: String,
     },
+    /// Signals that durable steering work may now be runnable.
+    /// Intercepted by the executor, which reloads the authoritative queue.
+    SteeringQueueChanged,
 
     /// Drained steering entries delivered to bedrock for persistence as
     /// `UserMessage`s. Fired by the executor at steering-drain hook points:
@@ -675,6 +678,7 @@ impl Event {
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
+            Event::SteeringQueueChanged => "SteeringQueueChanged",
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
             Event::WakeBatchAdopted => "WakeBatchAdopted",
             Event::Shutdown => "Shutdown",
@@ -1028,11 +1032,12 @@ impl TryFrom<Event> for ParentEvent {
                 repo_root,
             })),
             // Sub-agent-only events are invalid for parent;
-            // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
+            // Steering queue notifications and Shutdown are intercepted by
             // the executor before reaching the state-machine conversion.
             Event::GraceTurnExhausted { .. }
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
+            | Event::SteeringQueueChanged
             | Event::WakeBatchAdopted
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
@@ -1174,7 +1179,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
             // Parent-only events are invalid for sub-agent;
-            // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
+            // Steering queue notifications and Shutdown are intercepted by
             // the executor before reaching the state-machine conversion.
             // SteerDrainedUserMessages is parent-only: steering is a parent-
             // conversation feature, and the executor's drain detector guards
@@ -1190,6 +1195,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
+            | Event::SteeringQueueChanged
             | Event::SteerDrainedUserMessages { .. }
             | Event::WakeBatchAdopted
             | Event::Shutdown => Err(EventConversionError {

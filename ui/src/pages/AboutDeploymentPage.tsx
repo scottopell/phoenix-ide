@@ -1092,7 +1092,12 @@ export function AboutDeploymentPage() {
                 ) : (
                   <Row label="Log file">none</Row>
                 )}
-                {!info.log.stdout && !info.log.file && (
+                {info.log.fatal_file ? (
+                  <Row label="Fatal diagnostics"><code className="deploy-path">{info.log.fatal_file}</code></Row>
+                ) : (
+                  <Row label="Fatal diagnostics">none</Row>
+                )}
+                {!info.log.stdout && !info.log.file && !info.log.fatal_file && (
                   <div className="settings-section__hint">No log output configured.</div>
                 )}
                 </section>

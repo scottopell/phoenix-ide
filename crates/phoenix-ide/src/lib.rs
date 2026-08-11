@@ -84,6 +84,16 @@ use tower_http::{
 mod hot_restart;
 mod logging;
 
+/// Install the bounded fatal-diagnostic hook before structured logging starts.
+pub fn install_fatal_diagnostic_hook() {
+    logging::install_fatal_diagnostic_hook();
+}
+
+/// Preserve a fatal server error even when structured logging failed to start.
+pub fn record_fatal_diagnostic(error: &(impl std::fmt::Display + ?Sized)) {
+    logging::record_fatal_diagnostic(error);
+}
+
 /// Assemble the static deployment facts reported by `GET /api/deployment`.
 /// Resolves every path from the same logic the rest of the process uses so the
 /// page reports the locations the process actually opens (specs/deployment-info/).
@@ -615,7 +625,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // PHOENIX_LOG_FILE) and the Datadog tracer provider (DD_* env vars). The
     // handles must outlive the program so the file appender worker and the
     // tracer provider flush on shutdown; held until `main` returns.
-    let log_config = logging::LogConfig::from_env();
+    let log_config = logging::process_log_config().clone().prepare()?;
     let tracing_handles = logging::init(&log_config)?;
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses

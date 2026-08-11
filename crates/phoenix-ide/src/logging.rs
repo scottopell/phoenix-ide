@@ -1,35 +1,246 @@
 //! Logging configuration and initialization.
 //!
-//! Phoenix supports two independent log sinks, each toggled by its own env var:
+//! Phoenix resolves three independent logging destinations from the environment:
 //!
 //! - `PHOENIX_LOG_STDOUT` (bool, default `true`) — structured JSON to stdout.
 //! - `PHOENIX_LOG_FILE` (optional path) — structured JSON appended to that file,
-//!   written by the process itself via a non-blocking worker thread.
+//!   written by the process itself via a non-blocking worker thread. The active
+//!   file keeps that exact path; Phoenix rotates it daily, compresses closed
+//!   archives, and retains the newest 14 generations.
+//! - `PHOENIX_FATAL_LOG_FILE` (optional path) — the latest fatal startup/runtime
+//!   diagnostic. Each event overwrites the previous one and is capped at 64 KiB.
 //!
-//! Both may be enabled at once (logs fan out to every enabled sink), so a
-//! deployment chooses whatever is appropriate. [`LogConfig`] is resolved once
-//! from the environment and is the single source of truth for both what the
-//! subscriber writes and what `GET /api/deployment` reports (via
-//! [`LogConfig::to_log_info`]) — the report cannot drift from the wiring.
+//! stdout and the structured file may be enabled together; the fatal snapshot
+//! records only the latest startup/runtime failure. [`LogConfig`] is resolved
+//! once and is the single source of truth for both the wiring and what
+//! `GET /api/deployment` reports (via [`PreparedLogConfig::to_log_info`]).
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::resource::Resource;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-/// The resolved set of enabled log sinks.
+mod rotation;
+
+const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
+const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
+
+pub(crate) fn process_log_config() -> &'static LogConfig {
+    PROCESS_LOG_CONFIG.get_or_init(LogConfig::from_env)
+}
+
+pub(crate) fn install_fatal_diagnostic_hook() {
+    process_log_config();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record_fatal_diagnostic(&format!("panic: {info}"));
+        previous_hook(info);
+    }));
+}
+
+pub(crate) fn record_fatal_diagnostic(message: &(impl std::fmt::Display + ?Sized)) {
+    let config = process_log_config();
+    let Some(path) = config.fatal_file.as_deref() else {
+        return;
+    };
+    if let Some(structured) = config.file.as_deref() {
+        if let Err(error) = validate_fatal_log_path(structured, path) {
+            eprintln!("failed to resolve fatal diagnostic path: {error}");
+            return;
+        }
+    }
+    if let Err(error) = write_fatal_diagnostic(path, &message.to_string()) {
+        eprintln!("failed to write {}: {error}", path.display());
+    }
+}
+
+fn fatal_log_path() -> Option<PathBuf> {
+    std::env::var_os(FATAL_LOG_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn paths_alias(left: &std::path::Path, right: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    if let (Ok(left_metadata), Ok(right_metadata)) =
+        (std::fs::metadata(left), std::fs::metadata(right))
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(path_identity(left)? == path_identity(right)?)
+}
+
+fn validate_fatal_log_path(structured: &Path, fatal: &Path) -> std::io::Result<()> {
+    if paths_alias(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must differ from PHOENIX_LOG_FILE"),
+        ));
+    }
+    if rotation::path_is_reserved(structured, fatal)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{FATAL_LOG_ENV} must not use a Phoenix log rotation path"),
+        ));
+    }
+    Ok(())
+}
+
+fn path_identity(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other @ (std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_)) => normalized.push(other.as_os_str()),
+        }
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "log path has no existing ancestor",
+            )
+        })?;
+        missing.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "log path has no existing ancestor",
+            )
+        })?;
+    }
+    let mut identity = std::fs::canonicalize(existing)?;
+    for component in missing.iter().rev() {
+        identity.push(component);
+    }
+    Ok(identity)
+}
+
+fn write_fatal_diagnostic(path: &std::path::Path, message: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut diagnostic = format!("fatal: {message}\n");
+    if diagnostic.len() > MAX_FATAL_LOG_BYTES {
+        let mut end = MAX_FATAL_LOG_BYTES;
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+    }
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(diagnostic.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn reject_symlink(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("log path must not be a symlink: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn open_log_append(path: &Path, create_mode: Option<u32>) -> std::io::Result<File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent)?;
+    }
+    reject_symlink(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(create_mode.unwrap_or(0o600))
+            .custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn prepare_log_identity(path: &Path, private: bool) -> std::io::Result<()> {
+    let existed = path.exists();
+    let file = open_log_append(path, Some(0o600))?;
+    #[cfg(unix)]
+    if private || !existed {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// The resolved logging destinations.
+#[derive(Clone, Debug)]
 pub struct LogConfig {
     /// Whether structured logs are written to stdout.
     pub stdout: bool,
     /// Path of the process-owned log file, when file logging is enabled.
     pub file: Option<PathBuf>,
+    /// Path of the bounded latest-fatal diagnostic, when configured.
+    pub fatal_file: Option<PathBuf>,
+}
+
+/// Logging destinations whose paths were opened, checked for aliases, and
+/// proven writable before subscriber construction.
+#[derive(Clone, Debug)]
+pub struct PreparedLogConfig {
+    stdout: bool,
+    file: Option<PathBuf>,
+    fatal_file: Option<PathBuf>,
 }
 
 /// Handles that must outlive the process so background workers flush on shutdown.
@@ -40,6 +251,7 @@ pub struct LogConfig {
 ///   shutdown.
 pub struct TracingHandles {
     _log_guard: Option<WorkerGuard>,
+    _archive_guard: Option<rotation::ArchiveWorkerGuard>,
     tracer_provider: Option<SdkTracerProvider>,
 }
 
@@ -65,16 +277,59 @@ impl LogConfig {
             file: std::env::var_os("PHOENIX_LOG_FILE")
                 .map(PathBuf::from)
                 .filter(|p| !p.as_os_str().is_empty()),
+            fatal_file: fatal_log_path(),
         }
     }
 
+    pub fn prepare(self) -> std::io::Result<PreparedLogConfig> {
+        if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
+            validate_fatal_log_path(file, fatal)?;
+        }
+        if let Some(file) = self.file.as_deref() {
+            prepare_log_identity(file, false).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to prepare PHOENIX_LOG_FILE {}: {error}",
+                        file.display()
+                    ),
+                )
+            })?;
+        }
+        if let Some(fatal) = self.fatal_file.as_deref() {
+            prepare_log_identity(fatal, true).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to prepare {FATAL_LOG_ENV} {}: {error}",
+                        fatal.display()
+                    ),
+                )
+            })?;
+        }
+        if let (Some(file), Some(fatal)) = (self.file.as_deref(), self.fatal_file.as_deref()) {
+            validate_fatal_log_path(file, fatal)?;
+        }
+        Ok(PreparedLogConfig {
+            stdout: self.stdout,
+            file: self.file,
+            fatal_file: self.fatal_file,
+        })
+    }
+}
+
+impl PreparedLogConfig {
     /// The deployment-report view of the active sinks, with the file path made
-    /// absolute. Derived from the same values used to build the subscriber.
+    /// absolute. Derived from the same prepared values used by the subscriber.
     pub fn to_log_info(&self) -> crate::api::LogInfo {
         crate::api::LogInfo {
             stdout: self.stdout,
             file: self
                 .file
+                .as_deref()
+                .map(|p| crate::api::absolutize(p).display().to_string()),
+            fatal_file: self
+                .fatal_file
                 .as_deref()
                 .map(|p| crate::api::absolutize(p).display().to_string()),
         }
@@ -92,7 +347,7 @@ impl LogConfig {
 /// opened. Honoring the configured sinks exactly — or refusing to start — is
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
-pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
+pub fn init(config: &PreparedLogConfig) -> std::io::Result<TracingHandles> {
     let tracer_provider = match trace_exporter_from_env()? {
         TraceExporter::None => None,
         TraceExporter::Datadog => Some(init_datadog_provider()),
@@ -119,9 +374,9 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
             .with_filter(make_env_filter())
     });
 
-    let (file_layer, guard) = match config.file.as_deref() {
+    let (file_layer, guard, archive_guard) = match config.file.as_deref() {
         Some(path) => {
-            let file = open_append(path).map_err(|e| {
+            let (file, archive_guard) = rotation::DailyRotatingFile::open(path).map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!("failed to open PHOENIX_LOG_FILE {}: {e}", path.display()),
@@ -134,9 +389,9 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
                 .with_span_list(false)
                 .with_writer(writer)
                 .with_filter(make_env_filter());
-            (Some(layer), Some(guard))
+            (Some(layer), Some(guard), Some(archive_guard))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     tracing_subscriber::registry()
@@ -145,9 +400,13 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         .with(file_layer)
         .init();
 
+    if let Some(archive_guard) = archive_guard.as_ref() {
+        archive_guard.start_maintenance()?;
+    }
     install_panic_hook();
     Ok(TracingHandles {
         _log_guard: guard,
+        _archive_guard: archive_guard,
         tracer_provider,
     })
 }
@@ -158,10 +417,98 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "conversation.stream.init"),
     ("phoenix_ide::otel", "browser.conversation_open"),
     ("phoenix_ide::otel", "conversation.runtime.materialize"),
+    ("phoenix_ide::otel", "conversation.cancel"),
     ("phoenix_ide::otel", "conversation.turn"),
+    ("phoenix_ide::otel", "direct_turn.settle"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
 ];
+
+pub(crate) fn conversation_cancel_span(conversation_id: &str) -> tracing::Span {
+    tracing::info_span!(
+        target: "phoenix_ide::otel",
+        "conversation.cancel",
+        conv_id = %conversation_id,
+        observed_state = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        direct_turn_action = tracing::field::Empty,
+        turn_id = tracing::field::Empty,
+        generation = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+}
+
+pub(crate) fn direct_turn_settlement_span(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+) -> tracing::Span {
+    direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "state",
+    )
+}
+
+pub(crate) fn continuation_direct_turn_settlement_span(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    operation_id: &str,
+) -> tracing::Span {
+    let span = direct_turn_settlement_span_for_path(
+        parent,
+        conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        "continuation",
+    );
+    span.record("operation_id", operation_id);
+    span
+}
+
+fn direct_turn_settlement_span_for_path(
+    parent: &tracing::Span,
+    conversation_id: &str,
+    turn_id: u64,
+    generation: u64,
+    terminal_kind: &str,
+    target_state: &str,
+    settlement_path: &str,
+) -> tracing::Span {
+    tracing::info_span!(
+        target: "phoenix_ide::otel",
+        parent: parent,
+        "direct_turn.settle",
+        conv_id = %conversation_id,
+        turn_id,
+        generation,
+        terminal_kind,
+        target_state,
+        settlement_path,
+        operation_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+        commit_probe = tracing::field::Empty,
+        durable_state = tracing::field::Empty,
+        active_turn_present = tracing::field::Empty,
+        turn_still_active = tracing::field::Empty,
+        error.message = tracing::field::Empty,
+        probe.error.message = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    )
+}
 
 fn otel_metadata_enabled(meta: &tracing::Metadata<'_>) -> bool {
     meta.is_span() && OTEL_SPANS.contains(&(meta.target(), meta.name()))
@@ -367,17 +714,6 @@ fn stdout_enabled(var: Option<&str>) -> bool {
     })
 }
 
-/// Open `path` for appending, creating it and any missing parent directories.
-fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-}
-
 /// Route panics through `tracing` so they reach every configured sink (notably
 /// the log file), then chain to the previous hook so the default stderr message
 /// is preserved.
@@ -433,6 +769,11 @@ mod tests {
                 operation = "branch_and_work_change",
             );
             drop(pr_refresh);
+            let cancel = conversation_cancel_span("cancel-conversation-123");
+            cancel.record("observed_state", "LlmRequesting");
+            cancel.record("outcome", "runtime_cancel_requested");
+            cancel.record("direct_turn_action", "not_checked");
+            drop(cancel);
             drop(http);
             let stream_init = tracing::info_span!(
                 target: "phoenix_ide::otel",
@@ -452,6 +793,40 @@ mod tests {
             drop(stream_init);
             drop(runtime_materialize);
             drop(browser_open);
+            let turn = tracing::info_span!(
+                target: "phoenix_ide::otel",
+                "conversation.turn",
+                conv_id = "settlement-conversation-123",
+            );
+            let settlement = direct_turn_settlement_span(
+                &turn,
+                "settlement-conversation-123",
+                265,
+                0,
+                "completed",
+                "Idle",
+            );
+            settlement.record("outcome", "failed_still_owed");
+            settlement.record("commit_probe", "still_owed");
+            settlement.record("durable_state", "LlmRequesting");
+            settlement.record("active_turn_present", true);
+            settlement.record("turn_still_active", true);
+            settlement.record("error.message", "database is locked");
+            settlement.record("otel.status_code", "ERROR");
+            drop(settlement);
+            let continuation_settlement = continuation_direct_turn_settlement_span(
+                &turn,
+                "continuation-settlement-conversation-123",
+                266,
+                1,
+                "failed",
+                "ContextExhausted",
+                "continuation-operation-123",
+            );
+            continuation_settlement.record("outcome", "reconciled_duplicate");
+            continuation_settlement.record("commit_probe", "retry");
+            drop(continuation_settlement);
+            drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
                 "llm.request",
@@ -500,7 +875,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 6);
+        assert_eq!(spans.len(), 10);
         assert_eq!(
             spans
                 .iter()
@@ -508,10 +883,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "pr_status.refresh",
+                "conversation.cancel",
                 "http",
                 "conversation.stream.init",
                 "conversation.runtime.materialize",
                 "browser.conversation_open",
+                "direct_turn.settle",
+                "direct_turn.settle",
+                "conversation.turn",
                 "llm.request"
             ]
         );
@@ -544,6 +923,22 @@ mod tests {
             );
         }
         let encoded = format!("{spans:?}");
+        for required in [
+            "cancel-conversation-123",
+            "settlement-conversation-123",
+            "failed_still_owed",
+            "still_owed",
+            "database is locked",
+            "state",
+            "continuation",
+            "continuation-operation-123",
+            "reconciled_duplicate",
+        ] {
+            assert!(
+                encoded.contains(required),
+                "missing exported telemetry attribute {required}"
+            );
+        }
         for forbidden in [
             "PAYLOAD_SENTINEL",
             "DELTA_SENTINEL",
@@ -580,6 +975,145 @@ mod tests {
     }
 
     #[test]
+    fn fatal_diagnostic_overwrites_and_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fatal.log");
+
+        write_fatal_diagnostic(&path, "first failure").unwrap();
+        write_fatal_diagnostic(&path, "second failure").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fatal: second failure\n"
+        );
+
+        write_fatal_diagnostic(&path, &"é".repeat(MAX_FATAL_LOG_BYTES)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() <= MAX_FATAL_LOG_BYTES);
+        assert!(std::str::from_utf8(&bytes).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fatal_diagnostic_replaces_symlink_without_touching_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let path = directory.path().join("fatal.log");
+        std::fs::write(&target, "keep me").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        write_fatal_diagnostic(&path, "failure").unwrap();
+
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fatal: failure\n");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn log_path_identity_rejects_parent_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("logs");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert!(paths_alias(
+            &nested.join("../prod.log"),
+            &directory.path().join("prod.log"),
+        )
+        .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_path_identity_rejects_symlink_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("alias");
+        std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+
+        assert!(paths_alias(&link.join("prod.log"), &directory.path().join("prod.log"),).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_path_identity_rejects_hard_link_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("prod.log");
+        let alias = directory.path().join("fatal.log");
+        std::fs::write(&original, "log").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+
+        assert!(paths_alias(&original, &alias).unwrap());
+    }
+
+    #[test]
+    fn fatal_log_cannot_alias_the_rotation_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(rotation::reserved_sibling_lock_path(&structured)),
+            file: Some(structured),
+        };
+
+        let error = config.prepare().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("rotation path"));
+    }
+
+    #[test]
+    fn fatal_log_cannot_use_the_archive_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("prod.log");
+        let mut fatal = structured.as_os_str().to_os_string();
+        fatal.push(".00000000000000000001-2026-08-09");
+        let config = LogConfig {
+            stdout: false,
+            fatal_file: Some(PathBuf::from(fatal)),
+            file: Some(structured),
+        };
+
+        assert!(config
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("rotation path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_log_directories_are_created_private_for_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let structured = directory.path().join("missing/nested/prod.log");
+        LogConfig {
+            stdout: false,
+            fatal_file: None,
+            file: Some(structured.clone()),
+        }
+        .prepare()
+        .unwrap();
+
+        let mode = std::fs::metadata(structured.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let (_writer, _guard) = rotation::DailyRotatingFile::open(&structured).unwrap();
+    }
+
+    #[test]
     fn stdout_enabled_by_truthy_values() {
         for v in ["1", "true", "on", "yes", "anything"] {
             assert!(stdout_enabled(Some(v)), "{v:?} should enable stdout");
@@ -588,34 +1122,76 @@ mod tests {
 
     #[test]
     fn to_log_info_absolutizes_the_file_and_carries_stdout() {
-        let cfg = LogConfig {
+        let cfg = PreparedLogConfig {
             stdout: false,
             file: Some(PathBuf::from("relative.log")),
+            fatal_file: Some(PathBuf::from("relative-fatal.log")),
         };
         let info = cfg.to_log_info();
         assert!(!info.stdout);
         let file = info.file.expect("file sink");
         assert!(std::path::Path::new(&file).is_absolute());
         assert!(file.ends_with("relative.log"));
+        assert!(info
+            .fatal_file
+            .expect("fatal diagnostic")
+            .ends_with("relative-fatal.log"));
     }
 
     #[test]
-    fn open_append_errors_when_parent_is_not_a_directory() {
+    fn rotating_file_errors_when_parent_is_not_a_directory() {
         // A requested file under a path whose parent is a regular file cannot be
         // created; init turns this Err into a startup abort (fail fast).
         let blocker =
             std::env::temp_dir().join(format!("phoenix-logging-test-{}", std::process::id()));
         std::fs::write(&blocker, b"x").unwrap();
         let unopenable = blocker.join("nested.log");
-        assert!(open_append(&unopenable).is_err());
+        assert!(rotation::DailyRotatingFile::open(&unopenable).is_err());
         let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
+    fn fatal_only_configuration_is_prepared() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let config = LogConfig {
+            stdout: false,
+            file: None,
+            fatal_file: Some(blocker.join("fatal.log")),
+        };
+
+        let error = config.prepare().unwrap_err();
+
+        assert!(error.to_string().contains(FATAL_LOG_ENV));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_log_symlink_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.log");
+        let link = directory.path().join("prod.log");
+        std::fs::write(&target, "existing").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = LogConfig {
+            stdout: false,
+            file: Some(link),
+            fatal_file: None,
+        };
+
+        let error = config.prepare().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "existing");
+    }
+
+    #[test]
     fn to_log_info_reports_no_file_when_unset() {
-        let cfg = LogConfig {
+        let cfg = PreparedLogConfig {
             stdout: true,
             file: None,
+            fatal_file: None,
         };
         let info = cfg.to_log_info();
         assert!(info.stdout);

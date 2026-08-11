@@ -42,6 +42,22 @@ pub enum PersistError {
     ResultCountMismatch { tool_uses: usize, results: usize },
 }
 
+/// Transcript payload owned by one steering-drain commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SteeringDrainMessage {
+    pub content: MessageContent,
+    pub display_data: Option<Value>,
+    pub usage_data: Option<UsageData>,
+    pub message_id: String,
+}
+
+/// Reducer-owned work that may run only after a steering drain commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteeringDrainPostCommit {
+    StartLlmAndNotifyState,
+    ContinueExistingLlm,
+}
+
 impl fmt::Display for PersistError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -266,14 +282,13 @@ pub enum Effect {
         repo_root: String,
     },
 
-    /// Remove the specified drained entries from the persisted steering queue.
-    /// Emitted by `SteerDrainedUserMessages` transition arms AFTER all
-    /// `PersistMessage` + `PersistState` effects so that a crash before this
-    /// effect runs leaves the queue intact for re-drain on restart (idempotent
-    /// persist guards against double-delivery). Removing only the drained ids
-    /// (rather than overwriting with empty) preserves concurrently-enqueued
-    /// steers that arrived during the drain window.
-    ClearSteeringQueueEntries { message_ids: Vec<String> },
+    /// Commit the reducer-selected FIFO batch, current reducer state, and exact
+    /// queue removals as one storage transaction. The executor may publish the
+    /// committed projection and perform `post_commit` only after success.
+    CommitSteeringDrain {
+        messages: Vec<SteeringDrainMessage>,
+        post_commit: SteeringDrainPostCommit,
+    },
 }
 
 #[must_use]

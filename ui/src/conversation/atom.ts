@@ -1,5 +1,5 @@
 import * as v from 'valibot';
-import type { ConversationState, Message, Conversation } from '../api';
+import type { ConversationState, Message, Conversation, QueuedSteeringMessage } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
 import type { BashToolProgress } from '../generated/sse';
 import type { WorkScopeInventory } from '../generated/sse';
@@ -15,6 +15,7 @@ import {
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseSteerMessageCancelledDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
@@ -80,8 +81,12 @@ export interface ConversationAtom {
   phaseLastAppliedEventSeq: number;
   conversationLastAppliedEventSeq: number;
   messages: Message[];
+  /** Durable server-authoritative messages awaiting steering delivery. */
+  steeringMessages: QueuedSteeringMessage[];
   contextWindow: { used: number };
   systemPrompt: string | null;
+  /** Identity of the server-side in-memory sequence/replay incarnation. */
+  streamIncarnation: string | null;
   lastAppliedEventSeq: number;
   bufferedEventEnvelopes: Record<number, SSEAction>;
   eventGap: EventGap | null;
@@ -175,9 +180,11 @@ export interface ConversationAtom {
 export interface InitPayload {
   conversation: Conversation;
   messages: Message[];
+  steeringMessages: QueuedSteeringMessage[];
   phase: ConversationState;
   contextWindow: { used: number };
   transcriptGeneration: number;
+  streamIncarnation: string;
   /** Legacy wire `last_sequence_id` converted at the UI boundary. This is an
    *  event-sequence cursor, not transcript message availability. */
   lastAppliedEventSeq: number;
@@ -284,6 +291,18 @@ export type SSEAction =
     }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
+  | {
+      type: 'sse_steer_message_queued';
+      sequenceId: number;
+      message: QueuedSteeringMessage;
+      epoch?: number;
+    }
+  | {
+      type: 'sse_steer_message_cancelled';
+      sequenceId: number;
+      messageId: string;
+      epoch?: number;
+    }
   // REQ-WSUI-007 / REQ-WSUI-010: full-snapshot work-scope inventory push.
   // The wire payload carries the complete `WorkScopeInventory` for the
   // scope; the reducer replaces `workScope` wholesale (no delta merge).
@@ -346,6 +365,11 @@ export type SSEAction =
       expectedConversationId: string;
     }
   | {
+      type: 'local_steer_message_cancelled';
+      messageId: string;
+      expectedConversationId: string;
+    }
+  | {
       type: 'set_initial_data';
       conversationId: string;
       conversation: Conversation;
@@ -383,8 +407,10 @@ export function createInitialAtom(): ConversationAtom {
     phaseLastAppliedEventSeq: 0,
     conversationLastAppliedEventSeq: 0,
     messages: [],
+    steeringMessages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
+    streamIncarnation: null,
     lastAppliedEventSeq: 0,
     bufferedEventEnvelopes: {},
     eventGap: null,
@@ -600,7 +626,16 @@ function materializeMessages(atom: ConversationAtom, messages: Message[]): Conve
     materialized.push(nextMessage);
   }
   materialized.sort((left, right) => left.sequence_id - right.sequence_id);
-  return withDerivedMessageSyncState(nextAtom, materialized);
+  const deliveredMessageIds = new Set(materialized.map((message) => message.message_id));
+  return withDerivedMessageSyncState(
+    {
+      ...nextAtom,
+      steeringMessages: nextAtom.steeringMessages.filter(
+        (message) => !deliveredMessageIds.has(message.message_id),
+      ),
+    },
+    materialized,
+  );
 }
 
 function toolResultUseId(message: Message): string | null {
@@ -630,12 +665,18 @@ function clearProgressForMaterializedResults(
 function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_message': {
+      const steeringMessages = atom.steeringMessages.filter(
+        (message) => message.message_id !== action.message.message_id,
+      );
       const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
       if (idx >= 0) {
-        return withoutLiveBashProgress(atom, toolResultUseId(action.message));
+        return withoutLiveBashProgress(
+          { ...atom, steeringMessages },
+          toolResultUseId(action.message),
+        );
       }
       let nextAtom: ConversationAtom = withoutLiveBashProgress(
-        { ...atom, streamingBuffer: null },
+        { ...atom, streamingBuffer: null, steeringMessages },
         toolResultUseId(action.message),
       );
       let nextMessage = action.message;
@@ -766,6 +807,24 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
         conversation: { ...atom.conversation, browser_session_active: action.active },
         conversationLastAppliedEventSeq: action.sequenceId,
       };
+    case 'sse_steer_message_queued': {
+      const existingIndex = atom.steeringMessages.findIndex(
+        (message) => message.message_id === action.message.message_id,
+      );
+      if (existingIndex < 0) {
+        return { ...atom, steeringMessages: [...atom.steeringMessages, action.message] };
+      }
+      const steeringMessages = [...atom.steeringMessages];
+      steeringMessages[existingIndex] = action.message;
+      return { ...atom, steeringMessages };
+    }
+    case 'sse_steer_message_cancelled':
+      return {
+        ...atom,
+        steeringMessages: atom.steeringMessages.filter(
+          (message) => message.message_id !== action.messageId,
+        ),
+      };
     case 'sse_work_scope_update':
       return { ...atom, workScope: action.inventory };
     case 'sse_error':
@@ -810,6 +869,16 @@ function applyContiguousWireAction(
   const sequenceId = action.sequenceId;
   if (sequenceId === undefined) return applyWireActionBody(atom, action as SSEAction);
   if (action.type === 'sse_bash_tool_progress') {
+    if (sequenceId < atom.lastAppliedEventSeq) return atom;
+    return applyWireActionBody(atom, action as SSEAction);
+  }
+  if (
+    action.type === 'sse_steer_message_queued'
+    || action.type === 'sse_steer_message_cancelled'
+  ) {
+    // Steering mutations are live projections of the durable queue. Their
+    // sequence_id is a current-stream witness, not a newly allocated cursor;
+    // init replaces the projection after reconnect or a missed event.
     if (sequenceId < atom.lastAppliedEventSeq) return atom;
     return applyWireActionBody(atom, action as SSEAction);
   }
@@ -1077,9 +1146,6 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       });
     }
     case 'steer_message_queued': {
-      // Validated for forward-compat parity with the live handler in
-      // useConnection.ts; no reducer action needed (no-op). Schema drift
-      // still warns in DEV so a Rust-side wire change surfaces here.
       const res = v.safeParse(SseSteerMessageQueuedDataSchema, entry);
       if (!res.success) {
         if (import.meta.env.DEV) {
@@ -1088,8 +1154,23 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         return atom;
       }
       return conversationReducer(atom, {
-        type: 'sse_sequence_consumed',
+        type: 'sse_steer_message_queued',
         sequenceId: res.output.sequence_id,
+        message: res.output.message,
+      });
+    }
+    case 'steer_message_cancelled': {
+      const res = v.safeParse(SseSteerMessageCancelledDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending steer_message_cancelled entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_steer_message_cancelled',
+        sequenceId: res.output.sequence_id,
+        messageId: res.output.message_id,
       });
     }
     case 'rate_limit_snapshot': {
@@ -1183,6 +1264,12 @@ export function conversationReducer(
       const isFreshConnect = !ownsIncomingTranscript
         || atom.lastAppliedEventSeq === 0
         || generationChanged;
+      // Ephemeral sequence positions disappear with the in-memory replay ring
+      // on server restart. A lower authoritative init watermark therefore
+      // starts a new cursor incarnation even when transcript generation is
+      // unchanged; retaining the old floor would drop every new live event.
+      const streamIncarnationChanged = atom.streamIncarnation !== null
+        && atom.streamIncarnation !== p.streamIncarnation;
       const preservesTranscript = p.transcriptCoverage === 'preserve' && knownGenerationMatches;
       const mergesMessageSuffix = p.transcriptCoverage === 'tail' && knownGenerationMatches;
       const nextTranscriptCoverage = transcriptCoverageAfterInit(atom, p);
@@ -1194,13 +1281,19 @@ export function conversationReducer(
       } else {
         mergedMessages = [...p.messages].sort((left, right) => left.sequence_id - right.sequence_id);
       }
+      const deliveredMessageIds = new Set(mergedMessages.map((message) => message.message_id));
+      const steeringMessages = p.steeringMessages.filter(
+        (message) => !deliveredMessageIds.has(message.message_id),
+      );
 
       const snapshotMessageAnchor = p.messages.reduce(
         (maxSeq, message) => Math.max(maxSeq, message.sequence_id),
         0,
       );
       const phase1Floor = Math.max(
-        isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq,
+        isFreshConnect || streamIncarnationChanged
+          ? p.pendingAnchorSequenceId
+          : atom.lastAppliedEventSeq,
         snapshotMessageAnchor,
       );
       const initPhaseAuthoritySeq = Math.max(phase1Floor, p.lastAppliedEventSeq);
@@ -1220,7 +1313,10 @@ export function conversationReducer(
       // disconnected and we clear. See SseInitReconnectMerge in
       // specs/conversation_atom/conversation_atom.allium.
       const phase1StreamingBuffer =
-        !isFreshConnect && p.phase.type === 'llm_requesting' && !p.pendingTruncated
+        !isFreshConnect
+        && !streamIncarnationChanged
+        && p.phase.type === 'llm_requesting'
+        && !p.pendingTruncated
           ? atom.streamingBuffer
           : null;
       let next: ConversationAtom = {
@@ -1231,14 +1327,18 @@ export function conversationReducer(
         phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
         conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
+        streamIncarnation: p.streamIncarnation,
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
         eventGap: null,
         transcriptGeneration: p.transcriptGeneration,
         transcriptCoverage: nextTranscriptCoverage,
-        pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
+        pendingMessagePatches: isFreshConnect || streamIncarnationChanged
+          ? {}
+          : atom.pendingMessagePatches,
         ...deriveMessageSyncState(mergedMessages),
         messages: mergedMessages,
+        steeringMessages,
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
@@ -1317,6 +1417,8 @@ export function conversationReducer(
     case 'sse_token':
     case 'sse_conversation_update':
     case 'sse_browser_session_state':
+    case 'sse_steer_message_queued':
+    case 'sse_steer_message_cancelled':
     case 'sse_work_scope_update':
       return applyContiguousWireAction(atom, action);
 
@@ -1385,6 +1487,15 @@ export function conversationReducer(
       if (action.expectedConversationId !== atom.conversationId) return atom;
       if (!atom.conversation) return atom;
       return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
+
+    case 'local_steer_message_cancelled':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
+      return {
+        ...atom,
+        steeringMessages: atom.steeringMessages.filter(
+          (message) => message.message_id !== action.messageId,
+        ),
+      };
 
     case 'set_initial_data': {
       // Don't overwrite if SSE has already provided authoritative data

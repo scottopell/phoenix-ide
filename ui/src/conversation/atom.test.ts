@@ -47,9 +47,11 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
   return {
     conversation: testConversation,
     messages: [],
+    steeringMessages: [],
     phase: { type: 'idle' },
     contextWindow: { used: 1000 },
     transcriptGeneration: 1,
+    streamIncarnation: "test-stream",
     lastAppliedEventSeq,
     // Default to "no pending replay": anchor matches the tip and the ring
     // is empty. Tests exercising ReplayRing behaviour override these.
@@ -91,6 +93,7 @@ describe('conversationReducer', () => {
         lastAppliedEventSeq: 3,
         messages: [existing],
         transcriptGeneration: 1,
+        streamIncarnation: 'test-stream',
       };
       const newMsg = makeMessage(4);
       const payload = makeInitPayload({
@@ -104,6 +107,43 @@ describe('conversationReducer', () => {
       expect(next.messages).toHaveLength(2);
       expect(next.messages[0]!.sequence_id).toBe(3);
       expect(next.messages[1]!.sequence_id).toBe(4);
+    });
+
+    it('resets the ephemeral cursor when server restart lowers the init watermark', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: testConversation.id,
+        conversation: testConversation,
+        lastAppliedEventSeq: 12,
+        transcriptGeneration: 1,
+        streamIncarnation: 'old-stream',
+        pendingMessagePatches: {
+          'old-message': { lastAppliedPatchEventSeq: 12, patches: [] },
+        },
+        streamingBuffer: {
+          text: 'pre-restart partial',
+          lastSequence: 12,
+          startedAt: Date.now(),
+          requestId: 'old-request',
+        },
+      };
+      const payload = makeInitPayload({
+        lastAppliedEventSeq: 4,
+        pendingAnchorSequenceId: 4,
+      });
+
+      const restarted = dispatch(atom, { type: 'sse_init', payload });
+      const afterLive = dispatch(restarted, {
+        type: 'sse_state_change',
+        sequenceId: 5,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        stateUpdatedAt: 1,
+      });
+
+      expect(restarted.lastAppliedEventSeq).toBe(4);
+      expect(restarted.streamingBuffer).toBeNull();
+      expect(restarted.pendingMessagePatches).toEqual({});
+      expect(afterLive.lastAppliedEventSeq).toBe(5);
     });
 
     it('replaces cached transcript when authoritative route ownership changes', () => {
@@ -398,6 +438,7 @@ describe('conversationReducer', () => {
         conversationId: testConversation.id,
         lastAppliedEventSeq: 105,
         transcriptGeneration: 1,
+        streamIncarnation: 'test-stream',
       };
       const stalePayload = makeInitPayload({ lastAppliedEventSeq: 100 });
 
@@ -482,6 +523,134 @@ describe('conversationReducer', () => {
 
       expect(atom.messages.map((m) => m.message_id)).toEqual(['local-user-1']);
       expect(pending).toEqual([]);
+    });
+  });
+
+  describe('authoritative steering queue', () => {
+    const steeringMessage = {
+      message_id: 'steer-1',
+      text: 'queued elsewhere',
+      images: [],
+      files: [],
+    };
+
+    it('restores the durable queue from init without duplicating delivered history', () => {
+      const delivered = { ...makeMessage(4, 'user'), message_id: 'already-delivered' };
+      const atom = dispatch(createInitialAtom(), {
+        type: 'sse_init',
+        payload: makeInitPayload({
+          messages: [delivered],
+          steeringMessages: [steeringMessage, { ...steeringMessage, message_id: 'already-delivered' }],
+        }),
+      });
+
+      expect(atom.steeringMessages).toEqual([steeringMessage]);
+    });
+
+    it('removes delivered steering input during authoritative history reconciliation', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        steeringMessages: [steeringMessage],
+      };
+      const delivered = { ...makeMessage(8, 'user'), message_id: steeringMessage.message_id };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [delivered],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 0,
+      });
+
+      expect(next.steeringMessages).toEqual([]);
+      expect(next.messages).toEqual([delivered]);
+    });
+
+    it('applies live enqueue, idempotent replacement, cancel, and delivery', () => {
+      let atom = dispatch(createInitialAtom(), {
+        type: 'sse_init',
+        payload: makeInitPayload({ lastAppliedEventSeq: 5, pendingAnchorSequenceId: 5 }),
+      });
+      atom = dispatch(atom, {
+        type: 'sse_steer_message_queued',
+        sequenceId: 5,
+        message: steeringMessage,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_steer_message_queued',
+        sequenceId: 5,
+        message: { ...steeringMessage, text: 'authoritative replacement' },
+      });
+      expect(atom.steeringMessages).toHaveLength(1);
+      expect(atom.steeringMessages[0]?.text).toBe('authoritative replacement');
+
+      atom = dispatch(atom, {
+        type: 'sse_message',
+        sequenceId: 6,
+        message: { ...makeMessage(6, 'user'), message_id: 'steer-1' },
+      });
+      expect(atom.steeringMessages).toEqual([]);
+
+      atom = dispatch(atom, {
+        type: 'sse_steer_message_queued',
+        sequenceId: 6,
+        message: steeringMessage,
+      });
+      atom = dispatch(atom, {
+        type: 'sse_steer_message_cancelled',
+        sequenceId: 6,
+        messageId: 'steer-1',
+      });
+      expect(atom.steeringMessages).toEqual([]);
+      expect(atom.lastAppliedEventSeq).toBe(6);
+    });
+
+    it('removes a queued bubble when REST cancellation succeeds', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        steeringMessages: [steeringMessage],
+      };
+
+      const cancelled = dispatch(atom, {
+        type: 'local_steer_message_cancelled',
+        messageId: steeringMessage.message_id,
+        expectedConversationId: 'conv-1',
+      });
+      const stale = dispatch(atom, {
+        type: 'local_steer_message_cancelled',
+        messageId: steeringMessage.message_id,
+        expectedConversationId: 'other-conversation',
+      });
+
+      expect(cancelled.steeringMessages).toEqual([]);
+      expect(cancelled.lastAppliedEventSeq).toBe(atom.lastAppliedEventSeq);
+      expect(stale).toBe(atom);
+    });
+
+    it('recovers a missed live cancellation from authoritative init', () => {
+      const beforeReconnect: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: testConversation.id,
+        conversation: testConversation,
+        lastAppliedEventSeq: 5,
+        steeringMessages: [steeringMessage],
+      };
+      const atom = dispatch(beforeReconnect, {
+        type: 'sse_init',
+        payload: makeInitPayload({
+          lastAppliedEventSeq: 5,
+          pendingAnchorSequenceId: 5,
+          steeringMessages: [],
+        }),
+      });
+
+      expect(atom.steeringMessages).toEqual([]);
+      expect(atom.lastAppliedEventSeq).toBe(5);
     });
   });
 

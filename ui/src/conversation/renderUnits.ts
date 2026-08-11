@@ -18,7 +18,7 @@ import type {
   Message,
   ToolResultContent,
 } from '../api';
-import type { QueuedMessage } from '../hooks/useMessageQueue';
+import type { PendingUserMessage } from '../hooks/useMessageQueue';
 
 export type AwaitingSubAgentsState = Extract<
   ConversationState,
@@ -36,7 +36,7 @@ export type HistoricalUnit =
       isFirstInTurn: boolean;
     }
   | { kind: 'system'; key: string; message: Message }
-  | { kind: 'pending_user'; key: string; message: QueuedMessage };
+  | { kind: 'pending_user'; key: string; message: PendingUserMessage };
 
 export type TailUnit =
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
@@ -59,14 +59,14 @@ export interface StreamingHandle {
 
 export interface BuildInputs {
   messages: Message[];
-  pendingMessages: QueuedMessage[];
+  pendingMessages: PendingUserMessage[];
   convState: ConversationState;
   streamingHandle: StreamingHandle | null;
 }
 
 export interface HistoricalBuildInputs {
   messages: Message[];
-  pendingMessages: QueuedMessage[];
+  pendingMessages: PendingUserMessage[];
 }
 
 export interface HistoricalBuild {

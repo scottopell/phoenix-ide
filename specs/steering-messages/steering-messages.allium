@@ -9,7 +9,7 @@
 --             LlmRequesting entry from a tool round,
 --           user cancellation of queued entries,
 --           persistence and crash recovery,
---           SSE notification of queuing
+--           SSE notification of queue mutations and reconnect snapshots
 -- Excludes:
 --   - Conversation state machine transitions other than the
 --     SteerDrainedUserMessages arms (see bedrock.allium)
@@ -27,17 +27,22 @@
 --   bedrock via Event::SteerDrainedUserMessages { entries }, which bedrock
 --   handles with explicit transition arms from Idle and from LlmRequesting.
 --
---   Trade-off: the queue's existence stays orthogonal to bedrock (state
---   machine purity preserved), but the delivery contract — "drained steers
---   become UserMessages in the transcript" — is typed in bedrock. This
---   preserves the single-writer transcript-persistence invariant: all user
---   messages, including drained steers, flow through Effect::persist_user_message.
+--   The queue's existence stays orthogonal to bedrock, while the delivery
+--   contract is typed in bedrock. The reducer selects the exact FIFO batch,
+--   next state, and post-commit LLM action in one CommitSteeringDrain effect.
 --
 --   The queue is persisted in the steering_messages table (one row per entry,
 --   ordered by ordinal; each entry's attachments live in the grandchild
 --   steering_message_files / steering_message_images tables) and loaded into
---   executor memory on startup, enabling crash recovery without re-delivery
---   (the message_id PRIMARY KEY prevents double-insert).
+--   executor memory on startup. Startup drains use the same reducer and atomic
+--   transaction as live drains.
+--
+--   Accepted client identities also have an immutable durable fingerprint.
+--   This identity record is not queue state: the pending queue determines
+--   whether a request is queued, and the transcript determines whether it was
+--   delivered. An identity found in neither is terminal and cannot be admitted
+--   again. Legacy pending identities with no recoverable fingerprint are
+--   represented explicitly and validated against their durable queue payload.
 --
 -- Requirement traceability: REQ-STEER-001 through REQ-STEER-005
 
@@ -147,7 +152,7 @@ rule EnqueueSteeringMessage {
                      skill_invocation: skill_invocation
                  }
         -- The client receives a zero-based position indicating its place in line.
-        ensures: SteerMessageQueuedEmitted(conversation, message_id,
+        ensures: SteerMessageQueuedEmitted(conversation, q.entries.last,
                      queue_position = q.depth)
         -- HTTP response confirms the message was accepted as a steering entry.
         ensures: ChatResponseSent(conversation, message_id, steering = true)
@@ -162,12 +167,25 @@ rule EnqueueSteeringMessage {
         -- the expanded content is stored in llm_text. If expansion fails, the
         -- message is still enqueued with llm_text absent.
         --
-        -- Persistence order (P1): enqueue_steer_message() reads the current queue
-        -- from DB, appends the new SteerEntry, and writes the updated queue to DB
-        -- *before* sending Event::SteerMessage to the executor channel. The HTTP
-        -- response is returned only after the DB write succeeds. This guarantees
-        -- that a crash between acceptance and executor processing does not lose
-        -- the entry.
+        -- Persistence order: Database::append_steering_entry inserts only the
+        -- new queue row and its immutable acceptance identity in one transaction,
+        -- then returns the committed zero-based FIFO position. Existing rows are
+        -- never rewritten, so a concurrent drain cannot be resurrected from a
+        -- stale queue snapshot. Only after commit does the runtime publish
+        -- SteerMessageQueued and deliver Event::SteerMessage to the executor.
+        -- A failed append persists neither row and publishes no success event or
+        -- HTTP success.
+        -- Runtime ownership is revalidated after acquiring the queue projection
+        -- fence and held through channel admission. If the previously observed
+        -- executor was retired, enqueue retries against the current executor
+        -- before committing, so no accepted row is sent to a retired channel.
+        -- Once the append commits, durable queue admission is successful even
+        -- if executor delivery and immediate runtime reconstruction both fail.
+        -- The runtime makes one bounded reconstruction retry. If that also
+        -- fails, it releases the preserved broadcaster so connected clients
+        -- reconnect and retry ordinary runtime construction. The committed row
+        -- remains authoritative; the HTTP result must not invite duplicate
+        -- user intent.
 }
 
 -- REQ-STEER-002
@@ -204,14 +222,10 @@ rule DrainOnIdleEntry {
         -- user is clearing a banner, not completing a turn, so queued steers
         -- must wait for an explicit retry/send.
         --
-        -- Drain-all (not one-at-a-time): the executor uses std::mem::take to swap
-        -- the entire Vec<SteerEntry> out atomically. The bedrock arm for
-        -- (Idle, SteerDrainedUserMessages) emits one Effect::persist_user_message
-        -- per entry in iteration order, then Effect::PersistState, then
-        -- Effect::ClearSteeringQueueEntries { message_ids }, then
-        -- NotifyLlmRequesting, and finally Effect::RequestLlm. The effect loop
-        -- runs persist effects serially, each allocating a sequential
-        -- sequence_id, so transcript order is FIFO and matches enqueue order.
+        -- Drain-all (not one-at-a-time): the executor takes the complete durable
+        -- FIFO snapshot under the queue projection fence. The bedrock arm emits
+        -- one CommitSteeringDrain effect carrying that exact ordered batch and
+        -- StartLlmAndNotifyState. The executor supplies the reducer's next state.
         --
         -- Single RequestLlm: only one is emitted regardless of how many entries
         -- were drained. The next LLM call sees all N messages as freshly-persisted
@@ -221,20 +235,59 @@ rule DrainOnIdleEntry {
         -- apply_transition_result call that triggered the hook, not via the
         -- outer event loop. This is what makes ordering deterministic.
         --
-        -- Crash recovery: ClearSteeringQueueEntries removes ONLY the drained
-        -- message_ids (not the whole queue), so a concurrent enqueue during
-        -- the drain window is preserved. It runs AFTER persist effects, so a
-        -- crash mid-drain leaves the drained entries in the DB queue. On
-        -- restart the queue reloads; the next drain hook re-fires
-        -- SteerDrainedUserMessages with the same entries; Effect::PersistMessage
-        -- skips already-persisted entries via a storage.message_exists()
-        -- precheck gated by an idempotent: bool flag (so non-replayable
-        -- persists pay no extra DB query). At-least-once delivery without
-        -- double-insertion.
+        -- Database::commit_steering_drain inserts every supplied transcript
+        -- message, persists the supplied state, and deletes only the supplied
+        -- queue ids in one transaction. Failure rolls back all three. Messages,
+        -- state, and RequestLlm are published only after commit. A concurrent
+        -- enqueue has a different id and survives the exact deletes.
+        -- If the transaction commits but the LLM task cannot start, the
+        -- synchronous failure is reduced from LlmRequesting into a persisted
+        -- typed Error. The committed messages remain and the deleted queue rows
+        -- are neither recreated nor redrained.
+        -- Starting this drained batch as a new user turn resets the parent
+        -- tool-cycle budget before RequestLlm; a mid-turn drain does not reset
+        -- the existing turn's budget.
+        --
+        -- Startup routes the durable queue through this same reducer arm. A
+        -- matching pre-transaction message is a typed legacy partial and is
+        -- consumed without duplication. A mismatched identity or stale batch
+        -- fails once, leaves the durable queue intact, and stops that runtime so
+        -- a later reconstruction retries from database truth.
+        -- Once the transaction has committed LlmRequesting and removed the
+        -- exact queue row, the immutable acceptance identity plus the latest
+        -- transcript user message form bounded restart ownership until the
+        -- first provider response changes the transcript tail. Recovery resumes
+        -- one request without adding a steering lifecycle or queue authority.
+        -- A synchronous failure to start that recovered request is reduced into
+        -- the same persisted typed Error used by live drain dispatch failures.
+        -- If Error persistence fails, the executor retires so reconnect can
+        -- reconstruct from the unchanged database owner.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
         -- enqueue. std::mem::take preserves Vec order; iteration in the bedrock
         -- arm emits persist effects in the same order.
+}
+
+-- A steer may be accepted while the durable state is busy but arrive on the
+-- executor channel after that executor has already reached idle. Treat the
+-- late arrival as the missed idle drain hook rather than waiting for another
+-- unrelated transition.
+rule DrainWhenSteerArrivesAfterIdle {
+    when: SteerMessageReceivedByExecutor(conversation)
+    requires: conversation.core_status = idle
+    for q in SteeringQueue where q.conversation = conversation and q.depth > 0:
+        ensures: q.depth = 0
+        ensures: q.entries.all(e =>
+                     bedrock.UserSendsMessage(conversation,
+                         e.text, e.llm_text, e.images,
+                         e.message_id, e.user_agent, e.skill_invocation))
+        ensures: bedrock.RequestLlmIssued(conversation)
+
+    @guidance
+        -- The executor appends the received entry, atomically takes the full
+        -- queue, and routes SteerDrainedUserMessages through the normal Idle
+        -- bedrock arm. That arm owns transcript persistence, durable queue
+        -- removal, state notification, and the single RequestLlm effect.
 }
 
 -- REQ-STEER-005
@@ -272,8 +325,7 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         --   1. Defers any Effect::RequestLlm from the original effects.
         --   2. Runs the remaining original effects.
         --   3. Synchronously transitions (LlmRequesting, SteerDrainedUserMessages)
-        --      and runs its effects (N Effect::persist_user_message,
-        --      Effect::PersistState, Effect::ClearSteeringQueueEntries).
+        --      and runs its single CommitSteeringDrain effect.
         --   4. Runs the deferred RequestLlm. The spawned LLM task's
         --      build_llm_messages_static reads a DB that already contains the
         --      steered messages — deterministic, no race.
@@ -283,39 +335,59 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         -- closes the failure mode where a no-tool LLM response would settle
         -- the conversation to Idle with steers persisted but unanswered.
         --
-        -- ClearSteeringQueueEntries removes only the drained ids (not the whole
-        -- queue), so a concurrent enqueue during the drain window is preserved.
-        -- Crash recovery: queue updated AFTER persist effects, so a crash
-        -- mid-drain reloads the drained entries on restart; idempotent
-        -- PersistMessage (gated by idempotent: bool, via storage.message_exists)
-        -- prevents double-insertion on re-drain.
+        -- CommitSteeringDrain atomically inserts the exact FIFO batch, persists
+        -- the reducer's LlmRequesting state, and deletes only those queue ids.
+        -- The deferred RequestLlm runs only after commit. A failed transaction
+        -- performs no publication or dispatch and is not retried while holding
+        -- the projection fence. The runtime exits; its successor reconstructs
+        -- the untouched batch from database truth.
+        -- If the transaction commits but the deferred RequestLlm cannot start,
+        -- that synchronous failure is reduced through the same persisted typed
+        -- Error path as a turn-end steering drain. The committed messages remain
+        -- and the exact drained queue rows remain absent.
 }
 
 -- REQ-STEER-003
 -- A queued steering entry can be cancelled before it is drained.
--- Cancellation by message_id is idempotent: if the entry is already gone
--- (drained or never existed), the operation succeeds silently.
-rule CancelSteeringMessage {
+-- Cancellation of an existing entry commits before its live projection.
+rule CancelExistingSteeringMessage {
     when: UserCancelsSteeringMessage(conversation, message_id)
     for q in SteeringQueue where q.conversation = conversation:
+        requires: q.entries.any(e => e.message_id = message_id)
         ensures: not q.entries.any(e => e.message_id = message_id)
+        ensures: SteerMessageCancelledEmitted(conversation, message_id)
 
     @guidance
-        -- The HTTP response is 200 OK in all cases, including when no entry with
-        -- the given message_id exists in the queue. The caller cannot distinguish
-        -- a successful cancel from a cancel of an already-drained entry; this is
-        -- intentional: the postcondition "entry is not in queue" holds in both cases.
-        --
-        -- Cancel sequence (P2): the handler updates the DB first, then sends
-        -- Event::CancelSteerMessage{message_id} to the live executor (if one is
-        -- currently loaded) via try_get_handle(). The executor removes the matching
-        -- entry from its in-memory steering_queue without a further DB write.
-        -- If no executor is running, the DB update alone is sufficient: the next
-        -- executor to start loads the already-corrected queue from DB.
-        --
-        -- queue_position values reported in earlier SteerMessageQueuedEmitted
-        -- events are not retroactively adjusted after a cancel. Clients should
-        -- treat queue_position as an ordering hint at enqueue time, not a live index.
+        -- Database::remove_steering_entry returns true only when its committed
+        -- DELETE removed a row. That true result is the publication fence:
+        -- SteerMessageCancelled is sent live to every authorized client only
+        -- after commit, then the executor removes its in-memory projection.
+        -- If no executor is running, the DB mutation is sufficient: the next
+        -- executor loads the already-corrected queue from durable state.
+        -- Runtime startup and queue mutations share a per-conversation fence.
+        -- Startup reloads the durable queue while holding that fence immediately
+        -- before publishing and spawning the executor. Before draining, the
+        -- executor reloads the durable queue under the same fence and holds it
+        -- until persistence and removal commit. Cancellation and delivery thus
+        -- have one durable winner: a committed cancellation is filtered before
+        -- use, while a completed drain makes the later delete report no removal.
+        -- Earlier queue_position values are not rewritten after cancellation;
+        -- clients treat them as enqueue-time ordering witnesses.
+}
+
+-- Cancellation is idempotent when the entry is already gone.
+rule CancelAbsentSteeringMessage {
+    when: UserCancelsSteeringMessage(conversation, message_id)
+    for q in SteeringQueue where q.conversation = conversation:
+        requires: not q.entries.any(e => e.message_id = message_id)
+        ensures: not q.entries.any(e => e.message_id = message_id)
+        ensures: not SteerMessageCancelledEmitted(conversation, message_id)
+
+    @guidance
+        -- HTTP returns 200 because the requested postcondition already holds.
+        -- No false cancellation event is published for an absent row.
+        -- The idempotent in-memory executor removal is still delivered, repairing
+        -- an earlier cancellation interrupted after its durable delete.
 }
 
 -- REQ-STEER-004
@@ -386,17 +458,77 @@ surface SteeringQueueApi {
     @guarantee SteerMessageQueuedAck
         -- When a message is accepted as a steering entry (conversation was busy
         -- at call time), the HTTP response body contains { steering: true } and
-        -- an SSE event SteerMessageQueued { message_id, queue_position } is
-        -- emitted to all connected clients before the response is flushed.
+        -- an SSE event carrying the renderable SteerEntry and its queue position
+        -- is emitted live to all connected authorized clients before the response
+        -- is flushed. It is not replayed; init reconstructs the durable queue.
+
+    @guarantee AuthoritativeQueueProjection
+        -- A newly-subscribed client receives the complete persisted queue in
+        -- FIFO order. Live enqueue and cancellation events mutate that same
+        -- projection, so browser-local send state is never required to render
+        -- a server-accepted steering message.
+
+    @guarantee SteerMessageCancelledAck
+        -- After cancellation is durable, all connected clients receive the
+        -- cancelled message_id and remove that queued entry if present. An
+        -- idempotent retry of an already-absent id emits no second event.
 
     @guarantee DirectSendTransparency
-        -- When a message is sent while the conversation is idle, { steering: false }
-        -- is returned and the message enters the normal bedrock delivery path.
-        -- No SteerMessageQueued event is emitted.
+        -- When a message is sent while the conversation is idle, no durable
+        -- steering row is pending, and no durable direct-turn owner is active,
+        -- { steering: false } is returned and the message enters the normal
+        -- bedrock delivery path. No SteerMessageQueued event is emitted.
 
     @guarantee PersistenceBeforeResponse
         -- In all cases that mutate the queue (enqueue, cancel), the DB reflects
         -- the new state before the HTTP response is returned to the caller.
+
+    @guarantee DurableSteeringIdempotency
+        -- A retry whose accepted identity is still queued returns the queued
+        -- outcome; an identity present in the transcript returns the delivered
+        -- outcome; an accepted identity present in neither returns a stable
+        -- terminal outcome. An exact fingerprint mismatch is rejected. A
+        -- legacy pending identity without a recoverable fingerprint is checked
+        -- against its durable queue payload. Cancellation and drain never erase
+        -- the immutable acceptance identity.
+
+    @guarantee PendingQueueFencesDirectAcceptance
+        -- Message admission is serialized per conversation from before state
+        -- observation through validation and durable acceptance. A busy send
+        -- therefore reserves its place before slow payload work, and a non-empty
+        -- durable steering queue prevents a later idle observation from routing
+        -- into direct-turn acceptance. A durable direct-turn owner also fences an
+        -- idle observation until the accepted turn becomes visible as busy. The
+        -- later request joins the steering queue,
+        -- covering the window where a steer was accepted while busy but reaches
+        -- the executor after it became idle. The state is checked again before
+        -- acceptance; terminal and interaction-blocked states reject rather than
+        -- parking an undeliverable message. Error recovery remains a direct turn
+        -- so it cannot be stranded behind a queue that error dismissal does not
+        -- drain. Admission for unrelated conversations remains independent.
+
+    @guarantee AcceptedDirectTurnPrecedesStartupDrain
+        -- When an accepted direct turn has not yet materialized its authoritative
+        -- user message, startup recovery and live idle notifications leave the
+        -- durable steering queue untouched. The direct-turn worker materializes
+        -- that accepted turn first; the ordinary turn-end hook then drains the
+        -- queued steering batch in durable FIFO order.
+
+    @guarantee CancelledDirectTurnReleasesDeferredSteering
+        -- Cancelling an unmaterialized direct turn while its conversation is
+        -- idle attempts an executor wake after durable cancellation. The wake
+        -- settles as Applied, NothingToDrain, Conflict, or DispatchFailed.
+        -- NothingToDrain starts no LLM request and leaves no idle runtime behind.
+        -- Applied reloads queue authority and submits the exact durable batch to
+        -- the ordinary reducer-owned drain transaction. Conflict reports that
+        -- durable queue work could not be reconciled with the current state.
+        -- The wake holds the conversation admission gate through the executor
+        -- acknowledgement that carries this settlement. A surviving durable row
+        -- yields Conflict even when an unrelated turn has entered Error, so
+        -- aggregate runtime state cannot impersonate a steering result.
+        -- DispatchFailed reports that the batch committed but the LLM could not
+        -- start; the reducer-owned Error state is durable and visible, and the
+        -- exact drained rows are absent from the queue.
 
     @guarantee MidTurnDrainSemantics
         -- Steers queued while the conversation is busy may be delivered at one
@@ -407,13 +539,23 @@ surface SteeringQueueApi {
         -- entries are persisted to the transcript BEFORE the LLM task is
         -- spawned (inline drain + deferred RequestLlm in the executor), so the
         -- in-flight LLM call deterministically observes the steered messages.
+        -- The drain preserves the existing turn's tool-cycle budget. A
+        -- synchronous failure to start the deferred request settles as a
+        -- durable typed Error after the atomic drain commit.
+
+    @guarantee CommittedTurnRestartRecovery
+        -- A committed drain awaiting its first provider response resumes one
+        -- LLM request after reconstruction. The immutable acceptance identity,
+        -- latest transcript user message, and absence of that exact pending
+        -- queue row are the bounded evidence. The first provider response ends
+        -- this exception; no second queue authority or steering lifecycle exists.
+        -- A synchronous recovery dispatch failure settles as a durable typed
+        -- Error rather than leaving LlmRequesting without a provider task.
+        -- A failed Error write retires the runtime for database reconstruction.
 
     @guarantee EnqueueDuringDrainPreserved
         -- A steering message enqueued while a drain is in progress is not lost.
-        -- Effect::ClearSteeringQueueEntries removes only the specific drained
-        -- message_ids (not the whole queue); the DB method
-        -- Database::remove_steering_entries deletes exactly those message_id
-        -- rows from steering_messages (cascading their attachments) as a direct
-        -- DELETE — there is no read-modify-write window, so a concurrent
-        -- enqueue's read-append-write cannot be clobbered.
+        -- Database::commit_steering_drain deletes only the reducer-supplied
+        -- message_ids, while Database::append_steering_entry inserts only the
+        -- new row. Neither path rewrites rows owned by the other mutation.
 }

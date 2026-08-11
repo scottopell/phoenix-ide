@@ -9,9 +9,12 @@
 --
 -- Includes: All SSE event types (init, message, message_updated,
 --           state_change, token, llm_first_byte, llm_attempt, agent_done,
---           conversation_hard_deleted, conversation_update,
+--           conversation_became_terminal, conversation_hard_deleted,
+--           conversation_update, browser_session_state, bash_tool_progress,
+--           work_scope_update, steer_message_queued,
+--           steer_message_cancelled,
 --           product_conversation_lifecycle,
---           continuation_boundary, browser_session_state, steer_message_queued,
+--           continuation_boundary,
 --           rate_limit_snapshot, error); ordering constraints between them;
 --           the persist-before-broadcast invariant; broadcast-lag semantics;
 --           the per-conversation ReplayRing that buffers ephemeral events
@@ -74,14 +77,26 @@
 value InitSnapshot {
     product_conversation_lifecycle: ProductConversationLifecycleUpdate
     last_sequence_id: Integer
+    stream_incarnation: String
     transcript_generation: Integer
     transcript_coverage: TranscriptCoverage
     pending_anchor_sequence_id: Integer
     pending_events: List<PendingEventEntry>
     pending_truncated: Boolean
+    -- Complete persisted steering queue in FIFO order for an authenticated
+    -- conversation stream. Unlike ReplayRing entries, this survives process
+    -- restart. Token-shared transcript streams emit an empty list because
+    -- pending steering input is not part of the published transcript.
+    steering_messages: List<SteeringMessage>
     -- product_conversation_lifecycle is the authoritative aggregate snapshot;
     -- conversation, messages, agent_working, display_state,
     -- context_window_size, model_context_window, project_name: opaque at this level.
+}
+
+value SteeringMessage {
+    message_id: String
+    text: String
+    -- image and file attachment display payloads are opaque at this level.
 }
 
 -- One entry in the per-conversation replay ring. Each carries the
@@ -93,35 +108,36 @@ value InitSnapshot {
 -- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
 -- is:
 --   "init", "message", "message_updated", "state_change", "token",
---   "agent_done", "conversation_update", "product_conversation_lifecycle",
---   "continuation_boundary", "work_scope_update", "error", "browser_session_state",
---   "steer_message_queued", "rate_limit_snapshot",
---   "conversation_hard_deleted", "llm_first_byte", "llm_attempt"
+--   "agent_done", "conversation_became_terminal",
+--   "conversation_update", "error", "browser_session_state",
+--   "steer_message_queued", "steer_message_cancelled", "rate_limit_snapshot",
+--   "conversation_hard_deleted", "bash_tool_progress", "work_scope_update",
+--   "llm_first_byte", "llm_attempt"
 --
 -- Ring eligibility (which events can appear as a PendingEventEntry):
 --   - "message" enters the ring via the eager-assistant path
 --     (EagerAssistantMessageAppendedToReplayRing below).
 --   - "token", "state_change", "message_updated", "agent_done",
---     "conversation_update", "product_conversation_lifecycle",
---     "continuation_boundary", "work_scope_update", "error", "browser_session_state",
---     "steer_message_queued",
---     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
+--     "conversation_update", "conversation_became_terminal",
+--     "error", "browser_session_state", "rate_limit_snapshot",
+--     "work_scope_update",
+--     "llm_first_byte", "llm_attempt" enter
 --     via the ephemeral path (EphemeralEventAppendedToReplayRing
---     below). All non-Message broadcasts go through
---     `SseBroadcaster::send_seq`, which unconditionally appends to
---     the ring (`runtime.rs::send_with_ring` with `RingOp::Append`).
---   - Excluded entirely:
+--     below) through `SseBroadcaster::send_seq`, which appends to the
+--     ring (`runtime.rs::send_with_ring` with `RingOp::Append`).
+--   - Excluded from the ring:
 --     - "init" (per-subscriber, never broadcast)
---     - "conversation_hard_deleted" (terminal; no subsequent init
---       can fire, so replay is moot)
+--     - "bash_tool_progress" (replaceable live progress uses
+--       `send_live_progress`, which broadcasts without appending)
+--     - "steer_message_queued" and "steer_message_cancelled" (live
+--       projections of the durable queue; init reconstructs current state)
+--     - "conversation_hard_deleted" (terminal live projection; no later init)
 --
 -- Note on `rate_limit_snapshot` replay: the snapshot represents a
--- point-in-time codex quota state, so a stale snapshot replayed on
--- reconnect can paint the UI's quota chip with data that has since
--- been superseded. The protocol accepts that staleness in exchange for
--- the structural simplicity of "all broadcasts ride the ring": the
--- whitelist and the broadcaster agree that "rate_limit_snapshot"
--- replays like any other ephemeral event.
+-- point-in-time codex quota state. It remains in the conversation ring
+-- so sequence coverage stays structurally uniform, but clients consume
+-- a replayed entry only as a sequence witness. Only a live snapshot or
+-- an account-scoped source may update account-global quota state.
 --
 -- Distinguish from "llm_attempt" on rationale (the per-retry
 -- context's reconnect preservation is load-bearing for the StateBar's
@@ -292,10 +308,10 @@ entity SseStream {
 enum StreamStatus { open | closed }
 enum AggregateBoundLiveCarrierKind {
     message | state_change | token | message_updated | agent_done |
+    conversation_became_terminal |
     conversation_update | product_conversation_lifecycle |
     continuation_boundary | work_scope_update | error |
-    browser_session_state | steer_message_queued |
-    rate_limit_snapshot | llm_first_byte | llm_attempt
+    browser_session_state | rate_limit_snapshot | llm_first_byte | llm_attempt
 }
 
 
@@ -405,6 +421,15 @@ rule StreamOpened {
         -- messages that would otherwise be lost. See
         -- conversation_atom.allium SseInitFreshConnect /
         -- SseInitReconnectMerge for the replay semantics.
+        --
+        -- For an authenticated stream, snapshot.steering_messages is read from
+        -- the durable steering queue after the live receiver is subscribed. A
+        -- concurrent enqueue or cancellation is therefore represented either
+        -- in the snapshot or by the live delta; identity-based client
+        -- reconciliation tolerates both. A token-shared transcript stream
+        -- carries an empty steering_messages list and filters both steering
+        -- mutation variants from its pending replay and live broadcast path;
+        -- unpublished input is never part of the shared transcript.
         --
         -- init_sent is set true atomically with last_delivered_seq
         -- at creation, enforcing InitAlwaysFirst by construction:
@@ -660,14 +685,14 @@ rule PersistedMessageClearsReplayRing {
 -- a turn that only emits the un-registered event type.
 -- ============================================================
 
--- Every non-Message broadcast appends to the ring. Includes:
+-- Replayable non-Message broadcasts append to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
--- product_conversation_lifecycle, continuation_boundary, work_scope_update,
--- error, browser_session_state, steer_message_queued,
--- rate_limit_snapshot, llm_first_byte, llm_attempt. Excludes Init
--- (per-stream, never broadcast) and ConversationHardDeleted
--- (terminal action; no subsequent init can fire for this
--- conversation, so replay is moot).
+-- conversation_became_terminal, error, browser_session_state,
+-- rate_limit_snapshot, work_scope_update, llm_first_byte, llm_attempt.
+-- Excludes Init (per-stream, never broadcast) and BashToolProgress
+-- (replaceable live progress), steering queue mutations (durable-state-
+-- subsumed live projections), and ConversationHardDeleted (terminal live
+-- projection); each exclusion broadcasts without ring retention.
 --
 -- `llm_first_byte` (introduced by specs/working-phase-visibility/)
 -- MUST replay alongside the `token` events it precedes — if a client
@@ -695,8 +720,9 @@ rule EphemeralEventAppendedToReplayRing {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "product_conversation_lifecycle",
         "continuation_boundary", "work_scope_update", "error",
-        "browser_session_state", "steer_message_queued",
-        "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
+        "browser_session_state", "conversation_became_terminal",
+        "rate_limit_snapshot", "work_scope_update",
+        "llm_first_byte", "llm_attempt"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}
@@ -742,6 +768,34 @@ rule EphemeralEventAppendedToReplayRing {
         -- every append, gauge for current ring byte size). Bytes
         -- are observability-only — the cap is enforced by entry
         -- count, not bytes.
+}
+
+-- Queue mutations and hard deletion are live projections whose durable state
+-- is either reconstructed by init or no longer exists. They carry the current
+-- sequence witness but do not allocate a new cursor position or enter replay.
+rule DurableStateProjectionBroadcastLiveOnly {
+    when: EphemeralEventBroadcast(conv_id, entry)
+
+    requires: entry.event_type in {
+        "steer_message_queued", "steer_message_cancelled",
+        "conversation_hard_deleted"
+    }
+
+    let ring = ReplayRing{conversation_id: conv_id}
+
+    ensures: ring.entries = ring.entries
+    ensures: ring.anchor_sequence_id = ring.anchor_sequence_id
+    ensures: ring.truncated = ring.truncated
+
+    @guidance
+        -- SseBroadcaster::send_live_projection stamps the event with the
+        -- current stream watermark. Because it does not allocate a sequence,
+        -- excluding the event from pending_events cannot create a replay gap.
+        -- The broadcaster gate is held from watermark observation through the
+        -- channel send, so a later sequenced event cannot be delivered first.
+        -- Authorized init replaces steering state from SQLite. Shared init and
+        -- live filtering omit private steering content. Hard deletion has no
+        -- later init because the conversation row is gone.
 }
 
 -- Eager (non-persisted) Message broadcast appends to the ring without
@@ -931,10 +985,10 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
 
     requires: carrier_kind in {
         message, state_change, token, message_updated, agent_done,
+        conversation_became_terminal,
         conversation_update, product_conversation_lifecycle,
         continuation_boundary, work_scope_update, error,
-        browser_session_state, steer_message_queued,
-        rate_limit_snapshot, llm_first_byte, llm_attempt
+        browser_session_state, rate_limit_snapshot, llm_first_byte, llm_attempt
     }
 
     ensures: AggregateBoundLiveEvent(
@@ -955,8 +1009,8 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
         -- covered carrier unrepresentable without changing this spec.
         --
         -- Member-scoped carriers (`message`, `state_change`, `token`, `message_updated`,
-        -- `agent_done`, `conversation_update`, `error`, `browser_session_state`,
-        -- `steer_message_queued`, `rate_limit_snapshot`, `llm_first_byte`,
+        -- `agent_done`, `conversation_became_terminal`, `conversation_update`,
+        -- `error`, `browser_session_state`, `rate_limit_snapshot`, `llm_first_byte`,
         -- `llm_attempt`) carry the emitting member conversation id; aggregate-native
         -- carriers (`product_conversation_lifecycle`, `continuation_boundary`,
         -- `work_scope_update`) carry null there.
@@ -973,8 +1027,9 @@ rule AggregateBoundMemberLiveCarrierClaimsRootSequence {
 
     requires: carrier_kind in {
         "state_change", "token", "message_updated", "agent_done",
+        "conversation_became_terminal",
         "conversation_update", "error", "browser_session_state",
-        "steer_message_queued", "rate_limit_snapshot", "llm_first_byte",
+        "rate_limit_snapshot", "llm_first_byte",
         "llm_attempt"
     }
     requires: member_sequence_id > 0
@@ -1186,19 +1241,6 @@ rule BrowserSessionStateClaimsRootSequence {
     ensures: RootProjectedEventCommitted(
         root_conversation_id: DurableRootOf(conv_id),
         projected_kind: "browser_session_state",
-        payload_identity: payload_identity,
-        root_sequence_id: seq
-    )
-}
-
-rule SteerMessageQueuedClaimsRootSequence {
-    when: AggregateBoundMemberEventProduced(conv_id, "steer_message_queued", payload_identity, seq)
-
-    requires: seq > 0
-
-    ensures: RootProjectedEventCommitted(
-        root_conversation_id: DurableRootOf(conv_id),
-        projected_kind: "steer_message_queued",
         payload_identity: payload_identity,
         root_sequence_id: seq
     )
@@ -1426,9 +1468,10 @@ invariant AggregateBoundLiveEnvelopeCoversClosedCarrierSet {
     for event in AggregateBoundLiveEvents:
         event.carrier_kind in {
             message, state_change, token, message_updated, agent_done,
+            conversation_became_terminal,
             conversation_update, product_conversation_lifecycle,
-            continuation_boundary, error, browser_session_state,
-            steer_message_queued, rate_limit_snapshot, llm_first_byte,
+            continuation_boundary, work_scope_update, error, browser_session_state,
+            rate_limit_snapshot, llm_first_byte,
             llm_attempt
         }
 }

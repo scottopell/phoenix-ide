@@ -73,6 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 
 async fn trajectory_export_handler(
     State(state): State<AppState>,
@@ -3943,6 +3944,12 @@ async fn stream_conversation(
     }
 
     init_trace.record_ms("stream.metadata_hydration_ms", metadata_started.elapsed());
+    let steering_messages = state
+        .runtime
+        .db()
+        .get_steering_queue(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     // Create init event with typed data -- serialization deferred to SSE layer
     let transcript = match transcript_coverage {
         crate::runtime::TranscriptCoverage::Complete => {
@@ -3956,9 +3963,11 @@ async fn stream_conversation(
         conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
         transcript,
+        steering_messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
+        stream_incarnation: broadcast_tx.stream_incarnation().to_string(),
         context_window_size,
         project_name,
         pending_anchor_sequence_id,
@@ -3966,7 +3975,13 @@ async fn stream_conversation(
         pending_truncated,
     };
 
-    Ok(sse_stream(id, init_event, broadcast_rx, Some(init_trace)))
+    Ok(sse_stream(
+        id,
+        init_event,
+        broadcast_rx,
+        Some(init_trace),
+        crate::api::sse::SseStreamAudience::Authenticated,
+    ))
 }
 
 // ============================================================
@@ -4170,7 +4185,7 @@ async fn cancel_wake(
 async fn cancel_active_direct_turn(
     state: &AppState,
     conversation_id: &str,
-) -> Result<bool, AppError> {
+) -> Result<Option<phoenix_workflow::Materialization>, AppError> {
     let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
     let Some(turn) = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
@@ -4179,21 +4194,97 @@ async fn cancel_active_direct_turn(
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
+    let materialization = turn.materialization.clone();
     repo.terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
         turn_id: turn.id,
         expected_generation: turn.generation,
     })
     .await
     .map_err(|error| AppError::Internal(error.to_string()))?;
-    Ok(true)
+    Ok(Some(materialization))
+}
+
+async fn load_active_direct_turn_authority(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, AppError> {
+    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let turn = repo
+        .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+            conversation_id.to_string(),
+        ))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let Some(turn) = turn else {
+        return Ok(None);
+    };
+    let span = tracing::Span::current();
+    span.record("turn_id", turn.id.0);
+    span.record("generation", turn.generation);
+    Ok(Some(crate::runtime::traits::ActiveDirectTurn {
+        turn_id: turn.id,
+        generation: turn.generation,
+    }))
+}
+
+fn record_cancel_outcome(
+    conversation_id: &str,
+    observed_state: &ConvState,
+    outcome: &'static str,
+    direct_turn_action: &'static str,
+) {
+    let span = tracing::Span::current();
+    span.record("observed_state", observed_state.variant_name());
+    span.record("outcome", outcome);
+    span.record("direct_turn_action", direct_turn_action);
+    tracing::info!(
+        conv_id = %conversation_id,
+        observed_state = observed_state.variant_name(),
+        outcome,
+        direct_turn_action,
+        "Conversation cancel resolved"
+    );
 }
 
 #[allow(clippy::too_many_lines)]
 async fn cancel_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
+) -> Result<Json<CancelResponse>, AppError> {
+    let span = crate::logging::conversation_cancel_span(&id);
+    let result = cancel_conversation_inner(state, id)
+        .instrument(span.clone())
+        .await;
+    if let Err(error) = &result {
+        let (outcome, is_server_error) = match error {
+            AppError::Conflict(_) => ("rejected_state", false),
+            AppError::NotFound(_) => ("not_found", false),
+            AppError::BadRequest(_)
+            | AppError::TypedBadRequest { .. }
+            | AppError::Forbidden(_)
+            | AppError::UnprocessableEntity(_) => ("request_error", false),
+            AppError::Internal(_) | AppError::TypedInternal { .. } => ("server_error", true),
+        };
+        span.record("outcome", outcome);
+        if is_server_error {
+            span.record("otel.status_code", "ERROR");
+            tracing::warn!(parent: &span, error = ?error, "Conversation cancel failed");
+        } else {
+            tracing::info!(parent: &span, error = ?error, outcome, "Conversation cancel rejected");
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn cancel_conversation_inner(
+    state: AppState,
+    id: String,
 ) -> Result<Json<CancelResponse>, AppError> {
     // Provisioning cancellation is DB-owned because no conversation runtime
     // owns that lifecycle yet.
@@ -4231,6 +4322,12 @@ async fn cancel_conversation(
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
             .await;
         state.runtime.kick_creation_worker();
+        record_cancel_outcome(
+            &id,
+            &conversation.state,
+            "creation_cancelled",
+            "not_applicable",
+        );
         return Ok(Json(CancelResponse {
             ok: true,
             no_op: false,
@@ -4242,6 +4339,7 @@ async fn cancel_conversation(
         .effective_conversation_state(&id)
         .await
         .unwrap_or_else(|| conversation.state.clone());
+    tracing::Span::current().record("observed_state", effective_state.variant_name());
 
     if matches!(effective_state, ConvState::Idle) || effective_state.is_terminal() {
         let cancelled_direct_turn = cancel_active_direct_turn(&state, &id).await?;
@@ -4264,21 +4362,68 @@ async fn cancel_conversation(
                 .map_err(|error| {
                     AppError::Internal(format!("failed to send cancel event: {error}"))
                 })?;
+            record_cancel_outcome(
+                &id,
+                &effective_state,
+                "runtime_cancel_requested_after_turn_cancel",
+                "cancelled",
+            );
             return Ok(Json(CancelResponse {
                 ok: true,
                 no_op: false,
             }));
         }
-        if !cancelled_direct_turn {
+        if matches!(effective_state, ConvState::Idle) {
+            match state.runtime.wake_deferred_steering(&id).await {
+                Ok(
+                    crate::runtime::SteeringWakeOutcome::Applied
+                    | crate::runtime::SteeringWakeOutcome::NothingToDrain,
+                ) => {}
+                Ok(crate::runtime::SteeringWakeOutcome::Conflict) => {
+                    return Err(AppError::Conflict(Box::new(
+                        ConflictErrorResponse::new(
+                            "Deferred steering could not be reconciled with the current conversation state",
+                            "steering_wake_conflict",
+                        ),
+                    )));
+                }
+                Ok(crate::runtime::SteeringWakeOutcome::DispatchFailed) => {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Deferred steering committed, but its LLM request could not start",
+                        "steering_wake_dispatch_failed",
+                    ))));
+                }
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to wake steering queue: {error}"
+                    )));
+                }
+            }
+        }
+        if cancelled_direct_turn.is_none() {
             tracing::debug!(
                 conv_id = %id,
                 state = effective_state.variant_name(),
                 "cancel no-op: conversation has nothing in flight"
             );
         }
+        record_cancel_outcome(
+            &id,
+            &effective_state,
+            if cancelled_direct_turn.is_some() {
+                "direct_turn_cancelled"
+            } else {
+                "no_op"
+            },
+            if cancelled_direct_turn.is_some() {
+                "cancelled"
+            } else {
+                "absent"
+            },
+        );
         return Ok(Json(CancelResponse {
             ok: true,
-            no_op: !cancelled_direct_turn,
+            no_op: cancelled_direct_turn.is_none(),
         }));
     }
 
@@ -4292,6 +4437,20 @@ async fn cancel_conversation(
         ))));
     }
 
+    let direct_turn_action = match load_active_direct_turn_authority(&state, &id).await {
+        Ok(Some(_)) => "observed",
+        Ok(None) => "absent",
+        Err(error) => {
+            tracing::warn!(
+                conv_id = %id,
+                ?error,
+                "Active direct-turn lookup failed while enriching cancellation telemetry"
+            );
+            "lookup_failed"
+        }
+    };
+    tracing::Span::current().record("direct_turn_action", direct_turn_action);
+
     state
         .runtime
         .send_event(
@@ -4302,7 +4461,18 @@ async fn cancel_conversation(
             },
         )
         .await
-        .map_err(AppError::BadRequest)?;
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to dispatch conversation cancellation: {error}"
+            ))
+        })?;
+
+    record_cancel_outcome(
+        &id,
+        &effective_state,
+        "runtime_cancel_requested",
+        direct_turn_action,
+    );
 
     Ok(Json(CancelResponse {
         ok: true,
@@ -4485,18 +4655,39 @@ async fn cancel_steering_message(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // Delete the entry directly (cascading its attachments); a missing entry is
-    // a no-op, matching the idempotent contract.
-    state
-        .runtime
-        .db()
-        .remove_steering_entries(&id, std::slice::from_ref(&message_id))
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // Serialize removal and publication with queue admission. This preserves
+    // one durable mutation order and prevents a cancel event from overtaking
+    // an append event for the same conversation.
+    let removed = {
+        let _acceptance_guard = state.runtime.lock_message_acceptance(&id).await;
+        let _projection_guard = state.runtime.lock_steering_projection(&id).await;
 
-    // Notify the live executor (if running) to remove the entry from its
-    // in-memory queue. DB is already updated above, so the executor write
-    // in its SteerMessage handler is a no-op if the executor restarts.
+        // Delete the entry directly (cascading its attachments). Idempotent retries
+        // return success but do not publish a second cancellation projection.
+        let removed = state
+            .runtime
+            .db()
+            .remove_steering_entry(&id, &message_id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        if removed {
+            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
+            let cancelled_message_id = message_id.clone();
+            let _ =
+                broadcaster.send_live_projection(|sequence_id| SseEvent::SteerMessageCancelled {
+                    sequence_id,
+                    message_id: cancelled_message_id,
+                });
+        }
+        removed
+    };
+
+    // Executor removal is independently idempotent and runs even when the DB
+    // row was already absent. This repairs an interrupted earlier handler that
+    // committed the delete but did not reach its in-memory notification. The
+    // projection gate is released before this bounded send because the executor
+    // takes the same gate while draining.
     if let Some(handle) = state.runtime.try_get_handle(&id).await {
         let _ = handle
             .event_tx
@@ -4506,7 +4697,7 @@ async fn cancel_steering_message(
             .await;
     }
 
-    tracing::info!(conv_id = %id, %message_id, "Steering message cancelled");
+    tracing::info!(conv_id = %id, %message_id, removed, "Steering cancellation settled");
 
     Ok(Json(SuccessResponse { success: true }))
 }
@@ -5495,14 +5686,14 @@ async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
         let conv_id = id.to_string();
         let _ = handle
             .broadcast_tx
-            .send_seq(|seq| SseEvent::ConversationHardDeleted {
+            .send_live_projection(|seq| SseEvent::ConversationHardDeleted {
                 sequence_id: seq,
                 conversation_id: conv_id,
             });
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
         let conv_id = id.to_string();
-        let _ = tx.send_seq(|seq| SseEvent::ConversationHardDeleted {
+        let _ = tx.send_live_projection(|seq| SseEvent::ConversationHardDeleted {
             sequence_id: seq,
             conversation_id: conv_id,
         });
@@ -7767,9 +7958,12 @@ async fn shared_sse_stream(
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, false).await?),
         transcript_generation: conversation.transcript_generation,
         transcript,
+        // Pending steering input is not part of the published transcript.
+        steering_messages: Vec::new(),
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
+        stream_incarnation: broadcast_tx.stream_incarnation().to_string(),
         context_window_size,
         project_name,
         pending_anchor_sequence_id,
@@ -7777,7 +7971,13 @@ async fn shared_sse_stream(
         pending_truncated,
     };
 
-    Ok(sse_stream(conversation_id, init_event, broadcast_rx, None))
+    Ok(sse_stream(
+        conversation_id,
+        init_event,
+        broadcast_rx,
+        None,
+        crate::api::sse::SseStreamAudience::SharedTranscript,
+    ))
 }
 
 // ============================================================
@@ -11508,6 +11708,179 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("load active turn");
         assert!(active.is_none());
+        assert!(
+            state
+                .runtime
+                .try_get_handle("c-pending-turn")
+                .await
+                .is_none(),
+            "cancelling with no deferred steering must not create an idle runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_unmaterialized_direct_turn_wakes_deferred_steering() {
+        let state = make_test_state().await;
+        let conversation_id = "c-cancel-direct-wakes-steering";
+        state
+            .db
+            .create_conversation(conversation_id, "pending", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, conversation_id).await;
+        let handle = state
+            .runtime
+            .get_or_create(conversation_id)
+            .await
+            .expect("materialize idle runtime");
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "run after cancellation".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "deferred-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        state
+            .db
+            .update_steering_queue(conversation_id, std::slice::from_ref(&entry))
+            .await
+            .expect("persist steering queue");
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send((
+                Event::SteerMessage {
+                    text: entry.text.clone(),
+                    llm_text: entry.llm_text.clone(),
+                    images: entry.images.clone(),
+                    files: entry.files.clone(),
+                    message_id: entry.message_id.clone(),
+                    user_agent: entry.user_agent.clone(),
+                    skill_invocation: entry.skill_invocation.clone(),
+                },
+                ack_tx,
+            ))
+            .await
+            .expect("notify runtime of queued steering");
+        ack_rx
+            .await
+            .expect("runtime acknowledges steering notification")
+            .expect("steering notification defers cleanly");
+        assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
+        assert_eq!(
+            state
+                .db
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("load deferred queue")
+                .len(),
+            1
+        );
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+                .await
+                .expect("cancel pending direct turn");
+
+        assert!(response.ok);
+        assert!(!response.no_op);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let queue_empty = state
+                    .db
+                    .get_steering_queue(conversation_id)
+                    .await
+                    .expect("load steering queue")
+                    .is_empty();
+                let message_persisted = state
+                    .db
+                    .get_messages(conversation_id)
+                    .await
+                    .expect("load messages")
+                    .iter()
+                    .any(|message| message.message_id == entry.message_id);
+                if queue_empty && message_persisted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred steering drains after cancellation");
+    }
+
+    #[tokio::test]
+    async fn later_idle_cancel_repairs_failed_deferred_steering_wake() {
+        let state = make_test_state().await;
+        let conversation_id = "c-retry-cancel-wake";
+        state
+            .db
+            .create_conversation(conversation_id, "pending", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        accept_unmaterialized_direct_turn(&state, conversation_id).await;
+        let entry = crate::state_machine::event::SteerEntry {
+            text: "survive failed wake".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "retry-deferred-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        state
+            .db
+            .update_steering_queue(conversation_id, std::slice::from_ref(&entry))
+            .await
+            .expect("persist steering queue");
+
+        let first_cancellation = cancel_active_direct_turn(&state, conversation_id)
+            .await
+            .expect("commit direct-turn cancellation");
+        assert!(matches!(
+            first_cancellation,
+            Some(phoenix_workflow::Materialization::Unmaterialized)
+        ));
+        assert!(
+            state
+                .runtime
+                .try_get_handle(conversation_id)
+                .await
+                .is_none(),
+            "simulated first attempt stopped before waking a runtime"
+        );
+
+        let Json(response) =
+            cancel_conversation(State(state.clone()), Path(conversation_id.to_string()))
+                .await
+                .expect("later idle cancellation wakes deferred steering");
+
+        assert!(response.ok);
+        assert!(response.no_op, "the direct turn was already terminal");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let queue_empty = !state
+                    .db
+                    .has_steering_entries(conversation_id)
+                    .await
+                    .expect("check steering queue");
+                let message_persisted = state
+                    .db
+                    .get_messages(conversation_id)
+                    .await
+                    .expect("load messages")
+                    .iter()
+                    .any(|message| message.message_id == entry.message_id);
+                if queue_empty && message_persisted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later idle cancellation repairs deferred steering wake");
     }
 
     #[tokio::test]
@@ -14623,6 +14996,7 @@ mod chat_authority_tests {
             .runtime
             .inject_handle_for_test("c-fm7", ConvState::LlmRequesting { attempt: 1 })
             .await;
+        let mut sse_rx = state.runtime.subscribe("c-fm7").await.expect("subscribe");
 
         // Verify effective_conversation_state returns the live state.
         let effective = state
@@ -14652,6 +15026,211 @@ mod chat_authority_tests {
             result.0.steering,
             "must be routed as steering, not UserMessage"
         );
+        let queued_event = tokio::time::timeout(std::time::Duration::from_secs(1), sse_rx.recv())
+            .await
+            .expect("queued event timeout")
+            .expect("queued event");
+        let SseEvent::SteerMessageQueued { message, .. } = queued_event else {
+            panic!("expected steer_message_queued event");
+        };
+        assert_eq!(message.text, "continue please");
+        let durable_queue = state
+            .db
+            .get_steering_queue("c-fm7")
+            .await
+            .expect("durable queue");
+        assert_eq!(durable_queue.len(), 1, "broadcast follows durable append");
+        assert_eq!(durable_queue[0].message_id, message.message_id);
+    }
+
+    #[tokio::test]
+    async fn cancellation_commits_before_broadcast_and_reaches_every_live_client_once() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-cancel", "cancel", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .runtime
+            .inject_handle_for_test("c-cancel", ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let mut first = state
+            .runtime
+            .subscribe("c-cancel")
+            .await
+            .expect("first client");
+        let mut second = state
+            .runtime
+            .subscribe("c-cancel")
+            .await
+            .expect("second client");
+        let message_id = uuid::Uuid::new_v4().to_string();
+
+        let result = send_chat(
+            State(state.clone()),
+            Path("c-cancel".to_string()),
+            Json(ChatRequest {
+                text: "cancel me".to_string(),
+                message_id: message_id.clone(),
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+            }),
+        )
+        .await
+        .expect("enqueue");
+        assert!(result.0.steering);
+        for receiver in [&mut first, &mut second] {
+            assert!(matches!(
+                receiver.recv().await.expect("queued event"),
+                SseEvent::SteerMessageQueued { .. }
+            ));
+        }
+
+        let _ = cancel_steering_message(
+            State(state.clone()),
+            Path(("c-cancel".to_string(), message_id.clone())),
+        )
+        .await
+        .expect("cancel");
+
+        assert!(state
+            .db
+            .get_steering_queue("c-cancel")
+            .await
+            .expect("durable queue after cancel")
+            .is_empty());
+        for receiver in [&mut first, &mut second] {
+            assert!(matches!(
+                receiver.recv().await.expect("cancelled event"),
+                SseEvent::SteerMessageCancelled { message_id: ref cancelled, .. }
+                    if cancelled == &message_id
+            ));
+        }
+
+        let _ = cancel_steering_message(State(state), Path(("c-cancel".to_string(), message_id)))
+            .await
+            .expect("idempotent retry");
+        if let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(25), first.recv()).await
+        {
+            panic!("idempotent retry published an unexpected event: {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_steering_admissions_publish_committed_fifo_positions() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-order", "order", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .runtime
+            .inject_handle_for_test("c-order", ConvState::LlmRequesting { attempt: 1 })
+            .await;
+        let mut events = state.runtime.subscribe("c-order").await.expect("client");
+
+        let send = |message_id: &'static str, text: &'static str| {
+            send_chat(
+                State(state.clone()),
+                Path("c-order".to_string()),
+                Json(ChatRequest {
+                    text: text.to_string(),
+                    message_id: message_id.to_string(),
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    user_agent: None,
+                }),
+            )
+        };
+        let (first_result, second_result) =
+            tokio::join!(send("order-a", "A"), send("order-b", "B"));
+        assert!(first_result.expect("first admission").0.steering);
+        assert!(second_result.expect("second admission").0.steering);
+
+        let mut published = Vec::new();
+        for _ in 0..2 {
+            let SseEvent::SteerMessageQueued {
+                message,
+                queue_position,
+                ..
+            } = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("queued event timeout")
+                .expect("queued event")
+            else {
+                panic!("expected queued event");
+            };
+            published.push((queue_position, message.message_id));
+        }
+        published.sort_by_key(|(position, _)| *position);
+
+        let durable = state
+            .db
+            .get_steering_queue("c-order")
+            .await
+            .expect("durable queue");
+        assert_eq!(
+            published
+                .iter()
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            published
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>(),
+            durable
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_cancellation_retry_repairs_executor_without_false_sse() {
+        let state = make_state().await;
+        state
+            .db
+            .create_conversation("c-cancel-retry", "cancel retry", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let mut executor_events = state
+            .runtime
+            .inject_handle_with_event_capture_for_test(
+                "c-cancel-retry",
+                ConvState::LlmRequesting { attempt: 1 },
+            )
+            .await;
+        let mut sse = state
+            .runtime
+            .subscribe("c-cancel-retry")
+            .await
+            .expect("client");
+
+        let _ = cancel_steering_message(
+            State(state),
+            Path(("c-cancel-retry".to_string(), "already-removed".to_string())),
+        )
+        .await
+        .expect("idempotent retry");
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), executor_events.recv())
+                .await
+                .expect("executor notification timeout"),
+            Some(Event::CancelSteerMessage { message_id }) if message_id == "already-removed"
+        ));
+        if let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(25), sse.recv()).await
+        {
+            panic!("absent durable row published an unexpected SSE event: {event:?}");
+        }
     }
 }
 

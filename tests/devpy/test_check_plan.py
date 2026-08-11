@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -94,6 +96,97 @@ class CheckPlanTests(unittest.TestCase):
                     },
                     env,
                 )
+
+    def test_check_cpu_budget_saturates_at_four(self):
+        with mock.patch.object(self.dev.os, "cpu_count", return_value=10):
+            self.assertEqual(4, self.dev._check_cpu_budget())
+        with mock.patch.object(self.dev.os, "cpu_count", return_value=2):
+            self.assertEqual(2, self.dev._check_cpu_budget())
+        with mock.patch.object(self.dev.os, "cpu_count", return_value=None):
+            self.assertEqual(1, self.dev._check_cpu_budget())
+
+    def test_clippy_check_disables_incremental_artifacts(self):
+        root = Path("/tmp/phoenix-check")
+        self.assertEqual(
+            {
+                "CARGO_INCREMENTAL": "0",
+                "CARGO_TARGET_DIR": str(root / "target" / "clippy"),
+            },
+            self.dev._clippy_check_env(root),
+        )
+
+    def test_clippy_target_cleanup_removes_only_incremental_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            incremental = root / "target" / "clippy" / "debug" / "incremental"
+            retained = root / "target" / "clippy" / "debug" / "deps" / "artifact"
+            incremental.mkdir(parents=True)
+            (incremental / "query-cache.bin").write_text("stale")
+            retained.parent.mkdir(parents=True)
+            retained.write_text("keep")
+
+            self.dev._prepare_clippy_check_target(root)
+
+            self.assertFalse(incremental.exists())
+            self.assertEqual("keep", retained.read_text())
+
+    def test_vitest_worker_count_uses_check_budget(self):
+        with mock.patch.object(self.dev, "_check_cpu_budget", return_value=4):
+            self.assertEqual(
+                ["pnpm", "exec", "vitest", "run", "--maxWorkers", "4"],
+                self.dev._vitest_check_command(),
+            )
+
+    def test_check_lane_runs_and_records_no_failure(self):
+        lane = mock.Mock()
+        results = []
+
+        self.dev._run_check_lane("rust", lane, results, threading.Lock())
+
+        lane.assert_called_once_with()
+        self.assertEqual([], results)
+
+    def test_check_lane_exception_records_failure(self):
+        results = []
+
+        self.dev._run_check_lane(
+            "clippy",
+            mock.Mock(side_effect=PermissionError("incremental target is protected")),
+            results,
+            threading.Lock(),
+        )
+
+        self.assertEqual(1, len(results))
+        name, returncode, _elapsed, detail = results[0]
+        self.assertEqual("clippy lane", name)
+        self.assertEqual(1, returncode)
+        self.assertIn("PermissionError: incremental target is protected", detail)
+
+    def test_hung_lane_does_not_start_queued_lanes(self):
+        first = mock.MagicMock()
+        first.is_alive.return_value = True
+        second = mock.MagicMock()
+
+        stuck = self.dev._run_check_threads_sequentially([first, second], 0.01)
+
+        first.start.assert_called_once_with()
+        first.join.assert_called_once_with(timeout=0.01)
+        second.start.assert_not_called()
+        self.assertEqual([first], stuck)
+
+    def test_check_threads_start_in_sequence(self):
+        first = mock.MagicMock()
+        first.is_alive.return_value = False
+        second = mock.MagicMock()
+        second.is_alive.return_value = False
+
+        stuck = self.dev._run_check_threads_sequentially([first, second], 1)
+
+        first.start.assert_called_once_with()
+        first.join.assert_called_once_with(timeout=1)
+        second.start.assert_called_once_with()
+        second.join.assert_called_once_with(timeout=1)
+        self.assertEqual([], stuck)
 
     def test_ci_lane_inventory_covers_every_devpy_lane_once(self):
         self.assertEqual([], self.dev._ci_lane_inventory_errors())
@@ -211,6 +304,15 @@ class CheckPlanTests(unittest.TestCase):
                     lane for lane in workflow_order(group) if lane in lanes
                 )
             self.assertIn(expected, workflow)
+
+    def test_linux_musl_smoke_runs_once_in_rust_ci_group(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertEqual(1, workflow.count("cargo check --target x86_64-unknown-linux-musl"))
+        self.assertIn("sudo apt-get install -y musl-tools", workflow)
+        self.assertIn("target: x86_64-unknown-linux-musl", workflow)
+        graph_steps = self.dev._GRAPH_LANE_STEPS["rust"]
+        self.assertFalse(any("musl" in step for step in graph_steps))
+
 
     def test_workflow_check_plan_fails_closed(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()

@@ -39,6 +39,16 @@ pub enum ActiveDirectTurnTerminal {
     Failed { reason: String },
 }
 
+impl ActiveDirectTurnTerminal {
+    pub(crate) const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveDirectTurnSettlement {
     pub turn: ActiveDirectTurn,
@@ -343,23 +353,21 @@ pub trait StateStore: Send + Sync {
         metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String>;
 
-    /// Update the steering queue for a conversation. Persists the FIFO queue
-    /// of pending steering messages to the DB.
-    async fn update_steering_queue(
+    /// Load the current durable steering queue in FIFO order.
+    async fn load_steering_entries(
         &self,
         conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String>;
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String>;
 
-    /// Remove specific drained entries from the persisted steering queue,
-    /// preserving any concurrently-enqueued entries. Implementations must be
-    /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing
-    /// a steer queued during the drain window.
-    async fn remove_steering_entries(
+    /// Atomically insert the reducer-selected FIFO batch, persist its supplied
+    /// next state, and remove exactly its queue identities.
+    async fn commit_steering_drain(
         &self,
         conv_id: &str,
-        message_ids: &[String],
-    ) -> Result<(), String>;
+        messages: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Vec<crate::db::SteeringDrainMessageStatus>, String>;
 }
 
 /// Client for making LLM requests
@@ -743,20 +751,23 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).upsert_llm_request_metrics(metrics).await
     }
 
-    async fn update_steering_queue(
+    async fn load_steering_entries(
         &self,
         conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
-        (**self).update_steering_queue(conv_id, queue).await
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String> {
+        (**self).load_steering_entries(conv_id).await
     }
 
-    async fn remove_steering_entries(
+    async fn commit_steering_drain(
         &self,
         conv_id: &str,
-        message_ids: &[String],
-    ) -> Result<(), String> {
-        (**self).remove_steering_entries(conv_id, message_ids).await
+        messages: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Vec<crate::db::SteeringDrainMessageStatus>, String> {
+        (**self)
+            .commit_steering_drain(conv_id, messages, state, state_updated_at)
+            .await
     }
 }
 
@@ -1350,24 +1361,25 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn update_steering_queue(
+    async fn load_steering_entries(
         &self,
         conv_id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<phoenix_core::domain::sm_event::SteerEntry>, String> {
         self.db
-            .update_steering_queue(conv_id, queue)
+            .get_steering_queue(conv_id)
             .await
             .map_err(|e| e.to_string())
     }
 
-    async fn remove_steering_entries(
+    async fn commit_steering_drain(
         &self,
         conv_id: &str,
-        message_ids: &[String],
-    ) -> Result<(), String> {
+        messages: &[crate::db::Message],
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<Vec<crate::db::SteeringDrainMessageStatus>, String> {
         self.db
-            .remove_steering_entries(conv_id, message_ids)
+            .commit_steering_drain(conv_id, messages, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }

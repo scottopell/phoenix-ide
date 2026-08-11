@@ -61,6 +61,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+          target: x86_64-unknown-linux-musl
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -80,8 +81,12 @@ jobs:
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
+      - name: Install musl compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: ./dev.py check (rust,cargo-fmt)
         run: ./dev.py check --lanes rust,cargo-fmt
+      - name: Check x86_64 Linux musl compatibility
+        run: cargo check --target x86_64-unknown-linux-musl
 
   check-clippy:
     name: check (clippy)

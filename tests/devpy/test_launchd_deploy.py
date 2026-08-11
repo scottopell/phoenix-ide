@@ -873,6 +873,38 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("<string>IPv4v6</string>", plist)
         self.assertIn("<string>8031</string>", plist)
 
+    def test_launchd_has_no_second_file_writer_for_structured_log(self):
+        plist = plistlib.loads(
+            self.dev.generate_launchd_plist(
+                "1.0.0",
+                extra_env={
+                    "PHOENIX_LOG_FILE": "",
+                    "PHOENIX_FATAL_LOG_FILE": "",
+                    "PHOENIX_LOG_STDOUT": "true",
+                },
+                path_override="/usr/bin",
+            ).encode()
+        )
+        environment = plist["EnvironmentVariables"]
+        self.assertEqual(str(self.dev.LAUNCHD_LOG_PATH), environment["PHOENIX_LOG_FILE"])
+        self.assertEqual(
+            str(self.dev.LAUNCHD_FATAL_LOG_PATH), environment["PHOENIX_FATAL_LOG_FILE"]
+        )
+        self.assertEqual("false", environment["PHOENIX_LOG_STDOUT"])
+        self.assertEqual("/dev/null", plist["StandardOutPath"])
+        self.assertEqual(
+            str(self.dev.LAUNCHD_STDERR_LOG_PATH), plist["StandardErrorPath"]
+        )
+
+    def test_newsyslog_bounds_launchd_pre_main_stderr(self):
+        config = self.dev._newsyslog_config("phoenix", "staff")
+
+        self.assertNotIn(str(self.dev.LAUNCHD_LOG_PATH), config)
+        self.assertIn(
+            f"{self.dev.LAUNCHD_STDERR_LOG_PATH}    phoenix:staff    600  2    64",
+            config,
+        )
+        self.assertIn("64    *  BJN", config)
 
 if __name__ == "__main__":
     unittest.main()

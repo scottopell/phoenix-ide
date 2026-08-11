@@ -45,6 +45,7 @@ import {
   useModels,
   useAutoAuth,
   derivePendingMessages,
+  deriveDisplayedPendingMessages,
   deriveFailedMessages,
   useConversationPrStatus,
   DraftLifecycle,
@@ -574,9 +575,17 @@ function ConversationPageContent({
 
   // Pending messages shown in the conversation are a pure derivation of the
   // queue and `atom.messages` — see `derivePendingMessages` for the rule.
-  const pendingMessages = useMemo(
+  const localPendingMessages = useMemo(
     () => derivePendingMessages(queuedMessages, atom.messages.map((m) => m.message_id)),
     [atom.messages, queuedMessages],
+  );
+  const pendingMessages = useMemo(
+    () => deriveDisplayedPendingMessages(
+      localPendingMessages,
+      atom.steeringMessages,
+      atom.conversation?.archived === true,
+    ),
+    [atom.conversation?.archived, atom.steeringMessages, localPendingMessages],
   );
 
   const viewableMessages = atom.messages;
@@ -632,6 +641,7 @@ function ConversationPageContent({
       ? atomRef.current.transcriptGeneration
       : null,
     onValidatedInit: (payload) => {
+      reconcileAuthoritative(payload.steeringMessages.map((message) => message.message_id));
       setArchiveStatusConfirmedConversationId(payload.conversation.id);
       historyGenerationRef.current += 1;
       dispatchHistoryExpansion({
@@ -644,6 +654,9 @@ function ConversationPageContent({
         hasEarlierHistory: transcriptCoverageAfterInit(atomRef.current, payload) === 'tail',
       });
     },
+    onValidatedSteeringQueued: (messageId) => {
+      reconcileAuthoritative([messageId]);
+    },
   });
 
   const isOffline =
@@ -654,8 +667,11 @@ function ConversationPageContent({
   // Authoritative echoes are terminal for local queue ownership. Compact them
   // from localStorage instead of merely filtering them from this render.
   useEffect(() => {
-    reconcileAuthoritative(atom.messages.map((message) => message.message_id));
-  }, [atom.messages, reconcileAuthoritative]);
+    reconcileAuthoritative([
+      ...atom.messages.map((message) => message.message_id),
+      ...atom.steeringMessages.map((message) => message.message_id),
+    ]);
+  }, [atom.messages, atom.steeringMessages, reconcileAuthoritative]);
 
   const idleReconciliationKeyRef = useRef<string | null>(null);
   const optimisticPhaseOwnerRef = useRef<string | null>(null);
@@ -1261,7 +1277,7 @@ function ConversationPageContent({
 
   useEffect(() => {
     if (!serverArchived) return;
-    for (const msg of pendingMessages) {
+    for (const msg of localPendingMessages) {
       dismiss(msg.localId);
     }
     if (conversationId) {
@@ -1269,7 +1285,7 @@ function ConversationPageContent({
         console.error('Failed to drop archived pending operations:', err);
       });
     }
-  }, [serverArchived, conversationId, pendingMessages, dismiss, removePendingOperations]);
+  }, [serverArchived, conversationId, localPendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
@@ -1279,12 +1295,12 @@ function ConversationPageContent({
   useEffect(() => {
     if (!isConnected || !conversationId || isArchived) return;
 
-    for (const msg of pendingMessages) {
+    for (const msg of localPendingMessages) {
       if (msg.status === 'accepted' || msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }
-  }, [isConnected, conversationId, isArchived, pendingMessages]);
+  }, [isConnected, conversationId, isArchived, localPendingMessages]);
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId || isArchived) return;
@@ -1325,11 +1341,16 @@ function ConversationPageContent({
     if (!conversationId) return;
     try {
       await api.cancelSteeringMessage(conversationId, localId);
+      dispatch({
+        type: 'local_steer_message_cancelled',
+        messageId: localId,
+        expectedConversationId: conversationId,
+      });
       dismiss(localId);
     } catch (err) {
       console.error('Failed to cancel steering message:', err);
     }
-  }, [conversationId, dismiss]);
+  }, [conversationId, dismiss, dispatch]);
 
   const openConversationById = useCallback(async (
     targetConversationId: string,

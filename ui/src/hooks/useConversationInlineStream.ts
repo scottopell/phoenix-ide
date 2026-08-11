@@ -16,6 +16,7 @@ import {
   SseBashToolProgressDataSchema,
   SseStateChangeDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseSteerMessageCancelledDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseTokenDataSchema,
@@ -23,6 +24,7 @@ import {
 } from '../sseSchemas';
 import { parseConversationState, isAgentWorking } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
+import { setCodexQuota } from '../codexQuota';
 import * as v from 'valibot';
 
 export type InlineStreamState =
@@ -63,9 +65,11 @@ function transformInitData(raw: SseInitData): InitPayload {
   return {
     conversation,
     messages: raw.messages || [],
+    steeringMessages: raw.steering_messages,
     phase: parseConversationState(conversation?.state),
     contextWindow: { used: raw.context_window_size ?? 0 },
     transcriptGeneration: raw.transcript_generation,
+    streamIncarnation: raw.stream_incarnation,
     lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
@@ -110,9 +114,11 @@ function snapshotPayload(conversation: Conversation, messages: Message[], contex
   return {
     conversation,
     messages,
+    steeringMessages: [],
     phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
     contextWindow: { used: contextWindowSize },
     transcriptGeneration: conversation.transcript_generation ?? 1,
+    streamIncarnation: 'inline-snapshot',
     lastAppliedEventSeq,
     pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
@@ -333,11 +339,45 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
       });
 
       source.addEventListener('steer_message_queued', (event) => {
-        consumeSequencedEvent(event, SseSteerMessageQueuedDataSchema, dispatch);
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseSteerMessageQueuedDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_steer_message_queued',
+            sequenceId: res.output.sequence_id,
+            message: res.output.message,
+          },
+        });
+      });
+
+      source.addEventListener('steer_message_cancelled', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseSteerMessageCancelledDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_steer_message_cancelled',
+            sequenceId: res.output.sequence_id,
+            messageId: res.output.message_id,
+          },
+        });
       });
 
       source.addEventListener('rate_limit_snapshot', (event) => {
-        consumeSequencedEvent(event, SseRateLimitSnapshotDataSchema, dispatch);
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseRateLimitSnapshotDataSchema, raw);
+        if (!res.success) return;
+        setCodexQuota(res.output.snapshot);
+        dispatch({
+          type: 'atom',
+          atomAction: { type: 'sse_sequence_consumed', sequenceId: res.output.sequence_id },
+        });
       });
 
       source.addEventListener('work_scope_update', (event) => {

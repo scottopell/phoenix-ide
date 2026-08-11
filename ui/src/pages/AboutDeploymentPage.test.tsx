@@ -49,7 +49,7 @@ function deployment(overrides: Partial<DeploymentInfo> = {}): DeploymentInfo {
         hosts: [],
       },
     },
-    log: { stdout: true, file: null },
+    log: { stdout: true, file: null, fatal_file: null },
     installation_ownership: { kind: 'development' },
     local_access: false,
     sampled_at: '2026-06-01T00:00:01Z',
@@ -258,6 +258,20 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(within(summary).getByText('Viewing remotely')).toBeInTheDocument();
     expect(within(summary).getByText(/host-local actions are unavailable/i)).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Build' })).not.toBeInTheDocument();
+  });
+
+  it('shows the bounded fatal diagnostic path as a log sink', async () => {
+    renderPage(deployment({
+      log: {
+        stdout: false,
+        file: '/srv/phoenix/prod.log',
+        fatal_file: '/srv/phoenix/prod-fatal.log',
+      },
+    }));
+
+    expect(await screen.findByText('/srv/phoenix/prod-fatal.log')).toBeInTheDocument();
+    expect(screen.getByText('/srv/phoenix/prod.log')).toBeInTheDocument();
+    expect(screen.queryByText('No log output configured.')).not.toBeInTheDocument();
   });
 
   it('refreshes the single deployment summary when updates report a different running identity', async () => {

@@ -205,8 +205,17 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+WHEN the server emits a replayable non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, rate_limit_snapshot, llm_first_byte, llm_attempt)
 THE SYSTEM SHALL retain the event in a root-keyed in-memory ring buffer until the next persisted transcript-anchor broadcast replaces it (anchor reset)
+
+WHEN the server emits `steer_message_queued` or `steer_message_cancelled`
+THE SYSTEM SHALL broadcast the event live at the current stream watermark without allocating a new cursor position or retaining its payload in the replay ring
+AND SHALL reconstruct the complete current steering queue from durable state in every authorized init snapshot
+SO THAT missed live mutations converge on reconnect without retaining private or attachment-heavy queued payloads in memory
+
+WHEN the server emits `conversation_hard_deleted`
+THE SYSTEM SHALL broadcast it live without retaining it for replay
+WHERE deletion removes the durable conversation required to produce a later init snapshot
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
 THE SYSTEM SHALL request one root-stream sequence allocation from the RootStreamLedger for the enclosing ProductConversation
@@ -237,14 +246,14 @@ THE SYSTEM SHALL include in the init payload:
 - `pending_truncated`: whether the ring overflowed since the anchor
 - `last_sequence_id`: the same RootStreamLedger-derived root-stream watermark used by live delivery
 
-WHEN the server emits any aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
+WHEN the server emits any sequenced aggregate-bound live SSE carrier (message, token, state_change, message_updated, agent_done, conversation_became_terminal, conversation_update, product_conversation_lifecycle, continuation_boundary, work_scope_update, error, browser_session_state, rate_limit_snapshot, llm_first_byte, llm_attempt)
 THE SYSTEM SHALL materialize one closed typed aggregate-bound live envelope for that carrier
 AND SHALL allocate or reuse one root-stream sequence_id from the RootStreamLedger before broadcast
 AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on the live envelope
 AND SHALL include member conversation identity on carriers sourced from one transcript member rather than from the aggregate itself
 AND SHALL treat `work_scope_update` as aggregate-native, carrying the root ProductConversation id plus the inventory payload identity rather than any member-row owner
 AND SHALL append the same root-keyed envelope to replay and surface the same ledger watermark through init
-WHERE `init` is excluded because it is per-subscriber and `conversation_hard_deleted` is excluded because it is terminal and non-replayable
+WHERE `init` is excluded because it is per-subscriber, steering queue mutations are durable-state-subsumed live projections, and `conversation_hard_deleted` is terminal and non-replayable
 SO THAT live delivery, replay, and init snapshots share one authoritative ordering space
 
 WHEN the server process restarts

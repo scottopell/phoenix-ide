@@ -22,7 +22,7 @@ import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
 import { cacheDB } from '../cache';
-import type { QueuedMessage } from '../hooks';
+import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
 import { useIsDesktop } from '../hooks';
 import { useDensity } from '../hooks/useDensity';
@@ -457,7 +457,7 @@ function QueuedUserMessageImpl({
   onCancelSteering,
   activeHighlight = null,
 }: {
-  message: QueuedMessage;
+  message: PendingUserMessage;
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   activeHighlight?: ConversationHighlight | null;
