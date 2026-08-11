@@ -8,8 +8,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MockInstance } from 'vitest';
 import {
   buildRenderUnits,
+  buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
+  findHistoricalUnitLocationByMessageId,
   SUB_AGENT_STATUS_KEY,
+  type AgentTurnUnit,
   type HistoricalUnit,
 } from './renderUnits';
 import type {
@@ -18,8 +21,6 @@ import type {
   Message,
 } from '../api';
 import type { QueuedMessage } from '../hooks/useMessageQueue';
-
-type AgentTurnUnit = Extract<HistoricalUnit, { kind: 'agent_turn' }>;
 
 function assertAgentTurn(u: HistoricalUnit | undefined): AgentTurnUnit {
   if (!u) throw new Error('expected unit, got undefined');
@@ -49,6 +50,10 @@ function agentMsg(id: string, blocks: ContentBlock[] = []): Message {
     content: blocks,
     created_at: '',
   };
+}
+
+function toolUseBlock(id: string, name = 'bash'): ContentBlock {
+  return { type: 'tool_use', id, name, input: {} };
 }
 
 function toolMsg(
@@ -213,6 +218,176 @@ describe('buildRenderUnits', () => {
   // -------------------------------------------------------------------
   // Tool-result ownership (REQ-MLRU-002)
   // -------------------------------------------------------------------
+
+  describe('tool-only agent-turn grouping', () => {
+    it('emits one structural unit for a maximal adjacent tool-only run', () => {
+      const out = buildRenderUnits({
+        messages: [
+          userMsg('u1'),
+          agentMsg('a1', [toolUseBlock('use-1')]),
+          toolMsg('t1', 'use-1'),
+          agentMsg('a2', [toolUseBlock('use-2')]),
+          toolMsg('t2', 'use-2'),
+          agentMsg('a3', [toolUseBlock('use-3')]),
+          toolMsg('t3', 'use-3'),
+        ],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(out.historicalUnits).toHaveLength(2);
+      const group = out.historicalUnits[1];
+      expect(group?.kind).toBe('tool_only_agent_turn_group');
+      if (group?.kind !== 'tool_only_agent_turn_group') throw new Error('expected tool group');
+      expect(group.key).toBe('a1');
+      expect(group.members.map((member) => member.agent.message_id)).toEqual(['a1', 'a2', 'a3']);
+      expect(group.members[0]?.toolResultsByUseId.get('use-1')?.message_id).toBe('t1');
+      expect(group.members[1]?.toolResultsByUseId.get('use-2')?.message_id).toBe('t2');
+      expect(group.members[2]?.toolResultsByUseId.get('use-3')?.message_id).toBe('t3');
+    });
+
+    it('does not group across visible or non-action boundaries', () => {
+      const out = buildRenderUnits({
+        messages: [
+          userMsg('u1'),
+          agentMsg('a1', [toolUseBlock('use-1')]),
+          toolMsg('t1', 'use-1'),
+          systemMsg('sys1', 'break'),
+          agentMsg('a2', [toolUseBlock('use-2')]),
+          toolMsg('t2', 'use-2'),
+          agentMsg('a3', [toolUseBlock('use-3')]),
+          toolMsg('t3', 'use-3'),
+          agentMsg('a4', [{ type: 'text', text: 'not tool only' }]),
+          agentMsg('a5', [{ type: 'tool_use', id: 'think-5', name: 'think', input: {} }]),
+          agentMsg('a6', [toolUseBlock('use-6')]),
+        ],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(out.historicalUnits.map((unit) => unit.kind)).toEqual([
+        'user',
+        'tool_only_agent_turn_group',
+        'system',
+        'tool_only_agent_turn_group',
+        'agent_turn',
+        'agent_turn',
+        'tool_only_agent_turn_group',
+      ]);
+    });
+
+    it('does not split a visible tool group on a hidden system message', () => {
+      const hidden = { ...systemMsg('hidden-system', 'internal marker'), display_data: { hidden: true } };
+      const out = buildHistoricalUnits({
+        messages: [
+          agentMsg('hidden-a', [toolUseBlock('hidden-use-a')]),
+          hidden,
+          agentMsg('hidden-b', [toolUseBlock('hidden-use-b')]),
+        ],
+        pendingMessages: [],
+      });
+
+      expect(out.historicalUnits).toHaveLength(1);
+      expect(out.historicalUnits[0]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[0]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected one visible group');
+      expect(out.historicalUnits[0].members.map((member) => member.key)).toEqual(['hidden-a', 'hidden-b']);
+    });
+
+    it('bounds physical groups and keeps singleton overflow in the stable group variant', () => {
+      const messages = Array.from({ length: 9 }, (_, index) =>
+        agentMsg(`bounded-${index + 1}`, [toolUseBlock(`bounded-use-${index + 1}`)]));
+
+      const out = buildHistoricalUnits({ messages, pendingMessages: [] });
+
+      expect(out.historicalUnits).toHaveLength(2);
+      expect(out.historicalUnits[0]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[0]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected bounded group');
+      expect(out.historicalUnits[0].members).toHaveLength(8);
+      expect(out.historicalUnits[1]?.kind).toBe('tool_only_agent_turn_group');
+      if (out.historicalUnits[1]?.kind !== 'tool_only_agent_turn_group') throw new Error('expected stable singleton group');
+      expect(out.historicalUnits[1].members).toHaveLength(1);
+    });
+
+    it('does not merge newly prepended history across a preserved page boundary', () => {
+      const messages = [
+        agentMsg('older-a', [toolUseBlock('older-use-a')]),
+        agentMsg('older-b', [toolUseBlock('older-use-b')]),
+        agentMsg('loaded-a', [toolUseBlock('loaded-use-a')]),
+        agentMsg('loaded-b', [toolUseBlock('loaded-use-b')]),
+      ];
+
+      const out = buildHistoricalUnits({
+        messages,
+        pendingMessages: [],
+        groupBoundariesBeforeKeys: new Set(['loaded-a']),
+      });
+
+      expect(out.historicalUnits).toHaveLength(2);
+      expect(out.historicalUnits.map((unit) => unit.key)).toEqual(['older-a', 'loaded-a']);
+      expect(out.historicalUnits.every((unit) => unit.kind === 'tool_only_agent_turn_group')).toBe(true);
+    });
+
+    it('preserves distinct tool-result targets owned by one grouped member', () => {
+      const out = buildRenderUnits({
+        messages: [
+          agentMsg('multi-owner', [toolUseBlock('multi-use-a'), toolUseBlock('multi-use-b')]),
+          toolMsg('multi-result-a', 'multi-use-a'),
+          toolMsg('multi-result-b', 'multi-use-b'),
+        ],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'multi-result-a')).toMatchObject({
+        memberMessageId: 'multi-owner', toolUseId: 'multi-use-a',
+      });
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'multi-result-b')).toMatchObject({
+        memberMessageId: 'multi-owner', toolUseId: 'multi-use-b',
+      });
+    });
+
+    it('keeps the same unit kind and key when a singleton gains an adjacent tool turn', () => {
+      const first = agentMsg('stable-a', [toolUseBlock('stable-use-a')]);
+      const singleton = buildHistoricalUnits({ messages: [first], pendingMessages: [] });
+      const promoted = buildHistoricalUnits({
+        messages: [first, agentMsg('stable-b', [toolUseBlock('stable-use-b')])],
+        pendingMessages: [],
+      });
+
+      expect(singleton.historicalUnits[0]).toMatchObject({ kind: 'tool_only_agent_turn_group', key: 'stable-a' });
+      expect(promoted.historicalUnits[0]).toMatchObject({ kind: 'tool_only_agent_turn_group', key: 'stable-a' });
+    });
+
+    it('resolves every grouped member and result to the shared virtual row', () => {
+      const out = buildRenderUnits({
+        messages: [
+          userMsg('u1'),
+          agentMsg('a1', [toolUseBlock('use-1')]),
+          toolMsg('t1', 'use-1'),
+          agentMsg('a2', [toolUseBlock('use-2')]),
+          toolMsg('t2', 'use-2'),
+        ],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'a1')).toBe(1);
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 't1')).toBe(1);
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 'a2')).toBe(1);
+      expect(findHistoricalUnitIndexByMessageId(out.historicalUnits, 't2')).toBe(1);
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 'a2')).toEqual({
+        unitIndex: 1,
+        unitKey: 'a1',
+        memberMessageId: 'a2',
+      });
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 't2')?.memberMessageId).toBe('a2');
+      expect(findHistoricalUnitLocationByMessageId(out.historicalUnits, 't2')?.toolUseId).toBe('use-2');
+    });
+  });
 
   describe('tool result ownership', () => {
     it('consumes trailing tool messages and pairs them by tool_use_id', () => {

@@ -28,17 +28,19 @@
 -- Value Types
 ------------------------------------------------------------
 
--- A persisted message as seen by the transform. The transform inspects
--- message_type to dispatch; content is consulted only to extract text
--- (for system) or tool_use_id (for tool results) and is otherwise
--- treated opaquely.
+-- A persisted message as seen by the transform. The transform dispatches on
+-- message_type and owns the minimum typed classifications needed for physical
+-- render-unit construction; detailed content remains renderer-owned.
 value Message {
     message_id: String
     sequence_id: Integer
     message_type: String
-    -- Opaque to the transform unless message_type is 'system' (text) or
-    -- 'tool' (tool_use_id). The agent renderer reads content blocks
-    -- itself; the transform does not.
+    -- agent-only: true exactly when content is non-empty and every block is a
+    -- non-think tool_use block.
+    is_non_think_tool_only: Boolean?
+    -- system-only: hidden messages have no visible render unit and do not form
+    -- a physical grouping boundary.
+    is_hidden: Boolean?
 }
 
 -- A client-queued message awaiting server reflection. Sourced from
@@ -79,6 +81,7 @@ enum HistoricalKind {
     user
     skill
     agent_turn
+    tool_only_agent_turn_group
     system
     pending_user
 }
@@ -95,6 +98,7 @@ enum TailKind {
 -- emits at console.debug carrying its reason; the set is closed.
 enum SkipReason {
     empty_system
+    hidden_system
     orphan_tool
     unknown_type
     missing_tool_use_id
@@ -105,7 +109,11 @@ enum SkipReason {
 ------------------------------------------------------------
 
 -- A historical render unit. Kind-discriminated; agent_turn carries the
--- tool-result map and the pre-computed isFirstInTurn flag.
+-- tool-result map and the pre-computed isFirstInTurn flag. A
+-- tool_only_agent_turn_group carries an ordered bounded segment of one to
+-- eight adjacent agent_turn members; groups of one retain the same group variant
+-- so live appends preserve component identity and expansion state. Each member
+-- retains those same owned fields.
 entity HistoricalUnit {
     kind: HistoricalKind
     key: String
@@ -113,6 +121,8 @@ entity HistoricalUnit {
     -- agent_turn-only fields:
     tool_results_by_use_id: Map<String, Message>?
     is_first_in_turn: Boolean?
+    -- tool_only_agent_turn_group-only field:
+    members: List<HistoricalUnit>?
 }
 
 -- A tail render unit. Always rendered, never collapsed by the window.
@@ -129,6 +139,8 @@ entity TailUnit {
 entity Builder {
     messages: List<Message>
     pending_messages: List<QueuedMessage>
+    -- Stable row keys before which history acquisition must not merge groups.
+    group_boundaries_before_keys: Set<String>
     conv_state: ConvState
     is_streaming: Boolean
     streaming_handle: StreamingHandle?
@@ -250,6 +262,24 @@ rule EmitAgentTurnUnit {
         -- Subsequent EmitToolResultIntoActiveAgent firings populate the map.
 }
 
+-- Hidden system messages have no physical unit and do not break the agent run.
+rule SkipHiddenSystem {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: current_message_type(b) = "system"
+    requires: current_message(b).is_hidden = true
+
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=current_message(b).message_id,
+        --           reason=hidden_system).
+}
+
 -- System message with non-empty text → system unit. Does NOT break the
 -- agent run (a system note between agent turns is part of the same
 -- run for header-suppression purposes).
@@ -260,6 +290,7 @@ rule EmitSystemUnitWithText {
     requires: b.position < len(b.messages)
     requires: current_message_type(b) = "system"
     requires: current_message_has_text(b)
+    requires: current_message(b).is_hidden != true
 
     ensures: b.historical = append(b.historical, system_unit(current_message(b)))
     ensures: b.in_agent_run = b.in_agent_run
@@ -276,6 +307,7 @@ rule SkipEmptySystem {
     requires: b.position < len(b.messages)
     requires: current_message_type(b) = "system"
     requires: not current_message_has_text(b)
+    requires: current_message(b).is_hidden != true
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
@@ -394,6 +426,16 @@ rule WalkComplete {
 -- Rules — pending append (phase = pending_append)
 ------------------------------------------------------------
 
+-- Before pending messages append, adjacent tool-only agent turns become
+-- structural historical units of at most eight members. A tool-only
+-- turn has non-empty content consisting exclusively of non-think tool calls.
+-- The group key is its first member's key; members retain invocation order,
+-- tool-result ownership, source identity, and isFirstInTurn. Singleton runs
+-- remain one-member group units so appends preserve component identity. Any
+-- other visible historical unit breaks the run, so prose,
+-- think, visible system, user, skill, and pending content retain visible
+-- ordering. Hidden system messages emit no unit and do not split a run.
+--
 -- Pending queued messages → pending_user HISTORICAL units, in input
 -- order, appended at the END of b.historical. Each unit's key is
 -- q.local_id, which equals the eventual server-echoed message_id at
@@ -407,10 +449,27 @@ rule AppendPendingHistoricalUnits {
 
     requires: b.phase = "pending_append"
 
-    ensures: b.historical = concat(b.historical, pending_historical_units_in_order(b.pending_messages))
+    ensures: b.historical = concat(group_tool_only_agent_turns(b.historical, b.group_boundaries_before_keys), pending_historical_units_in_order(b.pending_messages))
     ensures: b.phase = "tail_assembly"
 
     @guidance
+        -- pending_historical_units_in_order(qs):
+        -- group_tool_only_agent_turns(units, boundaries) partitions each
+        -- boundary-delimited adjacent run of
+        -- tool-only agent_turn units into bounded groups of at most eight with
+        -- Tool-only classification is member.source_message.is_non_think_tool_only;
+        -- hidden system messages never entered units during the message walk.
+        -- { kind: tool_only_agent_turn_group,
+        --   key: first(run).key,
+        --   source_message_id: first(run).source_message_id,
+        --   members: run }.
+        -- A run of one remains a one-member tool_only_agent_turn_group so
+        -- appending an adjacent tool turn does not change the unit variant.
+        --
+        -- History acquisition inserts an explicit grouping boundary before
+        -- the previously loaded first historical unit, preserving that row's
+        -- key, extent, and mounted interaction state.
+        --
         -- pending_historical_units_in_order(qs):
         --   for q in qs (input order):
         --     emit { kind: pending_user, key: q.local_id, message: q }
@@ -469,7 +528,7 @@ rule AppendStreamingTailUnit {
     requires: b.phase = "tail_assembly"
     requires: b.is_streaming = true
     requires: b.streaming_handle != null
-    requires: not b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
+    requires: not historical_agent_members(b.historical).any(u => u.key = b.streaming_handle.key)
 
     ensures: b.tail = append(b.tail, streaming_unit(b.streaming_handle))
     ensures: b.phase = "tail_assembly"
@@ -485,7 +544,7 @@ rule SkipStreamingWhenFinalized {
     requires: b.phase = "tail_assembly"
     requires: b.is_streaming = true
     requires: b.streaming_handle != null
-    requires: b.historical.any(u => u.kind = "agent_turn" and u.key = b.streaming_handle.key)
+    requires: historical_agent_members(b.historical).any(u => u.key = b.streaming_handle.key)
 
     ensures: b.tail = b.tail
     ensures: b.phase = "tail_assembly"
@@ -526,6 +585,26 @@ rule AssemblyComplete {
 
 -- The historical list never contains a unit whose source message is a
 -- tool message. Tool messages live inside agent_turn.tool_results_by_use_id.
+-- Tool-only groups are physical render units rather than presentation metadata
+-- attached to several independently measured rows. Member ownership remains
+-- canonical. Member lookup resolves the group's index and member identity;
+-- result lookup additionally resolves the owning tool_use_id so navigation can
+-- target the exact compact card.
+invariant ToolOnlyGroupsAreStructural {
+    for b in Builders:
+        b.phase = "done" implies
+            for u in b.historical:
+                u.kind = "tool_only_agent_turn_group" implies
+                    u.members != null and
+                    len(u.members) >= 1 and
+                    len(u.members) <= 8 and
+                    u.key = first(u.members).key
+                    -- Every member has kind agent_turn. Grouped member agent
+                    -- messages and owned tool-result messages resolve to this
+                    -- group's physical index; each member retains its
+                    -- canonical result map.
+}
+
 invariant NoStandaloneToolUnit {
     for b in Builders:
         b.phase = "done" implies
@@ -552,19 +631,14 @@ invariant EveryToolMessageAccountedFor {
                 implies tool_message_accounted_for(b, m)
 }
 
--- isFirstInTurn is true for the first agent_turn after any
--- user/skill (or the start of the list); false for any agent_turn
--- whose immediate predecessor in b.historical is another agent_turn.
---
--- `agent_turn_first_in_turn_predecessor_aligned(b, u)` is an opaque
--- predicate that asserts u.is_first_in_turn = (predecessor of u in
--- b.historical is not an agent_turn). Encoded as a helper because the
--- dialect doesn't support positional indexing into lists.
+-- isFirstInTurn is true for the first agent-turn leaf after any user/skill
+-- boundary (or the start of the list) and false for continuation leaves. The
+-- helper flattens standalone agent_turn units and ordered group members before
+-- checking each leaf's predecessor and precomputed flag.
 invariant FirstInTurnReflectsPriorRun {
     for b in Builders:
-        for u in b.historical:
-            b.phase = "done" and u.kind = "agent_turn"
-                implies agent_turn_first_in_turn_predecessor_aligned(b, u)
+        b.phase = "done" implies
+            flattened_agent_turns_have_aligned_first_in_turn(b.historical)
 }
 
 -- Tail units appear after all historical units in any rendered
@@ -600,13 +674,13 @@ invariant PositionAdvancesMonotonically {
         and (b.phase != "walking" implies b.position = len(b.messages))
 }
 
--- Every emitted historical unit corresponds to exactly one input
--- message. The kind/type alignment is part of the predicate:
--- agent_turn ↔ agent, user ↔ user, skill ↔ skill, system ↔ system.
+-- Every leaf historical unit corresponds to exactly one input message.
+-- A tool-only group corresponds to its ordered one-to-eight agent_turn members,
+-- and every member independently satisfies the leaf source predicate.
 invariant EveryHistoricalUnitHasSource {
     for b in Builders:
         for u in b.historical:
-            b.phase = "done" implies historical_unit_has_source(b, u)
+            b.phase = "done" implies historical_unit_or_members_have_sources(b, u)
 }
 
 -- Unit keys are unique across the complete physical list. Pending and

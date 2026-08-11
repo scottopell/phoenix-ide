@@ -25,16 +25,25 @@ export type AwaitingSubAgentsState = Extract<
   { type: 'awaiting_sub_agents' }
 >;
 
+export interface AgentTurnUnit {
+  kind: 'agent_turn';
+  key: string;
+  agent: Message;
+  toolResultsByUseId: ReadonlyMap<string, Message>;
+  isFirstInTurn: boolean;
+}
+
+export interface ToolOnlyAgentTurnGroup {
+  kind: 'tool_only_agent_turn_group';
+  key: string;
+  members: readonly AgentTurnUnit[];
+}
+
 export type HistoricalUnit =
   | { kind: 'user'; key: string; message: Message }
   | { kind: 'skill'; key: string; message: Message }
-  | {
-      kind: 'agent_turn';
-      key: string;
-      agent: Message;
-      toolResultsByUseId: ReadonlyMap<string, Message>;
-      isFirstInTurn: boolean;
-    }
+  | AgentTurnUnit
+  | ToolOnlyAgentTurnGroup
   | { kind: 'system'; key: string; message: Message }
   | { kind: 'pending_user'; key: string; message: PendingUserMessage };
 
@@ -67,7 +76,10 @@ export interface BuildInputs {
 export interface HistoricalBuildInputs {
   messages: Message[];
   pendingMessages: PendingUserMessage[];
+  groupBoundariesBeforeKeys?: ReadonlySet<string>;
 }
+
+const MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP = 8;
 
 export interface HistoricalBuild {
   historicalUnits: HistoricalUnit[];
@@ -81,16 +93,42 @@ export function findHistoricalUnitIndexByMessageId(
   historicalUnits: readonly HistoricalUnit[],
   messageId: string,
 ): number {
-  return historicalUnits.findIndex((unit) => {
-    if (unit.kind === 'agent_turn') {
-      if (unit.agent.message_id === messageId) return true;
-      return Array.from(unit.toolResultsByUseId.values())
-        .some((message) => message.message_id === messageId);
+  return findHistoricalUnitLocationByMessageId(historicalUnits, messageId)?.unitIndex ?? -1;
+}
+
+export interface HistoricalUnitLocation {
+  unitIndex: number;
+  unitKey: string;
+  memberMessageId: string;
+  toolUseId?: string;
+}
+
+export function findHistoricalUnitLocationByMessageId(
+  historicalUnits: readonly HistoricalUnit[],
+  messageId: string,
+): HistoricalUnitLocation | null {
+  for (let unitIndex = 0; unitIndex < historicalUnits.length; unitIndex += 1) {
+    const unit = historicalUnits[unitIndex]!;
+    for (const member of agentTurnsInHistoricalUnit(unit)) {
+      if (member.agent.message_id === messageId) {
+        return { unitIndex, unitKey: unit.key, memberMessageId: member.agent.message_id };
+      }
+      for (const [toolUseId, result] of member.toolResultsByUseId) {
+        if (result.message_id === messageId) {
+          return {
+            unitIndex,
+            unitKey: unit.key,
+            memberMessageId: member.agent.message_id,
+            toolUseId,
+          };
+        }
+      }
     }
-    return 'message' in unit
-      && 'message_id' in unit.message
-      && unit.message.message_id === messageId;
-  });
+    if ('message' in unit && 'message_id' in unit.message && unit.message.message_id === messageId) {
+      return { unitIndex, unitKey: unit.key, memberMessageId: messageId };
+    }
+  }
+  return null;
 }
 
 export interface TailBuildInputs {
@@ -114,11 +152,16 @@ function hasNonEmptyText(msg: Message): boolean {
   return typeof content?.text === 'string' && content.text.length > 0;
 }
 
+function isHiddenSystemMessage(msg: Message): boolean {
+  const displayData = msg.display_data as { hidden?: unknown } | undefined;
+  return displayData?.hidden === true;
+}
+
 function debug(summary: string, fields: Record<string, unknown>): void {
   console.debug(`[renderUnits] ${summary}`, fields);
 }
 
-type MutableAgentTurnUnit = Extract<HistoricalUnit, { kind: 'agent_turn' }> & {
+type MutableAgentTurnUnit = Omit<AgentTurnUnit, 'toolResultsByUseId'> & {
   toolResultsByUseId: Map<string, Message>;
 };
 
@@ -162,10 +205,55 @@ function buildAgentTurn(
 // `buildRenderUnits` composes the halves for callers that want the whole
 // transform in one step (tests, non-memoized call sites).
 
+function isToolOnlyAgentTurn(unit: HistoricalUnit): unit is AgentTurnUnit {
+  if (unit.kind !== 'agent_turn' || !Array.isArray(unit.agent.content) || unit.agent.content.length === 0) {
+    return false;
+  }
+  return unit.agent.content.every((block) => block.type === 'tool_use' && block.name !== 'think');
+}
+
+function groupToolOnlyAgentTurns(
+  units: HistoricalUnit[],
+  boundariesBeforeKeys: ReadonlySet<string>,
+): HistoricalUnit[] {
+  const grouped: HistoricalUnit[] = [];
+  const run: AgentTurnUnit[] = [];
+
+  const flushRun = () => {
+    for (let start = 0; start < run.length; start += MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP) {
+      const members = run.slice(start, start + MAX_TOOL_ONLY_AGENT_TURNS_PER_GROUP);
+      grouped.push({
+        kind: 'tool_only_agent_turn_group',
+        key: members[0]!.key,
+        members,
+      });
+    }
+    run.length = 0;
+  };
+
+  for (const unit of units) {
+    if (isToolOnlyAgentTurn(unit)) {
+      if (boundariesBeforeKeys.has(unit.key)) flushRun();
+      run.push(unit);
+    } else {
+      flushRun();
+      grouped.push(unit);
+    }
+  }
+  flushRun();
+  return grouped;
+}
+
+export function agentTurnsInHistoricalUnit(unit: HistoricalUnit): readonly AgentTurnUnit[] {
+  if (unit.kind === 'agent_turn') return [unit];
+  if (unit.kind === 'tool_only_agent_turn_group') return unit.members;
+  return [];
+}
+
 export function buildHistoricalUnits(
   inputs: HistoricalBuildInputs,
 ): HistoricalBuild {
-  const { messages, pendingMessages } = inputs;
+  const { messages, pendingMessages, groupBoundariesBeforeKeys = new Set() } = inputs;
 
   const historicalUnits: HistoricalUnit[] = [];
   let i = 0;
@@ -194,7 +282,12 @@ export function buildHistoricalUnits(
       inAgentRun = true;
       i++;
     } else if (type === 'system') {
-      if (hasNonEmptyText(msg)) {
+      if (isHiddenSystemMessage(msg)) {
+        debug('skipped hidden system', {
+          message_id: msg.message_id,
+          reason: 'hidden_system',
+        });
+      } else if (hasNonEmptyText(msg)) {
         historicalUnits.push({ kind: 'system', key: msg.message_id, message: msg });
       } else {
         debug('skipped empty system', {
@@ -235,7 +328,10 @@ export function buildHistoricalUnits(
     historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
 
-  return { historicalUnits, endsInAgentRun: inAgentRun };
+  return {
+    historicalUnits: groupToolOnlyAgentTurns(historicalUnits, groupBoundariesBeforeKeys),
+    endsInAgentRun: inAgentRun,
+  };
 }
 
 export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {
@@ -279,9 +375,7 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     streamingHandle: inputs.streamingHandle,
     endsInAgentRun,
     finalizedAgentKeys: new Set(
-      historicalUnits
-        .filter((unit) => unit.kind === 'agent_turn')
-        .map((unit) => unit.key),
+      historicalUnits.flatMap((unit) => agentTurnsInHistoricalUnit(unit).map((member) => member.key)),
     ),
   });
   return { historicalUnits, tailUnits };

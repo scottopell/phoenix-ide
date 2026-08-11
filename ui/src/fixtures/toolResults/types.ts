@@ -7,6 +7,7 @@ export type ToolResultsScenarioFamily =
   | 'discovery'
   | 'media'
   | 'profiling'
+  | 'grid'
   | 'subagents';
 
 export interface ToolResultsFixtureData {

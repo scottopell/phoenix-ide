@@ -351,9 +351,17 @@ body.app-viewport-active #root {
 /* Compact density — per-turn tool summary cards. */
 .compact-tool-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
   gap: 6px;
   margin: 6px 0;
+}
+
+.compact-tool-card.wide {
+  grid-column: 1 / -1;
+}
+
+.tool-only-agent-turn-group-member:not(:last-child) {
+  padding-bottom: 8px;
 }
 
 .compact-tool-card {
@@ -370,11 +378,45 @@ body.app-viewport-active #root {
   cursor: pointer;
 }
 
+.compact-tool-card-expand {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.compact-tool-owner-copy {
+  align-self: flex-end;
+  margin: 0;
+}
+
+.compact-tool-group-audit {
+  position: sticky;
+  bottom: 4px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  width: fit-content;
+  margin: 2px 0 0 auto;
+  padding: 3px 6px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+}
+
 .compact-tool-card:hover {
   background: var(--border-color);
 }
 
-.compact-tool-card:focus-visible {
+.compact-tool-card-expand:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }

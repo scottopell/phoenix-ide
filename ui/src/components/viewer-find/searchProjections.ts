@@ -739,6 +739,29 @@ export function buildConversationSearchProjection(
           );
         }
         break;
+      case 'tool_only_agent_turn_group':
+        for (const member of unit.members) {
+          for (const source of agentTurnSources(
+            member.agent,
+            member.toolResultsByUseId,
+            density,
+            member.key === options.latestAgentKey,
+            options.commissionReviewCanOpenFullReview === true,
+            options.liveBashProgress ?? {},
+          )) {
+            addConversationSource(
+              sources,
+              unitIndex,
+              unit.kind,
+              unit.key,
+              `${member.key}:${source.role}`,
+              source.text,
+              source.fragmentId,
+              source.revealTarget,
+            );
+          }
+        }
+        break;
       case 'streaming_agent':
         addConversationSource(sources, unitIndex, unit.kind, unit.key, 'streaming-agent', visibleStreamingText(options.streamingBuffer));
         break;

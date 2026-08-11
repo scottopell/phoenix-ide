@@ -79,9 +79,27 @@ THE SYSTEM SHALL NOT emit a standalone unit for it
 AND SHALL attach it to the preceding `agent_turn` unit's
 `toolResultsByUseId` map keyed by the result's `tool_use_id`
 
+WHEN one or more adjacent `agent_turn` units contain only non-`think` tool calls
+THE SYSTEM SHALL partition that run into `tool_only_agent_turn_group` historical units of at most eight members, each keyed by its first member
+AND SHALL use the group variant for a one-member run so appending an adjacent tool turn preserves the renderer's identity and interaction state
+AND SHALL retain the ordered member units with each member's source identity, `toolResultsByUseId`, and `isFirstInTurn` intact
+
+WHEN older history is prepended
+THE SYSTEM SHALL preserve a grouping boundary before the previously loaded first historical unit
+SO THAT acquisition cannot merge that existing physical row into an older group or change its stable key, measured extent, or mounted interaction state
+
+WHEN user, skill, pending-user, visible system, assistant prose, or `think` content occurs
+THE SYSTEM SHALL terminate any tool-only grouping boundary before that content
+SO THAT one group corresponds to one independently measured virtual transcript row without changing visible conversation order
+
 WHEN a `system`-type message has empty or absent `content.text`
 THE SYSTEM SHALL skip it (emit no unit)
 AND log a `console.debug` recording the skipped `message_id`
+
+WHEN a `system`-type message has `display_data.hidden = true`
+THE SYSTEM SHALL skip it (emit no unit)
+AND SHALL preserve the active agent run and tool-only grouping adjacency
+AND log a `console.debug` recording the skipped `message_id` with `reason: 'hidden_system'`
 
 WHEN a message has a `message_type` not recognized by the construction
 function
@@ -126,6 +144,12 @@ log at `debug` level — never higher; a backend invariant violation
 manifesting here is still a UI-side recoverable skip, not a render-
 time error)
 
+WHEN lookup targets an agent message or owned tool-result message inside a `tool_only_agent_turn_group`
+THE SYSTEM SHALL resolve the containing group's historical-unit index and the matched member's agent-message identity
+AND for a tool result SHALL also resolve the owning `tool_use_id`
+AND SHALL position and highlight the exact matched member or tool card rather than the group's first member or first tool card
+AND SHALL retain the member's canonical tool-result ownership rather than copying results into a group-level parallel map
+
 **Rationale:** Keeping tool results in a `Map<string, Message>` built at
 the MessageList level and looked up during render creates a parallel data
 source. Moving the pairing to construction makes it structurally impossible
@@ -148,6 +172,9 @@ THE SYSTEM SHALL set `isFirstInTurn = true` on that `agent_turn`
 WHEN another `agent_turn` precedes an `agent_turn` with no intervening
 `user` or `skill`
 THE SYSTEM SHALL set `isFirstInTurn = false`
+
+WHEN adjacent tool-only agent turns become one `tool_only_agent_turn_group`
+THE SYSTEM SHALL preserve each member's precomputed `isFirstInTurn` value
 
 THE SYSTEM SHALL compute `isFirstInTurn` before the window applies
 SO THAT revealing older units on scroll-up cannot change the rendered

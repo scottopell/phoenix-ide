@@ -72,6 +72,21 @@ vi.mock('./MessageComponents', async () => {
       if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
       return <div className="message agent" data-sequence-id={message.sequence_id} data-highlight-fragment={activeHighlight?.fragmentId ?? ''}>agent</div>;
     }),
+    ToolOnlyAgentTurnGroup: ({ members, revealRequest, activeHighlight, onRevealHandled }: {
+      members: Array<{ agent: Message }>;
+      revealRequest?: AgentTextRevealRequest | null;
+      activeHighlight?: AgentTextHighlight | null;
+      onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
+    }) => (
+      <>
+        {members.map(({ agent }) => {
+          agentRenderCounter.count++;
+          agentMessageProps.push({ message: agent, forceExpandedText: false, isLatestAgentMessage: false, ...(revealRequest !== undefined ? { revealRequest } : {}), ...(activeHighlight !== undefined ? { activeHighlight } : {}) });
+          if (agentMessageMockState.autoHandleReveal && revealRequest && onRevealHandled) onRevealHandled(revealRequest);
+          return <div key={agent.message_id} id={`message-${agent.message_id}`} className="message agent" data-sequence-id={agent.sequence_id}>agent</div>;
+        })}
+      </>
+    ),
     SubAgentStatus: ({ stateData }: { stateData: { pending: Array<{ task: string }>; completed_results: Array<{ task: string }> } }) => (
       <div data-testid="subagent-status-mock">
         {stateData.completed_results.map((agent, index) => <div key={`completed-${index}`}>{`completed ${agent.task}`}</div>)}
@@ -934,6 +949,34 @@ describe('MessageList', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('highlights the exact grouped member targeted by message id', () => {
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const first = { ...makeMessage(1, 'agent'), content: [{ type: 'tool_use', id: 'group-use-1', name: 'read_file', input: { path: 'one' } }] } as Message;
+    const second = { ...makeMessage(2, 'agent'), content: [{ type: 'tool_use', id: 'group-use-2', name: 'search', input: { pattern: 'two' } }] } as Message;
+    const { container } = render(withConvContext(
+      <MessageList
+        ref={listRef}
+        messages={[first, second]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-group-jump"
+        transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}
+      />,
+    ));
+
+    expect(listRef.current?.scrollToMessageId(second.message_id)).toBe(true);
+    expect(virtualTranscriptMock.scrollToIndex).toHaveBeenLastCalledWith(
+      0,
+      'start',
+      0,
+      `#message-${second.message_id}, [data-message-id="${second.message_id}"]`,
+    );
+    expect(container.querySelector(`#message-${second.message_id}`)).toHaveClass('jump-highlight');
+    expect(container.querySelector(`#message-${first.message_id}`)).not.toHaveClass('jump-highlight');
   });
 
   it('highlights only the newest pending jump when virtualized rows mount late', () => {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
-import { AgentMessage } from '../../components/MessageComponents';
+import { AgentMessage, ToolOnlyAgentTurnGroup } from '../../components/MessageComponents';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { ForkProposalsProvider, useForkProposals } from '../../contexts/ForkProposalsContext';
 import { ConversationContext } from '../../conversation/ConversationContext';
@@ -38,11 +38,13 @@ function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean })
       display_data: { tool_starts: { 'shell-pending': Date.now() - 4_000 } },
     };
   }), [data.messages]);
-  const agentTurns = useMemo(
-    () => buildHistoricalUnits({ messages: renderedMessages, pendingMessages: [] }).historicalUnits
-      .filter((unit) => unit.kind === 'agent_turn'),
+  const historicalUnits = useMemo(
+    () => buildHistoricalUnits({ messages: renderedMessages, pendingMessages: [] }).historicalUnits,
     [renderedMessages],
   );
+  const lastAgentKey = historicalUnits
+    .flatMap((unit) => unit.kind === 'agent_turn' ? [unit] : unit.kind === 'tool_only_agent_turn_group' ? unit.members : [])
+    .at(-1)?.key;
 
   document.documentElement.dataset['theme'] = data.theme;
 
@@ -64,20 +66,36 @@ function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean })
               </div>
               <div className="fixture-message-list-stage tool-results-fixture-stage">
                 <div className="message-list-fixture-shell tool-results-fixture-shell">
-                  {agentTurns.map((turn) => (
-                    <AgentMessage
-                      key={turn.key}
-                      message={turn.agent}
-                      toolResults={turn.toolResultsByUseId}
-                      onOpenFile={() => {}}
-                      filePathRootDir={data.filePathRootDir}
-                      workScopeKey={data.workScopeKey}
-                      activeToolUseId={activeToolUseId}
-                      isFirstInTurn={turn.isFirstInTurn}
-                      isLatestAgentMessage={turn === agentTurns.at(-1)}
-                      forceExpandedText={turn === agentTurns.at(-1)}
-                    />
-                  ))}
+                  {historicalUnits.map((unit) => {
+                    if (unit.kind === 'tool_only_agent_turn_group') {
+                      return (
+                        <ToolOnlyAgentTurnGroup
+                          key={unit.key}
+                          members={unit.members}
+                          onOpenFile={() => {}}
+                          filePathRootDir={data.filePathRootDir}
+                          workScopeKey={data.workScopeKey}
+                          activeToolUseId={activeToolUseId}
+                          isLatestAgentMessage={unit.members.some((member) => member.key === lastAgentKey)}
+                        />
+                      );
+                    }
+                    if (unit.kind !== 'agent_turn') return null;
+                    return (
+                      <AgentMessage
+                        key={unit.key}
+                        message={unit.agent}
+                        toolResults={unit.toolResultsByUseId}
+                        onOpenFile={() => {}}
+                        filePathRootDir={data.filePathRootDir}
+                        workScopeKey={data.workScopeKey}
+                        activeToolUseId={activeToolUseId}
+                        isFirstInTurn={unit.isFirstInTurn}
+                        isLatestAgentMessage={unit.key === lastAgentKey}
+                        forceExpandedText={unit.key === lastAgentKey}
+                      />
+                    );
+                  })}
                 </div>
               </div>
               </main>

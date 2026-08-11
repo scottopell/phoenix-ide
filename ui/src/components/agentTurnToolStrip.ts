@@ -12,6 +12,8 @@ import type { ContentBlock, Message, ToolResultContent } from '../api';
 import type { BashToolProgress } from '../generated/sse';
 
 export interface ToolStripItem {
+  /** Persisted agent message that owns this tool call. */
+  ownerMessage: Message;
   /** Tool name as it appears on the content block (e.g. `bash`, `patch`). */
   name: string;
   /** The tool_use block id; used to key the summary and to target expansion. */
@@ -340,6 +342,7 @@ export function deriveToolStripItems(
       ? summarizeBashCompactCard(input, result, liveBashProgress[toolId]?.progress, block.display)
       : { commandIdentity: null, finalStatus: null, outputTail: null };
     items.push({
+      ownerMessage: message,
       name,
       toolId,
       inputSummary: summarizeToolInput(name, input, block.display),
