@@ -758,6 +758,46 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(identity.git_sha, status["expected_git_sha"])
             self.assertFalse(active_path.exists())
 
+    def test_staged_identity_mismatch_records_selected_candidate_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            candidate = root / "built-phoenix"
+            candidate.write_bytes(b"candidate")
+            active_path = root / "deploy" / "active"
+            status_path = root / "deploy" / "status.json"
+            selected = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+            observed = self.dev.RuntimeIdentity("9.9.9", "bad123def456")
+            prepared = self.dev.PreparedCandidate(
+                binary=candidate,
+                source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
+                source_commit="abc123def456" + "0" * 28,
+                identity=selected,
+            )
+
+            with mock.patch.object(self.dev, "LAUNCHD_DEPLOY_DIR", root / "deploy"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_ACTIVE_PATH", active_path), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_CLAIM_LOCK_PATH", root / "deploy" / "claim.lock"), \
+                 mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", status_path), \
+                 mock.patch.object(self.dev, "_launchd_candidate_env", return_value=({}, None)), \
+                 mock.patch.object(self.dev, "_preflight_prod_bind_auth"), \
+                 mock.patch.object(self.dev, "_prepare_local_candidate", return_value=prepared), \
+                 mock.patch.object(self.dev, "_binary_identity", return_value=observed), \
+                 mock.patch.object(
+                     self.dev.subprocess,
+                     "run",
+                     return_value=subprocess.CompletedProcess([], 0, "", ""),
+                 ):
+                with self.assertRaisesRegex(SystemExit, "staged candidate identity changed after signing"):
+                    self.dev.launchd_prod_deploy()
+
+            status = json.loads(status_path.read_text())
+            self.assertEqual("precondition_failed", status["state"])
+            self.assertEqual(selected.version, status["expected_version"])
+            self.assertEqual(selected.git_sha, status["expected_git_sha"])
+            self.assertNotEqual(observed.version, status["expected_version"])
+            self.assertNotEqual(observed.git_sha, status["expected_git_sha"])
+            self.assertFalse(active_path.exists())
+
     def test_rollback_binary_identity_mismatch_is_rejected(self):
         running = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
         rollback = {"version": "1.0.0", "git_sha": "bbbbbbbbbbbb"}

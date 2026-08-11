@@ -9142,7 +9142,7 @@ def launchd_prod_deploy(
     source_commit = None
     release_commit = None
     release_tag = release
-    identity: RuntimeIdentity | None = None
+    selected_identity: RuntimeIdentity | None = None
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "preparing",
@@ -9171,6 +9171,7 @@ def launchd_prod_deploy(
             else _prepare_local_candidate(target=None)
         )
         binary = prepared.binary
+        selected_identity = prepared.identity
         release_tag = prepared.release_tag
         source_commit = prepared.source_commit
         source_kind = prepared.source_kind.value
@@ -9185,11 +9186,8 @@ def launchd_prod_deploy(
             check=True,
         )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
-        identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
-        if (
-            identity.version != prepared.identity.version
-            or identity.git_sha != prepared.identity.git_sha
-        ):
+        observed_identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
+        if observed_identity != selected_identity:
             raise SystemExit("staged candidate identity changed after signing")
 
         env_overrides = dict(launchd_env)
@@ -9198,7 +9196,7 @@ def launchd_prod_deploy(
             print(f"  Loaded env from {env_file}")
         path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
-        plist_content = generate_launchd_plist(identity.version, extra_env=env_overrides, path_override=path_str)
+        plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
         candidate_plist = staging / "candidate.plist"
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
@@ -9267,7 +9265,7 @@ def launchd_prod_deploy(
             "source_commit": source_commit,
             "release_tag": release_tag,
             "release_commit": release_commit,
-            "expected": identity.as_dict(),
+            "expected": selected_identity.as_dict(),
             "previous": previous_identity.as_dict() if previous_identity is not None else None,
             "previous_deployed_sha": previous_deployed_sha,
             "candidate_binary": str(candidate_binary),
@@ -9300,7 +9298,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": identity.version, "expected_git_sha": identity.git_sha,
+            "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
             "failure": None, "rollback_failure": None,
         })
@@ -9320,8 +9318,8 @@ def launchd_prod_deploy(
                 "source_commit": source_commit,
                 "release_commit": release_commit,
                 "release_tag": release_tag,
-                "expected_version": identity.version if identity is not None else None,
-                "expected_git_sha": identity.git_sha if identity is not None else None,
+                "expected_version": selected_identity.version if selected_identity is not None else None,
+                "expected_git_sha": selected_identity.git_sha if selected_identity is not None else None,
                 "created_at": claimed_at, "updated_at": failed_at,
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
                 "rollback_failure": None,
@@ -9329,7 +9327,7 @@ def launchd_prod_deploy(
         finally:
             _release_launchd_deploy_claim(transaction_id)
         raise
-    _report_launchd_handoff(transaction_id, identity)
+    _report_launchd_handoff(transaction_id, selected_identity)
 
 
 
