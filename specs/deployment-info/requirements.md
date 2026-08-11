@@ -403,30 +403,41 @@ database."
 
 ---
 
-### REQ-DEPLOY-006: Surface the log sinks, never the contents
+### REQ-DEPLOY-006: Surface logging destinations, never their contents
 
-THE SYSTEM SHALL report every log sink the running logger is configured to write
-to. Logging fans out to independent sinks, each individually enabled:
+THE SYSTEM SHALL report every configured structured-log sink and the bounded
+latest-fatal destination. Structured logging fans out to independent sinks,
+each individually enabled:
 
 - WHEN logs are written to standard output THE SYSTEM SHALL indicate the stdout
   sink is active (captured by the supervising process)
 - WHEN logs are written to a process-owned file THE SYSTEM SHALL display that
   file's absolute path
+- WHEN a latest-fatal destination is configured THE SYSTEM SHALL display its
+  absolute path even though it is written by the pre-logger error and panic hook
 - WHEN a sink is not active THE SYSTEM SHALL indicate its absence rather than
   implying output that is not produced
 
-THE SYSTEM SHALL NOT render log file contents on the page
+THE SYSTEM SHALL resolve the structured and fatal destinations once per process,
+use that immutable resolution for both writing and reporting, and reject aliased
+structured and fatal files.
+
+THE SYSTEM SHALL preserve launcher failures that occur before process code can
+run in a separate launcher-owned diagnostic, with bounded retention.
+
+THE SYSTEM SHALL NOT render diagnostic or log file contents on the page.
 
 **Rationale:** The page's job is orientation, not log viewing. Showing the path
 is a one-step handoff to tools built for tailing and searching; rendering
 contents would turn a lightweight diagnostic page into an unbounded data view and
-risk leaking sensitive log lines into the browser. The sinks are independent
-because a deployment may want stdout (for a supervisor's journal), a file (for an
-operator to tail), or both at once — nothing structurally couples them. The
-honesty caveat is load-bearing: a path is shown only for a file the process
-*itself* writes, never a launcher redirection the process cannot guarantee. The
-reported sinks are derived from the same configuration that builds the logger, so
-the report and the wiring share one source of truth and cannot disagree.
+risk leaking sensitive log lines into the browser. The structured sinks are
+independent because a deployment may want stdout, a file, or both. The fatal
+snapshot is a separate bounded destination because it must work before the
+structured subscriber exists. A launcher-owned diagnostic is not reported as a
+process-owned sink; it exists only for failures such as loader rejection that
+happen before the process can install its hook. The reported destinations are
+derived from the same immutable configuration that drives their writers, so the
+report and the wiring cannot disagree.
 
 ---
 

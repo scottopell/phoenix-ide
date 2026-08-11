@@ -22,11 +22,34 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match parse_invocation(std::env::args().skip(1))? {
-        Invocation::Server | Invocation::ServerCommand => phoenix_ide::run_server().await,
-        Invocation::MigrateOnly => phoenix_ide::migrate_database().await,
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let invocation = parse_invocation(std::env::args().skip(1))?;
+    let records_fatal_diagnostics =
+        matches!(invocation, Invocation::Server | Invocation::ServerCommand);
+    if records_fatal_diagnostics {
+        phoenix_ide::install_fatal_diagnostic_hook();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if records_fatal_diagnostics {
+                phoenix_ide::record_fatal_diagnostic(&error);
+            }
+            return Err(error.into());
+        }
+    };
+    match invocation {
+        Invocation::Server | Invocation::ServerCommand => {
+            let result = runtime.block_on(phoenix_ide::run_server());
+            if let Err(error) = &result {
+                phoenix_ide::record_fatal_diagnostic(error);
+            }
+            result
+        }
+        Invocation::MigrateOnly => runtime.block_on(phoenix_ide::migrate_database()),
     }
 }
 

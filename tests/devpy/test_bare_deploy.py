@@ -20,6 +20,25 @@ def load_dev():
 
 
 class BareDeployCommandTests(unittest.TestCase):
+    def test_bare_logging_cannot_be_overridden_to_discarded_stdout(self):
+        environment = {
+            "PHOENIX_LOG_FILE": "",
+            "PHOENIX_FATAL_LOG_FILE": "",
+            "PHOENIX_LOG_STDOUT": "true",
+        }
+
+        self.dev._apply_bare_env_defaults(environment)
+
+        self.assertEqual(
+            str(Path.home() / ".phoenix-ide/prod.log"),
+            environment["PHOENIX_LOG_FILE"],
+        )
+        self.assertEqual(
+            str(Path.home() / ".phoenix-ide/prod-fatal.log"),
+            environment["PHOENIX_FATAL_LOG_FILE"],
+        )
+        self.assertEqual("false", environment["PHOENIX_LOG_STDOUT"])
+
     @classmethod
     def setUpClass(cls):
         cls.dev = load_dev()
@@ -368,6 +387,10 @@ class BareDeployCommandTests(unittest.TestCase):
             # Environment is re-read from .phoenix-ide.env, then defaults applied.
             self.assertEqual(call_env["DDTOOL_AUTH_LOGIN_MODE"], "device")
             self.assertEqual(call_env["PHOENIX_LOG_STDOUT"], "false")
+            self.assertEqual(
+                call_env["PHOENIX_FATAL_LOG_FILE"],
+                str(Path.home() / ".phoenix-ide/prod-fatal.log"),
+            )
 
     def test_daemon_restart_without_supervisor_directs_to_deploy(self):
         with tempfile.TemporaryDirectory() as td:

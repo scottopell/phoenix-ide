@@ -297,9 +297,8 @@ pub enum DiskSize {
     InlineDb,
 }
 
-/// The deployment's active log sinks. Both are independent — logs fan out to
-/// every enabled sink — so this mirrors the actual subscriber configuration
-/// rather than picking one. Derived from [`crate::logging::LogConfig`].
+/// The deployment's configured logging destinations, derived from
+/// [`crate::logging::LogConfig`].
 #[derive(Serialize, TS, Clone, Debug)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct LogInfo {
@@ -307,6 +306,8 @@ pub struct LogInfo {
     pub stdout: bool,
     /// Absolute path of the process-owned log file, when file logging is active.
     pub file: Option<String>,
+    /// Absolute path of the bounded latest-fatal diagnostic, when configured.
+    pub fatal_file: Option<String>,
 }
 
 // ============================================================
@@ -1113,6 +1114,7 @@ impl DeploymentConfig {
             log: LogInfo {
                 stdout: true,
                 file: None,
+                fatal_file: None,
             },
             locations: Vec::new(),
         }

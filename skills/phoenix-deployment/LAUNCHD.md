@@ -9,12 +9,15 @@ Applies when: macOS. This is the only macOS production mode. `./dev.py prod depl
 | Port | 8031 |
 | Binary | `~/.phoenix-ide/phoenix-ide` |
 | Database | `~/.phoenix-ide/prod.db` |
-| Logs | `~/.phoenix-ide/prod.log` (stdout + stderr) |
+| Logs | `~/.phoenix-ide/prod.log` (structured, daily rotation), `prod-fatal.log` (latest Rust fatal, maximum 64 KiB), and `prod-launchd-stderr.log` (pre-main loader errors) |
 | launchd label | `com.phoenix-ide.server` |
 | plist | `~/Library/LaunchAgents/com.phoenix-ide.server.plist` |
-| Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — daily at 00:00, 14 generations, bzip2, copy-truncate (no size threshold) |
+| OS-owned rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — launchd stderr at 64 KiB with 2 generations; it never touches process-owned `prod.log` |
+| Process-owned rotation | Phoenix rotates `prod.log` daily, gzip-compresses closed archives, and retains 14 generations |
 
 The binary is ad-hoc codesigned (`codesign --sign -`) on each deploy so the OS will run it.
+The launcher fixes the three `PHOENIX_LOG_*` destinations above; `.phoenix-ide.env`
+cannot redirect structured output into launchd's discarded stdout stream.
 
 ## Transaction ownership
 
@@ -84,6 +87,7 @@ Edit `.phoenix-ide.env` in the repo root, then run `./dev.py prod deploy` to ins
 ./dev.py prod status                                  # Recommended
 launchctl print gui/$(id -u)/com.phoenix-ide.server   # Direct launchd check (read-only)
 tail -f ~/.phoenix-ide/prod.log                       # Follow live logs
+tail -f ~/.phoenix-ide/prod-launchd-stderr.log        # Loader/pre-main failures
 ```
 
 ## If the deploy fails
