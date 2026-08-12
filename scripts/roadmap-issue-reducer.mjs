@@ -389,10 +389,14 @@ export async function run({ event, configuredIssueNumber, token }) {
       updates = updatesFromComments(comments);
       const body = renderRoadmap(updates, snapshotThroughCommentId);
       changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
-      const after = await listComments(owner, repo, configuredIssueNumber, token);
-      if (commentSnapshot(comments) === commentSnapshot(after)) {
-        stable = true;
-        break;
+      try {
+        const after = await listComments(owner, repo, configuredIssueNumber, token);
+        if (commentSnapshot(comments) === commentSnapshot(after)) {
+          stable = true;
+          break;
+        }
+      } catch (error) {
+        console.warn(`Roadmap verification attempt ${attempt} failed; rebuilding from a fresh snapshot: ${error.message}`);
       }
     }
     if (!stable) throw new Error("roadmap comments did not stabilize after 3 projection attempts");
