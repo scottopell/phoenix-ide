@@ -7,11 +7,17 @@ on:
   pull_request:
     paths:
       - "macos/Phoenix/**"
+      - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/src/lib.rs"
+      - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
   push:
     branches: [main]
     paths:
       - "macos/Phoenix/**"
+      - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/src/lib.rs"
+      - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
 
 concurrency:
