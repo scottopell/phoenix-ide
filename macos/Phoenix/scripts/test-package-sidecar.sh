@@ -30,6 +30,10 @@ EOF
 cat > "$fakebin/codesign" <<'EOF'
 #!/bin/sh
 if [ "$1" = "--verify" ] && [ "$2" = "--strict" ]; then
+  if [ "${FAKE_CODESIGN_REQUIREMENT_RESULT:-unset}" != "unset" ] && [ "$3" = "--requirement" ]; then
+    [ "$FAKE_CODESIGN_REQUIREMENT_RESULT" = "ok" ] && exit 0
+    exit 1
+  fi
   [ "${FAKE_CODESIGN_VERIFY_RESULT:-ok}" = "ok" ] && exit 0
   exit 1
 fi
@@ -82,6 +86,15 @@ run_script >/dev/null
 /usr/bin/grep '/bin/rm -f "\$destination"' "$script" >/dev/null
 /usr/bin/grep 'validate_packaged_sidecar "\$destination" "\$ARCHS" "\$expected_signing"' "$script" >/dev/null
 /usr/bin/grep 'packaged sidecar is not signed with expected identity' "$script" >/dev/null
+
+# designated requirement / identity-name verification should be present for explicit identities
+/usr/bin/grep 'codesign --verify --strict --requirement' "$script" >/dev/null
+if ! FAKE_CODESIGN_REQUIREMENT_RESULT=ok CODE_SIGNING_ALLOWED_OVERRIDE=YES EXPANDED_CODE_SIGN_IDENTITY_OVERRIDE='Developer ID Application: Phoenix' PHOENIX_SIDECAR_PATH="$dummy_sidecar" \
+  run_script >/dev/null 2>"$tmpdir/identity.err"; then
+  echo 'error: expected explicit identity requirement verification to pass' >&2
+  exit 1
+fi
+
 # strict codesign verification runs before metadata checks when signing is expected
 if FAKE_CODESIGN_VERIFY_RESULT=fail CODE_SIGNING_ALLOWED_OVERRIDE=YES CODE_SIGN_STYLE_OVERRIDE=Automatic PHOENIX_SIDECAR_PATH="$dummy_sidecar" \
   run_script >/dev/null 2>"$tmpdir/strict.err"; then

@@ -340,9 +340,9 @@ final class ServerManager: ObservableObject {
     private var operationID = UUID()
     private var launchedBundledInstance: LaunchedBundledInstance?
     private var logBuffer = ConnectionLogBuffer()
-    private let keychain: any SecretStore
+    private let keychain: any PackagedSidecarSecretProvider
 
-    init(keychain: any SecretStore = KeychainStore()) {
+    init(keychain: any PackagedSidecarSecretProvider = KeychainStore()) {
         self.keychain = keychain
         ConfigurationStore.removeLegacyPlaintextSecret()
     }
@@ -350,6 +350,7 @@ final class ServerManager: ObservableObject {
     var currentOperationToken: ConnectionOperationToken { ConnectionOperationToken(id: operationID) }
 
     func connect() {
+        resetBrowserOwnedStateForOperationTransition()
         readinessTask?.cancel()
         operationID = UUID()
         let operation = operationID
@@ -392,6 +393,7 @@ final class ServerManager: ObservableObject {
     }
 
     func showFailure(message: String) {
+        resetBrowserOwnedStateForOperationTransition()
         state = .failed(FailureState(version: currentVersion, message: message))
     }
 
@@ -419,16 +421,25 @@ final class ServerManager: ObservableObject {
         state = .unavailable(FailureState(version: currentVersion, message: message))
     }
 
-    func stop(completion: (() -> Void)? = nil) {
+    func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil) {
         if let completion { stopCompletions.append(completion) }
         readinessTask?.cancel()
         readinessTask = nil
 
-        guard case .bundled = mode, let process, process.isRunning else {
-            finishStop()
+        guard case .bundled = mode, let process else {
+            finishStop(finalState: preservedState ?? .stopped)
             return
         }
-        state = .stopping
+        guard process.isRunning else {
+            flushPendingLogFragment()
+            closeLauncherLog()
+            releaseOwnerLock()
+            self.process = nil
+            launchedBundledInstance = nil
+            finishStop(finalState: preservedState ?? .stopped)
+            return
+        }
+        state = preservedState ?? .stopping
         process.terminate()
 
         let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -471,6 +482,14 @@ final class ServerManager: ObservableObject {
 
     private var currentDeployment: DeploymentInfo? { state.deploymentInfo }
 
+    private func resetBrowserOwnedStateForOperationTransition() {
+        recentLogLines = []
+    }
+
+    private func stopPreservingFailureState(_ failure: FailureState) {
+        stop(completion: nil, preservedState: .failed(failure))
+    }
+
     private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
         state = .startingSidecar
         logBuffer = ConnectionLogBuffer()
@@ -494,7 +513,7 @@ final class ServerManager: ObservableObject {
                 "PHOENIX_INSTANCE_ID": instanceID.uuidString,
             ]
             for (key, value) in configuration.publicEnvironment { environment[key] = value }
-            for (key, value) in try keychain.processEnvironment() { environment[key] = value }
+            for (key, value) in try keychain.sidecarEnvironment() { environment[key] = value }
 
             let launched = Process()
             launched.executableURL = configuration.executableURL
@@ -594,8 +613,9 @@ final class ServerManager: ObservableObject {
             try? await Task.sleep(for: .milliseconds(300))
         }
         guard operation == operationID, process?.isRunning == true else { return }
-        state = .failed(FailureState(version: currentVersion, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log."))
-        stop()
+        let failure = FailureState(version: currentVersion, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")
+        state = .failed(failure)
+        stopPreservingFailureState(failure)
     }
 
     private func requestJSON<T: Decodable>(_ url: URL, expectedOrigin: PhoenixOrigin) async throws -> T {
@@ -657,24 +677,29 @@ final class ServerManager: ObservableObject {
 
     private func processExited(_ terminated: Process, operation: UUID) {
         guard process === terminated else { return }
+        let priorState = state
+        let version = currentVersion
         flushPendingLogFragment()
+        closeLauncherLog()
         stopDeadline?.cancel()
         stopDeadline = nil
+        releaseOwnerLock()
         process = nil
         launchedBundledInstance = nil
-        releaseOwnerLock()
-        closeLauncherLog()
 
-        switch state {
+        switch priorState {
         case .stopping, .restarting:
-            finishStop()
-        case .failed(let failure) where operation == operationID && failure.message.contains("did not become ready"):
-            finishStopCallbacksOnly()
+            finishStop(finalState: .stopped)
+        case .failed(let failure) where operation == operationID:
+            finishStop(finalState: .failed(failure))
         default:
+            let finalState: ConnectionState
             if operation == operationID {
-                state = .failed(FailureState(version: currentVersion, message: "Bundled Phoenix exited with code \(terminated.terminationStatus). Open Connection Status to locate the app-owned log."))
+                finalState = .failed(FailureState(version: version, message: "Bundled Phoenix exited with code \(terminated.terminationStatus). Open Connection Status to locate the app-owned log."))
+            } else {
+                finalState = .stopped
             }
-            finishStopCallbacksOnly()
+            finishStop(finalState: finalState)
         }
     }
 
@@ -689,14 +714,14 @@ final class ServerManager: ObservableObject {
         return deployment?.instanceID == launchedBundledInstance.instanceID.uuidString
     }
 
-    private func finishStop() {
+    private func finishStop(finalState: ConnectionState) {
         stopDeadline?.cancel()
         stopDeadline = nil
         process = nil
         launchedBundledInstance = nil
         releaseOwnerLock()
         closeLauncherLog()
-        state = .stopped
+        state = finalState
         finishStopCallbacksOnly()
     }
 

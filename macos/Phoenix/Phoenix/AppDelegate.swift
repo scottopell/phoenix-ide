@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let persistence = SettingsPersistence()
     private var cancellables = Set<AnyCancellable>()
     private var pendingConversationID: UUID?
+    private var pendingConversationValidationTask: Task<Void, Never>?
     private var hotkeyError: HotkeyError?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
         showWindow()
         do {
-            if try persistence.loadDraft().hasSavedModeSelection {
+            if try persistence.loadConnectionDraft().hasSavedModeSelection {
                 serverManager.connect()
             }
         } catch {
@@ -125,8 +126,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateWindowContent(for state: ConnectionState) {
         guard let window else { return }
         if state.canDisplayWebView, let origin = serverManager.webOrigin {
-            if webView != nil { return }
             let operation = serverManager.currentOperationToken
+            browserEnvironment.closeOperationOwnedSurfaces(for: operation)
+            if webView != nil { return }
             let wrapper = WebViewWrapper(
                 origin: origin,
                 operation: operation,
@@ -149,6 +151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if let current = webView {
+            current.navigationDelegate = nil
+            current.uiDelegate = nil
+        }
         webView = nil
         if let failure = state.failureViewModel {
             window.contentView = NSHostingView(rootView: ErrorView(message: failure.message) { [weak self] in
@@ -163,12 +169,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleIncomingURL(_ url: URL) {
         guard let action = PhoenixURLAction(url: url) else { return }
         switch action {
-        case .status: showServerStatusWindow()
+        case .status:
+            showServerStatusWindow()
         case .conversation(let id):
-            pendingConversationID = id
             showWindow()
-            openPendingConversation()
-        case .open: showWindow()
+            validateAndQueueConversationNavigation(id)
+        case .open:
+            showWindow()
         }
     }
 
@@ -176,6 +183,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let webView, let id = pendingConversationID, let origin = serverManager.webOrigin else { return }
         pendingConversationID = nil
         webView.load(URLRequest(url: origin.url(path: "/c/\(id.uuidString.lowercased())")))
+    }
+
+    private func validateAndQueueConversationNavigation(_ id: UUID) {
+        pendingConversationValidationTask?.cancel()
+        pendingConversationValidationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let conversationID = try await self.validatedConversationIDForNavigation(id)
+                guard !Task.isCancelled else { return }
+                self.pendingConversationID = conversationID
+                self.openPendingConversation()
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.pendingConversationID = nil
+                let message = error.localizedDescription
+                NSLog("Phoenix deep link rejected for %s: %s", id.uuidString.lowercased(), message)
+                self.serverManager.showFailure(message: message)
+            }
+        }
+    }
+
+    private func validatedConversationIDForNavigation(_ id: UUID) async throws -> UUID {
+        guard let webView, let origin = serverManager.webOrigin else {
+            throw DeepLinkValidationError.noAuthenticatedWebView
+        }
+        let script = Self.conversationValidationScript(uuid: id.uuidString.lowercased())
+        let result = try await webView.evaluateJavaScript(script)
+        guard let payload = result as? [String: Any],
+              let status = payload["status"] as? Int else {
+            throw DeepLinkValidationError.decoding("missing status payload")
+        }
+        if status == 404 {
+            throw DeepLinkValidationError.conversationMissing(id)
+        }
+        guard status == 200 else {
+            throw DeepLinkValidationError.invalidHTTPStatus(status)
+        }
+        guard let body = payload["body"] as? [String: Any],
+              let responseID = body["id"] as? String,
+              let validated = UUID(uuidString: responseID),
+              validated.uuidString.lowercased() == id.uuidString.lowercased() else {
+            throw DeepLinkValidationError.decoding("conversation response did not contain the requested UUID")
+        }
+        guard let finalURLString = payload["finalURL"] as? String,
+              let finalURL = URL(string: finalURLString),
+              origin.exactlyMatches(finalURL) else {
+            throw DeepLinkValidationError.decoding("validation escaped the configured origin")
+        }
+        return validated
+    }
+
+    private static func conversationValidationScript(uuid: String) -> String {
+        let path = "/api/conversations/\(uuid)"
+        return """
+        (async () => {
+          const response = await window.fetch(\"\(path)\", { credentials: 'same-origin' });
+          let body = null;
+          try { body = await response.json(); } catch (_) {}
+          return { status: response.status, body, finalURL: response.url };
+        })();
+        """
     }
 }
 

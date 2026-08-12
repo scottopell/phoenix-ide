@@ -133,6 +133,10 @@ protocol SecretStore {
     func processEnvironment() throws -> [String: String]
 }
 
+protocol PackagedSidecarSecretProvider {
+    func sidecarEnvironment() throws -> [String: String]
+}
+
 struct PersistedPreferenceSnapshot: Equatable {
     let serverMode: String?
     let attachedOrigin: String?
@@ -159,6 +163,13 @@ struct PersistedSettingsSnapshot: Equatable {
             openAIKey: (secrets[.openAIAPIKey] ?? nil) ?? ""
         )
     }
+
+    func nonsecretDraft() -> SettingsDraft {
+        var draft = draft()
+        draft.anthropicKey = ""
+        draft.openAIKey = ""
+        return draft
+    }
 }
 
 struct SettingsPersistence {
@@ -176,6 +187,12 @@ struct SettingsPersistence {
         let snapshot = try persistedSnapshot()
         let hasSavedModeSelection = snapshot.preferences.serverMode != nil
         return DraftLoadResult(draft: snapshot.draft(), hasSavedModeSelection: hasSavedModeSelection)
+    }
+
+    func loadConnectionDraft() throws -> DraftLoadResult {
+        let snapshot = try persistedSnapshot()
+        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
+        return DraftLoadResult(draft: snapshot.nonsecretDraft(), hasSavedModeSelection: hasSavedModeSelection)
     }
 
     func persistedSnapshot() throws -> PersistedSettingsSnapshot {
@@ -579,11 +596,13 @@ enum ConfigurationStore {
     static let defaultBundledPort = 8420
 
     static func load(bundle: Bundle = .main, defaults: UserDefaults = .standard) throws -> ServerMode {
-        try loadCandidate(
-            kind: defaults.string(forKey: PreferenceKey.serverMode)
-                .flatMap(ServerModeKind.init(rawValue:)) ?? .attached,
+        let persistedMode = defaults.string(forKey: PreferenceKey.serverMode)
+            .flatMap(ServerModeKind.init(rawValue:)) ?? .attached
+        let persistedBundledPort = defaults.object(forKey: PreferenceKey.bundledPort) as? Int
+        return try loadCandidate(
+            kind: persistedMode,
             attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin) ?? defaultAttachedOrigin,
-            bundledPort: defaults.integer(forKey: PreferenceKey.bundledPort),
+            bundledPort: persistedBundledPort ?? defaultBundledPort,
             developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary) ?? "",
             rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel) ?? "phoenix_ide=info",
             bundle: bundle
@@ -604,8 +623,8 @@ enum ConfigurationStore {
             try validateAttachedOriginTransport(origin)
             return .attached(AttachedServerConfiguration(origin: origin))
         case .bundled:
-            let port = bundledPort == 0 ? defaultBundledPort : bundledPort
-            guard (1024...65535).contains(port) else { throw ConfigurationError.invalidPort }
+            guard (1024...65535).contains(bundledPort) else { throw ConfigurationError.invalidPort }
+            let port = bundledPort
             let root = try applicationSupportRoot()
             let executable = bundledExecutable(bundle: bundle, developmentBinaryOverride: developmentBinaryOverride)
             guard FileManager.default.isExecutableFile(atPath: executable.path) else {
@@ -686,7 +705,7 @@ enum ProviderSecret: String, CaseIterable {
     }
 }
 
-struct KeychainStore: SecretStore {
+struct KeychainStore: SecretStore, PackagedSidecarSecretProvider {
     let service: String
 
     init(service: String = "com.phoenixide.macos.sidecar") {
@@ -739,6 +758,10 @@ struct KeychainStore: SecretStore {
         return result
     }
 
+    func sidecarEnvironment() throws -> [String: String] {
+        try processEnvironment()
+    }
+
     private func baseQuery(_ secret: ProviderSecret) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -754,6 +777,26 @@ enum KeychainError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .status(let status): SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)"
+        }
+    }
+}
+
+enum DeepLinkValidationError: LocalizedError, Equatable {
+    case noAuthenticatedWebView
+    case invalidHTTPStatus(Int)
+    case decoding(String)
+    case conversationMissing(UUID)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAuthenticatedWebView:
+            "Open Phoenix and sign in before opening a conversation deep link."
+        case .invalidHTTPStatus(let status):
+            "Conversation deep link validation failed with HTTP status \(status)."
+        case .decoding(let message):
+            "Conversation deep link validation could not decode the Phoenix response: \(message)"
+        case .conversationMissing(let id):
+            "Phoenix could not find conversation \(id.uuidString.lowercased()) at the configured origin."
         }
     }
 }

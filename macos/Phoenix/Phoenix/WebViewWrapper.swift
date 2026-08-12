@@ -315,7 +315,7 @@ struct WebViewWrapper: NSViewRepresentable {
                 download.cancel { _ in }
                 return
             }
-            browserEnvironment.downloadManager.attach(download: download)
+            browserEnvironment.downloadManager.attach(download: download, operation: operation)
         }
     }
 }
@@ -324,6 +324,11 @@ struct WebViewWrapper: NSViewRepresentable {
 final class BrowserEnvironment {
     let popupManager = PopupWindowManager()
     let downloadManager = DownloadManager()
+
+    func closeOperationOwnedSurfaces(for operation: ServerManager.ConnectionOperationToken) {
+        popupManager.closeAll(for: operation)
+        downloadManager.cancelAll(for: operation)
+    }
 
     func shutdown() {
         popupManager.closeAll()
@@ -369,11 +374,19 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
         window.contentView = childWebView
         window.delegate = self
         let identifier = ObjectIdentifier(window)
-        windows[identifier] = ManagedPopupWindow(window: window, coordinator: coordinator, webView: childWebView)
+        windows[identifier] = ManagedPopupWindow(operation: operation, window: window, coordinator: coordinator, webView: childWebView)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         return childWebView
+    }
+
+    func closeAll(for operation: ServerManager.ConnectionOperationToken) {
+        let matching = windows.filter { $0.value.operation == operation }
+        let identifiers = Set(matching.keys)
+        let activeWindows = matching.values.map(\.window)
+        windows = windows.filter { !identifiers.contains($0.key) }
+        activeWindows.forEach { $0.close() }
     }
 
     func closeAll() {
@@ -394,6 +407,7 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
     }
 
     private struct ManagedPopupWindow {
+        let operation: ServerManager.ConnectionOperationToken
         let window: NSWindow
         let coordinator: WebViewWrapper.Coordinator
         let webView: WKWebView
@@ -403,18 +417,29 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
 @MainActor
 final class DownloadManager {
     private struct ActiveDownload {
+        let operation: ServerManager.ConnectionOperationToken
         let download: WKDownload
         let delegate: DownloadDelegate
     }
 
     private var activeDownloads: [ObjectIdentifier: ActiveDownload] = [:]
 
-    func attach(download: WKDownload) {
+    func attach(download: WKDownload, operation: ServerManager.ConnectionOperationToken) {
         let delegate = DownloadDelegate { [weak self] finishedDownload in
             self?.activeDownloads.removeValue(forKey: ObjectIdentifier(finishedDownload))
         }
-        activeDownloads[ObjectIdentifier(download)] = ActiveDownload(download: download, delegate: delegate)
+        activeDownloads[ObjectIdentifier(download)] = ActiveDownload(operation: operation, download: download, delegate: delegate)
         download.delegate = delegate
+    }
+
+    func cancelAll(for operation: ServerManager.ConnectionOperationToken) {
+        let matching = activeDownloads.filter { $0.value.operation == operation }
+        let identifiers = Set(matching.keys)
+        let downloads = matching.values.map(\.download)
+        activeDownloads = activeDownloads.filter { !identifiers.contains($0.key) }
+        downloads.forEach { download in
+            download.cancel { _ in }
+        }
     }
 
     func cancelAll() {

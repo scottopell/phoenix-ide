@@ -39,9 +39,15 @@ validate_packaged_sidecar() {
         fi
       else
         identity="${expected_signing#identity:}"
-        if ! codesign -dv "$helper" 2>&1 | /usr/bin/grep -F "Authority=$identity" >/dev/null; then
-          echo "error: packaged sidecar is not signed with expected identity: $identity" >&2
-          return 1
+        designated_requirement="identifier \"$(/usr/bin/basename "$helper")\" and anchor trusted and certificate leaf[subject.CN] = \"$identity\""
+        if ! codesign --verify --strict --requirement "$designated_requirement" "$helper" >/dev/null 2>&1; then
+          actual_identity="$(codesign -dv "$helper" 2>&1 | /usr/bin/sed -n 's/^Authority=//p' | /usr/bin/head -n 1)"
+          if [ -n "$actual_identity" ] && [ "$actual_identity" = "$identity" ]; then
+            :
+          else
+            echo "error: packaged sidecar is not signed with expected identity: $identity" >&2
+            return 1
+          fi
         fi
       fi
       ;;

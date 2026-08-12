@@ -1,7 +1,7 @@
 import XCTest
 @testable import PhoenixMacCore
 
-private final class ScriptedSecretStore: SecretStore {
+private final class ScriptedSecretStore: SecretStore, PackagedSidecarSecretProvider {
     enum ReadStep {
         case succeed(String?)
         case fail(KeychainError)
@@ -68,6 +68,10 @@ private final class ScriptedSecretStore: SecretStore {
             guard let value = values[secret] ?? nil else { return nil }
             return (secret.environmentKey, value)
         })
+    }
+
+    func sidecarEnvironment() throws -> [String: String] {
+        try processEnvironment()
     }
 }
 
@@ -226,6 +230,34 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(destination.lastPathComponent, "report 4.pdf")
     }
 
+    func testLoadRejectsMissingBundledPortByUsingDefaultOnlyWhenPreferenceAbsent() throws {
+        let suite = "ConfigurationStore.load.default-port.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
+
+        let persistence = SettingsPersistence(defaults: defaults, keychain: ScriptedSecretStore(), bundle: .main)
+        let loaded = try persistence.loadConnectionDraft()
+
+        XCTAssertTrue(loaded.hasSavedModeSelection)
+        XCTAssertEqual(loaded.draft.mode, .bundled)
+        XCTAssertEqual(loaded.draft.bundledPort, ConfigurationStore.defaultBundledPort)
+    }
+
+    func testLoadCandidateRejectsExplicitBundledPortZero() {
+        XCTAssertThrowsError(
+            try ConfigurationStore.loadCandidate(
+                kind: .bundled,
+                attachedOrigin: ConfigurationStore.defaultAttachedOrigin,
+                bundledPort: 0,
+                developmentBinaryOverride: "/bin/sh",
+                rustLogLevel: "phoenix_ide=info"
+            )
+        ) { error in
+            XCTAssertEqual(error as? ConfigurationError, .invalidPort)
+        }
+    }
+
     func testLoadCandidateRejectsRemoteCleartextAttachedOrigin() {
         XCTAssertThrowsError(
             try ConfigurationStore.loadCandidate(
@@ -238,6 +270,27 @@ final class ConfigurationTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? ConfigurationError, .invalidAttachedCleartextOrigin)
         }
+    }
+
+    func testConnectionDraftRedactsSecretsButPreservesSavedMode() throws {
+        let suite = "SettingsPersistence.connection-load.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set(9420, forKey: PreferenceKey.bundledPort)
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "anthropic-secret",
+            .openAIAPIKey: "openai-secret",
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+
+        let loaded = try persistence.loadConnectionDraft()
+
+        XCTAssertTrue(loaded.hasSavedModeSelection)
+        XCTAssertEqual(loaded.draft.mode, .bundled)
+        XCTAssertEqual(loaded.draft.bundledPort, 9420)
+        XCTAssertEqual(loaded.draft.anthropicKey, "")
+        XCTAssertEqual(loaded.draft.openAIKey, "")
     }
 
     func testSettingsPersistenceLoadsUnselectedFirstRunWithoutPersistedMode() throws {
@@ -461,6 +514,17 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertFalse(ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: true))
     }
 
+    func testSidecarPackagingValidationRequiresExactIdentityName() {
+        let mismatch = SidecarPackagingValidation.validatePackagedSidecar(
+            helperExists: true,
+            actualArchitectures: ["arm64"],
+            requiredArchitectures: ["arm64"],
+            actualSigningIdentity: "Developer ID Application: Other",
+            expectedSigning: .identity("Developer ID Application: Phoenix")
+        )
+        XCTAssertTrue(mismatch.signingMismatch)
+    }
+
     func testSidecarPackagingValidationRequiresHelperArchitecturesAndExpectedSigning() {
         let ok = SidecarPackagingValidation.validatePackagedSidecar(
             helperExists: true,
@@ -544,6 +608,18 @@ final class ConfigurationTests: XCTestCase {
         defaults.set("secret", forKey: PreferenceKey.legacyAnthropicAPIKey)
         ConfigurationStore.removeLegacyPlaintextSecret(defaults: defaults)
         XCTAssertNil(defaults.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
+    }
+
+    func testDeepLinkValidationErrorsExplainWhyNavigationStayedPut() throws {
+        let id = try XCTUnwrap(UUID(uuidString: "66a063b4-6a90-49f5-8edc-9ffa67cffcf6"))
+        XCTAssertEqual(
+            DeepLinkValidationError.conversationMissing(id).localizedDescription,
+            "Phoenix could not find conversation 66a063b4-6a90-49f5-8edc-9ffa67cffcf6 at the configured origin."
+        )
+        XCTAssertEqual(
+            DeepLinkValidationError.invalidHTTPStatus(500).localizedDescription,
+            "Conversation deep link validation failed with HTTP status 500."
+        )
     }
 
     func testPhoenixURLActionsOpenExistingConversationByUUIDOnly() throws {
@@ -738,6 +814,15 @@ final class ServerManagerHelpersTests: XCTestCase {
     }
 
     func testLegacyPlaintextSecretDeletesLegacyPreferenceDomain() {
+    func testConnectionStateFailureVersionSurvivesPreservedStop() {
+        let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
+        let failure = FailureState(version: version, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")
+        let state = ConnectionState.failed(failure)
+
+        XCTAssertEqual(state.versionInfo, version)
+        XCTAssertEqual(state.failureViewModel?.message, failure.message)
+    }
+
         let currentSuite = "ConfigurationTests.current.\(UUID().uuidString)"
         let legacySuite = "com.scottopell.pa"
         let current = UserDefaults(suiteName: currentSuite)!
