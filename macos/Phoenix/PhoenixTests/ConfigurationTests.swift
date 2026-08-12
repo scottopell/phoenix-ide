@@ -163,6 +163,91 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testSettingsPersistenceLoadsUnselectedFirstRunWithoutPersistedMode() {
+        let suite = "SettingsPersistence.load.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let persistence = SettingsPersistence(defaults: defaults, keychain: KeychainStore(service: "test.settings.load"), bundle: .main)
+
+        let loaded = persistence.loadDraft()
+        XCTAssertFalse(loaded.hasSavedModeSelection)
+        XCTAssertNil(loaded.draft.mode)
+        XCTAssertEqual(loaded.draft.attachedOrigin, ConfigurationStore.defaultAttachedOrigin)
+        XCTAssertEqual(loaded.draft.bundledPort, ConfigurationStore.defaultBundledPort)
+    }
+
+    func testSettingsPersistencePersistsOnlyOnApply() throws {
+        let suite = "SettingsPersistence.persist.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let service = "test.settings.persist.\(UUID().uuidString)"
+        let keychain = KeychainStore(service: service)
+        for secret in ProviderSecret.allCases { try? keychain.write("", for: secret) }
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        var draft = SettingsDraft.defaults
+        draft.mode = .attached
+        draft.attachedOrigin = "https://phoenix.example.test:8031"
+        draft.rustLogLevel = "phoenix_ide=debug"
+        draft.anthropicKey = "anthropic-secret"
+
+        XCTAssertNil(defaults.object(forKey: PreferenceKey.serverMode))
+        XCTAssertNil(defaults.object(forKey: PreferenceKey.attachedOrigin))
+        XCTAssertNil(try keychain.read(.anthropicAPIKey))
+
+        let persisted = try persistence.persist(draft: draft)
+        guard case .attached(let attached) = persisted.candidate else {
+            return XCTFail("expected attached candidate")
+        }
+        XCTAssertEqual(attached.origin.description, "https://phoenix.example.test:8031")
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.serverMode), ServerModeKind.attached.rawValue)
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.attachedOrigin), "https://phoenix.example.test:8031")
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.rustLogLevel), "phoenix_ide=debug")
+        XCTAssertEqual(try keychain.read(.anthropicAPIKey), "anthropic-secret")
+        XCTAssertEqual(persisted.summary.savedSecrets, [.anthropicAPIKey])
+        XCTAssertTrue(persisted.summary.requiresReconnect)
+        for secret in ProviderSecret.allCases { try? keychain.write("", for: secret) }
+    }
+
+    func testSettingsPersistenceRejectsApplyWithoutChoosingMode() {
+        let suite = "SettingsPersistence.persist.missing-mode.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let persistence = SettingsPersistence(defaults: defaults, keychain: KeychainStore(service: "test.settings.missing.mode"), bundle: .main)
+
+        XCTAssertThrowsError(try persistence.persist(draft: .defaults)) { error in
+            XCTAssertEqual(error as? ConfigurationError, .missingModeSelection)
+        }
+    }
+
+    func testReopenDecisionShowsMainWindowOnlyWhenHidden() {
+        XCTAssertTrue(ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: false))
+        XCTAssertFalse(ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: true))
+    }
+
+    func testSidecarPackagingValidationRequiresHelperArchitecturesAndExpectedSigning() {
+        let ok = SidecarPackagingValidation.validatePackagedSidecar(
+            helperExists: true,
+            actualArchitectures: ["arm64", "x86_64"],
+            requiredArchitectures: ["arm64"],
+            actualSigningIdentity: "Developer ID Application: Phoenix",
+            expectedSigning: .identity("Developer ID Application: Phoenix")
+        )
+        XCTAssertTrue(ok.helperExists)
+        XCTAssertEqual(ok.missingArchitectures, [])
+        XCTAssertFalse(ok.signingMismatch)
+
+        let bad = SidecarPackagingValidation.validatePackagedSidecar(
+            helperExists: false,
+            actualArchitectures: ["arm64"],
+            requiredArchitectures: ["arm64", "x86_64"],
+            actualSigningIdentity: nil,
+            expectedSigning: .adHoc
+        )
+        XCTAssertFalse(bad.helperExists)
+        XCTAssertEqual(bad.missingArchitectures, ["x86_64"])
+        XCTAssertTrue(bad.signingMismatch)
+    }
+
     func testBundledEnvironmentIsLoopbackTLSOffAndPrivate() throws {
         let root = URL(fileURLWithPath: "/tmp/Phoenix Tests")
         let configuration = BundledServerConfiguration(

@@ -24,37 +24,58 @@ struct PhoenixApp: App {
 
 struct SettingsView: View {
     @ObservedObject var serverManager: ServerManager
-    @AppStorage(PreferenceKey.serverMode) private var mode = ServerModeKind.attached.rawValue
-    @AppStorage(PreferenceKey.attachedOrigin) private var attachedOrigin = ConfigurationStore.defaultAttachedOrigin
-    @AppStorage(PreferenceKey.bundledPort) private var bundledPort = ConfigurationStore.defaultBundledPort
-    @AppStorage(PreferenceKey.bundledDevelopmentBinary) private var developmentBinary = ""
-    @AppStorage(PreferenceKey.rustLogLevel) private var rustLogLevel = "phoenix_ide=info"
-    @State private var savedSignature = ""
-    @State private var anthropicKey = ""
-    @State private var openAIKey = ""
+    @State private var draft = SettingsDraft.defaults
+    @State private var savedDraft = SettingsDraft.defaults
+    @State private var hasSavedModeSelection = false
     @State private var keychainMessage: String?
-    private let keychain = KeychainStore()
+    @State private var modeMessage: String?
+    private let persistence = SettingsPersistence()
 
-    private var selectedKind: ServerModeKind {
-        ServerModeKind(rawValue: mode) ?? .attached
+    private var selectedKind: PendingServerModeKind? {
+        draft.mode
     }
 
-    private var signature: String {
-        [mode, attachedOrigin, String(bundledPort), developmentBinary, rustLogLevel].joined(separator: "\u{0}")
+    private var hasUnappliedChanges: Bool {
+        draft != savedDraft
+    }
+
+    private var canApply: Bool {
+        draft.mode != nil
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Picker("Phoenix server", selection: $mode) {
-                ForEach(ServerModeKind.allCases) { value in
-                    Text(value.label).tag(value.rawValue)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Phoenix server").font(.headline)
+                Picker(
+                    "Phoenix server",
+                    selection: Binding(
+                        get: { selectedKind },
+                        set: {
+                            draft.mode = $0
+                            modeMessage = nil
+                        }
+                    )
+                ) {
+                    Text("Choose one").tag(Optional<PendingServerModeKind>.none)
+                    ForEach(PendingServerModeKind.allCases) { value in
+                        Text(value.label).tag(Optional(value))
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                Text("Pick how Phoenix.app should connect before the first run. The app does not auto-connect until you choose a mode and apply it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let modeMessage {
+                    Text(modeMessage).font(.caption).foregroundStyle(.orange)
                 }
             }
-            .pickerStyle(.segmented)
 
             switch selectedKind {
-            case .attached: attachedSettings
-            case .bundled: bundledSettings
+            case .attached?: attachedSettings
+            case .bundled?: bundledSettings
+            case nil:
+                onboardingState
             }
 
             Divider()
@@ -64,24 +85,26 @@ struct SettingsView: View {
                 Spacer()
                 Button("Apply and Connect") {
                     do {
-                        let candidate = try ConfigurationStore.loadCandidate(
-                            kind: selectedKind,
-                            attachedOrigin: attachedOrigin,
-                            bundledPort: bundledPort,
-                            developmentBinaryOverride: developmentBinary,
-                            rustLogLevel: rustLogLevel
-                        )
-                        savedSignature = signature
-                        try serverManager.reconnect(to: candidate)
+                        let persisted = try persistence.persist(draft: draft)
+                        savedDraft = draft
+                        hasSavedModeSelection = true
+                        try serverManager.reconnect(to: persisted.candidate)
+                        keychainMessage = keychainStatusMessage(summary: persisted.summary)
+                        modeMessage = nil
                     } catch {
-                        keychainMessage = error.localizedDescription
+                        if case ConfigurationError.missingModeSelection = error {
+                            modeMessage = error.localizedDescription
+                        } else {
+                            keychainMessage = error.localizedDescription
+                        }
                     }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(!canApply)
             }
 
-            if savedSignature != signature {
-                Text("Settings changed; apply them to reconnect.")
+            if hasUnappliedChanges {
+                Text("Settings changed locally. Phoenix.app keeps using the saved configuration until you click Apply and Connect.")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -89,26 +112,34 @@ struct SettingsView: View {
         .padding(24)
         .frame(width: 540)
         .onAppear {
-            savedSignature = signature
-            anthropicKey = (try? keychain.read(.anthropicAPIKey)) ?? ""
-            openAIKey = (try? keychain.read(.openAIAPIKey)) ?? ""
+            let loaded = persistence.loadDraft()
+            draft = loaded.draft
+            savedDraft = loaded.draft
+            hasSavedModeSelection = loaded.hasSavedModeSelection
+            if !hasSavedModeSelection {
+                modeMessage = "Choose a mode before Phoenix.app can connect."
+            }
         }
     }
 
-    private func saveSecrets() {
-        do {
-            try keychain.write(anthropicKey, for: .anthropicAPIKey)
-            try keychain.write(openAIKey, for: .openAIAPIKey)
-            keychainMessage = "Saved. Reconnect bundled Phoenix to apply."
-        } catch {
-            keychainMessage = error.localizedDescription
+    private func keychainStatusMessage(summary: SettingsPersistenceSummary) -> String {
+        var parts: [String] = []
+        if !summary.savedSecrets.isEmpty {
+            parts.append("Saved provider secrets to Keychain only as part of this Apply and Connect.")
         }
+        if !summary.deletedSecrets.isEmpty {
+            parts.append("Deleted cleared provider secrets from Keychain.")
+        }
+        if summary.requiresReconnect {
+            parts.append("Saved settings now govern new connections.")
+        }
+        return parts.isEmpty ? "Saved settings." : parts.joined(separator: " ")
     }
 
     private var attachedSettings: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Managed deployment origin").font(.headline)
-            TextField("https://phoenix.example.test:8031", text: $attachedOrigin)
+            TextField("https://phoenix.example.test:8031", text: $draft.attachedOrigin)
                 .textFieldStyle(.roundedBorder)
             Text("Phoenix.app connects through the API and normal Phoenix login. It never starts, stops, configures, or updates this deployment.")
                 .font(.caption)
@@ -124,16 +155,16 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
             HStack {
                 Text("Port")
-                TextField("Port", value: $bundledPort, format: .number)
+                TextField("Port", value: $draft.bundledPort, format: .number)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 100)
             }
-            TextField("Rust log filter", text: $rustLogLevel)
+            TextField("Rust log filter", text: $draft.rustLogLevel)
                 .textFieldStyle(.roundedBorder)
             #if DEBUG
             VStack(alignment: .leading, spacing: 4) {
                 Text("Development binary override").font(.subheadline)
-                TextField("Leave empty to use the bundled sidecar", text: $developmentBinary)
+                TextField("Leave empty to use the bundled sidecar", text: $draft.developmentBinaryOverride)
                     .textFieldStyle(.roundedBorder)
                 Text("Debug builds only. Release builds always use Contents/Helpers/phoenix_ide.")
                     .font(.caption2)
@@ -142,17 +173,13 @@ struct SettingsView: View {
             #endif
             DisclosureGroup("Optional provider credentials") {
                 VStack(alignment: .leading, spacing: 8) {
-                    SecureField("Anthropic API key", text: $anthropicKey)
+                    SecureField("Anthropic API key", text: $draft.anthropicKey)
                         .textFieldStyle(.roundedBorder)
-                    SecureField("OpenAI API key", text: $openAIKey)
+                    SecureField("OpenAI API key", text: $draft.openAIKey)
                         .textFieldStyle(.roundedBorder)
-                    HStack {
-                        Text("Stored in this Mac's Keychain; never shown in diagnostics or preferences.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Save to Keychain") { saveSecrets() }
-                    }
+                    Text("Stored in this Mac's Keychain only when you click Apply and Connect. Clearing a field deletes that saved secret from Keychain on the next apply.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     if let keychainMessage {
                         Text(keychainMessage).font(.caption).foregroundStyle(.secondary)
                     }
@@ -160,6 +187,17 @@ struct SettingsView: View {
                 .padding(.top, 6)
             }
         }
+    }
+
+    private var onboardingState: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Choose a first-run connection mode").font(.headline)
+            Text("Managed deployment connects to an existing Phoenix server. Bundled Phoenix starts the app-owned sidecar on loopback with private data. Phoenix.app will not connect until you make a choice and apply it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
     }
 
     private var stateSymbol: String {

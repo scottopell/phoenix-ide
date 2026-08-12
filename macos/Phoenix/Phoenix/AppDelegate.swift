@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let browserEnvironment = BrowserEnvironment()
     private let hotkey = GlobalHotkeyManager()
     let serverManager = ServerManager()
+    private let persistence = SettingsPersistence()
     private var cancellables = Set<AnyCancellable>()
     private var pendingConversationID: UUID?
     private var hotkeyError: HotkeyError?
@@ -25,11 +26,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] state in self?.updateWindowContent(for: state) }
             .store(in: &cancellables)
         showWindow()
-        serverManager.connect()
+        if persistence.loadDraft().hasSavedModeSelection {
+            serverManager.connect()
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if window?.isVisible != true { showWindow() }
+        if ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: window?.isVisible == true) {
+            showWindow()
+        }
         return true
     }
 

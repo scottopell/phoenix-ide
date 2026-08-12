@@ -25,6 +25,186 @@ enum ServerModeKind: String, CaseIterable, Identifiable {
     }
 }
 
+enum PendingServerModeKind: String, CaseIterable, Identifiable {
+    case attached
+    case bundled
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .attached: "Managed deployment"
+        case .bundled: "Bundled Phoenix"
+        }
+    }
+
+    var persistedKind: ServerModeKind {
+        switch self {
+        case .attached: .attached
+        case .bundled: .bundled
+        }
+    }
+
+    init(_ persistedKind: ServerModeKind) {
+        switch persistedKind {
+        case .attached: self = .attached
+        case .bundled: self = .bundled
+        }
+    }
+}
+
+struct SettingsDraft: Equatable {
+    var mode: PendingServerModeKind?
+    var attachedOrigin: String
+    var bundledPort: Int
+    var developmentBinaryOverride: String
+    var rustLogLevel: String
+    var anthropicKey: String
+    var openAIKey: String
+
+    static let defaults = SettingsDraft(
+        mode: nil,
+        attachedOrigin: ConfigurationStore.defaultAttachedOrigin,
+        bundledPort: ConfigurationStore.defaultBundledPort,
+        developmentBinaryOverride: "",
+        rustLogLevel: "phoenix_ide=info",
+        anthropicKey: "",
+        openAIKey: ""
+    )
+}
+
+struct DraftLoadResult: Equatable {
+    let draft: SettingsDraft
+    let hasSavedModeSelection: Bool
+}
+
+struct SettingsPersistenceSummary: Equatable {
+    let requiresReconnect: Bool
+    let savedSecrets: [ProviderSecret]
+    let deletedSecrets: [ProviderSecret]
+}
+
+struct ReopenDecision {
+    static func shouldShowMainWindow(mainWindowIsVisible: Bool) -> Bool {
+        !mainWindowIsVisible
+    }
+}
+
+struct SidecarPackagingValidation {
+    enum SigningExpectation: Equatable {
+        case none
+        case adHoc
+        case identity(String)
+    }
+
+    struct Result: Equatable {
+        let helperExists: Bool
+        let missingArchitectures: [String]
+        let signingMismatch: Bool
+    }
+
+    static func validatePackagedSidecar(
+        helperExists: Bool,
+        actualArchitectures: [String],
+        requiredArchitectures: [String],
+        actualSigningIdentity: String?,
+        expectedSigning: SigningExpectation
+    ) -> Result {
+        let missingArchitectures = requiredArchitectures.filter { !actualArchitectures.contains($0) }
+        let signingMismatch: Bool = switch expectedSigning {
+        case .none:
+            false
+        case .adHoc:
+            actualSigningIdentity != "-"
+        case .identity(let identity):
+            actualSigningIdentity != identity
+        }
+        return Result(
+            helperExists: helperExists,
+            missingArchitectures: missingArchitectures,
+            signingMismatch: signingMismatch
+        )
+    }
+}
+
+struct SettingsPersistence {
+    let defaults: UserDefaults
+    let keychain: KeychainStore
+    let bundle: Bundle
+
+    init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore(), bundle: Bundle = .main) {
+        self.defaults = defaults
+        self.keychain = keychain
+        self.bundle = bundle
+    }
+
+    func loadDraft() -> DraftLoadResult {
+        let hasSavedModeSelection = defaults.object(forKey: PreferenceKey.serverMode) != nil
+        let persistedMode = defaults.string(forKey: PreferenceKey.serverMode)
+            .flatMap(ServerModeKind.init(rawValue:))
+            .map(PendingServerModeKind.init)
+        let draft = SettingsDraft(
+            mode: persistedMode,
+            attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin) ?? ConfigurationStore.defaultAttachedOrigin,
+            bundledPort: {
+                let stored = defaults.integer(forKey: PreferenceKey.bundledPort)
+                return stored == 0 ? ConfigurationStore.defaultBundledPort : stored
+            }(),
+            developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary) ?? "",
+            rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel) ?? "phoenix_ide=info",
+            anthropicKey: (try? keychain.read(.anthropicAPIKey)) ?? "",
+            openAIKey: (try? keychain.read(.openAIAPIKey)) ?? ""
+        )
+        return DraftLoadResult(draft: draft, hasSavedModeSelection: hasSavedModeSelection)
+    }
+
+    func persist(draft: SettingsDraft) throws -> (candidate: ServerMode, summary: SettingsPersistenceSummary) {
+        guard let mode = draft.mode else { throw ConfigurationError.missingModeSelection }
+        let candidate = try ConfigurationStore.loadCandidate(
+            kind: mode.persistedKind,
+            attachedOrigin: draft.attachedOrigin,
+            bundledPort: draft.bundledPort,
+            developmentBinaryOverride: draft.developmentBinaryOverride,
+            rustLogLevel: draft.rustLogLevel,
+            bundle: bundle
+        )
+        let previous = loadDraft().draft
+        defaults.set(mode.persistedKind.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set(draft.attachedOrigin, forKey: PreferenceKey.attachedOrigin)
+        defaults.set(draft.bundledPort, forKey: PreferenceKey.bundledPort)
+        defaults.set(draft.developmentBinaryOverride, forKey: PreferenceKey.bundledDevelopmentBinary)
+        defaults.set(draft.rustLogLevel, forKey: PreferenceKey.rustLogLevel)
+
+        var savedSecrets: [ProviderSecret] = []
+        var deletedSecrets: [ProviderSecret] = []
+        for secret in ProviderSecret.allCases {
+            let value: String = switch secret {
+            case .anthropicAPIKey: draft.anthropicKey
+            case .openAIAPIKey: draft.openAIKey
+            }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                if (try? keychain.read(secret)) != nil {
+                    deletedSecrets.append(secret)
+                }
+            } else {
+                savedSecrets.append(secret)
+            }
+            try keychain.write(value, for: secret)
+        }
+
+        return (candidate, SettingsPersistenceSummary(
+            requiresReconnect: previous.mode != draft.mode
+                || previous.attachedOrigin != draft.attachedOrigin
+                || previous.bundledPort != draft.bundledPort
+                || previous.developmentBinaryOverride != draft.developmentBinaryOverride
+                || previous.rustLogLevel != draft.rustLogLevel,
+            savedSecrets: savedSecrets,
+            deletedSecrets: deletedSecrets
+        ))
+    }
+}
+
 struct PhoenixWebViewPolicy {
     enum MediaCaptureDecision: Equatable {
         case grant
@@ -216,6 +396,7 @@ enum ConfigurationError: LocalizedError {
     case bundledBinaryMissing
     case bundledDataInUse
     case invalidAttachedCleartextOrigin
+    case missingModeSelection
 
     var errorDescription: String? {
         switch self {
@@ -224,6 +405,7 @@ enum ConfigurationError: LocalizedError {
         case .bundledBinaryMissing: "The Phoenix sidecar is not present in this app bundle."
         case .bundledDataInUse: "Another Phoenix.app instance owns the bundled data directory."
         case .invalidAttachedCleartextOrigin: "HTTP attached origins are supported only for localhost or loopback addresses. Use HTTPS for remote hosts."
+        case .missingModeSelection: "Choose whether Phoenix.app should connect to a managed deployment or start its bundled sidecar before connecting."
         }
     }
 }
