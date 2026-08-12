@@ -1,0 +1,244 @@
+-- allium: 3
+-- Phoenix macOS desktop release lifecycle
+--
+-- Scope: exact-tag release gating, architecture-specific helper/app builds,
+-- standalone-helper signing, app notarization/stapling, publish retries, and
+-- partial-failure recovery for the desktop release workflow.
+--
+-- Requirement traceability: REQ-DESKTOP-REL-001 through REQ-DESKTOP-REL-008.
+
+enum TagGateState { unresolved | exact_tag_match | new_tag_created | different_commit_refused }
+enum BuildState { pending | ready | built | failed }
+enum SignatureState { unsigned | signed_once | verified | failed }
+enum NotaryState { pending | submitted | stapled | failed }
+enum PublishState { idle | creating | replacing | completed | restored_previous | failed }
+enum AssetScope { standalone_helper | desktop_archive | checksum_set }
+
+enum FailureDomain {
+    none | tag_gate | helper_build | app_build | helper_signing | notarization | publish
+}
+
+value ReleaseIdentity {
+    tag: String
+    full_commit: String
+}
+
+value ReleaseAsset {
+    name: String
+    scope: AssetScope
+    target: String
+    identity: ReleaseIdentity
+}
+
+entity ReleaseGate {
+    id: String
+    identity: ReleaseIdentity
+    state: TagGateState
+
+    transitions state {
+        unresolved -> exact_tag_match
+        unresolved -> new_tag_created
+        unresolved -> different_commit_refused
+        exact_tag_match -> exact_tag_match
+        new_tag_created -> new_tag_created
+        different_commit_refused -> different_commit_refused
+    }
+}
+
+entity StandaloneHelperBuild {
+    id: String
+    target: String
+    identity: ReleaseIdentity
+    build: BuildState
+    signature: SignatureState
+    published_asset: ReleaseAsset?
+
+    transitions build {
+        pending -> ready
+        ready -> built
+        ready -> failed
+        built -> failed
+        failed -> failed
+    }
+
+    transitions signature {
+        unsigned -> signed_once
+        signed_once -> verified
+        signed_once -> failed
+        verified -> failed
+        failed -> failed
+    }
+}
+
+entity DesktopArchiveBuild {
+    id: String
+    target: String
+    identity: ReleaseIdentity
+    build: BuildState
+    notarization: NotaryState
+    archive_asset: ReleaseAsset?
+
+    transitions build {
+        pending -> ready
+        ready -> built
+        ready -> failed
+        built -> failed
+        failed -> failed
+    }
+
+    transitions notarization {
+        pending -> submitted
+        submitted -> stapled
+        submitted -> failed
+        stapled -> failed
+        failed -> failed
+    }
+}
+
+entity ReleasePublication {
+    id: String
+    identity: ReleaseIdentity
+    state: PublishState
+    previous_assets_backed_up: Boolean
+    previous_assets_restored: Boolean
+    failure_domain: FailureDomain
+
+    transitions state {
+        idle -> creating
+        idle -> replacing
+        creating -> completed
+        creating -> failed
+        replacing -> completed
+        replacing -> restored_previous
+        replacing -> failed
+        restored_previous -> failed
+        completed -> completed
+        restored_previous -> restored_previous
+        failed -> failed
+    }
+}
+
+-- Helpers
+--
+-- full_commit_identity(identity) -> Boolean
+--   identity.full_commit is exactly forty lowercase hexadecimal characters.
+-- release_tag_matches_semver(identity) -> Boolean
+--   identity.tag is a v-prefixed semantic version.
+-- tag_points_at_exact_commit(gate) -> Boolean
+--   the existing release tag resolves to gate.identity.full_commit exactly.
+-- tag_absent_for_identity(gate) -> Boolean
+--   no existing release tag with gate.identity.tag exists.
+-- helper_bytes_equal_signed_asset(helper, archive) -> Boolean
+--   the helper embedded in archive is byte-identical to the signed standalone
+--   helper artifact published for the same target and identity.
+-- helper_signature_verified(helper) -> Boolean
+--   the standalone helper artifact has passed codesign verification after being
+--   signed exactly once.
+-- app_info_matches_release(archive) -> Boolean
+--   the built app Info.plist carries MARKETING_VERSION from archive.identity.tag
+--   and the deterministic CURRENT_PROJECT_VERSION for that release.
+-- checksum_set_complete(publication) -> Boolean
+--   SHA256SUMS covers every required standalone-helper and desktop-archive
+--   release asset for publication.identity.
+-- previous_release_assets_downloaded(publication) -> Boolean
+--   the existing release asset set matching publication.identity was staged
+--   before replacement began.
+-- previous_release_assets_restored(publication) -> Boolean
+--   the pre-existing release asset set was re-uploaded after a replacement
+--   failure so the release retains a complete prior asset set.
+
+rule GateAcceptsExistingExactTag {
+    when: ExactReleaseTagFound(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: tag_points_at_exact_commit(gate)
+    ensures: gate.state = exact_tag_match
+}
+
+rule GateCreatesNewTagOnlyWhenAbsent {
+    when: ReleaseTagCreated(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: tag_absent_for_identity(gate)
+    ensures: gate.state = new_tag_created
+}
+
+rule GateRefusesDifferentCommitReuse {
+    when: ReleaseTagConflictDetected(gate)
+    requires: release_tag_matches_semver(gate.identity)
+    requires: full_commit_identity(gate.identity)
+    requires: not tag_points_at_exact_commit(gate)
+    requires: not tag_absent_for_identity(gate)
+    ensures: gate.state = different_commit_refused
+}
+
+rule StandaloneHelperMustBeSignedBeforeDesktopPackaging {
+    when: StandaloneHelperSigned(helper)
+    requires: helper.build = built
+    ensures: helper.signature = signed_once
+}
+
+rule StandaloneHelperVerificationPrecedesDesktopEmbedding {
+    when: StandaloneHelperVerified(helper)
+    requires: helper.signature = signed_once
+    requires: helper_signature_verified(helper)
+    ensures: helper.signature = verified
+}
+
+rule DesktopBuildConsumesVerifiedStandaloneHelper {
+    when: DesktopArchiveBuilt(helper, archive)
+    requires: helper.target = archive.target
+    requires: helper.identity = archive.identity
+    requires: helper.signature = verified
+    requires: archive.build = ready
+    requires: app_info_matches_release(archive)
+    requires: helper_bytes_equal_signed_asset(helper, archive)
+    ensures: archive.build = built
+}
+
+rule DesktopArchiveMustBeNotarizedBeforePublish {
+    when: DesktopArchiveStapled(archive)
+    requires: archive.build = built
+    requires: archive.notarization = submitted
+    ensures: archive.notarization = stapled
+}
+
+rule PublishCreatesFreshReleaseFromCompleteAssetSet {
+    when: ReleaseCreated(publication)
+    requires: publication.state = creating
+    requires: checksum_set_complete(publication)
+    ensures: publication.state = completed
+}
+
+rule PublishReplacementStagesPreviousAssets {
+    when: ReplacementUploadStarted(publication)
+    requires: publication.state = idle
+    requires: previous_release_assets_downloaded(publication)
+    ensures: publication.state = replacing
+    ensures: publication.previous_assets_backed_up
+}
+
+rule ReplacementFailureRestoresPreviousAssets {
+    when: ReplacementUploadFailed(publication)
+    requires: publication.state = replacing
+    requires: publication.previous_assets_backed_up
+    requires: previous_release_assets_restored(publication)
+    ensures: publication.state = restored_previous
+    ensures: publication.previous_assets_restored
+    ensures: publication.failure_domain = publish
+}
+
+rule SuccessfulReplacementPreservesReleaseIdentity {
+    when: ReplacementUploadCompleted(publication)
+    requires: publication.state = replacing
+    requires: checksum_set_complete(publication)
+    ensures: publication.state = completed
+}
+
+invariant ExactReleaseIdentityAlwaysUsesFullCommit {
+    full_commit_identity(ReleaseGate.identity) and full_commit_identity(ReleasePublication.identity)
+}
+
+invariant DesktopArchiveNeverMutatesSignedHelperBytes {
+    helper_bytes_equal_signed_asset(StandaloneHelperBuild, DesktopArchiveBuild)
+}

@@ -7,6 +7,10 @@ CODESIGN=${CODESIGN:-/usr/bin/codesign}
 DITTO=${DITTO:-/usr/bin/ditto}
 XCRUN=${XCRUN:-/usr/bin/xcrun}
 SPCTL=${SPCTL:-/usr/sbin/spctl}
+PLISTBUDDY=${PLISTBUDDY:-/usr/libexec/PlistBuddy}
+CMP=${CMP:-/usr/bin/cmp}
+PYTHON3=${PYTHON3:-/usr/bin/python3}
+MKTEMP=${MKTEMP:-/usr/bin/mktemp}
 
 usage() {
   cat >&2 <<'EOF'
@@ -17,6 +21,27 @@ Phoenix-macos-TARGET-TAG.zip. Normal mode requires Developer ID signing and
 Apple notarization credentials in the environment.
 EOF
   exit 2
+}
+
+release_build_number() {
+  local version=${1#v}
+  "$PYTHON3" - "$version" <<'PY'
+import re
+import sys
+version = sys.argv[1]
+match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:[-.]([0-9A-Za-z.-]+))?', version)
+if not match:
+    raise SystemExit(f"invalid semantic version: {version}")
+major, minor, patch = (int(match.group(i)) for i in range(1, 4))
+value = major * 1_000_000 + minor * 1_000 + patch
+print(value)
+PY
+}
+
+info_plist_string() {
+  local plist=$1
+  local key=$2
+  "$PLISTBUDDY" -c "Print :$key" "$plist"
 }
 
 unsigned_test=0
@@ -33,6 +58,8 @@ expected_commit=$4
 output_dir=$(mkdir -p "$5" && cd "$5" && pwd)
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 project="$repo_root/macos/Phoenix/Phoenix.xcodeproj"
+release_version=${tag#v}
+release_build_number=$(release_build_number "$tag")
 expected_arch=
 case "$target" in
   aarch64-apple-darwin) expected_arch=arm64 ;;
@@ -61,9 +88,14 @@ if (( unsigned_test == 0 )); then
   : "${APPLE_APP_SPECIFIC_PASSWORD:?APPLE_APP_SPECIFIC_PASSWORD is required}"
 fi
 
-derived="$RUNNER_TEMP/phoenix-desktop-$target"
-rm -rf "$derived"
-mkdir -p "$derived"
+tmp_root=${RUNNER_TEMP:-${TMPDIR:-}}
+if [[ -n "$tmp_root" ]]; then
+  mkdir -p "$tmp_root"
+  derived=$($MKTEMP -d "$tmp_root/phoenix-desktop-$target.XXXXXX")
+else
+  derived=$($MKTEMP -d)
+fi
+trap 'rm -rf "$derived"' EXIT
 PHOENIX_SIDECAR_PATH="$sidecar" \
   "$XCODEBUILD" \
     -project "$project" \
@@ -72,18 +104,21 @@ PHOENIX_SIDECAR_PATH="$sidecar" \
     -derivedDataPath "$derived" \
     ARCHS="$expected_arch" \
     ONLY_ACTIVE_ARCH=YES \
+    MARKETING_VERSION="$release_version" \
+    CURRENT_PROJECT_VERSION="$release_build_number" \
     CODE_SIGNING_ALLOWED=NO \
     build
 
 app="$derived/Build/Products/Release/Phoenix.app"
 helper="$app/Contents/Helpers/phoenix_ide"
-[[ -d "$app" && -x "$helper" ]] || { echo "error: built app or helper missing" >&2; exit 1; }
+info_plist="$app/Contents/Info.plist"
+[[ -d "$app" && -x "$helper" && -f "$info_plist" ]] || { echo "error: built app or helper missing" >&2; exit 1; }
 [[ " $($LIPO -archs "$helper") " == *" $expected_arch "* ]] || {
   echo "error: packaged helper architecture mismatch" >&2
   exit 1
 }
 identity_json=$($helper --build-identity)
-read -r embedded_version embedded_commit < <(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["version"], d["git_sha"])' <<<"$identity_json")
+read -r embedded_version embedded_commit < <("$PYTHON3" -c 'import json,sys; d=json.load(sys.stdin); print(d["version"], d["git_sha"])' <<<"$identity_json")
 [[ "v$embedded_version" == "$tag" ]] || {
   echo "error: sidecar version v$embedded_version does not match release $tag" >&2
   exit 1
@@ -92,9 +127,24 @@ read -r embedded_version embedded_commit < <(/usr/bin/python3 -c 'import json,sy
   echo "error: sidecar commit $embedded_commit does not match release commit $expected_commit" >&2
   exit 1
 }
+[[ "$(info_plist_string "$info_plist" CFBundleShortVersionString)" == "$release_version" ]] || {
+  echo "error: built app marketing version does not match release $release_version" >&2
+  exit 1
+}
+[[ "$(info_plist_string "$info_plist" CFBundleVersion)" == "$release_build_number" ]] || {
+  echo "error: built app project version does not match release build $release_build_number" >&2
+  exit 1
+}
 
 if (( unsigned_test == 0 )); then
-  "$CODESIGN" --force --sign "$MACOS_SIGNING_IDENTITY" --options runtime --timestamp "$helper"
+  "$CODESIGN" --verify --strict --verbose=2 "$sidecar"
+fi
+"$CMP" -s "$sidecar" "$helper" || {
+  echo "error: packaged helper bytes differ from supplied standalone helper" >&2
+  exit 1
+}
+
+if (( unsigned_test == 0 )); then
   "$CODESIGN" --force --sign "$MACOS_SIGNING_IDENTITY" \
     --entitlements "$repo_root/macos/Phoenix/Phoenix/Phoenix.entitlements" \
     --options runtime --timestamp "$app"

@@ -157,6 +157,33 @@ jobs:
         run: |
           cargo build --profile release-min --features phoenix_ide/datadog-tracing --target "${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release-min/phoenix_ide" "${{ matrix.asset }}"
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          : "${MACOS_CERTIFICATE_P12_BASE64:?MACOS_CERTIFICATE_P12_BASE64 is required}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?MACOS_CERTIFICATE_PASSWORD is required}"
+          CERTIFICATE_PATH="$RUNNER_TEMP/phoenix-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/phoenix-signing.keychain-db"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+      - name: Sign standalone macOS helper
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          : "${MACOS_SIGNING_IDENTITY:?MACOS_SIGNING_IDENTITY is required}"
+          codesign --force --sign "$MACOS_SIGNING_IDENTITY" --options runtime --timestamp "${{ matrix.asset }}"
+          codesign --verify --strict --verbose=2 "${{ matrix.asset }}"
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/phoenix-signing.keychain-db" || true
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.target }}
@@ -200,7 +227,7 @@ jobs:
           security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
-      - name: Build, sign, notarize, and package Phoenix.app
+      - name: Build, notarize, and package Phoenix.app
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -255,15 +282,47 @@ jobs:
           done
           sha256sum phoenix_ide-* Phoenix-macos-* > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 8
+
+          assets=(phoenix_ide-* Phoenix-macos-* SHA256SUMS)
           if gh release view "${{ needs.gate.outputs.tag }}" --repo scottopell/phoenix-ide >/dev/null 2>&1; then
-            gh release upload "${{ needs.gate.outputs.tag }}" \
+            backup_dir=$(mktemp -d)
+            restore_needed=0
+            cleanup() {
+              if [ "$restore_needed" -eq 1 ]; then
+                existing=$(find "$backup_dir" -type f -print)
+                if [ -n "$existing" ]; then
+                  gh release upload "${{ needs.gate.outputs.tag }}" \
+                    --repo scottopell/phoenix-ide \
+                    --clobber \
+                    $existing
+                fi
+              fi
+              rm -rf "$backup_dir"
+            }
+            trap cleanup EXIT
+
+            for asset in "${assets[@]}"; do
+              if gh release download "${{ needs.gate.outputs.tag }}" \
+                --repo scottopell/phoenix-ide \
+                --pattern "$asset" \
+                --dir "$backup_dir" >/dev/null 2>&1; then
+                :
+              fi
+            done
+
+            restore_needed=1
+            if ! gh release upload "${{ needs.gate.outputs.tag }}" \
               --repo scottopell/phoenix-ide \
               --clobber \
-              phoenix_ide-* Phoenix-macos-* SHA256SUMS
+              "${assets[@]}"; then
+              echo "release upload failed; restoring previously published assets" >&2
+              exit 1
+            fi
+            restore_needed=0
           else
             gh release create "${{ needs.gate.outputs.tag }}" \
               --repo scottopell/phoenix-ide \
               --title "${{ needs.gate.outputs.tag }}" \
               --generate-notes \
-              phoenix_ide-* Phoenix-macos-* SHA256SUMS
+              "${assets[@]}"
           fi
