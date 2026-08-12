@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -468,20 +469,35 @@ class DevTracingTests(unittest.TestCase):
         self.assertEqual(4096, attributes["build.artifact.size_bytes"])
         self.assertTrue(attributes["build.artifact.exists"])
         self.assertEqual("measured", attributes["build.artifact.provenance"])
-        self.assertEqual("build.artifact_size", span.events[0][0])
-        self.assertEqual(4096, span.events[0][1]["build.artifact.size_bytes"])
-        self.assertEqual(1_700_000_000_000_000_000, span.events[0][2])
+        self.assertEqual([], span.events)
         self.assertEqual(1_700_000_000_000_000_000, tracing.finished[0][3])
         dir_size.assert_called_once_with((ROOT / "target" / "release").resolve())
 
-    def test_record_span_artifact_size_marks_directory_absent(self):
+    def test_cargo_build_artifact_size_honors_custom_target_directory(self):
+        tracing = FakeTracing()
+        process = FakeProcess([])
+        self.dev._DEV_TRACING = tracing
+
+        with (
+            mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=2048) as dir_size,
+            mock.patch.object(Path, "exists", return_value=True),
+            mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/phoenix-cargo-target"}),
+            mock.patch("builtins.print"),
+        ):
+            self.dev._run_cargo_build(["cargo", "build"], ROOT, "debug")
+
+        attributes = tracing.finished[0][1]
+        self.assertEqual(2048, attributes["build.artifact.size_bytes"])
+        dir_size.assert_called_once_with(Path("/tmp/phoenix-cargo-target/debug").resolve())
+
+    def test_artifact_size_attributes_mark_directory_absent(self):
         tracing = FakeTracing()
         self.dev._DEV_TRACING = tracing
         span = FakeSpan()
 
-        attributes = self.dev._record_span_artifact_size(
+        attributes = self.dev._artifact_size_attributes(
             span,
-            event_name="check.artifact_size",
             path=ROOT / "target" / "missing-dir-for-test",
             attribute_prefix="check.artifact",
         )
@@ -489,18 +505,17 @@ class DevTracingTests(unittest.TestCase):
         self.assertFalse(attributes["check.artifact.exists"])
         self.assertEqual("absent", attributes["check.artifact.provenance"])
         self.assertNotIn("check.artifact.size_bytes", attributes)
-        self.assertEqual("check.artifact_size", span.events[0][0])
+        self.assertEqual([], span.events)
 
-    def test_record_span_artifact_size_marks_measurement_failure_unavailable(self):
+    def test_artifact_size_attributes_mark_measurement_failure_unavailable(self):
         self.dev._DEV_TRACING = FakeTracing()
         span = FakeSpan()
         with (
             mock.patch.object(Path, "exists", return_value=True),
             mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=None),
         ):
-            attributes = self.dev._record_span_artifact_size(
+            attributes = self.dev._artifact_size_attributes(
                 span,
-                event_name="check.artifact_size",
                 path=ROOT / "target" / "debug",
                 attribute_prefix="check.artifact",
             )
@@ -508,6 +523,17 @@ class DevTracingTests(unittest.TestCase):
         self.assertTrue(attributes["check.artifact.exists"])
         self.assertEqual("unavailable", attributes["check.artifact.provenance"])
         self.assertNotIn("check.artifact.size_bytes", attributes)
+
+    def test_cargo_target_dir_resolves_absolute_and_relative_configuration(self):
+        self.assertEqual(ROOT / "target", self.dev._cargo_target_dir(ROOT, {}))
+        self.assertEqual(
+            ROOT / "custom-target",
+            self.dev._cargo_target_dir(ROOT, {"CARGO_TARGET_DIR": "custom-target"}),
+        )
+        self.assertEqual(
+            Path("/tmp/custom-target"),
+            self.dev._cargo_target_dir(ROOT, {"CARGO_TARGET_DIR": "/tmp/custom-target"}),
+        )
 
     def test_check_step_artifact_dir_uses_cargo_target_dir_when_present(self):
         self.assertEqual(
@@ -531,9 +557,8 @@ class DevTracingTests(unittest.TestCase):
     def test_artifact_measurement_is_skipped_without_active_tracing(self):
         self.dev._DEV_TRACING = None
         with mock.patch.object(self.dev, "_measure_dir_size_bytes") as dir_size:
-            attributes = self.dev._record_span_artifact_size(
+            attributes = self.dev._artifact_size_attributes(
                 self.dev._NOOP_SPAN,
-                event_name="build.artifact_size",
                 path=ROOT / "target" / "debug",
                 attribute_prefix="build.artifact",
             )

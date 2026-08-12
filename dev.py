@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -1442,15 +1443,10 @@ def _dir_size_bytes(path: Path) -> int:
     return _measure_dir_size_bytes(path) or 0
 
 
-def _record_span_artifact_size(
-    span,
-    *,
-    event_name: str,
-    path: Path,
-    attribute_prefix: str,
-    event_time: int | None = None,
+def _artifact_size_attributes(
+    span, *, path: Path, attribute_prefix: str
 ) -> dict:
-    """Measure a bounded artifact tree outside the timed span and annotate it."""
+    """Measure a bounded artifact tree for attributes on one owning span."""
     if span is _NOOP_SPAN or _DEV_TRACING is None:
         return {}
     resolved = path.resolve()
@@ -1464,12 +1460,12 @@ def _record_span_artifact_size(
     }
     if size_bytes is not None:
         attributes[f"{attribute_prefix}.size_bytes"] = size_bytes
-    if hasattr(span, "add_event"):
-        try:
-            span.add_event(event_name, attributes, timestamp=event_time)
-        except Exception:
-            pass
     return attributes
+
+
+def _cargo_target_dir(cwd: Path, env: Mapping[str, str]) -> Path:
+    configured = Path(env.get("CARGO_TARGET_DIR", "target"))
+    return configured if configured.is_absolute() else cwd / configured
 
 
 def _registry_snapshot() -> list[tuple[str, int]]:
@@ -1824,12 +1820,10 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
             "cargo.lock_wait_seconds": lock_timer.finish(finished_at),
             "process.exit_code": returncode,
         }
-        attributes.update(_record_span_artifact_size(
+        attributes.update(_artifact_size_attributes(
             span,
-            event_name="build.artifact_size",
-            path=cwd / "target" / profile,
+            path=_cargo_target_dir(cwd, os.environ) / profile,
             attribute_prefix="build.artifact",
-            event_time=finished_wall_ns,
         ))
         _finish_dev_span(
             span,
@@ -4791,13 +4785,12 @@ def _verification_cargo_env() -> dict[str, str]:
     return {"CARGO_INCREMENTAL": "0"}
 
 
-def _clippy_invocation(package_flags: list[str]) -> tuple[list[str], dict[str, str]]:
+def _clippy_invocation(
+    package_flags: list[str], root: Path = ROOT
+) -> tuple[list[str], dict[str, str]]:
     return (
         ["cargo", "clippy", *package_flags, "--all-targets", "--", "-D", "warnings"],
-        {
-            "CARGO_TARGET_DIR": str(ROOT / "target" / "clippy"),
-            **_verification_cargo_env(),
-        },
+        _clippy_check_env(root),
     )
 
 
@@ -4829,11 +4822,9 @@ def _finish_check_step_span(
 
 def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
     if lane == "clippy" and name == "cargo clippy":
-        target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
-        return target_dir / "debug"
+        return _cargo_target_dir(ROOT, env) / "debug"
     if lane == "rust" and name == "cargo test":
-        target_dir = Path(env.get("CARGO_TARGET_DIR", ROOT / "target"))
-        return target_dir / "debug"
+        return _cargo_target_dir(ROOT, env) / "debug"
     return None
 
 
@@ -5078,12 +5069,10 @@ def cmd_check(
         artifact_attributes = {}
         artifact_dir = _check_step_artifact_dir(lane, name, env)
         if artifact_dir is not None:
-            artifact_attributes = _record_span_artifact_size(
+            artifact_attributes = _artifact_size_attributes(
                 span,
-                event_name="check.artifact_size",
                 path=artifact_dir,
                 attribute_prefix="check.artifact",
-                event_time=finished_wall_ns,
             )
         _finish_check_step_span(
             span,
@@ -5163,9 +5152,8 @@ def cmd_check(
         # as library code (a pedantic violation in a #[cfg(test)] module fails
         # CI); it composes with `-p` so the changed-crate scope still applies.
         _prepare_clippy_check_target()
-        run_step("cargo clippy",
-                 ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
-                 env_extra=_clippy_check_env())
+        command, cargo_env = _clippy_invocation(_pflags())
+        run_step("cargo clippy", command, env_extra=cargo_env)
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
