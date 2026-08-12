@@ -84,6 +84,110 @@ struct SettingsPersistenceSummary: Equatable {
     let deletedSecrets: [ProviderSecret]
 }
 
+struct ConnectionReapplyDecision: Equatable {
+    let requiresReconnect: Bool
+
+    static func evaluate(currentMode: ServerMode?, currentState: ConnectionState, candidate: ServerMode) -> ConnectionReapplyDecision {
+        guard currentMode == candidate else {
+            return ConnectionReapplyDecision(requiresReconnect: true)
+        }
+        switch currentState {
+        case .ready(_, let deployment):
+            let healthyMatch = deployment.originExactlyMatches(candidate.origin)
+            return ConnectionReapplyDecision(requiresReconnect: !healthyMatch)
+        default:
+            return ConnectionReapplyDecision(requiresReconnect: true)
+        }
+    }
+}
+
+struct SidecarLaunchEnvironment {
+    static let safeInheritedKeys = ["SHELL", "USER", "LOGNAME", "SSH_AUTH_SOCK"]
+
+    static func build(
+        inherited: [String: String],
+        privateHome: URL,
+        instanceID: UUID,
+        publicEnvironment: [String: String],
+        sidecarSecrets: [String: String]
+    ) -> [String: String] {
+        var environment = [
+            "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
+            "LANG": inherited["LANG"] ?? "en_US.UTF-8",
+            "HOME": privateHome.path,
+            "PHOENIX_INSTANCE_ID": instanceID.uuidString,
+        ]
+        for key in safeInheritedKeys {
+            if let value = inherited[key], !value.isEmpty {
+                environment[key] = value
+            }
+        }
+        for (key, value) in publicEnvironment { environment[key] = value }
+        for (key, value) in sidecarSecrets { environment[key] = value }
+        return environment
+    }
+}
+
+struct DeepLinkConversationResponseEnvelope: Decodable, Equatable {
+    struct Conversation: Decodable, Equatable {
+        let id: String
+    }
+
+    let conversation: Conversation
+
+    var conversationID: String { conversation.id }
+}
+
+struct DeepLinkConversationValidation {
+    static func extractConversationID(from body: Any) -> UUID? {
+        guard JSONSerialization.isValidJSONObject(body),
+              let data = try? JSONSerialization.data(withJSONObject: body),
+              let envelope = try? JSONDecoder().decode(DeepLinkConversationResponseEnvelope.self, from: data) else {
+            return nil
+        }
+        return UUID(uuidString: envelope.conversationID)
+    }
+}
+
+struct BundledSecretAccessPolicy {
+    static func shouldReadKeychain(for mode: PendingServerModeKind?) -> Bool {
+        mode == .bundled || mode == nil
+    }
+
+    static func shouldWriteKeychain(for mode: PendingServerModeKind?) -> Bool {
+        mode == .bundled
+    }
+}
+
+struct LogRecordBounds {
+    let maxRecordBytes: Int
+
+    func boundedRecord(_ data: Data) -> Data {
+        guard maxRecordBytes > 0, data.count > maxRecordBytes else { return data }
+        return Data(data.suffix(maxRecordBytes))
+    }
+}
+
+private extension DeploymentInfo {
+    func originExactlyMatches(_ origin: PhoenixOrigin) -> Bool {
+        origin.exactlyMatches(originURL)
+    }
+
+    var originURL: URL {
+        let hostPort = network.bindAddress
+        let scheme = network.tls.enabled ? "https" : "http"
+        if hostPort.hasPrefix("[") {
+            return URL(string: "\(scheme)://\(hostPort)")!
+        }
+        let parts = hostPort.split(separator: ":", maxSplits: 1).map(String.init)
+        if parts.count == 2, parts[0].contains(":") {
+            return URL(string: "\(scheme)://[\(parts[0])]:\(parts[1])")!
+        }
+        return URL(string: "\(scheme)://\(hostPort)")!
+    }
+}
+
 struct ReopenDecision {
     static func shouldShowMainWindow(mainWindowIsVisible: Bool) -> Bool {
         !mainWindowIsVisible
@@ -216,9 +320,16 @@ struct SettingsPersistence {
 
     func persistedSnapshot() throws -> PersistedSettingsSnapshot {
         let preferences = persistedPreferences()
+        let mode = preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)).map(PendingServerModeKind.init)
         var secrets: [ProviderSecret: String?] = [:]
-        for secret in ProviderSecret.allCases {
-            secrets[secret] = try keychain.read(secret)
+        if BundledSecretAccessPolicy.shouldReadKeychain(for: mode) {
+            for secret in ProviderSecret.allCases {
+                secrets[secret] = try keychain.read(secret)
+            }
+        } else {
+            for secret in ProviderSecret.allCases {
+                secrets[secret] = nil
+            }
         }
         return PersistedSettingsSnapshot(preferences: preferences, secrets: secrets)
     }
@@ -235,14 +346,15 @@ struct SettingsPersistence {
         )
         let priorAppliedSnapshot = try previous ?? persistedSnapshot()
 
-        let savedSecrets = ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
+        let keychainWritesActive = BundledSecretAccessPolicy.shouldWriteKeychain(for: draft.mode)
+        let savedSecrets = keychainWritesActive ? ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
             let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : secret
-        }
-        let deletedSecrets = ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
+        } : []
+        let deletedSecrets = keychainWritesActive ? ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
             let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty && priorAppliedSnapshot.secrets[secret] != nil ? secret : nil
-        }
+        } : []
 
         do {
             try apply(draft: draft)
@@ -262,6 +374,7 @@ struct SettingsPersistence {
                 rustLogLevel: draft.rustLogLevel
             ),
             secrets: Dictionary(uniqueKeysWithValues: ProviderSecret.allCases.map { secret in
+                guard keychainWritesActive else { return (secret, priorAppliedSnapshot.secrets[secret] ?? nil) }
                 let value = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
                 return (secret, value.isEmpty ? nil : value)
             })
@@ -275,6 +388,7 @@ struct SettingsPersistence {
 
     private func apply(draft: SettingsDraft) throws {
         writePreferences(for: draft)
+        guard BundledSecretAccessPolicy.shouldWriteKeychain(for: draft.mode) else { return }
         for secret in ProviderSecret.allCases {
             try keychain.write(secretValue(in: draft, for: secret), for: secret)
         }
@@ -291,6 +405,8 @@ struct SettingsPersistence {
     private func rollback(to snapshot: PersistedSettingsSnapshot) -> Error? {
         var rollbackFailures: [Error] = []
         restorePreferences(snapshot.preferences)
+        let mode = snapshot.preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)).map(PendingServerModeKind.init)
+        guard BundledSecretAccessPolicy.shouldWriteKeychain(for: mode) else { return nil }
         for secret in ProviderSecret.allCases {
             do {
                 try keychain.write((snapshot.secrets[secret] ?? nil) ?? "", for: secret)
@@ -621,8 +737,10 @@ enum ConfigurationStore {
     static let defaultBundledPort = 8420
 
     static func load(bundle: Bundle = .main, defaults: UserDefaults = .standard) throws -> ServerMode {
-        let persistedMode = defaults.string(forKey: PreferenceKey.serverMode)
-            .flatMap(ServerModeKind.init(rawValue:)) ?? .attached
+        guard let persistedModeRaw = defaults.string(forKey: PreferenceKey.serverMode),
+              let persistedMode = ServerModeKind(rawValue: persistedModeRaw) else {
+            throw ConfigurationError.missingModeSelection
+        }
         let persistedBundledPort = defaults.object(forKey: PreferenceKey.bundledPort) as? Int
         return try loadCandidate(
             kind: persistedMode,

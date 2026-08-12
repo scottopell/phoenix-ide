@@ -235,9 +235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard status == 200 else {
             throw DeepLinkValidationError.invalidHTTPStatus(status)
         }
-        guard let body = payload["body"] as? [String: Any],
-              let responseID = body["id"] as? String,
-              let validated = UUID(uuidString: responseID),
+        guard let body = payload["body"],
+              let validated = DeepLinkConversationValidation.extractConversationID(from: body),
               validated.uuidString.lowercased() == id.uuidString.lowercased() else {
             throw DeepLinkValidationError.decoding("conversation response did not contain the requested UUID")
         }

@@ -71,6 +71,9 @@ struct IdentityHTTPStatusError: LocalizedError, Equatable {
 }
 
 func classifyServerIdentityError(_ error: Error) -> ServerIdentityError {
+    if let identity = error as? ServerIdentityError {
+        return identity
+    }
     if let urlError = error as? URLError, isCertificateURLError(urlError.code) {
         return .tls(urlError.localizedDescription)
     }
@@ -295,18 +298,21 @@ struct RollingLogWriter {
     private func boundedTail(of data: Data) -> Data {
         guard maxBytes > 0, data.count > maxBytes else { return data }
 
+        let recordBounds = LogRecordBounds(maxRecordBytes: Int(maxBytes))
         let newline = UInt8(0x0A)
         var lines: [Data] = []
         var start = data.startIndex
         while let newlineIndex = data[start...].firstIndex(of: newline) {
-            lines.append(Data(data[start...newlineIndex]))
+            let line = Data(data[start...newlineIndex])
+            lines.append(recordBounds.boundedRecord(line))
             start = data.index(after: newlineIndex)
         }
         if start < data.endIndex {
-            lines.append(Data(data[start...]))
+            let fragment = Data(data[start...])
+            lines.append(recordBounds.boundedRecord(fragment))
         }
 
-        guard !lines.isEmpty else { return Data(data.suffix(Int(maxBytes))) }
+        guard !lines.isEmpty else { return recordBounds.boundedRecord(data) }
 
         var kept: [Data] = []
         var total = 0
@@ -387,6 +393,8 @@ final class ServerManager: ObservableObject {
     }
 
     func reconnect(to candidate: ServerMode) throws {
+        let decision = ConnectionReapplyDecision.evaluate(currentMode: mode, currentState: state, candidate: candidate)
+        guard decision.requiresReconnect else { return }
         switch mode {
         case .bundled?:
             transitionFromBundled(to: candidate)
@@ -511,14 +519,13 @@ final class ServerManager: ObservableObject {
 
             let inherited = ProcessInfo.processInfo.environment
             let instanceID = UUID()
-            var environment = [
-                "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
-                "LANG": inherited["LANG"] ?? "en_US.UTF-8",
-                "PHOENIX_INSTANCE_ID": instanceID.uuidString,
-            ]
-            for (key, value) in configuration.publicEnvironment { environment[key] = value }
-            for (key, value) in try keychain.sidecarEnvironment() { environment[key] = value }
+            let environment = SidecarLaunchEnvironment.build(
+                inherited: inherited,
+                privateHome: configuration.runtimeRootURL,
+                instanceID: instanceID,
+                publicEnvironment: configuration.publicEnvironment,
+                sidecarSecrets: try keychain.sidecarEnvironment()
+            )
 
             let launched = Process()
             launched.executableURL = configuration.executableURL

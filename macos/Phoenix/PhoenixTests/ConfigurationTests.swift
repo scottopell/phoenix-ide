@@ -293,6 +293,16 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(loaded.draft.openAIKey, "")
     }
 
+    func testConfigurationStoreLoadRejectsMissingSavedMode() {
+        let suite = "ConfigurationStore.load.missing-mode.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertThrowsError(try ConfigurationStore.load(bundle: .main, defaults: defaults)) { error in
+            XCTAssertEqual(error as? ConfigurationError, .missingModeSelection)
+        }
+    }
+
     func testSettingsPersistenceLoadsUnselectedFirstRunWithoutPersistedMode() throws {
         let suite = "SettingsPersistence.load.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -324,9 +334,9 @@ final class ConfigurationTests: XCTestCase {
         let suite = "SettingsPersistence.persist.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let service = "test.settings.persist.\(UUID().uuidString)"
-        let keychain = KeychainStore(service: service)
-        for secret in ProviderSecret.allCases { try? keychain.write("", for: secret) }
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "old-anthropic"
+        ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
         var draft = SettingsDraft.defaults
         draft.mode = .attached
@@ -336,7 +346,6 @@ final class ConfigurationTests: XCTestCase {
 
         XCTAssertNil(defaults.object(forKey: PreferenceKey.serverMode))
         XCTAssertNil(defaults.object(forKey: PreferenceKey.attachedOrigin))
-        XCTAssertNil(try keychain.read(.anthropicAPIKey))
 
         let persisted = try persistence.persist(draft: draft)
         guard case .attached(let attached) = persisted.candidate else {
@@ -346,10 +355,43 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(defaults.string(forKey: PreferenceKey.serverMode), ServerModeKind.attached.rawValue)
         XCTAssertEqual(defaults.string(forKey: PreferenceKey.attachedOrigin), "https://phoenix.example.test:8031")
         XCTAssertEqual(defaults.string(forKey: PreferenceKey.rustLogLevel), "phoenix_ide=debug")
+        XCTAssertEqual(try keychain.read(.anthropicAPIKey), "old-anthropic")
+        XCTAssertTrue(persisted.summary.savedSecrets.isEmpty)
+        XCTAssertTrue(persisted.summary.deletedSecrets.isEmpty)
+        XCTAssertTrue(persisted.summary.requiresReconnect)
+    }
+
+    func testSettingsPersistenceBundledApplyWritesConfiguredSecrets() throws {
+        let suite = "SettingsPersistence.persist.bundled.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let service = "test.settings.persist.bundled.\(UUID().uuidString)"
+        let keychain = KeychainStore(service: service)
+        for secret in ProviderSecret.allCases { try? keychain.write("", for: secret) }
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        var draft = SettingsDraft.defaults
+        draft.mode = .bundled
+        draft.bundledPort = 8420
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
+        draft.rustLogLevel = "phoenix_ide=debug"
+        draft.anthropicKey = "anthropic-secret"
+
+        let persisted = try persistence.persist(draft: draft)
+        guard case .bundled(let bundled) = persisted.candidate else {
+            return XCTFail("expected bundled candidate")
+        }
+        XCTAssertEqual(bundled.origin.description, "http://127.0.0.1:8420")
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.serverMode), ServerModeKind.bundled.rawValue)
+        XCTAssertEqual(defaults.object(forKey: PreferenceKey.bundledPort) as? Int, 8420)
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.rustLogLevel), "phoenix_ide=debug")
         XCTAssertEqual(try keychain.read(.anthropicAPIKey), "anthropic-secret")
         XCTAssertEqual(persisted.summary.savedSecrets, [.anthropicAPIKey])
         XCTAssertTrue(persisted.summary.requiresReconnect)
         for secret in ProviderSecret.allCases { try? keychain.write("", for: secret) }
+    }
+
+    private func bundledExecutableFixture() throws -> String {
+        "/bin/sh"
     }
 
     func testSettingsPersistenceRejectsApplyWithoutChoosingMode() {
@@ -367,10 +409,10 @@ final class ConfigurationTests: XCTestCase {
         let suite = "SettingsPersistence.persist.rollback-second-write.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
         defaults.set("https://before.example.test", forKey: PreferenceKey.attachedOrigin)
         defaults.set(9420, forKey: PreferenceKey.bundledPort)
-        defaults.set("old-binary", forKey: PreferenceKey.bundledDevelopmentBinary)
+        defaults.set(try bundledExecutableFixture(), forKey: PreferenceKey.bundledDevelopmentBinary)
         defaults.set("phoenix_ide=info", forKey: PreferenceKey.rustLogLevel)
         let keychain = ScriptedSecretStore(values: [
             .anthropicAPIKey: "old-anthropic",
@@ -383,10 +425,10 @@ final class ConfigurationTests: XCTestCase {
         ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
         var draft = SettingsDraft.defaults
-        draft.mode = .attached
+        draft.mode = .bundled
         draft.attachedOrigin = "https://after.example.test"
         draft.bundledPort = 9999
-        draft.developmentBinaryOverride = "new-binary"
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
         draft.rustLogLevel = "phoenix_ide=debug"
         draft.anthropicKey = "new-anthropic"
         draft.openAIKey = "new-openai"
@@ -398,10 +440,10 @@ final class ConfigurationTests: XCTestCase {
             XCTAssertEqual(keychainError, .status(errSecInteractionNotAllowed))
         }
 
-        XCTAssertEqual(defaults.string(forKey: PreferenceKey.serverMode), ServerModeKind.attached.rawValue)
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.serverMode), ServerModeKind.bundled.rawValue)
         XCTAssertEqual(defaults.string(forKey: PreferenceKey.attachedOrigin), "https://before.example.test")
         XCTAssertEqual(defaults.object(forKey: PreferenceKey.bundledPort) as? Int, 9420)
-        XCTAssertEqual(defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary), "old-binary")
+        XCTAssertEqual(defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary), try bundledExecutableFixture())
         XCTAssertEqual(defaults.string(forKey: PreferenceKey.rustLogLevel), "phoenix_ide=info")
         XCTAssertEqual(try keychain.read(.anthropicAPIKey), "old-anthropic")
         XCTAssertEqual(try keychain.read(.openAIAPIKey), "old-openai")
@@ -411,6 +453,9 @@ final class ConfigurationTests: XCTestCase {
         let suite = "SettingsPersistence.persist.rollback-delete-write.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set(8420, forKey: PreferenceKey.bundledPort)
+        defaults.set(try bundledExecutableFixture(), forKey: PreferenceKey.bundledDevelopmentBinary)
         let keychain = ScriptedSecretStore(values: [
             .anthropicAPIKey: "old-anthropic",
             .openAIAPIKey: "old-openai",
@@ -422,8 +467,9 @@ final class ConfigurationTests: XCTestCase {
         ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
         var draft = SettingsDraft.defaults
-        draft.mode = .attached
-        draft.attachedOrigin = "https://phoenix.example.test:8031"
+        draft.mode = .bundled
+        draft.bundledPort = 8420
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
         draft.anthropicKey = ""
         draft.openAIKey = "new-openai"
 
@@ -455,8 +501,10 @@ final class ConfigurationTests: XCTestCase {
         let suite = "SettingsPersistence.persist.rollback-compound.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
         defaults.set("https://before.example.test", forKey: PreferenceKey.attachedOrigin)
+        defaults.set(8420, forKey: PreferenceKey.bundledPort)
+        defaults.set(try bundledExecutableFixture(), forKey: PreferenceKey.bundledDevelopmentBinary)
         let failingWriteStore = ScriptedSecretStore(values: [
             .anthropicAPIKey: "old-anthropic",
             .openAIAPIKey: "old-openai",
@@ -469,10 +517,10 @@ final class ConfigurationTests: XCTestCase {
         let persistence = SettingsPersistence(defaults: defaults, keychain: failingWriteStore, bundle: .main)
         let snapshot = PersistedSettingsSnapshot(
             preferences: PersistedPreferenceSnapshot(
-                serverMode: ServerModeKind.attached.rawValue,
+                serverMode: ServerModeKind.bundled.rawValue,
                 attachedOrigin: "https://before.example.test",
-                bundledPort: nil,
-                developmentBinaryOverride: nil,
+                bundledPort: 8420,
+                developmentBinaryOverride: try bundledExecutableFixture(),
                 rustLogLevel: nil
             ),
             secrets: [
@@ -481,8 +529,10 @@ final class ConfigurationTests: XCTestCase {
             ]
         )
         var draft = SettingsDraft.defaults
-        draft.mode = .attached
+        draft.mode = .bundled
         draft.attachedOrigin = "https://after.example.test"
+        draft.bundledPort = 8420
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
         draft.anthropicKey = "new-anthropic"
         draft.openAIKey = "new-openai"
 
@@ -526,6 +576,53 @@ final class ConfigurationTests: XCTestCase {
         let result = try persistence.persist(draft: draft, appliedSnapshot: priorAppliedSnapshot)
 
         XCTAssertFalse(result.summary.requiresReconnect)
+    }
+
+    func testAttachedPersistSkipsKeychainReadsAndWrites() throws {
+        let suite = "SettingsPersistence.persist.attached-skips-keychain.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set("https://before.example.test", forKey: PreferenceKey.attachedOrigin)
+        let keychain = ScriptedSecretStore(
+            scriptedReads: [
+                .anthropicAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+                .openAIAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+            ],
+            scriptedWrites: [
+                .fail(.anthropicAPIKey, .status(errSecInteractionNotAllowed))
+            ]
+        )
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        var draft = SettingsDraft.defaults
+        draft.mode = .attached
+        draft.attachedOrigin = "https://after.example.test"
+        draft.anthropicKey = "should-not-touch-keychain"
+
+        let result = try persistence.persist(draft: draft)
+
+        XCTAssertEqual(result.candidate.kind, .attached)
+        XCTAssertTrue(result.summary.savedSecrets.isEmpty)
+        XCTAssertTrue(result.summary.deletedSecrets.isEmpty)
+    }
+
+    func testPersistedSnapshotSkipsKeychainWhenSavedModeIsAttached() throws {
+        let suite = "SettingsPersistence.snapshot.attached-skips-keychain.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        let keychain = ScriptedSecretStore(
+            scriptedReads: [
+                .anthropicAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+                .openAIAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+            ]
+        )
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+
+        let snapshot = try persistence.persistedSnapshot()
+
+        XCTAssertNil(snapshot.secrets[.anthropicAPIKey] ?? nil)
+        XCTAssertNil(snapshot.secrets[.openAIAPIKey] ?? nil)
     }
 
     func testReopenDecisionShowsMainWindowOnlyWhenHidden() {
@@ -706,6 +803,13 @@ final class ServerManagerHelpersTests: XCTestCase {
         )
     }
 
+    func testIdentityClassifierPreservesRedirectedErrors() {
+        XCTAssertEqual(
+            classifyServerIdentityError(ServerIdentityError.redirected("redirected elsewhere")),
+            .redirected("redirected elsewhere")
+        )
+    }
+
     func testBundledReconnectQueueSchedulesOneStopAndUsesLatestCandidate() throws {
         let first = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://first.example.test")))
         let latest = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://latest.example.test")))
@@ -757,6 +861,23 @@ final class ServerManagerHelpersTests: XCTestCase {
 
         XCTAssertEqual(logged, "prefix\n[REDACTED sensitive log line]\nnext\n")
         XCTAssertFalse(logged.hasPrefix("\n"))
+    }
+
+    func testRollingLogWriterHardBoundsOversizedNewlineDelimitedRecord() {
+        let oversized = String(repeating: "A", count: 80)
+        let data = Data(("keep\n\(oversized)\nnext\n").utf8)
+
+        let bounded = RollingLogWriter.boundedTail(data, maxBytes: 32)
+        let logged = String(decoding: bounded, as: UTF8.self)
+
+        XCTAssertEqual(logged, "next\n")
+    }
+
+    func testRollingLogWriterHardBoundsOversizedNewlineFreeRecord() {
+        let oversized = Data(String(repeating: "B", count: 90).utf8)
+        let bounded = RollingLogWriter.boundedTail(oversized, maxBytes: 24)
+
+        XCTAssertEqual(String(decoding: bounded, as: UTF8.self), String(repeating: "B", count: 24))
     }
 
     func testCertificateClassifierCoversFullCertificateFamily() {
@@ -900,5 +1021,65 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(state.versionInfo, version)
         XCTAssertEqual(state.deploymentInfo, deployment)
         XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
+    }
+
+    func testConnectionReapplySkipsOnlyHealthyMatchingConnection() throws {
+        let candidate = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test:8031")))
+        let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
+        let healthyDeployment = DeploymentInfo(
+            build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
+            network: NetworkInfo(bindAddress: "phoenix.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+            instanceID: nil,
+            localAccess: false,
+            installationOwnership: .launchdManaged
+        )
+        let wrongOriginDeployment = DeploymentInfo(
+            build: healthyDeployment.build,
+            network: NetworkInfo(bindAddress: "other.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+            instanceID: nil,
+            localAccess: false,
+            installationOwnership: .launchdManaged
+        )
+
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate).requiresReconnect)
+    }
+
+    func testSidecarLaunchEnvironmentUsesPrivateHomeButPassesSafeInheritedVars() {
+        let environment = SidecarLaunchEnvironment.build(
+            inherited: [
+                "PATH": "/usr/bin",
+                "TMPDIR": "/tmp/test",
+                "LANG": "en_US.UTF-8",
+                "HOME": "/Users/public",
+                "SHELL": "/bin/zsh",
+                "USER": "scott",
+                "LOGNAME": "scott",
+                "SSH_AUTH_SOCK": "/tmp/ssh.sock",
+                "SECRET_TOKEN": "nope",
+            ],
+            privateHome: URL(fileURLWithPath: "/private/phoenix-home"),
+            instanceID: UUID(uuidString: "123E4567-E89B-12D3-A456-426614174000")!,
+            publicEnvironment: ["PHOENIX_DATA_DIR": "/private/phoenix-home/.phoenix-ide"],
+            sidecarSecrets: ["ANTHROPIC_API_KEY": "secret"]
+        )
+
+        XCTAssertEqual(environment["HOME"], "/private/phoenix-home")
+        XCTAssertEqual(environment["SHELL"], "/bin/zsh")
+        XCTAssertEqual(environment["USER"], "scott")
+        XCTAssertEqual(environment["LOGNAME"], "scott")
+        XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh.sock")
+        XCTAssertNil(environment["SECRET_TOKEN"])
+        XCTAssertEqual(environment["ANTHROPIC_API_KEY"], "secret")
+    }
+
+    func testDeepLinkConversationValidationParsesConversationEnvelope() throws {
+        let id = try XCTUnwrap(UUID(uuidString: "66a063b4-6a90-49f5-8edc-9ffa67cffcf6"))
+        let body: [String: Any] = ["conversation": ["id": id.uuidString.lowercased()]]
+
+        XCTAssertEqual(DeepLinkConversationValidation.extractConversationID(from: body), id)
+        XCTAssertNil(DeepLinkConversationValidation.extractConversationID(from: ["id": id.uuidString.lowercased()]))
     }
 }

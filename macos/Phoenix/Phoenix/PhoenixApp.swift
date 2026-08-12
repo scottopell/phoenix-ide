@@ -87,10 +87,15 @@ struct SettingsView: View {
                 Button("Apply and Connect") {
                     do {
                         let persisted = try persistence.persist(draft: draft, appliedSnapshot: savedAppliedSnapshot)
+                        let reconnectDecision = ConnectionReapplyDecision.evaluate(
+                            currentMode: serverManager.mode,
+                            currentState: serverManager.state,
+                            candidate: persisted.candidate
+                        )
                         savedDraft = persisted.persistedSnapshot.draft()
                         savedAppliedSnapshot = persisted.persistedSnapshot
                         hasSavedModeSelection = true
-                        if persisted.summary.requiresReconnect {
+                        if reconnectDecision.requiresReconnect {
                             try serverManager.reconnect(to: persisted.candidate)
                         }
                         keychainMessage = keychainStatusMessage(summary: persisted.summary)
@@ -142,7 +147,7 @@ struct SettingsView: View {
         if summary.requiresReconnect {
             parts.append("Saved settings now govern new connections.")
         } else {
-            parts.append("Saved settings already match the active connection.")
+            parts.append("Saved settings already match the saved configuration.")
         }
         return parts.joined(separator: " ")
     }
