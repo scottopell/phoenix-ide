@@ -256,6 +256,122 @@ func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID:
     return deployment?.instanceID == instanceID.uuidString
 }
 
+actor SidecarLogRecorder {
+    struct Snapshot: Equatable {
+        let logAppend: Data
+        let recentLines: [String]
+    }
+
+    private struct EnqueueResult {
+        let accepted: Bool
+        let processor: Task<Void, Never>?
+    }
+
+    nonisolated static func defaultRedact(_ line: String) -> String {
+        let sensitiveNames = [
+            "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PHOENIX_PASSWORD", "secret",
+            "authorization", "bearer", "token", "api_key", "apikey", "password",
+        ]
+        let lowercased = line.lowercased()
+        guard sensitiveNames.contains(where: { lowercased.contains($0.lowercased()) }) else { return line }
+        if let separator = line.firstIndex(where: { $0 == "=" || $0 == ":" }) {
+            return String(line[...separator]) + " [REDACTED]"
+        }
+        return "[REDACTED sensitive log line]"
+    }
+
+    private let writer: RollingLogWriter?
+    private let snapshotSink: @Sendable ([String]) async -> Void
+    private let maxPendingChunks: Int
+    private var buffer = ConnectionLogBuffer()
+    private var pendingChunks: [Data] = []
+    private var processingTask: Task<Void, Never>?
+
+    init(
+        writer: RollingLogWriter? = nil,
+        maxPendingChunks: Int = 32,
+        snapshotSink: @escaping @Sendable ([String]) async -> Void = { _ in }
+    ) {
+        self.writer = writer
+        self.maxPendingChunks = max(1, maxPendingChunks)
+        self.snapshotSink = snapshotSink
+    }
+
+    func reset() async {
+        processingTask?.cancel()
+        _ = await processingTask?.value
+        processingTask = nil
+        pendingChunks.removeAll(keepingCapacity: true)
+        buffer = ConnectionLogBuffer()
+        if let writer {
+            _ = try? writer.openForAppend()
+        }
+        await snapshotSink(buffer.completeLines)
+    }
+
+    func record(_ data: Data) async -> Snapshot? {
+        let emitted = framedLines(from: data)
+        let started = enqueue(data)
+        if let processor = started.processor {
+            await processor.value
+        } else if started.accepted {
+            await processingTask?.value
+        }
+        guard started.accepted else { return Snapshot(logAppend: emitted, recentLines: buffer.completeLines) }
+        guard !emitted.isEmpty else { return nil }
+        return Snapshot(logAppend: emitted, recentLines: buffer.completeLines)
+    }
+
+    func finishPending() async -> Snapshot? {
+        if let processor = processingTask {
+            await processor.value
+        }
+        guard let flushed = buffer.flushPending(redact: Self.defaultRedact) else { return nil }
+        let append = Data((flushed + "\n").utf8)
+        try? appendToLog(append)
+        let lines = buffer.completeLines
+        await snapshotSink(lines)
+        return Snapshot(logAppend: append, recentLines: lines)
+    }
+
+    private func framedLines(from data: Data) -> Data {
+        var preview = buffer
+        let emitted = preview.append(data, redact: Self.defaultRedact)
+        guard !emitted.isEmpty else { return Data() }
+        return Data((emitted.joined(separator: "\n") + "\n").utf8)
+    }
+
+    private func enqueue(_ data: Data) -> EnqueueResult {
+        guard !data.isEmpty else { return EnqueueResult(accepted: true, processor: nil) }
+        if pendingChunks.count >= maxPendingChunks {
+            pendingChunks.removeFirst(pendingChunks.count - maxPendingChunks + 1)
+        }
+        pendingChunks.append(data)
+        guard processingTask == nil else { return EnqueueResult(accepted: true, processor: nil) }
+        let task = Task {
+            await self.drainPendingChunks()
+        }
+        processingTask = task
+        return EnqueueResult(accepted: true, processor: task)
+    }
+
+    private func drainPendingChunks() async {
+        while !pendingChunks.isEmpty {
+            let chunk = pendingChunks.removeFirst()
+            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
+            guard !emitted.isEmpty else { continue }
+            try? appendToLog(Data((emitted.joined(separator: "\n") + "\n").utf8))
+            await snapshotSink(buffer.completeLines)
+        }
+        processingTask = nil
+    }
+
+    private func appendToLog(_ data: Data) throws {
+        guard let writer, !data.isEmpty else { return }
+        _ = try writer.append(data)
+    }
+}
+
 struct BundledReconnectQueue {
     private(set) var latestCandidate: ServerMode?
     private(set) var stopScheduled = false
@@ -381,15 +497,21 @@ final class ServerManager: ObservableObject {
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
     private var terminationInProgress = false
-    private var launcherLogHandle: FileHandle?
     private var ownerLockDescriptor: Int32?
+    private lazy var logRecorder = SidecarLogRecorder(
+        writer: currentLogWriter,
+        snapshotSink: { [weak self] lines in
+            await MainActor.run {
+                self?.recentLogLines = lines
+            }
+        }
+    )
     struct ConnectionOperationToken: Equatable, Hashable {
         fileprivate let id: UUID
     }
 
     private var operationID = UUID()
     private var launchedBundledInstance: LaunchedBundledInstance?
-    private var logBuffer = ConnectionLogBuffer()
     private let keychain: any PackagedSidecarSecretProvider
 
     init(keychain: any PackagedSidecarSecretProvider = KeychainStore()) {
@@ -426,22 +548,41 @@ final class ServerManager: ObservableObject {
     func reconnect() {
         do {
             let candidate = try ConfigurationStore.load()
-            try reconnect(to: candidate)
+            let request = ServerReconnectRequest.evaluate(
+                currentMode: mode,
+                currentState: state,
+                candidate: candidate,
+                changedBundledSecrets: false
+            )
+            try reconnect(request)
         } catch {
             state = .failed(FailureState(version: currentVersion, message: error.localizedDescription))
         }
     }
 
     func reconnect(to candidate: ServerMode) throws {
-        let decision = ConnectionReapplyDecision.evaluate(currentMode: mode, currentState: state, candidate: candidate)
-        guard decision.requiresReconnect else { return }
+        let request = ServerReconnectRequest.evaluate(
+            currentMode: mode,
+            currentState: state,
+            candidate: candidate,
+            changedBundledSecrets: false
+        )
+        try reconnect(request)
+    }
+
+    func reconnect(_ request: ServerReconnectRequest) throws {
+        guard request.requiresReconnect else { return }
         switch mode {
         case .bundled?:
-            transitionFromBundled(to: candidate)
+            transitionFromBundled(to: request)
         default:
-            mode = candidate
-            webOrigin = candidate.origin
-            connect()
+            mode = request.candidate
+            webOrigin = request.candidate.origin
+            if request.forceRestart {
+                stop(completion: { [weak self] in self?.connect() }, isTransitionStop: true)
+            } else {
+                connect()
+            }
         }
     }
 
@@ -454,24 +595,32 @@ final class ServerManager: ObservableObject {
         guard operation.map({ $0.id == operationID }) ?? true else { return }
         guard let selected = mode else { return }
         guard let version = currentVersion else { return }
-        state = .verifyingDeployment(version)
+        let nextState: ConnectionState
         if let violation = deploymentViolation(deployment, for: selected, version: version) {
-            state = .unsupportedOwnership(version, deployment, violation)
+            nextState = .unsupportedOwnership(version, deployment, violation)
         } else {
-            state = .ready(version, deployment)
+            nextState = .ready(version, deployment)
         }
+        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        state = .verifyingDeployment(version)
+        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        state = nextState
     }
 
     func deploymentRequiresAuthentication(operation: ConnectionOperationToken? = nil) {
         guard operation.map({ $0.id == operationID }) ?? true else { return }
         guard let version = currentVersion else { return }
-        state = .authenticationRequired(version)
+        let nextState = ConnectionState.authenticationRequired(version)
+        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        state = nextState
     }
 
     func deploymentVerificationFailed(_ message: String, operation: ConnectionOperationToken? = nil) {
         guard operation.map({ $0.id == operationID }) ?? true else { return }
         guard state.canDisplayWebView else { return }
-        state = .unavailable(FailureState(version: currentVersion, message: message))
+        let nextState = ConnectionState.unavailable(FailureState(version: currentVersion, message: message))
+        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        state = nextState
     }
 
     func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil, isTransitionStop: Bool = false) {
@@ -485,8 +634,7 @@ final class ServerManager: ObservableObject {
             return
         }
         guard process.isRunning else {
-            flushPendingLogFragment()
-            closeLauncherLog()
+            Task { await handleSidecarEOF() }
             releaseOwnerLock()
             self.process = nil
             launchedBundledInstance = nil
@@ -541,6 +689,14 @@ final class ServerManager: ObservableObject {
 
     private var currentDeployment: DeploymentInfo? { state.deploymentInfo }
 
+    private var currentLogWriter: RollingLogWriter? {
+        guard let configuration = launchedBundledInstance?.configuration else { return nil }
+        return RollingLogWriter(
+            url: configuration.launcherLogURL,
+            maxBytes: BundledServerConfiguration.launcherLogMaxBytes
+        )
+    }
+
     private func resetBrowserOwnedStateForOperationTransition() {
         recentLogLines = []
     }
@@ -551,20 +707,19 @@ final class ServerManager: ObservableObject {
 
     private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
         state = .startingSidecar
-        logBuffer = ConnectionLogBuffer()
         recentLogLines = []
 
         do {
             try FileManager.default.createDirectory(at: configuration.runtimeRootURL, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
             try acquireOwnerLock(configuration.ownerLockURL)
-            launcherLogHandle = try RollingLogWriter(
-                url: configuration.launcherLogURL,
-                maxBytes: BundledServerConfiguration.launcherLogMaxBytes
-            ).openForAppend()
+            launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
+            Task { await logRecorder.reset() }
 
             let inherited = ProcessInfo.processInfo.environment
-            let instanceID = UUID()
+            guard let instanceID = launchedBundledInstance?.instanceID else {
+                throw ConfigurationError.bundledBinaryMissing
+            }
             let environment = SidecarLaunchEnvironment.build(
                 inherited: inherited,
                 privateHome: configuration.runtimeRootURL,
@@ -584,15 +739,13 @@ final class ServerManager: ObservableObject {
             launched.standardError = pipe
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                Task { @MainActor in
-                    guard let self else { return }
-                    if data.isEmpty {
-                        self.flushPendingLogFragment()
-                        handle.readabilityHandler = nil
-                        return
-                    }
-                    self.recordOutput(data)
+                guard let self else { return }
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    Task { await self.handleSidecarEOF() }
+                    return
                 }
+                Task { await self.handleSidecarOutput(data) }
             }
             launched.terminationHandler = { [weak self] terminated in
                 Task { @MainActor in self?.processExited(terminated, operation: operation) }
@@ -600,7 +753,6 @@ final class ServerManager: ObservableObject {
 
             try launched.run()
             process = launched
-            launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: instanceID)
             readinessTask = Task { [weak self] in
                 await self?.waitForBundledIdentity(operation: operation)
             }
@@ -610,9 +762,9 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    private func transitionFromBundled(to candidate: ServerMode) {
+    private func transitionFromBundled(to request: ServerReconnectRequest) {
         guard case .bundled = mode else { return }
-        guard bundledReconnectQueue.request(candidate) else { return }
+        guard bundledReconnectQueue.request(request.candidate) else { return }
         state = .restarting
         stop(completion: { [weak self] in
             guard let self else { return }
@@ -738,8 +890,7 @@ final class ServerManager: ObservableObject {
         guard process === terminated else { return }
         let priorState = state
         let version = currentVersion
-        flushPendingLogFragment()
-        closeLauncherLog()
+        Task { await handleSidecarEOF() }
         stopDeadline?.cancel()
         stopDeadline = nil
         releaseOwnerLock()
@@ -764,7 +915,6 @@ final class ServerManager: ObservableObject {
 
     private func cleanupLaunchPreparationFailure() {
         launchedBundledInstance = nil
-        closeLauncherLog()
         releaseOwnerLock()
     }
 
@@ -778,7 +928,6 @@ final class ServerManager: ObservableObject {
         process = nil
         launchedBundledInstance = nil
         releaseOwnerLock()
-        closeLauncherLog()
         state = finalState
         finishStopCallbacksOnly()
     }
@@ -793,50 +942,20 @@ final class ServerManager: ObservableObject {
         callbacks.forEach { $0() }
     }
 
-    private func recordOutput(_ data: Data) {
-        let emitted = logBuffer.append(data, redact: redact)
-        if !emitted.isEmpty {
-            appendToLauncherLog(Data((emitted.joined(separator: "\n") + "\n").utf8))
-            recentLogLines = logBuffer.completeLines
-        }
+    private func handleSidecarOutput(_ data: Data) async {
+        let snapshot = await logRecorder.record(data)
+        publishLogSnapshot(snapshot)
     }
 
-    private func flushPendingLogFragment() {
-        guard let flushed = logBuffer.flushPending(redact: redact) else { return }
-        appendToLauncherLog(Data((flushed + "\n").utf8))
-        recentLogLines = logBuffer.completeLines
+    private func handleSidecarEOF() async {
+        let snapshot = await logRecorder.finishPending()
+        publishLogSnapshot(snapshot)
     }
 
-    private func appendToLauncherLog(_ data: Data) {
-        guard let configuration = launchedBundledInstance?.configuration else { return }
-        let writer = RollingLogWriter(
-            url: configuration.launcherLogURL,
-            maxBytes: BundledServerConfiguration.launcherLogMaxBytes
-        )
-        do {
-            try launcherLogHandle?.close()
-            launcherLogHandle = try writer.append(data)
-        } catch {
-            launcherLogHandle = nil
-        }
-    }
-
-    private func redact(_ line: String) -> String {
-        let sensitiveNames = [
-            "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PHOENIX_PASSWORD",
-            "authorization", "bearer", "token", "api_key", "apikey",
-        ]
-        let lowercased = line.lowercased()
-        guard sensitiveNames.contains(where: { lowercased.contains($0.lowercased()) }) else { return line }
-        if let separator = line.firstIndex(where: { $0 == "=" || $0 == ":" }) {
-            return String(line[...separator]) + " [REDACTED]"
-        }
-        return "[REDACTED sensitive log line]"
-    }
-
-    private func closeLauncherLog() {
-        try? launcherLogHandle?.close()
-        launcherLogHandle = nil
+    @MainActor
+    private func publishLogSnapshot(_ snapshot: SidecarLogRecorder.Snapshot?) {
+        guard let snapshot else { return }
+        recentLogLines = snapshot.recentLines
     }
 
     private func acquireOwnerLock(_ url: URL) throws {

@@ -70,6 +70,7 @@ struct WebViewWrapper: NSViewRepresentable {
         )
     }
 
+    @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         let origin: PhoenixOrigin
         let role: BrowserSurfaceRole
@@ -101,7 +102,7 @@ struct WebViewWrapper: NSViewRepresentable {
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
             guard let url = navigationAction.request.url else {
                 decisionHandler(.cancel)
@@ -155,7 +156,7 @@ struct WebViewWrapper: NSViewRepresentable {
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationResponse: WKNavigationResponse,
-            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void
         ) {
             if navigationResponse.canShowMIMEType {
                 decisionHandler(.allow)
@@ -184,7 +185,7 @@ struct WebViewWrapper: NSViewRepresentable {
             requestMediaCapturePermissionFor securityOrigin: WKSecurityOrigin,
             initiatedByFrame frame: WKFrameInfo,
             type: WKMediaCaptureType,
-            decisionHandler: @escaping (WKPermissionDecision) -> Void
+            decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void
         ) {
             guard role == .primary else {
                 decisionHandler(.deny)
@@ -201,26 +202,20 @@ struct WebViewWrapper: NSViewRepresentable {
         @available(macOS 15.0, *)
         func webView(
             _ webView: WKWebView,
-            decideNotificationPermissionFor securityOrigin: WKSecurityOrigin,
-            decisionHandler: @escaping (WKPermissionDecision) -> Void
-        ) {
+            decideNotificationPermissionFor securityOrigin: WKSecurityOrigin
+        ) async -> WKPermissionDecision {
             guard role == .primary else {
-                decisionHandler(.deny)
-                return
+                return .deny
             }
             let notificationPolicy = PhoenixWebViewPolicy.notificationDecision(
                 for: SecurityOriginDescriptor(scheme: securityOrigin.protocol, host: securityOrigin.host, port: securityOrigin.port),
                 expectedOrigin: origin
             )
             guard notificationPolicy == .grant else {
-                decisionHandler(.deny)
-                return
+                return .deny
             }
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
-                DispatchQueue.main.async {
-                    decisionHandler(granted ? .grant : .deny)
-                }
-            }
+            let granted = (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])) ?? false
+            return granted ? .grant : .deny
         }
 
         func webView(
@@ -414,21 +409,61 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
     }
 }
 
+struct DownloadDestinationReservationState {
+    private(set) var reservedPaths: Set<String> = []
+
+    mutating func reserveDestination(in directory: URL, suggestedFilename: String, fileExists: (URL) -> Bool) -> URL {
+        let sanitized = PhoenixDownloadNaming.sanitizedFilename(suggestedFilename)
+        let ext = (sanitized as NSString).pathExtension
+        let base = (sanitized as NSString).deletingPathExtension
+        var suffix = 0
+        while true {
+            let candidateName: String
+            if suffix == 0 {
+                candidateName = sanitized
+            } else if ext.isEmpty {
+                candidateName = "\(base) (\(suffix))"
+            } else {
+                candidateName = "\(base) (\(suffix)).\(ext)"
+            }
+            let candidate = directory.appendingPathComponent(candidateName)
+            let path = candidate.path
+            if !reservedPaths.contains(path) && !fileExists(candidate) {
+                reservedPaths.insert(path)
+                return candidate
+            }
+            suffix += 1
+        }
+    }
+
+    mutating func release(_ url: URL?) {
+        guard let url else { return }
+        reservedPaths.remove(url.path)
+    }
+}
+
 @MainActor
 final class DownloadManager {
     private struct ActiveDownload {
         let operation: ServerManager.ConnectionOperationToken
         let download: WKDownload
         let delegate: DownloadDelegate
+        var reservedDestination: URL?
     }
 
     private var activeDownloads: [ObjectIdentifier: ActiveDownload] = [:]
+    private var reservations = DownloadDestinationReservationState()
 
     func attach(download: WKDownload, operation: ServerManager.ConnectionOperationToken) {
-        let delegate = DownloadDelegate { [weak self] finishedDownload in
-            self?.activeDownloads.removeValue(forKey: ObjectIdentifier(finishedDownload))
-        }
-        activeDownloads[ObjectIdentifier(download)] = ActiveDownload(operation: operation, download: download, delegate: delegate)
+        let delegate = DownloadDelegate(
+            reserveDestination: { [weak self] download, response, suggestedFilename in
+                self?.reserveDestination(for: download, response: response, suggestedFilename: suggestedFilename)
+            },
+            onFinish: { [weak self] finishedDownload in
+                self?.finishDownload(finishedDownload)
+            }
+        )
+        activeDownloads[ObjectIdentifier(download)] = ActiveDownload(operation: operation, download: download, delegate: delegate, reservedDestination: nil)
         download.delegate = delegate
     }
 
@@ -436,7 +471,9 @@ final class DownloadManager {
         let matching = activeDownloads.filter { $0.value.operation == operation }
         let identifiers = Set(matching.keys)
         let downloads = matching.values.map(\.download)
+        let reservationsToRelease = matching.values.compactMap(\.reservedDestination)
         activeDownloads = activeDownloads.filter { !identifiers.contains($0.key) }
+        reservationsToRelease.forEach { reservations.release($0) }
         downloads.forEach { download in
             download.cancel { _ in }
         }
@@ -444,40 +481,67 @@ final class DownloadManager {
 
     func cancelAll() {
         let downloads = activeDownloads.values.map(\.download)
+        let reservationsToRelease = activeDownloads.values.compactMap(\.reservedDestination)
         activeDownloads.removeAll()
+        reservationsToRelease.forEach { reservations.release($0) }
         downloads.forEach { download in
             download.cancel { _ in }
         }
     }
 
+    private func reserveDestination(for download: WKDownload, response _: URLResponse, suggestedFilename: String) -> URL {
+        let downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        let destination = reservations.reserveDestination(
+            in: downloadsDirectory,
+            suggestedFilename: suggestedFilename,
+            fileExists: { FileManager.default.fileExists(atPath: $0.path) }
+        )
+        let identifier = ObjectIdentifier(download)
+        if var entry = activeDownloads[identifier] {
+            entry.reservedDestination = destination
+            activeDownloads[identifier] = entry
+        }
+        return destination
+    }
+
+    private func finishDownload(_ download: WKDownload) {
+        let identifier = ObjectIdentifier(download)
+        let reservation = activeDownloads.removeValue(forKey: identifier)?.reservedDestination
+        reservations.release(reservation)
+    }
+
     private final class DownloadDelegate: NSObject, WKDownloadDelegate {
+        private let reserveDestination: (WKDownload, URLResponse, String) -> URL?
         private let onFinish: (WKDownload) -> Void
 
-        init(onFinish: @escaping (WKDownload) -> Void) {
+        init(
+            reserveDestination: @escaping (WKDownload, URLResponse, String) -> URL?,
+            onFinish: @escaping (WKDownload) -> Void
+        ) {
+            self.reserveDestination = reserveDestination
             self.onFinish = onFinish
         }
 
+        @available(macOS 11.3, *)
         func download(
             _ download: WKDownload,
             decideDestinationUsing response: URLResponse,
-            suggestedFilename: String,
-            completionHandler: @escaping (URL?) -> Void
-        ) {
-            let downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
-            let destination = PhoenixDownloadNaming.uniqueDestination(
-                in: downloadsDirectory,
-                suggestedFilename: suggestedFilename,
-                fileExists: { FileManager.default.fileExists(atPath: $0.path) }
-            )
-            completionHandler(destination)
+            suggestedFilename: String
+        ) async -> URL? {
+            reserveDestination(download, response, suggestedFilename)
         }
+
 
         func downloadDidFinish(_ download: WKDownload) {
             onFinish(download)
         }
 
         func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+            onFinish(download)
+        }
+
+        func downloadDidCancel(_ download: WKDownload) {
             onFinish(download)
         }
     }

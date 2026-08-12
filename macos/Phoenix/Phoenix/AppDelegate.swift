@@ -143,20 +143,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 origin: origin,
                 operation: operation,
                 browserEnvironment: browserEnvironment,
-                onWebViewReady: { [weak self] value, _ in
-                    self?.webView = value
+                onWebViewReady: { [weak self] value, operation in
+                    guard let self, self.isCurrentBrowserOperation(operation) else { return }
+                    self.webView = value
                 },
                 onDeployment: { [weak self] result, operation in
+                    guard let self, self.isCurrentBrowserOperation(operation) else { return }
                     switch result {
                     case .success(let deployment):
-                        self?.isPrimaryWebViewAuthenticated = true
-                        self?.serverManager.deploymentReceived(deployment, operation: operation)
-                        self?.validateQueuedConversationNavigationIfPossible()
-                    case .failure(let error): self?.serverManager.deploymentVerificationFailed(error.localizedDescription, operation: operation)
+                        self.isPrimaryWebViewAuthenticated = true
+                        self.serverManager.deploymentReceived(deployment, operation: operation)
+                        self.validateQueuedConversationNavigationIfPossible()
+                    case .failure(let error): self.serverManager.deploymentVerificationFailed(error.localizedDescription, operation: operation)
                     }
                 },
                 onAuthenticationRequired: { [weak self] operation in
-                    guard let self else { return }
+                    guard let self, self.isCurrentBrowserOperation(operation) else { return }
                     self.isPrimaryWebViewAuthenticated = false
                     self.pendingConversationValidationTask?.cancel()
                     self.serverManager.deploymentRequiresAuthentication(operation: operation)
@@ -194,6 +196,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .open:
             showWindow()
         }
+    }
+
+    private func isCurrentBrowserOperation(_ operation: ServerManager.ConnectionOperationToken) -> Bool {
+        browserOperation == operation && serverManager.currentOperationToken == operation
     }
 
     private func openPendingConversation() {
@@ -235,10 +241,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     validatedID: queued,
                     pendingConversationID: self.pendingConversationID
                 ) else { return }
-                self.pendingConversationID = nil
+                let decision = DeepLinkValidationOutcome.evaluate(error as? DeepLinkValidationError ?? .decoding(error.localizedDescription))
+                if decision.shouldClearAuthenticationGate {
+                    self.isPrimaryWebViewAuthenticated = false
+                }
+                if !decision.shouldRetainPendingConversation {
+                    self.pendingConversationID = nil
+                }
                 let message = error.localizedDescription
                 NSLog("Phoenix deep link rejected for %s: %s", queued.uuidString.lowercased(), message)
-                self.presentDeepLinkError(message)
+                if !decision.shouldRetainPendingConversation {
+                    self.presentDeepLinkError(message)
+                }
             }
         }
     }
@@ -260,6 +274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let payload = result as? [String: Any],
               let status = payload["status"] as? Int else {
             throw DeepLinkValidationError.decoding("missing status payload")
+        }
+        if status == 401 {
+            throw DeepLinkValidationError.authenticationRequired
         }
         if status == 404 {
             throw DeepLinkValidationError.conversationMissing(id)

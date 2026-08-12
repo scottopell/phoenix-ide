@@ -1154,6 +1154,38 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(buffer.pendingFragment, "")
     }
 
+    func testSidecarLogRecorderPublishesOnlyFramedRecentLines() async {
+        let recorder = SidecarLogRecorder()
+        await recorder.reset()
+
+        let first = await recorder.record(Data("alpha\nsecret=abc".utf8))
+        XCTAssertEqual(first?.recentLines, ["alpha"])
+        XCTAssertEqual(String(decoding: first?.logAppend ?? Data(), as: UTF8.self), "alpha\n")
+
+        let second = await recorder.record(Data("\nbeta\n".utf8))
+        XCTAssertEqual(second?.recentLines, ["alpha", "secret= [REDACTED]", "beta"])
+        XCTAssertEqual(String(decoding: second?.logAppend ?? Data(), as: UTF8.self), "secret= [REDACTED]\nbeta\n")
+
+        let eof = await recorder.finishPending()
+        XCTAssertNil(eof)
+    }
+
+    func testDownloadDestinationReservationStateAvoidsConcurrentCollisionsAndReleasesPaths() {
+        let directory = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
+        var state = DownloadDestinationReservationState()
+        let first = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { _ in false }
+        let second = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { _ in false }
+
+        XCTAssertEqual(first.lastPathComponent, "report.pdf")
+        XCTAssertEqual(second.lastPathComponent, "report (1).pdf")
+
+        state.release(first)
+        let reused = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { url in
+            url.path == second.path
+        }
+        XCTAssertEqual(reused.lastPathComponent, "report.pdf")
+    }
+
     func testConnectionStateFailureVersionSurvivesPreservedStop() {
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
         let failure = FailureState(version: version, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")
@@ -1237,7 +1269,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, deployment), candidate: candidate).requiresReconnect)
     }
 
-    func testSettingsReconnectDecisionForcesReconnectWhenBundledSecretsChange() throws {
+    func testServerReconnectRequestForcesRestartWhenBundledSecretsChange() throws {
         let bundled = ServerMode.bundled(BundledServerConfiguration(
             origin: try PhoenixOrigin("http://127.0.0.1:8420"),
             executableURL: URL(fileURLWithPath: "/bin/sh"),
@@ -1250,19 +1282,62 @@ final class ServerManagerHelpersTests: XCTestCase {
             rustLogLevel: "phoenix_ide=info"
         ))
         let summary = SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [.anthropicAPIKey], deletedSecrets: [])
-        let reapply = ConnectionReapplyDecision(requiresReconnect: false)
+        let bundledRequest = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: .ready(
+                VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+                DeploymentInfo(
+                    build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                    network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
+                    instanceID: UUID().uuidString,
+                    localAccess: true,
+                    installationOwnership: .development
+                )
+            ),
+            candidate: bundled,
+            changedBundledSecrets: summary.changedBundledSecrets
+        )
 
-        XCTAssertTrue(SettingsReconnectDecision.evaluate(summary: summary, reapply: reapply, candidate: bundled).requiresReconnect)
-        XCTAssertFalse(SettingsReconnectDecision.evaluate(
-            summary: summary,
-            reapply: reapply,
-            candidate: .attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test")))
-        ).requiresReconnect)
-        XCTAssertFalse(SettingsReconnectDecision.evaluate(
-            summary: SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [], deletedSecrets: []),
-            reapply: reapply,
-            candidate: bundled
-        ).requiresReconnect)
+        XCTAssertTrue(bundledRequest.requiresReconnect)
+        XCTAssertTrue(bundledRequest.forceRestart)
+
+        let attachedRequest = ServerReconnectRequest.evaluate(
+            currentMode: .attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test"))),
+            currentState: .ready(
+                VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+                DeploymentInfo(
+                    build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                    network: NetworkInfo(bindAddress: "phoenix.example.test:443", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+                    currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test"),
+                    instanceID: nil,
+                    localAccess: false,
+                    installationOwnership: .launchdManaged
+                )
+            ),
+            candidate: .attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test"))),
+            changedBundledSecrets: summary.changedBundledSecrets
+        )
+        XCTAssertFalse(attachedRequest.requiresReconnect)
+        XCTAssertFalse(attachedRequest.forceRestart)
+
+        let unchangedBundledRequest = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: .ready(
+                VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+                DeploymentInfo(
+                    build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                    network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
+                    instanceID: UUID().uuidString,
+                    localAccess: true,
+                    installationOwnership: .development
+                )
+            ),
+            candidate: bundled,
+            changedBundledSecrets: false
+        )
+        XCTAssertFalse(unchangedBundledRequest.forceRestart)
     }
 
     func testSettingsFeedbackSeparatesStatusFromError() {
@@ -1304,7 +1379,19 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertNil(queue.takeAfterStop())
     }
 
+    func testDeepLinkValidationOutcomeRetainsQueuedConversationAcrossAuthenticationChallenge() {
+        XCTAssertEqual(
+            DeepLinkValidationOutcome.evaluate(.authenticationRequired),
+            DeepLinkValidationOutcome(shouldClearAuthenticationGate: true, shouldRetainPendingConversation: true)
+        )
+        XCTAssertEqual(
+            DeepLinkValidationOutcome.evaluate(.invalidHTTPStatus(500)),
+            DeepLinkValidationOutcome(shouldClearAuthenticationGate: false, shouldRetainPendingConversation: false)
+        )
+    }
+
     func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {
+
         let first = UUID()
         let latest = UUID()
         XCTAssertFalse(DeepLinkNavigationDecision.validationResultIsCurrent(validatedID: first, pendingConversationID: latest))

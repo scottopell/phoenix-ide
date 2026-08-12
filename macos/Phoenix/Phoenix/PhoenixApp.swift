@@ -88,20 +88,17 @@ struct SettingsView: View {
                 Button("Apply and Connect") {
                     do {
                         let persisted = try persistence.persist(draft: draft, appliedSnapshot: savedAppliedSnapshot)
-                        let reconnectDecision = SettingsReconnectDecision.evaluate(
-                            summary: persisted.summary,
-                            reapply: ConnectionReapplyDecision.evaluate(
-                                currentMode: serverManager.mode,
-                                currentState: serverManager.state,
-                                candidate: persisted.candidate
-                            ),
-                            candidate: persisted.candidate
+                        let reconnectDecision = ServerReconnectRequest.evaluate(
+                            currentMode: serverManager.mode,
+                            currentState: serverManager.state,
+                            candidate: persisted.candidate,
+                            changedBundledSecrets: persisted.summary.changedBundledSecrets
                         )
                         savedDraft = persisted.persistedSnapshot.draft()
                         savedAppliedSnapshot = persisted.persistedSnapshot
                         hasSavedModeSelection = true
                         if reconnectDecision.requiresReconnect {
-                            try serverManager.reconnect(to: persisted.candidate)
+                            try serverManager.reconnect(reconnectDecision)
                         }
                         statusMessage = SettingsFeedback.statusMessage(summary: persisted.summary)
                         modeMessage = nil

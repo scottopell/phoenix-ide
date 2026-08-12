@@ -10,11 +10,21 @@ let package = Package(
             name: "PhoenixMacCore",
             path: "Phoenix",
             exclude: [
-                "AppDelegate.swift", "Assets.xcassets", "ErrorView.swift", "GlobalHotkey.swift",
-                "Info.plist", "LoadingView.swift", "Phoenix.entitlements", "PhoenixApp.swift",
-                "ServerStatusView.swift", "WebViewWrapper.swift",
+                "Assets.xcassets",
+                "Info.plist",
+                "Phoenix.entitlements",
+                "PhoenixApp.swift",
             ],
-            sources: ["Configuration.swift", "ServerManager.swift"]
+            sources: [
+                "AppDelegate.swift",
+                "Configuration.swift",
+                "ErrorView.swift",
+                "GlobalHotkey.swift",
+                "LoadingView.swift",
+                "ServerManager.swift",
+                "ServerStatusView.swift",
+                "WebViewWrapper.swift",
+            ]
         ),
         .testTarget(
             name: "PhoenixMacCoreTests",

@@ -105,12 +105,20 @@ struct ConnectionReapplyDecision: Equatable {
     }
 }
 
-struct SettingsReconnectDecision: Equatable {
-    let requiresReconnect: Bool
 
-    static func evaluate(summary: SettingsPersistenceSummary, reapply: ConnectionReapplyDecision, candidate: ServerMode) -> SettingsReconnectDecision {
-        let secretChangeRequiresReconnect = candidate.kind == .bundled && summary.changedBundledSecrets
-        return SettingsReconnectDecision(requiresReconnect: reapply.requiresReconnect || secretChangeRequiresReconnect)
+struct ServerReconnectRequest: Equatable {
+    let candidate: ServerMode
+    let requiresReconnect: Bool
+    let forceRestart: Bool
+
+    static func evaluate(currentMode: ServerMode?, currentState: ConnectionState, candidate: ServerMode, changedBundledSecrets: Bool) -> ServerReconnectRequest {
+        let reapply = ConnectionReapplyDecision.evaluate(currentMode: currentMode, currentState: currentState, candidate: candidate)
+        let requiresForceRestart = candidate.kind == .bundled && changedBundledSecrets
+        return ServerReconnectRequest(
+            candidate: candidate,
+            requiresReconnect: reapply.requiresReconnect || requiresForceRestart,
+            forceRestart: requiresForceRestart
+        )
     }
 }
 
@@ -208,6 +216,26 @@ struct DeepLinkNavigationDecision {
             && hasAuthenticatedPrimaryWebView
             && hasPrimaryWebView
             && hasConfiguredOrigin
+    }
+}
+
+struct DeepLinkValidationOutcome: Equatable {
+    let shouldClearAuthenticationGate: Bool
+    let shouldRetainPendingConversation: Bool
+
+    static func evaluate(_ error: DeepLinkValidationError) -> DeepLinkValidationOutcome {
+        switch error {
+        case .authenticationRequired:
+            return DeepLinkValidationOutcome(
+                shouldClearAuthenticationGate: true,
+                shouldRetainPendingConversation: true
+            )
+        default:
+            return DeepLinkValidationOutcome(
+                shouldClearAuthenticationGate: false,
+                shouldRetainPendingConversation: false
+            )
+        }
     }
 }
 
@@ -1154,6 +1182,7 @@ enum KeychainError: LocalizedError, Equatable {
 
 enum DeepLinkValidationError: LocalizedError, Equatable {
     case noAuthenticatedWebView
+    case authenticationRequired
     case invalidHTTPStatus(Int)
     case decoding(String)
     case conversationMissing(UUID)
@@ -1162,6 +1191,8 @@ enum DeepLinkValidationError: LocalizedError, Equatable {
         switch self {
         case .noAuthenticatedWebView:
             "Open Phoenix and sign in before opening a conversation deep link."
+        case .authenticationRequired:
+            "Phoenix needs you to sign in before it can validate that conversation deep link."
         case .invalidHTTPStatus(let status):
             "Conversation deep link validation failed with HTTP status \(status)."
         case .decoding(let message):
