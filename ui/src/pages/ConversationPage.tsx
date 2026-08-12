@@ -13,6 +13,11 @@ import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { canShowCommissionReviewViewer } from './commissionReviewViewerPrecedence';
+import {
+  decideRouteFocus,
+  reduceRouteFocusState,
+  type RouteFocusState,
+} from './conversationRouteFocus';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import {
   historyMergeEventCursorFloor,
@@ -51,6 +56,7 @@ import {
   DraftLifecycle,
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
+import { useFocusScope } from '../hooks/useFocusScope';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
@@ -121,7 +127,7 @@ const CommissionReviewViewer = lazy(() =>
 );
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
   ForkProposalsProvider,
@@ -327,6 +333,8 @@ function ConversationPageContent({
   // structural — opening any viewer rewrites `?viewer=` and the others close.
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
+  const viewerRestorationSettled = useViewerRestorationSettled();
+  const { activeScope } = useFocusScope();
   const slotKind = viewerSlot.slot.kind;
   const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
   const rawDiffTarget = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.target : 'workspace';
@@ -355,7 +363,6 @@ function ConversationPageContent({
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
   // on every consumer.
-  const isDesktop = useIsDesktop();
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
@@ -421,6 +428,7 @@ function ConversationPageContent({
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
+  const isDesktop = useIsDesktop();
 
   const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
@@ -435,6 +443,65 @@ function ConversationPageContent({
   const requestComposerFocus = useCallback(() => {
     setFocusToken((t) => t + 1);
   }, []);
+
+  const [routeFocusState, dispatchRouteFocus] = useReducer(
+    reduceRouteFocusState,
+    { routeKey: null, decision: 'consumed' } satisfies RouteFocusState,
+  );
+  const provisionalRouteFocusKey = slug ? `route:${slug}` : null;
+  const authoritativeConversationId = resolvedRouteConversationId === conversationId
+    ? conversationId
+    : undefined;
+  const routeFocusKey = authoritativeConversationId
+    ? `conversation:${authoritativeConversationId}`
+    : provisionalRouteFocusKey;
+  useLayoutEffect(() => {
+    dispatchRouteFocus({
+      type: 'route_observed',
+      ...(authoritativeConversationId && provisionalRouteFocusKey ? { continuesRouteKey: provisionalRouteFocusKey } : {}),
+      next: decideRouteFocus({
+        isDesktop,
+        routeKey: routeFocusKey,
+        routeSettled: archiveStatusConfirmed && viewerRestorationSettled,
+        browserSessionStateLoaded: archiveStatusConfirmed,
+        archived: isArchived,
+        targetMessageId,
+        activeFocusScope: activeScope,
+        viewerOwnsFocus: slotKind !== 'none',
+        composerRenders: inputRef.current !== null,
+        phase: atom.phase,
+      }),
+    });
+  }, [
+    isDesktop,
+    routeFocusKey,
+    authoritativeConversationId,
+    provisionalRouteFocusKey,
+    archiveStatusConfirmed,
+    viewerRestorationSettled,
+    isArchived,
+    targetMessageId,
+    activeScope,
+    slotKind,
+    atom.phase,
+  ]);
+  useLayoutEffect(() => {
+    if (routeFocusState.decision !== 'focus-composer') return;
+    if (inputRef.current?.focus()) dispatchRouteFocus({ type: 'focus_applied' });
+  }, [routeFocusState]);
+  useEffect(() => {
+    if (!routeFocusKey || (routeFocusState.decision !== 'pending' && routeFocusState.routeKey !== null)) return;
+    const claimInteraction = (event: Event) => {
+      if (!event.isTrusted) return;
+      dispatchRouteFocus({ type: 'interaction_claimed', routeKey: routeFocusKey });
+    };
+    document.addEventListener('pointerdown', claimInteraction, true);
+    document.addEventListener('keydown', claimInteraction, true);
+    return () => {
+      document.removeEventListener('pointerdown', claimInteraction, true);
+      document.removeEventListener('keydown', claimInteraction, true);
+    };
+  }, [routeFocusState.decision, routeFocusState.routeKey, routeFocusKey]);
 
   // App state for offline support
   const { isOnline, queueOperation, removePendingOperations } = useAppMachine();

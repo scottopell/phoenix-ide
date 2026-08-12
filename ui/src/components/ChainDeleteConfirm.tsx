@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import type { ChainView } from '../api';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import './ChainDeleteConfirm.css';
 
 interface ChainDeleteConfirmProps {
@@ -21,6 +22,7 @@ export function ChainDeleteConfirm({
   onConfirm,
   onCancel,
 }: ChainDeleteConfirmProps) {
+  useRegisterFocusScope(visible && chain ? 'chain-delete-confirm' : null);
   useEffect(() => {
     if (visible) {
       const handleEscape = (e: KeyboardEvent) => {

@@ -24,7 +24,8 @@ import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 import './InputArea.css';
 
 export interface InputAreaHandle {
-  focus: () => void;
+  /** Focus the mounted composer textarea. False when this phase renders no textarea. */
+  focus: () => boolean;
 }
 
 export interface ComposerQuickAction {
@@ -166,9 +167,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   useImperativeHandle(ref, () => ({
     focus: () => {
-      textareaRef.current?.focus();
+      const textarea = textareaRef.current;
+      if (!textarea || !acceptsChatMessage) return false;
+      textarea.focus();
+      return document.activeElement === textarea;
     },
-  }), []);
+  }), [acceptsChatMessage]);
 
   // Consume parent's focus-token bumps. Skipping the initial 0 means
   // mounting alone doesn't steal focus — the parent has to explicitly ask.

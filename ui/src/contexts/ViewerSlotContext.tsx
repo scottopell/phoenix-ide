@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../hooks/useScopedState';
@@ -80,6 +80,7 @@ export interface ViewerSlotValue extends ViewerSlotCommands {
 const ViewerSlotCommandsContext = createContext<ViewerSlotCommands | null>(null);
 const ViewerSlotDataContext = createContext<ViewerSlot | null>(null);
 const ViewerSlotBrowserActiveContext = createContext<boolean | null>(null);
+const ViewerSlotRestorationSettledContext = createContext<boolean | null>(null);
 
 const VIEWER_PARAM = 'viewer';
 const DIFF_PRESENTATION_PARAM = 'presentation';
@@ -377,16 +378,20 @@ export function ViewerSlotProvider({
   // carries viewer params is left alone (browser back/forward, shared link).
   const enteredScopeRef = useRef<string | undefined | typeof UNSET_SCOPE>(UNSET_SCOPE);
   const restorationScheduledForScopeRef = useRef<string | undefined>(undefined);
+  const [restorationSettledScope, setRestorationSettledScope] = useState<string | undefined | typeof UNSET_SCOPE>(UNSET_SCOPE);
   useEffect(() => {
     const isEntry = enteredScopeRef.current !== scopeKey;
     if (!isEntry) return;
     restorationScheduledForScopeRef.current = undefined;
     if (!scopeKey) {
       enteredScopeRef.current = scopeKey;
+      setRestorationSettledScope(scopeKey);
       return;
     }
+    if (!browserSessionStateLoaded || browserSessionActive === undefined) return;
     if (location.key === 'default') {
       enteredScopeRef.current = scopeKey;
+      setRestorationSettledScope(scopeKey);
       return;
     }
     if (
@@ -399,11 +404,13 @@ export function ViewerSlotProvider({
       || searchParams.has(REVIEW_PARAM)
     ) {
       enteredScopeRef.current = scopeKey;
+      setRestorationSettledScope(scopeKey);
       return;
     }
     const stored = getLastViewer(scopeKey);
     if (!stored) {
       enteredScopeRef.current = scopeKey;
+      setRestorationSettledScope(scopeKey);
       return;
     }
     const storedParams = new URLSearchParams(stored);
@@ -412,6 +419,7 @@ export function ViewerSlotProvider({
       if (!browserSessionActive) {
         clearLastViewer(scopeKey);
         enteredScopeRef.current = scopeKey;
+        setRestorationSettledScope(scopeKey);
         return;
       }
     }
@@ -421,8 +429,16 @@ export function ViewerSlotProvider({
   }, [scopeKey, browserSessionActive, browserSessionStateLoaded, location.key, searchParams, setSearchParams]);
 
   useEffect(() => {
-    if (restorationScheduledForScopeRef.current === scopeKey && slot.kind !== 'none') {
+    if (restorationScheduledForScopeRef.current !== scopeKey) return;
+    if (slot.kind !== 'none') {
       restorationScheduledForScopeRef.current = undefined;
+      setRestorationSettledScope(scopeKey);
+      return;
+    }
+    if (slot.kind === 'none' && scopeKey) {
+      clearLastViewer(scopeKey);
+      restorationScheduledForScopeRef.current = undefined;
+      setRestorationSettledScope(scopeKey);
     }
   }, [scopeKey, slot.kind]);
 
@@ -440,6 +456,12 @@ export function ViewerSlotProvider({
   // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
   const edgeScopeRef = useRef(scopeKey);
+  const browserAutoOpenPending = edgeScopeRef.current === scopeKey
+    && prevActiveRef.current !== true
+    && browserSessionStateLoaded
+    && browserSessionActive === true
+    && slot.kind === 'none';
+  const restorationSettled = restorationSettledScope === scopeKey && !browserAutoOpenPending;
   const clearStoredBrowserSnapshot = useCallback((key: string | undefined) => {
     if (!key) return;
     const stored = getLastViewer(key);
@@ -499,7 +521,9 @@ export function ViewerSlotProvider({
     <ViewerSlotCommandsContext.Provider value={commands}>
       <ViewerSlotDataContext.Provider value={slot}>
         <ViewerSlotBrowserActiveContext.Provider value={browserSessionStateLoaded && browserSessionActive === true}>
-          {children}
+          <ViewerSlotRestorationSettledContext.Provider value={restorationSettled}>
+            {children}
+          </ViewerSlotRestorationSettledContext.Provider>
         </ViewerSlotBrowserActiveContext.Provider>
       </ViewerSlotDataContext.Provider>
     </ViewerSlotCommandsContext.Provider>
@@ -535,9 +559,16 @@ export function useBrowserSessionActive(): boolean {
   return ctx;
 }
 
+export function useViewerRestorationSettled(): boolean {
+  const settled = useContext(ViewerSlotRestorationSettledContext);
+  if (settled === null) {
+    throw new Error('useViewerRestorationSettled must be used inside <ViewerSlotProvider>.');
+  }
+  return settled;
+}
+
 /** Back-compat combiner for consumers that genuinely need the whole surface
- *  (e.g. `ConversationPage`). Subscribes to all three slices — prefer the
- *  narrow hooks above when a consumer reads only one. */
+ *  (e.g. `ConversationPage`). Subscribes to commands, slot, and browser state. */
 export function useViewerSlot(): ViewerSlotValue {
   const commands = useViewerSlotCommands();
   const slot = useViewerSlotData();
