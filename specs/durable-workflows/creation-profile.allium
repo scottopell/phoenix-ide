@@ -95,10 +95,10 @@ value RepositoryResolution {
 
 value CanonicalDefaultOutcome {
     kind: CanonicalDefaultOutcomeKind
-    commit_id: String? when kind = resolved
-    branch_name: String? when kind = resolved
-    freshness: CanonicalDefaultFreshness? when kind = resolved
-    unresolved_reason: String? when kind = unresolved
+    commit_id: String when kind = resolved
+    branch_name: String when kind = resolved
+    freshness: CanonicalDefaultFreshness when kind = resolved
+    unresolved_reason: String when kind = unresolved
 }
 
 value CreationAcceptanceReceipt {

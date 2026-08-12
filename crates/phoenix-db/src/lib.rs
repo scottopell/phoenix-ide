@@ -1185,12 +1185,26 @@ impl Database {
 
     fn observe_worktree_fingerprint(worktree_path: &str) -> Option<String> {
         use std::fmt::Write as _;
+        use std::io::Read as _;
         use std::os::unix::fs::MetadataExt as _;
 
         let marker = std::path::Path::new(worktree_path).join(".git");
         let metadata = std::fs::symlink_metadata(&marker).ok()?;
         let marker_bytes = if metadata.is_file() {
-            std::fs::read(&marker).ok()?
+            const MAX_GIT_POINTER_BYTES: u64 = 4096;
+            if metadata.len() > MAX_GIT_POINTER_BYTES {
+                return None;
+            }
+            let mut bytes = Vec::with_capacity(4096);
+            std::fs::File::open(&marker)
+                .ok()?
+                .take(MAX_GIT_POINTER_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() as u64 > MAX_GIT_POINTER_BYTES {
+                return None;
+            }
+            bytes
         } else {
             Vec::new()
         };
@@ -1232,7 +1246,12 @@ impl Database {
                  worktree_id, worktree_fingerprint
              ) VALUES (
                  ?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8,
-                 ?9, ?10
+                 CASE WHEN ?10 IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM work_scopes WHERE worktree_fingerprint = ?10
+                 ) THEN ?9 END,
+                 CASE WHEN ?10 IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM work_scopes WHERE worktree_fingerprint = ?10
+                 ) THEN ?10 END
              )",
         )
         .bind(scope_id.as_str())
@@ -1261,6 +1280,7 @@ impl Database {
         let observed_fingerprint = worktree_path
             .as_deref()
             .and_then(Self::observe_worktree_fingerprint);
+        let probe_succeeded = observed_fingerprint.is_some();
         let existing =
             sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
                 "SELECT environment_kind, worktree_path, worktree_id, worktree_fingerprint
@@ -1287,7 +1307,8 @@ impl Database {
                 (Some(id), Some(fingerprint))
             }
             ("allocated_worktree", None)
-                if existing.0 == "allocated_worktree"
+                if !probe_succeeded
+                    && existing.0 == "allocated_worktree"
                     && existing.1.as_deref() == worktree_path.as_deref() =>
             {
                 (existing.2, existing.3)
@@ -1298,7 +1319,14 @@ impl Database {
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
                  branch_name = ?4, base_branch = ?5, updated_at = ?6,
-                 worktree_id = ?8, worktree_fingerprint = ?9
+                 worktree_id = CASE WHEN ?9 IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM work_scopes owner
+                     WHERE owner.worktree_fingerprint = ?9 AND owner.id <> ?7
+                 ) THEN ?8 END,
+                 worktree_fingerprint = CASE WHEN ?9 IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM work_scopes owner
+                     WHERE owner.worktree_fingerprint = ?9 AND owner.id <> ?7
+                 ) THEN ?9 END
              WHERE id = ?7",
         )
         .bind(kind)
@@ -2271,6 +2299,10 @@ impl Database {
                  SET worktree_id = ?1, worktree_fingerprint = ?2
                  WHERE id = ?3
                    AND NOT EXISTS (
+                       SELECT 1 FROM work_scopes owner
+                       WHERE owner.worktree_fingerprint = ?2 AND owner.id <> ?3
+                   )
+                   AND NOT EXISTS (
                        SELECT 1
                        FROM close_attempt_scopes captured
                        JOIN close_obligations obligation
@@ -2281,14 +2313,37 @@ impl Database {
                    )",
             )
             .bind(worktree_id)
-            .bind(observed_fingerprint)
+            .bind(&observed_fingerprint)
             .bind(&scope_id)
             .execute(&self.pool)
             .await?;
             if result.rows_affected() == 0 {
+                let cleared = sqlx::query(
+                    "UPDATE work_scopes
+                     SET worktree_id = NULL, worktree_fingerprint = NULL
+                     WHERE id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM work_scopes owner
+                           WHERE owner.worktree_fingerprint = ?2 AND owner.id <> ?1
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM close_attempt_scopes captured
+                           JOIN close_obligations obligation
+                             ON obligation.attempt_id = captured.attempt_id
+                           WHERE captured.scope = work_scopes.id
+                             AND obligation.phase <> 'completed'
+                             AND obligation.topology_sealed = 1
+                       )",
+                )
+                .bind(&scope_id)
+                .bind(&observed_fingerprint)
+                .execute(&self.pool)
+                .await?;
                 tracing::debug!(
                     work_scope_id = %scope_id,
-                    "deferring changed worktree identity reconciliation while Close snapshot is sealed"
+                    duplicate_unresolved = cleared.rows_affected() == 1,
+                    "worktree identity reconciliation deferred or unresolved"
                 );
             }
         }
@@ -10611,6 +10666,9 @@ mod tests {
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
         assert_ne!(first, replacement);
+        std::fs::write(&marker, vec![b'x'; 4097]).unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         std::fs::rename(&root, root.with_extension("moved")).unwrap();
         let moved = root.with_extension("moved");
         assert_eq!(

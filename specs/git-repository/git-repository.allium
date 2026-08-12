@@ -275,6 +275,7 @@ rule PreScopeProvisioningEvidenceMayReferenceRepositoryDirectly {
 
 rule RestartRepairEvidenceRecordsExactMissingOrInaccessibleObservation {
     when: RestartRepairObservationRecorded(product_conversation, scope, repository, worktree, observation_kind, observed_at)
+    requires: restart_repair_observation_is_not_stale(product_conversation, scope, observed_at)
     let observation_generation = next_restart_repair_generation(product_conversation, scope)
     ensures: RestartRepairEvidence.created(
         product_conversation: product_conversation,

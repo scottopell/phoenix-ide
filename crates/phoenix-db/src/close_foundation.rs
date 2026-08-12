@@ -2,9 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedConversationStateKind, CloseAttemptId, CloseAttemptMember,
-    CloseAttemptScope, CloseCompletionOutcome, CloseExpectedRetirementResource, CloseInspection,
-    CloseInspectionLoss, CloseLossItem, CloseMemberRole, CloseObligation,
+    AbsenceBasis, CapturedConversationStateKind, CapturedWorktreeIdentity, CloseAttemptId,
+    CloseAttemptMember, CloseAttemptScope, CloseCompletionOutcome, CloseExpectedRetirementResource,
+    CloseInspection, CloseInspectionLoss, CloseLossItem, CloseMemberRole, CloseObligation,
     CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
     CloseRetirementTarget, GitOidIdentity, GitPathIdentity, LossCategory, LossItemIdentity,
     OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
@@ -185,14 +185,20 @@ fn parse_close_attempt_scope_row(row: SqliteRow) -> DbResult<CloseAttemptScope> 
             row.try_get::<Option<String>, _>("captured_worktree_fingerprint")?,
             row.try_get::<Option<String>, _>("captured_worktree_locator")?,
         ) {
-            (Some(id), Some(fingerprint), Some(locator)) => Some(WorktreeIdentity::from_parts(
-                phoenix_core::domain::close::WorktreeId::parse(id)
+            (Some(id), Some(fingerprint), Some(locator)) => Some(
+                CapturedWorktreeIdentity::Resolved(WorktreeIdentity::from_parts(
+                    phoenix_core::domain::close::WorktreeId::parse(id)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    GitPathIdentity::decode_exact(&locator)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )),
+            ),
+            (None, None, Some(locator)) => Some(CapturedWorktreeIdentity::Unresolved {
+                locator: GitPathIdentity::decode_exact(&locator)
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
-                phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?,
-                GitPathIdentity::decode_exact(&locator)
-                    .map_err(|error| DbError::Serialization(error.to_string()))?,
-            )),
+            }),
             (None, None, None) => None,
             _ => {
                 return Err(DbError::Serialization(
@@ -1330,6 +1336,12 @@ impl Database {
                     GitPathIdentity::decode_exact(&locator)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
+                (None, None, Some(_)) => {
+                    return Err(close_precondition(format!(
+                        "attempt {} scope {} has unresolved worktree identity",
+                        request.attempt_id, scope.scope
+                    )))
+                }
                 (None, None, None) => None,
                 _ => {
                     return Err(DbError::Serialization(
@@ -1489,6 +1501,12 @@ impl Database {
                     GitPathIdentity::decode_exact(&locator)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
+                (None, None, Some(_)) => {
+                    return Err(close_precondition(format!(
+                        "scope {} has unresolved worktree identity",
+                        scope.scope
+                    )))
+                }
                 (None, None, None) => None,
                 _ => {
                     return Err(DbError::Serialization(
@@ -2926,6 +2944,69 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].conversation_id.as_str(), "root");
         assert_eq!(members[0].role, CloseMemberRole::RootLatest);
+    }
+
+    #[tokio::test]
+    async fn unresolved_allocated_worktree_admits_close_and_routes_inventory_to_repair() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        sqlx::query(
+            "UPDATE work_scopes SET worktree_id = NULL, worktree_fingerprint = NULL WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.begin_close_foundation("root", "attempt-unresolved")
+            .await
+            .unwrap();
+        let scopes = db
+            .list_close_attempt_scopes("attempt-unresolved")
+            .await
+            .unwrap();
+        assert!(matches!(
+            scopes[0].captured_worktree,
+            Some(CapturedWorktreeIdentity::Unresolved { .. })
+        ));
+
+        set_close_phase(
+            &db,
+            "attempt-unresolved",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-unresolved").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("unresolved:g1", "unresolved:fp1")
+                    .unwrap(),
+                losses: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+        let error = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: CloseAttemptId::parse("attempt-unresolved").unwrap(),
+                snapshot: current_test_snapshot(&db, "attempt-unresolved").await,
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope,
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: None,
+                        bash_process_groups: std::collections::BTreeSet::new(),
+                        tmux_servers: std::collections::BTreeSet::new(),
+                        pty_sessions: std::collections::BTreeSet::new(),
+                        browser_sessions: std::collections::BTreeSet::new(),
+                        equivalent_live_resources: std::collections::BTreeSet::new(),
+                    },
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
     }
 
     #[tokio::test]

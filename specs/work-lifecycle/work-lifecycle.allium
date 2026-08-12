@@ -310,16 +310,19 @@ rule LossConfirmationRecomputesInspectionBeforeRetirement {
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = awaiting_loss_confirmation
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
-    requires: current_retirement_inspection_generation(product_conversation) = inspection_generation
-    requires: current_retirement_inspection_fingerprint(product_conversation) = inspection_fingerprint
-    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, inspection_generation, inspection_fingerprint)
+    let fresh_scope_inspections = recompute_all_targeted_scope_inspections(product_conversation, attempt_id)
+    let fresh_generation = aggregate_generation(fresh_scope_inspections)
+    let fresh_fingerprint = aggregate_fingerprint(fresh_scope_inspections)
+    requires: fresh_generation = inspection_generation
+    requires: fresh_fingerprint = inspection_fingerprint
+    ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, fresh_generation, fresh_fingerprint)
     ensures: ResourceRetirementRequested(product_conversation, attempt_id)
 
     @guidance
         -- The only user-facing discard-confirmation control is bound to the exact
         -- active Close obligation plus its stored inspection generation/fingerprint.
-        -- The click re-runs the authoritative retirement inspection inside the same
-        -- atomic decision boundary that decides whether Close may enter
+        -- The click re-runs the authoritative retirement inspection for every targeted
+        -- attached WorkScope and derives one fresh aggregate pair inside the same atomic decision boundary that decides whether Close may enter
         -- retirement_requested. Phoenix compares the freshly recomputed generation and
         -- fingerprint against the stored inspection evidence from the outstanding Close
         -- obligation before requesting destructive retirement, so an async watcher
@@ -332,8 +335,8 @@ rule LossConfirmationDetectsChangedInspection {
     requires:
         bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation != inspection_generation
         or bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint != inspection_fingerprint
-        or current_retirement_inspection_generation(product_conversation) != inspection_generation
-        or current_retirement_inspection_fingerprint(product_conversation) != inspection_fingerprint
+        or aggregate_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_generation
+        or aggregate_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_fingerprint
     ensures: RetirementInspectionChanged(product_conversation, attempt_id)
 
     @guidance

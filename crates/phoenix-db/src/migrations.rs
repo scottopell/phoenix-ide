@@ -364,6 +364,8 @@ ALTER TABLE work_scopes ADD COLUMN worktree_id TEXT;
 ALTER TABLE work_scopes ADD COLUMN worktree_fingerprint TEXT;
 CREATE UNIQUE INDEX work_scopes_unique_worktree_id
 ON work_scopes(worktree_id) WHERE worktree_id IS NOT NULL;
+CREATE UNIQUE INDEX work_scopes_unique_worktree_fingerprint
+ON work_scopes(worktree_fingerprint) WHERE worktree_fingerprint IS NOT NULL;
 
 CREATE TRIGGER work_scope_stable_worktree_shape_insert
 BEFORE INSERT ON work_scopes
@@ -1026,8 +1028,7 @@ CREATE TABLE close_attempt_scopes (
     PRIMARY KEY (attempt_id, scope),
     CHECK (
         (captured_worktree_identity IS NULL
-            AND captured_worktree_fingerprint IS NULL
-            AND captured_worktree_locator IS NULL)
+            AND captured_worktree_fingerprint IS NULL)
         OR (captured_worktree_identity IS NOT NULL
             AND captured_worktree_fingerprint IS NOT NULL
             AND captured_worktree_locator IS NOT NULL)
@@ -1082,10 +1083,18 @@ WHEN NOT EXISTS (
     WHERE scope.id = NEW.scope
       AND (
           (scope.environment_kind = 'allocated_worktree'
-           AND NEW.captured_worktree_identity = scope.worktree_id
-           AND NEW.captured_worktree_fingerprint = scope.worktree_fingerprint
-           AND NEW.captured_worktree_locator =
-               'git_path_bytes_hex_v1:' || lower(hex(CAST(scope.worktree_path AS BLOB))))
+           AND (
+               (scope.worktree_id IS NULL
+                AND scope.worktree_fingerprint IS NULL
+                AND NEW.captured_worktree_identity IS NULL
+                AND NEW.captured_worktree_fingerprint IS NULL
+                AND NEW.captured_worktree_locator =
+                    'git_path_bytes_hex_v1:' || lower(hex(CAST(scope.worktree_path AS BLOB))))
+               OR (NEW.captured_worktree_identity = scope.worktree_id
+                   AND NEW.captured_worktree_fingerprint = scope.worktree_fingerprint
+                   AND NEW.captured_worktree_locator =
+                       'git_path_bytes_hex_v1:' || lower(hex(CAST(scope.worktree_path AS BLOB))))
+           ))
           OR (scope.environment_kind <> 'allocated_worktree'
               AND NEW.captured_worktree_identity IS NULL
               AND NEW.captured_worktree_fingerprint IS NULL

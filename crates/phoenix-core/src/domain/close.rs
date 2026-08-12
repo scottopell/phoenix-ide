@@ -821,10 +821,16 @@ pub struct CloseAttemptMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapturedWorktreeIdentity {
+    Resolved(WorktreeIdentity),
+    Unresolved { locator: GitPathIdentity },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseAttemptScope {
     pub attempt_id: CloseAttemptId,
     pub scope: WorkScopeId,
-    pub captured_worktree: Option<WorktreeIdentity>,
+    pub captured_worktree: Option<CapturedWorktreeIdentity>,
     pub captured_at: DateTime<Utc>,
 }
 
