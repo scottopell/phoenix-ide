@@ -217,6 +217,10 @@ enum ConfigurationStore {
         // The old app wrote this directly to its preferences plist. It is deliberately
         // deleted rather than silently migrating a secret into a differently-owned app.
         defaults.removeObject(forKey: PreferenceKey.legacyAnthropicAPIKey)
+        if let legacy = UserDefaults(suiteName: "com.scottopell.pa") {
+            legacy.removeObject(forKey: PreferenceKey.legacyAnthropicAPIKey)
+            legacy.synchronize()
+        }
     }
 }
 
@@ -282,10 +286,10 @@ struct KeychainStore {
         guard addStatus == errSecSuccess else { throw KeychainError.status(addStatus) }
     }
 
-    func processEnvironment() -> [String: String] {
+    func processEnvironment() throws -> [String: String] {
         var result: [String: String] = [:]
         for secret in ProviderSecret.allCases {
-            if let value = try? read(secret), !value.isEmpty {
+            if let value = try read(secret), !value.isEmpty {
                 result[secret.environmentKey] = value
             }
         }

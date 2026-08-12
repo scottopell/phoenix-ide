@@ -3,9 +3,10 @@ import WebKit
 
 struct WebViewWrapper: NSViewRepresentable {
     let origin: PhoenixOrigin
-    let onWebViewReady: (WKWebView) -> Void
-    let onDeployment: (Result<DeploymentInfo, Error>) -> Void
-    let onAuthenticationRequired: () -> Void
+    let operation: ServerManager.ConnectionOperationToken
+    let onWebViewReady: (WKWebView, ServerManager.ConnectionOperationToken) -> Void
+    let onDeployment: (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void
+    let onAuthenticationRequired: (ServerManager.ConnectionOperationToken) -> Void
 
     private static let authenticationBridgeScript = """
     (() => {
@@ -59,6 +60,7 @@ struct WebViewWrapper: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             origin: origin,
+            operation: operation,
             onWebViewReady: onWebViewReady,
             onDeployment: onDeployment,
             onAuthenticationRequired: onAuthenticationRequired
@@ -67,18 +69,21 @@ struct WebViewWrapper: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         let origin: PhoenixOrigin
-        let onWebViewReady: (WKWebView) -> Void
-        let onDeployment: (Result<DeploymentInfo, Error>) -> Void
-        let onAuthenticationRequired: () -> Void
+        let operation: ServerManager.ConnectionOperationToken
+        let onWebViewReady: (WKWebView, ServerManager.ConnectionOperationToken) -> Void
+        let onDeployment: (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void
+        let onAuthenticationRequired: (ServerManager.ConnectionOperationToken) -> Void
         weak var webView: WKWebView?
 
         init(
             origin: PhoenixOrigin,
-            onWebViewReady: @escaping (WKWebView) -> Void,
-            onDeployment: @escaping (Result<DeploymentInfo, Error>) -> Void,
-            onAuthenticationRequired: @escaping () -> Void
+            operation: ServerManager.ConnectionOperationToken,
+            onWebViewReady: @escaping (WKWebView, ServerManager.ConnectionOperationToken) -> Void,
+            onDeployment: @escaping (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void,
+            onAuthenticationRequired: @escaping (ServerManager.ConnectionOperationToken) -> Void
         ) {
             self.origin = origin
+            self.operation = operation
             self.onWebViewReady = onWebViewReady
             self.onDeployment = onDeployment
             self.onAuthenticationRequired = onAuthenticationRequired
@@ -105,7 +110,7 @@ struct WebViewWrapper: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            onWebViewReady(webView)
+            onWebViewReady(webView, operation)
             verifyDeployment(webView)
         }
 
@@ -114,7 +119,7 @@ struct WebViewWrapper: NSViewRepresentable {
             didFailProvisionalNavigation navigation: WKNavigation!,
             withError error: Error
         ) {
-            onDeployment(.failure(error))
+            onDeployment(.failure(error), operation)
         }
 
         func webView(
@@ -136,18 +141,18 @@ struct WebViewWrapper: NSViewRepresentable {
                   let body = message.body as? [String: Any],
                   let status = body["status"] as? Int else { return }
             if status == 401 {
-                onAuthenticationRequired()
+                onAuthenticationRequired(operation)
                 return
             }
             guard status == 200, let value = body["body"] else {
-                onDeployment(.failure(WebViewVerificationError.httpStatus(status)))
+                onDeployment(.failure(WebViewVerificationError.httpStatus(status)), operation)
                 return
             }
             do {
                 let data = try JSONSerialization.data(withJSONObject: value)
-                onDeployment(.success(try JSONDecoder().decode(DeploymentInfo.self, from: data)))
+                onDeployment(.success(try JSONDecoder().decode(DeploymentInfo.self, from: data)), operation)
             } catch {
-                onDeployment(.failure(error))
+                onDeployment(.failure(error), operation)
             }
         }
 

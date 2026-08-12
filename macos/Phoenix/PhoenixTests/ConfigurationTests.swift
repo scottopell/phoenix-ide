@@ -120,3 +120,118 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(deployment.instanceID, "123e4567-e89b-12d3-a456-426614174000")
     }
 }
+
+@MainActor
+final class ServerManagerHelpersTests: XCTestCase {
+    func testCertificateClassifierCoversFullCertificateFamily() {
+        let codes: [URLError.Code] = [
+            .secureConnectionFailed,
+            .serverCertificateHasBadDate,
+            .serverCertificateUntrusted,
+            .serverCertificateHasUnknownRoot,
+            .serverCertificateNotYetValid,
+            .clientCertificateRejected,
+            .clientCertificateRequired,
+        ]
+        for code in codes {
+            XCTAssertTrue(isCertificateURLError(code), "Expected \(code) to be classified as certificate related")
+            let classified = classifyServerIdentityError(URLError(code))
+            guard case .tls = classified else {
+                return XCTFail("Expected tls classification for \(code), got \(classified)")
+            }
+        }
+        XCTAssertFalse(isCertificateURLError(.timedOut))
+    }
+
+    func testLogBufferBuffersPartialLinesUntilNewlineAndFlushesOnExit() {
+        var buffer = ConnectionLogBuffer(maxLines: 4)
+        let redact: (String) -> String = { line in line.replacingOccurrences(of: "secret=abc", with: "secret= [REDACTED]") }
+
+        XCTAssertEqual(buffer.append(Data("first\nsecret=abc".utf8), redact: redact), ["first"])
+        XCTAssertEqual(buffer.completeLines, ["first"])
+        XCTAssertEqual(buffer.pendingFragment, "secret=abc")
+
+        XCTAssertEqual(buffer.append(Data("\nsecond\nthird".utf8), redact: redact), ["secret= [REDACTED]", "second"])
+        XCTAssertEqual(buffer.completeLines, ["first", "secret= [REDACTED]", "second"])
+        XCTAssertEqual(buffer.flushPending(redact: redact), "third")
+        XCTAssertEqual(buffer.completeLines, ["first", "secret= [REDACTED]", "second", "third"])
+        XCTAssertNil(buffer.flushPending(redact: redact))
+    }
+
+    func testLogBufferRedactsSensitiveKeySplitAcrossChunks() {
+        var buffer = ConnectionLogBuffer(maxLines: 4)
+        let redact: (String) -> String = { line in
+            let lowercased = line.lowercased()
+            guard lowercased.contains("authorization") else { return line }
+            if let separator = line.firstIndex(of: ":") {
+                return String(line[...separator]) + " [REDACTED]"
+            }
+            return "[REDACTED sensitive log line]"
+        }
+
+        XCTAssertEqual(buffer.append(Data("Authoriz".utf8), redact: redact), [])
+        XCTAssertEqual(buffer.pendingFragment, "Authoriz")
+
+        XCTAssertEqual(buffer.append(Data("ation: bearer abc123\n".utf8), redact: redact), ["Authorization: [REDACTED]"])
+        XCTAssertEqual(buffer.completeLines, ["Authorization: [REDACTED]"])
+        XCTAssertEqual(buffer.pendingFragment, "")
+    }
+
+    func testLogBufferRetainsSplitMultibyteUTF8ScalarUntilFramed() {
+        var buffer = ConnectionLogBuffer(maxLines: 4)
+        let redact: (String) -> String = { $0 }
+        let emoji = "🙂"
+        let emojiBytes = Array(emoji.utf8)
+
+        XCTAssertEqual(buffer.append(Data([emojiBytes[0], emojiBytes[1]]), redact: redact), [])
+        XCTAssertEqual(buffer.pendingFragment, "�")
+
+        XCTAssertEqual(buffer.append(Data([emojiBytes[2], emojiBytes[3], 0x0A]), redact: redact), [emoji])
+        XCTAssertEqual(buffer.completeLines, [emoji])
+        XCTAssertEqual(buffer.pendingFragment, "")
+    }
+
+    func testLogBufferPreservesNonUTF8BytesLossilyWithoutDroppingLine() {
+        var buffer = ConnectionLogBuffer(maxLines: 4)
+        let redact: (String) -> String = { $0 }
+        let emitted = buffer.append(Data([0x66, 0x6F, 0x80, 0x6F, 0x0A]), redact: redact)
+
+        XCTAssertEqual(emitted, ["fo�o"])
+        XCTAssertEqual(buffer.completeLines, ["fo�o"])
+        XCTAssertEqual(buffer.pendingFragment, "")
+    }
+
+    func testLegacyPlaintextSecretDeletesLegacyPreferenceDomain() {
+        let currentSuite = "ConfigurationTests.current.\(UUID().uuidString)"
+        let legacySuite = "com.scottopell.pa"
+        let current = UserDefaults(suiteName: currentSuite)!
+        let legacy = UserDefaults(suiteName: legacySuite)!
+        defer {
+            current.removePersistentDomain(forName: currentSuite)
+            legacy.removeObject(forKey: PreferenceKey.legacyAnthropicAPIKey)
+            legacy.synchronize()
+        }
+
+        current.set("current-secret", forKey: PreferenceKey.legacyAnthropicAPIKey)
+        legacy.set("legacy-secret", forKey: PreferenceKey.legacyAnthropicAPIKey)
+        ConfigurationStore.removeLegacyPlaintextSecret(defaults: current)
+        XCTAssertNil(current.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
+        XCTAssertNil(legacy.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
+    }
+
+    func testDeploymentViolationCanLeaveAttachedDeploymentViewableButReadOnly() throws {
+        let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
+        let deployment = DeploymentInfo(
+            build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
+            network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+            instanceID: nil,
+            localAccess: true,
+            installationOwnership: .systemdManaged
+        )
+        let state = ConnectionState.unsupportedOwnership(version, deployment, "read-only")
+        XCTAssertTrue(state.canDisplayWebView)
+        XCTAssertEqual(state.versionInfo, version)
+        XCTAssertEqual(state.deploymentInfo, deployment)
+        XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
+    }
+}

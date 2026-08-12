@@ -110,20 +110,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let window else { return }
         if state.canDisplayWebView, let origin = serverManager.webOrigin {
             if webView != nil { return }
+            let operation = serverManager.currentOperationToken
             let wrapper = WebViewWrapper(
                 origin: origin,
-                onWebViewReady: { [weak self] value in
+                operation: operation,
+                onWebViewReady: { [weak self] value, _ in
                     self?.webView = value
                     self?.openPendingConversation()
                 },
-                onDeployment: { [weak self] result in
+                onDeployment: { [weak self] result, operation in
                     switch result {
-                    case .success(let deployment): self?.serverManager.deploymentReceived(deployment)
-                    case .failure(let error): self?.serverManager.deploymentVerificationFailed(error.localizedDescription)
+                    case .success(let deployment): self?.serverManager.deploymentReceived(deployment, operation: operation)
+                    case .failure(let error): self?.serverManager.deploymentVerificationFailed(error.localizedDescription, operation: operation)
                     }
                 },
-                onAuthenticationRequired: { [weak self] in
-                    self?.serverManager.deploymentRequiresAuthentication()
+                onAuthenticationRequired: { [weak self] operation in
+                    self?.serverManager.deploymentRequiresAuthentication(operation: operation)
                 }
             )
             window.contentView = NSHostingView(rootView: wrapper)
@@ -131,13 +133,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         webView = nil
-        switch state {
-        case .failed(let message), .unavailable(let message), .tlsFailure(let message),
-             .wrongService(let message), .unsupportedOwnership(let message):
-            window.contentView = NSHostingView(rootView: ErrorView(message: message) { [weak self] in
+        if let failure = state.failureViewModel {
+            window.contentView = NSHostingView(rootView: ErrorView(message: failure.message) { [weak self] in
+                guard failure.allowsReconnect else { return }
                 self?.serverManager.reconnect()
             })
-        default:
+        } else {
             window.contentView = NSHostingView(rootView: LoadingView(message: state.displayName))
         }
     }
