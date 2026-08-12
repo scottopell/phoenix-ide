@@ -20,11 +20,12 @@ Launches only `Phoenix.app/Contents/Helpers/phoenix_ide` (or a clearly marked De
 
 - `PHOENIX_BIND_ADDR=127.0.0.1`
 - `PHOENIX_TLS=off`
-- a private runtime home under `~/Library/Application Support/Phoenix/sidecar-home`
-- a private `PHOENIX_DATA_DIR` and database beneath that runtime home
+- the real user `HOME` and working directory, so terminals, Git, SSH, skills, and `~` behave normally
+- a private runtime root under `~/Library/Application Support/Phoenix/sidecar-home` used only for Phoenix/Codex-owned mutable state
+- a private `PHOENIX_DATA_DIR`, `CODEX_HOME`, and database beneath that runtime root
 - a fixed configured loopback port
 
-An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. Phoenix.app creates the private runtime/data directories before taking that lock so the lock itself remains outside the managed data tree and cleanup still works after launch-preparation failures. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Any transition away from bundled mode first stops the exact child Phoenix.app launched, coalesces overlapping reconnect requests, and only then connects the latest candidate mode. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
+An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. This is state isolation, not a filesystem sandbox: the sidecar and its terminals retain ordinary access to the user's files. Phoenix.app creates the private runtime/data directories before taking that lock so the lock itself remains outside the managed data tree and cleanup still works after launch-preparation failures. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Any transition away from bundled mode first stops the exact child Phoenix.app launched, coalesces overlapping reconnect requests, and only then connects the latest candidate mode. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
 
 Optional Anthropic/OpenAI keys are stored in Keychain and injected only into the app-owned child environment. Phoenix.app writes or deletes those Keychain entries only during **Apply and Connect**; clearing a field in Settings does not touch Keychain until that apply step. If the saved settings already match the active connection, Apply still persists/acknowledges secrets but does not reconnect or restart. The legacy plaintext `anthropicApiKey` preference is deleted from both the current preference domain and the legacy `com.scottopell.pa` domain. Diagnostics are typed and allowlisted; raw environments and secret values are never rendered. The app-owned launcher capture is bounded to a recent rotating `launcher.log` so diagnostics remain available without unbounded growth.
 

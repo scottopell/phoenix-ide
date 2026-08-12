@@ -157,7 +157,7 @@ struct SidecarLaunchEnvironment {
 
     static func build(
         inherited: [String: String],
-        privateHome: URL,
+        userHome: URL,
         instanceID: UUID,
         publicEnvironment: [String: String],
         sidecarSecrets: [String: String]
@@ -166,7 +166,7 @@ struct SidecarLaunchEnvironment {
             "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
             "LANG": inherited["LANG"] ?? "en_US.UTF-8",
-            "HOME": privateHome.path,
+            "HOME": userHome.path,
             "PHOENIX_INSTANCE_ID": instanceID.uuidString,
         ]
         for key in safeInheritedKeys {
@@ -957,7 +957,6 @@ struct BundledServerConfiguration: Equatable {
 
     var publicEnvironment: [String: String] {
         [
-            "HOME": runtimeRootURL.path,
             "CODEX_HOME": runtimeRootURL.appendingPathComponent(".codex", isDirectory: true).path,
             "PHOENIX_DATA_DIR": dataDirectoryURL.path,
             "PHOENIX_BIND_ADDR": "127.0.0.1",

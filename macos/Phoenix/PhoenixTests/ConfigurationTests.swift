@@ -848,7 +848,7 @@ final class ConfigurationTests: XCTestCase {
             rustLogLevel: "phoenix_ide=debug"
         )
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_BIND_ADDR"], "127.0.0.1")
-        XCTAssertEqual(configuration.publicEnvironment["HOME"], "/tmp/Phoenix Tests")
+        XCTAssertNil(configuration.publicEnvironment["HOME"])
         XCTAssertEqual(configuration.publicEnvironment["CODEX_HOME"], "/tmp/Phoenix Tests/.codex")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DATA_DIR"], "/tmp/Phoenix Tests/.phoenix-ide")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
@@ -1488,7 +1488,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate).requiresReconnect)
     }
 
-    func testSidecarLaunchEnvironmentUsesPrivateHomeButPassesSafeInheritedVars() {
+    func testSidecarLaunchEnvironmentPreservesRealUserHomeAndSafeSessionVars() {
         let environment = SidecarLaunchEnvironment.build(
             inherited: [
                 "PATH": "/usr/bin",
@@ -1501,13 +1501,13 @@ final class ServerManagerHelpersTests: XCTestCase {
                 "SSH_AUTH_SOCK": "/tmp/ssh.sock",
                 "SECRET_TOKEN": "nope",
             ],
-            privateHome: URL(fileURLWithPath: "/private/phoenix-home"),
+            userHome: URL(fileURLWithPath: "/Users/public"),
             instanceID: UUID(uuidString: "123E4567-E89B-12D3-A456-426614174000")!,
             publicEnvironment: ["PHOENIX_DATA_DIR": "/private/phoenix-home/.phoenix-ide"],
             sidecarSecrets: ["ANTHROPIC_API_KEY": "secret"]
         )
 
-        XCTAssertEqual(environment["HOME"], "/private/phoenix-home")
+        XCTAssertEqual(environment["HOME"], "/Users/public")
         XCTAssertEqual(environment["SHELL"], "/bin/zsh")
         XCTAssertEqual(environment["USER"], "scott")
         XCTAssertEqual(environment["LOGNAME"], "scott")

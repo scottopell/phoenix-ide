@@ -479,6 +479,19 @@ struct RollingLogWriter {
 }
 
 @MainActor
+private final class SidecarLogSnapshotSink {
+    weak var manager: ServerManager?
+
+    init(manager: ServerManager) {
+        self.manager = manager
+    }
+
+    func publish(_ lines: [String]) {
+        manager?.publishRecentLogLines(lines)
+    }
+}
+
+@MainActor
 final class ServerManager: ObservableObject {
     @Published private(set) var state: ConnectionState = .stopped
     @Published private(set) var mode: ServerMode?
@@ -492,12 +505,11 @@ final class ServerManager: ObservableObject {
     private var bundledReconnectQueue = BundledReconnectQueue()
     private var terminationInProgress = false
     private var ownerLockDescriptor: Int32?
+    private lazy var logSnapshotSink = SidecarLogSnapshotSink(manager: self)
     private lazy var logRecorder = SidecarLogRecorder(
         writer: currentLogWriter,
-        snapshotSink: { [weak self] lines in
-            await MainActor.run {
-                self?.recentLogLines = lines
-            }
+        snapshotSink: { [logSnapshotSink] lines in
+            await logSnapshotSink.publish(lines)
         }
     )
     struct ConnectionOperationToken: Equatable, Hashable {
@@ -579,6 +591,10 @@ final class ServerManager: ObservableObject {
                 connect()
             }
         }
+    }
+
+    fileprivate func publishRecentLogLines(_ lines: [String]) {
+        recentLogLines = lines
     }
 
     func showFailure(message: String) {
@@ -717,7 +733,7 @@ final class ServerManager: ObservableObject {
             }
             let environment = SidecarLaunchEnvironment.build(
                 inherited: inherited,
-                privateHome: configuration.runtimeRootURL,
+                userHome: FileManager.default.homeDirectoryForCurrentUser,
                 instanceID: instanceID,
                 publicEnvironment: configuration.publicEnvironment,
                 sidecarSecrets: try keychain.sidecarEnvironment()
@@ -726,7 +742,7 @@ final class ServerManager: ObservableObject {
             let launched = Process()
             launched.executableURL = configuration.executableURL
             launched.environment = environment
-            launched.currentDirectoryURL = configuration.runtimeRootURL
+            launched.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
             launched.qualityOfService = .userInitiated
 
             let pipe = Pipe()
