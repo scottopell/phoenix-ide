@@ -570,6 +570,33 @@ final class ConfigurationTests: XCTestCase {
 
 @MainActor
 final class ServerManagerHelpersTests: XCTestCase {
+    func testIdentityHTTPStatusClassifiesWrongEndpointSeparatelyFromOutage() {
+        XCTAssertEqual(
+            classifyServerIdentityError(IdentityHTTPStatusError(statusCode: 404)),
+            .wrongService("Phoenix identity endpoint returned HTTP 404.")
+        )
+        XCTAssertEqual(
+            classifyServerIdentityError(IdentityHTTPStatusError(statusCode: 405)),
+            .wrongService("Phoenix identity endpoint returned HTTP 405.")
+        )
+        XCTAssertEqual(
+            classifyServerIdentityError(IdentityHTTPStatusError(statusCode: 503)),
+            .unavailable("Phoenix identity endpoint returned HTTP 503.")
+        )
+    }
+
+    func testBundledReconnectQueueSchedulesOneStopAndUsesLatestCandidate() throws {
+        let first = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://first.example.test")))
+        let latest = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://latest.example.test")))
+        var queue = BundledReconnectQueue()
+
+        XCTAssertTrue(queue.request(first))
+        XCTAssertFalse(queue.request(latest))
+        XCTAssertEqual(queue.takeAfterStop(), latest)
+        XCTAssertFalse(queue.stopScheduled)
+        XCTAssertNil(queue.latestCandidate)
+    }
+
     func testCertificateClassifierCoversFullCertificateFamily() {
         let codes: [URLError.Code] = [
             .secureConnectionFailed,

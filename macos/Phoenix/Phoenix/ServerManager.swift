@@ -64,12 +64,22 @@ enum ServerIdentityError: Error, Equatable {
     case redirected(String)
 }
 
+struct IdentityHTTPStatusError: LocalizedError, Equatable {
+    let statusCode: Int
+
+    var errorDescription: String? { "Phoenix identity endpoint returned HTTP \(statusCode)." }
+}
+
 func classifyServerIdentityError(_ error: Error) -> ServerIdentityError {
     if let urlError = error as? URLError, isCertificateURLError(urlError.code) {
         return .tls(urlError.localizedDescription)
     }
     if let decoding = error as? DecodingError {
         return .wrongService(String(describing: decoding))
+    }
+    if let status = error as? IdentityHTTPStatusError,
+       status.statusCode == 404 || status.statusCode == 405 {
+        return .wrongService(status.localizedDescription)
     }
     return .unavailable(error.localizedDescription)
 }
@@ -217,6 +227,24 @@ private struct LaunchedBundledInstance {
     let instanceID: UUID
 }
 
+struct BundledReconnectQueue {
+    private(set) var latestCandidate: ServerMode?
+    private(set) var stopScheduled = false
+
+    mutating func request(_ candidate: ServerMode) -> Bool {
+        latestCandidate = candidate
+        guard !stopScheduled else { return false }
+        stopScheduled = true
+        return true
+    }
+
+    mutating func takeAfterStop() -> ServerMode? {
+        stopScheduled = false
+        defer { latestCandidate = nil }
+        return latestCandidate
+    }
+}
+
 @MainActor
 final class ServerManager: ObservableObject {
     @Published private(set) var state: ConnectionState = .stopped
@@ -228,6 +256,7 @@ final class ServerManager: ObservableObject {
     private var readinessTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
+    private var bundledReconnectQueue = BundledReconnectQueue()
     private var logFileHandle: FileHandle?
     private var ownerLockDescriptor: Int32?
     struct ConnectionOperationToken: Equatable, Hashable {
@@ -429,11 +458,13 @@ final class ServerManager: ObservableObject {
 
     private func restartBundled(with candidate: ServerMode) {
         guard case .bundled = mode else { return }
+        guard bundledReconnectQueue.request(candidate) else { return }
         state = .restarting
         stop { [weak self] in
             guard let self else { return }
-            self.mode = candidate
-            self.webOrigin = candidate.origin
+            guard let latestCandidate = self.bundledReconnectQueue.takeAfterStop() else { return }
+            self.mode = latestCandidate
+            self.webOrigin = latestCandidate.origin
             self.connect()
         }
     }
@@ -498,14 +529,19 @@ final class ServerManager: ObservableObject {
         defer { session.invalidateAndCancel() }
         do {
             let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            guard let http = response as? HTTPURLResponse else {
                 throw URLError(.badServerResponse)
+            }
+            guard http.statusCode == 200 else {
+                throw IdentityHTTPStatusError(statusCode: http.statusCode)
             }
             guard let finalURL = response.url, finalURL == url, expectedOrigin.exactlyMatches(finalURL) else {
                 throw ServerIdentityError.redirected("Phoenix identity verification redirected away from the configured origin.")
             }
             return try JSONDecoder().decode(T.self, from: data)
         } catch let error as ServerIdentityError {
+            throw error
+        } catch let error as IdentityHTTPStatusError {
             throw error
         } catch let error as URLError where error.code == .badServerResponse {
             throw error

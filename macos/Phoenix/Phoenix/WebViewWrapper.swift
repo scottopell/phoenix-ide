@@ -137,6 +137,13 @@ struct WebViewWrapper: NSViewRepresentable {
                 }
                 return
             }
+            if navigationAction.targetFrame?.isMainFrame == true && !origin.exactlyMatches(url) {
+                if navigationAction.navigationType == .linkActivated {
+                    openExternallyIfSafe(url)
+                }
+                decisionHandler(.cancel)
+                return
+            }
             if navigationAction.navigationType == .linkActivated && !origin.exactlyMatches(url) {
                 openExternallyIfSafe(url)
                 decisionHandler(.cancel)
