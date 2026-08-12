@@ -191,6 +191,7 @@ config {
 -- shell_for(intent), initial_creation_plan(binding), creation_effect_kind(effect): CreationEffectKind
 -- effect_is_declared(binding, kind), dependency_exists(binding, successor_kind, predecessor_kind)
 -- no_effect_other_than(binding, kind), no_other_post_resolution_creation_dependencies(binding)
+-- no_other_seeded_empty_post_resolution_dependencies(binding)
 -- readiness_members(binding), readiness_requires_dispatch(binding)
 -- repository_resolution_observation(effect), canonical_default_outcome(effect, observation): CanonicalDefaultOutcome
 -- hidden_repository_identity_proven(observation), transient_failure(evidence), permanent_failure(evidence)
@@ -214,6 +215,13 @@ config {
 --       True iff the post-resolution DAG contains only the dependencies declared by
 --       ResolvedInitialTurnCreationDagDeclared; the already-receipted repository
 --       resolution effect remains the root predecessor rather than being redeclared.
+--
+--   no_other_seeded_empty_post_resolution_dependencies(
+--       binding: CreationWorkflowBinding
+--   ) -> Boolean
+--       True iff the seeded-empty post-resolution DAG contains only the metadata,
+--       attachment, optional Git provisioning, and bootstrap dependencies declared
+--       by ResolvedSeededEmptyCreationDagDeclared.
 --
 --   resolved_repository_kind(observation) -> RepositoryKind
 --       The typed repository kind proven by the resolve_repository observation.
@@ -392,12 +400,33 @@ rule ResolvedInitialTurnCreationDagDeclared {
     ensures: readiness_members(binding) = workflow_effect_set(binding)
 }
 
-rule SeededEmptyCreationOmitsMessageAndDispatchEffects {
-    when: InitialCreationPlanEvaluated(reducer, binding)
+rule ResolvedSeededEmptyCreationDagDeclared {
+    when: RepositoryObservationRecorded(adapter, effect, observation)
+    let binding = CreationWorkflowBinding{workflow: effect.workflow}
+    requires: creation_effect_kind(effect) = resolve_repository
     requires: binding.outcome = provisioning
     requires: binding.intent.start.variant = seeded_empty
+
+    ensures: effect_is_declared(binding, finalize_attachments)
+    ensures: effect_is_declared(binding, commit_metadata)
+    ensures: effect_is_declared(binding, bootstrap_runtime)
     ensures: not effect_is_declared(binding, expand_initial_message)
     ensures: not effect_is_declared(binding, dispatch_first_llm)
+    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, attach_work_scope)
+    ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
+    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
+    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, commit_metadata, attach_work_scope)
+    ensures: resolved_repository_kind(observation) = non_git implies dependency_exists(binding, commit_metadata, resolve_repository)
+    ensures: dependency_exists(binding, commit_metadata, finalize_attachments)
+    ensures: dependency_exists(binding, bootstrap_runtime, commit_metadata)
+    ensures: no_other_seeded_empty_post_resolution_dependencies(binding)
+    ensures: readiness_members(binding) = workflow_effect_set(binding)
     ensures: readiness_requires_dispatch(binding) = false
 }
 

@@ -181,14 +181,18 @@ entity CloseObligation {
     transitions phase {
         awaiting_blocker_resolution -> awaiting_stop_work_confirmation
         awaiting_blocker_resolution -> settling_active_work
+        awaiting_blocker_resolution -> completed
         awaiting_stop_work_confirmation -> settling_active_work
+        awaiting_stop_work_confirmation -> completed
         settling_active_work -> cancel_requested_during_settlement
         settling_active_work -> awaiting_retirement_inspection
         cancel_requested_during_settlement -> completed
         awaiting_retirement_inspection -> awaiting_loss_confirmation
         awaiting_retirement_inspection -> retirement_requested
+        awaiting_retirement_inspection -> completed
         awaiting_loss_confirmation -> awaiting_retirement_inspection
         awaiting_loss_confirmation -> retirement_requested
+        awaiting_loss_confirmation -> completed
         retirement_requested -> needs_repair
         needs_repair -> retirement_requested
         retirement_requested -> completed

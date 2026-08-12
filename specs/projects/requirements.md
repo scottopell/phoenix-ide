@@ -1,44 +1,8 @@
-# Projects — Retired Traceability Index
+# Projects — Deprecated Requirements
 
-`Project` is retired as a normative domain, product, UI, and API authority. The standing repository-backed authority now lives in `specs/git-repository/`; conversation creation, lifecycle, UI, and tool-capability rules live in their owning specs.
+The Project-specific requirements below are canonical standing deprecations. Surviving repository, conversation, lifecycle, UI, and tool behavior is specified by its owning feature requirements.
 
-This file is a traceability index only. It deliberately does **not** duplicate normative clauses.
-
-## Moved REQ-PROJ IDs
-
-| REQ ID | New owner |
-|---|---|
-| REQ-PROJ-000 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-001 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-001A | `specs/conversation-ui/requirements.md` |
-| REQ-PROJ-002 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-003 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-004 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-005 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-005A | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-006 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-007 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-008 | `specs/subagents/requirements.md` |
-| REQ-PROJ-012 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-013 | `specs/bash/requirements.md` |
-| REQ-PROJ-015 | `specs/git-repository/requirements.md` |
-| REQ-PROJ-017 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-018 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-019 | `specs/conversation-ui/requirements.md` |
-| REQ-PROJ-020 | `specs/git-repository/requirements.md` |
-| REQ-PROJ-021 | `specs/git-repository/requirements.md` |
-| REQ-PROJ-022 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-024 | `specs/git-repository/requirements.md` |
-| REQ-PROJ-025 | `specs/git-repository/requirements.md` |
-| REQ-PROJ-028 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-028a | `specs/work-lifecycle/requirements.md` |
-| REQ-PROJ-029 | `specs/conversation-creation/requirements.md` |
-| REQ-PROJ-033 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-036 | `specs/bedrock/requirements.md` |
-| REQ-PROJ-038 | `specs/file-explorer/requirements.md` |
-| REQ-PROJ-WS-001 | `specs/work-lifecycle/requirements.md` |
-
-## Explicit deprecations retained for traceability only
+## Deprecated Project-specific requirements
 
 ### REQ-PROJ-009: DEPRECATED
 
@@ -95,7 +59,3 @@ This file is a traceability index only. It deliberately does **not** duplicate n
 ### REQ-PROJ-037: DEPRECATED
 
 **DEPRECATED.** Reserved compatibility slot.
-
-## Retirement note
-
-Historical references to `Project` in older ADRs and executives remain valid as point-in-time records. New normative repository-backed behavior must cite the owning destination spec above, not this file.
