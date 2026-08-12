@@ -7138,11 +7138,11 @@ impl Database {
         Ok(())
     }
 
-    /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
+    /// Reset the service tier without changing the model or effort.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
+    /// Returns a [`DbError`] if the conversation is absent or the database update fails.
     pub async fn update_conversation_service_tier(
         &self,
         id: &str,
@@ -7162,6 +7162,11 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically update the model, effort, and service tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the conversation is absent or the database update fails.
     pub async fn update_conversation_model_and_effort(
         &self,
         id: &str,
