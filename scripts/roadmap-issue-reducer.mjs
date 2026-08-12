@@ -328,20 +328,26 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  const reactions = [];
-  for (let page = 1; ; page += 1) {
-    const batch = await githubRequest(`${path}?per_page=100&page=${page}`, token);
-    reactions.push(...batch);
-    if (batch.length < 100) break;
-  }
-  for (const reaction of reactions) {
-    if (
-      reaction.user?.login === "github-actions[bot]" &&
-      LIFECYCLE_REACTIONS.has(reaction.content) &&
-      reaction.content !== content
-    ) {
-      await githubRequest(`${path}/${reaction.id}`, token, { method: "DELETE" });
+  const terminal = content === "rocket" || content === "confused";
+  try {
+    const reactions = [];
+    for (let page = 1; ; page += 1) {
+      const batch = await githubRequest(`${path}?per_page=100&page=${page}`, token);
+      reactions.push(...batch);
+      if (batch.length < 100) break;
     }
+    for (const reaction of reactions) {
+      if (
+        reaction.user?.login === "github-actions[bot]" &&
+        LIFECYCLE_REACTIONS.has(reaction.content) &&
+        reaction.content !== content
+      ) {
+        await githubRequest(`${path}/${reaction.id}`, token, { method: "DELETE" });
+      }
+    }
+  } catch (error) {
+    if (!terminal) throw error;
+    console.warn(`Terminal ${content} posted for comment ${commentId}, but lifecycle cleanup failed: ${error.message}`);
   }
 }
 
