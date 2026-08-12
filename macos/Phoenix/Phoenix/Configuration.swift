@@ -25,6 +25,66 @@ enum ServerModeKind: String, CaseIterable, Identifiable {
     }
 }
 
+struct PhoenixWebViewPolicy {
+    enum MediaCaptureDecision: Equatable {
+        case grant
+        case deny
+    }
+
+    enum NotificationDecision: Equatable {
+        case grant
+        case deny
+    }
+
+    static func url(for securityOrigin: SecurityOriginDescriptor) -> URL? {
+        let host = securityOrigin.host.contains(":") && !securityOrigin.host.hasPrefix("[")
+            ? "[\(securityOrigin.host)]"
+            : securityOrigin.host
+        var value = "\(securityOrigin.scheme)://\(host)"
+        if securityOrigin.port >= 0 {
+            value += ":\(securityOrigin.port)"
+        }
+        return URL(string: value)
+    }
+
+    static func mediaCaptureDecision(
+        for securityOrigin: SecurityOriginDescriptor,
+        captureType: MediaCaptureKind,
+        expectedOrigin: PhoenixOrigin
+    ) -> MediaCaptureDecision {
+        guard captureType == .microphone,
+              let candidate = url(for: securityOrigin),
+              expectedOrigin.exactlyMatches(candidate) else {
+            return .deny
+        }
+        return .grant
+    }
+
+    static func notificationDecision(
+        for securityOrigin: SecurityOriginDescriptor,
+        expectedOrigin: PhoenixOrigin
+    ) -> NotificationDecision {
+        guard let candidate = url(for: securityOrigin), expectedOrigin.exactlyMatches(candidate) else {
+            return .deny
+        }
+        return .grant
+    }
+}
+
+struct SecurityOriginDescriptor: Equatable {
+    let scheme: String
+    let host: String
+    let port: Int
+}
+
+enum MediaCaptureKind: Equatable {
+    case camera
+    case microphone
+    case cameraAndMicrophone
+    case display
+    case unknown
+}
+
 struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
     let url: URL
 

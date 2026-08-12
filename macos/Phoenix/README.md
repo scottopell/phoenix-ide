@@ -46,6 +46,8 @@ PHOENIX_SIDECAR_PATH=/absolute/path/to/phoenix_ide \
 
 The packaging phase copies the executable to `Contents/Helpers/phoenix_ide`, checks architectures, and signs the nested executable when code signing is enabled. The app and sidecar form one release artifact; managed Phoenix's deployment updater does not own this sidecar.
 
+Signed hardened-runtime builds also require the `com.apple.security.device.audio-input` entitlement for WebKit microphone capture; Phoenix.app includes it and still denies camera-only or combined camera/microphone requests.
+
 ## URL scheme
 
 - `phoenix://open`
@@ -56,7 +58,7 @@ Conversation links activate Phoenix.app and navigate the existing authenticated 
 
 ## Trust and origin policy
 
-Phoenix.app uses normal macOS TLS trust. It does not bypass certificate validation. Install the Phoenix-managed local CA through the supported Phoenix deployment flow when needed. Activated links and microphone permission are internal only when scheme, host, and effective port exactly match the configured origin.
+Phoenix.app uses normal macOS TLS trust. It does not bypass certificate validation. Install the Phoenix-managed local CA through the supported Phoenix deployment flow when needed. Identity verification rejects cross-origin redirects instead of silently rebinding the configured origin. Activated links, popup `window.open` requests, microphone permission, and notification permission are internal only when scheme, host, and effective port exactly match the configured origin.
 
 ## Manual compatibility matrix
 
@@ -64,7 +66,7 @@ Run a signed Finder-launched build, not only Xcode:
 
 - Managed launchd deployment: login, shared Safari/iOS conversation history, reconnect, and quit without process changes.
 - Bundled sidecar: private history, verified loopback/non-TLS/non-socket-activated deployment, second-owner refusal, occupied-port failure, intentional restart, graceful quit, and force-stop fallback.
-- Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, and Web Inspector.
+- Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, popup authentication windows, and Web Inspector.
 - Failures: offline, wrong service, auth required, TLS trust failure, unknown/unmanaged/ambiguous ownership, no models, sidecar crash, missing sidecar, and hotkey conflict.
 - Deep links: an existing conversation UUID opens in the authenticated app; malformed and unknown UUIDs do not navigate or mutate server state.
 - Security: no key/token/password/custom secret header in preferences, diagnostics, app logs, error text, or process arguments.

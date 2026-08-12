@@ -24,6 +24,54 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testSecurityOriginURLBuilderBracketsIPv6Hosts() throws {
+        let built = try XCTUnwrap(PhoenixWebViewPolicy.url(for: SecurityOriginDescriptor(scheme: "https", host: "::1", port: 8031)))
+        XCTAssertEqual(built.absoluteString, "https://[::1]:8031")
+    }
+
+    func testMediaCapturePolicyAllowsOnlyExactOriginMicrophone() throws {
+        let expected = try PhoenixOrigin("https://[::1]:8031")
+        let descriptor = SecurityOriginDescriptor(scheme: "https", host: "::1", port: 8031)
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.mediaCaptureDecision(for: descriptor, captureType: .microphone, expectedOrigin: expected),
+            .grant
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.mediaCaptureDecision(for: descriptor, captureType: .camera, expectedOrigin: expected),
+            .deny
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.mediaCaptureDecision(for: descriptor, captureType: .cameraAndMicrophone, expectedOrigin: expected),
+            .deny
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.mediaCaptureDecision(
+                for: SecurityOriginDescriptor(scheme: "https", host: "example.com", port: 8031),
+                captureType: .microphone,
+                expectedOrigin: expected
+            ),
+            .deny
+        )
+    }
+
+    func testNotificationPolicyRequiresExactVerifiedOrigin() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.notificationDecision(
+                for: SecurityOriginDescriptor(scheme: "https", host: "phoenix.example.test", port: 443),
+                expectedOrigin: expected
+            ),
+            .grant
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.notificationDecision(
+                for: SecurityOriginDescriptor(scheme: "https", host: "other.example.test", port: 443),
+                expectedOrigin: expected
+            ),
+            .deny
+        )
+    }
+
     func testLoadCandidateRejectsRemoteCleartextAttachedOrigin() {
         XCTAssertThrowsError(
             try ConfigurationStore.loadCandidate(

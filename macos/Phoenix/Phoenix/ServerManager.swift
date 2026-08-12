@@ -61,6 +61,7 @@ enum ServerIdentityError: Error, Equatable {
     case tls(String)
     case wrongService(String)
     case unavailable(String)
+    case redirected(String)
 }
 
 func classifyServerIdentityError(_ error: Error) -> ServerIdentityError {
@@ -71,6 +72,32 @@ func classifyServerIdentityError(_ error: Error) -> ServerIdentityError {
         return .wrongService(String(describing: decoding))
     }
     return .unavailable(error.localizedDescription)
+}
+
+final class RedirectRejectingURLSessionDelegate: NSObject, URLSessionTaskDelegate {
+    private let expectedOrigin: PhoenixOrigin
+
+    init(expectedOrigin: PhoenixOrigin) {
+        self.expectedOrigin = expectedOrigin
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let redirectedURL = request.url else {
+            completionHandler(nil)
+            return
+        }
+        if expectedOrigin.exactlyMatches(redirectedURL) {
+            completionHandler(request)
+        } else {
+            completionHandler(nil)
+        }
+    }
 }
 
 func isCertificateURLError(_ code: URLError.Code) -> Bool {
@@ -409,11 +436,11 @@ final class ServerManager: ObservableObject {
 
     private func verifyIdentity(for selected: ServerMode, operation: UUID, allowIntermediateFailureState: Bool) async {
         do {
-            let version: VersionInfo = try await requestJSON(selected.origin.url(path: "/api/version"))
+            let version: VersionInfo = try await requestJSON(selected.origin.url(path: "/api/version"), expectedOrigin: selected.origin)
             guard operation == operationID else { return }
             state = .identityVerified(version)
             if case .bundled = selected {
-                let deployment: DeploymentInfo = try await requestJSON(selected.origin.url(path: "/api/deployment"))
+                let deployment: DeploymentInfo = try await requestJSON(selected.origin.url(path: "/api/deployment"), expectedOrigin: selected.origin)
                 guard operation == operationID else { return }
                 deploymentReceived(deployment, operation: ConnectionOperationToken(id: operation))
             }
@@ -428,7 +455,7 @@ final class ServerManager: ObservableObject {
     private func applyIdentityFailure(_ error: ServerIdentityError, version: VersionInfo?) {
         let failure = FailureState(version: version, message: {
             switch error {
-            case .tls(let message), .wrongService(let message), .unavailable(let message): return message
+            case .tls(let message), .wrongService(let message), .unavailable(let message), .redirected(let message): return message
             }
         }())
         switch error {
@@ -436,7 +463,7 @@ final class ServerManager: ObservableObject {
             state = .tlsFailure(failure)
         case .wrongService:
             state = .wrongService(failure)
-        case .unavailable:
+        case .unavailable, .redirected:
             state = .unavailable(failure)
         }
     }
@@ -459,14 +486,31 @@ final class ServerManager: ObservableObject {
         stop()
     }
 
-    private func requestJSON<T: Decodable>(_ url: URL) async throws -> T {
+    private func requestJSON<T: Decodable>(_ url: URL, expectedOrigin: PhoenixOrigin) async throws -> T {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
+        let delegate = RedirectRejectingURLSessionDelegate(expectedOrigin: expectedOrigin)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw URLError(.badServerResponse)
+            }
+            guard let finalURL = response.url, finalURL == url, expectedOrigin.exactlyMatches(finalURL) else {
+                throw ServerIdentityError.redirected("Phoenix identity verification redirected away from the configured origin.")
+            }
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch let error as ServerIdentityError {
+            throw error
+        } catch let error as URLError where error.code == .badServerResponse {
+            throw error
+        } catch {
+            if let nsError = error as NSError?, nsError.domain == NSURLErrorDomain, nsError.code == URLError.cancelled.rawValue {
+                throw ServerIdentityError.redirected("Phoenix identity verification redirected away from the configured origin.")
+            }
+            throw error
         }
-        return try JSONDecoder().decode(T.self, from: data)
     }
 
     private func deploymentViolation(_ deployment: DeploymentInfo, for selected: ServerMode, version: VersionInfo) -> String? {

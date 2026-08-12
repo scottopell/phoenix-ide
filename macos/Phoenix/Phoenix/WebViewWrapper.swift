@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import UserNotifications
 
 struct WebViewWrapper: NSViewRepresentable {
     let origin: PhoenixOrigin
@@ -74,6 +75,7 @@ struct WebViewWrapper: NSViewRepresentable {
         let onDeployment: (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void
         let onAuthenticationRequired: (ServerManager.ConnectionOperationToken) -> Void
         weak var webView: WKWebView?
+        private var downloadDelegates: [ObjectIdentifier: DownloadDelegate] = [:]
 
         init(
             origin: PhoenixOrigin,
@@ -98,14 +100,32 @@ struct WebViewWrapper: NSViewRepresentable {
                 decisionHandler(.cancel)
                 return
             }
+            if navigationAction.shouldPerformDownload {
+                decisionHandler(.download)
+                return
+            }
+            if navigationAction.targetFrame == nil {
+                openExternallyIfSafe(url)
+                decisionHandler(.cancel)
+                return
+            }
             if navigationAction.navigationType == .linkActivated && !origin.exactlyMatches(url) {
-                let safeExternalSchemes = ["http", "https", "mailto", "tel"]
-                if let scheme = url.scheme?.lowercased(), safeExternalSchemes.contains(scheme) {
-                    NSWorkspace.shared.open(url)
-                }
+                openExternallyIfSafe(url)
                 decisionHandler(.cancel)
             } else {
                 decisionHandler(.allow)
+            }
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            if navigationResponse.canShowMIMEType {
+                decisionHandler(.allow)
+            } else {
+                decisionHandler(.download)
             }
         }
 
@@ -129,11 +149,54 @@ struct WebViewWrapper: NSViewRepresentable {
             type: WKMediaCaptureType,
             decisionHandler: @escaping (WKPermissionDecision) -> Void
         ) {
-            guard let candidate = URL(string: "\(securityOrigin.protocol)://\(securityOrigin.host):\(securityOrigin.port)") else {
+            let policy = PhoenixWebViewPolicy.mediaCaptureDecision(
+                for: SecurityOriginDescriptor(scheme: securityOrigin.protocol, host: securityOrigin.host, port: securityOrigin.port),
+                captureType: mediaCaptureKind(for: type),
+                expectedOrigin: origin
+            )
+            decisionHandler(policy == .grant ? .grant : .deny)
+        }
+
+        #if compiler(>=6.0)
+        @available(macOS 15.0, *)
+        func webView(
+            _ webView: WKWebView,
+            decideNotificationPermissionFor securityOrigin: WKSecurityOrigin,
+            decisionHandler: @escaping (WKPermissionDecision) -> Void
+        ) {
+            let notificationPolicy = PhoenixWebViewPolicy.notificationDecision(
+                for: SecurityOriginDescriptor(scheme: securityOrigin.protocol, host: securityOrigin.host, port: securityOrigin.port),
+                expectedOrigin: origin
+            )
+            guard notificationPolicy == .grant else {
                 decisionHandler(.deny)
                 return
             }
-            decisionHandler(origin.exactlyMatches(candidate) ? .grant : .deny)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
+                DispatchQueue.main.async {
+                    decisionHandler(granted ? .grant : .deny)
+                }
+            }
+        }
+        #endif
+
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            guard let url = navigationAction.request.url else { return nil }
+            openExternallyIfSafe(url)
+            return nil
+        }
+
+        func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+            attachDownloadDelegate(to: download)
+        }
+
+        func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+            attachDownloadDelegate(to: download)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -159,6 +222,56 @@ struct WebViewWrapper: NSViewRepresentable {
         private func verifyDeployment(_ webView: WKWebView) {
             webView.evaluateJavaScript("window.__phoenixMacReportDeployment?.()")
         }
+
+        private func mediaCaptureKind(for type: WKMediaCaptureType) -> MediaCaptureKind {
+            switch type {
+            case .camera:
+                return .camera
+            case .microphone:
+                return .microphone
+            case .cameraAndMicrophone:
+                return .cameraAndMicrophone
+            @unknown default:
+                return .unknown
+            }
+        }
+
+        private func openExternallyIfSafe(_ url: URL) {
+            let safeExternalSchemes = ["http", "https", "mailto", "tel"]
+            if let scheme = url.scheme?.lowercased(), safeExternalSchemes.contains(scheme) {
+                NSWorkspace.shared.open(url)
+            }
+        }
+
+        private func attachDownloadDelegate(to download: WKDownload) {
+            let delegate = DownloadDelegate { [weak self] finishedDownload in
+                self?.downloadDelegates.removeValue(forKey: ObjectIdentifier(finishedDownload))
+            }
+            download.delegate = delegate
+            downloadDelegates[ObjectIdentifier(download)] = delegate
+        }
+    }
+}
+
+private final class DownloadDelegate: NSObject, WKDownloadDelegate {
+    private let onFinish: (WKDownload) -> Void
+
+    init(onFinish: @escaping (WKDownload) -> Void) {
+        self.onFinish = onFinish
+    }
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        completionHandler(downloadsDirectory.appendingPathComponent(suggestedFilename))
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        onFinish(download)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        onFinish(download)
     }
 }
 
