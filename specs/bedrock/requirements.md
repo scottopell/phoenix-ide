@@ -735,21 +735,30 @@ THE SYSTEM SHALL expose the initial Close conversation action
 AND SHALL create the durable Close attempt without stopping work immediately
 AND SHALL require explicit stop-work confirmation before settlement begins
 
-WHEN Close conversation completes for an Open conversation that owns a `WorkScope`
-THE SYSTEM SHALL transition the product conversation to History state
-AND the latest transcript row SHALL NOT accept new user messages
+WHEN Close conversation completes for an ordinary Open ProductConversation with an attached `WorkScope`
+THE SYSTEM SHALL transition that ProductConversation aggregate to History state
+AND the latest transcript row in that aggregate SHALL NOT accept new user messages
 AND SHALL durably persist one Close-outcome system message in the finalization transaction before the aggregate lifecycle announcement is emitted
 
-WHEN a conversation enters History after successful Close completion
+WHEN a ProductConversation enters History after successful Close completion
 THE SYSTEM SHALL emit one aggregate lifecycle announcement for downstream consumers
-AND the conversation SHALL remain visible in the sidebar for reference
-AND the user SHALL be able to start a new conversation on the same project
+AND that ProductConversation SHALL remain visible in the sidebar for reference
+AND the user SHALL be able to start a new ProductConversation on the same project
 
-EACH Close operation SHALL carry one durable Close-attempt identity bound to that ProductConversation
+EACH Close operation SHALL carry one durable Close-attempt identity bound to that exact ProductConversation identity
 AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
 AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, retry, and finalization event to that exact Close-attempt identity
 AND MAY retain completed Close attempts as historical records
 AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
+AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
+AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
+AND SHALL snapshot the exact ordered parent transcript-row continuation topology of that ProductConversation when the attempt is admitted
+AND SHALL bind every snapshot member to both that exact Close attempt and the parent transcript row's explicit ProductConversation membership
+AND SHALL treat subordinate execution conversations as aggregate participants rather than continuation-topology members
+AND SHALL preserve that admitted snapshot unchanged when later topology changes are permitted
+
+WHILE a non-completed Close attempt exists for a ProductConversation
+THE SYSTEM SHALL NOT permit a continuation successor to be created for that ProductConversation
 
 **Rationale:** Closing is the one product-facing way to retire active work. The
 conversation moves to History because its owned live environment is gone; there is no
@@ -760,7 +769,7 @@ separate in-Phoenix merged-versus-abandoned lifecycle.
 ### REQ-BED-030: Context Continuation Inherits Parent Environment
 
 WHEN user initiates continuation from a context-exhausted conversation
-THE SYSTEM SHALL create a new transcript row within the same product conversation that inherits:
+THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same ProductConversation and inherits:
   - the parent's execution authority, preserving whether the latest live row is read-only planning, write-capable against an attached `WorkScope`, or chat-only
   - the parent's working directory
   - the parent's worktree, if any, without destroy-and-recreate
@@ -801,6 +810,29 @@ and therefore one inherited worktree.
 
 ---
 
+### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
+
+EACH ProductConversation SHALL have a typed durable identity whose domain is independent of every transcript-row identity
+AND THE SYSTEM SHALL allocate that identity without deriving it from a root or latest transcript-row identity during runtime creation
+AND SHALL NOT substitute a ProductConversation identity for a transcript-row identity, or the reverse, based on equal underlying bytes
+AND SHALL require every durable conversation row to explicitly belong to exactly one ProductConversation
+AND SHALL distinguish parent transcript rows from subordinate execution participants within that aggregate
+AND SHALL derive root and latest parent transcript rows from the continuation topology within the ProductConversation rather than storing either as a second mutable aggregate authority
+
+WHEN a parent transcript row has a continuation successor
+THE SYSTEM SHALL require that successor to be a parent transcript row in the same ProductConversation
+AND SHALL permit at most one predecessor and one successor for each parent transcript row
+AND SHALL reject cyclic continuation topology
+
+EACH ProductConversation SHALL have exactly one typed kind: ordinary or coordinator
+AND THE SYSTEM SHALL model Open/History lifecycle for ordinary ProductConversations only
+AND SHALL make Open/History lifecycle structurally inapplicable to coordinator ProductConversations rather than representing coordinator lifecycle as an optionally absent ordinary value
+AND SHALL expose ProductConversation lifecycle through one writable authority rather than parallel writable aggregate and transcript-row values
+
+**Rationale:** Aggregate identity, transcript membership, topology, and lifecycle are distinct facts. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner.
+
+---
+
 ### REQ-BED-031: Exhausted Parent Post-Handoff Behavior
 
 WHILE a conversation is in context-exhausted state
@@ -809,7 +841,7 @@ AND preserve its worktree, if any, across server restarts
 AND preserve its branch in git
 
 WHEN a context-exhausted conversation has no continuation
-THE SYSTEM SHALL permit user-initiated Close conversation on that latest row
+THE SYSTEM SHALL permit user-initiated Close on that latest row of the same ordinary Open ProductConversation
 AND SHALL apply the same close contract and worktree/resource disposition as Close from a non-terminal state
 AND SHALL route any direct-turn-owned runtime work, wake deliveries, tool execution, sub-agent execution, and other child work through the durable workflow profile's typed effects and reconciliation machinery rather than through parent-row callbacks that mutate conversation state directly
 
@@ -842,8 +874,8 @@ boundaries so restart/replay and Close settlement share one authority.
 
 ### REQ-BED-031A: Start Follow-up Creates a Fresh Open Conversation from History
 
-WHEN the user starts a follow-up from a History conversation
-THE SYSTEM SHALL create a separate Open conversation rather than reopening or continuing the historical one
+WHEN the user starts a follow-up from a History ProductConversation
+THE SYSTEM SHALL create a separate Open ProductConversation rather than reopening or continuing the historical one
 AND SHALL attach a fresh `WorkScope`
 AND SHALL provision a fresh detached-default-branch disposable worktree when the follow-up is Git-backed
 AND SHALL treat that follow-up as an independent ProductConversation rather than as a sub-agent or continuation attachment to the source `WorkScope`
@@ -861,7 +893,7 @@ AND SHALL render that Follow-up relationship visibly from the source conversatio
 
 WHEN the user permanently deletes a History conversation
 THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus every solely-owned normalized child row required by that aggregate
-AND SHALL explicitly delete solely-owned message rows, tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
+AND SHALL explicitly delete solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
 AND SHALL preserve typed tombstone-grade source identity needed by surviving provenance consumers
 AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
 
@@ -900,8 +932,7 @@ following sequence of direct calls in order:
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
    Chrome session for the scope unless another still-live owner retains the
    same `WorkScope` (REQ-BROWSER-WS-003)
-6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned message rows,
-   tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
+6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
    separately-owned conversations, branches, and pull requests untouched
 7. Broadcast `ConversationHardDeleted` for UI consumers
 

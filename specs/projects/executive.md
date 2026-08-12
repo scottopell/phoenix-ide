@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-Projects covers how Phoenix detects Git-backed directories, provisions repository-backed conversations, exposes branch discovery, and presents current repository/worktree context in the UI. It also remains the main compatibility home for the shipped mode-based product model while unified Open/History lifecycle work is still spec-first.
+Projects covers how Phoenix detects Git-backed directories, provisions repository-backed conversations, exposes branch discovery, and presents current repository/worktree context in the UI. It also remains the main compatibility home for the shipped mode-based product model while unified Open/History lifecycle work is staged. The normative target groups by ProductConversation aggregate identity and keeps ProductConversation-to-WorkScope attachment derived from shipped authority until every attachment reader and writer can move together.
 
 ## Current Reality
 
@@ -33,11 +33,11 @@ Phoenix persists mode-derived Git context through `cm_*` conversation columns re
 | **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Tool is exposed in shipped eligible modes, but the unified approval-placement model is not implemented |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Explore-mode sandbox gating remains shipped |
 | **REQ-PROJ-014:** Project UI | ✅ Complete (legacy current reality) | UI still exposes mode badges, branch/base/task context, and branch-oriented entry points |
-| **REQ-PROJ-015:** Project Worktree Registry | Descoped | Persisted work-scope/conversation ownership is the effective authority |
+| **REQ-PROJ-015:** Project Worktree Registry | 🟡 Partial | Persisted row-level WorkScope fields and continuation-aware reconciliation are shipped; stable ProductConversation identity and distinct-aggregate attachment/conflict evaluation remain migration targets. |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by Direct |
 | **REQ-PROJ-017:** Base Branch Tracking in Work Mode | ✅ Complete (legacy current reality) | Work/Branch still persist base-branch metadata |
 | **REQ-PROJ-018:** Direct Mode | ✅ Complete (legacy current reality) | Direct remains the default shipped mode |
-| **REQ-PROJ-019:** Conversation List Filtering | ✅ Complete (legacy current reality) | Sidebar still filters around active/archived and project groupings, not Open/History aggregates |
+| **REQ-PROJ-019:** Conversation List Filtering and Explicit Close | 🟡 Partial | Sidebar filtering is shipped around active/archived and project groupings; explicit Close and Open/History ProductConversation projection remain unimplemented, and dormant aggregate lifecycle is not reader authority. |
 | **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker remains shipped |
 | **REQ-PROJ-021:** Remote Branch Search (On-Demand) | ✅ Complete | Cached `git ls-remote` search remains shipped |
 | **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | ✅ Complete | Existing worktree provisioning still does bounded branch fetch/materialization |
@@ -57,6 +57,7 @@ Phoenix persists mode-derived Git context through `cm_*` conversation columns re
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode fork eligibility remains unimplemented |
 | **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only | Not implemented |
 | **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Diff/review still reads live checkout state rather than persisted assumptions |
+| **REQ-PROJ-WS-001:** WorkScope as Resource Owner | 🟡 Partial | WorkScope resource ownership is shipped, but ProductConversation attachment still uses row-level authority; the normalized single-writer cutover remains deferred. |
 
 ## Verification Notes
 
@@ -69,7 +70,7 @@ Current-reality checks for this reconciliation used code anchors rather than nor
 ## Dependencies
 
 - `specs/bedrock/` — reducer/runtime lifecycle and approval states still underpin the current mode-based behavior
-- `specs/work-lifecycle/` — current mark-merged / abandon surfaces live there while Close→History remains unimplemented
+- `specs/work-lifecycle/` — current mark-merged / abandon surfaces and legacy attachment authority remain live while Close→History and coordinated attachment cutovers remain unimplemented
 - `specs/pr-association/` — PR observation, freshness, and active-selection behavior
 - `specs/work-scope-ui/` — resource visibility for the attached work scope
 - `specs/chains/` — chain-era compatibility surface still depends on continuation topology retained here

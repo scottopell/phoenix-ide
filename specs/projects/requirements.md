@@ -351,29 +351,30 @@ THE SYSTEM SHALL indicate its current capabilities and whether it is Open or in 
 
 ### REQ-PROJ-015: Project Worktree Registry
 
-WHEN a Phoenix-owned disposable worktree exists for a conversation
-THE SYSTEM SHALL register enough data to report its owning conversation, stable owning ProductConversation, worktree path, and `WorkScope`
+WHEN a Phoenix-owned disposable worktree exists for a ProductConversation
+THE SYSTEM SHALL register enough data to report that stable ProductConversation identity, its topology-derived latest parent transcript row, worktree path, and `WorkScope`
 
 WHEN the server starts
 THE SYSTEM SHALL reconcile the registry against worktrees on disk
 AND clean up orphaned registry entries
 AND report worktrees that exist on disk but have no registry entry
 
-WHEN a conversation is in context-exhausted state and has not transferred ownership through `continued_in_conv_id`
+WHEN a parent transcript row is in context-exhausted state and has no continuation successor through `continued_in_conv_id`
 THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 
 WHEN a transcript row has transferred execution through `continued_in_conv_id`
 THE SYSTEM SHALL treat that row as a historical transcript segment rather than as an independent WorkScope authority
 AND SHALL derive the latest execution row from continuation topology rather than storing a second ownership authority
 AND SHALL keep the same stable ProductConversation-scoped `WorkScope` identity and the same filesystem worktree path across that continuation
-AND SHALL preserve the worktree only while a non-History open product conversation still has that same `WorkScope` attached
+AND SHALL preserve the worktree only while an ordinary Open ProductConversation still has that same `WorkScope` attached
 
 WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
-AND another live conversation still resolves to the same `WorkScope`
+AND a distinct ordinary Open ProductConversation still resolves to the same `WorkScope`, or persisted transcript membership and attachment records cannot prove whether such a distinct Open aggregate exists
 THE SYSTEM SHALL preserve the worktree
 
 WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
-AND no other live conversation resolves to its `WorkScope`
+AND no distinct ordinary Open ProductConversation resolves to its `WorkScope`
+AND every persisted transcript row and attachment record for that `WorkScope` resolves to a known ProductConversation
 THE SYSTEM SHALL remove the worktree when safe to do so
 AND SHALL NOT create, delete, or rewrite a branch as part of that reclamation
 
@@ -700,5 +701,5 @@ AND SHALL keep the worktree checkout's remote relationship distinct from the bas
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner
 
-Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from conversation ids, transcript-row ids, sub-agent ids, working directories, or worktree paths. Product conversations, transcript rows, and subordinate execution conversations MAY have a `WorkScope` attached, but attachment is not ownership. When continuation creates a new execution row within the same product conversation, the conversation keeps the same attached `WorkScope`; Phoenix SHALL NOT describe that step as transferring WorkScope ownership from one row to another or as electing a latest row owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Distinct product conversations remain isolated by distinct WorkScope identities even when their environments use the same path.
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from ProductConversation ids, transcript-row ids, sub-agent ids, working directories, or worktree paths. ProductConversations, transcript rows, and subordinate execution conversations MAY have a `WorkScope` attached, but attachment is not ownership. THE SYSTEM SHALL expose ProductConversation-to-WorkScope attachments through exactly one authoritative writable representation and SHALL treat every other attachment representation as a read-only derivation rather than a parallel writable authority. When continuation creates a new execution row within the same ProductConversation, the ProductConversation keeps the same attached `WorkScope`; Phoenix SHALL NOT describe that step as transferring WorkScope ownership from one row to another or as electing a latest row owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Distinct ProductConversations remain isolated by distinct WorkScope identities even when their environments use the same path.
 

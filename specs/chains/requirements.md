@@ -12,10 +12,10 @@ normal conversation list and want one place where I can:
 - ask a recall question across the whole workstream without reopening
   old rows or re-explaining the context
 
-I do not want Phoenix to make me manage a separate product object for
-that lineage. The durable root conversation is the product identity, and
-continuation-linked rows are implementation topology Phoenix uses to
-preserve the history of that one product conversation.
+I do not want Phoenix to make me manage a separate lineage object. The
+durable ProductConversation is the one product identity, and
+continuation-linked transcript rows are implementation topology Phoenix uses
+to preserve the history of that one ProductConversation.
 
 ## Why the User Cares
 
@@ -61,19 +61,19 @@ rather than forcing the user to replay it manually.
 
 ### REQ-CHN-002: Continuation Lineage Is Navigation Topology, Not a Separate Product Entity
 
-WHEN two or more stored conversation rows share a linear handoff lineage
+WHEN two or more stored transcript rows share a linear handoff lineage
 through `continued_in_conv_id`
-THE SYSTEM SHALL treat them as one product conversation whose durable
-identity is the root conversation row
+THE SYSTEM SHALL require them to belong explicitly to one ProductConversation
+whose durable identity is independent of every transcript-row identity
 
-THE SYSTEM SHALL render that product conversation as a single entry in
-conversation navigation surfaces keyed by the durable root conversation
+THE SYSTEM SHALL render that ProductConversation as a single entry in
+conversation navigation surfaces keyed by its durable aggregate identity
 rather than as nested member rows under a separate chain header
 
-WHEN a conversation has no continuation lineage beyond its durable root
-row
-THE SYSTEM SHALL still render it as one product conversation entry using
-that same root-keyed identity model
+WHEN a ProductConversation has no continuation lineage beyond its root
+transcript row
+THE SYSTEM SHALL still render it as one ProductConversation entry using
+that same aggregate identity model
 
 **Rationale:** Continuation rows preserve transcript topology and latest-row
 authority, but the user-facing product object remains one conversation.
@@ -87,7 +87,7 @@ second product identity for the same work.
 WHEN the user opens a product conversation whose history spans
 continuation-linked rows
 THE SYSTEM SHALL navigate to the normal conversation surface for the
-root conversation
+ProductConversation aggregate
 AND that surface SHALL render the transcript history in lineage order
 and host any lineage-wide recall interaction on that same page
 
@@ -132,9 +132,9 @@ product conversation
 THE SYSTEM SHALL display the prior questions and answers when that same
 conversation surface is reopened
 
-THE persisted Q&A history MAY remain attached to the durable root
-conversation row so long as the user experiences it as history belonging
-to that one product conversation rather than to a separate chain object
+THE persisted Q&A history SHALL belong to the durable ProductConversation
+aggregate so the user experiences it as history belonging to that one
+product conversation rather than to a separate chain object
 
 WHEN a stored Q&A answer was produced before the lineage grew or later
 member rows accumulated additional messages
@@ -147,7 +147,7 @@ THE SYSTEM SHALL render the question and a clear failure indicator so the
 user sees their question was not lost and can re-ask if desired
 
 **Rationale:** Users return to prior recall answers. Persisting that
-history on the root is acceptable if it preserves one conversation-level
+history on the aggregate preserves one conversation-level
 experience and does not invent a separate Q&A lifecycle.
 
 ---
@@ -171,14 +171,14 @@ a new question.
 
 ---
 
-### REQ-CHN-007: Conversation Title Belongs to the Root Product Conversation
+### REQ-CHN-007: Conversation Title Belongs to the ProductConversation Aggregate
 
 WHEN a continuation-linked lineage is surfaced to the user
-THE SYSTEM SHALL identify it using the root product conversation's title
+THE SYSTEM SHALL identify it using the ProductConversation aggregate's title
 or rename value
 
 THE SYSTEM SHALL treat conversation naming as part of the normal
-conversation title/rename behavior for that root product conversation
+conversation title/rename behavior for that ProductConversation
 rather than as a separate chain-specific naming action or lifecycle
 
 THE SYSTEM SHALL apply the chosen title consistently anywhere this one
@@ -200,8 +200,9 @@ and any associated task context — and its pull-request health when an
 associated PR exists: `display_state` (open / draft / merged / closed),
 checks, and feedback-freshness signal
 
-THE SYSTEM SHALL resolve this work identity from the attached
-`WorkScope` / latest live conversation-row authority and present it on
+THE SYSTEM SHALL resolve the attached `WorkScope` from the ProductConversation
+attachment authority, derive live execution-state fields from the latest parent
+transcript row, and present both on
 the normal conversation surface rather than requiring a separate chain
 surface
 
@@ -210,9 +211,8 @@ THE SYSTEM SHALL indicate the absence of a Git-backed work scope rather
 than rendering empty worktree/branch/PR fields
 
 **Rationale:** The user needs to know what work this conversation is
-attached to now. That identity belongs beside the transcript on the
-ordinary page, even though the underlying authority resolves through the
-latest live row.
+attached to now. Aggregate attachment and latest-row execution state belong
+beside the transcript without making that row the attachment owner.
 
 ---
 
@@ -229,7 +229,7 @@ THE agent's tools SHALL be scope-bound to that one product conversation:
 the search tool retrieves only across that conversation's member rows,
 and the read tool can fetch only the content of rows in that lineage
 
-THE host SHALL bind the durable root conversation identity and resolve
+THE host SHALL bind the durable ProductConversation identity and resolve
 the member-row set live per tool call rather than freezing it at run
 start
 
@@ -255,7 +255,7 @@ conversation unless the user includes that context in the new question
 
 **Rationale:** The user wants Phoenix to dig through the whole
 conversation lineage, not through a lossy summary bundle. Binding the
-agent to one root-keyed product conversation preserves that scope
+agent to one aggregate-keyed ProductConversation preserves that scope
 without inventing a second product entity.
 
 ---
@@ -265,15 +265,15 @@ without inventing a second product entity.
 WHEN a product conversation spans continuation-linked rows
 THE SYSTEM SHALL NOT introduce separate chain-specific rename,
 regenerate-name, archive, unarchive, delete, or dedicated management
-actions that duplicate ordinary conversation actions for the same root
-product conversation
+actions that duplicate ordinary conversation actions for the same
+ProductConversation
 
 THE SYSTEM SHALL treat continuation lineage as transcript/retrieval
 scope within the product conversation rather than as a separately named,
 archivable, or deletable object
 
 **Rationale:** Separate management actions would imply a second
-user-facing object with its own lifecycle. One root-keyed
+user-facing object with its own lifecycle. One aggregate-keyed
 ProductConversation already carries the transcript history and recall
 scope for that work.
 
@@ -288,12 +288,12 @@ scope for that work.
 - **Separate chain page, route, or sidebar container.** The conversation
   page is the surface; dedicated chain navigation is explicitly not part
   of the product model.
-- **Separate chain rename or regenerate-name flow.** Conversation title
-  behavior on the root product conversation is sufficient.
+- **Separate chain rename or regenerate-name flow.** ProductConversation title
+  behavior is sufficient.
 - **Separate chain archive or delete lifecycle.** Ordinary conversation
   lifecycle rules apply; there is no second chain lifecycle.
 - **Follow-up Q&A with prior-answer model context.** Recall questions are
   intentionally independent.
-- **Cross-conversation comparison outside one root-keyed product
-  conversation.** This spec scopes recall to one product conversation's
+- **Cross-conversation comparison outside one ProductConversation.** This
+  spec scopes recall to one ProductConversation's
   continuation lineage.

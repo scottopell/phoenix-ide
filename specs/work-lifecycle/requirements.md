@@ -116,15 +116,15 @@ THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the C
 ### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
 
 WHEN bedrock requests resource retirement for one exact Close attempt
-THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
+THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that ProductConversation operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
 
 THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
-AND SHALL derive cleanup authority only from the root product conversation's committed Close retirement operation targeting that attached `WorkScope`
+AND SHALL derive cleanup authority only from the exact ProductConversation's committed Close retirement operation targeting that attached `WorkScope`
 
-THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same open product conversation as participants in that one aggregate rather than as independent WorkScope owners
-AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the product conversation's attached `WorkScope`
+THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same ordinary Open ProductConversation as participants in that one aggregate rather than as independent WorkScope owners
+AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the ProductConversation's attached `WorkScope`
 
-THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate open product conversation that also resolves to the same `WorkScope`, or from unresolved conversation-identity evidence that prevents Phoenix from proving whether another open product aggregate exists
+THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate ordinary Open ProductConversation that also resolves to the same `WorkScope`, or from unresolved ProductConversation-identity evidence that prevents Phoenix from proving whether another Open product aggregate exists
 AND SHALL block destructive teardown only for that distinct-open-aggregate or unresolved-identity-conflict case
 
 THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records per-owned-resource completion or residual-error evidence as each step is attempted so retries can safely continue from the exact prior state

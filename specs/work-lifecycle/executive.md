@@ -6,7 +6,7 @@ The work lifecycle spec now describes the intended user-facing **Close conversat
 
 ## Current Reality
 
-That unified lifecycle is not yet the shipped product behavior. Phoenix still exposes legacy terminal actions instead of Close: `POST /api/conversations/:id/abandon-task` and `POST /api/conversations/:id/mark-merged` are live, and both continue to gate on the current conversation row plus `continued_in_conv_id` compatibility checks in `crates/phoenix-ide/src/api/lifecycle_handlers.rs`. Archive is still a separate ordinary API action (`POST /api/conversations/:id/archive`) backed by `archived` row state rather than the future Open/History aggregate transition. Legacy cleanup logic still captures abandon diff state and still distinguishes branch-disposition by legacy mode/worktree semantics.
+That unified lifecycle is not yet the shipped product behavior. Phoenix still exposes legacy terminal actions instead of Close: `POST /api/conversations/:id/abandon-task` and `POST /api/conversations/:id/mark-merged` are live, and both continue to gate on the current conversation row plus `continued_in_conv_id` compatibility checks in `crates/phoenix-ide/src/api/lifecycle_handlers.rs`. Archive is still a separate ordinary API action (`POST /api/conversations/:id/archive`) backed by `archived` row state rather than the future Open/History aggregate transition. Existing row-level WorkScope fields remain attachment authority; the dormant ProductConversation projection is read-only, with no parallel writable normalized attachment relation. Legacy cleanup logic still captures abandon diff state and still distinguishes branch-disposition by legacy mode/worktree semantics.
 
 ## Requirements Summary
 
@@ -20,7 +20,7 @@ That unified lifecycle is not yet the shipped product behavior. Phoenix still ex
 
 ## Normative Authority
 
-Current normative authority is `requirements.md`, `specs/bedrock/bedrock.allium`, and ADR-026. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
+Current normative authority is `requirements.md`, `work-lifecycle.allium`, and `specs/bedrock/bedrock.allium`. ADR-026 records WorkScope resource ownership; ADR-031 records staged single authority for ProductConversation lifecycle and attachment persistence. This executive intentionally reports current implementation drift instead of treating the normative Close model as shipped.
 
 ## Implementation Status
 
