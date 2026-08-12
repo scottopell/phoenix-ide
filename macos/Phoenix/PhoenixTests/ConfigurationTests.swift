@@ -24,20 +24,39 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testLoadCandidateRejectsRemoteCleartextAttachedOrigin() {
+        XCTAssertThrowsError(
+            try ConfigurationStore.loadCandidate(
+                kind: .attached,
+                attachedOrigin: "http://phoenix.example.test:8031",
+                bundledPort: ConfigurationStore.defaultBundledPort,
+                developmentBinaryOverride: "",
+                rustLogLevel: "phoenix_ide=info"
+            )
+        ) { error in
+            XCTAssertEqual(error as? ConfigurationError, .invalidAttachedCleartextOrigin)
+        }
+    }
+
     func testBundledEnvironmentIsLoopbackTLSOffAndPrivate() throws {
         let root = URL(fileURLWithPath: "/tmp/Phoenix Tests")
         let configuration = BundledServerConfiguration(
             origin: try PhoenixOrigin("http://127.0.0.1:8420"),
             executableURL: root.appendingPathComponent("phoenix_ide"),
-            databaseURL: root.appendingPathComponent("phoenix.db"),
-            logURL: root.appendingPathComponent("phoenix.log"),
-            ownerLockURL: root.appendingPathComponent("owner.lock"),
+            runtimeRootURL: root,
+            dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
+            databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
+            logURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            ownerLockURL: root.appendingPathComponent(".phoenix-ide/owner.lock"),
             rustLogLevel: "phoenix_ide=debug"
         )
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_BIND_ADDR"], "127.0.0.1")
+        XCTAssertEqual(configuration.publicEnvironment["HOME"], "/tmp/Phoenix Tests")
+        XCTAssertEqual(configuration.publicEnvironment["CODEX_HOME"], "/tmp/Phoenix Tests/.codex")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DATA_DIR"], "/tmp/Phoenix Tests/.phoenix-ide")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_PORT"], "8420")
-        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/phoenix.db")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.db")
         XCTAssertNil(configuration.publicEnvironment["ANTHROPIC_API_KEY"])
         XCTAssertNil(configuration.publicEnvironment["PHOENIX_PASSWORD"])
     }
@@ -83,13 +102,21 @@ final class ConfigurationTests: XCTestCase {
         let bundledConfig = BundledServerConfiguration(
             origin: try PhoenixOrigin("http://127.0.0.1:8420"),
             executableURL: root.appendingPathComponent("phoenix_ide"),
-            databaseURL: root.appendingPathComponent("phoenix.db"),
-            logURL: root.appendingPathComponent("phoenix.log"),
-            ownerLockURL: root.appendingPathComponent("owner.lock"),
+            runtimeRootURL: root,
+            dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
+            databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
+            logURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            ownerLockURL: root.appendingPathComponent(".phoenix-ide/owner.lock"),
             rustLogLevel: "info"
         )
         let bundled = ServerMode.bundled(bundledConfig)
         XCTAssertEqual(bundled.kind, .bundled)
         XCTAssertEqual(bundled.origin.description, "http://127.0.0.1:8420")
+    }
+
+    func testDeploymentInfoDecodesOptionalInstanceID() throws {
+        let json = Data(#"{"build":{"version":"1.0","git_sha":"abc"},"network":{"bind_address":"127.0.0.1:8420","socket_activated":false,"tls":{"enabled":false,"mode":null}},"instance_id":"123e4567-e89b-12d3-a456-426614174000","local_access":true,"installation_ownership":{"kind":"development"}}"#.utf8)
+        let deployment = try JSONDecoder().decode(DeploymentInfo.self, from: json)
+        XCTAssertEqual(deployment.instanceID, "123e4567-e89b-12d3-a456-426614174000")
     }
 }

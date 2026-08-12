@@ -63,6 +63,7 @@ pub struct DeploymentConfig {
     pub tls: TlsInfo,
     pub log: LogInfo,
     pub locations: Vec<DiskLocation>,
+    pub instance_id: Option<String>,
 }
 
 // ============================================================
@@ -76,6 +77,10 @@ pub struct DeploymentInfo {
     pub build: BuildInfo,
     pub network: NetworkInfo,
     pub log: LogInfo,
+    /// Typed per-process launch identity supplied by the launcher when it needs
+    /// to correlate readiness to one exact sidecar instance. `None` for normal
+    /// Phoenix deployments that were not launched under such a contract.
+    pub instance_id: Option<String>,
     /// Whether the requesting browser is on the server host, and so may use
     /// host-local actions like revealing a path in the OS file manager. False
     /// for any remote browser — the file-manager window opens on the server's
@@ -340,6 +345,7 @@ pub async fn deployment_info(
         network,
         installation_ownership: installation_ownership::detect(&state.runtime_env).await,
         log: cfg.log.clone(),
+        instance_id: cfg.instance_id.clone(),
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
     })
@@ -1117,6 +1123,7 @@ impl DeploymentConfig {
                 fatal_file: None,
             },
             locations: Vec::new(),
+            instance_id: None,
         }
     }
 }

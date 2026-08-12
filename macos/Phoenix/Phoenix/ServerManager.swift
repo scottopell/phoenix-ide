@@ -57,11 +57,17 @@ struct ServerStatusSnapshot {
     let tlsEnabled: Bool?
     let socketActivated: Bool?
     let localAccess: Bool?
+    let instanceID: String?
     let processID: Int32?
     let executablePath: String?
     let databasePath: String?
     let logPath: String?
     let recentLogLines: [String]
+}
+
+private struct LaunchedBundledInstance {
+    let configuration: BundledServerConfiguration
+    let instanceID: UUID
 }
 
 @MainActor
@@ -78,6 +84,7 @@ final class ServerManager: ObservableObject {
     private var recentLines: [String] = []
     private var ownerLockDescriptor: Int32?
     private var operationID = UUID()
+    private var launchedBundledInstance: LaunchedBundledInstance?
     private let keychain = KeychainStore()
 
     init() {
@@ -107,9 +114,20 @@ final class ServerManager: ObservableObject {
     }
 
     func reconnect() {
-        switch mode {
-        case .bundled?: restartBundled()
-        default: connect()
+        do {
+            let candidate = try ConfigurationStore.load()
+            try reconnect(to: candidate)
+        } catch {
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    func reconnect(to candidate: ServerMode) throws {
+        switch (mode, candidate) {
+        case (.bundled, .bundled):
+            restartBundled(with: candidate)
+        default:
+            connect()
         }
     }
 
@@ -173,6 +191,7 @@ final class ServerManager: ObservableObject {
             tlsEnabled: deployment?.network.tls.enabled,
             socketActivated: deployment?.network.socketActivated,
             localAccess: deployment?.localAccess,
+            instanceID: deployment?.instanceID ?? launchedBundledInstance?.instanceID.uuidString,
             processID: process?.processIdentifier,
             executablePath: bundled?.executableURL.path,
             databasePath: bundled?.databaseURL.path,
@@ -199,60 +218,66 @@ final class ServerManager: ObservableObject {
         state = .startingSidecar
         recentLines = []
 
-        try FileManager.default.createDirectory(
-            at: configuration.databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        FileManager.default.createFile(atPath: configuration.logURL.path, contents: nil)
-        logFileHandle = try FileHandle(forWritingTo: configuration.logURL)
-        try logFileHandle?.seekToEnd()
-
-        let inherited = ProcessInfo.processInfo.environment
-        var environment = [
-            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
-            "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
-            "LANG": inherited["LANG"] ?? "en_US.UTF-8",
-        ]
-        for (key, value) in configuration.publicEnvironment { environment[key] = value }
-        for (key, value) in keychain.processEnvironment() { environment[key] = value }
-
-        let launched = Process()
-        launched.executableURL = configuration.executableURL
-        launched.environment = environment
-        launched.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-        launched.qualityOfService = .userInitiated
-
-        let pipe = Pipe()
-        launched.standardOutput = pipe
-        launched.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            Task { @MainActor in self?.recordOutput(data) }
-        }
-        launched.terminationHandler = { [weak self] terminated in
-            Task { @MainActor in self?.processExited(terminated, operation: operation) }
-        }
-
         do {
+            try FileManager.default.createDirectory(at: configuration.runtimeRootURL, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: configuration.logURL.path, contents: nil)
+            logFileHandle = try FileHandle(forWritingTo: configuration.logURL)
+            try logFileHandle?.seekToEnd()
+
+            let inherited = ProcessInfo.processInfo.environment
+            let instanceID = UUID()
+            var environment = [
+                "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
+                "LANG": inherited["LANG"] ?? "en_US.UTF-8",
+                "PHOENIX_INSTANCE_ID": instanceID.uuidString,
+            ]
+            for (key, value) in configuration.publicEnvironment { environment[key] = value }
+            for (key, value) in keychain.processEnvironment() { environment[key] = value }
+
+            let launched = Process()
+            launched.executableURL = configuration.executableURL
+            launched.environment = environment
+            launched.currentDirectoryURL = configuration.runtimeRootURL
+            launched.qualityOfService = .userInitiated
+
+            let pipe = Pipe()
+            launched.standardOutput = pipe
+            launched.standardError = pipe
+            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                Task { @MainActor in self?.recordOutput(data) }
+            }
+            launched.terminationHandler = { [weak self] terminated in
+                Task { @MainActor in self?.processExited(terminated, operation: operation) }
+            }
+
             try launched.run()
+            process = launched
+            launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: instanceID)
+            readinessTask = Task { [weak self] in
+                await self?.waitForBundledIdentity(operation: operation)
+            }
         } catch {
-            try? logFileHandle?.close()
-            logFileHandle = nil
-            releaseOwnerLock()
+            cleanupLaunchPreparationFailure()
             throw error
-        }
-        process = launched
-        readinessTask = Task { [weak self] in
-            await self?.waitForBundledIdentity(configuration, operation: operation)
         }
     }
 
-    private func restartBundled() {
+    private func restartBundled(with candidate: ServerMode) {
         guard case .bundled = mode else { return }
         state = .restarting
-        stop { [weak self] in self?.connect() }
+        stop { [weak self] in
+            guard let self else { return }
+            self.mode = candidate
+            self.webOrigin = candidate.origin
+            self.connect()
+        }
     }
 
     private func verifyIdentity(for selected: ServerMode, operation: UUID) async {
@@ -278,11 +303,15 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    private func waitForBundledIdentity(_ configuration: BundledServerConfiguration, operation: UUID) async {
+    private func waitForBundledIdentity(operation: UUID) async {
         let deadline = ContinuousClock.now + .seconds(30)
         while !Task.isCancelled && ContinuousClock.now < deadline {
-            await verifyIdentity(for: .bundled(configuration), operation: operation)
-            if state.canDisplayWebView { return }
+            guard let launchedBundledInstance else { return }
+            await verifyIdentity(for: .bundled(launchedBundledInstance.configuration), operation: operation)
+            if case .ready(_, let deployment) = state,
+               deployment.instanceID == launchedBundledInstance.instanceID.uuidString {
+                return
+            }
             try? await Task.sleep(for: .milliseconds(300))
         }
         guard operation == operationID, process?.isRunning == true else { return }
@@ -317,6 +346,9 @@ final class ServerManager: ObservableObject {
             guard !deployment.installationOwnership.grantsManagedAuthority else {
                 return "Bundled Phoenix unexpectedly claimed managed update authority."
             }
+            guard deploymentMatchesLaunchedInstance(deployment) else {
+                return "Bundled Phoenix responded from a different launch instance than the sidecar Phoenix.app started."
+            }
         }
         return nil
     }
@@ -326,6 +358,7 @@ final class ServerManager: ObservableObject {
         stopDeadline?.cancel()
         stopDeadline = nil
         process = nil
+        launchedBundledInstance = nil
         releaseOwnerLock()
         try? logFileHandle?.close()
         logFileHandle = nil
@@ -341,10 +374,23 @@ final class ServerManager: ObservableObject {
         }
     }
 
+    private func cleanupLaunchPreparationFailure() {
+        launchedBundledInstance = nil
+        try? logFileHandle?.close()
+        logFileHandle = nil
+        releaseOwnerLock()
+    }
+
+    private func deploymentMatchesLaunchedInstance(_ deployment: DeploymentInfo?) -> Bool {
+        guard let launchedBundledInstance else { return true }
+        return deployment?.instanceID == launchedBundledInstance.instanceID.uuidString
+    }
+
     private func finishStop() {
         stopDeadline?.cancel()
         stopDeadline = nil
         process = nil
+        launchedBundledInstance = nil
         releaseOwnerLock()
         state = .stopped
         finishStopCallbacksOnly()

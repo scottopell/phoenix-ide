@@ -63,8 +63,19 @@ struct SettingsView: View {
                     .foregroundStyle(stateColor)
                 Spacer()
                 Button("Apply and Connect") {
-                    savedSignature = signature
-                    serverManager.reconnect()
+                    do {
+                        let candidate = try ConfigurationStore.loadCandidate(
+                            kind: selectedKind,
+                            attachedOrigin: attachedOrigin,
+                            bundledPort: bundledPort,
+                            developmentBinaryOverride: developmentBinary,
+                            rustLogLevel: rustLogLevel
+                        )
+                        savedSignature = signature
+                        try serverManager.reconnect(to: candidate)
+                    } catch {
+                        keychainMessage = error.localizedDescription
+                    }
                 }
                 .buttonStyle(.borderedProminent)
             }

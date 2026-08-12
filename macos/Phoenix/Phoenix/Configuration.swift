@@ -72,6 +72,7 @@ enum ConfigurationError: LocalizedError {
     case invalidPort
     case bundledBinaryMissing
     case bundledDataInUse
+    case invalidAttachedCleartextOrigin
 
     var errorDescription: String? {
         switch self {
@@ -79,6 +80,7 @@ enum ConfigurationError: LocalizedError {
         case .invalidPort: "Bundled Phoenix port must be between 1024 and 65535."
         case .bundledBinaryMissing: "The Phoenix sidecar is not present in this app bundle."
         case .bundledDataInUse: "Another Phoenix.app instance owns the bundled data directory."
+        case .invalidAttachedCleartextOrigin: "HTTP attached origins are supported only for localhost or loopback addresses. Use HTTPS for remote hosts."
         }
     }
 }
@@ -90,6 +92,8 @@ struct AttachedServerConfiguration: Equatable {
 struct BundledServerConfiguration: Equatable {
     let origin: PhoenixOrigin
     let executableURL: URL
+    let runtimeRootURL: URL
+    let dataDirectoryURL: URL
     let databaseURL: URL
     let logURL: URL
     let ownerLockURL: URL
@@ -97,6 +101,9 @@ struct BundledServerConfiguration: Equatable {
 
     var publicEnvironment: [String: String] {
         [
+            "HOME": runtimeRootURL.path,
+            "CODEX_HOME": runtimeRootURL.appendingPathComponent(".codex", isDirectory: true).path,
+            "PHOENIX_DATA_DIR": dataDirectoryURL.path,
             "PHOENIX_BIND_ADDR": "127.0.0.1",
             "PHOENIX_TLS": "off",
             "PHOENIX_PORT": String(origin.url.port!),
@@ -130,28 +137,49 @@ enum ConfigurationStore {
     static let defaultBundledPort = 8420
 
     static func load(bundle: Bundle = .main, defaults: UserDefaults = .standard) throws -> ServerMode {
-        let kind = defaults.string(forKey: PreferenceKey.serverMode)
-            .flatMap(ServerModeKind.init(rawValue:)) ?? .attached
+        try loadCandidate(
+            kind: defaults.string(forKey: PreferenceKey.serverMode)
+                .flatMap(ServerModeKind.init(rawValue:)) ?? .attached,
+            attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin) ?? defaultAttachedOrigin,
+            bundledPort: defaults.integer(forKey: PreferenceKey.bundledPort),
+            developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary) ?? "",
+            rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel) ?? "phoenix_ide=info",
+            bundle: bundle
+        )
+    }
+
+    static func loadCandidate(
+        kind: ServerModeKind,
+        attachedOrigin: String,
+        bundledPort: Int,
+        developmentBinaryOverride: String,
+        rustLogLevel: String,
+        bundle: Bundle = .main
+    ) throws -> ServerMode {
         switch kind {
         case .attached:
-            let raw = defaults.string(forKey: PreferenceKey.attachedOrigin) ?? defaultAttachedOrigin
-            return .attached(AttachedServerConfiguration(origin: try PhoenixOrigin(raw)))
+            let origin = try PhoenixOrigin(attachedOrigin)
+            try validateAttachedOriginTransport(origin)
+            return .attached(AttachedServerConfiguration(origin: origin))
         case .bundled:
-            let storedPort = defaults.integer(forKey: PreferenceKey.bundledPort)
-            let port = storedPort == 0 ? defaultBundledPort : storedPort
+            let port = bundledPort == 0 ? defaultBundledPort : bundledPort
             guard (1024...65535).contains(port) else { throw ConfigurationError.invalidPort }
             let root = try applicationSupportRoot()
-            let executable = bundledExecutable(bundle: bundle, defaults: defaults)
+            let executable = bundledExecutable(bundle: bundle, developmentBinaryOverride: developmentBinaryOverride)
             guard FileManager.default.isExecutableFile(atPath: executable.path) else {
                 throw ConfigurationError.bundledBinaryMissing
             }
+            let runtimeRoot = root.appendingPathComponent("sidecar-home", isDirectory: true)
+            let dataDir = runtimeRoot.appendingPathComponent(".phoenix-ide", isDirectory: true)
             return .bundled(BundledServerConfiguration(
                 origin: try PhoenixOrigin("http://127.0.0.1:\(port)"),
                 executableURL: executable,
-                databaseURL: root.appendingPathComponent("phoenix.db"),
-                logURL: root.appendingPathComponent("phoenix.log"),
-                ownerLockURL: root.appendingPathComponent("owner.lock"),
-                rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel) ?? "phoenix_ide=info"
+                runtimeRootURL: runtimeRoot,
+                dataDirectoryURL: dataDir,
+                databaseURL: dataDir.appendingPathComponent("phoenix.db"),
+                logURL: dataDir.appendingPathComponent("phoenix.log"),
+                ownerLockURL: dataDir.appendingPathComponent("owner.lock"),
+                rustLogLevel: rustLogLevel
             ))
         }
     }
@@ -168,13 +196,21 @@ enum ConfigurationStore {
         return root
     }
 
-    private static func bundledExecutable(bundle: Bundle, defaults: UserDefaults) -> URL {
+    private static func bundledExecutable(bundle: Bundle, developmentBinaryOverride: String) -> URL {
         #if DEBUG
-        if let override = defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary), !override.isEmpty {
-            return URL(fileURLWithPath: NSString(string: override).expandingTildeInPath)
+        if !developmentBinaryOverride.isEmpty {
+            return URL(fileURLWithPath: NSString(string: developmentBinaryOverride).expandingTildeInPath)
         }
         #endif
         return bundle.bundleURL.appendingPathComponent("Contents/Helpers/phoenix_ide")
+    }
+
+    private static func validateAttachedOriginTransport(_ origin: PhoenixOrigin) throws {
+        guard origin.url.scheme?.lowercased() == "http" else { return }
+        guard let host = origin.url.host?.lowercased(),
+              host == "localhost" || host == "127.0.0.1" || host == "::1" else {
+            throw ConfigurationError.invalidAttachedCleartextOrigin
+        }
     }
 
     static func removeLegacyPlaintextSecret(defaults: UserDefaults = .standard) {
@@ -308,11 +344,13 @@ struct VersionInfo: Codable, Equatable {
 struct DeploymentInfo: Codable, Equatable {
     let build: BuildInfo
     let network: NetworkInfo
+    let instanceID: String?
     let localAccess: Bool
     let installationOwnership: InstallationOwnership
 
     enum CodingKeys: String, CodingKey {
         case build, network
+        case instanceID = "instance_id"
         case localAccess = "local_access"
         case installationOwnership = "installation_ownership"
     }

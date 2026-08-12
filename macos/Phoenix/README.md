@@ -16,10 +16,11 @@ Launches only `Phoenix.app/Contents/Helpers/phoenix_ide` (or a clearly marked De
 
 - `PHOENIX_BIND_ADDR=127.0.0.1`
 - `PHOENIX_TLS=off`
-- a private database under `~/Library/Application Support/Phoenix`
+- a private runtime home under `~/Library/Application Support/Phoenix/sidecar-home`
+- a private `PHOENIX_DATA_DIR` and database beneath that runtime home
 - a fixed configured loopback port
 
-An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
+An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
 
 Optional Anthropic/OpenAI keys are stored in Keychain and injected only into the app-owned child environment. The legacy plaintext `anthropicApiKey` preference is deleted. Diagnostics are typed and allowlisted; raw environments and secret values are never rendered.
 
