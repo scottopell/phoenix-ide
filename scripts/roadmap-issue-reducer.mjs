@@ -334,11 +334,11 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
   }
 }
 
-function createdRecordAccepted(comment, comments) {
+function createdRecordAccepted(comment, comments, renderedUpdates) {
   const prefix = comments.filter((candidate) => candidate.id <= comment.id);
   const record = roadmapPayload(comment.body);
   if (record?.recordType === "update") {
-    return updatesFromComments(prefix).some((update) => update.source.id === comment.id);
+    return renderedUpdates.some((update) => update.source.id === comment.id);
   }
   if (record?.recordType === "retirement") {
     try {
@@ -379,7 +379,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
     if (!acknowledgesCreation) return { ...changed, updates: updates.length };
-    const accepted = createdRecordAccepted(event.comment, comments);
+    const accepted = createdRecordAccepted(event.comment, comments, updates);
     if (!accepted) {
       console.error(`Rejecting roadmap record in comment ${event.comment.id}: it was invalid or superseded before application`);
     }
