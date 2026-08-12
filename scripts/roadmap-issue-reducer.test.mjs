@@ -267,6 +267,44 @@ test("terminal reaction is posted before the processing reaction is removed", as
   }
 });
 
+test("reaction cleanup follows pagination", async () => {
+  const trigger = comment(2, fenced(update()));
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    content: "heart",
+    user: { login: `reviewer-${index}` },
+  }));
+  const eyes = { id: 101, content: "eyes", user: { login: "github-actions[bot]" } };
+  const mock = installGitHubMock([trigger], [firstPage, [], firstPage, [eyes]]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/101"),
+    ));
+    assert.ok(mock.requests.some(
+      (request) => request.method === "GET" && request.url.includes("per_page=100&page=2"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("replacement update clears the displaced source rocket", async () => {
+  const displaced = comment(1, fenced(update({ state: "Old" })));
+  const trigger = comment(2, fenced(update({ state: "New" })));
+  const oldRocket = { id: 51, content: "rocket", user: { login: "github-actions[bot]" } };
+  const mock = installGitHubMock([displaced, trigger], [[], [oldRocket], []]);
+  try {
+    const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "accepted" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/51"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
 test("invalid structured record transitions from eyes to confused", async () => {
   const trigger = comment(2, fenced(update({ evidence: [] })));
   const mock = installGitHubMock([trigger]);
@@ -289,6 +327,21 @@ test("accepted retirement transitions from eyes to rocket after removing the ent
     const body = JSON.parse(mock.requests.find((request) => request.method === "PATCH").body).body;
     assert.doesNotMatch(body, /issuecomment-1/);
     assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("accepted retirement clears the retired source rocket", async () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const oldRocket = { id: 61, content: "rocket", user: { login: "github-actions[bot]" } };
+  const mock = installGitHubMock([current, trigger], [[], [oldRocket], []]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/61"),
+    ));
   } finally {
     mock.restore();
   }

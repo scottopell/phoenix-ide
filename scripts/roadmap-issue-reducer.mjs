@@ -320,9 +320,20 @@ async function listComments(owner, repo, issueNumber, token) {
 
 const LIFECYCLE_REACTIONS = new Set(["eyes", "rocket", "confused"]);
 
+async function listReactions(owner, repo, commentId, token) {
+  const reactions = [];
+  for (let page = 1; ; page += 1) {
+    const batch = await githubRequest(
+      `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions?per_page=100&page=${page}`,
+      token,
+    );
+    reactions.push(...batch);
+    if (batch.length < 100) return reactions;
+  }
+}
+
 async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
-  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
-  const reactions = await githubRequest(`${path}?per_page=100`, token);
+  const reactions = await listReactions(owner, repo, commentId, token);
   for (const reaction of reactions) {
     if (
       reaction.user?.login === "github-actions[bot]" &&
@@ -332,6 +343,38 @@ async function clearLifecycleReactions(owner, repo, commentId, token, except = n
       await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
         method: "DELETE",
       });
+    }
+  }
+}
+
+async function clearAcceptedReaction(owner, repo, commentId, token) {
+  const reactions = await listReactions(owner, repo, commentId, token);
+  for (const reaction of reactions) {
+    if (reaction.user?.login === "github-actions[bot]" && reaction.content === "rocket") {
+      await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
+        method: "DELETE",
+      });
+    }
+  }
+}
+
+function reflectedCommentIds(updates, outcomes) {
+  const reflected = new Set(updates.map((update) => update.source.id));
+  const activeWorkstreams = new Set(updates.map((update) => update.workstream));
+  const latestRetirements = new Map();
+  for (const [commentId, outcome] of outcomes) {
+    if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
+      latestRetirements.set(outcome.workstream, commentId);
+    }
+  }
+  for (const commentId of latestRetirements.values()) reflected.add(commentId);
+  return reflected;
+}
+
+async function clearDisplacedAcceptedReactions(owner, repo, previousReflected, reflected, token) {
+  for (const commentId of previousReflected) {
+    if (!reflected.has(commentId)) {
+      await clearAcceptedReaction(owner, repo, commentId, token);
     }
   }
 }
@@ -374,10 +417,21 @@ export async function run({ event, configuredIssueNumber, token }) {
       .map((comment) => comment.id);
     const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
     const { updates, outcomes } = reduceComments(comments);
+    const previous = tracksLifecycle
+      ? reduceComments(comments.filter((comment) => comment.id !== event.comment.id))
+      : null;
     const body = renderRoadmap(updates, snapshotThroughCommentId);
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
     if (!tracksLifecycle) return { ...changed, updates: updates.length };
+    const reflectedIds = reflectedCommentIds(updates, outcomes);
+    await clearDisplacedAcceptedReactions(
+      owner,
+      repo,
+      reflectedCommentIds(previous.updates, previous.outcomes),
+      reflectedIds,
+      token,
+    );
 
     const outcome = outcomes.get(event.comment.id);
     const reflected = outcome?.recordType === "retirement"
