@@ -182,6 +182,15 @@ struct WebViewWrapper: NSViewRepresentable {
 
         func webView(
             _ webView: WKWebView,
+            didFail navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            guard role == .primary else { return }
+            onDeployment(.failure(error), operation)
+        }
+
+        func webView(
+            _ webView: WKWebView,
             requestMediaCapturePermissionFor securityOrigin: WKSecurityOrigin,
             initiatedByFrame frame: WKFrameInfo,
             type: WKMediaCaptureType,

@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Security
 
 // Only non-secret preferences are stored in UserDefaults.
@@ -88,10 +89,23 @@ struct SettingsPersistenceSummary: Equatable {
     }
 }
 
+enum ReconnectIntent {
+    case applySettings
+    case statusReconnect
+}
+
 struct ConnectionReapplyDecision: Equatable {
     let requiresReconnect: Bool
 
-    static func evaluate(currentMode: ServerMode?, currentState: ConnectionState, candidate: ServerMode) -> ConnectionReapplyDecision {
+    static func evaluate(
+        currentMode: ServerMode?,
+        currentState: ConnectionState,
+        candidate: ServerMode,
+        intent: ReconnectIntent
+    ) -> ConnectionReapplyDecision {
+        if intent == .statusReconnect {
+            return ConnectionReapplyDecision(requiresReconnect: true)
+        }
         guard currentMode == candidate else {
             return ConnectionReapplyDecision(requiresReconnect: true)
         }
@@ -110,8 +124,19 @@ struct ServerReconnectRequest: Equatable {
     let requiresReconnect: Bool
     let forceRestart: Bool
 
-    static func evaluate(currentMode: ServerMode?, currentState: ConnectionState, candidate: ServerMode, changedBundledSecrets: Bool) -> ServerReconnectRequest {
-        let reapply = ConnectionReapplyDecision.evaluate(currentMode: currentMode, currentState: currentState, candidate: candidate)
+    static func evaluate(
+        currentMode: ServerMode?,
+        currentState: ConnectionState,
+        candidate: ServerMode,
+        changedBundledSecrets: Bool,
+        intent: ReconnectIntent = .applySettings
+    ) -> ServerReconnectRequest {
+        let reapply = ConnectionReapplyDecision.evaluate(
+            currentMode: currentMode,
+            currentState: currentState,
+            candidate: candidate,
+            intent: intent
+        )
         let requiresForceRestart = candidate.kind == .bundled && changedBundledSecrets
         return ServerReconnectRequest(
             candidate: candidate,
@@ -179,24 +204,19 @@ struct SidecarLaunchEnvironment {
     }
 }
 
-struct DeepLinkConversationResponseEnvelope: Decodable, Equatable {
-    struct Conversation: Decodable, Equatable {
-        let id: String
-    }
-
-    let conversation: Conversation
-
-    var conversationID: String { conversation.id }
+struct DeepLinkConversationRouteResponse: Decodable, Equatable {
+    let id: String
+    let slug: String?
 }
 
 struct DeepLinkConversationValidation {
-    static func extractConversationID(from body: Any) -> UUID? {
+    static func extractConversationID(fromRouteBody body: Any) -> UUID? {
         guard JSONSerialization.isValidJSONObject(body),
               let data = try? JSONSerialization.data(withJSONObject: body),
-              let envelope = try? JSONDecoder().decode(DeepLinkConversationResponseEnvelope.self, from: data) else {
+              let route = try? JSONDecoder().decode(DeepLinkConversationRouteResponse.self, from: data) else {
             return nil
         }
-        return UUID(uuidString: envelope.conversationID)
+        return UUID(uuidString: route.id)
     }
 }
 
@@ -235,6 +255,40 @@ struct DeepLinkValidationOutcome: Equatable {
                 shouldRetainPendingConversation: false
             )
         }
+    }
+}
+
+struct LoopbackAddressPolicy {
+    static func allowsCleartextAttachedOrigin(host: String?) -> Bool {
+        guard let host else { return false }
+        let normalized = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        guard !normalized.isEmpty else { return false }
+        if normalized == "localhost" { return true }
+        if normalized == "::1", IPv6Address(normalized)?.isLoopback == true { return true }
+        if let ipv4 = IPv4Address(normalized) {
+            return ipv4.rawValue.first == 127
+        }
+        return false
+    }
+
+    static func bundledBindAddressIsLoopback(_ bindAddress: String) -> Bool {
+        guard let host = hostComponent(fromBindAddress: bindAddress) else { return false }
+        return allowsCleartextAttachedOrigin(host: host)
+    }
+
+    private static func hostComponent(fromBindAddress bindAddress: String) -> String? {
+        if bindAddress.hasPrefix("[") {
+            guard let end = bindAddress.firstIndex(of: "]") else { return nil }
+            return String(bindAddress[bindAddress.index(after: bindAddress.startIndex)..<end])
+        }
+        if let lastColon = bindAddress.lastIndex(of: ":") {
+            let candidate = String(bindAddress[..<lastColon])
+            if candidate.contains(":") {
+                return bindAddress
+            }
+            return candidate
+        }
+        return bindAddress
     }
 }
 
@@ -1085,8 +1139,7 @@ enum ConfigurationStore {
 
     private static func validateAttachedOriginTransport(_ origin: PhoenixOrigin) throws {
         guard origin.url.scheme?.lowercased() == "http" else { return }
-        guard let host = origin.url.host?.lowercased(),
-              host == "localhost" || host == "127.0.0.1" || host == "::1" else {
+        guard LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: origin.url.host) else {
             throw ConfigurationError.invalidAttachedCleartextOrigin
         }
     }

@@ -518,12 +518,6 @@ final class ServerManager: ObservableObject {
     private var terminationInProgress = false
     private var ownerLockDescriptor: Int32?
     private lazy var logSnapshotSink = SidecarLogSnapshotSink(manager: self)
-    private lazy var logRecorder = SidecarLogRecorder(
-        writer: currentLogWriter,
-        snapshotSink: { [logSnapshotSink] lines in
-            await logSnapshotSink.publish(lines)
-        }
-    )
     struct ConnectionOperationToken: Equatable, Hashable {
         fileprivate let id: UUID
     }
@@ -571,7 +565,8 @@ final class ServerManager: ObservableObject {
                 currentMode: mode,
                 currentState: state,
                 candidate: candidate,
-                changedBundledSecrets: false
+                changedBundledSecrets: false,
+                intent: .statusReconnect
             )
             try reconnect(request)
         } catch {
@@ -651,14 +646,13 @@ final class ServerManager: ObservableObject {
         if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
         readinessTask?.cancel()
         readinessTask = nil
-        let operation = operationID
 
         guard case .bundled = mode, let process else {
             finishStop(finalState: preservedState ?? .stopped)
             return
         }
         guard process.isRunning else {
-            Task { await handleSidecarEOF(operation: operation) }
+
             releaseOwnerLock()
             self.process = nil
             launchedBundledInstance = nil
@@ -738,6 +732,12 @@ final class ServerManager: ObservableObject {
             try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
             try acquireOwnerLock(configuration.ownerLockURL)
             launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
+            let logRecorder = SidecarLogRecorder(
+                writer: currentLogWriter,
+                snapshotSink: { [logSnapshotSink] lines in
+                    await logSnapshotSink.publish(lines)
+                }
+            )
             Task { await logRecorder.reset(operation: operation) }
 
             let inherited = ProcessInfo.processInfo.environment
@@ -769,12 +769,12 @@ final class ServerManager: ObservableObject {
                     guard let self else { return }
                     if data.isEmpty {
                         handle.readabilityHandler = nil
-                        Task { await self.handleSidecarEOF(operation: operation) }
+                        Task { await self.handleSidecarEOF(logRecorder: logRecorder, operation: operation) }
                         return
                     }
                     Task {
-                        await self.logRecorder.enqueue(data, operation: operation)
-                        await self.handleBufferedSidecarOutput(operation: operation)
+                        await logRecorder.enqueue(data, operation: operation)
+                        await self.handleBufferedSidecarOutput(logRecorder: logRecorder, operation: operation)
                     }
                 }
             }
@@ -901,8 +901,7 @@ final class ServerManager: ObservableObject {
         case .attached:
             return nil
         case .bundled:
-            let host = deployment.network.bindAddress.split(separator: ":").first.map(String.init) ?? ""
-            guard host == "127.0.0.1" || host == "[::1]" else {
+            guard LoopbackAddressPolicy.bundledBindAddressIsLoopback(deployment.network.bindAddress) else {
                 return "Bundled Phoenix reported a non-loopback listener: \(deployment.network.bindAddress)"
             }
             guard !deployment.network.tls.enabled, !deployment.network.socketActivated else {
@@ -922,7 +921,6 @@ final class ServerManager: ObservableObject {
         guard process === terminated else { return }
         let priorState = state
         let version = currentVersion
-        Task { await handleSidecarEOF(operation: operation) }
         stopDeadline?.cancel()
         stopDeadline = nil
         releaseOwnerLock()
@@ -974,13 +972,13 @@ final class ServerManager: ObservableObject {
         callbacks.forEach { $0() }
     }
 
-    private func handleBufferedSidecarOutput(operation: UUID) async {
+    private func handleBufferedSidecarOutput(logRecorder: SidecarLogRecorder, operation: UUID) async {
         let snapshots = await logRecorder.drain(operation: operation)
         guard let latest = snapshots.last else { return }
         publishLogSnapshot(latest)
     }
 
-    private func handleSidecarEOF(operation: UUID) async {
+    private func handleSidecarEOF(logRecorder: SidecarLogRecorder, operation: UUID) async {
         let snapshot = await logRecorder.finishPending(operation: operation)
         publishLogSnapshot(snapshot)
     }

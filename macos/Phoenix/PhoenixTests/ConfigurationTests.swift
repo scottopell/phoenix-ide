@@ -1321,7 +1321,7 @@ final class ServerManagerHelpersTests: XCTestCase {
             installationOwnership: .launchdManaged
         )
 
-        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, deployment), candidate: candidate).requiresReconnect)
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, deployment), candidate: candidate, intent: .applySettings).requiresReconnect)
     }
 
     func testServerReconnectRequestForcesRestartWhenBundledSecretsChange() throws {
@@ -1501,10 +1501,11 @@ final class ServerManagerHelpersTests: XCTestCase {
             installationOwnership: .launchdManaged
         )
 
-        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate).requiresReconnect)
-        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate).requiresReconnect)
-        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate).requiresReconnect)
-        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate).requiresReconnect)
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .statusReconnect).requiresReconnect)
     }
 
     func testSidecarLaunchEnvironmentPreservesRealUserHomeAndSafeSessionVars() {
@@ -1535,11 +1536,26 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(environment["ANTHROPIC_API_KEY"], "secret")
     }
 
-    func testDeepLinkConversationValidationParsesConversationEnvelope() throws {
+    func testDeepLinkConversationValidationParsesRouteResponse() throws {
         let id = try XCTUnwrap(UUID(uuidString: "66a063b4-6a90-49f5-8edc-9ffa67cffcf6"))
-        let body: [String: Any] = ["conversation": ["id": id.uuidString.lowercased()]]
+        let body: [String: Any] = ["id": id.uuidString.lowercased(), "slug": "hello-world"]
 
-        XCTAssertEqual(DeepLinkConversationValidation.extractConversationID(from: body), id)
-        XCTAssertNil(DeepLinkConversationValidation.extractConversationID(from: ["id": id.uuidString.lowercased()]))
+        XCTAssertEqual(DeepLinkConversationValidation.extractConversationID(fromRouteBody: body), id)
+        XCTAssertNil(DeepLinkConversationValidation.extractConversationID(fromRouteBody: ["conversation": ["id": id.uuidString.lowercased()]]))
+    }
+
+    func testLoopbackAddressPolicyAllowsAllLoopbackOrigins() {
+        XCTAssertTrue(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "localhost"))
+        XCTAssertTrue(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "127.0.0.1"))
+        XCTAssertTrue(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "127.99.4.5"))
+        XCTAssertTrue(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "::1"))
+        XCTAssertFalse(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "128.0.0.1"))
+        XCTAssertFalse(LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: "example.com"))
+    }
+
+    func testLoopbackAddressPolicyAcceptsBundledBindAddressesByParsedHost() {
+        XCTAssertTrue(LoopbackAddressPolicy.bundledBindAddressIsLoopback("127.0.0.2:8420"))
+        XCTAssertTrue(LoopbackAddressPolicy.bundledBindAddressIsLoopback("[::1]:8420"))
+        XCTAssertFalse(LoopbackAddressPolicy.bundledBindAddressIsLoopback("192.168.1.10:8420"))
     }
 }

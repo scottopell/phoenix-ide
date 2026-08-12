@@ -282,7 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let webView, let origin = serverManager.webOrigin else {
             throw DeepLinkValidationError.noAuthenticatedWebView
         }
-        let script = Self.conversationValidationScript(uuid: id.uuidString.lowercased())
+        let script = Self.conversationRouteValidationScript(uuid: id.uuidString.lowercased())
         let result = try await webView.evaluateJavaScript(script)
         guard let payload = result as? [String: Any],
               let status = payload["status"] as? Int else {
@@ -298,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             throw DeepLinkValidationError.invalidHTTPStatus(status)
         }
         guard let body = payload["body"],
-              let validated = DeepLinkConversationValidation.extractConversationID(from: body),
+              let validated = DeepLinkConversationValidation.extractConversationID(fromRouteBody: body),
               validated.uuidString.lowercased() == id.uuidString.lowercased() else {
             throw DeepLinkValidationError.decoding("conversation response did not contain the requested UUID")
         }
@@ -310,8 +310,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return validated
     }
 
-    private static func conversationValidationScript(uuid: String) -> String {
-        let path = "/api/conversations/\(uuid)"
+    private static func conversationRouteValidationScript(uuid: String) -> String {
+        let path = "/api/conversations/\(uuid)/route"
         return """
         (async () => {
           const response = await window.fetch(\"\(path)\", { credentials: 'same-origin' });
