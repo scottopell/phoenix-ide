@@ -73,6 +73,9 @@ function installGitHubMock(comments, reactionSnapshots = []) {
     if (String(url).includes("/reactions") && method === "POST") {
       return new Response(JSON.stringify({}), { status: 201 });
     }
+    if (String(url).endsWith("/issues/7/comments") && method === "POST") {
+      return new Response(JSON.stringify({}), { status: 201 });
+    }
     if (String(url).includes("/reactions/") && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
@@ -509,7 +512,6 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
   const responses = [
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
-    new Response(JSON.stringify({ body: "" }), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),

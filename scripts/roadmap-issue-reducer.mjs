@@ -269,19 +269,23 @@ function renderUpdate(update, open) {
 
 function retirementReceipt(comment) {
   const digest = createHash("sha256").update(comment.body).digest("hex");
-  return `<!-- phoenix-roadmap:retirement:${comment.id}:${digest} -->`;
+  return `<!-- phoenix-roadmap-retirement-receipt:${comment.id}:${digest} -->`;
 }
 
-function retirementReceiptIds(issueBody, comments) {
-  const acknowledged = new Set();
-  for (const comment of comments) {
-    if (!TRUSTED_ASSOCIATIONS.has(comment.author_association)) continue;
-    if (issueBody.includes(retirementReceipt(comment))) acknowledged.add(comment.id);
-  }
-  return acknowledged;
+function retirementReceiptIds(comments) {
+  const receipts = new Set(
+    comments
+      .filter((comment) => comment.user?.login === "github-actions[bot]")
+      .map((comment) => comment.body),
+  );
+  return new Set(
+    comments
+      .filter((comment) => TRUSTED_ASSOCIATIONS.has(comment.author_association) && receipts.has(retirementReceipt(comment)))
+      .map((comment) => comment.id),
+  );
 }
 
-export function renderRoadmap(updates, snapshotThroughCommentId = 0, retirementReceipts = []) {
+export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
   const lines = [
     "# Phoenix delivery roadmap",
     "",
@@ -289,7 +293,6 @@ export function renderRoadmap(updates, snapshotThroughCommentId = 0, retirementR
     "",
     PROJECTION_START,
     `<!-- phoenix-roadmap:snapshot-through:${snapshotThroughCommentId} -->`,
-    ...retirementReceipts,
     "",
     "## Current roadmap",
     "",
@@ -349,10 +352,6 @@ function trustedSnapshotKey(comments) {
     .join("|");
 }
 
-async function getIssue(owner, repo, issueNumber, token) {
-  return githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token);
-}
-
 async function replaceIssueBody(owner, repo, issueNumber, body, token) {
   await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token, {
     method: "PATCH",
@@ -385,18 +384,26 @@ async function listReactions(owner, repo, commentId, token) {
   }
 }
 
-function authoritativeRetirementReceipts(comments, current, outcomes) {
+async function ensureRetirementReceipts(owner, repo, issueNumber, comments, current, outcomes, token) {
   const activeWorkstreams = new Set(current.map((update) => update.workstream));
+  const existing = new Set(comments.map((comment) => comment.body));
+  const byId = new Map(comments.map((comment) => [comment.id, comment]));
   const latest = new Map();
   for (const [commentId, outcome] of outcomes) {
     if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
       latest.set(outcome.workstream, commentId);
     }
   }
-  const byId = new Map(comments.map((comment) => [comment.id, comment]));
-  return [...latest.values()]
-    .slice(-MAX_WORKSTREAMS)
-    .map((commentId) => retirementReceipt(byId.get(commentId)));
+  for (const commentId of latest.values()) {
+    const body = retirementReceipt(byId.get(commentId));
+    if (!existing.has(body)) {
+      await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body }),
+      });
+    }
+  }
 }
 
 async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
@@ -518,7 +525,7 @@ export async function run({ event, configuredIssueNumber, token }) {
   const [owner, repo] = event.repository.full_name.split("/");
   const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
 
-  let projectionCommitted = false;
+  let terminalReactionSet = false;
   try {
     if (tracksLifecycle) {
       await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
@@ -541,14 +548,12 @@ export async function run({ event, configuredIssueNumber, token }) {
         .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
         .map((comment) => comment.id);
       const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-      const issue = await getIssue(owner, repo, configuredIssueNumber, token);
-      const retirementAcknowledgments = retirementReceiptIds(issue.body ?? "", comments);
+      const retirementAcknowledgments = retirementReceiptIds(comments);
       ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
       before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
-      const receipts = authoritativeRetirementReceipts(comments, current, outcomes);
-      const body = renderRoadmap(updates, snapshotThroughCommentId, receipts);
+      const body = renderRoadmap(updates, snapshotThroughCommentId);
       changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
-      projectionCommitted = true;
+      await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
 
       const after = await listComments(owner, repo, configuredIssueNumber, token);
       if (trustedSnapshotKey(comments) === trustedSnapshotKey(after)) {
@@ -568,6 +573,7 @@ export async function run({ event, configuredIssueNumber, token }) {
         console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
       }
       await setLifecycleReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+      terminalReactionSet = true;
     }
 
     try {
@@ -590,7 +596,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     if (!tracksLifecycle) return { ...changed, updates: updates.length };
     return { ...changed, updates: updates.length, acknowledged: reflected ? "accepted" : "rejected" };
   } catch (error) {
-    if (tracksLifecycle && !projectionCommitted) {
+    if (tracksLifecycle && !terminalReactionSet) {
       try {
         await setLifecycleReaction(owner, repo, event.comment.id, "confused", token);
       } catch (reactionError) {
