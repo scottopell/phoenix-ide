@@ -29,6 +29,10 @@ fi
 EOF
 cat > "$fakebin/codesign" <<'EOF'
 #!/bin/sh
+if [ "$1" = "--verify" ] && [ "$2" = "--strict" ]; then
+  [ "${FAKE_CODESIGN_VERIFY_RESULT:-ok}" = "ok" ] && exit 0
+  exit 1
+fi
 if [ "$1" = "-dv" ]; then
   case "${FAKE_CODESIGN_AUTHORITY:-none}" in
     none)
@@ -77,6 +81,19 @@ run_script >/dev/null
 # source inspection regression: keep stale-helper cleanup and packaged validation in the script
 /usr/bin/grep '/bin/rm -f "\$destination"' "$script" >/dev/null
 /usr/bin/grep 'validate_packaged_sidecar "\$destination" "\$ARCHS" "\$expected_signing"' "$script" >/dev/null
+/usr/bin/grep 'packaged sidecar is not signed with expected identity' "$script" >/dev/null
+# strict codesign verification runs before metadata checks when signing is expected
+if FAKE_CODESIGN_VERIFY_RESULT=fail CODE_SIGNING_ALLOWED_OVERRIDE=YES CODE_SIGN_STYLE_OVERRIDE=Automatic PHOENIX_SIDECAR_PATH="$dummy_sidecar" \
+  run_script >/dev/null 2>"$tmpdir/strict.err"; then
+  echo 'error: expected strict codesign verification to fail' >&2
+  exit 1
+fi
+/usr/bin/grep 'packaged sidecar failed codesign --verify --strict' "$tmpdir/strict.err" >/dev/null
+
+# source inspection regression: keep stale-helper cleanup and packaged validation in the script
+/usr/bin/grep '/bin/rm -f "\$destination"' "$script" >/dev/null
+/usr/bin/grep 'validate_packaged_sidecar "\$destination" "\$ARCHS" "\$expected_signing"' "$script" >/dev/null
+/usr/bin/grep 'codesign --verify --strict' "$script" >/dev/null
 /usr/bin/grep 'packaged sidecar is not signed with expected identity' "$script" >/dev/null
 
 echo 'package-sidecar.sh regression checks passed'

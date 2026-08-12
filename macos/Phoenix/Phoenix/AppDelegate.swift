@@ -26,8 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] state in self?.updateWindowContent(for: state) }
             .store(in: &cancellables)
         showWindow()
-        if persistence.loadDraft().hasSavedModeSelection {
-            serverManager.connect()
+        do {
+            if try persistence.loadDraft().hasSavedModeSelection {
+                serverManager.connect()
+            }
+        } catch {
+            serverManager.showFailure(message: error.localizedDescription)
         }
     }
 

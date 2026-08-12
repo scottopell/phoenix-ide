@@ -237,9 +237,9 @@ final class ServerManager: ObservableObject {
     private var operationID = UUID()
     private var launchedBundledInstance: LaunchedBundledInstance?
     private var logBuffer = ConnectionLogBuffer()
-    private let keychain: KeychainStore
+    private let keychain: any SecretStore
 
-    init(keychain: KeychainStore = KeychainStore()) {
+    init(keychain: any SecretStore = KeychainStore()) {
         self.keychain = keychain
         ConfigurationStore.removeLegacyPlaintextSecret()
     }
@@ -284,6 +284,10 @@ final class ServerManager: ObservableObject {
         default:
             connect()
         }
+    }
+
+    func showFailure(message: String) {
+        state = .failed(FailureState(version: currentVersion, message: message))
     }
 
     func deploymentReceived(_ deployment: DeploymentInfo, operation: ConnectionOperationToken? = nil) {

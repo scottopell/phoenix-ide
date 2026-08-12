@@ -127,38 +127,73 @@ struct SidecarPackagingValidation {
     }
 }
 
+protocol SecretStore {
+    func read(_ secret: ProviderSecret) throws -> String?
+    func write(_ value: String, for secret: ProviderSecret) throws
+    func processEnvironment() throws -> [String: String]
+}
+
+struct PersistedPreferenceSnapshot: Equatable {
+    let serverMode: String?
+    let attachedOrigin: String?
+    let bundledPort: Int?
+    let developmentBinaryOverride: String?
+    let rustLogLevel: String?
+}
+
+struct PersistedSettingsSnapshot: Equatable {
+    let preferences: PersistedPreferenceSnapshot
+    let secrets: [ProviderSecret: String?]
+
+    func draft() -> SettingsDraft {
+        let persistedMode = preferences.serverMode
+            .flatMap(ServerModeKind.init(rawValue:))
+            .map(PendingServerModeKind.init)
+        return SettingsDraft(
+            mode: persistedMode,
+            attachedOrigin: preferences.attachedOrigin ?? ConfigurationStore.defaultAttachedOrigin,
+            bundledPort: preferences.bundledPort ?? ConfigurationStore.defaultBundledPort,
+            developmentBinaryOverride: preferences.developmentBinaryOverride ?? "",
+            rustLogLevel: preferences.rustLogLevel ?? "phoenix_ide=info",
+            anthropicKey: (secrets[.anthropicAPIKey] ?? nil) ?? "",
+            openAIKey: (secrets[.openAIAPIKey] ?? nil) ?? ""
+        )
+    }
+}
+
 struct SettingsPersistence {
     let defaults: UserDefaults
-    let keychain: KeychainStore
+    let keychain: any SecretStore
     let bundle: Bundle
 
-    init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore(), bundle: Bundle = .main) {
+    init(defaults: UserDefaults = .standard, keychain: any SecretStore = KeychainStore(), bundle: Bundle = .main) {
         self.defaults = defaults
         self.keychain = keychain
         self.bundle = bundle
     }
 
-    func loadDraft() -> DraftLoadResult {
-        let hasSavedModeSelection = defaults.object(forKey: PreferenceKey.serverMode) != nil
-        let persistedMode = defaults.string(forKey: PreferenceKey.serverMode)
-            .flatMap(ServerModeKind.init(rawValue:))
-            .map(PendingServerModeKind.init)
-        let draft = SettingsDraft(
-            mode: persistedMode,
-            attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin) ?? ConfigurationStore.defaultAttachedOrigin,
-            bundledPort: {
-                let stored = defaults.integer(forKey: PreferenceKey.bundledPort)
-                return stored == 0 ? ConfigurationStore.defaultBundledPort : stored
-            }(),
-            developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary) ?? "",
-            rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel) ?? "phoenix_ide=info",
-            anthropicKey: (try? keychain.read(.anthropicAPIKey)) ?? "",
-            openAIKey: (try? keychain.read(.openAIAPIKey)) ?? ""
-        )
-        return DraftLoadResult(draft: draft, hasSavedModeSelection: hasSavedModeSelection)
+    func loadDraft() throws -> DraftLoadResult {
+        let snapshot = try persistedSnapshot()
+        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
+        return DraftLoadResult(draft: snapshot.draft(), hasSavedModeSelection: hasSavedModeSelection)
     }
 
-    func persist(draft: SettingsDraft) throws -> (candidate: ServerMode, summary: SettingsPersistenceSummary) {
+    func persistedSnapshot() throws -> PersistedSettingsSnapshot {
+        let preferences = PersistedPreferenceSnapshot(
+            serverMode: defaults.string(forKey: PreferenceKey.serverMode),
+            attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin),
+            bundledPort: defaults.object(forKey: PreferenceKey.bundledPort) as? Int,
+            developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary),
+            rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel)
+        )
+        var secrets: [ProviderSecret: String?] = [:]
+        for secret in ProviderSecret.allCases {
+            secrets[secret] = try keychain.read(secret)
+        }
+        return PersistedSettingsSnapshot(preferences: preferences, secrets: secrets)
+    }
+
+    func persist(draft: SettingsDraft, appliedSnapshot previous: PersistedSettingsSnapshot? = nil) throws -> (candidate: ServerMode, summary: SettingsPersistenceSummary, persistedSnapshot: PersistedSettingsSnapshot) {
         guard let mode = draft.mode else { throw ConfigurationError.missingModeSelection }
         let candidate = try ConfigurationStore.loadCandidate(
             kind: mode.persistedKind,
@@ -168,40 +203,105 @@ struct SettingsPersistence {
             rustLogLevel: draft.rustLogLevel,
             bundle: bundle
         )
-        let previous = loadDraft().draft
-        defaults.set(mode.persistedKind.rawValue, forKey: PreferenceKey.serverMode)
+        let priorAppliedSnapshot = try previous ?? persistedSnapshot()
+
+        let savedSecrets = ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
+            let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : secret
+        }
+        let deletedSecrets = ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
+            let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty && priorAppliedSnapshot.secrets[secret] != nil ? secret : nil
+        }
+
+        do {
+            try apply(draft: draft)
+        } catch {
+            if let rollbackFailure = rollback(to: priorAppliedSnapshot) {
+                throw SettingsPersistenceError.applyFailedWithRollbackFailure(cause: error, rollbackFailure: rollbackFailure)
+            }
+            throw error
+        }
+
+        let after = try persistedSnapshot()
+        return (candidate, SettingsPersistenceSummary(
+            requiresReconnect: priorAppliedSnapshot.draft() != after.draft(),
+            savedSecrets: savedSecrets,
+            deletedSecrets: deletedSecrets
+        ), after)
+    }
+
+    private func apply(draft: SettingsDraft) throws {
+        writePreferences(for: draft)
+        for secret in ProviderSecret.allCases {
+            try keychain.write(secretValue(in: draft, for: secret), for: secret)
+        }
+    }
+
+    private func writePreferences(for draft: SettingsDraft) {
+        defaults.set(draft.mode?.persistedKind.rawValue, forKey: PreferenceKey.serverMode)
         defaults.set(draft.attachedOrigin, forKey: PreferenceKey.attachedOrigin)
         defaults.set(draft.bundledPort, forKey: PreferenceKey.bundledPort)
         defaults.set(draft.developmentBinaryOverride, forKey: PreferenceKey.bundledDevelopmentBinary)
         defaults.set(draft.rustLogLevel, forKey: PreferenceKey.rustLogLevel)
+    }
 
-        var savedSecrets: [ProviderSecret] = []
-        var deletedSecrets: [ProviderSecret] = []
+    private func rollback(to snapshot: PersistedSettingsSnapshot) -> Error? {
+        var rollbackFailures: [Error] = []
+        restorePreferences(snapshot.preferences)
         for secret in ProviderSecret.allCases {
-            let value: String = switch secret {
-            case .anthropicAPIKey: draft.anthropicKey
-            case .openAIAPIKey: draft.openAIKey
+            do {
+                try keychain.write((snapshot.secrets[secret] ?? nil) ?? "", for: secret)
+            } catch {
+                rollbackFailures.append(error)
             }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                if (try? keychain.read(secret)) != nil {
-                    deletedSecrets.append(secret)
-                }
-            } else {
-                savedSecrets.append(secret)
-            }
-            try keychain.write(value, for: secret)
         }
+        guard !rollbackFailures.isEmpty else { return nil }
+        return RollbackFailure(errors: rollbackFailures)
+    }
 
-        return (candidate, SettingsPersistenceSummary(
-            requiresReconnect: previous.mode != draft.mode
-                || previous.attachedOrigin != draft.attachedOrigin
-                || previous.bundledPort != draft.bundledPort
-                || previous.developmentBinaryOverride != draft.developmentBinaryOverride
-                || previous.rustLogLevel != draft.rustLogLevel,
-            savedSecrets: savedSecrets,
-            deletedSecrets: deletedSecrets
-        ))
+    private func restorePreferences(_ snapshot: PersistedPreferenceSnapshot) {
+        restore(snapshot.serverMode, forKey: PreferenceKey.serverMode)
+        restore(snapshot.attachedOrigin, forKey: PreferenceKey.attachedOrigin)
+        restore(snapshot.bundledPort, forKey: PreferenceKey.bundledPort)
+        restore(snapshot.developmentBinaryOverride, forKey: PreferenceKey.bundledDevelopmentBinary)
+        restore(snapshot.rustLogLevel, forKey: PreferenceKey.rustLogLevel)
+    }
+
+    private func restore(_ value: String?, forKey key: String) {
+        if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+    }
+
+    private func restore(_ value: Int?, forKey key: String) {
+        if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+    }
+
+    private func secretValue(in draft: SettingsDraft, for secret: ProviderSecret) -> String {
+        switch secret {
+        case .anthropicAPIKey: draft.anthropicKey
+        case .openAIAPIKey: draft.openAIKey
+        }
+    }
+}
+
+struct RollbackFailure: LocalizedError {
+    let errors: [Error]
+
+    var errorDescription: String? {
+        let descriptions = errors.compactMap { $0.localizedDescription }
+        guard !descriptions.isEmpty else { return "Unknown rollback failure" }
+        return descriptions.joined(separator: "; ")
+    }
+}
+
+enum SettingsPersistenceError: LocalizedError {
+    case applyFailedWithRollbackFailure(cause: Error, rollbackFailure: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .applyFailedWithRollbackFailure(let cause, let rollbackFailure):
+            "Failed to save settings: \(cause.localizedDescription). Rollback also failed: \(rollbackFailure.localizedDescription)"
+        }
     }
 }
 
@@ -568,7 +668,7 @@ enum ProviderSecret: String, CaseIterable {
     }
 }
 
-struct KeychainStore {
+struct KeychainStore: SecretStore {
     let service: String
 
     init(service: String = "com.phoenixide.macos.sidecar") {
@@ -630,7 +730,7 @@ struct KeychainStore {
     }
 }
 
-enum KeychainError: LocalizedError {
+enum KeychainError: LocalizedError, Equatable {
     case status(OSStatus)
 
     var errorDescription: String? {
