@@ -597,6 +597,40 @@ test("changing trusted snapshot aborts before patching", async () => {
   }
 });
 
+test("untrusted retirement comments do not fetch reactions", async () => {
+  const trigger = comment(2, "Trusted coordination note.");
+  const outsider = comment(1, retired("ios-vnext", 99), { author_association: "NONE" });
+  const mock = installGitHubMock([outsider, trigger]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(!mock.requests.some(
+      (request) => request.method === "GET" && request.url.includes("issues/comments/1/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("retirement acknowledgment must postdate the current comment revision", async () => {
+  const trigger = comment(2, retired("missing", 99), {
+    updated_at: "2026-08-09T18:00:00Z",
+    user: { login: "owner" },
+  });
+  const staleRocket = {
+    id: 71,
+    content: "rocket",
+    created_at: "2026-08-09T17:00:00Z",
+    user: { login: "github-actions[bot]" },
+  };
+  const mock = installGitHubMock([trigger], [[], [staleRocket], []]);
+  try {
+    const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "rejected" });
+  } finally {
+    mock.restore();
+  }
+});
+
 test("untrusted trigger is rejected before API access", async () => {
   const trigger = comment(1, fenced(update()), { author_association: "NONE" });
   const originalFetch = globalThis.fetch;

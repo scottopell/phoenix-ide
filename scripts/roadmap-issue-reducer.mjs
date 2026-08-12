@@ -368,10 +368,16 @@ async function listReactions(owner, repo, commentId, token) {
 async function acknowledgedRetirementIds(owner, repo, comments, token) {
   const acknowledged = new Set();
   for (const comment of comments) {
+    if (!TRUSTED_ASSOCIATIONS.has(comment.author_association)) continue;
     const record = roadmapPayload(comment.body);
     if (record?.recordType !== "retirement") continue;
     const reactions = await listReactions(owner, repo, comment.id, token);
-    if (reactions.some((reaction) => reaction.user?.login === "github-actions[bot]" && reaction.content === "rocket")) {
+    const revisionTime = Date.parse(comment.updated_at ?? comment.created_at);
+    if (reactions.some((reaction) =>
+      reaction.user?.login === "github-actions[bot]" &&
+      reaction.content === "rocket" &&
+      Date.parse(reaction.created_at) >= revisionTime
+    )) {
       acknowledged.add(comment.id);
     }
   }
