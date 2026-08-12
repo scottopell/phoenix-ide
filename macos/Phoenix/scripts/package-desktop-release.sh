@@ -29,7 +29,7 @@ release_build_number() {
 import re
 import sys
 version = sys.argv[1]
-match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:[-.]([0-9A-Za-z.-]+))?', version)
+match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
 if not match:
     raise SystemExit(f"invalid semantic version: {version}")
 major, minor, patch = (int(match.group(i)) for i in range(1, 4))
@@ -66,7 +66,7 @@ case "$target" in
   x86_64-apple-darwin) expected_arch=x86_64 ;;
   *) echo "error: unsupported desktop target: $target" >&2; exit 1 ;;
 esac
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "error: release tag must be v-prefixed semantic version: $tag" >&2
   exit 1
 }
@@ -160,6 +160,10 @@ if (( unsigned_test == 0 )); then
   "$XCRUN" stapler staple "$app"
   "$XCRUN" stapler validate "$app"
   "$SPCTL" --assess --type execute --verbose=2 "$app"
+  "$CMP" -s "$sidecar" "$helper" || {
+    echo "error: app signing changed the embedded standalone helper bytes" >&2
+    exit 1
+  }
 fi
 
 asset="Phoenix-macos-$target-$tag.zip"

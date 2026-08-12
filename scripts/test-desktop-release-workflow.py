@@ -16,8 +16,7 @@ required_fragments = [
     'sha256sum phoenix_ide-* Phoenix-macos-* > SHA256SUMS',
     'test "$(wc -l < SHA256SUMS)" -eq 8',
     'Tag $TAG already points at this exact commit — retrying its release.',
-    'gh release upload "${{ needs.gate.outputs.tag }}"',
-    '--clobber',
+    'scripts/publish-release-assets.sh',
 ]
 missing = [fragment for fragment in required_fragments if fragment not in workflow]
 if missing:

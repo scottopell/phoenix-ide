@@ -284,45 +284,7 @@ jobs:
           test "$(wc -l < SHA256SUMS)" -eq 8
 
           assets=(phoenix_ide-* Phoenix-macos-* SHA256SUMS)
-          if gh release view "${{ needs.gate.outputs.tag }}" --repo scottopell/phoenix-ide >/dev/null 2>&1; then
-            backup_dir=$(mktemp -d)
-            restore_needed=0
-            cleanup() {
-              if [ "$restore_needed" -eq 1 ]; then
-                existing=$(find "$backup_dir" -type f -print)
-                if [ -n "$existing" ]; then
-                  gh release upload "${{ needs.gate.outputs.tag }}" \
-                    --repo scottopell/phoenix-ide \
-                    --clobber \
-                    $existing
-                fi
-              fi
-              rm -rf "$backup_dir"
-            }
-            trap cleanup EXIT
-
-            for asset in "${assets[@]}"; do
-              if gh release download "${{ needs.gate.outputs.tag }}" \
-                --repo scottopell/phoenix-ide \
-                --pattern "$asset" \
-                --dir "$backup_dir" >/dev/null 2>&1; then
-                :
-              fi
-            done
-
-            restore_needed=1
-            if ! gh release upload "${{ needs.gate.outputs.tag }}" \
-              --repo scottopell/phoenix-ide \
-              --clobber \
-              "${assets[@]}"; then
-              echo "release upload failed; restoring previously published assets" >&2
-              exit 1
-            fi
-            restore_needed=0
-          else
-            gh release create "${{ needs.gate.outputs.tag }}" \
-              --repo scottopell/phoenix-ide \
-              --title "${{ needs.gate.outputs.tag }}" \
-              --generate-notes \
-              "${assets[@]}"
-          fi
+          scripts/publish-release-assets.sh \
+            scottopell/phoenix-ide \
+            "${{ needs.gate.outputs.tag }}" \
+            "${assets[@]}"

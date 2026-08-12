@@ -50,9 +50,16 @@ gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q
 gh release view vX.Y.Z --json url,assets -q '{url, assets: [.assets[].name]}'
 ```
 
-Expect status `success` and seven assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; and `SHA256SUMS` covering all six binaries. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
+Expect status `success` and nine assets: primary binaries for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-musl`; symbol-rich `-debug` variants for both Linux targets; signed/notarized `Phoenix.app` zips for arm64 and Intel macOS; and `SHA256SUMS` covering all eight binaries/archives. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
-If the build fails, do not retry blindly. Open the run, read the failed step, fix the underlying issue, and merge a fix. Because the tag is created only when a *new* version reaches `main`, a re-run of the same version is a no-op (the gate sees the tag already exists); ship the fix as the next patch version instead. Never `--force` a tag.
+If the build fails, do not retry blindly. Open the run and fix the underlying issue first. For transient runner, signing-credential, notarization, or publication failures that require no code change, rerun the failed workflow run at the tagged commit:
+
+```bash
+gh run rerun <run-id> --failed
+gh run watch <run-id> --exit-status
+```
+
+The gate permits this only when the existing tag still points at the workflow commit; publication stages and safely replaces that exact release's assets. If a code change is required, ship the fix as the next patch version—the existing tag points at the old commit and the gate will refuse to republish it from a different commit. Never delete or force-move a release tag.
 
 ## Step 4 — Draft polished release notes via sub-agent
 

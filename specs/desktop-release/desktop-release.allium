@@ -9,13 +9,13 @@
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | different_commit_refused }
 enum BuildState { pending | ready | built | failed }
-enum SignatureState { unsigned | signed_once | verified | failed }
-enum NotaryState { pending | submitted | stapled | failed }
-enum PublishState { idle | creating | replacing | completed | restored_previous | failed }
+enum SignatureState { unsigned | signed_once | verified | app_signed | app_verified | failed }
+enum NotaryState { pending | submitted | stapled | validated | failed }
+enum PublishState { idle | creating | replacing | staged | committed | completed | restored_previous | failed }
 enum AssetScope { standalone_helper | desktop_archive | checksum_set }
 
 enum FailureDomain {
-    none | tag_gate | helper_build | app_build | helper_signing | notarization | publish
+    none | tag_gate | helper_build | app_build | helper_signing | notarization | publish | credentials
 }
 
 value ReleaseIdentity {
@@ -31,7 +31,6 @@ value ReleaseAsset {
 }
 
 entity ReleaseGate {
-    id: String
     identity: ReleaseIdentity
     state: TagGateState
 
@@ -46,7 +45,6 @@ entity ReleaseGate {
 }
 
 entity StandaloneHelperBuild {
-    id: String
     target: String
     identity: ReleaseIdentity
     build: BuildState
@@ -71,10 +69,10 @@ entity StandaloneHelperBuild {
 }
 
 entity DesktopArchiveBuild {
-    id: String
     target: String
     identity: ReleaseIdentity
     build: BuildState
+    app_signature: SignatureState
     notarization: NotaryState
     archive_asset: ReleaseAsset?
 
@@ -86,17 +84,26 @@ entity DesktopArchiveBuild {
         failed -> failed
     }
 
+    transitions app_signature {
+        unsigned -> app_signed
+        app_signed -> app_verified
+        app_signed -> failed
+        app_verified -> failed
+        failed -> failed
+    }
+
     transitions notarization {
         pending -> submitted
         submitted -> stapled
         submitted -> failed
+        stapled -> validated
         stapled -> failed
+        validated -> failed
         failed -> failed
     }
 }
 
 entity ReleasePublication {
-    id: String
     identity: ReleaseIdentity
     state: PublishState
     previous_assets_backed_up: Boolean
@@ -106,16 +113,25 @@ entity ReleasePublication {
     transitions state {
         idle -> creating
         idle -> replacing
+        replacing -> staged
+        staged -> committed
+        committed -> completed
         creating -> completed
-        creating -> failed
-        replacing -> completed
         replacing -> restored_previous
-        replacing -> failed
+        staged -> restored_previous
+        committed -> restored_previous
         restored_previous -> failed
+        replacing -> failed
+        staged -> failed
+        committed -> failed
+        creating -> failed
         completed -> completed
         restored_previous -> restored_previous
         failed -> failed
     }
+}
+
+surface DesktopReleaseWorkflow {
 }
 
 -- Helpers
@@ -123,29 +139,42 @@ entity ReleasePublication {
 -- full_commit_identity(identity) -> Boolean
 --   identity.full_commit is exactly forty lowercase hexadecimal characters.
 -- release_tag_matches_semver(identity) -> Boolean
---   identity.tag is a v-prefixed semantic version.
+--   identity.tag is a v-prefixed semantic version with no prerelease/build suffix.
 -- tag_points_at_exact_commit(gate) -> Boolean
 --   the existing release tag resolves to gate.identity.full_commit exactly.
 -- tag_absent_for_identity(gate) -> Boolean
 --   no existing release tag with gate.identity.tag exists.
 -- helper_bytes_equal_signed_asset(helper, archive) -> Boolean
 --   the helper embedded in archive is byte-identical to the signed standalone
---   helper artifact published for the same target and identity.
+--   helper artifact published for the same target and identity both before and
+--   after outer-app signing.
 -- helper_signature_verified(helper) -> Boolean
 --   the standalone helper artifact has passed codesign verification after being
 --   signed exactly once.
 -- app_info_matches_release(archive) -> Boolean
 --   the built app Info.plist carries MARKETING_VERSION from archive.identity.tag
 --   and the deterministic CURRENT_PROJECT_VERSION for that release.
--- checksum_set_complete(publication) -> Boolean
---   SHA256SUMS covers every required standalone-helper and desktop-archive
---   release asset for publication.identity.
+-- app_signature_verified(archive) -> Boolean
+--   the signed outer app passed hardened-runtime codesign verification.
+-- notarization_credentials_available(archive) -> Boolean
+--   Apple ID, team ID, app-specific password, and signing identity are all present.
+-- stapled_ticket_valid(archive) -> Boolean
+--   stapler validate and spctl assessment both passed for archive.
+-- required_release_assets_complete(publication) -> Boolean
+--   the publication includes every standalone helper, every desktop archive, and
+--   SHA256SUMS for publication.identity.
+-- checksum_membership_complete(publication) -> Boolean
+--   SHA256SUMS covers every required standalone-helper and desktop-archive asset
+--   exactly once for publication.identity.
 -- previous_release_assets_downloaded(publication) -> Boolean
 --   the existing release asset set matching publication.identity was staged
 --   before replacement began.
+-- staged_replacement_assets_complete(publication) -> Boolean
+--   staged upload contains the complete replacement asset and checksum set before
+--   any destructive rename/delete commit step starts.
 -- previous_release_assets_restored(publication) -> Boolean
 --   the pre-existing release asset set was re-uploaded after a replacement
---   failure so the release retains a complete prior asset set.
+--   failure and verified by exact asset-name membership.
 
 rule GateAcceptsExistingExactTag {
     when: ExactReleaseTagFound(gate)
@@ -172,10 +201,22 @@ rule GateRefusesDifferentCommitReuse {
     ensures: gate.state = different_commit_refused
 }
 
+rule StandaloneHelperBuildMustCompleteBeforeSigning {
+    when: StandaloneHelperBuilt(helper)
+    requires: helper.build = ready
+    ensures: helper.build = built
+}
+
 rule StandaloneHelperMustBeSignedBeforeDesktopPackaging {
     when: StandaloneHelperSigned(helper)
     requires: helper.build = built
     ensures: helper.signature = signed_once
+}
+
+rule StandaloneHelperSigningFailureStopsRelease {
+    when: StandaloneHelperSignatureRejected(helper)
+    requires: helper.build = built
+    ensures: helper.signature = failed
 }
 
 rule StandaloneHelperVerificationPrecedesDesktopEmbedding {
@@ -183,6 +224,15 @@ rule StandaloneHelperVerificationPrecedesDesktopEmbedding {
     requires: helper.signature = signed_once
     requires: helper_signature_verified(helper)
     ensures: helper.signature = verified
+}
+
+rule MissingCredentialsRejectSignedReleasePath {
+    when: ReleaseCredentialsMissing(archive, publication)
+    requires: archive.build = ready
+    requires: not notarization_credentials_available(archive)
+    ensures: archive.build = failed
+    ensures: publication.state = failed
+    ensures: publication.failure_domain = credentials
 }
 
 rule DesktopBuildConsumesVerifiedStandaloneHelper {
@@ -196,21 +246,73 @@ rule DesktopBuildConsumesVerifiedStandaloneHelper {
     ensures: archive.build = built
 }
 
-rule DesktopArchiveMustBeNotarizedBeforePublish {
-    when: DesktopArchiveStapled(archive)
+rule OuterAppSigningRequiresBuiltArchive {
+    when: OuterAppSigned(archive)
     requires: archive.build = built
+    ensures: archive.app_signature = app_signed
+}
+
+rule OuterAppSigningFailureStopsRelease {
+    when: OuterAppSignatureRejected(archive)
+    requires: archive.build = built
+    ensures: archive.app_signature = failed
+}
+
+rule OuterAppVerificationFollowsSigning {
+    when: OuterAppVerified(archive)
+    requires: archive.app_signature = app_signed
+    requires: app_signature_verified(archive)
+    requires: helper_bytes_equal_signed_asset(StandaloneHelperBuild, archive)
+    ensures: archive.app_signature = app_verified
+}
+
+rule NotarizationSubmissionRequiresVerifiedApp {
+    when: NotarizationSubmitted(archive)
+    requires: archive.app_signature = app_verified
+    requires: notarization_credentials_available(archive)
+    ensures: archive.notarization = submitted
+}
+
+rule NotarizationSubmissionFailureStopsRelease {
+    when: NotarizationSubmissionRejected(archive)
+    requires: archive.app_signature = app_verified
+    ensures: archive.notarization = failed
+}
+
+rule NotarizationStaplingRequiresSubmission {
+    when: NotarizationStapled(archive)
     requires: archive.notarization = submitted
     ensures: archive.notarization = stapled
+}
+
+rule NotarizationStapleFailureStopsRelease {
+    when: NotarizationStapleRejected(archive)
+    requires: archive.notarization = submitted
+    ensures: archive.notarization = failed
+}
+
+rule NotarizationValidationRequiresStapledArchive {
+    when: NotarizationValidated(archive)
+    requires: archive.notarization = stapled
+    requires: stapled_ticket_valid(archive)
+    ensures: archive.notarization = validated
+}
+
+rule NotarizationValidationFailureStopsRelease {
+    when: NotarizationValidationRejected(archive)
+    requires: archive.notarization = stapled
+    ensures: archive.notarization = failed
 }
 
 rule PublishCreatesFreshReleaseFromCompleteAssetSet {
     when: ReleaseCreated(publication)
     requires: publication.state = creating
-    requires: checksum_set_complete(publication)
+    requires: required_release_assets_complete(publication)
+    requires: checksum_membership_complete(publication)
     ensures: publication.state = completed
 }
 
-rule PublishReplacementStagesPreviousAssets {
+rule PublishReplacementStartsOnlyForExactTagRetry {
     when: ReplacementUploadStarted(publication)
     requires: publication.state = idle
     requires: previous_release_assets_downloaded(publication)
@@ -218,9 +320,25 @@ rule PublishReplacementStagesPreviousAssets {
     ensures: publication.previous_assets_backed_up
 }
 
-rule ReplacementFailureRestoresPreviousAssets {
-    when: ReplacementUploadFailed(publication)
+rule ReplacementStagesCompleteSetBeforeCommit {
+    when: ReplacementAssetsStaged(publication)
     requires: publication.state = replacing
+    requires: publication.previous_assets_backed_up
+    requires: staged_replacement_assets_complete(publication)
+    requires: required_release_assets_complete(publication)
+    requires: checksum_membership_complete(publication)
+    ensures: publication.state = staged
+}
+
+rule ReplacementCommitAdvancesOnlyAfterStaging {
+    when: ReplacementCommitCompleted(publication)
+    requires: publication.state = staged
+    ensures: publication.state = committed
+}
+
+rule ReplacementCommitFailureRestoresPreviousAssets {
+    when: ReplacementCommitFailed(publication)
+    requires: publication.state = staged
     requires: publication.previous_assets_backed_up
     requires: previous_release_assets_restored(publication)
     ensures: publication.state = restored_previous
@@ -228,10 +346,20 @@ rule ReplacementFailureRestoresPreviousAssets {
     ensures: publication.failure_domain = publish
 }
 
+rule ReplacementRestoreFailureIsDistinctTerminalFailure {
+    when: ReplacementRestoreFailed(publication)
+    requires: publication.state = staged
+    requires: publication.previous_assets_backed_up
+    requires: not previous_release_assets_restored(publication)
+    ensures: publication.state = failed
+    ensures: publication.failure_domain = publish
+}
+
 rule SuccessfulReplacementPreservesReleaseIdentity {
     when: ReplacementUploadCompleted(publication)
-    requires: publication.state = replacing
-    requires: checksum_set_complete(publication)
+    requires: publication.state = committed
+    requires: required_release_assets_complete(publication)
+    requires: checksum_membership_complete(publication)
     ensures: publication.state = completed
 }
 
