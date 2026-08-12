@@ -144,7 +144,7 @@ function roadmapPayload(markdown) {
   return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
-export function updatesFromComments(comments) {
+function reduceUpdates(comments, bounded) {
   const latest = new Map();
   const ordered = [...comments]
     .filter(
@@ -199,7 +199,11 @@ export function updatesFromComments(comments) {
   if (orderedUpdates.length > MAX_WORKSTREAMS) {
     console.warn(`Roadmap has ${orderedUpdates.length} workstreams; projecting the first ${MAX_WORKSTREAMS} by explicit roadmap order`);
   }
-  return orderedUpdates.slice(0, MAX_WORKSTREAMS);
+  return bounded ? orderedUpdates.slice(0, MAX_WORKSTREAMS) : orderedUpdates;
+}
+
+export function updatesFromComments(comments) {
+  return reduceUpdates(comments, true);
 }
 
 function markdownText(value) {
@@ -350,7 +354,7 @@ function createdRecordAccepted(comment, comments, renderedUpdates) {
   if (record?.recordType === "retirement") {
     try {
       const retirement = validateRetirement(JSON.parse(record.payload));
-      const before = updatesFromComments(prefix.filter((candidate) => candidate.id !== comment.id));
+      const before = reduceUpdates(prefix.filter((candidate) => candidate.id !== comment.id), false);
       const current = before.find((update) => update.workstream === retirement.workstream);
       const author = comment.user?.login ?? "unknown";
       return current === undefined ||
@@ -399,7 +403,9 @@ export async function run({ event, configuredIssueNumber, token }) {
         console.warn(`Roadmap verification attempt ${attempt} failed; rebuilding from a fresh snapshot: ${error.message}`);
       }
     }
-    if (!stable) throw new Error("roadmap comments did not stabilize after 3 projection attempts");
+    if (!stable) {
+      console.warn("Roadmap comments kept changing through 3 projection attempts; later uncancelled events will project newer comments");
+    }
 
     if (!acknowledgesCreation) return { ...changed, updates: updates.length };
     const accepted = createdRecordAccepted(event.comment, comments, updates);
