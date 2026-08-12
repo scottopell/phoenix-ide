@@ -8,7 +8,7 @@ Current normative authority is `requirements.md` for timeless rules and `bedrock
 
 ## Current Reality
 
-The implementation still reflects the pre-unification product model in several user-facing places. The durable conversation row continues to carry `ConvMode` (`Direct`, `Explore`, `Work`, `Branch`), task approval still parks in `AwaitingTaskApproval`, task resolution still drives legacy terminal actions (`/abandon-task`, `/mark-merged`), and archived versus non-archived remains the shipped lifecycle authority. Continuation already uses `continued_in_conv_id` and transfers the live worktree/work-scope forward. The branch-only Close foundation is being redesigned to persist dormant first-class ProductConversation identity and normalized Close evidence, but its lifecycle projection serves no readers and receives no dual writes; the Open/History authority cutover remains separate work.
+The implementation still reflects the pre-unification product model in several user-facing places. The durable conversation row continues to carry `ConvMode` (`Direct`, `Explore`, `Work`, `Branch`), task approval still parks in `AwaitingTaskApproval`, task resolution still drives legacy terminal actions (`/abandon-task`, `/mark-merged`), and archived versus non-archived remains the shipped lifecycle authority. Continuation already uses `continued_in_conv_id` while reusing the ProductConversation's attached WorkScope and environment. The branch-only Close foundation now carries dormant normalized Close evidence, but first-class ProductConversation persistence is not yet redesigned in migration 63; dormant lifecycle serves no readers and receives no dual writes, and the Open/History authority cutover remains separate work.
 
 ## Technical Summary
 
@@ -54,4 +54,4 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-031B:** Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent | Not implemented | Shipped hard delete removes a legacy row-oriented shape; complete ProductConversation aggregate deletion, normalized-child coverage, and typed surviving provenance tombstones remain migration targets |
 | **REQ-BED-032:** Conversation Terminal-Transition Cascade | ✅ Complete (legacy current reality) | Existing hard-delete cascade invokes bash/tmux/projects/browser cleanup and broadcasts `ConversationHardDeleted`; aggregate-aware Delete remains governed by REQ-BED-031B |
 
-**Current implementation:** 29 requirements complete, 3 deprecated, and 4 requirements not implemented.
+**Current implementation:** 28 requirements complete, 3 deprecated, and 4 requirements not implemented.

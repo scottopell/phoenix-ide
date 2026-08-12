@@ -152,8 +152,8 @@ entity CloseObligation {
     product_conversation: ProductConversation
     phase: ClosePhase
     outcome: CloseOutcome when phase = completed
-    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair }
-    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair }
+    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
+    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
 
     transitions phase {
         awaiting_blocker_resolution -> awaiting_stop_work_confirmation
@@ -1673,7 +1673,7 @@ rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
     requires: product_conversation.lifecycle = open
-    ensures: CloseOutcomeSystemMessagePersisted(product_conversation)
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id)
     ensures: product_conversation.lifecycle = history
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: ProductConversationEnteredHistory(product_conversation, attempt_id)
@@ -1901,6 +1901,13 @@ rule UserHardDeletesConversationRule {
         -- Direct call: cascade_projects_on_delete
         -- (specs/projects/ subscriber rule).
     ensures: AggregateTranscriptRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseObligationsRemoved(aggregate)
+    ensures: SolelyOwnedCloseAttemptMembersRemoved(aggregate)
+    ensures: SolelyOwnedCloseInspectionRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseInventoryRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseLossRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseRetirementEvidenceRowsRemoved(aggregate)
+    ensures: SolelyOwnedLineageQaRowsRemoved(aggregate)
     ensures: SolelyOwnedConversationMessagesRemoved(aggregate)
     ensures: SolelyOwnedConversationToolCallRowsRemoved(aggregate)
     ensures: SolelyOwnedConversationApprovalRowsRemoved(aggregate)
@@ -1933,9 +1940,10 @@ rule UserHardDeletesConversationRule {
         --      unless another live owner retains the same WorkScope.
         --   6. db.delete_product_conversation(product_conversation_id) — remove
         --      every transcript row and solely-owned child row in the History
-        --      aggregate, including message rows, tool-call rows, approval rows,
-        --      attachment rows, retrieval chunk rows, retrieval locator rows,
-        --      and FTS rows, while retaining typed tombstones for surviving
+        --      aggregate, including Close obligations/members/evidence,
+        --      lineage Q&A, message rows, tool-call rows, approval rows,
+        --      message/file-attachment rows, retrieval chunk/locator rows, and
+        --      FTS rows, while retaining typed tombstones for surviving
         --      provenance links and leaving separately-owned branch /
         --      pull-request relations untouched.
         --      Re-running the same delete after rows are already gone still

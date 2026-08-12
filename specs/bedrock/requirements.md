@@ -748,10 +748,12 @@ AND the user SHALL be able to start a new ProductConversation on the same projec
 EACH Close operation SHALL carry one durable Close-attempt identity bound to that exact ProductConversation identity
 AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
 AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, retry, and finalization event to that exact Close-attempt identity
-AND MAY retain completed Close attempts as historical records
+AND SHALL retain completed Close attempts as historical records until permanent Delete removes their ProductConversation aggregate
 AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
 AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
 AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
+AND SHALL retain the last bound inspection generation and fingerprint on a completed `archived` attempt
+AND SHALL omit that aggregate inspection pair from a completed `cancelled` attempt while preserving any normalized exact-attempt inspection and loss evidence already recorded before cancellation
 AND SHALL snapshot the exact ordered parent transcript-row continuation topology of that ProductConversation when the attempt is admitted
 AND SHALL bind every snapshot member to both that exact Close attempt and the parent transcript row's explicit ProductConversation membership
 AND SHALL treat subordinate execution conversations as aggregate participants rather than continuation-topology members
@@ -965,7 +967,7 @@ browser side).
 History after Close is NOT reversible in place. Close moves the conversation to History through the separate Close lifecycle; permanent Delete later removes that retained aggregate entirely. There is
 no `unarchive` operation because Archive is not a normative lifecycle concept.
 
-THE `ConversationHardDeleted` SSE wire event (step 6) SHALL be emitted
+THE `ConversationHardDeleted` SSE wire event (step 7) SHALL be emitted
 exactly once per hard-delete operation, after all cascade steps have
 completed. UI consumers use it to refresh sidebar, navigation, and
 related views. It is NOT a subscriber-dispatch hook for cleanup logic;
