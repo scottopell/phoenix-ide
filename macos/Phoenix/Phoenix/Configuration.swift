@@ -82,6 +82,10 @@ struct SettingsPersistenceSummary: Equatable {
     let requiresReconnect: Bool
     let savedSecrets: [ProviderSecret]
     let deletedSecrets: [ProviderSecret]
+
+    var changedBundledSecrets: Bool {
+        !savedSecrets.isEmpty || !deletedSecrets.isEmpty
+    }
 }
 
 struct ConnectionReapplyDecision: Equatable {
@@ -98,6 +102,45 @@ struct ConnectionReapplyDecision: Equatable {
         default:
             return ConnectionReapplyDecision(requiresReconnect: true)
         }
+    }
+}
+
+struct SettingsReconnectDecision: Equatable {
+    let requiresReconnect: Bool
+
+    static func evaluate(summary: SettingsPersistenceSummary, reapply: ConnectionReapplyDecision, candidate: ServerMode) -> SettingsReconnectDecision {
+        let secretChangeRequiresReconnect = candidate.kind == .bundled && summary.changedBundledSecrets
+        return SettingsReconnectDecision(requiresReconnect: reapply.requiresReconnect || secretChangeRequiresReconnect)
+    }
+}
+
+struct SettingsFeedback: Equatable {
+    let statusMessage: String?
+    let errorMessage: String?
+
+    static func statusMessage(summary: SettingsPersistenceSummary) -> String {
+        var parts: [String] = []
+        if !summary.savedSecrets.isEmpty {
+            parts.append("Saved provider secrets to Keychain only as part of this Apply and Connect.")
+        }
+        if !summary.deletedSecrets.isEmpty {
+            parts.append("Deleted cleared provider secrets from Keychain.")
+        }
+        if summary.requiresReconnect {
+            parts.append("Saved settings now govern new connections.")
+        } else {
+            parts.append("Saved settings already match the saved configuration.")
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+struct DeepLinkAuthDecision {
+    static func shouldKeepQueuedConversationOnDeploymentAuthenticationStop(
+        pendingConversationID: UUID?,
+        stopWasForTransition: Bool
+    ) -> Bool {
+        pendingConversationID != nil && !stopWasForTransition
     }
 }
 

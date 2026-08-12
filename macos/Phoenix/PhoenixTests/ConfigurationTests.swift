@@ -707,6 +707,41 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertFalse(result.summary.requiresReconnect)
     }
 
+    func testBundledSecretDeletionMarksSummaryWithoutChangingOtherSettings() throws {
+        let suite = "SettingsPersistence.persist.bundle-secret-delete-summary.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "old-secret",
+            .openAIAPIKey: "unchanged-openai",
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        let previous = PersistedSettingsSnapshot(
+            preferences: PersistedPreferenceSnapshot(
+                serverMode: ServerModeKind.bundled.rawValue,
+                attachedOrigin: ConfigurationStore.defaultAttachedOrigin,
+                bundledPort: 8420,
+                developmentBinaryOverride: try bundledExecutableFixture(),
+                rustLogLevel: "phoenix_ide=info"
+            ),
+            secrets: [
+                .anthropicAPIKey: .loaded("old-secret"),
+                .openAIAPIKey: .unloaded,
+            ]
+        )
+        var draft = previous.draft()
+        draft.mode = .bundled
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
+        draft.anthropicKey = ""
+
+        let result = try persistence.persist(draft: draft, appliedSnapshot: previous)
+
+        XCTAssertTrue(result.summary.requiresReconnect)
+        XCTAssertEqual(result.summary.deletedSecrets, [.anthropicAPIKey])
+        XCTAssertTrue(result.summary.changedBundledSecrets)
+        XCTAssertEqual(try keychain.read(.openAIAPIKey), "unchanged-openai")
+    }
+
     func testAttachedPersistSkipsKeychainReadsAndWrites() throws {
         let suite = "SettingsPersistence.persist.attached-skips-keychain.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -1200,6 +1235,61 @@ final class ServerManagerHelpersTests: XCTestCase {
         )
 
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, deployment), candidate: candidate).requiresReconnect)
+    }
+
+    func testSettingsReconnectDecisionForcesReconnectWhenBundledSecretsChange() throws {
+        let bundled = ServerMode.bundled(BundledServerConfiguration(
+            origin: try PhoenixOrigin("http://127.0.0.1:8420"),
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            runtimeRootURL: URL(fileURLWithPath: "/tmp/runtime", isDirectory: true),
+            dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
+            databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
+            phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
+            ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
+            rustLogLevel: "phoenix_ide=info"
+        ))
+        let summary = SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [.anthropicAPIKey], deletedSecrets: [])
+        let reapply = ConnectionReapplyDecision(requiresReconnect: false)
+
+        XCTAssertTrue(SettingsReconnectDecision.evaluate(summary: summary, reapply: reapply, candidate: bundled).requiresReconnect)
+        XCTAssertFalse(SettingsReconnectDecision.evaluate(
+            summary: summary,
+            reapply: reapply,
+            candidate: .attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test")))
+        ).requiresReconnect)
+        XCTAssertFalse(SettingsReconnectDecision.evaluate(
+            summary: SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [], deletedSecrets: []),
+            reapply: reapply,
+            candidate: bundled
+        ).requiresReconnect)
+    }
+
+    func testSettingsFeedbackSeparatesStatusFromError() {
+        let summary = SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [], deletedSecrets: [.openAIAPIKey])
+        XCTAssertEqual(
+            SettingsFeedback.statusMessage(summary: summary),
+            "Deleted cleared provider secrets from Keychain. Saved settings already match the saved configuration."
+        )
+        XCTAssertEqual(
+            SettingsFeedback(statusMessage: "ok", errorMessage: "nope"),
+            SettingsFeedback(statusMessage: "ok", errorMessage: "nope")
+        )
+    }
+
+    func testDeepLinkAuthDecisionKeepsQueuedConversationOnlyAcrossAuthenticationStop() {
+        XCTAssertTrue(DeepLinkAuthDecision.shouldKeepQueuedConversationOnDeploymentAuthenticationStop(
+            pendingConversationID: UUID(),
+            stopWasForTransition: false
+        ))
+        XCTAssertFalse(DeepLinkAuthDecision.shouldKeepQueuedConversationOnDeploymentAuthenticationStop(
+            pendingConversationID: UUID(),
+            stopWasForTransition: true
+        ))
+        XCTAssertFalse(DeepLinkAuthDecision.shouldKeepQueuedConversationOnDeploymentAuthenticationStop(
+            pendingConversationID: nil,
+            stopWasForTransition: false
+        ))
     }
 
     func testBundledReconnectQueueCanBeCancelled() throws {

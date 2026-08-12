@@ -474,9 +474,9 @@ final class ServerManager: ObservableObject {
         state = .unavailable(FailureState(version: currentVersion, message: message))
     }
 
-    func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil) {
+    func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil, isTransitionStop: Bool = false) {
         if let completion { stopCompletions.append(completion) }
-        if preservedState == nil { bundledReconnectQueue.cancel() }
+        if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
         readinessTask?.cancel()
         readinessTask = nil
 
@@ -614,14 +614,14 @@ final class ServerManager: ObservableObject {
         guard case .bundled = mode else { return }
         guard bundledReconnectQueue.request(candidate) else { return }
         state = .restarting
-        stop { [weak self] in
+        stop(completion: { [weak self] in
             guard let self else { return }
             guard !self.terminationInProgress else { return }
             guard let latestCandidate = self.bundledReconnectQueue.takeAfterStop() else { return }
             self.mode = latestCandidate
             self.webOrigin = latestCandidate.origin
             self.connect()
-        }
+        }, isTransitionStop: true)
     }
 
     private func verifyIdentity(for selected: ServerMode, operation: UUID, allowIntermediateFailureState: Bool) async {

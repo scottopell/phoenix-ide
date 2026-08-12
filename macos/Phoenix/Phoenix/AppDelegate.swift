@@ -156,7 +156,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 },
                 onAuthenticationRequired: { [weak self] operation in
-                    self?.serverManager.deploymentRequiresAuthentication(operation: operation)
+                    guard let self else { return }
+                    self.isPrimaryWebViewAuthenticated = false
+                    self.pendingConversationValidationTask?.cancel()
+                    self.serverManager.deploymentRequiresAuthentication(operation: operation)
+                    self.validateQueuedConversationNavigationIfPossible()
                 }
             )
             window.contentView = NSHostingView(rootView: wrapper)

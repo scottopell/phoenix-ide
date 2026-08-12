@@ -28,7 +28,8 @@ struct SettingsView: View {
     @State private var savedDraft = SettingsDraft.defaults
     @State private var savedAppliedSnapshot: PersistedSettingsSnapshot?
     @State private var hasSavedModeSelection = false
-    @State private var keychainMessage: String?
+    @State private var statusMessage: String?
+    @State private var errorMessage: String?
     @State private var modeMessage: String?
     private let persistence = SettingsPersistence()
 
@@ -87,9 +88,13 @@ struct SettingsView: View {
                 Button("Apply and Connect") {
                     do {
                         let persisted = try persistence.persist(draft: draft, appliedSnapshot: savedAppliedSnapshot)
-                        let reconnectDecision = ConnectionReapplyDecision.evaluate(
-                            currentMode: serverManager.mode,
-                            currentState: serverManager.state,
+                        let reconnectDecision = SettingsReconnectDecision.evaluate(
+                            summary: persisted.summary,
+                            reapply: ConnectionReapplyDecision.evaluate(
+                                currentMode: serverManager.mode,
+                                currentState: serverManager.state,
+                                candidate: persisted.candidate
+                            ),
                             candidate: persisted.candidate
                         )
                         savedDraft = persisted.persistedSnapshot.draft()
@@ -98,13 +103,13 @@ struct SettingsView: View {
                         if reconnectDecision.requiresReconnect {
                             try serverManager.reconnect(to: persisted.candidate)
                         }
-                        keychainMessage = keychainStatusMessage(summary: persisted.summary)
+                        statusMessage = SettingsFeedback.statusMessage(summary: persisted.summary)
                         modeMessage = nil
                     } catch {
                         if case ConfigurationError.missingModeSelection = error {
                             modeMessage = error.localizedDescription
                         } else {
-                            keychainMessage = error.localizedDescription
+                            errorMessage = error.localizedDescription
                         }
                     }
                 }
@@ -116,6 +121,11 @@ struct SettingsView: View {
                 Text("Settings changed locally. Phoenix.app keeps using the saved configuration until you click Apply and Connect.")
                     .font(.caption)
                     .foregroundStyle(.orange)
+            }
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
         .padding(24)
@@ -131,26 +141,12 @@ struct SettingsView: View {
                     modeMessage = "Choose a mode before Phoenix.app can connect."
                 }
             } catch {
-                keychainMessage = error.localizedDescription
+                errorMessage = error.localizedDescription
             }
         }
     }
 
-    private func keychainStatusMessage(summary: SettingsPersistenceSummary) -> String {
-        var parts: [String] = []
-        if !summary.savedSecrets.isEmpty {
-            parts.append("Saved provider secrets to Keychain only as part of this Apply and Connect.")
-        }
-        if !summary.deletedSecrets.isEmpty {
-            parts.append("Deleted cleared provider secrets from Keychain.")
-        }
-        if summary.requiresReconnect {
-            parts.append("Saved settings now govern new connections.")
-        } else {
-            parts.append("Saved settings already match the saved configuration.")
-        }
-        return parts.joined(separator: " ")
-    }
+
 
     private var attachedSettings: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -196,8 +192,8 @@ struct SettingsView: View {
                     Text("Stored in this Mac's Keychain only when you click Apply and Connect. Clearing a field deletes that saved secret from Keychain on the next apply.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    if let keychainMessage {
-                        Text(keychainMessage).font(.caption).foregroundStyle(.secondary)
+                    if let statusMessage {
+                        Text(statusMessage).font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 .padding(.top, 6)
