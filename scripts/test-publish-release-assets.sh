@@ -103,7 +103,7 @@ def upload_count():
 
 
 def is_restore_upload(clobber):
-    return clobber and upload_count() > 1
+    return clobber
 
 
 def should_skip_restore_asset(name, restore_phase):
@@ -257,7 +257,14 @@ if args[0] == 'api':
     if method == 'GET' and endpoint.startswith('repos/') and '/releases/tags/' in endpoint:
         tag = endpoint.rsplit('/', 1)[1]
         release = ensure_release(tag)
-        print(json.dumps({'assets': [{'id': a['id'], 'name': a['name']} for a in release['assets']]}))
+        print(json.dumps({
+            'id': release.get('id', 42),
+            'draft': release.get('draft', False),
+            'assets': [{'id': a['id'], 'name': a['name']} for a in release['assets']],
+        }))
+        raise SystemExit(0)
+    if method == 'DELETE' and '/releases/' in endpoint and '/assets/' not in endpoint:
+        release_path.unlink(missing_ok=True)
         raise SystemExit(0)
     if method == 'DELETE' and '/releases/assets/' in endpoint:
         release = load_release()
@@ -310,6 +317,17 @@ while i < len(args):
     else:
         i += 1
 payload = json.load(sys.stdin)
+expression = next((arg for arg in args if arg.startswith('.')), '')
+if expression == '.draft // false':
+    print('true' if payload.get('draft', False) else 'false')
+    raise SystemExit(0)
+if expression == '.id':
+    if 'id' not in payload: raise SystemExit(1)
+    print(payload['id'])
+    raise SystemExit(0)
+if expression == '.assets[].name':
+    for asset in payload.get('assets', []): print(asset.get('name'))
+    raise SystemExit(0)
 for asset in payload.get('assets', []):
     if asset.get('name') == name:
         print(asset.get('id'))
@@ -385,6 +403,22 @@ bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" 
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
 grep -F 'release create v1.2.3 --repo owner/repo --title v1.2.3 --generate-notes' "$tmp/gh.log" >/dev/null
 
+# surviving draft is discarded and recreated as a complete published release
+reset_env
+write_release 'partial-old.zip'
+python3 - "$state_dir/release.json" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+release = json.loads(path.read_text())
+release['draft'] = True
+release['id'] = 42
+path.write_text(json.dumps(release))
+PY
+bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two"
+assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
+grep -F 'api --method DELETE repos/owner/repo/releases/42' "$tmp/gh.log" >/dev/null
+
 # exact-tag staged replacement success
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
@@ -438,9 +472,9 @@ set -e
 [[ "$status" -eq 2 ]]
 grep -F 'error: previous release asset restoration failed' "$tmp/restore-partial.err" >/dev/null
 
-# restore failure is detected when rollback leaves an extra final asset behind
+# restore failure is detected when rollback leaves a newly introduced final asset behind
 reset_env
-write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
+write_release 'old note.txt'
 write_state_file fail_patch_on_count 2
 write_state_file restore_keep_extra_name 'Phoenix Desktop.zip'
 set +e

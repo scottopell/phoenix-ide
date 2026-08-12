@@ -146,6 +146,11 @@ if run_unsigned v1.2.3-rc1 0123456789abcdef0123456789abcdef01234567 >/dev/null 2
   exit 1
 fi
 
+if run_unsigned v1.1000.0 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1; then
+  echo "expected colliding bundle-version components to fail" >&2
+  exit 1
+fi
+
 if run_unsigned v1.2.3 0123456789abcdef >/dev/null 2>&1; then
   echo "expected short SHA to fail" >&2
   exit 1

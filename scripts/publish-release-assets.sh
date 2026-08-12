@@ -7,7 +7,14 @@ tag=$2
 shift 2
 assets=("$@")
 
-if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+release_metadata=$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
+if [[ -z "$release_metadata" ]]; then
+  gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${assets[@]}"
+  exit 0
+fi
+if [[ $(jq -r '.draft // false' <<<"$release_metadata") == true ]]; then
+  draft_id=$(jq -er '.id' <<<"$release_metadata")
+  gh api --method DELETE "repos/$repo/releases/$draft_id" >/dev/null
   gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${assets[@]}"
   exit 0
 fi
@@ -101,8 +108,11 @@ done
 
 if ((commit_failed)); then
   echo "release asset replacement failed; restoring previous asset set" >&2
-  restore_previous || { echo "error: previous release asset restoration failed" >&2; exit 2; }
-  exit 1
+  if restore_previous; then
+    exit 1
+  fi
+  echo "error: previous release asset restoration failed" >&2
+  exit 2
 fi
 cleanup_staged || { echo "error: committed assets but failed to remove staged release debris" >&2; exit 2; }
 for asset in "${assets[@]}"; do asset_id "$(basename "$asset")" >/dev/null; done
