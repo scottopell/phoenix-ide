@@ -592,6 +592,9 @@ export async function run({ event, configuredIssueNumber, token }) {
         const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
         console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
       }
+      if (reflected && outcome?.recordType === "retirement") {
+        await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
+      }
       await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
       terminalReactionSet = true;
     }
