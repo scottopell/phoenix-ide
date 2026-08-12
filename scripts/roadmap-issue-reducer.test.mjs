@@ -255,6 +255,49 @@ test("created structured record transitions from eyes to rocket", async () => {
   }
 });
 
+test("created retirement is accepted when its workstream is absent", async () => {
+  const trigger = comment(2, retired("ios-vnext", 1));
+  const responses = [
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
+    new Response(JSON.stringify([trigger]), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => responses.shift();
+  try {
+    assert.deepEqual(
+      await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
+      { changed: true, updates: 0, acknowledged: "accepted" },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("processing transition failure attempts a confused terminal reaction", async () => {
+  const trigger = comment(2, fenced(update()));
+  const posts = [];
+  let call = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    call += 1;
+    if (options.method === "POST") posts.push(JSON.parse(options.body).content);
+    if (call === 1) return new Response(JSON.stringify({}), { status: 201 });
+    if (call === 2) return new Response("temporary", { status: 500 });
+    if (call === 3) return new Response(JSON.stringify({}), { status: 201 });
+    return new Response(JSON.stringify([]), { status: 200 });
+  };
+  try {
+    await assert.rejects(run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }));
+    assert.deepEqual(posts, ["eyes", "confused"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("editing an update into invalid content removes it immediately", async () => {
   const trigger = comment(2, "No structured update remains.", { updated_at: "2026-08-09T17:00:00Z" });
   const responses = [

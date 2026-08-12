@@ -329,6 +329,22 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
   }
 }
 
+function createdRecordAccepted(comment, updates) {
+  const record = roadmapPayload(comment.body);
+  if (record?.recordType === "update") {
+    return updates.some((update) => update.source.id === comment.id);
+  }
+  if (record?.recordType === "retirement") {
+    try {
+      const retirement = validateRetirement(JSON.parse(record.payload));
+      return !updates.some((update) => update.workstream === retirement.workstream);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 export async function run({ event, configuredIssueNumber, token }) {
   if (!["created", "edited", "deleted"].includes(event.action) || event.issue?.pull_request) {
     return { skipped: "not a supported Issue comment event" };
@@ -340,9 +356,9 @@ export async function run({ event, configuredIssueNumber, token }) {
   }
   const [owner, repo] = event.repository.full_name.split("/");
   const acknowledgesCreation = event.action === "created" && roadmapPayload(event.comment.body) !== null;
-  if (acknowledgesCreation) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
 
   try {
+    if (acknowledgesCreation) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
     const comments = await listComments(owner, repo, configuredIssueNumber, token);
     const trustedCommentIds = comments
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
@@ -353,7 +369,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
     if (!acknowledgesCreation) return { ...changed, updates: updates.length };
-    const accepted = updates.some((update) => update.source.id === event.comment.id);
+    const accepted = createdRecordAccepted(event.comment, updates);
     await setLifecycleReaction(owner, repo, event.comment.id, accepted ? "rocket" : "confused", token);
     return { ...changed, updates: updates.length, acknowledged: accepted ? "accepted" : "rejected" };
   } catch (error) {
