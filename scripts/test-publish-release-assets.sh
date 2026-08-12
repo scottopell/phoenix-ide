@@ -459,7 +459,7 @@ grep -F 'api --method DELETE repos/owner/repo/releases/42' "$tmp/gh.log" >/dev/n
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 publish "$asset_one" "$asset_two"
-assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
+assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
 grep -E 'release upload v1.2.3 --repo owner/repo .*/Phoenix Desktop\.zip\.staged-' "$tmp/gh.log" >/dev/null
 grep -E 'api repos/owner/repo/releases/tags/v1.2.3' "$tmp/gh.log" >/dev/null
 grep -E 'api --method PATCH repos/owner/repo/releases/assets/[0-9]+ -f name=Phoenix Desktop\.zip' "$tmp/gh.log" >/dev/null
@@ -485,51 +485,21 @@ if release_asset_names | grep -F '.staged-' >/dev/null; then
 fi
 unset FAKE_GH_UPLOAD_FAIL_AFTER
 
-# commit failure restores previous complete set and verifies
+# an interrupted commit may leave a mixed same-commit set; the next retry converges
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 write_state_file fail_delete_on_count 1
 status=0
-publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-success.err" || status=$?
-[[ "$status" -eq 1 ]]
-grep -F 'release asset replacement failed; restoring previous asset set' "$tmp/restore-success.err" >/dev/null
-assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-grep -E 'release upload v1.2.3 --repo owner/repo --clobber .*/old note\.txt' "$tmp/gh.log" >/dev/null
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/commit-fail.err" || status=$?
+[[ "$status" -ne 0 ]]
+rm -f "$state_dir/fail_delete_on_count" "$state_dir/delete_count"
+publish "$asset_one" "$asset_two"
+assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
 
-# partial restore is detected when a prior replacement name is missing after rollback
+# stale staged assets from a killed runner are removed before the next retry
 reset_env
-write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-write_state_file fail_patch_on_count 2
-write_state_file restore_skip_name 'SHA 256 SUMS.txt'
-set +e
-publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-partial.err"
-status=$?
-set -e
-[[ "$status" -eq 2 ]]
-grep -F 'error: previous release asset restoration failed' "$tmp/restore-partial.err" >/dev/null
-
-# restore failure is detected when rollback leaves a newly introduced final asset behind
-reset_env
-write_release 'old note.txt'
-write_state_file fail_patch_on_count 2
-write_state_file restore_keep_extra_name 'Phoenix Desktop.zip'
-set +e
-publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-extra.err"
-status=$?
-set -e
-[[ "$status" -eq 2 ]]
-grep -F 'error: previous release asset restoration failed' "$tmp/restore-extra.err" >/dev/null
-
-# restore upload failure returns distinct failure
-reset_env
-write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-write_state_file fail_delete_on_count 1
-export FAKE_GH_UPLOAD_CLOBBER_FAIL=1
-set +e
-publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-fail.err"
-status=$?
-set -e
-[[ "$status" -eq 2 ]]
-grep -F 'error: previous release asset restoration failed' "$tmp/restore-fail.err" >/dev/null
+write_release 'Phoenix Desktop.zip' 'old note.txt' 'orphan.staged-prior-run'
+publish "$asset_one" "$asset_two"
+assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
 
 echo 'publish release asset regression checks passed'
