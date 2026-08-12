@@ -18,6 +18,7 @@ required_fragments = [
     'Tag $TAG already points at this exact commit — retrying its release.',
     'concurrency:',
     'group: publish-release-assets-${{ needs.gate.outputs.tag }}',
+    'ref: ${{ needs.gate.outputs.tag }}',
     'cancel-in-progress: false',
     'bash scripts/publish-release-assets.sh',
 ]

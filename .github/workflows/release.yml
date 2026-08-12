@@ -256,6 +256,9 @@ jobs:
       group: publish-release-assets-${{ needs.gate.outputs.tag }}
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           pattern: '*-release-assets'
