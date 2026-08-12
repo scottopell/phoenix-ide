@@ -371,10 +371,13 @@ function reflectedCommentIds(updates, outcomes) {
   return reflected;
 }
 
-async function clearDisplacedAcceptedReactions(owner, repo, previousReflected, reflected, token) {
-  for (const commentId of previousReflected) {
-    if (!reflected.has(commentId)) {
-      await clearAcceptedReaction(owner, repo, commentId, token);
+async function reconcileAcceptedReactions(owner, repo, comments, reflected, triggerId, token) {
+  for (const comment of comments) {
+    if (!Number.isSafeInteger(comment.id) || comment.id === triggerId) continue;
+    if (reflected.has(comment.id)) {
+      await setLifecycleReaction(owner, repo, comment.id, "rocket", token);
+    } else if (TRUSTED_ASSOCIATIONS.has(comment.author_association) && roadmapPayload(comment.body) !== null) {
+      await clearAcceptedReaction(owner, repo, comment.id, token);
     }
   }
 }
@@ -417,21 +420,21 @@ export async function run({ event, configuredIssueNumber, token }) {
       .map((comment) => comment.id);
     const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
     const { updates, outcomes } = reduceComments(comments);
-    const previous = tracksLifecycle
-      ? reduceComments(comments.filter((comment) => comment.id !== event.comment.id))
-      : null;
     const body = renderRoadmap(updates, snapshotThroughCommentId);
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
-    if (!tracksLifecycle) return { ...changed, updates: updates.length };
     const reflectedIds = reflectedCommentIds(updates, outcomes);
-    await clearDisplacedAcceptedReactions(
-      owner,
-      repo,
-      reflectedCommentIds(previous.updates, previous.outcomes),
-      reflectedIds,
-      token,
-    );
+    if (tracksLifecycle || event.action === "edited" || event.action === "deleted") {
+      await reconcileAcceptedReactions(
+        owner,
+        repo,
+        comments,
+        reflectedIds,
+        event.comment.id,
+        token,
+      );
+    }
+    if (!tracksLifecycle) return { ...changed, updates: updates.length };
 
     const outcome = outcomes.get(event.comment.id);
     const reflected = outcome?.recordType === "retirement"

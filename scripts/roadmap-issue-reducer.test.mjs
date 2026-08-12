@@ -355,7 +355,7 @@ test("stale retirement transitions from eyes to confused", async () => {
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "rejected" });
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket", "confused"]);
   } finally {
     mock.restore();
   }
@@ -384,24 +384,15 @@ test("editing an update away removes its projection and lifecycle reaction", asy
 test("deleted update rebuilds from remaining live comments", async () => {
   const deleted = comment(2, fenced(update({ workstream: "deleted" })));
   const remaining = comment(1, fenced(update({ workstream: "remaining", title: "Remaining" })));
-  const responses = [
-    new Response(JSON.stringify([remaining]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  const requests = [];
-  globalThis.fetch = async (_url, options = {}) => {
-    requests.push(options);
-    return responses.shift();
-  };
+  const mock = installGitHubMock([remaining], [[]]);
   try {
     const result = await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1 });
-    const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
+    const body = JSON.parse(mock.requests.find((request) => request.method === "PATCH").body).body;
     assert.match(body, /Generated from the current trusted comment set/);
     assert.doesNotMatch(body, new RegExp(deleted.updated_at));
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 
@@ -421,6 +412,35 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("deleting a replacement restores the reactivated source rocket", async () => {
+  const reactivated = comment(1, fenced(update({ state: "Old" })));
+  const deleted = comment(2, fenced(update({ state: "Deleted" })));
+  const mock = installGitHubMock([reactivated], [[]]);
+  try {
+    const result = await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 1 });
+    assert.deepEqual(postedReactions(mock.requests), ["rocket"]);
+    assert.ok(mock.requests.some(
+      (request) => request.method === "POST" && request.url.includes("issues/comments/1/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("editing a replacement away restores the reactivated source rocket", async () => {
+  const reactivated = comment(1, fenced(update({ state: "Old" })));
+  const trigger = comment(2, "Replacement removed.", { updated_at: "2026-08-09T17:00:00Z" });
+  const mock = installGitHubMock([reactivated, trigger], [[], []]);
+  try {
+    const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 1 });
+    assert.deepEqual(postedReactions(mock.requests), ["rocket"]);
+  } finally {
+    mock.restore();
   }
 });
 
