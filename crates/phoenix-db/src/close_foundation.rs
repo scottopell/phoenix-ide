@@ -8,7 +8,7 @@ use phoenix_core::domain::close::{
     CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
     CloseRetirementTarget, GitOidIdentity, GitPathIdentity, LossCategory, LossItemIdentity,
     OpaqueIdentity, ProductConversationId, RetiredResourceIdentity, RetiredResourceKind,
-    RetirementFailureReason, RetirementOutcome, TranscriptConversationId,
+    RetirementFailureReason, RetirementOutcome, TranscriptConversationId, WorktreeIdentity,
 };
 use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
 use sqlx::sqlite::SqliteRow;
@@ -180,11 +180,26 @@ fn parse_close_attempt_scope_row(row: SqliteRow) -> DbResult<CloseAttemptScope> 
         attempt_id: parse_close_attempt_id(row.try_get("attempt_id")?)?,
         scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
             .map_err(|error| DbError::Serialization(error.to_string()))?,
-        captured_worktree: row
-            .try_get::<Option<String>, _>("captured_worktree_identity")?
-            .map(|value| GitPathIdentity::decode_exact(&value))
-            .transpose()
-            .map_err(|error| DbError::Serialization(error.to_string()))?,
+        captured_worktree: match (
+            row.try_get::<Option<String>, _>("captured_worktree_identity")?,
+            row.try_get::<Option<String>, _>("captured_worktree_fingerprint")?,
+            row.try_get::<Option<String>, _>("captured_worktree_locator")?,
+        ) {
+            (Some(id), Some(fingerprint), Some(locator)) => Some(WorktreeIdentity::from_parts(
+                phoenix_core::domain::close::WorktreeId::parse(id)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                GitPathIdentity::decode_exact(&locator)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+            )),
+            (None, None, None) => None,
+            _ => {
+                return Err(DbError::Serialization(
+                    "partial worktree identity".to_string(),
+                ))
+            }
+        },
         captured_at: parse_rfc3339_utc(row.try_get("captured_at")?, "captured_at")?,
     })
 }
@@ -239,7 +254,13 @@ fn parse_retirement_failure_reason(value: &str) -> DbResult<RetirementFailureRea
     }
 }
 
-fn parse_loss_item_identity(kind: &str, codec: &str, value: &str) -> DbResult<LossItemIdentity> {
+fn parse_loss_item_identity(
+    kind: &str,
+    codec: &str,
+    value: &str,
+    worktree_fingerprint: Option<String>,
+    worktree_locator: Option<String>,
+) -> DbResult<LossItemIdentity> {
     match kind {
         "git_path" => {
             if codec != "git_path_bytes_hex_v1" {
@@ -278,6 +299,27 @@ fn parse_loss_item_identity(kind: &str, codec: &str, value: &str) -> DbResult<Lo
                     .map_err(|error| DbError::Serialization(error.to_string()))?,
             ))
         }
+        "worktree" => {
+            if codec != "worktree_id_v1" {
+                return Err(DbError::Serialization(format!(
+                    "unexpected worktree codec {codec}"
+                )));
+            }
+            let fingerprint = worktree_fingerprint.ok_or_else(|| {
+                DbError::Serialization("worktree identity missing fingerprint".to_string())
+            })?;
+            let locator = worktree_locator.ok_or_else(|| {
+                DbError::Serialization("worktree identity missing locator".to_string())
+            })?;
+            Ok(LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+                phoenix_core::domain::close::WorktreeId::parse(value)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                GitPathIdentity::decode_exact(&locator)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+            )))
+        }
         other => Err(DbError::Serialization(format!(
             "unknown loss item identity kind {other}"
         ))),
@@ -290,7 +332,7 @@ fn parse_close_loss_item(
     codec: &str,
     value: &str,
 ) -> DbResult<CloseLossItem> {
-    let identity = parse_loss_item_identity(kind, codec, value)?;
+    let identity = parse_loss_item_identity(kind, codec, value, None, None)?;
     match (category, identity) {
         (LossCategory::StagedTrackedPaths, LossItemIdentity::GitPath(path)) => {
             Ok(CloseLossItem::StagedTrackedPath(path))
@@ -444,8 +486,13 @@ fn parse_close_retired_resource_row(row: SqliteRow) -> DbResult<CloseRetiredReso
     let identity_value: String = row.try_get("identity_value")?;
     let proof_kind: String = row.try_get("proof_kind")?;
     let resource_kind = parse_retired_resource_kind(&row.try_get::<String, _>("resource_kind")?)?;
-    let resource_identity =
-        parse_loss_item_identity(&identity_kind, &identity_codec, &identity_value)?;
+    let resource_identity = parse_loss_item_identity(
+        &identity_kind,
+        &identity_codec,
+        &identity_value,
+        row.try_get("captured_worktree_fingerprint")?,
+        row.try_get("captured_worktree_locator")?,
+    )?;
     Ok(CloseRetiredResource {
         attempt_id: parse_close_attempt_id(row.try_get("attempt_id")?)?,
         scope: WorkScopeId::parse(row.try_get::<String, _>("scope")?)
@@ -878,29 +925,28 @@ impl Database {
             }
         }
         for scope in distinct_scopes {
-            let captured_worktree_identity = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT worktree_path FROM work_scopes WHERE id = ?1",
-            )
-            .bind(scope.as_str())
-            .fetch_one(&mut *tx)
-            .await?
-            .map(|path| {
-                if path.as_bytes().contains(&0) {
-                    return Err(DbError::Serialization(
-                        "Git path identity cannot contain a NUL byte".to_string(),
-                    ));
-                }
-                Ok(GitPathIdentity::from_bytes(path.into_bytes()).encode())
-            })
-            .transpose()?;
+            let captured_worktree =
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT worktree_id, worktree_fingerprint,
+                        CASE WHEN environment_kind = 'allocated_worktree' THEN
+                            'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
+                        END
+                 FROM work_scopes WHERE id = ?1",
+                )
+                .bind(scope.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
             sqlx::query(
                 "INSERT INTO close_attempt_scopes (
-                     attempt_id, scope, captured_worktree_identity, captured_at
-                 ) VALUES (?1, ?2, ?3, ?4)",
+                     attempt_id, scope, captured_worktree_identity,
+                     captured_worktree_fingerprint, captured_worktree_locator, captured_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .bind(attempt_id)
             .bind(scope.as_str())
-            .bind(captured_worktree_identity)
+            .bind(captured_worktree.0)
+            .bind(captured_worktree.1)
+            .bind(captured_worktree.2)
             .bind(&now)
             .execute(&mut *tx)
             .await?;
@@ -1030,7 +1076,8 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<CloseAttemptScope>> {
         sqlx::query(
-            "SELECT attempt_id, scope, captured_worktree_identity, captured_at
+            "SELECT attempt_id, scope, captured_worktree_identity,
+                    captured_worktree_fingerprint, captured_worktree_locator, captured_at
              FROM close_attempt_scopes
              WHERE attempt_id = ?1
              ORDER BY scope, captured_at",
@@ -1263,18 +1310,33 @@ impl Database {
         }
 
         for scope in &request.scopes {
-            let captured_worktree = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT captured_worktree_identity
+            let captured_worktree =
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT captured_worktree_identity, captured_worktree_fingerprint,
+                        captured_worktree_locator
                  FROM close_attempt_scopes
                  WHERE attempt_id = ?1 AND scope = ?2",
-            )
-            .bind(request.attempt_id.as_str())
-            .bind(scope.scope.as_str())
-            .fetch_one(&mut *tx)
-            .await?
-            .map(|value| GitPathIdentity::decode_exact(&value))
-            .transpose()
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
+                )
+                .bind(request.attempt_id.as_str())
+                .bind(scope.scope.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+            let captured_worktree = match captured_worktree {
+                (Some(id), Some(fingerprint), Some(locator)) => Some(WorktreeIdentity::from_parts(
+                    phoenix_core::domain::close::WorktreeId::parse(id)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    GitPathIdentity::decode_exact(&locator)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )),
+                (None, None, None) => None,
+                _ => {
+                    return Err(DbError::Serialization(
+                        "partial worktree identity".to_string(),
+                    ))
+                }
+            };
             if scope.inventory.worktree != captured_worktree {
                 return Err(close_precondition(format!(
                     "attempt {} scope {} inventory worktree must equal its captured scope snapshot",
@@ -1407,32 +1469,38 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         for scope in &request.scopes {
-            let environment = sqlx::query_as::<_, (String, Option<String>)>(
-                "SELECT environment_kind, worktree_path FROM work_scopes WHERE id = ?1",
-            )
-            .bind(scope.scope.as_str())
-            .fetch_one(&mut *tx)
-            .await?;
-            match (
-                environment.0.as_str(),
-                &scope.inventory.worktree,
-                environment.1,
-            ) {
-                ("allocated_worktree", Some(identity), Some(path))
-                    if identity == &GitPathIdentity::from_bytes(path.as_bytes().to_vec()) => {}
-                ("allocated_worktree", _, _) => {
-                    return Err(close_precondition(format!(
-                        "scope {} expected worktree must match its allocated environment",
-                        scope.scope
-                    )));
+            let environment =
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    "SELECT worktree_id, worktree_fingerprint,
+                        CASE WHEN environment_kind = 'allocated_worktree' THEN
+                            'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
+                        END
+                 FROM work_scopes WHERE id = ?1",
+                )
+                .bind(scope.scope.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+            let environment = match environment {
+                (Some(id), Some(fingerprint), Some(locator)) => Some(WorktreeIdentity::from_parts(
+                    phoenix_core::domain::close::WorktreeId::parse(id)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    GitPathIdentity::decode_exact(&locator)
+                        .map_err(|error| DbError::Serialization(error.to_string()))?,
+                )),
+                (None, None, None) => None,
+                _ => {
+                    return Err(DbError::Serialization(
+                        "partial worktree identity".to_string(),
+                    ))
                 }
-                (_, None, _) => {}
-                (_, Some(_), _) => {
-                    return Err(close_precondition(format!(
-                        "scope {} cannot inventory a worktree without an allocated environment",
-                        scope.scope
-                    )));
-                }
+            };
+            if scope.inventory.worktree != environment {
+                return Err(close_precondition(format!(
+                    "scope {} expected worktree must match its stable allocated identity",
+                    scope.scope
+                )));
             }
             sqlx::query(
                 "INSERT INTO close_retirement_inventories (
@@ -1526,9 +1594,13 @@ impl Database {
         sqlx::query(
             "SELECT expected.attempt_id, expected.scope, expected.inspection_generation,
                     expected.inspection_fingerprint, expected.resource_kind,
-                    expected.identity_kind, expected.identity_codec, expected.identity_value
+                    expected.identity_kind, expected.identity_codec, expected.identity_value,
+                    captured.captured_worktree_fingerprint,
+                    captured.captured_worktree_locator
              FROM close_expected_retirement_resources expected
              JOIN close_obligations obligation ON obligation.attempt_id = expected.attempt_id
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = expected.attempt_id AND captured.scope = expected.scope
              WHERE expected.attempt_id = ?1
                AND expected.inspection_generation = obligation.inspection_generation
                AND expected.inspection_fingerprint = obligation.inspection_fingerprint
@@ -1555,7 +1627,13 @@ impl Database {
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
                 resource: RetiredResourceIdentity::parse(
                     resource_kind,
-                    parse_loss_item_identity(&identity_kind, &identity_codec, &identity_value)?,
+                    parse_loss_item_identity(
+                        &identity_kind,
+                        &identity_codec,
+                        &identity_value,
+                        row.try_get("captured_worktree_fingerprint")?,
+                        row.try_get("captured_worktree_locator")?,
+                    )?,
                 )
                 .map_err(|error| DbError::Serialization(error.to_string()))?,
             })
@@ -1671,12 +1749,42 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         sqlx::query(
+            "INSERT OR IGNORE INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, absence_basis, residual_reason, detail, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(&inspection_generation)
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(request.resource.identity().identity_kind())
+        .bind(request.resource.identity().codec())
+        .bind(request.resource.identity().value())
+        .bind(proof_kind)
+        .bind(absence_basis)
+        .bind(residual_reason)
+        .bind(request.detail.as_deref().filter(|value| !value.is_empty()))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
             "INSERT INTO close_retirement_resources (
                 attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value,
                 proof_kind, absence_basis, residual_reason, detail, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
              ON CONFLICT(attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_value)
-             DO NOTHING",
+             DO UPDATE SET
+                 proof_kind = excluded.proof_kind,
+                 absence_basis = excluded.absence_basis,
+                 residual_reason = excluded.residual_reason,
+                 detail = excluded.detail,
+                 updated_at = excluded.updated_at
+             WHERE close_retirement_resources.proof_kind = 'residual'
+               AND excluded.proof_kind IN ('retired', 'absence_adopted')",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -1757,9 +1865,13 @@ impl Database {
                     resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
                     resource.identity_codec, resource.identity_value,
                     resource.proof_kind, resource.absence_basis, resource.residual_reason, resource.detail,
-                    resource.created_at, resource.updated_at
+                    resource.created_at, resource.updated_at,
+                    captured.captured_worktree_fingerprint,
+                    captured.captured_worktree_locator
              FROM close_retirement_resources resource
              JOIN close_obligations obligation ON obligation.attempt_id = resource.attempt_id
+             JOIN close_attempt_scopes captured
+               ON captured.attempt_id = resource.attempt_id AND captured.scope = resource.scope
              WHERE resource.attempt_id = ?1
                AND resource.inspection_generation = obligation.inspection_generation
                AND resource.inspection_fingerprint = obligation.inspection_fingerprint
@@ -1990,6 +2102,8 @@ mod tests {
              SET environment_kind = 'allocated_worktree',
                  cwd = '/tmp',
                  worktree_path = '/tmp/worktree',
+                 worktree_id = lower(hex(randomblob(16))),
+                 worktree_fingerprint = lower(hex(randomblob(32))),
                  branch_name = 'branch',
                  base_branch = 'main'
              WHERE id = ?1",
@@ -2071,6 +2185,23 @@ mod tests {
         .unwrap();
     }
 
+    async fn current_test_worktree(db: &Database, scope: &WorkScopeId) -> WorktreeIdentity {
+        let (id, fingerprint, locator): (String, String, String) = sqlx::query_as(
+            "SELECT worktree_id, worktree_fingerprint,
+                    'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
+             FROM work_scopes WHERE id = ?1 AND environment_kind = 'allocated_worktree'",
+        )
+        .bind(scope.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        WorktreeIdentity::from_parts(
+            phoenix_core::domain::close::WorktreeId::parse(id).unwrap(),
+            phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint).unwrap(),
+            GitPathIdentity::decode_exact(&locator).unwrap(),
+        )
+    }
+
     async fn capture_test_inventory(
         db: &Database,
         attempt_id: &str,
@@ -2089,11 +2220,11 @@ mod tests {
         for resource in resources {
             let identity = match resource.identity() {
                 LossItemIdentity::Opaque(identity) => identity.clone(),
-                LossItemIdentity::GitPath(identity) => {
+                LossItemIdentity::Worktree(identity) => {
                     inventory.worktree = Some(identity.clone());
                     continue;
                 }
-                LossItemIdentity::GitOid(_) => unreachable!(),
+                LossItemIdentity::GitPath(_) | LossItemIdentity::GitOid(_) => unreachable!(),
             };
             match resource.kind() {
                 RetiredResourceKind::BashProcessGroup => {
@@ -2137,14 +2268,30 @@ mod tests {
                 }
             };
             if target_inventory.worktree.is_none() {
-                let worktree_path: Option<String> =
-                    sqlx::query_scalar("SELECT worktree_path FROM work_scopes WHERE id = ?1")
-                        .bind(target_scope.as_str())
-                        .fetch_one(db.pool())
-                        .await
-                        .unwrap();
-                target_inventory.worktree =
-                    worktree_path.map(|path| GitPathIdentity::from_bytes(path.as_bytes().to_vec()));
+                let worktree_identity =
+                    sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                        "SELECT worktree_id, worktree_fingerprint,
+                            CASE WHEN environment_kind = 'allocated_worktree' THEN
+                                'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
+                            END
+                     FROM work_scopes WHERE id = ?1",
+                    )
+                    .bind(target_scope.as_str())
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+                target_inventory.worktree = match worktree_identity {
+                    (Some(id), Some(fingerprint), Some(locator)) => {
+                        Some(WorktreeIdentity::from_parts(
+                            phoenix_core::domain::close::WorktreeId::parse(id).unwrap(),
+                            phoenix_core::domain::close::WorktreeFingerprint::parse(fingerprint)
+                                .unwrap(),
+                            GitPathIdentity::decode_exact(&locator).unwrap(),
+                        ))
+                    }
+                    (None, None, None) => None,
+                    _ => panic!("partial worktree identity"),
+                };
             }
             scopes.push(CaptureCloseRetirementInventoryScopeRequest {
                 scope: target_scope,
@@ -2344,8 +2491,8 @@ mod tests {
                      resource_kind, identity_kind, identity_codec, identity_value,
                      proof_kind, residual_reason, created_at, updated_at
                  )
-                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'git_path',
-                        'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:2f746d702f776f726b74726565',
+                 SELECT target.attempt_id, target.scope, ?2, ?3, 'worktree', 'worktree',
+                        'worktree_id_v1', target.captured_worktree_identity,
                         ?5, ?6, ?4, ?4
                  FROM close_attempt_scopes target
                  JOIN work_scopes scope ON scope.id = target.scope
@@ -2553,11 +2700,12 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO close_attempt_scopes (
-                 attempt_id, scope, captured_worktree_identity, captured_at
+                 attempt_id, scope, captured_worktree_identity,
+                 captured_worktree_fingerprint, captured_worktree_locator, captured_at
              )
-             SELECT 'attempt-wrong-scope', ?1,
+             SELECT 'attempt-wrong-scope', ?1, worktree_id, worktree_fingerprint,
                     CASE WHEN environment_kind = 'allocated_worktree'
-                         THEN 'git_path_bytes_hex_v1:2f746d702f7774'
+                         THEN 'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
                          ELSE NULL END,
                     ?2
              FROM work_scopes WHERE id = ?1",
@@ -3089,10 +3237,11 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                  id, authority_kind, created_at, updated_at,
-                 environment_kind, cwd, worktree_path
+                 environment_kind, cwd, worktree_path, worktree_id, worktree_fingerprint
              ) VALUES (
                  ?1, 'work', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z',
-                 'allocated_worktree', '/tmp/nul', CAST(X'610062' AS TEXT)
+                 'allocated_worktree', '/tmp/nul', CAST(X'610062' AS TEXT),
+                 'nul-worktree', 'nul-fingerprint'
              )",
         )
         .bind(scope.as_str())
@@ -3109,7 +3258,10 @@ mod tests {
             .begin_close_foundation("root", "attempt-nul")
             .await
             .unwrap_err();
-        assert!(matches!(error, DbError::Serialization(message) if message.contains("NUL")));
+        assert!(matches!(
+            error,
+            DbError::Sqlx(_) | DbError::Serialization(_)
+        ));
     }
 
     #[tokio::test]
@@ -3128,8 +3280,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/worktree', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/worktree',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(synthetic_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -3645,8 +3801,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(leaf_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -3779,8 +3939,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(leaf_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -3842,8 +4006,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(other_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -3957,7 +4125,7 @@ mod tests {
         let snapshot = current_test_snapshot(&db, "attempt-1").await;
         let worktree = RetiredResourceIdentity::parse(
             RetiredResourceKind::Worktree,
-            LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec())),
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
         )
         .unwrap();
 
@@ -3969,10 +4137,10 @@ mod tests {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
                         worktree: match worktree.identity() {
-                            LossItemIdentity::GitPath(identity) => Some(identity.clone()),
-                            LossItemIdentity::GitOid(_) | LossItemIdentity::Opaque(_) => {
-                                unreachable!()
-                            }
+                            LossItemIdentity::Worktree(identity) => Some(identity.clone()),
+                            LossItemIdentity::GitPath(_)
+                            | LossItemIdentity::GitOid(_)
+                            | LossItemIdentity::Opaque(_) => unreachable!(),
                         },
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -3996,10 +4164,10 @@ mod tests {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
                         worktree: match worktree.identity() {
-                            LossItemIdentity::GitPath(identity) => Some(identity.clone()),
-                            LossItemIdentity::GitOid(_) | LossItemIdentity::Opaque(_) => {
-                                unreachable!()
-                            }
+                            LossItemIdentity::Worktree(identity) => Some(identity.clone()),
+                            LossItemIdentity::GitPath(_)
+                            | LossItemIdentity::GitOid(_)
+                            | LossItemIdentity::Opaque(_) => unreachable!(),
                         },
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -4030,7 +4198,12 @@ mod tests {
 
         let wrong_worktree = RetiredResourceIdentity::parse(
             RetiredResourceKind::Worktree,
-            LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"/tmp/wrong".to_vec())),
+            LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+                phoenix_core::domain::close::WorktreeId::parse("wrong-worktree").unwrap(),
+                phoenix_core::domain::close::WorktreeFingerprint::parse("wrong-fingerprint")
+                    .unwrap(),
+                GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec()),
+            )),
         )
         .unwrap();
         let db2 = Database::open_in_memory().await.unwrap();
@@ -4054,10 +4227,10 @@ mod tests {
                     scope: scope2,
                     inventory: CloseOwnedResourceInventory {
                         worktree: match wrong_worktree.identity() {
-                            LossItemIdentity::GitPath(identity) => Some(identity.clone()),
-                            LossItemIdentity::GitOid(_) | LossItemIdentity::Opaque(_) => {
-                                unreachable!()
-                            }
+                            LossItemIdentity::Worktree(identity) => Some(identity.clone()),
+                            LossItemIdentity::GitPath(_)
+                            | LossItemIdentity::GitOid(_)
+                            | LossItemIdentity::Opaque(_) => unreachable!(),
                         },
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -4114,8 +4287,8 @@ mod tests {
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value
              ) VALUES (
-                 'attempt-partial', ?1, ?2, ?3, 'worktree', 'git_path',
-                 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:2f746d702f776f726b74726565'
+                 'attempt-partial', ?1, ?2, ?3, 'browser_session', 'opaque',
+                 'opaque_string_v1', 'partial-browser'
              )",
         )
         .bind(scope.as_str())
@@ -4130,9 +4303,9 @@ mod tests {
                 attempt_id: CloseAttemptId::parse("attempt-partial").unwrap(),
                 snapshot,
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                    scope,
+                    scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec())),
+                        worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
                         pty_sessions: std::collections::BTreeSet::default(),
@@ -4235,9 +4408,9 @@ mod tests {
                 attempt_id: CloseAttemptId::parse("attempt-shared").unwrap(),
                 snapshot: current_test_snapshot(&db, "attempt-shared").await,
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                    scope,
+                    scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec())),
+                        worktree: Some(current_test_worktree(&db, &scope).await),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
                         pty_sessions: std::collections::BTreeSet::default(),
@@ -4296,8 +4469,7 @@ mod tests {
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
 
-        let retired_identity =
-            LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec()));
+        let retired_identity = LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await);
         let browser_identity =
             LossItemIdentity::Opaque(OpaqueIdentity::parse("browser:1").unwrap());
         let equivalent_identity = LossItemIdentity::Opaque(
@@ -4604,7 +4776,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn retirement_evidence_is_immutable_after_first_proof() {
+    async fn retirement_evidence_is_monotonic_after_first_proof() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
@@ -4665,7 +4837,7 @@ mod tests {
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
 
         let worktree_identity =
-            LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"/tmp/worktree".to_vec()));
+            LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await);
         let browser_identity =
             LossItemIdentity::Opaque(OpaqueIdentity::parse("browser:1").unwrap());
         let current_snapshot = current_test_snapshot(&db, "attempt-1").await;
@@ -4741,21 +4913,50 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db
-            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
-                snapshot: current_test_snapshot(&db, "attempt-1").await,
-                scope: scope.clone(),
-                resource: RetiredResourceIdentity::parse(
-                    RetiredResourceKind::BrowserSession,
-                    browser_identity.clone(),
-                )
-                .unwrap(),
-                outcome: RetirementOutcome::Retired,
-                detail: Some("retired later".to_string()),
-            })
-            .await
-            .is_err());
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
+            snapshot: current_test_snapshot(&db, "attempt-1").await,
+            scope: scope.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::BrowserSession,
+                browser_identity.clone(),
+            )
+            .unwrap(),
+            outcome: RetirementOutcome::Retired,
+            detail: Some("retired later".to_string()),
+        })
+        .await
+        .unwrap();
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_history
+             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(history_count, 2);
+        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
+            snapshot: current_test_snapshot(&db, "attempt-1").await,
+            scope: scope.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::BrowserSession,
+                browser_identity.clone(),
+            )
+            .unwrap(),
+            outcome: RetirementOutcome::Retired,
+            detail: Some("retired later".to_string()),
+        })
+        .await
+        .unwrap();
+        let replay_history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_history
+             WHERE attempt_id = 'attempt-1' AND resource_kind = 'browser_session'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(replay_history_count, 2);
 
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
@@ -4803,11 +5004,8 @@ mod tests {
         assert!(evidence
             .iter()
             .any(|item| item.resource.identity() == &browser_identity
-                && item.outcome
-                    == RetirementOutcome::Residual {
-                        residual_reason: RetirementFailureReason::ManualRepairRequired
-                    }
-                && item.detail.as_deref() == Some("residual first")));
+                && item.outcome == RetirementOutcome::Retired
+                && item.detail.as_deref() == Some("retired later")));
         assert!(evidence
             .iter()
             .any(|item| item.resource.identity() == &tmux_identity
@@ -4866,8 +5064,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(leaf_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -5201,8 +5403,12 @@ mod tests {
         sqlx::query(
             "INSERT INTO work_scopes (
                 id, authority_kind, lifecycle, environment_kind, cwd,
-                worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other', 'branch', 'main', ?2, ?2)",
+                worktree_path, branch_name, base_branch, created_at, updated_at,
+                worktree_id, worktree_fingerprint
+             ) VALUES (
+                ?1, 'work', 'active', 'allocated_worktree', '/tmp', '/tmp/other',
+                'branch', 'main', ?2, ?2, lower(hex(randomblob(16))), lower(hex(randomblob(32)))
+             )",
         )
         .bind(other_scope.as_str())
         .bind(Utc::now().to_rfc3339())
@@ -5210,6 +5416,7 @@ mod tests {
         .await
         .unwrap();
 
+        let other_worktree = current_test_worktree(&db, &other_scope).await;
         let err = db
             .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
@@ -5217,7 +5424,7 @@ mod tests {
                 scope: other_scope,
                 resource: RetiredResourceIdentity::parse(
                     RetiredResourceKind::Worktree,
-                    LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"/tmp/other".to_vec())),
+                    LossItemIdentity::Worktree(other_worktree),
                 )
                 .unwrap(),
                 outcome: RetirementOutcome::Retired,

@@ -543,6 +543,7 @@ rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
     requires: worktree_already_absent(product_conversation, scope_binding.scope)
     requires: exists repair_evidence
+    requires: repair_evidence.observation_kind = missing
     requires: complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
     requires: same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
     requires: no_replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
@@ -586,7 +587,8 @@ rule RestartRepairConflictRoutesTypedRepair {
     requires: worktree_already_absent(product_conversation, scope_binding.scope)
     requires: exists repair_evidence
     requires:
-        not complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
+        repair_evidence.observation_kind = inaccessible
+        or not complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
         or not same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
         or replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
         or not exact_active_retirement_attempt(product_conversation, attempt_id, scope_binding.scope)
@@ -595,8 +597,8 @@ rule RestartRepairConflictRoutesTypedRepair {
     @guidance
         -- A later Close attempt may bind fresh retained restart evidence for the
         -- same repository, but only from a new exact attempt. When identity is
-        -- incomplete, a replacement appears, or the active attempt does not match,
-        -- Phoenix routes to typed repair instead of guessing continuity from the
+        -- inaccessible, identity is incomplete, a replacement appears, or the active
+        -- attempt does not match, Phoenix routes to typed repair instead of guessing continuity from the
         -- path or silently adopting a stale absence observation.
 }
 

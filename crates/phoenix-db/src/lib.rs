@@ -1183,6 +1183,33 @@ impl Database {
         restrict_db_permissions(&self.path);
     }
 
+    fn observe_worktree_fingerprint(worktree_path: &str) -> Option<String> {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let marker = std::path::Path::new(worktree_path).join(".git");
+        let metadata = std::fs::symlink_metadata(&marker).ok()?;
+        let marker_bytes = if metadata.is_file() {
+            std::fs::read(&marker).ok()?
+        } else {
+            Vec::new()
+        };
+        let mut encoded = String::with_capacity(marker_bytes.len() * 2);
+        for byte in marker_bytes {
+            write!(&mut encoded, "{byte:02x}").ok()?;
+        }
+        let created_nanos = metadata
+            .created()
+            .ok()
+            .and_then(|instant| instant.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        Some(format!(
+            "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+
     async fn insert_work_scope_tx(
         tx: &mut Transaction<'_, Sqlite>,
         scope_id: &WorkScopeId,
@@ -1192,11 +1219,21 @@ impl Database {
     ) -> DbResult<()> {
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
+        let worktree_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let worktree_id = worktree_fingerprint
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4().to_string());
         sqlx::query(
             "INSERT INTO work_scopes (
                  id, authority_kind, lifecycle, environment_kind, cwd,
-                 worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                 worktree_path, branch_name, base_branch, created_at, updated_at,
+                 worktree_id, worktree_fingerprint
+             ) VALUES (
+                 ?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8,
+                 ?9, ?10
+             )",
         )
         .bind(scope_id.as_str())
         .bind(authority_kind.as_str())
@@ -1206,6 +1243,8 @@ impl Database {
         .bind(branch_name)
         .bind(base_branch)
         .bind(now)
+        .bind(worktree_id)
+        .bind(worktree_fingerprint)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -1219,10 +1258,35 @@ impl Database {
     ) -> DbResult<()> {
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
+        let observed_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let existing = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT worktree_id, worktree_fingerprint FROM work_scopes WHERE id = ?1",
+        )
+        .bind(scope_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::Serialization(format!(
+                "work scope {scope_id} has no normalized environment"
+            ))
+        })?;
+        let worktree_id = observed_fingerprint.as_ref().map(|fingerprint| {
+            if existing.1.as_ref() == Some(fingerprint) {
+                existing
+                    .0
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        });
         let result = sqlx::query(
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
-                 branch_name = ?4, base_branch = ?5, updated_at = ?6
+                 branch_name = ?4, base_branch = ?5, updated_at = ?6,
+                 worktree_id = ?8, worktree_fingerprint = ?9
              WHERE id = ?7",
         )
         .bind(kind)
@@ -1232,6 +1296,8 @@ impl Database {
         .bind(base_branch)
         .bind(now)
         .bind(scope_id.as_str())
+        .bind(worktree_id)
+        .bind(observed_fingerprint)
         .execute(&mut **tx)
         .await?;
         if result.rows_affected() != 1 {
@@ -2163,6 +2229,62 @@ impl Database {
             })
         })
         .transpose()
+    }
+
+    /// Reconcile persisted worktree identity with the current Git administrative marker.
+    ///
+    /// Inaccessible worktrees remain unresolved instead of receiving fabricated continuity.
+    /// # Errors
+    /// Returns a database error when an observed identity cannot be persisted.
+    pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
+        let scopes = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+            "SELECT id, worktree_path, worktree_id, worktree_fingerprint
+             FROM work_scopes
+             WHERE environment_kind = 'allocated_worktree' AND worktree_path IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (scope_id, path, existing_id, existing_fingerprint) in scopes {
+            let Some(observed_fingerprint) = Self::observe_worktree_fingerprint(&path) else {
+                continue;
+            };
+            if existing_fingerprint.as_deref() == Some(observed_fingerprint.as_str())
+                && existing_id.is_some()
+            {
+                continue;
+            }
+            let worktree_id = uuid::Uuid::new_v4().to_string();
+            let result = sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = ?1, worktree_fingerprint = ?2
+                 WHERE id = ?3
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase IN (
+                             'settling_active_work', 'cancel_requested_during_settlement',
+                             'awaiting_retirement_inspection', 'awaiting_loss_confirmation',
+                             'retirement_requested', 'needs_repair'
+                         )
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(worktree_id)
+            .bind(observed_fingerprint)
+            .bind(&scope_id)
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                tracing::debug!(
+                    work_scope_id = %scope_id,
+                    "deferring changed worktree identity reconciliation while Close snapshot is sealed"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Open or create database at the given path
@@ -10466,6 +10588,29 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    #[test]
+    fn worktree_fingerprint_tracks_git_administrative_incarnation() {
+        let root = std::env::temp_dir().join(format!(
+            "phoenix-worktree-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join(".git");
+        std::fs::write(&marker, "gitdir: /tmp/first\n").unwrap();
+        let first = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
+        let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        assert_ne!(first, replacement);
+        std::fs::rename(&root, root.with_extension("moved")).unwrap();
+        let moved = root.with_extension("moved");
+        assert_eq!(
+            replacement,
+            Database::observe_worktree_fingerprint(moved.to_str().unwrap()).unwrap()
+        );
+        std::fs::remove_dir_all(moved).unwrap();
+    }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)

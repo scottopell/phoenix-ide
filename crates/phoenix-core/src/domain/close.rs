@@ -300,7 +300,7 @@ impl RetiredResourceKind {
     #[must_use]
     pub fn admits_identity_kind(self, identity: &LossItemIdentity) -> bool {
         match self {
-            Self::Worktree => matches!(identity, LossItemIdentity::GitPath(_)),
+            Self::Worktree => matches!(identity, LossItemIdentity::Worktree(_)),
             Self::BashProcessGroup
             | Self::TmuxServer
             | Self::PtySession
@@ -344,6 +344,103 @@ impl RetirementFailureReason {
             Self::IdentityNotProven => "identity_not_proven",
             Self::ManualRepairRequired => "manual_repair_required",
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeId(String);
+
+impl WorktreeId {
+    /// # Errors
+    /// Returns [`OpaqueIdentityError`] when the identifier is empty.
+    pub fn parse(value: impl Into<String>) -> Result<Self, OpaqueIdentityError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(OpaqueIdentityError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorktreeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct WorktreeFingerprint(String);
+
+impl WorktreeFingerprint {
+    /// # Errors
+    /// Returns [`OpaqueIdentityError`] when the fingerprint is empty.
+    pub fn parse(value: impl Into<String>) -> Result<Self, OpaqueIdentityError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(OpaqueIdentityError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorktreeFingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorktreeIdentity {
+    id: WorktreeId,
+    fingerprint: WorktreeFingerprint,
+    locator: GitPathIdentity,
+}
+
+impl WorktreeIdentity {
+    #[must_use]
+    pub fn from_parts(
+        id: WorktreeId,
+        fingerprint: WorktreeFingerprint,
+        locator: GitPathIdentity,
+    ) -> Self {
+        Self {
+            id,
+            fingerprint,
+            locator,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &WorktreeId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> &WorktreeFingerprint {
+        &self.fingerprint
+    }
+
+    #[must_use]
+    pub fn locator(&self) -> &GitPathIdentity {
+        &self.locator
     }
 }
 
@@ -589,6 +686,7 @@ pub enum LossItemIdentity {
     GitPath(GitPathIdentity),
     GitOid(GitOidIdentity),
     Opaque(OpaqueIdentity),
+    Worktree(WorktreeIdentity),
 }
 
 impl LossItemIdentity {
@@ -598,6 +696,7 @@ impl LossItemIdentity {
             Self::GitPath(_) => "git_path",
             Self::GitOid(_) => "git_oid",
             Self::Opaque(_) => "opaque",
+            Self::Worktree(_) => "worktree",
         }
     }
 
@@ -607,6 +706,7 @@ impl LossItemIdentity {
             Self::GitPath(identity) => identity.codec(),
             Self::GitOid(_) => "hex",
             Self::Opaque(identity) => identity.codec(),
+            Self::Worktree(_) => "worktree_id_v1",
         }
     }
 
@@ -616,6 +716,7 @@ impl LossItemIdentity {
             Self::GitPath(identity) => identity.encode(),
             Self::GitOid(identity) => identity.as_hex().to_string(),
             Self::Opaque(identity) => identity.as_str().to_string(),
+            Self::Worktree(identity) => identity.id().as_str().to_string(),
         }
     }
 }
@@ -723,7 +824,7 @@ pub struct CloseAttemptMember {
 pub struct CloseAttemptScope {
     pub attempt_id: CloseAttemptId,
     pub scope: WorkScopeId,
-    pub captured_worktree: Option<GitPathIdentity>,
+    pub captured_worktree: Option<WorktreeIdentity>,
     pub captured_at: DateTime<Utc>,
 }
 
@@ -1031,7 +1132,7 @@ impl std::error::Error for RetiredResourceIdentityError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseOwnedResourceInventory {
-    pub worktree: Option<GitPathIdentity>,
+    pub worktree: Option<WorktreeIdentity>,
     pub bash_process_groups: std::collections::BTreeSet<OpaqueIdentity>,
     pub tmux_servers: std::collections::BTreeSet<OpaqueIdentity>,
     pub pty_sessions: std::collections::BTreeSet<OpaqueIdentity>,
@@ -1055,7 +1156,7 @@ impl CloseOwnedResourceInventory {
             .map(|identity| {
                 RetiredResourceIdentity::parse(
                     RetiredResourceKind::Worktree,
-                    LossItemIdentity::GitPath(identity),
+                    LossItemIdentity::Worktree(identity),
                 )
                 .expect("worktree identity pairing is structural")
             })
@@ -1449,16 +1550,23 @@ mod tests {
     #[test]
     fn retired_resource_kind_restricts_identity_kinds() {
         let git_path = LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"wt".to_vec()));
+        let worktree = LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+            WorktreeId::parse("worktree-id").unwrap(),
+            WorktreeFingerprint::parse("worktree-fingerprint").unwrap(),
+            GitPathIdentity::from_bytes(b"wt".to_vec()),
+        ));
         let opaque = LossItemIdentity::Opaque(OpaqueIdentity::parse("browser:1").unwrap());
         let git_oid = LossItemIdentity::GitOid(
             GitOidIdentity::parse_hex("1234567890123456789012345678901234567890").unwrap(),
         );
 
-        assert!(RetiredResourceKind::Worktree.admits_identity_kind(&git_path));
+        assert!(RetiredResourceKind::Worktree.admits_identity_kind(&worktree));
+        assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_path));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::Worktree.admits_identity_kind(&git_oid));
         assert!(RetiredResourceKind::BrowserSession.admits_identity_kind(&opaque));
         assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&git_path));
+        assert!(!RetiredResourceKind::BrowserSession.admits_identity_kind(&worktree));
     }
 
     #[test]
