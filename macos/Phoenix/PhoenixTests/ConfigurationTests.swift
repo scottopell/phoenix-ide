@@ -202,6 +202,13 @@ final class ConfigurationTests: XCTestCase {
         )
     }
 
+    func testAuthPopupNavigationAllowsWebOAuthButRejectsPrivilegedSchemes() {
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "https://accounts.example.test/oauth")!), .allowManagedChild)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "about:blank")!), .allowManagedChild)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "mailto:help@example.test")!), .externalize)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "file:///tmp/secret")!), .cancel)
+    }
+
     func testDownloadNamingSanitizesDangerousSuggestedNames() {
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename(" ../../quarterly?.pdf "), "____quarterly_.pdf")
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("   "), "download")

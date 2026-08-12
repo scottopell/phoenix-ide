@@ -305,6 +305,11 @@ enum SettingsPersistenceError: LocalizedError {
     }
 }
 
+enum BrowserSurfaceRole: Equatable {
+    case primary
+    case authPopup
+}
+
 struct PhoenixWebViewPolicy {
     enum MediaCaptureDecision: Equatable {
         case grant
@@ -376,6 +381,15 @@ struct PhoenixWebViewPolicy {
     static func safeToExternalize(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased() else { return false }
         return ["http", "https", "mailto", "tel"].contains(scheme)
+    }
+
+    static func popupNavigationDecision(_ url: URL) -> PopupDecision {
+        guard let scheme = url.scheme?.lowercased() else { return .cancel }
+        switch scheme {
+        case "about", "http", "https": return .allowManagedChild
+        case "mailto", "tel": return .externalize
+        default: return .cancel
+        }
     }
 }
 

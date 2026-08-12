@@ -2,6 +2,8 @@
 
 Phoenix.app is a thin native host for the Phoenix web UI. It keeps Phoenix's HTTP, SSE, WebSocket, persistence, terminal, browser, and update contracts in the Rust server while adding a native macOS window, Dock/Cmd+Tab identity, global shortcut, settings, diagnostics, microphone permission, and `phoenix://` handoff.
 
+The app icon is derived from the canonical `ui/public/phoenix.svg` bird/flame mark, adapted to a padded dark macOS application tile for legibility from 16px through 1024px.
+
 ## Server modes
 
 On first launch Phoenix.app stays disconnected until the user explicitly chooses either **Managed deployment** or **Bundled Phoenix** in Settings and clicks **Apply and Connect**. Draft edits in Settings remain local to that window until apply; simply closing Settings never changes the next launch target.
@@ -61,6 +63,8 @@ Conversation links activate Phoenix.app and navigate the existing authenticated 
 ## Trust and origin policy
 
 Phoenix.app uses normal macOS TLS trust. It does not bypass certificate validation. Install the Phoenix-managed local CA through the supported Phoenix deployment flow when needed. Identity verification rejects cross-origin redirects instead of silently rebinding the configured origin. Activated links, popup `window.open` requests, microphone permission, and notification permission are internal only when scheme, host, and effective port exactly match the configured origin.
+
+Same-origin `window.open` authentication uses managed child WebKit windows with WebKit's supplied opener configuration. Auth popups may navigate through HTTP(S) OAuth pages but cannot request microphone/notification permission, download files, or mutate the primary deployment-verification state.
 
 ## Manual compatibility matrix
 

@@ -56,8 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Quit and Stop Phoenix")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
-        browserEnvironment.shutdown()
-        serverManager.stop { sender.reply(toApplicationShouldTerminate: true) }
+        serverManager.stop { [browserEnvironment] in
+            browserEnvironment.shutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
         return .terminateLater
     }
 

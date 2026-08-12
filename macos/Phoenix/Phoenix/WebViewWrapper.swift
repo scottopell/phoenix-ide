@@ -72,6 +72,7 @@ struct WebViewWrapper: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         let origin: PhoenixOrigin
+        let role: BrowserSurfaceRole
         let operation: ServerManager.ConnectionOperationToken
         let browserEnvironment: BrowserEnvironment
         let onWebViewReady: (WKWebView, ServerManager.ConnectionOperationToken) -> Void
@@ -81,6 +82,7 @@ struct WebViewWrapper: NSViewRepresentable {
 
         init(
             origin: PhoenixOrigin,
+            role: BrowserSurfaceRole = .primary,
             operation: ServerManager.ConnectionOperationToken,
             browserEnvironment: BrowserEnvironment,
             onWebViewReady: @escaping (WKWebView, ServerManager.ConnectionOperationToken) -> Void,
@@ -88,6 +90,7 @@ struct WebViewWrapper: NSViewRepresentable {
             onAuthenticationRequired: @escaping (ServerManager.ConnectionOperationToken) -> Void
         ) {
             self.origin = origin
+            self.role = role
             self.operation = operation
             self.browserEnvironment = browserEnvironment
             self.onWebViewReady = onWebViewReady
@@ -102,6 +105,16 @@ struct WebViewWrapper: NSViewRepresentable {
         ) {
             guard let url = navigationAction.request.url else {
                 decisionHandler(.cancel)
+                return
+            }
+            if role == .authPopup {
+                switch PhoenixWebViewPolicy.popupNavigationDecision(url) {
+                case .allowManagedChild: decisionHandler(.allow)
+                case .externalize:
+                    openExternallyIfSafe(url)
+                    decisionHandler(.cancel)
+                case .cancel: decisionHandler(.cancel)
+                }
                 return
             }
             if navigationAction.shouldPerformDownload {
@@ -145,6 +158,7 @@ struct WebViewWrapper: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard role == .primary else { return }
             onWebViewReady(webView, operation)
             verifyDeployment(webView)
         }
@@ -154,6 +168,7 @@ struct WebViewWrapper: NSViewRepresentable {
             didFailProvisionalNavigation navigation: WKNavigation!,
             withError error: Error
         ) {
+            guard role == .primary else { return }
             onDeployment(.failure(error), operation)
         }
 
@@ -164,6 +179,10 @@ struct WebViewWrapper: NSViewRepresentable {
             type: WKMediaCaptureType,
             decisionHandler: @escaping (WKPermissionDecision) -> Void
         ) {
+            guard role == .primary else {
+                decisionHandler(.deny)
+                return
+            }
             let policy = PhoenixWebViewPolicy.mediaCaptureDecision(
                 for: SecurityOriginDescriptor(scheme: securityOrigin.protocol, host: securityOrigin.host, port: securityOrigin.port),
                 captureType: mediaCaptureKind(for: type),
@@ -178,6 +197,10 @@ struct WebViewWrapper: NSViewRepresentable {
             decideNotificationPermissionFor securityOrigin: WKSecurityOrigin,
             decisionHandler: @escaping (WKPermissionDecision) -> Void
         ) {
+            guard role == .primary else {
+                decisionHandler(.deny)
+                return
+            }
             let notificationPolicy = PhoenixWebViewPolicy.notificationDecision(
                 for: SecurityOriginDescriptor(scheme: securityOrigin.protocol, host: securityOrigin.host, port: securityOrigin.port),
                 expectedOrigin: origin
@@ -208,6 +231,7 @@ struct WebViewWrapper: NSViewRepresentable {
                 return browserEnvironment.popupManager.makeChildWebView(
                     configuration: configuration,
                     origin: origin,
+                    role: .authPopup,
                     operation: operation,
                     browserEnvironment: browserEnvironment,
                     onDeployment: onDeployment,
@@ -236,6 +260,7 @@ struct WebViewWrapper: NSViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard role == .primary else { return }
             guard message.name == "phoenixDeployment",
                   let body = message.body as? [String: Any],
                   let status = body["status"] as? Int else { return }
@@ -279,6 +304,10 @@ struct WebViewWrapper: NSViewRepresentable {
         }
 
         private func attachDownloadDelegate(to download: WKDownload) {
+            guard role == .primary else {
+                download.cancel { _ in }
+                return
+            }
             browserEnvironment.downloadManager.attach(download: download)
         }
     }
@@ -302,6 +331,7 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
     func makeChildWebView(
         configuration: WKWebViewConfiguration,
         origin: PhoenixOrigin,
+        role: BrowserSurfaceRole,
         operation: ServerManager.ConnectionOperationToken,
         browserEnvironment: BrowserEnvironment,
         onDeployment: @escaping (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void,
@@ -310,11 +340,12 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
         let childWebView = WKWebView(frame: .zero, configuration: configuration)
         let coordinator = WebViewWrapper.Coordinator(
             origin: origin,
+            role: role,
             operation: operation,
             browserEnvironment: browserEnvironment,
             onWebViewReady: { _, _ in },
-            onDeployment: onDeployment,
-            onAuthenticationRequired: onAuthenticationRequired
+            onDeployment: { _, _ in },
+            onAuthenticationRequired: { _ in }
         )
         coordinator.webView = childWebView
         childWebView.navigationDelegate = coordinator
