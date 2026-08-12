@@ -317,7 +317,12 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  const reactions = await githubRequest(`${path}?per_page=100`, token);
+  const reactions = [];
+  for (let page = 1; ; page += 1) {
+    const batch = await githubRequest(`${path}?per_page=100&page=${page}`, token);
+    reactions.push(...batch);
+    if (batch.length < 100) break;
+  }
   for (const reaction of reactions) {
     if (
       reaction.user?.login === "github-actions[bot]" &&
@@ -329,15 +334,20 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
   }
 }
 
-function createdRecordAccepted(comment, updates) {
+function createdRecordAccepted(comment, comments) {
+  const prefix = comments.filter((candidate) => candidate.id <= comment.id);
   const record = roadmapPayload(comment.body);
   if (record?.recordType === "update") {
-    return updates.some((update) => update.source.id === comment.id);
+    return updatesFromComments(prefix).some((update) => update.source.id === comment.id);
   }
   if (record?.recordType === "retirement") {
     try {
       const retirement = validateRetirement(JSON.parse(record.payload));
-      return !updates.some((update) => update.workstream === retirement.workstream);
+      const before = updatesFromComments(prefix.filter((candidate) => candidate.id !== comment.id));
+      const current = before.find((update) => update.workstream === retirement.workstream);
+      const author = comment.user?.login ?? "unknown";
+      return current === undefined ||
+        (current.source.id <= retirement.supersedes_comment_id && current.source.author === author);
     } catch {
       return false;
     }
@@ -369,7 +379,10 @@ export async function run({ event, configuredIssueNumber, token }) {
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
     if (!acknowledgesCreation) return { ...changed, updates: updates.length };
-    const accepted = createdRecordAccepted(event.comment, updates);
+    const accepted = createdRecordAccepted(event.comment, comments);
+    if (!accepted) {
+      console.error(`Rejecting roadmap record in comment ${event.comment.id}: it was invalid or superseded before application`);
+    }
     await setLifecycleReaction(owner, repo, event.comment.id, accepted ? "rocket" : "confused", token);
     return { ...changed, updates: updates.length, acknowledged: accepted ? "accepted" : "rejected" };
   } catch (error) {

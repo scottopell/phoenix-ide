@@ -80,7 +80,7 @@ When you own a workstream represented on the roadmap:
 - append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
 - link detailed evidence instead of copying plans into the roadmap;
 - for a newly created structured record, poll bot-authored reactions: 👀 means processing, 🚀 means accepted, and 😕 means rejected; reactions do not track later edits or deletions;
-- on 🚀, verify that the generated Issue body reflects the exact source comment; on 😕, inspect the reducer Actions log.
+- on 🚀, verify that the generated Issue body reflects the exact source comment; on 😕, inspect the reducer Actions log; if no bot reaction appears within the bounded wait, inspect the workflow run because setup may have failed before lifecycle processing began.
 
 The reducer owns the Issue body; never edit it manually. The first Issue comment owns the current comment schema and limits. Use the `phoenix-development` skill for the posting procedure.
 
