@@ -54,6 +54,19 @@ describe('ToolResultsFixture', () => {
     expect(container.querySelector('[data-tool-results-fixture-ready="execution-compact"]')).not.toBeNull();
   });
 
+  it('renders consecutive one-tool messages as one compact grid with full-span bash', async () => {
+    const { container } = render(<ToolResultsFixture scenario={getToolResultsScenario('grid-compact')} />);
+
+    await screen.findByText('scenario=grid-compact');
+
+    const group = container.querySelector('.compact-tool-group');
+    expect(group).not.toBeNull();
+    expect(group?.querySelectorAll('.compact-tool-card')).toHaveLength(5);
+    expect(group?.querySelector('.compact-tool-card.wide')).toHaveTextContent('bash');
+    expect(screen.getByText(/Prose breaks the compact grid/)).toBeInTheDocument();
+    expect(container.querySelector('[data-tool-results-fixture-ready="grid-compact"]')).not.toBeNull();
+  });
+
   it('renders the grouped specialized renderer families for discovery, media, profiling, and subagents', async () => {
     const { rerender } = render(<ToolResultsFixture scenario={getToolResultsScenario('discovery-full')} />);
 

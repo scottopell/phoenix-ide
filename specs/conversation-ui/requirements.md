@@ -129,6 +129,18 @@ THE SYSTEM SHALL begin as one compact control row
 AND SHALL expand the editable area only as its content grows up to the maximum height
 AND SHALL keep send, queue, and cancellation actions directly accessible as compact controls without reserving a second action row
 
+WHEN desktop navigation enters a live conversation whose message composer is the active interaction surface
+THE SYSTEM SHALL focus the composer after authoritative conversation state and viewer restoration settle
+AND SHALL NOT reinterpret background refresh, viewport changes, or later viewer restoration as new focus requests
+
+IF a higher focus scope, route-owned viewer, message deep-link reading target, archived state, or other interaction surface owns keyboard input
+THEN THE SYSTEM SHALL preserve that owner's focus instead of focusing the composer
+
+IF a transient conversation phase has not rendered a focusable composer
+THEN THE SYSTEM SHALL retain the navigation focus request until the same route renders one
+
+**Dependencies:** `specs/keyboard-interaction/` REQ-KB-001, REQ-KB-002A, and REQ-KB-008 define topmost interaction ownership; `specs/viewer_slot/` defines when a route-owned viewer has settled and owns the interaction surface.
+
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
 
 ---
@@ -498,14 +510,17 @@ THE SYSTEM SHALL render every message at full fidelity, identical to a conversat
 
 WHEN density is `compact`
 THE SYSTEM SHALL collapse each agent turn's tool calls into a single inline pill strip, one pill per tool call in invocation order, reusing the conversation's pill styling and tool-type colors
-AND for bash tool calls, preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
+AND SHALL render consecutive tool-only agent messages from the same agent run in responsive grids of at most eight message members so lightweight tool cards share a row when space permits
+AND SHALL reduce the grid column count as available width narrows without horizontal page overflow
+AND for bash tool calls, span the available grid width and preserve command or handle-operation identity, lifecycle status, and elapsed or final duration within the collapsed card rather than reducing the card to a generic completion summary
 AND for bash tool calls, render a bounded inline output tail from the best available live or final structured bash output, including a visible truncation indication when older output has fallen out of the bounded tail
 AND render every assistant text block in full without truncation or folding
 AND render user messages at full fidelity
 AND treat density as a presentation choice only, not as permission to omit assistant prose or live tool facts available to the other density
 
 WHEN a collapsed tool-call pill is clicked
-THE SYSTEM SHALL reveal the full detail for that tool call and bring it into view
+THE SYSTEM SHALL reveal only the full detail for that selected tool call and bring it into view
+AND SHALL keep every unrelated tool call in the grouped run compact, interactive, and in invocation order
 
 THE SYSTEM SHALL NOT hide any content without a visible click-to-expand affordance
 AND SHALL NOT discard any content as a result of the active density

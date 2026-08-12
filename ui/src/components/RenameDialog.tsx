@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 
 interface RenameDialogProps {
   visible: boolean;
@@ -20,6 +21,7 @@ export function RenameDialog({
   const [name, setName] = useState(currentName);
   const [generating, setGenerating] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  useRegisterFocusScope(visible ? 'rename-conversation' : null);
 
   useEffect(() => {
     if (visible) {

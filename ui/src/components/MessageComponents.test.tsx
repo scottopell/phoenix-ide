@@ -1,8 +1,8 @@
 import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
+import { SubAgentStatus, AgentMessage, ToolOnlyAgentTurnGroup, UserMessage, TerminalToolResultHighlight } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -761,8 +761,9 @@ describe('inline tool timers', () => {
       convState: { type: 'idle' },
       streamingHandle: null,
     });
-    const initialTurn = initialUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
-    if (!initialTurn || initialTurn.kind !== 'agent_turn') throw new Error('missing initial agent turn');
+    const initialUnit = initialUnits.historicalUnits.find((u) => u.kind === 'tool_only_agent_turn_group');
+    const initialTurn = initialUnit?.kind === 'tool_only_agent_turn_group' ? initialUnit.members[0] : undefined;
+    if (!initialTurn) throw new Error('missing initial agent turn');
 
     const { rerender } = render(
       <MemoryRouter>
@@ -789,8 +790,9 @@ describe('inline tool timers', () => {
       convState: { type: 'idle' },
       streamingHandle: null,
     });
-    const liveTurn = liveUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
-    if (!liveTurn || liveTurn.kind !== 'agent_turn') throw new Error('missing live agent turn');
+    const liveUnit = liveUnits.historicalUnits.find((u) => u.kind === 'tool_only_agent_turn_group');
+    const liveTurn = liveUnit?.kind === 'tool_only_agent_turn_group' ? liveUnit.members[0] : undefined;
+    if (!liveTurn) throw new Error('missing live agent turn');
 
     rerender(
       <MemoryRouter>
@@ -885,6 +887,127 @@ describe('inline tool timers', () => {
 
     expect(screen.queryByText('result not received')).not.toBeInTheDocument();
   });
+  it('renders consecutive tool-only agent messages in one compact grid and expands exact detail', () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-grid-a', [
+      { type: 'tool_use', id: 'grid-read', name: 'read_file', input: { path: 'a.md' } },
+      { type: 'tool_use', id: 'grid-search', name: 'search', input: { pattern: 'needle' } },
+    ], 2);
+    const second = agentMessage('agent-grid-b', [
+      { type: 'tool_use', id: 'grid-keyword', name: 'keyword_search', input: { query: 'tool grid' } },
+      { type: 'tool_use', id: 'grid-bash', name: 'bash', input: { cmd: 'pnpm test' } },
+    ], 3);
+    const members = [
+      { kind: 'agent_turn' as const, key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn' as const, key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ];
+    Element.prototype.scrollIntoView = vi.fn();
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={members} /></MemoryRouter>);
+
+    const strip = screen.getByRole('list', { name: 'Tool calls' });
+    expect(strip.querySelectorAll('.compact-tool-card')).toHaveLength(4);
+    expect(strip.querySelector('.compact-tool-card.wide')).toHaveTextContent('bash');
+    expect(screen.getByRole('button', { name: /keyword_search:.*expand tool detail/i }).closest('.compact-tool-card')).toHaveAttribute('data-sequence-id', '3');
+    expect(strip.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole('button', { name: /read_file:.*expand tool detail/i }));
+
+    const remainingStrip = screen.getByRole('list', { name: 'Tool calls' });
+    expect(remainingStrip.querySelectorAll('.compact-tool-card')).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: /read_file:.*expand tool detail/i })).not.toBeInTheDocument();
+    expect(within(remainingStrip).getAllByRole('button', { name: /search:.*expand tool detail/i }).length).toBeGreaterThan(0);
+    expect(document.querySelector('.compact-tool-selected-detail [data-tool-id="grid-read"]')).not.toBeNull();
+    expect(document.querySelector('.compact-tool-selected-detail [data-tool-id="grid-search"]')).toBeNull();
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+  });
+
+  it('renders response-level retry metadata once when one message owns multiple tools', () => {
+    mockDensity = 'compact';
+    const owner = { ...agentMessage('agent-retry-multi', [
+      { type: 'tool_use', id: 'retry-multi-read', name: 'read_file', input: { path: 'a.md' } },
+      { type: 'tool_use', id: 'retry-multi-search', name: 'search', input: { pattern: 'needle' } },
+    ], 2), display_data: { retry_count: 1 } };
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: owner.message_id, agent: owner, toolResultsByUseId: new Map(), isFirstInTurn: true },
+    ]} /></MemoryRouter>);
+
+    expect(screen.getAllByText('retried 1x')).toHaveLength(1);
+    expect(screen.getByLabelText('Response retry audit')).toContainElement(screen.getByText('retried 1x'));
+    expect(document.querySelectorAll('.compact-tool-owner-copy .message-mobile-copy')).toHaveLength(1);
+  });
+
+  it('routes a grouped compact card context menu to its owning message', async () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-context-a', [
+      { type: 'tool_use', id: 'context-read', name: 'read_file', input: { path: 'first.md' } },
+    ], 2);
+    const second = agentMessage('agent-context-b', [
+      { type: 'tool_use', id: 'context-search', name: 'search', input: { pattern: 'second owner' } },
+    ], 3);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <ToolOnlyAgentTurnGroup members={[
+            { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+            { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+          ]} />
+          <MessageContextMenu messages={[first, second]} />
+        </div>
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: /search:.*expand tool detail/i }), { clientX: 20, clientY: 30 });
+    fireEvent.click(await screen.findByRole('button', { name: 'Copy as Plain Text' }));
+
+    expect(copyToClipboard).toHaveBeenCalledWith(expect.stringContaining('second owner'));
+    expect(copyToClipboard).not.toHaveBeenCalledWith(expect.stringContaining('first.md'));
+  });
+
+  it('preserves retry audit metadata in a collapsed tool group', () => {
+    mockDensity = 'compact';
+    const first = agentMessage('agent-retry-a', [
+      { type: 'tool_use', id: 'retry-read', name: 'read_file', input: { path: 'a.md' } },
+    ], 2);
+    const second = { ...agentMessage('agent-retry-b', [
+      { type: 'tool_use', id: 'retry-search', name: 'search', input: { pattern: 'needle' } },
+    ], 3), display_data: { retry_count: 2 } };
+
+    render(<MemoryRouter><ToolOnlyAgentTurnGroup members={[
+      { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+      { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+    ]} /></MemoryRouter>);
+
+    expect(screen.getByText('retried 2x')).toBeInTheDocument();
+    expect(screen.getByText('retried 2x').closest('.compact-tool-group-audit')).not.toBeNull();
+    expect(screen.getByText('retried 2x').closest('.compact-tool-card')).toBeNull();
+  });
+
+  it('preserves the vertical detailed rendering for a tool-only group in full density', () => {
+    const first = agentMessage('agent-full-a', [
+      { type: 'tool_use', id: 'full-read', name: 'read_file', input: { path: 'a.md' } },
+    ], 2);
+    const second = agentMessage('agent-full-b', [
+      { type: 'tool_use', id: 'full-search', name: 'search', input: { pattern: 'needle' } },
+    ], 3);
+
+    render(
+      <MemoryRouter>
+        <ToolOnlyAgentTurnGroup members={[
+          { kind: 'agent_turn', key: first.message_id, agent: first, toolResultsByUseId: new Map(), isFirstInTurn: true },
+          { kind: 'agent_turn', key: second.message_id, agent: second, toolResultsByUseId: new Map(), isFirstInTurn: false },
+        ]} />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelectorAll('.message.agent')).toHaveLength(2);
+    expect(document.querySelectorAll('.tool-only-agent-turn-group-member')).toHaveLength(2);
+    expect(document.querySelectorAll('.tool-block')).toHaveLength(2);
+    expect(document.querySelector('.compact-tool-strip')).toBeNull();
+  });
+
   it('renders compact bash cards with identity, final status+duration, and output tail from existing results', () => {
     mockDensity = 'compact';
     const agent = agentMessage('agent-compact-bash', [

@@ -37,6 +37,7 @@ import {
   UserMessage,
   QueuedUserMessage,
   AgentMessage,
+  ToolOnlyAgentTurnGroup,
   type AgentTextRevealRequest,
   type ConversationHighlight,
   SubAgentStatus,
@@ -52,7 +53,9 @@ import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useCo
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
+  findHistoricalUnitLocationByMessageId,
   buildTailUnits,
+  agentTurnsInHistoricalUnit,
   type HistoricalUnit,
   type TailUnit,
   type RenderUnit,
@@ -212,6 +215,24 @@ function LiveAgentTurn({ slug, message, ...props }: Omit<React.ComponentProps<ty
   return <AgentMessage message={message} liveBashProgress={liveBashProgress} {...props} />;
 }
 
+function LiveToolOnlyAgentTurnGroup({
+  slug,
+  members,
+  ...props
+}: Omit<React.ComponentProps<typeof ToolOnlyAgentTurnGroup>, 'liveBashProgress' | 'members'> & {
+  slug: string | null;
+  members: Extract<HistoricalUnit, { kind: 'tool_only_agent_turn_group' }>['members'];
+}) {
+  const toolUseIds = useMemo(
+    () => members.flatMap((member) => (Array.isArray(member.agent.content) ? member.agent.content : [])
+      .filter((block) => block.type === 'tool_use' && block.name === 'bash')
+      .flatMap((block) => block.id ? [block.id] : [])),
+    [members],
+  );
+  const liveBashProgress = useLiveBashProgressForToolIds(slug, toolUseIds);
+  return <ToolOnlyAgentTurnGroup members={members} liveBashProgress={liveBashProgress} {...props} />;
+}
+
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
@@ -276,6 +297,23 @@ function renderHistoricalUnit(
           activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
+          isLatestAgentMessage={isLatestAgentMessage}
+          unitKey={unit.key}
+          {...(revealRequest ? { revealRequest } : {})}
+          {...(activeHighlight ? { activeHighlight } : {})}
+          {...(onRevealHandled ? { onRevealHandled } : {})}
+        />
+      );
+    case 'tool_only_agent_turn_group':
+      return (
+        <LiveToolOnlyAgentTurnGroup
+          slug={slug}
+          members={unit.members}
+          onOpenFile={onOpenFile}
+          onOpenCommissionReview={onOpenCommissionReview}
+          filePathRootDir={filePathRootDir}
+          workScopeKey={workScopeKey}
+          activeToolUseId={activeToolUseId}
           isLatestAgentMessage={isLatestAgentMessage}
           unitKey={unit.key}
           {...(revealRequest ? { revealRequest } : {})}
@@ -464,6 +502,26 @@ function MessageListImpl({
   const transcriptRef = useRef<VirtualTranscriptHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
+  const loadedHistoryBoundaryKeysRef = useRef(new Set<string>());
+  const boundaryConversationIdRef = useRef(conversationId);
+  const previousFirstMessageIdRef = useRef<string | null>(null);
+  const previousFirstHistoricalKeyRef = useRef<string | null>(null);
+  if (boundaryConversationIdRef.current !== conversationId) {
+    boundaryConversationIdRef.current = conversationId;
+    loadedHistoryBoundaryKeysRef.current.clear();
+    previousFirstMessageIdRef.current = null;
+    previousFirstHistoricalKeyRef.current = null;
+  }
+  const firstMessageId = messages[0]?.message_id ?? null;
+  if (
+    previousFirstMessageIdRef.current !== null
+    && firstMessageId !== previousFirstMessageIdRef.current
+    && messages.some((message) => message.message_id === previousFirstMessageIdRef.current)
+    && previousFirstHistoricalKeyRef.current !== null
+  ) {
+    loadedHistoryBoundaryKeysRef.current.add(previousFirstHistoricalKeyRef.current);
+  }
+  previousFirstMessageIdRef.current = firstMessageId;
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -485,18 +543,21 @@ function MessageListImpl({
   // transition (sending → streaming → tool_executing → …) for zero visual
   // change.
   const { historicalUnits, endsInAgentRun } = useMemo(
-    () => buildHistoricalUnits({ messages, pendingMessages }),
+    () => buildHistoricalUnits({
+      messages,
+      pendingMessages,
+      groupBoundariesBeforeKeys: loadedHistoryBoundaryKeysRef.current,
+    }),
     [messages, pendingMessages],
   );
+  previousFirstHistoricalKeyRef.current = historicalUnits[0]?.key ?? null;
   const tailUnits = useMemo(
     () => buildTailUnits({
       convState,
       streamingHandle,
       endsInAgentRun,
       finalizedAgentKeys: new Set(
-        historicalUnits
-          .filter((unit) => unit.kind === 'agent_turn')
-          .map((unit) => unit.key),
+        historicalUnits.flatMap((unit) => agentTurnsInHistoricalUnit(unit).map((member) => member.key)),
       ),
     }),
     [convState, streamingHandle, endsInAgentRun, historicalUnits],
@@ -510,7 +571,9 @@ function MessageListImpl({
   const latestAgentKey = useMemo(() => {
     for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
       const unit = historicalUnits[i];
-      if (unit?.kind === 'agent_turn') return unit.key;
+      if (!unit) continue;
+      const members = agentTurnsInHistoricalUnit(unit);
+      if (members.length > 0) return members[members.length - 1]!.key;
     }
     return null;
   }, [historicalUnits]);
@@ -996,7 +1059,12 @@ function MessageListImpl({
   // A navigation jump has one positioning owner: VirtualTranscript. The selected
   // key remains pending until its virtualized row mounts, at which point the row
   // ref applies presentation-only highlighting without moving the scroller.
-  const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
+  const pendingPulseRef = useRef<{
+    conversationId: string | undefined;
+    key: string;
+    memberMessageId?: string;
+    toolUseId?: string;
+  } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
   const pulseTimerRef = useRef(0);
 
@@ -1019,7 +1087,11 @@ function MessageListImpl({
     ) return;
     pendingPulseRef.current = null;
     clearHighlight();
-    const target = row.querySelector('.message') ?? row;
+    const target = pending.toolUseId
+      ? row.querySelector(`[data-tool-id="${CSS.escape(pending.toolUseId)}"]`) ?? row
+      : pending.memberMessageId
+        ? row.querySelector(`#message-${CSS.escape(pending.memberMessageId)}, [data-message-id="${CSS.escape(pending.memberMessageId)}"]`) ?? row
+        : row.querySelector('.message') ?? row;
     highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
     pulseTimerRef.current = window.setTimeout(() => {
@@ -1046,13 +1118,29 @@ function MessageListImpl({
     if (row) pulseMountedRow(key, row);
   }, [pulseMountedRow]);
 
-  const scrollToUnitIndex = useCallback((unitIndex: number) => {
+  const scrollToUnitIndex = useCallback((
+    unitIndex: number,
+    memberMessageId?: string,
+    toolUseId?: string,
+  ) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
     dispatchScrollEvent({ type: 'navigationJumped' });
     clearHighlight();
-    pendingPulseRef.current = { conversationId, key: unit.key };
-    transcriptRef.current?.scrollToIndex(unitIndex, 'start');
+    pendingPulseRef.current = {
+      conversationId,
+      key: unit.key,
+      ...(memberMessageId ? { memberMessageId } : {}),
+      ...(toolUseId ? { toolUseId } : {}),
+    };
+    if (toolUseId || memberMessageId) {
+      const targetSelector = toolUseId
+        ? `[data-tool-id="${CSS.escape(toolUseId)}"]`
+        : `#message-${CSS.escape(memberMessageId!)}, [data-message-id="${CSS.escape(memberMessageId!)}"]`;
+      transcriptRef.current?.scrollToIndex(unitIndex, 'start', 0, targetSelector);
+    } else {
+      transcriptRef.current?.scrollToIndex(unitIndex, 'start');
+    }
     pulseIfMounted(unit.key);
   }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 
@@ -1062,17 +1150,24 @@ function MessageListImpl({
   );
 
   const messageIdForHistoricalUnit = useCallback((unit: HistoricalUnit): string | null => {
-    if (unit.kind === 'agent_turn') return unit.agent.message_id;
+    const firstAgentTurn = agentTurnsInHistoricalUnit(unit)[0];
+    if (firstAgentTurn) return firstAgentTurn.agent.message_id;
     if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
     return null;
   }, []);
 
   const scrollToMessageId = useCallback((messageId: string) => {
-    const index = findUnitIndexByMessageId(messageId);
-    if (index < 0) return false;
-    scrollToUnitIndex(index);
+    const location = findHistoricalUnitLocationByMessageId(historicalUnits, messageId);
+    if (!location) return false;
+    const unit = historicalUnits[location.unitIndex];
+    const grouped = unit?.kind === 'tool_only_agent_turn_group';
+    scrollToUnitIndex(
+      location.unitIndex,
+      grouped ? location.memberMessageId : undefined,
+      grouped ? location.toolUseId : undefined,
+    );
     return true;
-  }, [findUnitIndexByMessageId, scrollToUnitIndex]);
+  }, [historicalUnits, scrollToUnitIndex]);
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
@@ -1161,11 +1256,38 @@ function MessageListImpl({
             if (unit) {
               dispatchScrollEvent({ type: 'navigationJumped' });
               clearHighlight();
-              pendingPulseRef.current = { conversationId, key: unit.key };
-              if (effect.viewportStartOffset === undefined) {
+              const location = findHistoricalUnitLocationByMessageId(historicalUnits, command.targetMessageId);
+              pendingPulseRef.current = {
+                conversationId,
+                key: unit.key,
+                ...(unit.kind === 'tool_only_agent_turn_group' && location
+                  ? { memberMessageId: location.memberMessageId }
+                  : {}),
+                ...(unit.kind === 'tool_only_agent_turn_group' && location?.toolUseId
+                  ? { toolUseId: location.toolUseId }
+                  : {}),
+              };
+              const grouped = unit.kind === 'tool_only_agent_turn_group';
+              const targetSelector = grouped && location?.toolUseId
+                ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
+                : grouped && location
+                  ? `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`
+                  : undefined;
+              if (targetSelector) {
+                transcriptRef.current?.scrollToIndex(
+                  effect.targetIndex,
+                  effect.align,
+                  effect.viewportStartOffset,
+                  targetSelector,
+                );
+              } else if (effect.viewportStartOffset === undefined) {
                 transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align);
               } else {
-                transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
+                transcriptRef.current?.scrollToIndex(
+                  effect.targetIndex,
+                  effect.align,
+                  effect.viewportStartOffset,
+                );
               }
               pulseIfMounted(unit.key);
             }
@@ -1173,7 +1295,23 @@ function MessageListImpl({
             continuityRestoreInFlightRef.current = true;
             transcriptRef.current?.scrollToIndex(effect.targetIndex, effect.align, effect.viewportStartOffset);
           }
-          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(effect.targetIndex)
+          const physicalTargetSelector = effect.command.kind === 'jump_to_message'
+            ? (() => {
+                const location = findHistoricalUnitLocationByMessageId(
+                  historicalUnits,
+                  effect.command.targetMessageId,
+                );
+                const unit = historicalUnits[effect.targetIndex];
+                if (unit?.kind !== 'tool_only_agent_turn_group' || !location) return undefined;
+                return location.toolUseId
+                  ? `[data-tool-id="${CSS.escape(location.toolUseId)}"]`
+                  : `#message-${CSS.escape(location.memberMessageId)}, [data-message-id="${CSS.escape(location.memberMessageId)}"]`;
+              })()
+            : undefined;
+          const physicalSnapshot = transcriptRef.current?.physicalSnapshot(
+            effect.targetIndex,
+            physicalTargetSelector,
+          )
             ?? lastPhysicalSnapshotRef.current
             ?? { renderedRange: null, visibleRange: null, viewportTop: 0, layoutRevision: 0, targetIndex: effect.targetIndex, targetOffset: null };
           lastPhysicalSnapshotRef.current = physicalSnapshot;
@@ -1343,7 +1481,9 @@ function MessageListImpl({
           onCancelSteering,
           workScopeKey,
           activeToolUseId,
-          unit.kind === 'agent_turn' && unit.key === latestAgentKey,
+          unit.kind !== 'sub_agent_status'
+            && unit.kind !== 'streaming_agent'
+            && agentTurnsInHistoricalUnit(unit).some((member) => member.key === latestAgentKey),
           pendingRevealRequest && pendingRevealRequest.unitKey === unit.key ? pendingRevealRequest : null,
           activeFindHighlight && activeFindHighlight.unitKey === unit.key
             ? (

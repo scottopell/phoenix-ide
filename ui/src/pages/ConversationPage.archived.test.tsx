@@ -11,6 +11,7 @@ import { ConversationStore, type InitPayload, type SSEAction } from '../conversa
 import { DraftStore } from '../conversation/DraftStore';
 import { api, ExpansionError, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
+import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
@@ -98,6 +99,10 @@ function useConnectedConnection(options: ConnectionOptions) {
       ?? makeConversation({ id: connectedConversationId });
     validatedInitRef.current?.(makeConnectionInit(conversation));
   }, [connectedConversationId]);
+  return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
+}
+
+function useManuallyDrivenConnection() {
   return { state: 'connected' as const, attempt: 0, nextRetryIn: null, retryNow: vi.fn() };
 }
 
@@ -241,11 +246,21 @@ function LocationProbe() {
   return <output data-testid="route-location">{location.pathname}{location.search}{location.hash}</output>;
 }
 
+function PersistentFocusScope() {
+  const { pushScope, popScope } = useFocusScopeCommands();
+  useEffect(() => {
+    pushScope('persistent-test-scope');
+    return () => popScope('persistent-test-scope');
+  }, [pushScope, popScope]);
+  return null;
+}
+
 function renderPage(
   conversation: Conversation,
   routeSegment: string = conversation.slug,
   initialSearch = '',
   routePrefix: '/c' | '/global' = '/c',
+  activeFocusScope = false,
 ) {
   authoritativeConversations.set(conversation.id, conversation);
   const store = new ConversationStore();
@@ -286,16 +301,18 @@ function renderPage(
   const page = () => (
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={draftStore}>
-        <ConversationReadinessProvider>
-          <MemoryRouter initialEntries={[`${routePrefix}/${routeSegment}${initialSearch}`]}>
-            <Routes>
-              <Route
-                path={`${routePrefix}/:slug`}
-                element={<><DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout><LocationProbe /></>}
-              />
-            </Routes>
-          </MemoryRouter>
-        </ConversationReadinessProvider>
+        <FocusScopeProvider>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`${routePrefix}/${routeSegment}${initialSearch}`]}>
+              <Routes>
+                <Route
+                  path={`${routePrefix}/:slug`}
+                  element={<>{activeFocusScope && <PersistentFocusScope />}<DesktopLayout><ConversationPage routePrefix={routePrefix} /></DesktopLayout><LocationProbe /></>}
+                />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </FocusScopeProvider>
       </DraftContext.Provider>
     </ConversationContext.Provider>
   );
@@ -338,6 +355,208 @@ describe('ConversationPage message viewer layout', () => {
     await waitFor(() => {
       expect(container.querySelector('.app-split-pane')).toBeInTheDocument();
     });
+  });
+});
+
+describe('ConversationPage route focus', () => {
+  it('focuses the composer when a live conversation route becomes ready', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation());
+
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
+    document.body.removeChild(anchor);
+  });
+
+  it('does not steal focus when the route renders no composer', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation({
+      state: { type: 'awaiting_user_response', questions: [] },
+    }));
+
+    await screen.findByTestId('message-history');
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('preserves approval-dialog focus instead of focusing its underlying composer', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation({
+      state: {
+        type: 'awaiting_commission_review_approval',
+        brief: 'Review this commission',
+        focus: null,
+        scope: undefined,
+      },
+    }));
+
+    await screen.findByTestId('message-history');
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('does not turn a mobile navigation into a focus request after resizing to desktop', async () => {
+    viewportFlags.isDesktop = false;
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    const view = renderPage(makeConversation());
+    await screen.findByRole('textbox');
+    expect(anchor).toHaveFocus();
+
+    viewportFlags.isDesktop = true;
+    view.rerenderPage();
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('does not focus a composer underneath a route-owned modal viewer', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation(), slug, '?viewer=message&presentation=fullscreen&message=1');
+
+    await screen.findByTestId('message-history');
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('focuses the composer when an already-active browser session intentionally keeps its viewer closed', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation({ browser_session_active: true }));
+
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
+    document.body.removeChild(anchor);
+  });
+
+  it('preserves reading focus for a message deep link', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation(), slug, '#message-m1');
+
+    await screen.findByTestId('message-history');
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('preserves the topmost focus scope during conversation entry', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation(), slug, '', '/c', true);
+
+    await screen.findByRole('textbox');
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('defers the navigation focus request until a temporary disabled composer becomes writable', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    const { store } = renderPage(makeConversation({ state: { type: 'awaiting_continuation', attempt: 1 } }));
+    await screen.findByRole('status');
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(anchor).toHaveFocus();
+
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'idle' },
+        stateUpdatedAt: Date.now() + 1,
+      });
+    });
+
+    const textbox = await screen.findByRole('textbox');
+    expect(textbox).toBeEnabled();
+    expect(textbox).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('keeps focus pending while awaiting the LLM, then focuses when chat becomes writable', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    const { store } = renderPage(makeConversation({ state: { type: 'awaiting_llm' } }));
+    const textbox = await screen.findByRole('textbox');
+    expect(anchor).toHaveFocus();
+
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        stateUpdatedAt: Date.now() + 1,
+      });
+    });
+
+    await waitFor(() => expect(textbox).toHaveFocus());
+    document.body.removeChild(anchor);
+  });
+
+  it('preserves continuation-recovery action ownership', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    renderPage(makeConversation({
+      state: {
+        type: 'recoverable_continuation_failure',
+        message: 'Summary failed',
+        error_kind: 'server_error',
+        operation_id: 'op-1',
+        attempt: 1,
+      },
+    }));
+
+    await screen.findByRole('button', { name: /retry summary/i });
+    expect(anchor).toHaveFocus();
+    document.body.removeChild(anchor);
+  });
+
+  it('retains focus intent while provisioning, then focuses when the same route becomes writable', async () => {
+    const anchor = document.createElement('button');
+    document.body.appendChild(anchor);
+    anchor.focus();
+
+    const { store } = renderPage(makeConversation({ state: { type: 'provisioning' } }));
+    await screen.findByText(/Creating conversation/);
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(anchor).toHaveFocus();
+
+    act(() => {
+      store.dispatch(slug, {
+        type: 'sse_state_change',
+        sequenceId: 1,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        stateUpdatedAt: Date.now() + 1,
+      });
+    });
+
+    const textbox = await screen.findByRole('textbox');
+    await waitFor(() => expect(textbox).toHaveFocus());
+    document.body.removeChild(anchor);
   });
 });
 
@@ -1227,6 +1446,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('keeps cached history provisional until authoritative SSE init replaces it', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const cachedConversation = makeConversation({ transcript_generation: 7 });
     const authoritativeMessage = {
       ...catchUpMessage,
@@ -1258,6 +1478,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('preserves lazy older-history availability across cursor reconnect', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const conversation = makeConversation();
     const { store } = renderPage(conversation);
     await screen.findByText('keep this history visible');
@@ -1287,6 +1508,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('loads older history lazily from REST after SSE reports tail coverage', async () => {
+    hooksMockState.useConnection.mockImplementation(useManuallyDrivenConnection);
     const newest = { ...catchUpMessage, sequence_id: 2 } as Message;
     vi.mocked(api.getConversation).mockResolvedValue({
       conversation: makeConversation(),

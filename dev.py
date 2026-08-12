@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -1425,8 +1426,7 @@ def _git_worktree_bases() -> list[Path]:
     return [main_root / ".claude" / "worktrees", main_root / ".phoenix" / "worktrees"]
 
 
-def _dir_size_bytes(path: Path) -> int:
-    """Best-effort recursive size of a directory in bytes (0 on failure)."""
+def _measure_dir_size_bytes(path: Path) -> int | None:
     try:
         out = subprocess.run(
             ["du", "-sk", str(path)], capture_output=True, text=True, timeout=60
@@ -1435,7 +1435,37 @@ def _dir_size_bytes(path: Path) -> int:
             return int(out.stdout.split()[0]) * 1024
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         pass
-    return 0
+    return None
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Best-effort recursive size of a directory in bytes (0 on failure)."""
+    return _measure_dir_size_bytes(path) or 0
+
+
+def _artifact_size_attributes(
+    span, *, path: Path, attribute_prefix: str
+) -> dict:
+    """Measure a bounded artifact tree for attributes on one owning span."""
+    if span is _NOOP_SPAN or _DEV_TRACING is None:
+        return {}
+    resolved = path.resolve()
+    exists = resolved.exists()
+    size_bytes = _measure_dir_size_bytes(resolved) if exists else None
+    provenance = "measured" if size_bytes is not None else ("unavailable" if exists else "absent")
+    attributes = {
+        f"{attribute_prefix}.path": _display_path(resolved),
+        f"{attribute_prefix}.exists": exists,
+        f"{attribute_prefix}.provenance": provenance,
+    }
+    if size_bytes is not None:
+        attributes[f"{attribute_prefix}.size_bytes"] = size_bytes
+    return attributes
+
+
+def _cargo_target_dir(cwd: Path, env: Mapping[str, str]) -> Path:
+    configured = Path(env.get("CARGO_TARGET_DIR", "target"))
+    return configured if configured.is_absolute() else cwd / configured
 
 
 def _registry_snapshot() -> list[tuple[str, int]]:
@@ -1784,16 +1814,27 @@ def _run_cargo_build(args: list[str], cwd: Path, profile: str) -> None:
         raise
     finally:
         finished_at = time.monotonic()
-        lock_wait = lock_timer.finish(finished_at)
-        _finish_dev_span(span, {
+        finished_wall_ns = time.time_ns()
+        attributes = {
             "build.elapsed_seconds": max(0.0, finished_at - started_at),
-            "cargo.lock_wait_seconds": lock_wait,
+            "cargo.lock_wait_seconds": lock_timer.finish(finished_at),
             "process.exit_code": returncode,
-        }, failed=returncode != 0)
+        }
+        attributes.update(_artifact_size_attributes(
+            span,
+            path=_cargo_target_dir(cwd, os.environ) / profile,
+            attribute_prefix="build.artifact",
+        ))
+        _finish_dev_span(
+            span,
+            attributes,
+            failed=returncode != 0,
+            end_time=finished_wall_ns,
+        )
 
 
-def build_rust(release: bool = True):
-    """Build the Rust backend."""
+def build_rust(release: bool = False):
+    """Build the Rust backend for local development by default."""
     # RustEmbed requires ui/dist to exist at compile time, even if empty.
     # In dev mode Vite serves assets, so an empty dir is fine.
     (UI_DIR / "dist").mkdir(exist_ok=True)
@@ -2145,16 +2186,16 @@ def cmd_up(
     print(f"  Hash: {get_worktree_hash()}, Port offsets: Phoenix +{phoenix_offset}, Vite +{vite_offset}")
     print()
     
-    build_rust(release=True)
+    build_rust()
 
     # Seed before Phoenix starts so the seeder remains the only database writer.
-    # The release binary is already built, so seed can run its canonical
+    # The debug binary is already built, so seed can run its canonical
     # migrate-only path without rebuilding.
     if not no_seed:
-        cmd_seed(quiet_if_populated=True, build=False)
+        cmd_seed(quiet_if_populated=True, build=False, release=False)
         print()
 
-    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    phoenix_tls = start_phoenix(port=phoenix_port, release=False, tls=tls)
     vite_tls = start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
     api_scheme = "https" if phoenix_tls else "http"
     ui_scheme = "https" if vite_tls else "http"
@@ -2240,10 +2281,10 @@ def _title_from_slug(slug: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
 
 
-def _migrate_seed_database(*, build: bool) -> None:
+def _migrate_seed_database(*, build: bool, release: bool) -> None:
     if build:
-        build_rust(release=True)
-    binary = ROOT / "target" / "release" / "phoenix_ide"
+        build_rust(release=release)
+    binary = ROOT / "target" / ("release" if release else "debug") / "phoenix_ide"
     if not binary.exists():
         raise RuntimeError(f"Phoenix binary not found after build: {binary}")
     env = os.environ.copy()
@@ -2256,7 +2297,9 @@ def _migrate_seed_database(*, build: bool) -> None:
     )
 
 
-def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
+def cmd_seed(
+    quiet_if_populated: bool = False, *, build: bool = True, release: bool = False
+) -> None:
     """Populate the dev DB with representative conversations.
 
     Runs offline after the Phoenix binary applies the canonical Rust migration
@@ -3123,7 +3166,7 @@ def cmd_seed(quiet_if_populated: bool = False, *, build: bool = True) -> None:
     direct_mode = {"mode": "Direct"}
     explore_mode = {"mode": "Explore"}
 
-    _migrate_seed_database(build=build)
+    _migrate_seed_database(build=build, release=release)
     with sqlite3.connect(str(db_path), timeout=10) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -3605,10 +3648,10 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
         phoenix_port, _ = select_dev_ports(phoenix_port, vite_port)
     vite_was_running = vite_pid is not None
 
-    build_rust(release=True)
+    build_rust()
     stop_process(PHOENIX_PID_FILE, "Phoenix")
     time.sleep(0.5)
-    phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
+    phoenix_tls = start_phoenix(port=phoenix_port, release=False, tls=tls)
     api_scheme = "https" if phoenix_tls else "http"
 
     if vite_was_running:
@@ -4640,8 +4683,42 @@ def _configure_compiler_cache(requested: str | None = None) -> str:
             print(f"  ⚠ kache unavailable; continuing without compiler cache: {daemon_error}")
             return "none"
     elif backend == "sccache":
-        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+        os.environ.setdefault("SCCACHE_CACHE_SIZE", "10G")
     return backend
+
+
+def _parse_cache_size(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)B?\s*", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"unsupported cache size {value!r}")
+    exponent = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4}[match.group(2).upper()]
+    return int(match.group(1)) * 1024**exponent
+
+
+def _sccache_limit_warning(
+    expected: str | None = None, binary: str = "sccache"
+) -> str | None:
+    expected = expected or os.environ.get("SCCACHE_CACHE_SIZE", "10G")
+    try:
+        requested = _parse_cache_size(expected)
+        result = subprocess.run(
+            [binary, "--show-stats", "--stats-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return f"sccache limit unavailable: {(result.stderr or result.stdout).strip()}"
+        actual = int(json.loads(result.stdout)["max_cache_size"])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        return f"sccache limit unavailable: {error}"
+    if actual != requested:
+        return (
+            f"running sccache server limit is {actual / 1024**3:.1f} GiB, not "
+            f"the requested {expected}; restart sccache to apply SCCACHE_CACHE_SIZE"
+        )
+    return None
 
 
 _CARGO_CHECK_LANES = frozenset({"rust", "clippy", "e2e"})
@@ -4704,6 +4781,19 @@ def _cargo_check_active(active: set[str]) -> bool:
     return bool(active & _CARGO_CHECK_LANES)
 
 
+def _verification_cargo_env() -> dict[str, str]:
+    return {"CARGO_INCREMENTAL": "0"}
+
+
+def _clippy_invocation(
+    package_flags: list[str], root: Path = ROOT
+) -> tuple[list[str], dict[str, str]]:
+    return (
+        ["cargo", "clippy", *package_flags, "--all-targets", "--", "-D", "warnings"],
+        _clippy_check_env(root),
+    )
+
+
 def _finish_check_step_span(
     span,
     *,
@@ -4712,6 +4802,7 @@ def _finish_check_step_span(
     lock_wait: float,
     returncode: int,
     cpu_attributes: dict | None = None,
+    artifact_attributes: dict | None = None,
     end_time: int | None = None,
 ) -> None:
     attributes = {
@@ -4724,7 +4815,17 @@ def _finish_check_step_span(
         attributes.update(cpu_attributes)
     elif _CHECK_PROFILE is not None:
         attributes.update({"cpu.provenance": "unavailable"})
+    if artifact_attributes:
+        attributes.update(artifact_attributes)
     _finish_dev_span(span, attributes, failed=returncode != 0, end_time=end_time)
+
+
+def _check_step_artifact_dir(lane: str, name: str, env: dict[str, str]) -> Path | None:
+    if lane == "clippy" and name == "cargo clippy":
+        return _cargo_target_dir(ROOT, env) / "debug"
+    if lane == "rust" and name == "cargo test":
+        return _cargo_target_dir(ROOT, env) / "debug"
+    return None
 
 
 def cmd_check(
@@ -4965,6 +5066,14 @@ def cmd_check(
             _read_cpu_measurement(measurement_path)
             if measurement_path is not None else None
         )
+        artifact_attributes = {}
+        artifact_dir = _check_step_artifact_dir(lane, name, env)
+        if artifact_dir is not None:
+            artifact_attributes = _artifact_size_attributes(
+                span,
+                path=artifact_dir,
+                attribute_prefix="check.artifact",
+            )
         _finish_check_step_span(
             span,
             elapsed=elapsed,
@@ -4972,6 +5081,7 @@ def cmd_check(
             lock_wait=lock_wait,
             returncode=rc,
             cpu_attributes=cpu_attributes,
+            artifact_attributes=artifact_attributes,
             end_time=finished_wall_ns,
         )
         if profile_work and _CHECK_PROFILE is not None:
@@ -4987,8 +5097,7 @@ def cmd_check(
     def lane_rust():
         """Rust lane: test compile → codegen export → staleness diff → test run.
 
-        Linux-musl compatibility is checked once per commit by CI rather than
-        generating a separate cross-target artifact tree in every macOS worktree.
+        This lane does not generate a Linux-musl cross-target artifact tree.
 
         vite build is intentionally NOT run here. `#[derive(Embed)]` in
         crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
@@ -5043,9 +5152,8 @@ def cmd_check(
         # as library code (a pedantic violation in a #[cfg(test)] module fails
         # CI); it composes with `-p` so the changed-crate scope still applies.
         _prepare_clippy_check_target()
-        run_step("cargo clippy",
-                 ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
-                 env_extra=_clippy_check_env())
+        command, cargo_env = _clippy_invocation(_pflags())
+        run_step("cargo clippy", command, env_extra=cargo_env)
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
@@ -5509,6 +5617,9 @@ def cmd_check(
     selected_compiler_cache = None
     if cargo_active:
         selected_compiler_cache = _configure_compiler_cache(compiler_cache)
+        if selected_compiler_cache == "sccache":
+            if warning := _sccache_limit_warning():
+                reporter.info(warning)
     if _CHECK_PROFILE is not None:
         _CHECK_PROFILE.metadata["compiler_cache"] = selected_compiler_cache
     if _CHECK_PROFILE is not None and _DEV_TRACING is not None:
@@ -7116,6 +7227,10 @@ def check_systemd_available() -> bool:
         return False
 
 
+def _production_cargo_feature_args() -> list[str]:
+    return ["--features", "phoenix_ide/datadog-tracing"]
+
+
 def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-musl") -> Path:
     """Build the production binary from the invoking checkout's exact HEAD."""
     result = subprocess.run(
@@ -7180,7 +7295,7 @@ def prod_build(strip: bool = True, target: str | None = "x86_64-unknown-linux-mu
     needs_cross = target and sys.platform != "linux"
     if needs_cross:
         raise SystemExit(f"Cross-compilation not supported on {sys.platform}; use CI for release builds.")
-    cargo_cmd = ["cargo", "build", "--release"]
+    cargo_cmd = ["cargo", "build", "--release", *_production_cargo_feature_args()]
     if target:
         print(f"Building Rust ({target}, release)...")
         cargo_cmd += ["--target", target]
@@ -9138,11 +9253,18 @@ def launchd_prod_deploy(
     _claim_launchd_deploy(transaction_id)
     claimed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     staging = LAUNCHD_DEPLOY_DIR / "transactions" / transaction_id
+    source_kind = "published_release" if release else "local_head"
+    source_commit = None
+    release_commit = None
+    release_tag = release
+    selected_identity: RuntimeIdentity | None = None
     try:
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "preparing",
-            "source_kind": "published_release" if release else "local_head",
-            "source_commit": None, "release_commit": None, "release_tag": release,
+            "source_kind": source_kind,
+            "source_commit": source_commit,
+            "release_commit": release_commit,
+            "release_tag": release_tag,
             "expected_version": None, "expected_git_sha": None,
             "created_at": claimed_at, "updated_at": claimed_at,
             "failure": None, "rollback_failure": None,
@@ -9164,6 +9286,7 @@ def launchd_prod_deploy(
             else _prepare_local_candidate(target=None)
         )
         binary = prepared.binary
+        selected_identity = prepared.identity
         release_tag = prepared.release_tag
         source_commit = prepared.source_commit
         source_kind = prepared.source_kind.value
@@ -9178,11 +9301,8 @@ def launchd_prod_deploy(
             check=True,
         )
         subprocess.run(["codesign", "--verify", "--strict", str(candidate_binary)], check=True)
-        identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
-        if (
-            identity.version != prepared.identity.version
-            or identity.git_sha != prepared.identity.git_sha
-        ):
+        observed_identity = RuntimeIdentity.from_value(_binary_identity(candidate_binary))
+        if observed_identity != selected_identity:
             raise SystemExit("staged candidate identity changed after signing")
 
         env_overrides = dict(launchd_env)
@@ -9191,7 +9311,7 @@ def launchd_prod_deploy(
             print(f"  Loaded env from {env_file}")
         path_str, path_source = capture_login_shell_path()
         print_launchd_path_report(path_str, path_source)
-        plist_content = generate_launchd_plist(identity.version, extra_env=env_overrides, path_override=path_str)
+        plist_content = generate_launchd_plist(selected_identity.version, extra_env=env_overrides, path_override=path_str)
         candidate_plist = staging / "candidate.plist"
         candidate_plist.write_text(plist_content)
         candidate_plist.chmod(0o600)
@@ -9260,7 +9380,7 @@ def launchd_prod_deploy(
             "source_commit": source_commit,
             "release_tag": release_tag,
             "release_commit": release_commit,
-            "expected": identity.as_dict(),
+            "expected": selected_identity.as_dict(),
             "previous": previous_identity.as_dict() if previous_identity is not None else None,
             "previous_deployed_sha": previous_deployed_sha,
             "candidate_binary": str(candidate_binary),
@@ -9293,7 +9413,7 @@ def launchd_prod_deploy(
         _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
             "transaction_id": transaction_id, "state": "prepared", "source_kind": source_kind,
             "source_commit": source_commit, "release_commit": release_commit, "release_tag": release_tag,
-            "expected_version": identity.version, "expected_git_sha": identity.git_sha,
+            "expected_version": selected_identity.version, "expected_git_sha": selected_identity.git_sha,
             "created_at": manifest["created_at"], "updated_at": manifest["created_at"],
             "failure": None, "rollback_failure": None,
         })
@@ -9308,13 +9428,13 @@ def launchd_prod_deploy(
         failed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
             _write_json_atomic(LAUNCHD_DEPLOY_STATUS_PATH, {
-             "transaction_id": transaction_id, "state": "precondition_failed",
-             "source_kind": "published_release" if release else locals().get("source_kind"),
-             "source_commit": locals().get("source_commit"),
-
-                "release_commit": locals().get("release_commit"), "release_tag": locals().get("release_tag", release),
-                "expected_version": locals().get("identity", {}).get("version"),
-                "expected_git_sha": locals().get("identity", {}).get("git_sha"),
+                "transaction_id": transaction_id, "state": "precondition_failed",
+                "source_kind": source_kind,
+                "source_commit": source_commit,
+                "release_commit": release_commit,
+                "release_tag": release_tag,
+                "expected_version": selected_identity.version if selected_identity is not None else None,
+                "expected_git_sha": selected_identity.git_sha if selected_identity is not None else None,
                 "created_at": claimed_at, "updated_at": failed_at,
                 "failure": f"{type(exc).__name__}: preparation failed before handoff",
                 "rollback_failure": None,
@@ -9322,7 +9442,7 @@ def launchd_prod_deploy(
         finally:
             _release_launchd_deploy_claim(transaction_id)
         raise
-    _report_launchd_handoff(transaction_id, identity)
+    _report_launchd_handoff(transaction_id, selected_identity)
 
 
 

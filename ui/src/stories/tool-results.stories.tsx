@@ -38,6 +38,12 @@ ProfilingFull.storyName = 'profiling-full';
 export const ProfilingCompact = storyFor('profiling-compact');
 ProfilingCompact.storyName = 'profiling-compact';
 
+export const GridFull = storyFor('grid-full');
+GridFull.storyName = 'grid-full';
+
+export const GridCompact = storyFor('grid-compact');
+GridCompact.storyName = 'grid-compact';
+
 export const SubagentsFull = storyFor('subagents-full');
 SubagentsFull.storyName = 'subagents-full';
 

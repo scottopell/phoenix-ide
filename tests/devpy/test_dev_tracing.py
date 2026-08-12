@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,11 @@ def load_devpy():
 
 
 class FakeSpan:
-    pass
+    def __init__(self):
+        self.events = []
+
+    def add_event(self, name, attributes, timestamp=None):
+        self.events.append((name, attributes, timestamp))
 
 
 class FakeTracing:
@@ -447,17 +452,118 @@ class DevTracingTests(unittest.TestCase):
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
             mock.patch.object(self.dev.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(self.dev.time, "time_ns", return_value=1_700_000_000_000_000_000),
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=4096) as dir_size,
+            mock.patch.object(Path, "exists", return_value=True),
             mock.patch("builtins.print"),
         ):
             self.dev._run_cargo_build(["cargo", "build", "--release"], ROOT, "release")
 
         self.assertEqual("dev.build", tracing.started[0][0])
         self.assertEqual({"build.profile": "release"}, tracing.started[0][1])
-        _, attributes, failed, _ = tracing.finished[0]
+        span, attributes, failed, _ = tracing.finished[0]
         self.assertFalse(failed)
         self.assertEqual(6.0, attributes["build.elapsed_seconds"])
         self.assertEqual(2.0, attributes["cargo.lock_wait_seconds"])
         self.assertEqual(0, attributes["process.exit_code"])
+        self.assertEqual(4096, attributes["build.artifact.size_bytes"])
+        self.assertTrue(attributes["build.artifact.exists"])
+        self.assertEqual("measured", attributes["build.artifact.provenance"])
+        self.assertEqual([], span.events)
+        self.assertEqual(1_700_000_000_000_000_000, tracing.finished[0][3])
+        dir_size.assert_called_once_with((ROOT / "target" / "release").resolve())
+
+    def test_cargo_build_artifact_size_honors_custom_target_directory(self):
+        tracing = FakeTracing()
+        process = FakeProcess([])
+        self.dev._DEV_TRACING = tracing
+
+        with (
+            mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=2048) as dir_size,
+            mock.patch.object(Path, "exists", return_value=True),
+            mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/phoenix-cargo-target"}),
+            mock.patch("builtins.print"),
+        ):
+            self.dev._run_cargo_build(["cargo", "build"], ROOT, "debug")
+
+        attributes = tracing.finished[0][1]
+        self.assertEqual(2048, attributes["build.artifact.size_bytes"])
+        dir_size.assert_called_once_with(Path("/tmp/phoenix-cargo-target/debug").resolve())
+
+    def test_artifact_size_attributes_mark_directory_absent(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        span = FakeSpan()
+
+        attributes = self.dev._artifact_size_attributes(
+            span,
+            path=ROOT / "target" / "missing-dir-for-test",
+            attribute_prefix="check.artifact",
+        )
+
+        self.assertFalse(attributes["check.artifact.exists"])
+        self.assertEqual("absent", attributes["check.artifact.provenance"])
+        self.assertNotIn("check.artifact.size_bytes", attributes)
+        self.assertEqual([], span.events)
+
+    def test_artifact_size_attributes_mark_measurement_failure_unavailable(self):
+        self.dev._DEV_TRACING = FakeTracing()
+        span = FakeSpan()
+        with (
+            mock.patch.object(Path, "exists", return_value=True),
+            mock.patch.object(self.dev, "_measure_dir_size_bytes", return_value=None),
+        ):
+            attributes = self.dev._artifact_size_attributes(
+                span,
+                path=ROOT / "target" / "debug",
+                attribute_prefix="check.artifact",
+            )
+
+        self.assertTrue(attributes["check.artifact.exists"])
+        self.assertEqual("unavailable", attributes["check.artifact.provenance"])
+        self.assertNotIn("check.artifact.size_bytes", attributes)
+
+    def test_cargo_target_dir_resolves_absolute_and_relative_configuration(self):
+        self.assertEqual(ROOT / "target", self.dev._cargo_target_dir(ROOT, {}))
+        self.assertEqual(
+            ROOT / "custom-target",
+            self.dev._cargo_target_dir(ROOT, {"CARGO_TARGET_DIR": "custom-target"}),
+        )
+        self.assertEqual(
+            Path("/tmp/custom-target"),
+            self.dev._cargo_target_dir(ROOT, {"CARGO_TARGET_DIR": "/tmp/custom-target"}),
+        )
+
+    def test_check_step_artifact_dir_uses_cargo_target_dir_when_present(self):
+        self.assertEqual(
+            Path("/tmp/clippy-target/debug"),
+            self.dev._check_step_artifact_dir(
+                "clippy", "cargo clippy", {"CARGO_TARGET_DIR": "/tmp/clippy-target"}
+            ),
+        )
+        self.assertEqual(
+            ROOT / "target" / "debug",
+            self.dev._check_step_artifact_dir("rust", "cargo test", {}),
+        )
+        self.assertEqual(
+            Path("/tmp/rust-target/debug"),
+            self.dev._check_step_artifact_dir(
+                "rust", "cargo test", {"CARGO_TARGET_DIR": "/tmp/rust-target"}
+            ),
+        )
+        self.assertIsNone(self.dev._check_step_artifact_dir("ui", "eslint", {}))
+
+    def test_artifact_measurement_is_skipped_without_active_tracing(self):
+        self.dev._DEV_TRACING = None
+        with mock.patch.object(self.dev, "_measure_dir_size_bytes") as dir_size:
+            attributes = self.dev._artifact_size_attributes(
+                self.dev._NOOP_SPAN,
+                path=ROOT / "target" / "debug",
+                attribute_prefix="build.artifact",
+            )
+        self.assertEqual({}, attributes)
+        dir_size.assert_not_called()
 
     def test_cargo_build_interrupt_terminates_and_waits_for_child(self):
         class InterruptingStream:
@@ -475,6 +581,7 @@ class DevTracingTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="4\t/target\n")),
             mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0]),
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -491,6 +598,7 @@ class DevTracingTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.dev.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.dev.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="4\t/target\n")),
             mock.patch.object(self.dev.time, "monotonic", side_effect=[10.0, 11.0, 12.0]),
             mock.patch("builtins.print"),
         ):
@@ -512,6 +620,10 @@ class DevTracingTests(unittest.TestCase):
             timed_out=True,
             lock_wait=2.25,
             returncode=1,
+            artifact_attributes={
+                "check.artifact.size_bytes": 8192,
+                "check.artifact.exists": True,
+            },
             end_time=123_000_000,
         )
 
@@ -521,9 +633,31 @@ class DevTracingTests(unittest.TestCase):
             "check.timed_out": True,
             "cargo.lock_wait_seconds": 2.25,
             "process.exit_code": 1,
+            "check.artifact.size_bytes": 8192,
+            "check.artifact.exists": True,
         }, tracing.finished[0][1])
         self.assertTrue(tracing.finished[0][2])
         self.assertEqual(123_000_000, tracing.finished[0][3])
+
+    def test_artifact_attributes_preserve_missing_cpu_provenance(self):
+        tracing = FakeTracing()
+        self.dev._DEV_TRACING = tracing
+        self.dev._CHECK_PROFILE = mock.Mock()
+        span = FakeSpan()
+
+        self.dev._finish_check_step_span(
+            span,
+            elapsed=1.0,
+            timed_out=False,
+            lock_wait=0.0,
+            returncode=0,
+            cpu_attributes=None,
+            artifact_attributes={"check.artifact.size_bytes": 8192},
+        )
+
+        attributes = tracing.finished[0][1]
+        self.assertEqual("unavailable", attributes["cpu.provenance"])
+        self.assertEqual(8192, attributes["check.artifact.size_bytes"])
 
     def test_span_recording_failure_does_not_mask_command_result(self):
         class BrokenTracing:

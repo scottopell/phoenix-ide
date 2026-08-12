@@ -25,6 +25,7 @@ import {
   type ShellSnippet,
 } from '../shellIntegrationSnippets';
 import { useTheme } from '../hooks/useTheme';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { copyToClipboard } from '../utils/clipboard';
 
 const CheckIcon = () => (
@@ -374,6 +375,7 @@ export function TerminalPanel({
   // Hint UI (absent state) state — tooltip + snippet modal
   const [hintTooltipVisible, setHintTooltipVisible] = useState(false);
   const [snippetModalOpen, setSnippetModalOpen] = useState(false);
+  useRegisterFocusScope(snippetModalOpen ? 'terminal-snippet-modal' : null);
   const [copyAck, setCopyAck] = useState(false);
 
   const setStatus = useCallback((msg: string) => {

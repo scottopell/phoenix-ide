@@ -42,14 +42,19 @@ export interface VirtualTranscriptAnchor {
 }
 
 export interface VirtualTranscriptHandle {
-  scrollToIndex(index: number, align: 'start' | 'end', viewportStartOffset?: number): void;
+  scrollToIndex(
+    index: number,
+    align: 'start' | 'end',
+    viewportStartOffset?: number,
+    targetSelector?: string,
+  ): void;
   scrollToTail(): void;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
   preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
   measureOffsetForIndexAtSnapshot(index: number, snapshot: VirtualTranscriptPhysicalSnapshot): number | null;
   layoutRevision(): number;
-  physicalSnapshot(targetIndex?: number): VirtualTranscriptPhysicalSnapshot;
+  physicalSnapshot(targetIndex?: number, targetSelector?: string): VirtualTranscriptPhysicalSnapshot;
 }
 
 export interface VirtualTranscriptProps<T> {
@@ -88,6 +93,13 @@ interface PhysicalStore<T> {
   resizeObserver: ResizeObserver | null;
   initialTailPending: boolean;
   preservedViewport: { top: number; firstKey: string | null } | null;
+  pendingTarget: {
+    index: number;
+    key: string;
+    align: 'start' | 'end';
+    viewportStartOffset: number;
+    selector: string;
+  } | null;
   pinned: boolean;
   revision: number;
 }
@@ -120,7 +132,11 @@ function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null
   });
 }
 
-function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
+function buildPhysicalSnapshot<T>(
+  store: PhysicalStore<T>,
+  targetIndex?: number,
+  targetSelector?: string,
+): VirtualTranscriptPhysicalSnapshot {
   const visibleRange = computeVisibleRange(store);
   const baseSnapshot = {
     renderedRange: normalizeRange(store.range),
@@ -129,20 +145,35 @@ function buildPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number)
     layoutRevision: store.revision,
   } satisfies Omit<VirtualTranscriptPhysicalSnapshot, 'targetIndex' | 'targetOffset' | 'targetMeasured'>;
   if (targetIndex === undefined) return baseSnapshot;
-  const offset = itemPhysicalOffset(store, targetIndex);
+  const key = store.keys[targetIndex] ?? '';
+  const row = store.rowElements.get(key);
+  const targetElement = targetSelector ? row?.querySelector(targetSelector) : null;
+  const rowOffset = itemPhysicalOffset(store, targetIndex);
+  const intraRowOffset = targetElement && row
+    ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
+    : targetSelector
+      ? undefined
+      : 0;
+  const offset = rowOffset === undefined || intraRowOffset === undefined
+    ? undefined
+    : rowOffset + intraRowOffset;
   return {
     ...baseSnapshot,
     targetIndex,
     targetOffset: offset === undefined ? null : offset - store.viewportTop,
-    targetMeasured: store.measuredExtents.has(store.keys[targetIndex] ?? ''),
+    targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
 
-function synchronizedPhysicalSnapshot<T>(store: PhysicalStore<T>, targetIndex?: number): VirtualTranscriptPhysicalSnapshot {
+function synchronizedPhysicalSnapshot<T>(
+  store: PhysicalStore<T>,
+  targetIndex?: number,
+  targetSelector?: string,
+): VirtualTranscriptPhysicalSnapshot {
   store.viewportTop = store.scroller?.scrollTop ?? store.viewportTop;
   store.viewportExtent = store.scroller?.clientHeight ?? store.viewportExtent;
   recompute(store);
-  return buildPhysicalSnapshot(store, targetIndex);
+  return buildPhysicalSnapshot(store, targetIndex, targetSelector);
 }
 
 function measureOffsetForIndexInStore<T>(store: PhysicalStore<T>, index: number): number | null {
@@ -387,6 +418,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     resizeObserver: null,
     initialTailPending: props.initialTail ?? true,
     preservedViewport: null,
+    pendingTarget: null,
     pinned: true,
     revision: 0,
   };
@@ -481,6 +513,24 @@ function VirtualTranscriptInner<T>(
       if (changed) {
         applyPhysicalChange(current, anchor, wasPinned);
         publish();
+      }
+      const pending = current.pendingTarget;
+      if (pending?.key === key) {
+        const targetElement = element.querySelector(pending.selector);
+        const unit = current.layout.itemAt(pending.index);
+        if (targetElement && unit) {
+          current.pendingTarget = null;
+          const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
+          const physicalOffset = current.headerExtent + unit.offset;
+          const physicalEnd = current.headerExtent + unit.end;
+          const target = pending.align === 'end'
+            ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
+            : physicalOffset + intraRowOffset - pending.viewportStartOffset;
+          current.activeAnchor = { index: pending.index, key, offset: physicalOffset - target };
+          setScrollerScrollTop(current, target);
+          recompute(current);
+          publish();
+        }
       }
     };
     rowRefCallbacks.current.set(key, callback);
@@ -583,16 +633,24 @@ function VirtualTranscriptInner<T>(
   }, [onPinnedChange, pinned]);
 
   useImperativeHandle(ref, () => ({
-    scrollToIndex(index, align, viewportStartOffset = 0) {
+    scrollToIndex(index, align, viewportStartOffset = 0, targetSelector) {
       const current = storeRef.current;
       if (!current) return;
       const unit = current.layout.itemAt(index);
       if (!unit) return;
+      const row = current.rowElements.get(unit.key);
+      const targetElement = targetSelector ? row?.querySelector(targetSelector) : null;
+      const intraRowOffset = targetElement && row
+        ? targetElement.getBoundingClientRect().top - row.getBoundingClientRect().top
+        : 0;
+      current.pendingTarget = targetSelector && !targetElement
+        ? { index, key: unit.key, align, viewportStartOffset, selector: targetSelector }
+        : null;
       const physicalOffset = current.headerExtent + unit.offset;
       const physicalEnd = current.headerExtent + unit.end;
       const target = align === 'end'
         ? physicalEnd - current.viewportExtent + viewportStartOffset
-        : physicalOffset - viewportStartOffset;
+        : physicalOffset + intraRowOffset - viewportStartOffset;
       current.activeAnchor = { index, key: unit.key, offset: physicalOffset - target };
       setScrollerScrollTop(current, target);
       recompute(current);
@@ -637,10 +695,10 @@ function VirtualTranscriptInner<T>(
     layoutRevision() {
       return storeRef.current?.revision ?? 0;
     },
-    physicalSnapshot(targetIndex) {
+    physicalSnapshot(targetIndex, targetSelector) {
       const current = storeRef.current;
       return current
-        ? synchronizedPhysicalSnapshot(current, targetIndex)
+        ? synchronizedPhysicalSnapshot(current, targetIndex, targetSelector)
         : {
             renderedRange: null,
             visibleRange: null,

@@ -21,6 +21,7 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
 import type { BashToolInput } from '../generated/sse';
+import type { AgentTurnUnit } from '../conversation/renderUnits';
 import { cacheDB } from '../cache';
 import type { PendingUserMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -337,8 +338,8 @@ function SkillToolBlock({
 
 // =====================================================================// User Message Components
 // =====================================================================
-function MessageCopyButton({ message, title }: { message: Message; title: string }) {
-  const markdown = getMessageMarkdown(message);
+function MessageCopyButton({ message, title, text }: { message: Message; title: string; text?: string }) {
+  const markdown = text ?? getMessageMarkdown(message);
   if (markdown.trim() === '') return null;
 
   return (
@@ -697,6 +698,7 @@ function CompactToolStripImpl({
           item.isSubAgent ? 'subagents' : '',
           item.isError ? 'error' : '',
           !item.hasResult ? 'pending' : '',
+          item.name === 'bash' ? 'wide' : '',
         ].filter(Boolean).join(' ');
         const summary = item.resultSummary ?? item.inputSummary;
         const statusLabel = item.isError
@@ -712,31 +714,49 @@ function CompactToolStripImpl({
         const ariaStatus = item.finalStatus ?? statusLabel;
         const ariaSummary = item.outputTail ?? summary;
         const isCompactBash = item.name === 'bash';
+        const isFirstCardForOwner = i === 0
+          || items[i - 1]?.ownerMessage.message_id !== item.ownerMessage.message_id;
         return (
-          <button
+          <div
             key={item.toolId || `${item.name}-${i}`}
-            type="button"
             className={classNames}
-            onClick={() => onExpand(item.toolId)}
-            aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
+            data-sequence-id={item.ownerMessage.sequence_id}
+            data-message-id={item.ownerMessage.message_id}
+            data-tool-id={item.toolId}
           >
-            <span className="compact-tool-card-header">
-              <span className="compact-tool-card-name">{item.name}</span>
-              <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
-            </span>
-            {isCompactBash ? (
-              <>
-                <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
-                  {item.commandIdentity ?? item.inputSummary}
-                </span>
-                <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
-                  {item.outputTail ?? '(no output)'}
-                </span>
-              </>
-            ) : (
-              <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+            <button
+              type="button"
+              className="compact-tool-card-expand"
+              onClick={() => onExpand(item.toolId)}
+              aria-label={`${item.name}: ${item.commandIdentity ?? item.inputSummary} (${ariaStatus})${ariaSummary ? ` — ${ariaSummary}` : ''} — expand tool detail`}
+            >
+              <span className="compact-tool-card-header">
+                <span className="compact-tool-card-name">{item.name}</span>
+                <span className="compact-tool-card-status">{item.finalStatus ?? statusLabel}{liveElapsed}</span>
+              </span>
+              {isCompactBash ? (
+                <>
+                  <span className="compact-tool-card-identity" title={item.commandIdentity ?? item.inputSummary}>
+                    {item.commandIdentity ?? item.inputSummary}
+                  </span>
+                  <span className="compact-tool-card-summary compact-tool-card-summary-tail" title={item.outputTail ?? ''}>
+                    {item.outputTail ?? '(no output)'}
+                  </span>
+                </>
+              ) : (
+                <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+              )}
+            </button>
+            {isFirstCardForOwner && (
+              <span className="compact-tool-owner-copy message-mobile-copy-row">
+                <MessageCopyButton
+                  message={item.ownerMessage}
+                  title="Copy Phoenix message"
+                  text={getToolOnlyMessageCopy(item.ownerMessage)}
+                />
+              </span>
             )}
-          </button>
+          </div>
         );
       })}
     </div>
@@ -787,6 +807,8 @@ interface AgentMessageProps {
    * renders in its full non-collapsed form.
    */
   forceExpandedText?: boolean;
+  forceExpandedTools?: boolean;
+  visibleToolUseId?: string;
   isLatestAgentMessage?: boolean;
   unitKey?: string;
   revealRequest?: AgentTextRevealRequest | null;
@@ -794,9 +816,187 @@ interface AgentMessageProps {
   onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
 }
 
+interface ToolOnlyAgentTurnGroupProps {
+  members: readonly AgentTurnUnit[];
+  liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
+  onOpenFile?: AgentMessageProps['onOpenFile'];
+  onOpenCommissionReview?: AgentMessageProps['onOpenCommissionReview'];
+  filePathRootDir?: string | undefined;
+  workScopeKey?: string | undefined;
+  activeToolUseId?: string | undefined;
+  isLatestAgentMessage?: boolean;
+  unitKey?: string;
+  revealRequest?: AgentTextRevealRequest | null;
+  activeHighlight?: ConversationHighlight | null;
+  onRevealHandled?: ((request: AgentTextRevealRequest) => void) | undefined;
+}
+
+function getToolOnlyMessageCopy(message: Message): string {
+  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  return blocks.flatMap((block) => block.type === 'tool_use'
+    ? [`${block.name}\n\n\`\`\`json\n${JSON.stringify(block.input, null, 2)}\n\`\`\``]
+    : []).join('\n\n');
+}
+
+function hasAgentRetries(message: Message): boolean {
+  const displayData = message.display_data as Record<string, unknown> | undefined;
+  return typeof displayData?.['retry_count'] === 'number' && displayData['retry_count'] > 0;
+}
+
+function AgentRetryBadge({ message }: { message: Message }) {
+  const displayData = message.display_data as Record<string, unknown> | undefined;
+  const retryCount = typeof displayData?.['retry_count'] === 'number' ? displayData['retry_count'] : 0;
+  if (retryCount <= 0) return null;
+  return (
+    <span
+      className="message-retry-badge"
+      title={`This response succeeded after ${retryCount} retry attempt${retryCount === 1 ? '' : 's'}.`}
+    >
+      retried {retryCount}x
+    </span>
+  );
+}
+
+export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
+  members,
+  liveBashProgress = {},
+  onOpenFile,
+  onOpenCommissionReview,
+  filePathRootDir,
+  workScopeKey,
+  activeToolUseId,
+  isLatestAgentMessage = false,
+  unitKey,
+  revealRequest = null,
+  activeHighlight = null,
+  onRevealHandled,
+}: ToolOnlyAgentTurnGroupProps) {
+  const { density } = useDensity();
+  const [expandedToolId, setExpandedToolId] = useState<string | null>(null);
+  const pendingScrollToolIdRef = useRef<string | null>(null);
+  const items = useMemo(
+    () => members.flatMap((member) => deriveToolStripItems(member.agent, member.toolResultsByUseId, liveBashProgress)),
+    [liveBashProgress, members],
+  );
+
+  const expand = useCallback((toolId: string) => {
+    pendingScrollToolIdRef.current = toolId || null;
+    setExpandedToolId(toolId || null);
+  }, []);
+
+  useEffect(() => {
+    if (!expandedToolId) return;
+    const toolId = pendingScrollToolIdRef.current;
+    pendingScrollToolIdRef.current = null;
+    if (!toolId) return;
+    document.querySelector(`[data-tool-id="${CSS.escape(toolId)}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [expandedToolId]);
+
+  useEffect(() => {
+    if (density !== 'compact' || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
+    const toolUseId = 'toolUseId' in revealRequest.revealTarget
+      ? revealRequest.revealTarget.toolUseId
+      : null;
+    if (!toolUseId || toolUseId === expandedToolId) return;
+    pendingScrollToolIdRef.current = toolUseId;
+    setExpandedToolId(toolUseId);
+  }, [density, expandedToolId, revealRequest]);
+
+  if (density === 'compact') {
+    const first = members[0];
+    const compactItems = expandedToolId
+      ? items.filter((item) => item.toolId !== expandedToolId)
+      : items;
+    const expandedMemberIndex = expandedToolId
+      ? members.findIndex((member) => Array.isArray(member.agent.content)
+        && member.agent.content.some((block) => block.type === 'tool_use' && block.id === expandedToolId))
+      : -1;
+    const expandedMember = expandedMemberIndex >= 0 ? members[expandedMemberIndex] : undefined;
+    return (
+      <div
+        id={first ? `message-${first.agent.message_id}` : undefined}
+        className="message agent compact-tool-group"
+        data-sequence-id={first?.agent.sequence_id}
+      >
+        {first?.isFirstInTurn && (
+          <div className="message-header">
+            <span className="message-sender">Phoenix</span>
+            {first.agent.created_at && (
+              <span className="message-time" title={new Date(first.agent.created_at).toLocaleString()}>
+                {formatMessageTime(first.agent.created_at)}
+              </span>
+            )}
+
+          </div>
+        )}
+        <div className="message-content">
+          {compactItems.length > 0 && <CompactToolStrip items={compactItems} onExpand={expand} />}
+          {members.some((member) => hasAgentRetries(member.agent)) && (
+            <div className="compact-tool-group-audit" aria-label="Response retry audit">
+              {members.filter((member) => hasAgentRetries(member.agent)).map((member) => (
+                <AgentRetryBadge key={member.key} message={member.agent} />
+              ))}
+            </div>
+          )}
+          {expandedMember && expandedToolId && (
+            <div className="compact-tool-selected-detail">
+              <AgentMessage
+                message={expandedMember.agent}
+                toolResults={expandedMember.toolResultsByUseId}
+                liveBashProgress={liveBashProgress}
+                onOpenFile={onOpenFile}
+                onOpenCommissionReview={onOpenCommissionReview}
+                filePathRootDir={filePathRootDir}
+                workScopeKey={workScopeKey}
+                activeToolUseId={activeToolUseId}
+                forceExpandedTools
+                visibleToolUseId={expandedToolId}
+                isFirstInTurn={false}
+                isLatestAgentMessage={isLatestAgentMessage && expandedMemberIndex === members.length - 1}
+                {...(unitKey !== undefined ? { unitKey } : {})}
+                {...(revealRequest ? { revealRequest } : {})}
+                {...(activeHighlight ? { activeHighlight } : {})}
+                {...(onRevealHandled ? { onRevealHandled } : {})}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="tool-only-agent-turn-group-details">
+      {members.map((member, index) => (
+        <div className="tool-only-agent-turn-group-member" key={member.key}>
+          <AgentMessage
+      message={member.agent}
+      toolResults={member.toolResultsByUseId}
+      liveBashProgress={liveBashProgress}
+      onOpenFile={onOpenFile}
+      onOpenCommissionReview={onOpenCommissionReview}
+      filePathRootDir={filePathRootDir}
+      workScopeKey={workScopeKey}
+      activeToolUseId={activeToolUseId}
+      forceExpandedTools
+      isFirstInTurn={member.isFirstInTurn}
+      forceExpandedText={isLatestAgentMessage && index === members.length - 1}
+      isLatestAgentMessage={isLatestAgentMessage && index === members.length - 1}
+      {...(unitKey !== undefined ? { unitKey } : {})}
+      {...(revealRequest ? { revealRequest } : {})}
+      {...(activeHighlight ? { activeHighlight } : {})}
+      {...(onRevealHandled ? { onRevealHandled } : {})}
+          />
+        </div>
+      ))}
+    </div>
+  );
+});
+
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -845,7 +1045,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
 
   // Compact mode collapses tools only when there is at least one strip item;
   // a turn of pure prose / think asides has nothing to collapse.
-  const collapseTools = compact && !toolsExpanded && toolStripItems.length > 0;
+  const collapseTools = compact && !forceExpandedTools && !toolsExpanded && toolStripItems.length > 0;
 
   useEffect(() => {
     if (!compact || toolsExpanded || !revealRequest || revealRequest.revealTarget.kind === 'agent-text') return;
@@ -1030,28 +1230,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
               {formatMessageTime(timestamp)}
             </span>
           )}
-          {/* REQ-LRV-006: post-hoc retry badge. The runtime stamps
-              `display_data.retry_count` on the persisted assistant
-              message iff the turn retried (max(0, final_attempt - 1)).
-              Zero is encoded as "field absent" on the JSON, so the
-              `> 0` check doubles as a presence check. The badge is
-              the long-lived record of "this answer took N tries" once
-              the live retry suffix on the StateBar has cleared. */}
-          {(() => {
-            const dd = message.display_data as Record<string, unknown> | undefined;
-            const retryCount = typeof dd?.['retry_count'] === 'number' ? (dd['retry_count'] as number) : 0;
-            if (retryCount > 0) {
-              return (
-                <span
-                  className="message-retry-badge"
-                  title={`This response succeeded after ${retryCount} retry attempt${retryCount === 1 ? '' : 's'}.`}
-                >
-                  retried {retryCount}x
-                </span>
-              );
-            }
-            return null;
-          })()}
+          <AgentRetryBadge message={message} />
           <span className="message-header-actions">
             <MessageCopyButton message={message} title="Copy Phoenix message" />
           </span>
@@ -1074,6 +1253,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
               }
               return renderTextFragment(fragment);
             } else if (block.type === 'tool_use') {
+              if (visibleToolUseId && block.id !== visibleToolUseId) return null;
               // `think` renders as a subtle inline aside, not the full tool-block
               // shell — it's model reasoning, not an action. Collapsed by default,
               // identical in both densities.
