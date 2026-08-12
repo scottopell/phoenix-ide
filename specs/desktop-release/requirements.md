@@ -38,15 +38,19 @@ AND SHALL publish the desktop archives and checksum file in the same GitHub rele
 
 THE SYSTEM SHALL provide an unsigned local-test mode that verifies app construction, embedded-helper identity, architecture, built Info.plist version fields, exact embedded-helper bytes, temporary-directory fallback behavior, and archive naming without weakening the signed release path.
 
-## REQ-DESKTOP-REL-007 — Retry the exact release safely
+## REQ-DESKTOP-REL-007 — Retry the exact release by converging the published set
 
 IF a release tag already points at the exact commit being built,
 THE SYSTEM SHALL permit the release jobs to rebuild and republish that same asset set
 AND SHALL replace assets in the existing GitHub release without changing the tag or release identity
-AND SHALL preserve or restore the previously published asset set if republishing fails before the replacement set is fully uploaded.
+AND SHALL perform same-tag retry publication as a serialized sequence that cleans stale stage names and commits asset replacements one-by-one
+AND SHALL tolerate an interrupted retry leaving the release temporarily mixed between old and new asset names or contents
+AND SHALL make the next retry converge the release back to the exact required asset and checksum set for that tag and commit
+AND SHALL treat publication as successful only when the release contains exactly the required assets and matching checksums for that tag and commit.
 
 IF the version tag points at a different commit,
 THE SYSTEM SHALL refuse to rebuild or overwrite that release from the current commit.
+AND THE SYSTEM SHALL NOT promise local or durable rollback to the previously published asset set after an interrupted same-tag retry.
 
 ## REQ-DESKTOP-REL-008 — Stamp release-specific app versions truthfully
 
