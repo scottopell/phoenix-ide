@@ -347,7 +347,10 @@ async function githubRequest(path, token, options = {}) {
 
 function trustedSnapshotKey(comments) {
   return comments
-    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+    .filter((comment) =>
+      Number.isSafeInteger(comment.id) &&
+      (TRUSTED_ASSOCIATIONS.has(comment.author_association) || comment.user?.login === "github-actions[bot]"),
+    )
     .map((comment) => {
       const digest = createHash("sha256").update(comment.body).digest("hex");
       return `${comment.id}:${comment.updated_at ?? comment.created_at}:${digest}`;
@@ -540,7 +543,10 @@ export async function run({ event, configuredIssueNumber, token }) {
   }
   if (event.issue?.number !== configuredIssueNumber) return { skipped: "not the configured roadmap Issue" };
   if (!Number.isSafeInteger(event.comment?.id) || !event.comment?.created_at) throw new Error("event lacks a triggering comment identity");
-  if (!TRUSTED_ASSOCIATIONS.has(event.comment.author_association)) {
+  if (
+    !TRUSTED_ASSOCIATIONS.has(event.comment?.author_association) &&
+    event.comment?.user?.login !== "github-actions[bot]"
+  ) {
     return { skipped: "triggering author is not trusted" };
   }
   const [owner, repo] = event.repository.full_name.split("/");

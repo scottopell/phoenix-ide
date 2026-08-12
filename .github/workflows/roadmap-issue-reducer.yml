@@ -14,7 +14,7 @@ jobs:
       github.event.issue.pull_request == null &&
       vars.PHOENIX_ROADMAP_ISSUE_NUMBER != '' &&
       github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
-      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) || github.event.comment.user.login == 'github-actions[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
