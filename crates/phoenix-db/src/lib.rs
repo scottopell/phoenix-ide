@@ -1261,27 +1261,39 @@ impl Database {
         let observed_fingerprint = worktree_path
             .as_deref()
             .and_then(Self::observe_worktree_fingerprint);
-        let existing = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT worktree_id, worktree_fingerprint FROM work_scopes WHERE id = ?1",
-        )
-        .bind(scope_id.as_str())
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| {
-            DbError::Serialization(format!(
-                "work scope {scope_id} has no normalized environment"
-            ))
-        })?;
-        let worktree_id = observed_fingerprint.as_ref().map(|fingerprint| {
-            if existing.1.as_ref() == Some(fingerprint) {
-                existing
-                    .0
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-            } else {
-                uuid::Uuid::new_v4().to_string()
+        let existing =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                "SELECT environment_kind, worktree_path, worktree_id, worktree_fingerprint
+             FROM work_scopes WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(format!(
+                    "work scope {scope_id} has no normalized environment"
+                ))
+            })?;
+        let (worktree_id, observed_fingerprint) = match (kind, observed_fingerprint) {
+            ("allocated_worktree", Some(fingerprint)) => {
+                let id = if existing.3.as_ref() == Some(&fingerprint) {
+                    existing
+                        .2
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
+                (Some(id), Some(fingerprint))
             }
-        });
+            ("allocated_worktree", None)
+                if existing.0 == "allocated_worktree"
+                    && existing.1.as_deref() == worktree_path.as_deref() =>
+            {
+                (existing.2, existing.3)
+            }
+            _ => (None, None),
+        };
         let result = sqlx::query(
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
@@ -2264,11 +2276,7 @@ impl Database {
                        JOIN close_obligations obligation
                          ON obligation.attempt_id = captured.attempt_id
                        WHERE captured.scope = work_scopes.id
-                         AND obligation.phase IN (
-                             'settling_active_work', 'cancel_requested_during_settlement',
-                             'awaiting_retirement_inspection', 'awaiting_loss_confirmation',
-                             'retirement_requested', 'needs_repair'
-                         )
+                         AND obligation.phase <> 'completed'
                          AND obligation.topology_sealed = 1
                    )",
             )

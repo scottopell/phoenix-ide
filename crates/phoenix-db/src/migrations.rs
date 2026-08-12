@@ -540,6 +540,25 @@ BEGIN
     SELECT RAISE(ABORT, 'close obligation must begin at admission phase');
 END;
 
+CREATE TABLE close_aggregate_delete_commands (
+    attempt_id TEXT PRIMARY KEY
+);
+CREATE TRIGGER close_aggregate_delete_commands_require_completed_obligation
+BEFORE INSERT ON close_aggregate_delete_commands
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations
+    WHERE attempt_id = NEW.attempt_id AND phase = 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Close aggregate deletion requires a completed obligation');
+END;
+CREATE TRIGGER close_aggregate_delete_commands_execute
+AFTER INSERT ON close_aggregate_delete_commands
+BEGIN
+    DELETE FROM close_obligations WHERE attempt_id = NEW.attempt_id;
+    DELETE FROM close_aggregate_delete_commands WHERE attempt_id = NEW.attempt_id;
+END;
+
 CREATE TRIGGER close_obligations_reject_invalid_timestamps_on_insert
 BEFORE INSERT ON close_obligations
 FOR EACH ROW
@@ -1378,6 +1397,10 @@ CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
 BEFORE DELETE ON close_obligations
 FOR EACH ROW
 WHEN OLD.phase = 'completed'
+  AND NOT EXISTS (
+      SELECT 1 FROM close_aggregate_delete_commands intent
+      WHERE intent.attempt_id = OLD.attempt_id
+  )
   AND (
       EXISTS (
           SELECT 1 FROM close_attempt_members member
@@ -1552,6 +1575,10 @@ WHEN EXISTS (
     WHERE obligation.attempt_id = OLD.attempt_id
       AND obligation.phase <> 'awaiting_retirement_inspection'
 )
+AND NOT EXISTS (
+    SELECT 1 FROM close_aggregate_delete_commands intent
+    WHERE intent.attempt_id = OLD.attempt_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'persisted close inspection snapshot is sealed');
 END;
@@ -1648,6 +1675,10 @@ WHEN EXISTS (
     JOIN conversations root ON root.id = obligation.root_conversation_id
     WHERE obligation.attempt_id = OLD.attempt_id
       AND obligation.phase <> 'awaiting_retirement_inspection'
+)
+AND NOT EXISTS (
+    SELECT 1 FROM close_aggregate_delete_commands intent
+    WHERE intent.attempt_id = OLD.attempt_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'close loss inventory is sealed outside inspection replacement');
@@ -1823,6 +1854,10 @@ WHEN EXISTS (
     JOIN conversations root ON root.id = obligation.root_conversation_id
     WHERE obligation.attempt_id = OLD.attempt_id
 )
+AND NOT EXISTS (
+    SELECT 1 FROM close_aggregate_delete_commands intent
+    WHERE intent.attempt_id = OLD.attempt_id
+)
 BEGIN
     SELECT RAISE(ABORT, 'captured retirement inventory can only be deleted with its root');
 END;
@@ -1905,6 +1940,10 @@ WHEN EXISTS (
     SELECT 1 FROM close_obligations obligation
     JOIN conversations root ON root.id = obligation.root_conversation_id
     WHERE obligation.attempt_id = OLD.attempt_id
+)
+AND NOT EXISTS (
+    SELECT 1 FROM close_aggregate_delete_commands intent
+    WHERE intent.attempt_id = OLD.attempt_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
@@ -2118,6 +2157,10 @@ END;
 CREATE TRIGGER close_retirement_resource_history_reject_delete
 BEFORE DELETE ON close_retirement_resource_history
 WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+  AND NOT EXISTS (
+      SELECT 1 FROM close_aggregate_delete_commands intent
+      WHERE intent.attempt_id = OLD.attempt_id
+  )
 BEGIN
     SELECT RAISE(ABORT, 'retirement resource history belongs to its Close aggregate');
 END;
@@ -2325,6 +2368,10 @@ WHEN EXISTS (
     FROM close_obligations obligation
     JOIN conversations root ON root.id = obligation.root_conversation_id
     WHERE obligation.attempt_id = OLD.attempt_id
+)
+AND NOT EXISTS (
+    SELECT 1 FROM close_aggregate_delete_commands intent
+    WHERE intent.attempt_id = OLD.attempt_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'retirement evidence can only be deleted with its root');
@@ -6822,6 +6869,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retained_inspections, 1);
+        assert!(
+            sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'partial-cancel'",)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query(
+            "INSERT INTO close_aggregate_delete_commands (attempt_id) VALUES ('partial-cancel')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let deleted_inspections: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id = 'partial-cancel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted_inspections, 0);
+        let remaining_commands: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_aggregate_delete_commands
+             WHERE attempt_id = 'partial-cancel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_commands, 0);
 
         insert_close_admission(&pool, "unsealed-phase", "other-6", "2025-01-04T00:00:00Z").await;
         assert!(sqlx::query(

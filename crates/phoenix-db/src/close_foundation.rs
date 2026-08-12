@@ -1693,6 +1693,39 @@ impl Database {
             )));
         }
         let identity = request.resource.identity();
+        if let LossItemIdentity::Worktree(requested) = identity {
+            let captured = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT captured_worktree_identity, captured_worktree_fingerprint,
+                        captured_worktree_locator
+                 FROM close_attempt_scopes
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND captured_worktree_identity IS NOT NULL",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                close_precondition(format!(
+                    "attempt {} scope {} has no captured worktree identity",
+                    request.attempt_id, request.scope
+                ))
+            })?;
+            let captured = WorktreeIdentity::from_parts(
+                phoenix_core::domain::close::WorktreeId::parse(captured.0)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                phoenix_core::domain::close::WorktreeFingerprint::parse(captured.1)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                GitPathIdentity::decode_exact(&captured.2)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+            );
+            if requested != &captured {
+                return Err(close_precondition(format!(
+                    "attempt {} worktree proof does not match the complete captured identity",
+                    request.attempt_id
+                )));
+            }
+        }
         let expected: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1
@@ -4500,6 +4533,38 @@ mod tests {
             ],
         )
         .await;
+        let mismatched_worktree = match &retired_identity {
+            LossItemIdentity::Worktree(identity) => {
+                LossItemIdentity::Worktree(WorktreeIdentity::from_parts(
+                    phoenix_core::domain::close::WorktreeId::parse(identity.id().as_str()).unwrap(),
+                    phoenix_core::domain::close::WorktreeFingerprint::parse(
+                        "replacement-fingerprint",
+                    )
+                    .unwrap(),
+                    identity.locator().clone(),
+                ))
+            }
+            LossItemIdentity::GitPath(_)
+            | LossItemIdentity::GitOid(_)
+            | LossItemIdentity::Opaque(_) => unreachable!(),
+        };
+        let mismatch = db
+            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
+                snapshot: current_test_snapshot(&db, "attempt-1").await,
+                scope: scope.clone(),
+                resource: RetiredResourceIdentity::parse(
+                    RetiredResourceKind::Worktree,
+                    mismatched_worktree,
+                )
+                .unwrap(),
+                outcome: RetirementOutcome::Retired,
+                detail: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(mismatch, DbError::CloseFoundationPrecondition(_)));
+
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
             snapshot: current_test_snapshot(&db, "attempt-1").await,
