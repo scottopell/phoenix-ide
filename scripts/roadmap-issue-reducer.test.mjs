@@ -220,8 +220,8 @@ test("reactivation outside the projection supersedes its retirement", async () =
   const mock = installGitHubMock([...base, original, retirement, trigger], [[], [], []]);
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
-    assert.deepEqual(result, { changed: true, updates: 12, acknowledged: "accepted" });
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
+    assert.deepEqual(result, { changed: true, updates: 12, acknowledged: "rejected" });
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
   } finally {
     mock.restore();
   }

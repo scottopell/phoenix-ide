@@ -445,7 +445,7 @@ export async function run({ event, configuredIssueNumber, token }) {
       const outcome = outcomes.get(event.comment.id);
       reflected = outcome?.recordType === "retirement"
         ? outcome.accepted && !current.some((update) => update.workstream === outcome.workstream)
-        : outcome?.accepted && current.some((update) => update.source.id === event.comment.id);
+        : outcome?.accepted && updates.some((update) => update.source.id === event.comment.id);
       if (!reflected) {
         const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
         console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
