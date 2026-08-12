@@ -131,8 +131,13 @@ external entity ProductConversationDeletion {
 ------------------------------------------------------------
 
 rule LinkedWorktreesReuseOneHiddenRepositoryIdentity {
-    when: LinkedWorktreeObserved(repository, shared_git_common_dir)
-    ensures: GitRepository.created(opaque_id: repository.opaque_id)
+    when: LinkedWorktreesObserved(left_worktree, right_worktree, shared_git_common_dir)
+    let left_repository = resolved_hidden_repository(left_worktree)
+    let right_repository = resolved_hidden_repository(right_worktree)
+    requires: retained_git_common_dir(left_worktree) = shared_git_common_dir
+    requires: retained_git_common_dir(right_worktree) = shared_git_common_dir
+    ensures: left_repository.opaque_id = right_repository.opaque_id
+    ensures: GitRepository.created(opaque_id: left_repository.opaque_id)
 
     @guidance
         -- Phoenix keys hidden repository sameness from retained local repository

@@ -932,13 +932,16 @@ impl CloseObligation {
         let forbids_snapshot =
             !requires_snapshot && !admits_optional_prior_snapshot && phase != ClosePhase::Completed;
         let is_completed = phase == ClosePhase::Completed;
-        let archived_completion_missing_snapshot =
-            close_outcome == Some(CloseCompletionOutcome::Archived) && snapshot.is_none();
+        let completion_snapshot_disagrees = match close_outcome {
+            Some(CloseCompletionOutcome::Archived) => snapshot.is_none(),
+            Some(CloseCompletionOutcome::Cancelled) => snapshot.is_some(),
+            None => false,
+        };
         if (requires_snapshot && snapshot.is_none())
             || (forbids_snapshot && snapshot.is_some())
             || (is_completed != completed_at.is_some())
             || (is_completed != close_outcome.is_some())
-            || archived_completion_missing_snapshot
+            || completion_snapshot_disagrees
         {
             return Err(CloseObligationError);
         }
@@ -1639,6 +1642,17 @@ mod tests {
             Some(CloseCompletionOutcome::Cancelled),
         )
         .is_ok());
+        assert!(CloseObligation::parse(
+            attempt_id.clone(),
+            product_conversation_id.clone(),
+            ClosePhase::Completed,
+            Some(CloseRetirementSnapshot::parse("cancelled:g1", "cancelled:fp1").unwrap()),
+            now,
+            now,
+            Some(now),
+            Some(CloseCompletionOutcome::Cancelled),
+        )
+        .is_err());
         assert!(CloseObligation::parse(
             attempt_id.clone(),
             product_conversation_id.clone(),

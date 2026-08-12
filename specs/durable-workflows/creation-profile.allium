@@ -382,6 +382,20 @@ rule InitialCreationPlanDeclaresRepositoryResolutionFirst {
         -- second plan without guessing Git behavior from request mode or path.
 }
 
+rule ApprovedTaskNonGitResolutionPublishesTypedFailure {
+    when: RepositoryObservationRecorded(adapter, effect, observation)
+    let binding = CreationWorkflowBinding{workflow: effect.workflow}
+    requires: creation_effect_kind(effect) = resolve_repository
+    requires: binding.outcome = provisioning
+    requires: binding.intent.start.variant = initial_turn
+    requires: binding.intent.start.initial_turn_origin = approved_task
+    requires: resolved_repository_kind(observation) = non_git
+    ensures: binding.repository_resolution = repository_resolution_observation(effect, observation)
+    ensures: CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
+    ensures: not WorkScopeAttachmentCreated(binding)
+    ensures: no_post_resolution_effects_declared(binding)
+}
+
 rule ResolvedInitialTurnCreationDagDeclared {
     when: RepositoryObservationRecorded(adapter, effect, observation)
     let binding = CreationWorkflowBinding{workflow: effect.workflow}
@@ -389,6 +403,9 @@ rule ResolvedInitialTurnCreationDagDeclared {
     requires: binding.outcome = provisioning
     requires: binding.intent.start.variant = initial_turn
     requires: resolved_repository_kind(observation) in {non_git, git_resolved}
+    requires:
+        binding.intent.start.initial_turn_origin = ordinary
+        or resolved_repository_kind(observation) = git_resolved
 
     ensures: effect_is_declared(binding, finalize_attachments)
     ensures: effect_is_declared(binding, commit_metadata)
