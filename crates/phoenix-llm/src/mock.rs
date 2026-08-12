@@ -852,6 +852,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }

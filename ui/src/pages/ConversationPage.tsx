@@ -1422,13 +1422,25 @@ function ConversationPageContent({
     }
   }, [conversationId, isArchived, showError]);
 
-  const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
+  const handleUpgradeModel = useCallback(async (
+    newModelId: string,
+    effort?: import('../api').ModelEffort | null,
+    serviceTier?: 'standard' | 'fast',
+  ) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
-      await api.upgradeModel(conversationId, newModelId, effort);
-      showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'local_conversation_update', updates: { model: newModelId, effort: effort ?? null }, expectedConversationId: conversationId });
+      await api.upgradeModel(conversationId, newModelId, effort, serviceTier);
+      showInfo(serviceTier === 'fast' ? `Fast mode enabled for ${newModelId}` : `Switched to ${newModelId}`);
+      dispatch({
+        type: 'local_conversation_update',
+        updates: {
+          model: newModelId,
+          effort: effort ?? null,
+          ...(serviceTier ? { service_tier: serviceTier } : {}),
+        },
+        expectedConversationId: conversationId,
+      });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }

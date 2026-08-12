@@ -1183,6 +1183,7 @@ mod tests {
             supports_tool_search,
             source: crate::models::ModelSource::BuiltIn,
             effort_capabilities: crate::models::EffortCapabilities::unknown(),
+            service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
     }
 
@@ -1206,6 +1207,7 @@ mod tests {
             ],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
@@ -1218,6 +1220,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
@@ -1347,6 +1350,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

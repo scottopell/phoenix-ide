@@ -36,6 +36,7 @@ use crate::tools::{
     BashHandleRegistry, BashLifecycleEvent, BashTerminalEffect, BrowserSessionManager,
     ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
+use phoenix_core::domain::llm_types::ServiceTier;
 use phoenix_core::work_scope::ResourceScopeKey;
 
 /// Type alias for production runtime with concrete implementations
@@ -2665,6 +2666,7 @@ impl RuntimeManager {
         );
         conv_context.max_turns = spec.max_turns;
         conv_context.effort = conv.effort;
+        conv_context.service_tier = ServiceTier::Standard;
         conv_context.effective_effort = self
             .llm_registry
             .effective_effort(&spec.model_id, conv.effort);
@@ -3104,6 +3106,7 @@ impl RuntimeManager {
         };
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
+        context.service_tier = conv.service_tier;
         context.effective_effort = self.llm_registry.effective_effort(&model_id, conv.effort);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();
@@ -5573,6 +5576,7 @@ mod scope_liveness_tests {
                 conversation_id,
                 "claude-sonnet-5",
                 Some(phoenix_core::domain::llm_types::ModelEffort::High),
+                ServiceTier::Standard,
             )
             .await
             .expect("persist unsupported effort");

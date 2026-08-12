@@ -105,6 +105,8 @@ export class ConversationSearchWarmingError extends Error {
 
 export type { ModelEffort } from './generated/ModelEffort';
 import type { ModelEffort } from './generated/ModelEffort';
+export type { ServiceTier } from './generated/ServiceTier';
+import type { ServiceTier } from './generated/ServiceTier';
 import type { EffortSource } from './generated/EffortSource';
 import type { UsageData } from './generated/UsageData';
 export type { UsageData } from './generated/UsageData';
@@ -128,6 +130,7 @@ export interface Conversation {
   title?: string | null;
   model: string;
   effort?: ModelEffort | null;
+  service_tier?: ServiceTier;
   cwd: string;
   created_at: string;
   updated_at: string;
@@ -751,6 +754,7 @@ export interface ModelInfo {
   context_window: number;
   recommended: boolean;
   effort_capabilities?: EffortCapabilities;
+  service_tier_capabilities?: 'unsupported' | 'supported';
 }
 
 export type CredentialStatus = 'not_configured' | 'valid' | 'required' | 'running' | 'failed';
@@ -2352,11 +2356,16 @@ export const api = {
     return resp.json();
   },
 
-  async upgradeModel(conversationId: string, model: string, effort?: ModelEffort | null): Promise<void> {
+  async upgradeModel(
+    conversationId: string,
+    model: string,
+    effort?: ModelEffort | null,
+    serviceTier?: ServiceTier,
+  ): Promise<void> {
     const resp = await fetch(`/api/conversations/${conversationId}/upgrade-model`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, effort }),
+      body: JSON.stringify({ model, effort, service_tier: serviceTier }),
     });
     if (!resp.ok) {
       const err = await resp.json();

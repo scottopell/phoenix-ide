@@ -87,8 +87,12 @@ interface StateBarProps {
   /** Continuation trigger, structurally bound to the idle phase. Absent or
    *  `{ phase: 'unavailable' }` means the trigger is unavailable. */
   continuation?: ContinuationState;
-  /** Callback invoked when the user selects a different model or effort for this conversation */
-  onUpgradeModel?: (newModelId: string, effort?: ModelEffort | null) => void;
+  /** Callback invoked when the user selects model, effort, or Codex service tier. */
+  onUpgradeModel?: (
+    newModelId: string,
+    effort?: ModelEffort | null,
+    serviceTier?: 'standard' | 'fast',
+  ) => void;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
    *  `null` or `undefined` when not in tool_executing.
@@ -937,6 +941,8 @@ export function StateBar({
   const effortIsStale = persistedEffort !== null
     && !effortCompatible(currentEffortCapabilities, persistedEffort);
   const currentEffort = persistedEffort;
+  const currentServiceTier = conversation?.service_tier ?? 'standard';
+  const supportsFastMode = currentModelInfo?.service_tier_capabilities === 'supported';
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -978,6 +984,12 @@ export function StateBar({
     if (!onUpgradeModel || !currentModel) return;
     if (persistedEffort === effort) return;
     onUpgradeModel(currentModel, effort);
+  };
+
+  const handleSelectServiceTier = (serviceTier: 'standard' | 'fast') => {
+    setPickerOpen(false);
+    if (!onUpgradeModel || !currentModel || currentServiceTier === serviceTier) return;
+    onUpgradeModel(currentModel, persistedEffort, serviceTier);
   };
 
   const baseBranch = identity?.branch.base ?? null;
@@ -1058,6 +1070,7 @@ export function StateBar({
           {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
             <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
+          {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
           <span className="conv-model-caret" aria-hidden="true">
             &#9662;
           </span>
@@ -1073,6 +1086,7 @@ export function StateBar({
           {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
             <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
           )}
+          {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
         </span>
       )}
       {pickerOpen && canPickModel && (
@@ -1141,6 +1155,27 @@ export function StateBar({
                       {selected ? <CheckIcon /> : null}
                     </span>
                     <span className="model-picker-item-id">{effortLabel(level)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {supportsFastMode && (
+            <div className="model-picker-list" role="listbox" aria-label="Select speed">
+              {(['standard', 'fast'] as const).map((tier) => {
+                const selected = currentServiceTier === tier;
+                return (
+                  <button
+                    key={tier}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    className={'model-picker-item' + (selected ? ' model-picker-item--selected' : '')}
+                    onClick={() => handleSelectServiceTier(tier)}
+                    title={tier === 'fast' ? 'Fast: 1.5x speed, increased usage' : 'Standard speed and usage'}
+                  >
+                    <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
+                    <span className="model-picker-item-id">{tier === 'fast' ? 'Fast · 1.5x speed, increased usage' : 'Standard'}</span>
                   </button>
                 );
               })}

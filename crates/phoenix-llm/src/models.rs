@@ -2,7 +2,7 @@
 //!
 use std::collections::HashSet;
 
-use phoenix_core::domain::llm_types::ModelEffort;
+use phoenix_core::domain::llm_types::{ModelEffort, ServiceTier};
 
 /// Default maximum output tokens when a model does not declare a smaller cap.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
@@ -14,6 +14,31 @@ pub enum EffortCapabilities {
     Unsupported,
     Unknown,
     Supported(SupportedEffortCapabilities),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceTierCapabilities {
+    Unsupported,
+    Supported,
+}
+
+impl serde::Serialize for ServiceTierCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Unsupported => "unsupported",
+            Self::Supported => "supported",
+        })
+    }
+}
+
+impl ServiceTierCapabilities {
+    #[must_use]
+    pub const fn supports(self, tier: ServiceTier) -> bool {
+        matches!((self, tier), (Self::Supported, ServiceTier::Fast))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +190,7 @@ pub struct ModelInfo {
     pub context_window: usize,
     pub recommended: bool,
     pub effort_capabilities: EffortCapabilities,
+    pub service_tier_capabilities: ServiceTierCapabilities,
 }
 
 /// Backend route + wire protocol used for a model.
@@ -319,6 +345,9 @@ pub struct ModelSpec {
     /// external model, Phoenix represents that absence honestly instead of
     /// fabricating unsupported/optional/native.
     pub effort_capabilities: EffortCapabilities,
+    /// Route-aware Codex fast-mode capability. Only built-in `OpenAI` Responses
+    /// models routed through the Codex bridge advertise support.
+    pub service_tier_capabilities: ServiceTierCapabilities,
 }
 
 impl ModelSpec {
@@ -353,6 +382,18 @@ impl ModelSpec {
     #[must_use]
     pub fn effort_capabilities_for(&self, _service: &dyn crate::LlmService) -> EffortCapabilities {
         self.effort_capabilities.clone()
+    }
+
+    #[must_use]
+    pub fn service_tier_capabilities_for(
+        &self,
+        service: &dyn crate::LlmService,
+    ) -> ServiceTierCapabilities {
+        if service.uses_codex_bridge() {
+            self.service_tier_capabilities
+        } else {
+            ServiceTierCapabilities::Unsupported
+        }
     }
 }
 
@@ -517,6 +558,7 @@ fn external_model_spec_from_config(
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
         effort_capabilities,
+        service_tier_capabilities: ServiceTierCapabilities::Unsupported,
     })
 }
 
@@ -563,6 +605,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
@@ -576,6 +619,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
@@ -589,6 +633,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_anthropic_base(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
             id: "claude-sonnet-5".into(),
@@ -602,6 +647,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_anthropic_xhigh(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
@@ -615,6 +661,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_anthropic_base(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
@@ -628,6 +675,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: EffortCapabilities::unsupported(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         // OpenAI models
         // Context windows here are the platform-API ceilings. The codex bridge
@@ -647,6 +695,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_55_plus(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
             id: "gpt-5.6-luna".into(),
@@ -660,6 +709,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_55_plus(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
             id: "gpt-5.6-terra".into(),
@@ -673,6 +723,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_55_plus(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
             id: "gpt-5.5".into(),
@@ -686,6 +737,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_55_plus(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
             id: "gpt-5.4".into(),
@@ -699,6 +751,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_54(),
+            service_tier_capabilities: ServiceTierCapabilities::Supported,
         },
         ModelSpec {
             id: "gpt-5.4-mini".into(),
@@ -712,6 +765,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: effort_gpt_54(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
         // Mock model for frontend development without API keys
         ModelSpec {
@@ -726,6 +780,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: EffortCapabilities::unknown(),
+            service_tier_capabilities: ServiceTierCapabilities::Unsupported,
         },
     ]
 }

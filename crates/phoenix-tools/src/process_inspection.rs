@@ -186,6 +186,7 @@ mod tests {
             archived: false,
             model: None,
             effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             project_id: None,
             conv_mode: phoenix_core::domain::db_schema::ConvMode::Work {
                 branch_name: phoenix_core::domain::db_schema::NonEmptyString::new("owner").unwrap(),

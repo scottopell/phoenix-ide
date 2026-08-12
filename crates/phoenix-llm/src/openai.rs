@@ -1601,6 +1601,10 @@ fn translate_to_responses_request(
             .effective_effort
             .explicit_level()
             .map(platform_reasoning),
+        service_tier: use_codex_backend
+            .then(|| request.service_tier.codex_request_value())
+            .flatten()
+            .map(str::to_string),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -1955,6 +1959,8 @@ struct CodexResponsesLiteRequest {
     tool_choice: CodexResponsesLiteToolChoice,
     reasoning: CodexResponsesLiteReasoning,
     #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<BTreeMap<String, String>>,
@@ -2009,6 +2015,7 @@ impl CodexResponsesLiteRequest {
             parallel_tool_calls: false,
             tool_choice: CodexResponsesLiteToolChoice::Auto,
             reasoning: codex_lite_reasoning(request.reasoning.as_ref().map(|r| r.effort)),
+            service_tier: request.service_tier,
             stream: request.stream,
             tags: request.tags,
         }
@@ -2043,6 +2050,8 @@ pub(crate) struct ResponsesApiRequest {
     pub(crate) prompt_cache_options: Option<PromptCacheOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ResponsesApiReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) service_tier: Option<String>,
     /// Tool selection strategy. `"auto"` is the server-side default; sent
     /// explicitly to stabilise the wire shape and to make non-default
     /// strategies a smaller change later. Omitted when no tools are sent.
@@ -3469,6 +3478,7 @@ mod tests {
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
             effort_capabilities: crate::EffortCapabilities::unknown(),
+            service_tier_capabilities: crate::models::ServiceTierCapabilities::Unsupported,
         }
     }
 
@@ -3485,6 +3495,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
@@ -4071,6 +4082,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }

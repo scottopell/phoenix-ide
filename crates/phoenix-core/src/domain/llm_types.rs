@@ -71,6 +71,50 @@ pub enum ModelEffort {
     Max,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ServiceTier {
+    Standard,
+    Fast,
+}
+
+impl ServiceTier {
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+        }
+    }
+
+    #[must_use]
+    pub const fn codex_request_value(self) -> Option<&'static str> {
+        match self {
+            Self::Standard => None,
+            Self::Fast => Some("priority"),
+        }
+    }
+}
+
+impl fmt::Display for ServiceTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_name())
+    }
+}
+
+impl FromStr for ServiceTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standard" => Ok(Self::Standard),
+            "fast" => Ok(Self::Fast),
+            other => Err(format!("unknown service tier '{other}'")),
+        }
+    }
+}
+
 impl ModelEffort {
     pub const ALL: [Self; 7] = [
         Self::None,
@@ -465,6 +509,7 @@ pub struct LlmRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub effective_effort: EffectiveEffort,
+    pub service_tier: ServiceTier,
     pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
@@ -874,6 +919,7 @@ mod attempt_capture_tests {
             tools: vec![],
             max_tokens: Some(50),
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
+            service_tier: ServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

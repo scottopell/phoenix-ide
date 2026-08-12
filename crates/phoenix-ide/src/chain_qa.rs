@@ -781,6 +781,7 @@ fn build_agent_request(
             max_output_tokens.map_or(ANSWER_MAX_TOKENS, |limit| limit.min(ANSWER_MAX_TOKENS)),
         ),
         effective_effort,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
         telemetry: None,
         // One cache key per language so phoenix-native and caveman prompts
         // don't collide on a shared cache slot.

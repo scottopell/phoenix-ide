@@ -36,7 +36,7 @@ pub use workflow::*;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::{
     EffectiveEffort, EffortSource, LlmAttemptMetrics, LlmAttemptOutcome, LlmTransport, ModelEffort,
-    ProviderStreamTelemetry, StreamTelemetryOutputKind,
+    ProviderStreamTelemetry, ServiceTier, StreamTelemetryOutputKind,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
@@ -3061,8 +3061,8 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -3086,6 +3086,7 @@ impl Database {
             .bind(runtime_role.as_str())
             .bind(work_scope_id.as_str())
             .bind(parent_id.map(|_| cwd))
+            .bind(ServiceTier::Standard.as_wire_name())
             .execute(&mut *tx)
             .await;
 
@@ -3136,6 +3137,7 @@ impl Database {
             model: model.map(String::from),
             project_id: project_id.map(String::from),
             effort: inherited_effort,
+            service_tier: ServiceTier::Standard,
             conv_mode: conv_mode.clone(),
             runtime_role,
             attached_work_scope_id: Some(created_work_scope_id),
@@ -3277,7 +3279,7 @@ impl Database {
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3306,7 +3308,7 @@ impl Database {
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3455,7 +3457,7 @@ impl Database {
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3590,7 +3592,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, attachment.work_scope_id, c.transcript_generation,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3619,7 +3621,7 @@ impl Database {
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3646,7 +3648,7 @@ impl Database {
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3670,7 +3672,7 @@ impl Database {
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -3862,6 +3864,7 @@ impl Database {
             conv_mode: conv_mode.clone(),
             runtime_role: RuntimeRole::User,
             effort: job.intent.effort,
+            service_tier: ServiceTier::Standard,
             attached_work_scope_id: Some(created_work_scope_id),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
@@ -5745,7 +5748,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -5775,7 +5778,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -5963,8 +5966,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?15, 'user', ?16)",
+                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, service_tier)
+                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?15, 'user', ?16, ?17)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -5985,6 +5988,7 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(work_scope_id.as_str())
+            .bind(parent.service_tier.as_wire_name())
             .execute(&mut *tx)
             .await;
 
@@ -6115,6 +6119,7 @@ impl Database {
             runtime_role: phoenix_core::work_scope::RuntimeRole::User,
             attached_work_scope_id: Some(work_scope_id),
             effort: parent.effort,
+            service_tier: parent.service_tier,
             desired_base_branch: parent.desired_base_branch,
             message_count: 1,
             seed_parent_id: None,
@@ -6273,8 +6278,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21)",
+                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
+                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21, ?22)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -6305,6 +6310,7 @@ impl Database {
             .bind(
                 (parent.runtime_role == RuntimeRole::SubAgent).then_some(parent.cwd.as_str()),
             )
+            .bind(parent.service_tier.as_wire_name())
             .execute(&mut *tx)
             .await;
 
@@ -6407,6 +6413,7 @@ impl Database {
             runtime_role: parent.runtime_role,
             attached_work_scope_id: continuation_work_scope_id,
             effort: parent.effort,
+            service_tier: parent.service_tier,
             desired_base_branch: parent.desired_base_branch,
             message_count: 0,
             seed_parent_id: None,
@@ -6482,7 +6489,7 @@ impl Database {
                 JOIN chain ON c.id = chain.next_id
             )
             SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -7141,13 +7148,15 @@ impl Database {
         id: &str,
         model: &str,
         effort: Option<ModelEffort>,
+        service_tier: ServiceTier,
     ) -> DbResult<()> {
         let now = Utc::now();
         let result = sqlx::query(
-            "UPDATE conversations SET model = ?1, effort = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE conversations SET model = ?1, effort = ?2, service_tier = ?3, updated_at = ?4 WHERE id = ?5",
         )
         .bind(model)
         .bind(effort.map(ModelEffort::as_wire_name))
+        .bind(service_tier.as_wire_name())
         .bind(now.to_rfc3339())
         .bind(id)
         .execute(&self.pool)
@@ -7408,7 +7417,7 @@ impl Database {
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
                     c.cm_kind, e.branch_name AS env_branch_name, e.worktree_path AS env_worktree_path, e.base_branch AS env_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
@@ -9323,6 +9332,12 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
                 ModelEffort::from_str(&value).map_err(|error| sqlx::Error::Decode(error.into()))
             })
             .transpose()?,
+        service_tier: row
+            .try_get::<Option<String>, _>("service_tier")
+            .unwrap_or(None)
+            .map_or(Ok(ServiceTier::Standard), |value| {
+                ServiceTier::from_str(&value).map_err(|error| sqlx::Error::Decode(error.into()))
+            })?,
         project_id: row
             .try_get::<Option<String>, _>("project_id")
             .unwrap_or(None),
@@ -13060,9 +13075,14 @@ mod tests {
         db.create_conversation("conv-effort", "slug-effort", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.update_conversation_model_and_effort("conv-effort", "gpt-5.4", Some(ModelEffort::Low))
-            .await
-            .unwrap();
+        db.update_conversation_model_and_effort(
+            "conv-effort",
+            "gpt-5.4",
+            Some(ModelEffort::Low),
+            ServiceTier::Fast,
+        )
+        .await
+        .unwrap();
 
         let listed = db.list_conversations().await.unwrap();
         assert_eq!(
@@ -13071,6 +13091,14 @@ mod tests {
                 .find(|conversation| conversation.id == "conv-effort")
                 .and_then(|conversation| conversation.effort),
             Some(ModelEffort::Low)
+        );
+        let listed = db.list_conversations().await.unwrap();
+        assert_eq!(
+            listed
+                .into_iter()
+                .find(|conversation| conversation.id == "conv-effort")
+                .map(|conversation| conversation.service_tier),
+            Some(ServiceTier::Fast)
         );
     }
 
@@ -15972,6 +16000,7 @@ mod tests {
             "effort-parent",
             "gpt-5.4",
             Some(ModelEffort::High),
+            ServiceTier::Standard,
         )
         .await
         .unwrap();
@@ -16276,6 +16305,7 @@ mod tests {
             "parent-work",
             "claude-opus-test",
             Some(ModelEffort::High),
+            ServiceTier::Standard,
         )
         .await
         .unwrap();
@@ -16748,6 +16778,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_create_task_approval_handoff_links_parent_to_work_successor() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
@@ -16757,6 +16788,7 @@ mod tests {
             "handoff-parent",
             "claude-opus-test",
             Some(ModelEffort::High),
+            ServiceTier::Standard,
         )
         .await
         .unwrap();
@@ -16770,7 +16802,6 @@ mod tests {
         )
         .await
         .unwrap();
-
         let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27002".to_string(),
             task_title: "Approve Fresh".to_string(),
@@ -16782,7 +16813,6 @@ mod tests {
             plan: "Do the work".to_string(),
             task_file: "tasks/27002-p1-ready--approve-fresh.md".to_string(),
         };
-
         let successor = db
             .create_task_approval_handoff_conversation("handoff-parent", &approval)
             .await

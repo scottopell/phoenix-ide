@@ -830,6 +830,7 @@ mod tests {
             transcript_generation: 1,
             model: None,
             effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             project_id: Some("proj-1".to_string()),
             conv_mode: ConvMode::Work {
                 branch_name: NonEmptyString::new("task-24696-gate").unwrap(),

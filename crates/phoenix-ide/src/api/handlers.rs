@@ -4544,11 +4544,31 @@ async fn upgrade_conversation_model(
         crate::api::types::EffortUpdate::Set(effort) => Some(effort),
     };
 
+    let requested_service_tier = req.service_tier.unwrap_or(conv.service_tier);
+    let next_service_tier =
+        if requested_service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast {
+            if state
+                .llm_registry
+                .supports_service_tier(&req.model, requested_service_tier)
+            {
+                requested_service_tier
+            } else if req.service_tier.is_some() {
+                return Err(AppError::BadRequest(format!(
+                    "Fast mode is not supported by model '{}' on the active provider route",
+                    req.model
+                )));
+            } else {
+                phoenix_core::domain::llm_types::ServiceTier::Standard
+            }
+        } else {
+            phoenix_core::domain::llm_types::ServiceTier::Standard
+        };
+
     // Update in DB
     state
         .runtime
         .db()
-        .update_conversation_model_and_effort(&id, &req.model, next_effort)
+        .update_conversation_model_and_effort(&id, &req.model, next_effort, next_service_tier)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -4562,6 +4582,7 @@ async fn upgrade_conversation_model(
         conv_id = %id,
         old_model = conv.model.as_deref().unwrap_or("default"),
         new_model = %req.model,
+        service_tier = %next_service_tier,
         "Conversation model upgraded"
     );
 
@@ -13938,6 +13959,7 @@ mod upgrade_model_state_guard_tests {
             Json(UpgradeModelRequest {
                 model: model.to_string(),
                 effort: crate::api::types::EffortUpdate::Reset,
+                service_tier: None,
             }),
         )
         .await
@@ -13953,7 +13975,12 @@ mod upgrade_model_state_guard_tests {
         // Start from a non-default model so a successful switch is observable.
         state
             .db
-            .update_conversation_model_and_effort(id, "claude-opus-4-7", None)
+            .update_conversation_model_and_effort(
+                id,
+                "claude-opus-4-7",
+                None,
+                phoenix_core::domain::llm_types::ServiceTier::Standard,
+            )
             .await
             .expect("seed model");
     }
