@@ -441,6 +441,10 @@ pub struct Conversation {
     /// model route's native default.
     #[serde(default)]
     pub effort: Option<crate::domain::llm_types::ModelEffort>,
+    /// Explicit per-conversation service-tier selection. Existing rows and
+    /// sub-agents default to Standard.
+    #[serde(default = "crate::domain::db_schema::default_service_tier")]
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     /// Project this conversation belongs to (None for legacy pre-project conversations)
     #[serde(default)]
     pub project_id: Option<String>,
@@ -503,6 +507,10 @@ pub struct Conversation {
     /// column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_from_conversation_id: Option<String>,
+}
+
+fn default_service_tier() -> crate::domain::llm_types::ServiceTier {
+    crate::domain::llm_types::ServiceTier::Standard
 }
 
 /// Derive a human-readable title from a kebab-case slug.
@@ -1950,6 +1958,7 @@ mod conversation_serde_tests {
             model: None,
             project_id: None,
             effort: None,
+            service_tier: crate::domain::llm_types::ServiceTier::Standard,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
                 next_taskmd_id_hint: None,

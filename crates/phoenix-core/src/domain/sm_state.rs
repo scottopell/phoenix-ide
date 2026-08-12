@@ -2353,6 +2353,7 @@ pub struct ConvContext {
     pub model_id: String,
     pub effort: Option<crate::domain::llm_types::ModelEffort>,
     pub effective_effort: crate::domain::llm_types::EffectiveEffort,
+    pub service_tier: crate::domain::llm_types::ServiceTier,
     /// Whether this is a sub-agent conversation
     pub is_sub_agent: bool,
     /// Model's context window size in tokens
@@ -2431,6 +2432,7 @@ impl ConvContext {
             is_sub_agent: false,
             effort: None,
             effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: crate::domain::llm_types::ServiceTier::Standard,
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
@@ -2499,6 +2501,7 @@ impl ConvContext {
             is_sub_agent: true,
             effort: None,
             effective_effort: crate::domain::llm_types::EffectiveEffort::native_unknown(),
+            service_tier: crate::domain::llm_types::ServiceTier::Standard,
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,

@@ -45,6 +45,7 @@ pub async fn suggest_commands(
             max_output_tokens.map_or(MAX_SUGGEST_TOKENS, |limit| limit.min(MAX_SUGGEST_TOKENS)),
         ),
         effective_effort,
+        service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
         telemetry: None,
         // Shared by every suggestion call so SUGGEST_SYSTEM caches.
         cache_key: PromptCacheKey::stable("command-suggester"),

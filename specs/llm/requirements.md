@@ -169,6 +169,33 @@ THE child conversation SHALL resolve its own model-native default from its selec
 
 ---
 
+### REQ-LLM-004g: Codex Fast Service Tier
+
+WHEN a conversation uses a built-in model routed through the ChatGPT/Codex bridge and that model advertises the Fast service tier
+THE SYSTEM SHALL allow the user to select Standard or Fast independently of model reasoning effort
+AND SHALL disclose that Fast provides approximately 1.5x speed with increased usage
+
+WHEN Fast is selected for a supported Codex request
+THE SYSTEM SHALL send the provider-native `priority` service tier
+
+WHEN Standard is selected
+THE SYSTEM SHALL omit the service-tier field from the provider request
+
+WHEN the selected model or provider route does not support Codex Fast mode
+THE SYSTEM SHALL NOT advertise Fast capability
+AND SHALL reject an explicit attempt to enable Fast
+AND SHALL reset an inherited conversation selection to Standard when switching to that route
+
+WHEN Phoenix spawns a subagent conversation
+THE child conversation SHALL start with Standard service tier independently of the parent's selection
+
+WHEN a conversation continues into a successor conversation
+THE successor SHALL preserve the parent's service-tier selection
+
+**Rationale:** Fast is a paid routing choice, not a model or reasoning-effort alias. Capability gating prevents Phoenix from claiming support on direct API-key and third-party routes, while independent subagent defaults avoid multiplying usage without an explicit child choice.
+
+---
+
 ### REQ-LLM-004e: Provider Translation of Reasoning Effort
 
 WHEN request translation targets a provider with known native reasoning-effort support

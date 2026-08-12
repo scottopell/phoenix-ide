@@ -1162,6 +1162,7 @@ mod tests {
             transcript_generation: 1,
             model: None,
             effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             project_id: None,
             conv_mode: ConvMode::Work {
                 branch_name: NonEmptyString::new(format!("branch-{id}")).unwrap(),

@@ -1521,6 +1521,7 @@ fn build_child_conversation(
         model: None,
         project_id: Some(project_id.to_string()),
         effort: None,
+        service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
         conv_mode,
         desired_base_branch: Some(base.to_string()),
         message_count: 0,

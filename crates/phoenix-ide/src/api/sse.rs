@@ -512,6 +512,7 @@ mod tests {
             transcript_generation: 1,
             model: Some("claude-sonnet-4-5".to_string()),
             effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             project_id: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,

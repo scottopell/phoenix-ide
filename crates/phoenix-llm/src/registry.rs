@@ -994,6 +994,42 @@ impl ModelRegistry {
     }
 
     #[must_use]
+    pub fn supports_service_tier(
+        &self,
+        model_id: &str,
+        tier: phoenix_core::domain::llm_types::ServiceTier,
+    ) -> bool {
+        let Ok(specs) = self.specs.read() else {
+            return false;
+        };
+        let Ok(services) = self.services.read() else {
+            return false;
+        };
+        specs
+            .get(model_id)
+            .zip(services.get(model_id))
+            .is_some_and(|(spec, service)| {
+                spec.service_tier_capabilities_for(service.as_ref())
+                    .supports(tier)
+            })
+    }
+
+    #[must_use]
+    pub fn effective_service_tier(
+        &self,
+        model_id: &str,
+        requested: phoenix_core::domain::llm_types::ServiceTier,
+    ) -> phoenix_core::domain::llm_types::EffectiveServiceTier {
+        phoenix_core::domain::llm_types::EffectiveServiceTier::from_preference(
+            requested,
+            self.supports_service_tier(
+                model_id,
+                phoenix_core::domain::llm_types::ServiceTier::Fast,
+            ),
+        )
+    }
+
+    #[must_use]
     pub fn supports_effort(
         &self,
         model_id: &str,
@@ -1079,6 +1115,7 @@ impl ModelRegistry {
                     context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
                     effort_capabilities: spec.effort_capabilities_for(service.as_ref()),
+                    service_tier_capabilities: spec.service_tier_capabilities_for(service.as_ref()),
                 });
             }
         }

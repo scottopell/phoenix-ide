@@ -71,6 +71,132 @@ pub enum ModelEffort {
     Max,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ServiceTier {
+    Standard,
+    Fast,
+}
+
+impl ServiceTier {
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+        }
+    }
+
+    #[must_use]
+    pub const fn codex_request_value(self) -> Option<&'static str> {
+        match self {
+            Self::Standard => None,
+            Self::Fast => Some("priority"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveServiceTier {
+    Standard,
+    Fast,
+}
+
+impl EffectiveServiceTier {
+    #[must_use]
+    pub const fn from_preference(preference: ServiceTier, fast_supported: bool) -> Self {
+        match (preference, fast_supported) {
+            (ServiceTier::Fast, true) => Self::Fast,
+            (ServiceTier::Fast, false) | (ServiceTier::Standard, _) => Self::Standard,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+impl fmt::Display for EffectiveServiceTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_name())
+    }
+}
+
+impl From<EffectiveServiceTier> for ServiceTier {
+    fn from(value: EffectiveServiceTier) -> Self {
+        match value {
+            EffectiveServiceTier::Standard => Self::Standard,
+            EffectiveServiceTier::Fast => Self::Fast,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRequestTier {
+    Standard,
+    CodexFast,
+}
+
+impl ProviderRequestTier {
+    #[must_use]
+    pub const fn from_effective_service_tier(
+        tier: EffectiveServiceTier,
+        use_codex_backend: bool,
+    ) -> Self {
+        match (tier, use_codex_backend) {
+            (EffectiveServiceTier::Fast, true) => Self::CodexFast,
+            (EffectiveServiceTier::Fast, false) | (EffectiveServiceTier::Standard, _) => {
+                Self::Standard
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn as_service_tier(self) -> EffectiveServiceTier {
+        match self {
+            Self::Standard => EffectiveServiceTier::Standard,
+            Self::CodexFast => EffectiveServiceTier::Fast,
+        }
+    }
+
+    #[must_use]
+    pub const fn codex_request_value(self) -> Option<&'static str> {
+        match self {
+            Self::Standard => None,
+            Self::CodexFast => Some("priority"),
+        }
+    }
+}
+
+impl fmt::Display for ProviderRequestTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_service_tier().as_wire_name())
+    }
+}
+
+impl fmt::Display for ServiceTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_name())
+    }
+}
+
+impl FromStr for ServiceTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standard" => Ok(Self::Standard),
+            "fast" => Ok(Self::Fast),
+            other => Err(format!("unknown service tier '{other}'")),
+        }
+    }
+}
+
 impl ModelEffort {
     pub const ALL: [Self; 7] = [
         Self::None,
@@ -465,6 +591,7 @@ pub struct LlmRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub effective_effort: EffectiveEffort,
+    pub service_tier: EffectiveServiceTier,
     pub telemetry: Option<LlmRequestTelemetry>,
     /// Required cache key. See [`PromptCacheKey`] for how to pick one — the
     /// choice is the caller's because only the caller knows its caching
@@ -874,6 +1001,7 @@ mod attempt_capture_tests {
             tools: vec![],
             max_tokens: Some(50),
             effective_effort: EffectiveEffort::native_known(ModelEffort::Max),
+            service_tier: EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

@@ -1489,17 +1489,34 @@ function ConversationPageContent({
     }
   }, [conversationId, isArchived, showError]);
 
-  const handleUpgradeModel = useCallback(async (newModelId: string, effort?: import('../api').ModelEffort | null) => {
+  const handleUpgradeModel = useCallback(async (
+    newModelId: string,
+    effort?: import('../api').ModelEffort | null,
+    serviceTier?: 'standard' | 'fast',
+  ) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
-      await api.upgradeModel(conversationId, newModelId, effort);
-      showInfo(`Switched to ${newModelId}`);
-      dispatch({ type: 'local_conversation_update', updates: { model: newModelId, effort: effort ?? null }, expectedConversationId: conversationId });
+      await api.upgradeModel(conversationId, newModelId, effort, serviceTier);
+      const targetSupportsFast = availableModels.some(
+        (model) => model.id === newModelId && model.service_tier_capabilities === 'supported',
+      );
+      const effectiveServiceTier = serviceTier
+        ?? (targetSupportsFast ? atom.conversation?.service_tier ?? 'standard' : 'standard');
+      showInfo(effectiveServiceTier === 'fast' ? `Fast mode enabled for ${newModelId}` : `Switched to ${newModelId}`);
+      dispatch({
+        type: 'local_conversation_update',
+        updates: {
+          model: newModelId,
+          effort: effort ?? null,
+          service_tier: effectiveServiceTier,
+        },
+        expectedConversationId: conversationId,
+      });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
-  }, [conversationId, isArchived, atom.phase, showInfo, dispatch]);
+  }, [conversationId, isArchived, atom.phase, atom.conversation?.service_tier, availableModels, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API

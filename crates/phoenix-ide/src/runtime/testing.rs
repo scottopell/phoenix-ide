@@ -1730,6 +1730,8 @@ mod tests {
             tools: vec![],
             max_tokens: Some(100),
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
+
+            service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::ephemeral(),
         };

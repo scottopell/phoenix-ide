@@ -642,6 +642,7 @@ mod tests {
             transcript_generation: 1,
             model: Some("mock".to_string()),
             effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
             project_id: None,
             conv_mode: ConvMode::Direct,
             desired_base_branch: None,

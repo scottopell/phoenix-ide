@@ -100,6 +100,10 @@ pub struct UpgradeModelRequest {
     /// Omission preserves a compatible override; null explicitly resets it.
     #[serde(default, deserialize_with = "deserialize_effort_update")]
     pub effort: EffortUpdate,
+    /// Omission preserves Fast only when the target model still supports it;
+    /// otherwise the setting resets to Standard.
+    #[serde(default)]
+    pub service_tier: Option<phoenix_core::domain::llm_types::ServiceTier>,
 }
 
 /// Request to send a chat message

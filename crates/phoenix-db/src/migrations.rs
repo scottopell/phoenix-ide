@@ -326,7 +326,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_steering_acceptance_receipts",
         sql: MIGRATION_062,
     },
+    Migration {
+        version: 63,
+        name: "add_conversation_service_tier",
+        sql: MIGRATION_063,
+    },
 ];
+
+const MIGRATION_063: &str = r"
+ALTER TABLE conversations ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'
+CHECK (service_tier IN ('standard', 'fast'));
+";
 
 const MIGRATION_062: &str = r"
 CREATE TABLE IF NOT EXISTS steering_acceptance_receipts (
