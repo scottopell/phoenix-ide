@@ -509,6 +509,20 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
   await clearLifecycleReactions(owner, repo, commentId, token, content);
 }
 
+async function postTerminalReaction(owner, repo, commentId, content, token) {
+  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
+  await githubRequest(path, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  try {
+    await clearLifecycleReactions(owner, repo, commentId, token, content);
+  } catch (error) {
+    console.error(`Terminal ${content} posted for comment ${commentId}, but lifecycle cleanup failed: ${error.message}`);
+  }
+}
+
 function isStructuredRoadmapComment(comment) {
   return roadmapPayload(comment?.body) !== null;
 }
@@ -572,7 +586,7 @@ export async function run({ event, configuredIssueNumber, token }) {
         const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
         console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
       }
-      await setLifecycleReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+      await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
       terminalReactionSet = true;
     }
 
@@ -598,7 +612,7 @@ export async function run({ event, configuredIssueNumber, token }) {
   } catch (error) {
     if (tracksLifecycle && !terminalReactionSet) {
       try {
-        await setLifecycleReaction(owner, repo, event.comment.id, "confused", token);
+        await postTerminalReaction(owner, repo, event.comment.id, "confused", token);
       } catch (reactionError) {
         console.error(`Could not mark comment ${event.comment.id} rejected: ${reactionError.message}`);
       }
