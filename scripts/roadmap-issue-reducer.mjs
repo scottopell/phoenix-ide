@@ -172,7 +172,8 @@ export function reduceComments(comments) {
         const repeatsOwnedRetirement = current === undefined &&
           priorRetirement?.author === retirementAuthor &&
           priorRetirement.supersedesCommentId === retirement.supersedes_comment_id;
-        if (retiresCurrent || repeatsOwnedRetirement) {
+        const establishesMissingSourceTombstone = current === undefined && priorRetirement === undefined;
+        if (retiresCurrent || repeatsOwnedRetirement || establishesMissingSourceTombstone) {
           latest.delete(retirement.workstream);
           retirements.set(retirement.workstream, {
             author: retirementAuthor,
