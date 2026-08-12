@@ -276,6 +276,22 @@ test("coalesced run repairs missing rockets on authoritative retirements", async
   }
 });
 
+test("coalesced run marks invalid structured comments confused", async () => {
+  const invalid = comment(1, fenced(update({ evidence: [] })));
+  const trigger = comment(2, "Later coordination note.");
+  const mock = installGitHubMock([invalid, trigger], [[], []]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "POST" &&
+        request.url.includes("issues/comments/1/reactions") &&
+        JSON.parse(request.body).content === "confused",
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
 test("editing an older retirement does not acknowledge it over the latest retirement", async () => {
   const updateComment = comment(1, fenced(update()), { user: { login: "owner" } });
   const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
@@ -508,6 +524,20 @@ test("deleting a replacement restores the reactivated source rocket", async () =
     assert.deepEqual(postedReactions(mock.requests), ["rocket"]);
     assert.ok(mock.requests.some(
       (request) => request.method === "POST" && request.url.includes("issues/comments/1/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("deletion never fetches reactions from the deleted comment", async () => {
+  const reactivated = comment(1, fenced(update({ state: "Old" })));
+  const deleted = comment(2, fenced(update({ state: "Deleted" })));
+  const mock = installGitHubMock([reactivated], [[]]);
+  try {
+    await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
+    assert.ok(!mock.requests.some(
+      (request) => request.method === "GET" && request.url.includes("issues/comments/2/reactions"),
     ));
   } finally {
     mock.restore();

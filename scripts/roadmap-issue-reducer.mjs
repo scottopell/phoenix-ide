@@ -383,9 +383,9 @@ function commentsBeforeEvent(comments, event) {
   return comments;
 }
 
-async function reconcileAcceptedReactions(owner, repo, before, after, projectedUpdates, triggerId, token) {
+async function reconcileReactions(owner, repo, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
   for (const commentId of before) {
-    if (commentId !== triggerId && !after.has(commentId)) {
+    if (commentId !== triggerId && commentId !== deletedId && !after.has(commentId)) {
       await clearAcceptedReaction(owner, repo, commentId, token);
     }
   }
@@ -395,6 +395,12 @@ async function reconcileAcceptedReactions(owner, repo, before, after, projectedU
   ensureAccepted.delete(triggerId);
   for (const commentId of ensureAccepted) {
     await setLifecycleReaction(owner, repo, commentId, "rocket", token);
+  }
+
+  for (const [commentId, outcome] of outcomes) {
+    if (commentId !== triggerId && !outcome.accepted) {
+      await setLifecycleReaction(owner, repo, commentId, "confused", token);
+    }
   }
 }
 
@@ -455,13 +461,15 @@ export async function run({ event, configuredIssueNumber, token }) {
     }
 
     try {
-      await reconcileAcceptedReactions(
+      await reconcileReactions(
         owner,
         repo,
         acknowledgedCommentIds(before.updates, before.current, before.outcomes),
         acknowledgedCommentIds(updates, current, outcomes),
         updates,
+        outcomes,
         event.comment.id,
+        event.action === "deleted" ? event.comment.id : null,
         token,
       );
     } catch (error) {
