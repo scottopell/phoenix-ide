@@ -916,7 +916,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         tls_source.as_ref(),
         loaded_tls.as_ref(),
         log_config.to_log_info(),
-        std::env::var("PHOENIX_INSTANCE_ID").ok().filter(|value| !value.is_empty()),
+        std::env::var("PHOENIX_INSTANCE_ID")
+            .ok()
+            .filter(|value| !value.is_empty()),
     ));
 
     let auth_enabled = password.is_some();
