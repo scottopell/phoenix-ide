@@ -183,26 +183,33 @@ struct SettingsPersistence {
         self.bundle = bundle
     }
 
-    func loadDraft() throws -> DraftLoadResult {
-        let snapshot = try persistedSnapshot()
-        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
-        return DraftLoadResult(draft: snapshot.draft(), hasSavedModeSelection: hasSavedModeSelection)
-    }
-
-    func loadConnectionDraft() throws -> DraftLoadResult {
-        let snapshot = try persistedSnapshot()
-        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
-        return DraftLoadResult(draft: snapshot.nonsecretDraft(), hasSavedModeSelection: hasSavedModeSelection)
-    }
-
-    func persistedSnapshot() throws -> PersistedSettingsSnapshot {
-        let preferences = PersistedPreferenceSnapshot(
+    private func persistedPreferences() -> PersistedPreferenceSnapshot {
+        PersistedPreferenceSnapshot(
             serverMode: defaults.string(forKey: PreferenceKey.serverMode),
             attachedOrigin: defaults.string(forKey: PreferenceKey.attachedOrigin),
             bundledPort: defaults.object(forKey: PreferenceKey.bundledPort) as? Int,
             developmentBinaryOverride: defaults.string(forKey: PreferenceKey.bundledDevelopmentBinary),
             rustLogLevel: defaults.string(forKey: PreferenceKey.rustLogLevel)
         )
+    }
+
+    func loadDraft() throws -> DraftLoadResult {
+        let snapshot = try persistedSnapshot()
+        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
+        return DraftLoadResult(draft: snapshot.draft(), hasSavedModeSelection: hasSavedModeSelection)
+    }
+
+    func loadConnectionDraft() -> DraftLoadResult {
+        let preferences = persistedPreferences()
+        let snapshot = PersistedSettingsSnapshot(preferences: preferences, secrets: [:])
+        return DraftLoadResult(
+            draft: snapshot.nonsecretDraft(),
+            hasSavedModeSelection: preferences.serverMode != nil
+        )
+    }
+
+    func persistedSnapshot() throws -> PersistedSettingsSnapshot {
+        let preferences = persistedPreferences()
         var secrets: [ProviderSecret: String?] = [:]
         for secret in ProviderSecret.allCases {
             secrets[secret] = try keychain.read(secret)

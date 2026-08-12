@@ -237,7 +237,7 @@ final class ConfigurationTests: XCTestCase {
         defaults.set(ServerModeKind.bundled.rawValue, forKey: PreferenceKey.serverMode)
 
         let persistence = SettingsPersistence(defaults: defaults, keychain: ScriptedSecretStore(), bundle: .main)
-        let loaded = try persistence.loadConnectionDraft()
+        let loaded = persistence.loadConnectionDraft()
 
         XCTAssertTrue(loaded.hasSavedModeSelection)
         XCTAssertEqual(loaded.draft.mode, .bundled)
@@ -284,7 +284,7 @@ final class ConfigurationTests: XCTestCase {
         ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
 
-        let loaded = try persistence.loadConnectionDraft()
+        let loaded = persistence.loadConnectionDraft()
 
         XCTAssertTrue(loaded.hasSavedModeSelection)
         XCTAssertEqual(loaded.draft.mode, .bundled)
@@ -813,7 +813,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(buffer.pendingFragment, "")
     }
 
-    func testLegacyPlaintextSecretDeletesLegacyPreferenceDomain() {
     func testConnectionStateFailureVersionSurvivesPreservedStop() {
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
         let failure = FailureState(version: version, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")
@@ -823,6 +822,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(state.failureViewModel?.message, failure.message)
     }
 
+    func testLegacyPlaintextSecretDeletesLegacyPreferenceDomain() {
         let currentSuite = "ConfigurationTests.current.\(UUID().uuidString)"
         let legacySuite = "com.scottopell.pa"
         let current = UserDefaults(suiteName: currentSuite)!
@@ -838,6 +838,28 @@ final class ServerManagerHelpersTests: XCTestCase {
         ConfigurationStore.removeLegacyPlaintextSecret(defaults: current)
         XCTAssertNil(current.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
         XCTAssertNil(legacy.object(forKey: PreferenceKey.legacyAnthropicAPIKey))
+    }
+
+    func testBundledDeploymentMustMatchExactLaunchInstance() {
+        let instanceID = UUID()
+        let matching = DeploymentInfo(
+            build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
+            network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+            instanceID: instanceID.uuidString,
+            localAccess: true,
+            installationOwnership: .development
+        )
+        let mismatched = DeploymentInfo(
+            build: matching.build,
+            network: matching.network,
+            instanceID: UUID().uuidString,
+            localAccess: matching.localAccess,
+            installationOwnership: matching.installationOwnership
+        )
+
+        XCTAssertTrue(deploymentMatchesBundledInstance(matching, instanceID: instanceID))
+        XCTAssertFalse(deploymentMatchesBundledInstance(mismatched, instanceID: instanceID))
+        XCTAssertFalse(deploymentMatchesBundledInstance(nil, instanceID: instanceID))
     }
 
     func testDeploymentViolationCanLeaveAttachedDeploymentViewableButReadOnly() throws {

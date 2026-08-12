@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusWindow: NSWindow?
     private var webView: WKWebView?
     private let browserEnvironment = BrowserEnvironment()
+    private var browserOperation: ServerManager.ConnectionOperationToken?
     private let hotkey = GlobalHotkeyManager()
     let serverManager = ServerManager()
     private let persistence = SettingsPersistence()
@@ -27,12 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] state in self?.updateWindowContent(for: state) }
             .store(in: &cancellables)
         showWindow()
-        do {
-            if try persistence.loadConnectionDraft().hasSavedModeSelection {
-                serverManager.connect()
-            }
-        } catch {
-            serverManager.showFailure(message: error.localizedDescription)
+        if persistence.loadConnectionDraft().hasSavedModeSelection {
+            serverManager.connect()
         }
     }
 
@@ -125,10 +122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateWindowContent(for state: ConnectionState) {
         guard let window else { return }
+        let currentOperation = serverManager.currentOperationToken
+        if let browserOperation, browserOperation != currentOperation {
+            browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
+            self.browserOperation = nil
+        }
         if state.canDisplayWebView, let origin = serverManager.webOrigin {
-            let operation = serverManager.currentOperationToken
-            browserEnvironment.closeOperationOwnedSurfaces(for: operation)
+            let operation = currentOperation
             if webView != nil { return }
+            browserOperation = operation
             let wrapper = WebViewWrapper(
                 origin: origin,
                 operation: operation,
@@ -199,9 +201,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.pendingConversationID = nil
                 let message = error.localizedDescription
                 NSLog("Phoenix deep link rejected for %s: %s", id.uuidString.lowercased(), message)
-                self.serverManager.showFailure(message: message)
+                self.presentDeepLinkError(message)
             }
         }
+    }
+
+    private func presentDeepLinkError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Conversation could not be opened"
+        alert.informativeText = message
+        alert.runModal()
     }
 
     private func validatedConversationIDForNavigation(_ id: UUID) async throws -> UUID {

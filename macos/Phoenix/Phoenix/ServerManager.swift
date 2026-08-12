@@ -227,6 +227,11 @@ private struct LaunchedBundledInstance {
     let instanceID: UUID
 }
 
+func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID: UUID?) -> Bool {
+    guard let instanceID else { return true }
+    return deployment?.instanceID == instanceID.uuidString
+}
+
 struct BundledReconnectQueue {
     private(set) var latestCandidate: ServerMode?
     private(set) var stopScheduled = false
@@ -710,8 +715,7 @@ final class ServerManager: ObservableObject {
     }
 
     private func deploymentMatchesLaunchedInstance(_ deployment: DeploymentInfo?) -> Bool {
-        guard let launchedBundledInstance else { return true }
-        return deployment?.instanceID == launchedBundledInstance.instanceID.uuidString
+        deploymentMatchesBundledInstance(deployment, instanceID: launchedBundledInstance?.instanceID)
     }
 
     private func finishStop(finalState: ConnectionState) {
