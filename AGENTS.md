@@ -79,9 +79,8 @@ When you own a workstream represented on the roadmap:
 - append a new structured update when its material state, blocker, owner, or next step changes;
 - append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
 - link detailed evidence instead of copying plans into the roadmap;
-- poll reducer outcomes from `github-actions[bot]`: 👀 means processing, 🚀 means accepted, and 😕 means rejected; ignore reactions from other users; after editing a comment, require a bot-authored lifecycle receipt bound to that comment ID and exact payload revision before accepting its terminal reaction;
-- on 🚀, verify that the generated Issue body snapshot includes the comment and that an update links back to that exact source comment (or that a retirement removed the entry);
-- on 😕, inspect the roadmap reducer Actions log for the validation or application error; do not treat the snapshot marker alone as acceptance.
+- for a newly created structured record, poll bot-authored reactions: 👀 means processing, 🚀 means accepted, and 😕 means rejected; reactions do not track later edits or deletions;
+- on 🚀, verify that the generated Issue body reflects the exact source comment; on 😕, inspect the reducer Actions log.
 
 The reducer owns the Issue body; never edit it manually. The first Issue comment owns the current comment schema and limits. Use the `phoenix-development` skill for the posting procedure.
 

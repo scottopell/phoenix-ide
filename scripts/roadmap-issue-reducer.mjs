@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -145,11 +144,8 @@ function roadmapPayload(markdown) {
   return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
-export function reduceComments(comments, acknowledgedRetirements = new Set()) {
+export function updatesFromComments(comments) {
   const latest = new Map();
-  const knownSources = new Map();
-  const retirements = new Map();
-  const outcomes = new Map();
   const ordered = [...comments]
     .filter(
       (comment) =>
@@ -166,38 +162,18 @@ export function reduceComments(comments, acknowledgedRetirements = new Set()) {
       if (record.recordType === "retirement") {
         const retirement = validateRetirement(value);
         const current = latest.get(retirement.workstream);
-        const priorRetirement = retirements.get(retirement.workstream);
         const retirementAuthor = comment.user?.login ?? "unknown";
-        const retiresCurrent = current !== undefined &&
-          current.source.id <= retirement.supersedes_comment_id &&
-          current.source.author === retirementAuthor;
-        const repeatsOwnedRetirement = current === undefined &&
-          priorRetirement?.author === retirementAuthor &&
-          priorRetirement.supersedesCommentId === retirement.supersedes_comment_id;
-        const knownSource = knownSources.get(retirement.supersedes_comment_id);
-        const establishesMissingSourceTombstone = current === undefined &&
-          priorRetirement === undefined &&
-          ((knownSource?.workstream === retirement.workstream && knownSource.author === retirementAuthor) ||
-            acknowledgedRetirements.has(comment.id));
-        if (retiresCurrent || repeatsOwnedRetirement || establishesMissingSourceTombstone) {
+        if (
+          current === undefined ||
+          (current.source.id <= retirement.supersedes_comment_id && current.source.author === retirementAuthor)
+        ) {
           latest.delete(retirement.workstream);
-          retirements.set(retirement.workstream, {
-            author: retirementAuthor,
-            supersedesCommentId: retirement.supersedes_comment_id,
-          });
-          outcomes.set(comment.id, { accepted: true, recordType: "retirement", workstream: retirement.workstream });
         } else {
-          const reason = "retirement must supersede the same author's current source or owned retirement";
-          outcomes.set(comment.id, { accepted: false, reason, recordType: "retirement", workstream: retirement.workstream });
-          console.warn(`Ignoring retirement in comment ${comment.id}: ${reason}`);
+          console.warn(`Ignoring retirement in comment ${comment.id}: it must supersede the same author's current source`);
         }
         continue;
       }
       const update = validateUpdate(value);
-      knownSources.set(comment.id, {
-        workstream: update.workstream,
-        author: comment.user?.login ?? "unknown",
-      });
       latest.set(update.workstream, {
         ...update,
         source: {
@@ -207,21 +183,12 @@ export function reduceComments(comments, acknowledgedRetirements = new Set()) {
           created_at: comment.created_at,
         },
       });
-      retirements.delete(update.workstream);
-      outcomes.set(comment.id, { accepted: true, recordType: "update", workstream: update.workstream });
     } catch (error) {
-      outcomes.set(comment.id, {
-        accepted: false,
-        reason: error.message,
-        recordType: record.recordType,
-        workstream: typeof record.payload?.workstream === "string" ? record.payload.workstream : null,
-      });
       console.warn(`Ignoring invalid roadmap record in comment ${comment.id}: ${error.message}`);
     }
   }
 
-  const current = [...latest.values()];
-  const orderedUpdates = current.sort((left, right) => {
+  const orderedUpdates = [...latest.values()].sort((left, right) => {
     const sectionOrder =
       SECTION_ORDER.findIndex(([key]) => key === left.section) -
       SECTION_ORDER.findIndex(([key]) => key === right.section);
@@ -232,11 +199,7 @@ export function reduceComments(comments, acknowledgedRetirements = new Set()) {
   if (orderedUpdates.length > MAX_WORKSTREAMS) {
     console.warn(`Roadmap has ${orderedUpdates.length} workstreams; projecting the first ${MAX_WORKSTREAMS} by explicit roadmap order`);
   }
-  return { updates: orderedUpdates.slice(0, MAX_WORKSTREAMS), current, outcomes };
-}
-
-export function updatesFromComments(comments) {
-  return reduceComments(comments).updates;
+  return orderedUpdates.slice(0, MAX_WORKSTREAMS);
 }
 
 function markdownText(value) {
@@ -265,44 +228,6 @@ function renderUpdate(update, open) {
   const blockers = update.blocked_by.length === 0 ? "None" : update.blocked_by.map(markdownText).join(" · ");
   const sourceLabel = `@${update.source.author} update`;
   return `<details${open ? " open" : ""}>\n<summary><strong>${htmlText(update.title)}</strong> — ${htmlText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
-}
-
-function retirementReceipt(comment) {
-  const digest = createHash("sha256").update(comment.body).digest("hex");
-  return `<!-- phoenix-roadmap-retirement-receipt:${comment.id}:${digest} -->`;
-}
-
-function retirementReceiptSource(body) {
-  const match = body?.match(/^<!-- phoenix-roadmap-retirement-receipt:(\d+):([a-f0-9]{64}) -->$/);
-  return match ? { commentId: Number(match[1]), digest: match[2] } : null;
-}
-
-function lifecycleReceipt(comment, outcome) {
-  const digest = createHash("sha256").update(comment.body).digest("hex");
-  return `<!-- phoenix-roadmap-lifecycle-receipt:${comment.id}:${digest}:${outcome} -->`;
-}
-
-async function ensureLifecycleReceipt(owner, repo, issueNumber, comments, comment, outcome, token) {
-  const body = lifecycleReceipt(comment, outcome);
-  if (comments.some((candidate) => candidate.user?.login === "github-actions[bot]" && candidate.body === body)) return;
-  await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, token, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body }),
-  });
-}
-
-function retirementReceiptIds(comments) {
-  const receipts = new Set(
-    comments
-      .filter((comment) => comment.user?.login === "github-actions[bot]")
-      .map((comment) => comment.body),
-  );
-  return new Set(
-    comments
-      .filter((comment) => TRUSTED_ASSOCIATIONS.has(comment.author_association) && receipts.has(retirementReceipt(comment)))
-      .map((comment) => comment.id),
-  );
 }
 
 export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
@@ -365,19 +290,6 @@ async function githubRequest(path, token, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
-function trustedSnapshotKey(comments) {
-  return comments
-    .filter((comment) =>
-      Number.isSafeInteger(comment.id) &&
-      (TRUSTED_ASSOCIATIONS.has(comment.author_association) || comment.user?.login === "github-actions[bot]"),
-    )
-    .map((comment) => {
-      const digest = createHash("sha256").update(comment.body).digest("hex");
-      return `${comment.id}:${comment.updated_at ?? comment.created_at}:${digest}`;
-    })
-    .join("|");
-}
-
 async function replaceIssueBody(owner, repo, issueNumber, body, token) {
   await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token, {
     method: "PATCH",
@@ -398,156 +310,6 @@ async function listComments(owner, repo, issueNumber, token) {
 
 const LIFECYCLE_REACTIONS = new Set(["eyes", "rocket", "confused"]);
 
-async function listReactions(owner, repo, commentId, token) {
-  const reactions = [];
-  for (let page = 1; ; page += 1) {
-    const batch = await githubRequest(
-      `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions?per_page=100&page=${page}`,
-      token,
-    );
-    reactions.push(...batch);
-    if (batch.length < 100) return reactions;
-  }
-}
-
-async function ensureRetirementReceipts(owner, repo, issueNumber, comments, current, outcomes, token) {
-  const activeWorkstreams = new Set(current.map((update) => update.workstream));
-  const existing = new Set(
-    comments
-      .filter((comment) => comment.user?.login === "github-actions[bot]")
-      .map((comment) => comment.body),
-  );
-  const byId = new Map(comments.map((comment) => [comment.id, comment]));
-  const latest = new Map();
-  for (const [commentId, outcome] of outcomes) {
-    if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
-      latest.set(outcome.workstream, commentId);
-    }
-  }
-  for (const commentId of latest.values()) {
-    const body = retirementReceipt(byId.get(commentId));
-    if (!existing.has(body)) {
-      await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, token, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
-      });
-    }
-  }
-}
-
-async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
-  const reactions = await listReactions(owner, repo, commentId, token);
-  for (const reaction of reactions) {
-    if (
-      reaction.user?.login === "github-actions[bot]" &&
-      LIFECYCLE_REACTIONS.has(reaction.content) &&
-      reaction.content !== except
-    ) {
-      await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
-        method: "DELETE",
-      });
-    }
-  }
-}
-
-async function clearAcceptedReaction(owner, repo, commentId, token) {
-  const reactions = await listReactions(owner, repo, commentId, token);
-  for (const reaction of reactions) {
-    if (reaction.user?.login === "github-actions[bot]" && reaction.content === "rocket") {
-      await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
-        method: "DELETE",
-      });
-    }
-  }
-}
-
-async function rejectIfUnacknowledged(owner, repo, commentId, token) {
-  const reactions = await listReactions(owner, repo, commentId, token);
-  const botLifecycle = reactions.filter(
-    (reaction) => reaction.user?.login === "github-actions[bot]" && LIFECYCLE_REACTIONS.has(reaction.content),
-  );
-  if (botLifecycle.length === 0) {
-    await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`, token, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "confused" }),
-    });
-  }
-}
-
-function acknowledgedCommentIds(updates, current, outcomes) {
-  const acknowledged = new Set(updates.map((update) => update.source.id));
-  const activeWorkstreams = new Set(current.map((update) => update.workstream));
-  const latestRetirements = new Map();
-  for (const [commentId, outcome] of outcomes) {
-    if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
-      latestRetirements.set(outcome.workstream, commentId);
-    }
-  }
-  for (const commentId of latestRetirements.values()) acknowledged.add(commentId);
-  return acknowledged;
-}
-
-function commentsBeforeEvent(comments, event) {
-  if (event.action === "created") return comments.filter((comment) => comment.id !== event.comment.id);
-  if (event.action === "deleted") return [...comments, event.comment];
-  if (event.action === "edited" && typeof event.changes?.body?.from === "string") {
-    return comments.map((comment) => comment.id === event.comment.id
-      ? { ...comment, body: event.changes.body.from }
-      : comment);
-  }
-  return comments;
-}
-
-async function reconcileReactions(owner, repo, issueNumber, comments, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
-  for (const commentId of before) {
-    if (commentId !== triggerId && commentId !== deletedId && !after.has(commentId)) {
-      await setLifecycleReaction(owner, repo, commentId, "confused", token);
-    }
-  }
-
-  const staleCandidates = comments
-    .filter((comment) =>
-      comment.id !== triggerId &&
-      comment.id !== deletedId &&
-      !after.has(comment.id) &&
-      TRUSTED_ASSOCIATIONS.has(comment.author_association) &&
-      roadmapPayload(comment.body) !== null &&
-      (comment.reactions?.rocket ?? 0) > 0,
-    )
-    .sort((left, right) => right.id - left.id)
-    .slice(0, MAX_WORKSTREAMS);
-  for (const comment of staleCandidates) {
-    await clearAcceptedReaction(owner, repo, comment.id, token);
-  }
-
-  const ensureAccepted = new Set(projectedUpdates.map((update) => update.source.id));
-  for (const commentId of after) ensureAccepted.add(commentId);
-  ensureAccepted.delete(triggerId);
-  for (const commentId of ensureAccepted) {
-    const comment = comments.find((candidate) => candidate.id === commentId);
-    if (comment !== undefined) {
-      await ensureLifecycleReceipt(owner, repo, issueNumber, comments, comment, "accepted", token);
-    }
-    await setLifecycleReaction(owner, repo, commentId, "rocket", token);
-  }
-
-  const newestRejectedByWorkstream = new Map();
-  for (const [commentId, outcome] of outcomes) {
-    if (commentId !== triggerId && !outcome.accepted) {
-      const key = outcome.workstream ?? `comment-${commentId}`;
-      newestRejectedByWorkstream.set(key, commentId);
-    }
-  }
-  const boundedRejected = [...newestRejectedByWorkstream.values()]
-    .sort((left, right) => right - left)
-    .slice(0, MAX_WORKSTREAMS);
-  for (const commentId of boundedRejected) {
-    await rejectIfUnacknowledged(owner, repo, commentId, token);
-  }
-}
-
 async function setLifecycleReaction(owner, repo, commentId, content, token) {
   const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
   await githubRequest(path, token, {
@@ -555,25 +317,16 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  await clearLifecycleReactions(owner, repo, commentId, token, content);
-}
-
-async function postTerminalReaction(owner, repo, commentId, content, token) {
-  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
-  await githubRequest(path, token, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  try {
-    await clearLifecycleReactions(owner, repo, commentId, token, content);
-  } catch (error) {
-    console.error(`Terminal ${content} posted for comment ${commentId}, but lifecycle cleanup failed: ${error.message}`);
+  const reactions = await githubRequest(`${path}?per_page=100`, token);
+  for (const reaction of reactions) {
+    if (
+      reaction.user?.login === "github-actions[bot]" &&
+      LIFECYCLE_REACTIONS.has(reaction.content) &&
+      reaction.content !== content
+    ) {
+      await githubRequest(`${path}/${reaction.id}`, token, { method: "DELETE" });
+    }
   }
-}
-
-function isStructuredRoadmapComment(comment) {
-  return roadmapPayload(comment?.body) !== null;
 }
 
 export async function run({ event, configuredIssueNumber, token }) {
@@ -582,127 +335,31 @@ export async function run({ event, configuredIssueNumber, token }) {
   }
   if (event.issue?.number !== configuredIssueNumber) return { skipped: "not the configured roadmap Issue" };
   if (!Number.isSafeInteger(event.comment?.id) || !event.comment?.created_at) throw new Error("event lacks a triggering comment identity");
-  if (
-    !TRUSTED_ASSOCIATIONS.has(event.comment?.author_association) &&
-    event.comment?.user?.login !== "github-actions[bot]"
-  ) {
+  if (!TRUSTED_ASSOCIATIONS.has(event.comment.author_association)) {
     return { skipped: "triggering author is not trusted" };
   }
   const [owner, repo] = event.repository.full_name.split("/");
-  const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
+  const acknowledgesCreation = event.action === "created" && roadmapPayload(event.comment.body) !== null;
+  if (acknowledgesCreation) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
 
-  let terminalReactionSet = false;
-  let processingReactionSet = false;
   try {
-    if (!tracksLifecycle && event.action === "edited") {
-      await clearLifecycleReactions(owner, repo, event.comment.id, token);
-    }
-    let comments;
-    let deletedReceiptSource = null;
-    let updates;
-    let current;
-    let outcomes;
-    let before;
-    let changed;
-    let stable = false;
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
-      comments = await listComments(owner, repo, configuredIssueNumber, token);
-      if (event.action === "deleted" && event.comment.user?.login === "github-actions[bot]") {
-        deletedReceiptSource = retirementReceiptSource(event.comment.body);
-      }
-      const confirmation = await listComments(owner, repo, configuredIssueNumber, token);
-      if (trustedSnapshotKey(comments) !== trustedSnapshotKey(confirmation)) continue;
+    const comments = await listComments(owner, repo, configuredIssueNumber, token);
+    const trustedCommentIds = comments
+      .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+      .map((comment) => comment.id);
+    const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
+    const updates = updatesFromComments(comments);
+    const body = renderRoadmap(updates, snapshotThroughCommentId);
+    const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
-      const trustedCommentIds = comments
-        .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
-        .map((comment) => comment.id);
-      const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-      const retirementAcknowledgments = retirementReceiptIds(comments);
-      if (deletedReceiptSource !== null) {
-        const sourceComment = comments.find((comment) => comment.id === deletedReceiptSource.commentId);
-        if (sourceComment !== undefined) {
-          const currentDigest = createHash("sha256").update(sourceComment.body).digest("hex");
-          if (currentDigest === deletedReceiptSource.digest) {
-            retirementAcknowledgments.add(deletedReceiptSource.commentId);
-          }
-        }
-      }
-      ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
-      before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
-      const liveAttemptTrigger = comments.find((comment) => comment.id === event.comment.id);
-      if (tracksLifecycle && liveAttemptTrigger?.body === event.comment.body && !processingReactionSet) {
-        await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
-        processingReactionSet = true;
-      }
-      const body = renderRoadmap(updates, snapshotThroughCommentId);
-      changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
-
-      const after = await listComments(owner, repo, configuredIssueNumber, token);
-      if (trustedSnapshotKey(comments) === trustedSnapshotKey(after)) {
-        stable = true;
-        break;
-      }
-    }
-    if (!stable) throw new Error("roadmap comment snapshot did not stabilize after 5 reduction attempts");
-
-    let reflected = false;
-    let triggerRetirementReceiptPersisted = false;
-    const liveTrigger = comments.find((comment) => comment.id === event.comment.id);
-    const triggerRevisionIsCurrent = liveTrigger?.body === event.comment.body;
-    if (tracksLifecycle && triggerRevisionIsCurrent) {
-      const outcome = outcomes.get(event.comment.id);
-      const acknowledgedIds = acknowledgedCommentIds(updates, current, outcomes);
-      reflected = outcome?.accepted && acknowledgedIds.has(event.comment.id);
-      if (!reflected) {
-        const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
-        console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
-      }
-      if (reflected && outcome?.recordType === "retirement") {
-        await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
-      }
-      triggerRetirementReceiptPersisted = reflected && outcome?.recordType === "retirement";
-      await ensureLifecycleReceipt(
-        owner,
-        repo,
-        configuredIssueNumber,
-        comments,
-        liveTrigger,
-        reflected ? "accepted" : "rejected",
-        token,
-      );
-      await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
-      terminalReactionSet = true;
-    }
-
-    try {
-      if (!triggerRetirementReceiptPersisted) {
-        await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
-      }
-      await reconcileReactions(
-        owner,
-        repo,
-        configuredIssueNumber,
-        comments,
-        acknowledgedCommentIds(before.updates, before.current, before.outcomes),
-        acknowledgedCommentIds(updates, current, outcomes),
-        updates,
-        outcomes,
-        event.comment.id,
-        event.action === "deleted" ? event.comment.id : null,
-        token,
-      );
-    } catch (error) {
-      console.error(`Roadmap projection committed but reaction reconciliation failed: ${error.message}`);
-      throw error;
-    }
-
-    if (!tracksLifecycle) return { ...changed, updates: updates.length };
-    if (!triggerRevisionIsCurrent) return { ...changed, updates: updates.length, acknowledged: "superseded" };
-    return { ...changed, updates: updates.length, acknowledged: reflected ? "accepted" : "rejected" };
+    if (!acknowledgesCreation) return { ...changed, updates: updates.length };
+    const accepted = updates.some((update) => update.source.id === event.comment.id);
+    await setLifecycleReaction(owner, repo, event.comment.id, accepted ? "rocket" : "confused", token);
+    return { ...changed, updates: updates.length, acknowledged: accepted ? "accepted" : "rejected" };
   } catch (error) {
-    if (tracksLifecycle && !terminalReactionSet) {
+    if (acknowledgesCreation) {
       try {
-        await postTerminalReaction(owner, repo, event.comment.id, "confused", token);
+        await setLifecycleReaction(owner, repo, event.comment.id, "confused", token);
       } catch (reactionError) {
         console.error(`Could not mark comment ${event.comment.id} rejected: ${reactionError.message}`);
       }
