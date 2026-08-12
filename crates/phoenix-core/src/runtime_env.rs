@@ -131,10 +131,10 @@ impl PhoenixRuntimeEnvironment {
         &self.home
     }
 
-    /// `home/.phoenix-ide` — root of all Phoenix on-disk state.
+    /// `$PHOENIX_DATA_DIR` (or `home/.phoenix-ide`) — root of all Phoenix-owned on-disk state.
     #[must_use]
     pub fn phoenix_home(&self) -> PathBuf {
-        self.home.join(PHOENIX_HOME_SUBDIR)
+        self.data_dir.clone()
     }
 
     /// `$CODEX_HOME` (or `home/.codex`) — the Codex CLI's home directory.
@@ -243,13 +243,10 @@ impl PhoenixRuntimeEnvironment {
         )
     }
 
-    /// `home/.cache/phoenix-ide/chromium` — Chrome-for-Testing download cache.
+    /// `data_dir/chromium-cache` — Phoenix-owned Chrome-for-Testing download cache.
     #[must_use]
     pub fn chromium_cache_dir(&self) -> PathBuf {
-        self.home
-            .join(".cache")
-            .join("phoenix-ide")
-            .join("chromium")
+        self.data_dir.join("chromium-cache")
     }
 
     /// `tmp_root/namespace`, created (`mkdir -p`) and returned. Use this
@@ -321,11 +318,47 @@ mod tests {
         );
         assert_eq!(
             env.chromium_cache_dir(),
-            root.join(".cache/phoenix-ide/chromium")
+            root.join(".phoenix-ide/chromium-cache")
         );
         // Attachments live beside tmp_root (root/tmp here), not under it, so the
         // historical path is preserved.
         assert_eq!(env.attachments_dir(), root.join("phoenix-ide-attachments"));
+    }
+
+    #[test]
+    fn private_data_dir_does_not_replace_user_home() {
+        let env = PhoenixRuntimeEnvironment {
+            home: PathBuf::from("/Users/example"),
+            codex_home: PathBuf::from("/private/sidecar/.codex"),
+            data_dir: PathBuf::from("/private/sidecar/.phoenix-ide"),
+            db_path: PathBuf::from("/private/sidecar/.phoenix-ide/phoenix.db"),
+            tmp_root: PathBuf::from("/tmp/phoenix-ide"),
+        };
+
+        assert_eq!(env.home(), Path::new("/Users/example"));
+        assert_eq!(
+            env.phoenix_home(),
+            PathBuf::from("/private/sidecar/.phoenix-ide")
+        );
+        assert_eq!(
+            env.codex_auth_path(),
+            PathBuf::from("/private/sidecar/.phoenix-ide/codex-auth.json")
+        );
+        assert_eq!(
+            env.terminal_output_dir(),
+            PathBuf::from("/private/sidecar/.phoenix-ide/terminal-output")
+        );
+        assert_eq!(
+            env.builtin_skills_dir(),
+            PathBuf::from("/private/sidecar/.phoenix-ide/builtin-skills")
+        );
+        let [claude, agents, builtin] = env.skill_viewer_roots();
+        assert_eq!(claude, PathBuf::from("/Users/example/.claude/skills"));
+        assert_eq!(agents, PathBuf::from("/Users/example/.agents/skills"));
+        assert_eq!(
+            builtin,
+            PathBuf::from("/private/sidecar/.phoenix-ide/builtin-skills")
+        );
     }
 
     #[test]
