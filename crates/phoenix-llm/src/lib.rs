@@ -260,6 +260,7 @@ impl LoggingService {
             retry_attempt = telemetry.map_or(1, |value| value.retry_attempt),
             effort_source = request.effective_effort.source().as_str(),
             effort_level = request.effective_effort.level().map(ModelEffort::as_wire_name),
+            service_tier = request.service_tier.as_wire_name(),
             reserved_output_tokens = request.reserved_output_tokens(),
             input_tokens = tracing::field::Empty,
             output_tokens = tracing::field::Empty,

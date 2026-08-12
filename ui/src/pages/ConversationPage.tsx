@@ -1431,20 +1431,25 @@ function ConversationPageContent({
 
     try {
       await api.upgradeModel(conversationId, newModelId, effort, serviceTier);
-      showInfo(serviceTier === 'fast' ? `Fast mode enabled for ${newModelId}` : `Switched to ${newModelId}`);
+      const targetSupportsFast = availableModels.some(
+        (model) => model.id === newModelId && model.service_tier_capabilities === 'supported',
+      );
+      const effectiveServiceTier = serviceTier
+        ?? (targetSupportsFast ? atom.conversation?.service_tier ?? 'standard' : 'standard');
+      showInfo(effectiveServiceTier === 'fast' ? `Fast mode enabled for ${newModelId}` : `Switched to ${newModelId}`);
       dispatch({
         type: 'local_conversation_update',
         updates: {
           model: newModelId,
           effort: effort ?? null,
-          ...(serviceTier ? { service_tier: serviceTier } : {}),
+          service_tier: effectiveServiceTier,
         },
         expectedConversationId: conversationId,
       });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
-  }, [conversationId, isArchived, atom.phase, showInfo, dispatch]);
+  }, [conversationId, isArchived, atom.phase, atom.conversation?.service_tier, availableModels, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API

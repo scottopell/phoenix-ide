@@ -7143,6 +7143,25 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn update_conversation_service_tier(
+        &self,
+        id: &str,
+        service_tier: ServiceTier,
+    ) -> DbResult<()> {
+        let result = sqlx::query(
+            "UPDATE conversations SET service_tier = ?1, updated_at = ?2 WHERE id = ?3",
+        )
+        .bind(service_tier.as_wire_name())
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     pub async fn update_conversation_model_and_effort(
         &self,
         id: &str,
