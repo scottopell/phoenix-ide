@@ -584,6 +584,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     if (!stable) throw new Error("roadmap comment snapshot did not stabilize after 5 reduction attempts");
 
     let reflected = false;
+    let triggerRetirementReceiptPersisted = false;
     if (tracksLifecycle) {
       const outcome = outcomes.get(event.comment.id);
       const acknowledgedIds = acknowledgedCommentIds(updates, current, outcomes);
@@ -595,12 +596,15 @@ export async function run({ event, configuredIssueNumber, token }) {
       if (reflected && outcome?.recordType === "retirement") {
         await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
       }
+      triggerRetirementReceiptPersisted = reflected && outcome?.recordType === "retirement";
       await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
       terminalReactionSet = true;
     }
 
     try {
-      await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
+      if (!triggerRetirementReceiptPersisted) {
+        await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
+      }
       await reconcileReactions(
         owner,
         repo,
