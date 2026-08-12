@@ -329,26 +329,32 @@ async function setLifecycleReaction(owner, repo, commentId, content, token) {
     body: JSON.stringify({ content }),
   });
   const terminal = content === "rocket" || content === "confused";
-  try {
-    const reactions = [];
-    for (let page = 1; ; page += 1) {
-      const batch = await githubRequest(`${path}?per_page=100&page=${page}`, token);
-      reactions.push(...batch);
-      if (batch.length < 100) break;
-    }
-    for (const reaction of reactions) {
-      if (
-        reaction.user?.login === "github-actions[bot]" &&
-        LIFECYCLE_REACTIONS.has(reaction.content) &&
-        reaction.content !== content
-      ) {
-        await githubRequest(`${path}/${reaction.id}`, token, { method: "DELETE" });
+  const attempts = terminal ? 3 : 1;
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const reactions = [];
+      for (let page = 1; ; page += 1) {
+        const batch = await githubRequest(`${path}?per_page=100&page=${page}`, token);
+        reactions.push(...batch);
+        if (batch.length < 100) break;
       }
+      for (const reaction of reactions) {
+        if (
+          reaction.user?.login === "github-actions[bot]" &&
+          LIFECYCLE_REACTIONS.has(reaction.content) &&
+          reaction.content !== content
+        ) {
+          await githubRequest(`${path}/${reaction.id}`, token, { method: "DELETE" });
+        }
+      }
+      return;
+    } catch (error) {
+      lastError = error;
     }
-  } catch (error) {
-    if (!terminal) throw error;
-    console.warn(`Terminal ${content} posted for comment ${commentId}, but lifecycle cleanup failed: ${error.message}`);
   }
+  if (!terminal) throw lastError;
+  console.warn(`Terminal ${content} posted for comment ${commentId}, but lifecycle cleanup failed after ${attempts} attempts: ${lastError.message}`);
 }
 
 function createdRecordAccepted(comment, comments, renderedUpdates) {
