@@ -59,6 +59,37 @@ function event(action, trigger) {
   };
 }
 
+function installGitHubMock(comments, reactionSnapshots = []) {
+  const requests = [];
+  const snapshots = [...reactionSnapshots];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method ?? "GET";
+    requests.push({ url: String(url), ...options, method });
+    if (String(url).includes("/reactions") && method === "GET") {
+      return new Response(JSON.stringify(snapshots.shift() ?? []), { status: 200 });
+    }
+    if (String(url).includes("/reactions") && method === "POST") {
+      return new Response(JSON.stringify({}), { status: 201 });
+    }
+    if (String(url).includes("/reactions/") && method === "DELETE") {
+      return new Response(null, { status: 204 });
+    }
+    if (String(url).includes("/comments?") && method === "GET") {
+      return new Response(JSON.stringify(comments), { status: 200 });
+    }
+    if (method === "PATCH") return new Response(JSON.stringify({}), { status: 200 });
+    throw new Error(`Unexpected mock request: ${method} ${url}`);
+  };
+  return { requests, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+function postedReactions(requests) {
+  return requests
+    .filter((request) => request.method === "POST" && request.url.includes("/reactions"))
+    .map((request) => JSON.parse(request.body).content);
+}
+
 test("latest valid current comment wins per workstream", () => {
   const result = updatesFromComments([
     comment(1, fenced(update({ state: "Planning" }))),
@@ -198,45 +229,94 @@ test("summary fields use HTML entity escaping", () => {
   assert.doesNotMatch(body, /<summary><strong><!--/);
 });
 
-test("created and edited events rebuild the reducer-owned body", async () => {
+test("created and edited records transition from eyes to rocket after projection", async () => {
   for (const action of ["created", "edited"]) {
     const trigger = comment(2, fenced(update()), {
       updated_at: action === "edited" ? "2026-08-09T17:00:00Z" : "2026-08-09T16:02:00Z",
     });
-    const requests = [];
-    const responses = [
-      new Response(JSON.stringify([trigger]), { status: 200 }),
-      new Response(JSON.stringify({}), { status: 200 }),
-    ];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (_url, options = {}) => {
-      requests.push(options);
-      return responses.shift();
-    };
+    const mock = installGitHubMock([trigger]);
     try {
       const result = await run({ event: event(action, trigger), configuredIssueNumber: 7, token: "token" });
-      assert.deepEqual(result, { changed: true, updates: 1 });
-      const body = JSON.parse(requests.find((request) => request.method === "PATCH").body).body;
+      assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "accepted" });
+      const body = JSON.parse(mock.requests.find((request) => request.method === "PATCH").body).body;
       assert.match(body, /Generated from the current trusted comment set/);
+      assert.match(body, /issuecomment-2/);
+      assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
     } finally {
-      globalThis.fetch = originalFetch;
+      mock.restore();
     }
+  }
+});
+
+test("terminal reaction is posted before the processing reaction is removed", async () => {
+  const trigger = comment(2, fenced(update()));
+  const eyes = { id: 41, content: "eyes", user: { login: "github-actions[bot]" } };
+  const mock = installGitHubMock([trigger], [[], [eyes]]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    const terminalPost = mock.requests.findIndex(
+      (request) => request.method === "POST" && JSON.parse(request.body).content === "rocket",
+    );
+    const eyesDelete = mock.requests.findIndex(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/41"),
+    );
+    assert.ok(terminalPost >= 0);
+    assert.ok(eyesDelete > terminalPost);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("invalid structured record transitions from eyes to confused", async () => {
+  const trigger = comment(2, fenced(update({ evidence: [] })));
+  const mock = installGitHubMock([trigger]);
+  try {
+    const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "rejected" });
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("accepted retirement transitions from eyes to rocket after removing the entry", async () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const mock = installGitHubMock([current, trigger]);
+  try {
+    const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "accepted" });
+    const body = JSON.parse(mock.requests.find((request) => request.method === "PATCH").body).body;
+    assert.doesNotMatch(body, /issuecomment-1/);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("stale retirement transitions from eyes to confused", async () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const newer = comment(2, fenced(update({ state: "Newer" })), { user: { login: "owner" } });
+  const trigger = comment(3, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const mock = installGitHubMock([current, newer, trigger]);
+  try {
+    const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "rejected" });
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
+  } finally {
+    mock.restore();
   }
 });
 
 test("editing an update into invalid content removes it immediately", async () => {
   const trigger = comment(2, "No structured update remains.", { updated_at: "2026-08-09T17:00:00Z" });
-  const responses = [
-    new Response(JSON.stringify([]), { status: 200 }),
-    new Response(JSON.stringify({}), { status: 200 }),
-  ];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => responses.shift();
+  const mock = installGitHubMock([]);
   try {
     const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 0 });
+    assert.deepEqual(postedReactions(mock.requests), []);
   } finally {
-    globalThis.fetch = originalFetch;
+    mock.restore();
   }
 });
 

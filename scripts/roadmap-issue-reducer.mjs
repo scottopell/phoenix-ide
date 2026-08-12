@@ -144,8 +144,9 @@ function roadmapPayload(markdown) {
   return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
-export function updatesFromComments(comments) {
+export function reduceComments(comments) {
   const latest = new Map();
+  const outcomes = new Map();
   const ordered = [...comments]
     .filter(
       (comment) =>
@@ -168,8 +169,11 @@ export function updatesFromComments(comments) {
           (current.source.id <= retirement.supersedes_comment_id && current.source.author === retirementAuthor)
         ) {
           latest.delete(retirement.workstream);
+          outcomes.set(comment.id, { accepted: true, recordType: "retirement", workstream: retirement.workstream });
         } else {
-          console.warn(`Ignoring retirement in comment ${comment.id}: it must supersede the same author's current source`);
+          const reason = "retirement must supersede the same author's current source";
+          outcomes.set(comment.id, { accepted: false, reason, recordType: "retirement", workstream: retirement.workstream });
+          console.warn(`Ignoring retirement in comment ${comment.id}: ${reason}`);
         }
         continue;
       }
@@ -183,7 +187,9 @@ export function updatesFromComments(comments) {
           created_at: comment.created_at,
         },
       });
+      outcomes.set(comment.id, { accepted: true, recordType: "update", workstream: update.workstream });
     } catch (error) {
+      outcomes.set(comment.id, { accepted: false, reason: error.message, recordType: record.recordType });
       console.warn(`Ignoring invalid roadmap record in comment ${comment.id}: ${error.message}`);
     }
   }
@@ -199,7 +205,11 @@ export function updatesFromComments(comments) {
   if (orderedUpdates.length > MAX_WORKSTREAMS) {
     console.warn(`Roadmap has ${orderedUpdates.length} workstreams; projecting the first ${MAX_WORKSTREAMS} by explicit roadmap order`);
   }
-  return orderedUpdates.slice(0, MAX_WORKSTREAMS);
+  return { updates: orderedUpdates.slice(0, MAX_WORKSTREAMS), outcomes };
+}
+
+export function updatesFromComments(comments) {
+  return reduceComments(comments).updates;
 }
 
 function markdownText(value) {
@@ -308,6 +318,33 @@ async function listComments(owner, repo, issueNumber, token) {
   }
 }
 
+const LIFECYCLE_REACTIONS = new Set(["eyes", "rocket", "confused"]);
+
+async function setLifecycleReaction(owner, repo, commentId, content, token) {
+  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
+  const reactions = await githubRequest(`${path}?per_page=100`, token);
+  await githubRequest(path, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  for (const reaction of reactions) {
+    if (
+      reaction.user?.login === "github-actions[bot]" &&
+      LIFECYCLE_REACTIONS.has(reaction.content) &&
+      reaction.content !== content
+    ) {
+      await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
+        method: "DELETE",
+      });
+    }
+  }
+}
+
+function isStructuredRoadmapComment(comment) {
+  return roadmapPayload(comment?.body) !== null;
+}
+
 export async function run({ event, configuredIssueNumber, token }) {
   if (!["created", "edited", "deleted"].includes(event.action) || event.issue?.pull_request) {
     return { skipped: "not a supported Issue comment event" };
@@ -318,17 +355,41 @@ export async function run({ event, configuredIssueNumber, token }) {
     return { skipped: "triggering author is not trusted" };
   }
   const [owner, repo] = event.repository.full_name.split("/");
-  const comments = await listComments(owner, repo, configuredIssueNumber, token);
-  const trustedCommentIds = comments
-    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
-    .map((comment) => comment.id);
-  const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-  const updates = updatesFromComments(comments);
-  const body = renderRoadmap(updates, snapshotThroughCommentId);
-  return {
-    ...(await replaceIssueBody(owner, repo, configuredIssueNumber, body, token)),
-    updates: updates.length,
-  };
+  const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
+
+  try {
+    if (tracksLifecycle) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+    const comments = await listComments(owner, repo, configuredIssueNumber, token);
+    const trustedCommentIds = comments
+      .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+      .map((comment) => comment.id);
+    const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
+    const { updates, outcomes } = reduceComments(comments);
+    const body = renderRoadmap(updates, snapshotThroughCommentId);
+    const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
+
+    if (!tracksLifecycle) return { ...changed, updates: updates.length };
+
+    const outcome = outcomes.get(event.comment.id);
+    const reflected = outcome?.recordType === "retirement"
+      ? outcome.accepted && !updates.some((update) => update.workstream === outcome.workstream)
+      : outcome?.accepted && updates.some((update) => update.source.id === event.comment.id);
+    if (!reflected) {
+      const reason = outcome?.reason ?? "record was valid but is not present in the bounded current projection";
+      console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
+    }
+    await setLifecycleReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+    return { ...changed, updates: updates.length, acknowledged: reflected ? "accepted" : "rejected" };
+  } catch (error) {
+    if (tracksLifecycle) {
+      try {
+        await setLifecycleReaction(owner, repo, event.comment.id, "confused", token);
+      } catch (reactionError) {
+        console.error(`Could not mark comment ${event.comment.id} rejected: ${reactionError.message}`);
+      }
+    }
+    throw error;
+  }
 }
 
 async function main() {

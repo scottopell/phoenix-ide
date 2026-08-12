@@ -79,7 +79,9 @@ When you own a workstream represented on the roadmap:
 - append a new structured update when its material state, blocker, owner, or next step changes;
 - append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
 - link detailed evidence instead of copying plans into the roadmap;
-- verify that the generated Issue body reflects the comment you posted.
+- poll the source comment through the reducer reaction lifecycle: 👀 means processing, 🚀 means accepted, and 😕 means rejected;
+- on 🚀, verify that the generated Issue body snapshot includes the comment and that an update links back to that exact source comment (or that a retirement removed the entry);
+- on 😕, inspect the roadmap reducer Actions log for the validation or application error; do not treat the snapshot marker alone as acceptance.
 
 The reducer owns the Issue body; never edit it manually. The first Issue comment owns the current comment schema and limits. Use the `phoenix-development` skill for the posting procedure.
 
