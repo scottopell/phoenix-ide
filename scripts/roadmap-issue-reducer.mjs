@@ -290,6 +290,13 @@ async function githubRequest(path, token, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+function commentSnapshot(comments) {
+  return comments
+    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+    .map((comment) => `${comment.id}:${comment.updated_at ?? comment.created_at}`)
+    .join("|");
+}
+
 async function replaceIssueBody(owner, repo, issueNumber, body, token) {
   await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token, {
     method: "PATCH",
@@ -369,14 +376,26 @@ export async function run({ event, configuredIssueNumber, token }) {
 
   try {
     if (acknowledgesCreation) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
-    const comments = await listComments(owner, repo, configuredIssueNumber, token);
-    const trustedCommentIds = comments
-      .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
-      .map((comment) => comment.id);
-    const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-    const updates = updatesFromComments(comments);
-    const body = renderRoadmap(updates, snapshotThroughCommentId);
-    const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
+    let comments;
+    let updates;
+    let changed;
+    let stable = false;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      comments = await listComments(owner, repo, configuredIssueNumber, token);
+      const trustedCommentIds = comments
+        .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+        .map((comment) => comment.id);
+      const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
+      updates = updatesFromComments(comments);
+      const body = renderRoadmap(updates, snapshotThroughCommentId);
+      changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
+      const after = await listComments(owner, repo, configuredIssueNumber, token);
+      if (commentSnapshot(comments) === commentSnapshot(after)) {
+        stable = true;
+        break;
+      }
+    }
+    if (!stable) throw new Error("roadmap comments did not stabilize after 3 projection attempts");
 
     if (!acknowledgesCreation) return { ...changed, updates: updates.length };
     const accepted = createdRecordAccepted(event.comment, comments, updates);

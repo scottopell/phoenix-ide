@@ -207,6 +207,7 @@ test("edited events rebuild the reducer-owned body without lifecycle reactions",
     const responses = [
       new Response(JSON.stringify([trigger]), { status: 200 }),
       new Response(JSON.stringify({}), { status: 200 }),
+      new Response(JSON.stringify([trigger]), { status: 200 }),
     ];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (_url, options = {}) => {
@@ -232,6 +233,7 @@ test("created structured record transitions from eyes to rocket", async () => {
     new Response(JSON.stringify([]), { status: 200 }),
     new Response(JSON.stringify([trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([{ id: 10, content: "eyes", user: { login: "github-actions[bot]" } }]), { status: 200 }),
     new Response(null, { status: 204 }),
@@ -262,6 +264,7 @@ test("created retirement is accepted when its workstream is absent", async () =>
     new Response(JSON.stringify([]), { status: 200 }),
     new Response(JSON.stringify([trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([]), { status: 200 }),
   ];
@@ -303,6 +306,7 @@ test("editing an update into invalid content removes it immediately", async () =
   const responses = [
     new Response(JSON.stringify([]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([]), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => responses.shift();
@@ -320,6 +324,7 @@ test("deleted update rebuilds from remaining live comments", async () => {
   const responses = [
     new Response(JSON.stringify([remaining]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([remaining]), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
   const requests = [];
@@ -344,6 +349,7 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
   const responses = [
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => responses.shift();
