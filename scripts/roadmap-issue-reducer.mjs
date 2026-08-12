@@ -394,7 +394,9 @@ function authoritativeRetirementReceipts(comments, current, outcomes) {
     }
   }
   const byId = new Map(comments.map((comment) => [comment.id, comment]));
-  return [...latest.values()].map((commentId) => retirementReceipt(byId.get(commentId)));
+  return [...latest.values()]
+    .slice(-MAX_WORKSTREAMS)
+    .map((commentId) => retirementReceipt(byId.get(commentId)));
 }
 
 async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
@@ -523,23 +525,38 @@ export async function run({ event, configuredIssueNumber, token }) {
     } else if (event.action === "edited") {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
-    const comments = await listComments(owner, repo, configuredIssueNumber, token);
-    const confirmation = await listComments(owner, repo, configuredIssueNumber, token);
-    if (trustedSnapshotKey(comments) !== trustedSnapshotKey(confirmation)) {
-      throw new Error("roadmap comment snapshot changed during reduction; retrying from the next event");
+    let comments;
+    let updates;
+    let current;
+    let outcomes;
+    let before;
+    let changed;
+    let stable = false;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      comments = await listComments(owner, repo, configuredIssueNumber, token);
+      const confirmation = await listComments(owner, repo, configuredIssueNumber, token);
+      if (trustedSnapshotKey(comments) !== trustedSnapshotKey(confirmation)) continue;
+
+      const trustedCommentIds = comments
+        .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+        .map((comment) => comment.id);
+      const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
+      const issue = await getIssue(owner, repo, configuredIssueNumber, token);
+      const retirementAcknowledgments = retirementReceiptIds(issue.body ?? "", comments);
+      ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
+      before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
+      const receipts = authoritativeRetirementReceipts(comments, current, outcomes);
+      const body = renderRoadmap(updates, snapshotThroughCommentId, receipts);
+      changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
+      projectionCommitted = true;
+
+      const after = await listComments(owner, repo, configuredIssueNumber, token);
+      if (trustedSnapshotKey(comments) === trustedSnapshotKey(after)) {
+        stable = true;
+        break;
+      }
     }
-    const trustedCommentIds = comments
-      .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
-      .map((comment) => comment.id);
-    const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-    const issue = await getIssue(owner, repo, configuredIssueNumber, token);
-    const retirementAcknowledgments = retirementReceiptIds(issue.body ?? "", comments);
-    const { updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments);
-    const before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
-    const receipts = authoritativeRetirementReceipts(comments, current, outcomes);
-    const body = renderRoadmap(updates, snapshotThroughCommentId, receipts);
-    const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
-    projectionCommitted = true;
+    if (!stable) throw new Error("roadmap comment snapshot did not stabilize after 5 reduction attempts");
 
     let reflected = false;
     if (tracksLifecycle) {

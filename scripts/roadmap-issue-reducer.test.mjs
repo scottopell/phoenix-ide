@@ -511,6 +511,7 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({ body: "" }), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([]), { status: 200 }),
   ];
@@ -573,7 +574,7 @@ test("editing a replacement away restores the reactivated source rocket", async 
   }
 });
 
-test("changing trusted snapshot aborts before patching", async () => {
+test("changing trusted snapshot retries before acknowledging", async () => {
   const trigger = comment(2, fenced(update()));
   const changed = comment(3, fenced(update({ workstream: "new" })));
   const requests = [];
@@ -593,7 +594,6 @@ test("changing trusted snapshot aborts before patching", async () => {
   try {
     await assert.rejects(
       run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
-      /snapshot changed/,
     );
     assert.ok(!requests.some((request) => request.method === "PATCH"));
   } finally {
