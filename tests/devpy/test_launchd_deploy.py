@@ -313,7 +313,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_positional_version_is_rejected_with_release_guidance(self):
         result = subprocess.run(
-            ["python3", str(ROOT / "dev.py"), "prod", "deploy", "v1.2.3"],
+            [sys.executable, str(ROOT / "dev.py"), "prod", "deploy", "v1.2.3"],
             cwd=ROOT, capture_output=True, text=True,
         )
         self.assertNotEqual(0, result.returncode)
@@ -406,9 +406,10 @@ class PreparationTests(unittest.TestCase):
                 self.assertEqual(expected, self.dev._release_asset_name())
 
     def test_latest_resolves_once_then_downloads_immutable_tag_and_checks_checksum(self):
+        release_commit = "abc123def456" + "0" * 28
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": release_commit}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"

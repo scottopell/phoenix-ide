@@ -185,10 +185,19 @@ class SystemdManifestValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(helper.ValidationError, "candidate identity must use a full lowercase embedded git SHA"):
             self.validate()
 
-    def test_accepts_previous_identity_with_legacy_twelve_char_sha(self):
+    def install_previous_rollback_artifacts(self):
         self.raw["previous"] = {"version": "1.0.0", "git_sha": "a" * 12}
         self.raw["previous_health_url"] = "http://127.0.0.1:49151/api/version"
         self.raw["previous_deployed_sha"] = "a" * 40
+        self.raw["rollback"] = {
+            "binary": self.artifact("rollback", "old-binary"),
+            "service": self.artifact("rollback.service", "old-service"),
+            "socket": self.artifact("rollback.socket", "old-socket"),
+            "environment": self.artifact("rollback.env", "OLD=value"),
+        }
+
+    def test_accepts_previous_identity_with_legacy_twelve_char_sha(self):
+        self.install_previous_rollback_artifacts()
         self.write_manifest()
         self.validate()
 

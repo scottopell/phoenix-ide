@@ -151,7 +151,7 @@ class BareTransactionTests(unittest.TestCase):
         path.chmod(0o600)
         return {"name": name, "sha256": supervisor.sha256(path)}
 
-    def manifest(self, *, previous=False):
+    def manifest(self, *, previous=False, expected_sha=None):
         candidate_binary = self.artifact("candidate-binary", "new binary")
         candidate_environment = self.artifact("candidate.env", "MODE=new\n")
         rollback_binary = self.artifact("rollback-binary", "old binary") if previous else None
@@ -159,7 +159,7 @@ class BareTransactionTests(unittest.TestCase):
         value = {
             "manifest_version": 1,
             "transaction_id": self.transaction_id,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 40},
+            "expected": {"version": "2.0.0", "git_sha": expected_sha or "b" * 40},
             "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
             "expected_health_url": "http://127.0.0.1:49155/api/version",
             "previous_health_url": "http://127.0.0.1:49155/api/version" if previous else None,
@@ -260,11 +260,7 @@ class BareTransactionTests(unittest.TestCase):
             owner.activate(self.transaction_id, supervisor.sha256(path))
 
     def test_rejects_candidate_manifest_with_legacy_twelve_char_expected_sha(self):
-        path = self.manifest()
-        value = __import__("json").loads(path.read_text())
-        value["expected"]["git_sha"] = "b" * 12
-        path.write_text(__import__("json").dumps(value))
-        path.chmod(0o600)
+        path = self.manifest(expected_sha="b" * 12)
         owner = supervisor.Supervisor(self.layout)
         with self.assertRaisesRegex(supervisor.SupervisorError, "expected identity must use a full lowercase embedded git SHA"):
             owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
@@ -438,8 +434,8 @@ class BareTransactionTests(unittest.TestCase):
 
         owner.start_child.assert_called_once_with(
             [str(self.layout.binary)],
-            mock.ANY,
-            supervisor.RuntimeIdentity("2.0.0", "b" * 12),
+            {"MODE": "new"},
+            supervisor.RuntimeIdentity("2.0.0", "b" * 40),
             "http://127.0.0.1:49155/api/version",
             1,
         )
