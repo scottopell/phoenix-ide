@@ -189,7 +189,12 @@ export function reduceComments(comments) {
       });
       outcomes.set(comment.id, { accepted: true, recordType: "update", workstream: update.workstream });
     } catch (error) {
-      outcomes.set(comment.id, { accepted: false, reason: error.message, recordType: record.recordType });
+      outcomes.set(comment.id, {
+        accepted: false,
+        reason: error.message,
+        recordType: record.recordType,
+        workstream: typeof record.payload?.workstream === "string" ? record.payload.workstream : null,
+      });
       console.warn(`Ignoring invalid roadmap record in comment ${comment.id}: ${error.message}`);
     }
   }
@@ -359,6 +364,20 @@ async function clearAcceptedReaction(owner, repo, commentId, token) {
   }
 }
 
+async function rejectIfUnacknowledged(owner, repo, commentId, token) {
+  const reactions = await listReactions(owner, repo, commentId, token);
+  const botLifecycle = reactions.filter(
+    (reaction) => reaction.user?.login === "github-actions[bot]" && LIFECYCLE_REACTIONS.has(reaction.content),
+  );
+  if (botLifecycle.length === 0) {
+    await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`, token, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "confused" }),
+    });
+  }
+}
+
 function acknowledgedCommentIds(updates, current, outcomes) {
   const acknowledged = new Set(updates.map((update) => update.source.id));
   const activeWorkstreams = new Set(current.map((update) => update.workstream));
@@ -386,7 +405,7 @@ function commentsBeforeEvent(comments, event) {
 async function reconcileReactions(owner, repo, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
   for (const commentId of before) {
     if (commentId !== triggerId && commentId !== deletedId && !after.has(commentId)) {
-      await clearAcceptedReaction(owner, repo, commentId, token);
+      await setLifecycleReaction(owner, repo, commentId, "confused", token);
     }
   }
 
@@ -397,10 +416,18 @@ async function reconcileReactions(owner, repo, before, after, projectedUpdates, 
     await setLifecycleReaction(owner, repo, commentId, "rocket", token);
   }
 
+  const newestRejectedByWorkstream = new Map();
   for (const [commentId, outcome] of outcomes) {
     if (commentId !== triggerId && !outcome.accepted) {
-      await setLifecycleReaction(owner, repo, commentId, "confused", token);
+      const key = outcome.workstream ?? `comment-${commentId}`;
+      newestRejectedByWorkstream.set(key, commentId);
     }
+  }
+  const boundedRejected = [...newestRejectedByWorkstream.values()]
+    .sort((left, right) => right - left)
+    .slice(0, MAX_WORKSTREAMS);
+  for (const commentId of boundedRejected) {
+    await rejectIfUnacknowledged(owner, repo, commentId, token);
   }
 }
 

@@ -423,7 +423,7 @@ test("accepted retirement transitions from eyes to rocket after removing the ent
     assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "accepted" });
     const body = JSON.parse(mock.requests.find((request) => request.method === "PATCH").body).body;
     assert.doesNotMatch(body, /issuecomment-1/);
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket", "confused"]);
   } finally {
     mock.restore();
   }
