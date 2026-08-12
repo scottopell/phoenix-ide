@@ -42,7 +42,7 @@ Anchors for that current reality include `ui/src/components/WorkActions.tsx`, `u
 | REQ-WAB-009 | Implemented | Continuation still suppresses legacy finish actions on predecessors |
 | REQ-WAB-010 | Implemented | GitHub link behavior remains shipped |
 | REQ-WAB-011 | Implemented | Mobile rail behavior is shipped |
-| REQ-WAB-012 | Implemented | Desktop multi-PR rail behavior is shipped |
+| REQ-WAB-012 | Implemented | Desktop multi-PR rail and the shared-authority top-layer StateBar fallback selector are covered by `WorkActions`, `StateBar`, `SelectionDialog`, and the `mobileMultiPrConversation` fixture |
 
 ## Reconciliation Note
 

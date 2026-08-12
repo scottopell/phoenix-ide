@@ -1515,6 +1515,7 @@ function ConversationPageContent({
       });
     } catch (err) {
       console.error('Failed to upgrade model:', err);
+      throw err;
     }
   }, [conversationId, isArchived, atom.phase, atom.conversation?.service_tier, availableModels, showInfo, dispatch]);
 

@@ -396,8 +396,10 @@ describe('StateBar PR badge', () => {
     );
 
     fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
-    expect(screen.getByText('Main repo PR').closest('[role="menuitemradio"]')).toHaveAttribute('aria-checked', 'true');
-    expect(screen.getByText('Fork PR').closest('[role="menuitemradio"]')).toHaveAttribute('aria-checked', 'false');
+    const dialog = screen.getByRole('dialog', { name: /choose active pull request/i });
+    expect(dialog.parentElement).toBe(document.body);
+    expect(screen.getByText('Main repo PR').closest('[role="option"]')).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('Fork PR').closest('[role="option"]')).toHaveAttribute('aria-selected', 'false');
     expect(screen.getAllByText('Active')).toHaveLength(1);
   });
 
@@ -427,7 +429,7 @@ describe('StateBar PR badge', () => {
 
     expect(screen.queryByRole('link', { name: /^#12/i })).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
-    expect(screen.getByTestId('active-pr-ambiguity-label')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /choose active pull request/i })).toHaveTextContent('Multiple actionable PRs');
     expect(screen.getByText('b → develop · o/r')).toBeInTheDocument();
     fireEvent.click(screen.getByTestId('active-pr-choice-34'));
     await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
@@ -471,11 +473,11 @@ describe('StateBar PR badge', () => {
     fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: 'Escape' });
     await waitFor(() => expect(trigger).toHaveFocus());
 
-    fireEvent.keyDown(trigger, { key: 'Enter' });
+    fireEvent.click(trigger);
     expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
-    expect(screen.getByTestId('active-pr-ambiguity-label')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /choose active pull request/i })).toHaveTextContent('Multiple actionable PRs');
     fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'ArrowDown' });
-    fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: ' ' });
+    fireEvent.click(screen.getByTestId('active-pr-choice-34'));
     await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
     await waitFor(() => expect(trigger).toHaveFocus());
   });
@@ -681,6 +683,59 @@ describe('StateBar model picker enablement (task 02713)', () => {
     const { container } = renderWithState({ type: 'llm_requesting', attempt: 1 });
     expect(container.querySelector('button.conv-model--button')).toBeNull();
     expect(container.querySelector('span.conv-model')).not.toBeNull();
+  });
+
+  it('explains the mobile model lock while an operation is in flight', () => {
+    setMobileViewport(true);
+    renderWithState({ type: 'llm_requesting', attempt: 1 });
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.getByText(/Locked while the current operation is running/i)).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: /model and effort/i })).not.toBeInTheDocument();
+  });
+
+  it('discards staged model edits if the conversation starts work', () => {
+    setMobileViewport(true);
+    const onUpgradeModel = vi.fn();
+    const { rerender } = renderWithState({ type: 'idle' });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
+    fireEvent.click(screen.getByRole('radio', { name: /claude-opus-4-7/i }));
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'llm_requesting', attempt: 1 }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          availableModels={models}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('dialog', { name: /model and effort/i })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          availableModels={models}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('dialog', { name: /model and effort/i })).not.toBeInTheDocument();
+    expect(onUpgradeModel).not.toHaveBeenCalled();
   });
 
   it('disables the model picker while a tool is executing', () => {
@@ -1285,8 +1340,10 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByTitle(/Model: claude-sonnet-5/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
-    expect(screen.getByRole('listbox', { name: /select model/i })).toBeInTheDocument();
-    expect(screen.getByRole('listbox', { name: /select effort/i })).toBeInTheDocument();
+    const dialog = screen.getByRole('dialog', { name: /model and effort/i });
+    expect(dialog.parentElement).toBe(document.body);
+    expect(screen.getByRole('radiogroup', { name: /select model/i })).toBeInTheDocument();
+    expect(screen.getByRole('radiogroup', { name: /select effort/i })).toBeInTheDocument();
   });
 
   it('sends explicit effort changes from the state bar', () => {
@@ -1299,9 +1356,39 @@ describe('StateBar mobile layout', () => {
 
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
     fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
-    fireEvent.click(screen.getByRole('option', { name: 'High' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'High' }));
+    expect(onUpgradeModel).not.toHaveBeenCalled();
+    expect(screen.getByRole('radio', { name: 'High' })).toHaveAttribute('aria-checked', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
     expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', 'high');
+  });
+
+  it('cancels staged model and effort without mutation', async () => {
+    const onUpgradeModel = vi.fn();
+    renderStateBar({ availableModels: pickerModels, onUpgradeModel });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    const trigger = screen.getByTitle(/Model: claude-sonnet-5/i);
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole('radio', { name: /claude-opus-4-7/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(onUpgradeModel).not.toHaveBeenCalled();
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('keeps a failed atomic update open with retryable error feedback', async () => {
+    const onUpgradeModel = vi.fn().mockRejectedValue(new Error('Model update failed'));
+    renderStateBar({ availableModels: pickerModels, onUpgradeModel });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
+    fireEvent.click(screen.getByRole('radio', { name: /claude-opus-4-7/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Model update failed');
+    expect(screen.getByRole('dialog', { name: /model and effort/i })).toBeInTheDocument();
   });
 
   it('preserves compatible effort when switching models', () => {
@@ -1329,7 +1416,9 @@ describe('StateBar mobile layout', () => {
 
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
     fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
-    fireEvent.click(screen.getByRole('option', { name: /claude-opus-compatible/i }));
+    fireEvent.click(screen.getByRole('radio', { name: /claude-opus-compatible/i }));
+    expect(onUpgradeModel).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
     expect(onUpgradeModel).toHaveBeenCalledWith('claude-opus-compatible', 'high');
   });
@@ -1344,7 +1433,9 @@ describe('StateBar mobile layout', () => {
 
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
     fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
-    fireEvent.click(screen.getByRole('option', { name: /claude-opus-4-7/i }));
+    fireEvent.click(screen.getByRole('radio', { name: /claude-opus-4-7/i }));
+    expect(screen.getByText(/Effort controls are unavailable because this model's effort capabilities are unknown/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
 
     expect(onUpgradeModel).toHaveBeenCalledWith('claude-opus-4-7', null);
   });

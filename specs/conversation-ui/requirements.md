@@ -298,6 +298,12 @@ WHEN viewport is desktop-sized (> 1024px)
 THE SYSTEM SHALL use sidebar layout per REQ-CONV-016
 AND support full keyboard navigation
 
+**REQ-CONV-010g:** When an existing conversation is in a settled phase that permits model changes, the compact conversation layout SHALL provide one touch-friendly dialog in the browser top layer for staging model and compatible effort choices and SHALL submit the final pair atomically only after explicit confirmation.
+
+**REQ-CONV-010h:** When an existing conversation has an operation in flight, the compact conversation layout SHALL keep its current model and effort visible, SHALL explain that changing them requires the operation to finish or be cancelled, and SHALL NOT represent the locked setting as an editable control or queue a deferred change.
+
+**REQ-CONV-010i:** A compact StateBar selection dialog SHALL remain within safe-area and viewport bounds, SHALL scroll its choices internally, SHALL provide controls at least 44 by 44 CSS pixels, SHALL prevent interaction with obscured background controls, and SHALL restore focus to its invoking control when dismissed or completed.
+
 **Rationale:** Phoenix serves both mobile (on-the-go monitoring) and desktop (primary development) use cases. Each viewport size gets optimized layout rather than one-size-fits-all responsive scaling.
 
 ---

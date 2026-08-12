@@ -20,6 +20,12 @@ Expanded.storyName = 'expanded';
 export const ChooserOpen = storyFor('chooser-open');
 ChooserOpen.storyName = 'chooser-open';
 
+export const ModelDialog = storyFor('model-dialog');
+ModelDialog.storyName = 'model-dialog';
+
+export const ModelLocked = storyFor('model-locked');
+ModelLocked.storyName = 'model-locked';
+
 export const ActivePrActions = storyFor('active-pr-actions');
 ActivePrActions.storyName = 'active-pr-actions';
 

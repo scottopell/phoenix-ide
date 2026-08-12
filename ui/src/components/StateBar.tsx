@@ -2,7 +2,6 @@ import {
   useState,
   useRef,
   useEffect,
-  useId,
   useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -29,6 +28,7 @@ import {
   getConversationIdentity,
 } from '../utils/conversationIdentity';
 import { ContextIndicator } from "./ContextIndicator";
+import { SelectionDialog } from "./SelectionDialog";
 import "./StateBar.css";
 import { setActivePrSelectorIntent, type ActivePrSelectorIntent } from './activePrSelectorIntent';
 import { derivePrRailAvailability } from './prRailAvailability';
@@ -87,12 +87,12 @@ interface StateBarProps {
   /** Continuation trigger, structurally bound to the idle phase. Absent or
    *  `{ phase: 'unavailable' }` means the trigger is unavailable. */
   continuation?: ContinuationState;
-  /** Callback invoked when the user selects model, effort, or Codex service tier. */
+  /** Callback invoked when the user confirms model, effort, and Codex service tier together. */
   onUpgradeModel?: (
     newModelId: string,
     effort?: ModelEffort | null,
     serviceTier?: 'standard' | 'fast',
-  ) => void;
+  ) => void | Promise<void>;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
    *  `null` or `undefined` when not in tool_executing.
@@ -250,17 +250,30 @@ function autoInferenceSummary(selection: NonNullable<ConversationPrStatusHandle[
   return `Auto follows the latest observed branch: ${observed.branch_name} · ${observed.repository_identity}.`;
 }
 
+function handleChoiceGroupKeyDown(
+  event: ReactKeyboardEvent<HTMLElement>,
+  selectIndex?: (index: number) => void,
+) {
+  if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
+  const options = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]:not([disabled]), [role="option"]:not([disabled])'));
+  if (options.length === 0) return;
+  const currentIndex = Math.max(0, options.indexOf(document.activeElement as HTMLElement));
+  let nextIndex = currentIndex;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % options.length;
+  if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + options.length) % options.length;
+  if (event.key === 'Home') nextIndex = 0;
+  if (event.key === 'End') nextIndex = options.length - 1;
+  event.preventDefault();
+  options[nextIndex]?.focus();
+  if (nextIndex !== currentIndex) selectIndex?.(nextIndex);
+}
+
 function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const [open, setOpen] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(0);
   const [pendingAction, setPendingAction] = useState<'pin' | 'resume' | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
-  const rootRef = useRef<HTMLSpanElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
-  const menuId = useId();
   const selection = handle.activeSelection;
   const activePr = handle.activePrSummary;
   const actionablePrs = selection?.associated_prs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft') ?? [];
@@ -271,63 +284,26 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const auto = provenance === 'inferred';
   const canResume = provenance === 'pinned';
   const autoSummary = selection ? autoInferenceSummary(selection) : null;
-  const optionCount = actionablePrs.length + (canResume ? 1 : 0);
 
-  const closeMenu = (restoreFocus = true) => {
+  const closeDialog = () => {
     setOpen(false);
     setMutationError(null);
     setPendingAction(null);
-    if (!restoreFocus) return;
-    window.setTimeout(() => {
-      const restoreTarget = restoreFocusRef.current;
-      restoreFocusRef.current = null;
-      if (restoreTarget && document.contains(restoreTarget)) restoreTarget.focus();
-      else triggerRef.current?.focus();
-    }, 0);
   };
 
-  const openMenu = useCallback((focusIndex = 0, source?: HTMLElement | null) => {
+  const openDialog = useCallback((source?: HTMLElement | null) => {
     if (source) restoreFocusRef.current = source;
     setMutationError(null);
     setOpen(true);
-    setActiveIndex(Math.max(0, Math.min(focusIndex, Math.max(optionCount - 1, 0))));
-  }, [optionCount]);
-
-  useEffect(() => {
-    setActiveIndex((current) => Math.max(0, Math.min(current, Math.max(optionCount - 1, 0))));
-  }, [optionCount]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) closeMenu(false);
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        closeMenu();
-      }
-    };
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    itemRefs.current[activeIndex]?.focus();
-  }, [open, activeIndex]);
+  }, []);
 
   useEffect(() => {
     const intent: ActivePrSelectorIntent = {
       owner: Symbol('active-pr-selector-intent'),
-      requestOpen: () => openMenu(0, document.activeElement instanceof HTMLElement ? document.activeElement : null),
+      requestOpen: () => openDialog(document.activeElement instanceof HTMLElement ? document.activeElement : null),
     };
     return setActivePrSelectorIntent(intent);
-  }, [openMenu]);
+  }, [openDialog]);
 
   if (actionablePrs.length === 0 && !activePr && !ambiguous) return null;
 
@@ -338,7 +314,7 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
     setMutationError(null);
     try {
       await handle.pinActivePr?.({ repo_owner: pr.repo_owner, repo_name: pr.repo_name, pr_number: pr.pr_number });
-      closeMenu();
+      closeDialog();
     } catch (error) {
       setPendingAction(null);
       setMutationError(error instanceof Error ? error.message : 'Failed to set active PR');
@@ -351,69 +327,26 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
     setMutationError(null);
     try {
       await handle.resumeInference?.();
-      closeMenu();
+      closeDialog();
     } catch (error) {
       setPendingAction(null);
       setMutationError(error instanceof Error ? error.message : 'Failed to resume automatic PR selection');
     }
   };
 
-  const onMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (optionCount === 0) return;
-    switch (event.key) {
-      case 'ArrowDown':
-      case 'ArrowRight':
-        event.preventDefault();
-        setActiveIndex((current) => (current + 1) % optionCount);
-        break;
-      case 'ArrowUp':
-      case 'ArrowLeft':
-        event.preventDefault();
-        setActiveIndex((current) => (current - 1 + optionCount) % optionCount);
-        break;
-      case 'Home':
-        event.preventDefault();
-        setActiveIndex(0);
-        break;
-      case 'End':
-        event.preventDefault();
-        setActiveIndex(optionCount - 1);
-        break;
-      case 'Enter':
-      case ' ': {
-        event.preventDefault();
-        if (activeIndex < actionablePrs.length) void runPin(activeIndex);
-        else void runResume();
-        break;
-      }
-      case 'Escape':
-        event.preventDefault();
-        closeMenu();
-        break;
-    }
-  };
-
   return (
-    <span className="active-pr-selector" ref={rootRef}>
+    <span className="active-pr-selector">
       <button
         ref={triggerRef}
         type="button"
         className={`active-pr-selector-trigger${ambiguous ? ' active-pr-selector-trigger--ambiguous' : ''}${open ? ' active-pr-selector-trigger--open' : ''}`}
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
-        aria-controls={open ? menuId : undefined}
         aria-label={ambiguous ? 'Select active pull request' : `Active pull request ${activeLabel}`}
         data-testid="active-pr-selector-trigger"
         onClick={(event) => {
           event.stopPropagation();
-          if (open) closeMenu();
-          else openMenu(0, event.currentTarget);
-        }}
-        onKeyDown={(event) => {
-          if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            openMenu(event.key === 'ArrowUp' && optionCount > 0 ? optionCount - 1 : 0, event.currentTarget);
-          }
+          openDialog(event.currentTarget);
         }}
       >
         <span className="active-pr-selector-label">{ambiguous ? 'PR ?' : activeLabel}</span>
@@ -421,80 +354,69 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
         {auto && activePr && <span className="active-pr-selector-badge">Auto</span>}
       </button>
       {open && (
-        <div
-          id={menuId}
-          ref={menuRef}
-          className="active-pr-selector-menu"
-          role="menu"
-          aria-label="Active pull request choices"
-          onKeyDown={onMenuKeyDown}
+        <SelectionDialog
+          title="Choose active pull request"
+          description={ambiguous ? 'Multiple actionable PRs are associated with this work. Choose the one Phoenix should target.' : 'Choose which pull request Phoenix should target for this work.'}
+          onClose={closeDialog}
+          dismissible={pendingAction === null}
+          restoreFocusRef={restoreFocusRef}
+          ariaBusy={pendingAction !== null}
+          className="active-pr-dialog"
         >
-          {ambiguous && (
-            <div className="active-pr-selector-note" data-testid="active-pr-ambiguity-label">
-              Multiple actionable PRs — choose one.
-            </div>
-          )}
           {autoSummary && auto && (
             <div className="active-pr-selector-auto-summary" data-testid="active-pr-auto-summary">{autoSummary}</div>
           )}
-          {actionablePrs.map((pr, index) => {
-            const isActive = activePr?.repo_owner === pr.repo_owner
-              && activePr.repo_name === pr.repo_name
-              && activePr.pr_number === pr.pr_number;
-            return (
+          <div className="active-pr-selector-options" role="listbox" aria-label="Active pull request choices" onKeyDown={(event) => handleChoiceGroupKeyDown(event)}>
+            {actionablePrs.map((pr, index) => {
+              const isActive = activePr?.repo_owner === pr.repo_owner
+                && activePr.repo_name === pr.repo_name
+                && activePr.pr_number === pr.pr_number;
+              return (
+                <button
+                  key={`${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`}
+                  type="button"
+                  role="option"
+                  aria-selected={isActive}
+                  className={`active-pr-selector-item${isActive ? ' active-pr-selector-item--active' : ''}`}
+                  data-testid={`active-pr-choice-${pr.pr_number}`}
+                  data-selection-dialog-autofocus={index === 0 ? '' : undefined}
+                  disabled={pendingAction !== null}
+                  onClick={() => void runPin(index)}
+                >
+                  <span className="active-pr-selector-item-main">
+                    <span className="active-pr-selector-item-line">
+                      <span className="active-pr-selector-item-label">#{pr.pr_number}</span>
+                      <span className="active-pr-selector-item-title">{pr.title}</span>
+                      <span className="active-pr-selector-item-state">{pr.display_state === 'draft' ? 'Draft' : 'Open'}</span>
+                      {isActive && <span className="active-pr-selector-item-state">Active</span>}
+                    </span>
+                    <span className="active-pr-selector-item-meta">{selectorMetaLabel(pr)}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          {canResume && (
+            <div className="active-pr-selector-auto-action">
               <button
-                key={`${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`}
-                ref={(element) => {
-                  itemRefs.current[index] = element;
-                }}
                 type="button"
-                role="menuitemradio"
-                aria-checked={isActive}
-                className={`active-pr-selector-item${isActive ? ' active-pr-selector-item--active' : ''}`}
-                data-testid={`active-pr-choice-${pr.pr_number}`}
+                className="active-pr-selector-item active-pr-selector-item--resume"
+                data-testid="active-pr-resume-inference"
                 disabled={pendingAction !== null}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void runPin(index);
-                }}
+                onClick={() => void runResume()}
               >
                 <span className="active-pr-selector-item-main">
-                  <span className="active-pr-selector-item-line">
-                    <span className="active-pr-selector-item-label">#{pr.pr_number}</span>
-                    <span className="active-pr-selector-item-title">{pr.title}</span>
-                    {isActive && <span className="active-pr-selector-item-state">Active</span>}
+                  <span className="active-pr-selector-item-line active-pr-selector-item-line--resume">
+                    <span className="active-pr-selector-item-title">{pendingAction === 'resume' ? 'Resuming automatic selection…' : 'Resume automatic selection'}</span>
                   </span>
-                  <span className="active-pr-selector-item-meta">{selectorMetaLabel(pr)}</span>
+                  {selection && <span className="active-pr-selector-item-meta">{autoInferenceSummary(selection)}</span>}
                 </span>
               </button>
-            );
-          })}
-          {canResume && (
-            <button
-              ref={(element) => {
-                itemRefs.current[actionablePrs.length] = element;
-              }}
-              type="button"
-              role="menuitem"
-              className="active-pr-selector-item active-pr-selector-item--resume"
-              data-testid="active-pr-resume-inference"
-              disabled={pendingAction !== null}
-              onClick={(event) => {
-                event.stopPropagation();
-                void runResume();
-              }}
-            >
-              <span className="active-pr-selector-item-main">
-                <span className="active-pr-selector-item-line active-pr-selector-item-line--resume">
-                  <span className="active-pr-selector-item-title">{pendingAction === 'resume' ? 'Resuming automatic selection…' : 'Resume automatic selection'}</span>
-                </span>
-                {selection && <span className="active-pr-selector-item-meta">{autoInferenceSummary(selection)}</span>}
-              </span>
-            </button>
+            </div>
           )}
           {pendingAction && <div className="active-pr-selector-status" role="status">Saving active PR…</div>}
           {mutationError && <div className="active-pr-selector-error" role="alert">{mutationError}</div>}
-        </div>
+        </SelectionDialog>
       )}
     </span>
   );
@@ -547,6 +469,10 @@ export function StateBar({
   void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
+  const [stagedModel, setStagedModel] = useState('');
+  const [stagedEffort, setStagedEffort] = useState<ModelEffort | null>(null);
+  const [modelMutationPending, setModelMutationPending] = useState(false);
+  const [modelMutationError, setModelMutationError] = useState<string | null>(null);
   const usesCompactLayout = useIsCompactLayout();
   const [mobileExpanded, setMobileExpanded] = useState(false);
   // Collapse the mobile-expanded section when the viewport widens past
@@ -555,7 +481,7 @@ export function StateBar({
   useEffect(() => {
     if (!usesCompactLayout) setMobileExpanded(false);
   }, [usesCompactLayout]);
-  const pickerRef = useRef<HTMLSpanElement>(null);
+  const pickerTriggerRef = useRef<HTMLButtonElement>(null);
 
   // Live elapsed-time counter, generalized for every working phase
   // (REQ-WPV-001 / REQ-WPV-003). The source of truth is the server-
@@ -680,28 +606,6 @@ export function StateBar({
     convState,
     firstByteRequestId,
   ]);
-
-  // Close model picker on outside click
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
-        setPickerOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [pickerOpen]);
-
-  // Close model picker on Escape
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setPickerOpen(false);
-    };
-    document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  }, [pickerOpen]);
 
   let dotClass = "dot";
   let stateText = "";
@@ -950,40 +854,62 @@ export function StateBar({
     canChangeModelInState(convState)
   );
 
-  // Default list: recommended models plus the currently selected one (if not recommended).
-  // "Show all" expands to the full list. Always deduplicate by id.
+  useEffect(() => {
+    if (canPickModel || !pickerOpen) return;
+    setPickerOpen(false);
+    setStagedModel('');
+    setStagedEffort(null);
+    setModelMutationError(null);
+  }, [canPickModel, pickerOpen]);
+
   const pickerModels: ModelInfo[] = (() => {
     if (!availableModels) return [];
     if (pickerShowAll) return availableModels;
-    const recommended = availableModels.filter((m) => m.recommended);
-    if (currentModel && !recommended.some((m) => m.id === currentModel)) {
-      const current = availableModels.find((m) => m.id === currentModel);
-      if (current) return [current, ...recommended];
+    const recommended = availableModels.filter((model) => model.recommended);
+    const selectedId = stagedModel || currentModel;
+    if (selectedId && !recommended.some((model) => model.id === selectedId)) {
+      const selected = availableModels.find((model) => model.id === selectedId);
+      if (selected) return [selected, ...recommended];
     }
     return recommended;
   })();
+  const stagedModelInfo = availableModels?.find((model) => model.id === stagedModel);
+  const stagedEffortCapabilities = stagedModelInfo?.effort_capabilities;
+  const modelSelectionChanged = stagedModel !== currentModel || stagedEffort !== persistedEffort;
 
-  const handleModelTriggerClick = () => {
+  const openModelDialog = () => {
     if (!canPickModel) return;
-    setPickerOpen((v) => !v);
+    setStagedModel(currentModel);
+    setStagedEffort(effortCompatible(currentEffortCapabilities, persistedEffort) ? persistedEffort : null);
+    setModelMutationError(null);
+    setPickerOpen(true);
   };
 
-  const handleSelectModel = (modelId: string) => {
+  const closeModelDialog = () => {
+    if (modelMutationPending) return;
     setPickerOpen(false);
-    if (!onUpgradeModel) return;
-    if (modelId === currentModel) return;
+    setModelMutationError(null);
+  };
+
+  const stageModel = (modelId: string) => {
     const targetCapabilities = availableModels?.find((model) => model.id === modelId)?.effort_capabilities;
-    const compatibleEffort = effortCompatible(targetCapabilities, persistedEffort)
-      ? persistedEffort
-      : null;
-    onUpgradeModel(modelId, compatibleEffort);
+    setStagedModel(modelId);
+    setStagedEffort((effort) => effortCompatible(targetCapabilities, effort) ? effort : null);
+    setModelMutationError(null);
   };
 
-  const handleSelectEffort = (effort: ModelEffort | null) => {
-    setPickerOpen(false);
-    if (!onUpgradeModel || !currentModel) return;
-    if (persistedEffort === effort) return;
-    onUpgradeModel(currentModel, effort);
+  const applyModelSelection = async () => {
+    if (!onUpgradeModel || !stagedModel || !modelSelectionChanged || modelMutationPending) return;
+    setModelMutationPending(true);
+    setModelMutationError(null);
+    try {
+      await onUpgradeModel(stagedModel, stagedEffort);
+      setPickerOpen(false);
+    } catch (error) {
+      setModelMutationError(error instanceof Error ? error.message : 'Failed to update model and effort');
+    } finally {
+      setModelMutationPending(false);
+    }
   };
 
   const handleSelectServiceTier = (serviceTier: 'standard' | 'fast') => {
@@ -1049,147 +975,129 @@ export function StateBar({
   );
 
   const renderModelControl = (variant: "desktop" | "mobile" = "desktop") => (
-    <span
-      className={`conv-model-wrapper${variant === "mobile" ? " conv-model-wrapper--mobile" : ""}`}
-      ref={pickerRef}
-    >
+    <span className={`conv-model-wrapper${variant === "mobile" ? " conv-model-wrapper--mobile" : ""}`}>
       {canPickModel ? (
         <button
+          ref={pickerTriggerRef}
+          type="button"
           className="conv-model conv-model--button"
           title={`Model: ${conversation?.model ?? "default"} (click to change)`}
-          onClick={(e) => {
-            e.stopPropagation();
-            handleModelTriggerClick();
+          onClick={(event) => {
+            event.stopPropagation();
+            openModelDialog();
           }}
-          aria-haspopup="listbox"
+          aria-haspopup="dialog"
           aria-expanded={pickerOpen}
         >
-          {variant === "mobile"
-            ? (conversation?.model ?? "default")
-            : modelAbbrev}
-          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
-            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
-          )}
-          {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
-          <span className="conv-model-caret" aria-hidden="true">
-            &#9662;
+          <span className="conv-model-value">
+            {variant === "mobile" ? (conversation?.model ?? "default") : modelAbbrev}
+            {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
+              <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+            )}
+            {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
           </span>
+          <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
         </button>
       ) : (
-        <span
-          className="conv-model"
-          title={`Model: ${conversation?.model ?? "default"}`}
-        >
-          {variant === "mobile"
-            ? (conversation?.model ?? "default")
-            : modelAbbrev}
-          {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
-            <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+        <span className="conv-model-readonly">
+          <span className="conv-model" title={`Model: ${conversation?.model ?? "default"}`}>
+            {variant === "mobile" ? (conversation?.model ?? "default") : modelAbbrev}
+            {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
+              <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
+            )}
+          </span>
+          {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && (
+            <span className="conv-model-lock-reason">Locked while the current operation is running. Finish or cancel it to change model or effort.</span>
           )}
           {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
         </span>
       )}
       {pickerOpen && canPickModel && (
-        <div className="model-picker" role="listbox" aria-label="Select model">
-          <div className="model-picker-list">
-            {pickerModels.map((m) => {
-              const selected = m.id === currentModel;
-              return (
-                <button
-                  key={m.id}
-                  type="button"
-                  role="option"
-                  aria-selected={selected}
-                  className={
-                    "model-picker-item" +
-                    (selected ? " model-picker-item--selected" : "")
-                  }
-                  onClick={() => handleSelectModel(m.id)}
-                  title={m.description || m.id}
-                >
-                  <span className="model-picker-item-check" aria-hidden="true">
-                    {selected ? <CheckIcon /> : null}
-                  </span>
-                  <span className="model-picker-item-id">{m.id}</span>
-                  <span className="model-picker-item-ctx">
-                    {formatContextWindow(m.context_window)}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          {(currentEffortCapabilities?.support === 'supported' || effortIsStale) && (
-            <div className="model-picker-list" role="listbox" aria-label="Select effort">
-              <button
-                type="button"
-                role="option"
-                aria-selected={currentEffort === null}
-                className={
-                  'model-picker-item' +
-                  (currentEffort === null ? ' model-picker-item--selected' : '')
-                }
-                onClick={() => handleSelectEffort(null)}
-                title={effortTriggerLabel(null, currentEffortCapabilities)}
-              >
-                <span className="model-picker-item-check" aria-hidden="true">
-                  {currentEffort === null ? <CheckIcon /> : null}
-                </span>
-                <span className="model-picker-item-id">{effortTriggerLabel(null, currentEffortCapabilities)}</span>
+        <SelectionDialog
+          title="Model and effort"
+          description="Choose the model and reasoning effort for the next turn. Changes apply together."
+          onClose={closeModelDialog}
+          dismissible={!modelMutationPending}
+          restoreFocusRef={pickerTriggerRef}
+          ariaBusy={modelMutationPending}
+          className="model-selection-dialog"
+          footer={
+            <>
+              <button type="button" className="selection-dialog__cancel" onClick={closeModelDialog} disabled={modelMutationPending}>Cancel</button>
+              <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!modelSelectionChanged || modelMutationPending}>
+                {modelMutationPending ? 'Applying…' : 'Apply'}
               </button>
-              {currentEffortCapabilities?.support === 'supported' && currentEffortCapabilities.levels.map((level) => {
-                const selected = currentEffort === level;
+            </>
+          }
+        >
+          <fieldset className="model-picker-section">
+            <legend>Model</legend>
+            <div className="model-picker-list" role="radiogroup" aria-label="Select model" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => { const model = pickerModels[index]; if (model) stageModel(model.id); })}>
+              {pickerModels.map((model, index) => {
+                const selected = model.id === stagedModel;
                 return (
                   <button
-                    key={level}
+                    key={model.id}
                     type="button"
-                    role="option"
-                    aria-selected={selected}
-                    className={
-                      'model-picker-item' +
-                      (selected ? ' model-picker-item--selected' : '')
-                    }
-                    onClick={() => handleSelectEffort(level)}
-                    title={`Effort: ${effortLabel(level)}`}
-                  >
-                    <span className="model-picker-item-check" aria-hidden="true">
-                      {selected ? <CheckIcon /> : null}
-                    </span>
-                    <span className="model-picker-item-id">{effortLabel(level)}</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          {supportsFastMode && (
-            <div className="model-picker-list" role="listbox" aria-label="Select speed">
-              {(['standard', 'fast'] as const).map((tier) => {
-                const selected = currentServiceTier === tier;
-                return (
-                  <button
-                    key={tier}
-                    type="button"
-                    role="option"
-                    aria-selected={selected}
-                    className={'model-picker-item' + (selected ? ' model-picker-item--selected' : '')}
-                    onClick={() => handleSelectServiceTier(tier)}
-                    title={tier === 'fast' ? 'Fast: 1.5x speed, increased usage' : 'Standard speed and usage'}
+                    role="radio"
+                    aria-checked={selected}
+                    className={`model-picker-item${selected ? " model-picker-item--selected" : ""}`}
+                    onClick={() => stageModel(model.id)}
+                    title={model.description || model.id}
+                    data-selection-dialog-autofocus={index === 0 ? '' : undefined}
                   >
                     <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
-                    <span className="model-picker-item-id">{tier === 'fast' ? 'Fast · 1.5x speed, increased usage' : 'Standard'}</span>
+                    <span className="model-picker-item-main">
+                      <span className="model-picker-item-id">{model.id}</span>
+                      {model.description && <span className="model-picker-item-description">{model.description}</span>}
+                    </span>
+                    <span className="model-picker-item-ctx">{formatContextWindow(model.context_window)}</span>
                   </button>
                 );
               })}
             </div>
-          )}
-          <label className="model-picker-show-all-toggle">
-            <input
-              type="checkbox"
-              checked={pickerShowAll}
-              onChange={(e) => setPickerShowAll(e.target.checked)}
-            />
-            <span>Show all models</span>
-          </label>
-        </div>
+            <label className="model-picker-show-all-toggle">
+              <input type="checkbox" checked={pickerShowAll} onChange={(event) => setPickerShowAll(event.target.checked)} />
+              <span>Show all models</span>
+            </label>
+          </fieldset>
+          {stagedEffortCapabilities?.support === 'supported' ? (
+            <fieldset className="model-picker-section">
+              <legend>Effort</legend>
+              <div className="model-picker-list model-picker-effort-list" role="radiogroup" aria-label="Select effort" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedEffort(index === 0 ? null : stagedEffortCapabilities.levels[index - 1] ?? null))}>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={stagedEffort === null}
+                  className={`model-picker-item${stagedEffort === null ? ' model-picker-item--selected' : ''}`}
+                  onClick={() => setStagedEffort(null)}
+                >
+                  <span className="model-picker-item-check" aria-hidden="true">{stagedEffort === null ? <CheckIcon /> : null}</span>
+                  <span className="model-picker-item-id">{effortTriggerLabel(null, stagedEffortCapabilities)}</span>
+                </button>
+                {stagedEffortCapabilities.levels.map((level) => {
+                  const selected = stagedEffort === level;
+                  return (
+                    <button
+                      key={level}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      className={`model-picker-item${selected ? ' model-picker-item--selected' : ''}`}
+                      onClick={() => setStagedEffort(level)}
+                    >
+                      <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
+                      <span className="model-picker-item-id">{effortLabel(level)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </fieldset>
+          ) : stagedEffortCapabilities?.support === 'unknown' ? (
+            <div className="model-picker-capability-note">Effort controls are unavailable because this model's effort capabilities are unknown.</div>
+          ) : null}
+          {modelMutationError && <div className="model-picker-error" role="alert">{modelMutationError}</div>}
+        </SelectionDialog>
       )}
     </span>
   );

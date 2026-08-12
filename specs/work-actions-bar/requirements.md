@@ -348,7 +348,10 @@ expanding it.
 
 The Work Actions rail and StateBar selector SHALL derive availability from the same rule. The
 StateBar selector SHALL remain available while Work Actions is hidden, while fewer than two desktop
-PRs are actionable, or when a terminal active PR cannot be represented by the rail.
+PRs are actionable, or when a terminal active PR cannot be represented by the rail. The StateBar
+selector SHALL open a top-layer single-select dialog that cannot be clipped or obscured by StateBar
+or conversation layout boundaries, SHALL identify candidates by complete repository-plus-PR
+identity, and SHALL preserve the shared `pr-association` authority without local selection state.
 
 ---
 

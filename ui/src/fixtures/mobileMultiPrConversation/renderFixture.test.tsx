@@ -81,7 +81,7 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(screen.getByTestId('mobile-pr-actions')).toHaveTextContent('feature/mobile-pr-selector → main');
   });
 
-  it('expands the active PR into hero and secondary action rows', async () => {
+  it('opens the StateBar active-PR dialog while in-flight Work Actions are hidden', async () => {
     setMobileViewport();
     const scenario = getMobileMultiPrConversationScenario('chooser-open');
     render(<MobileMultiPrConversationFixture scenario={scenario} />);
@@ -90,11 +90,23 @@ describe('MobileMultiPrConversationFixture', () => {
       expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
     });
 
-    expect(screen.getByTestId('mobile-primary-address-feedback')).toHaveTextContent('Address feedback · 2 new');
-    expect(screen.getByRole('button', { name: 'PR #423 diff' })).toHaveTextContent('PR diff');
-    expect(screen.getByRole('button', { name: 'Workspace diff' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Clean up' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toHaveClass('mobile-pr-action--danger');
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /choose active pull request/i })).toBeInTheDocument();
+    expect(screen.getByRole('listbox', { name: /active pull request choices/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
+    expect(screen.getByText(/Locked while the current operation is running/i)).toBeInTheDocument();
+  });
+
+  it('opens the idle model-and-effort dialog through its real StateBar trigger', async () => {
+    setMobileViewport();
+    const scenario = getMobileMultiPrConversationScenario('model-dialog');
+    render(<MobileMultiPrConversationFixture scenario={scenario} />);
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
+    });
+
+    expect(screen.getByRole('dialog', { name: /model and effort/i })).toBeInTheDocument();
+    expect(screen.getByRole('radiogroup', { name: /select model/i })).toBeInTheDocument();
+    expect(screen.getByRole('radiogroup', { name: /select effort/i })).toBeInTheDocument();
   });
 });
