@@ -261,6 +261,21 @@ test("coalesced run repairs missing rockets on projected sources", async () => {
   }
 });
 
+test("coalesced run repairs missing rockets on authoritative retirements", async () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const retirement = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const trigger = comment(3, "Later coordination note.");
+  const mock = installGitHubMock([current, retirement, trigger], [[], []]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "POST" && request.url.includes("issues/comments/2/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
 test("editing an older retirement does not acknowledge it over the latest retirement", async () => {
   const updateComment = comment(1, fenced(update()), { user: { login: "owner" } });
   const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
@@ -269,7 +284,7 @@ test("editing an older retirement does not acknowledge it over the latest retire
   try {
     const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "rejected" });
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused", "rocket"]);
   } finally {
     mock.restore();
   }

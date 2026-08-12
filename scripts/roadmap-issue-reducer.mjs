@@ -391,9 +391,7 @@ async function reconcileAcceptedReactions(owner, repo, before, after, projectedU
   }
 
   const ensureAccepted = new Set(projectedUpdates.map((update) => update.source.id));
-  for (const commentId of after) {
-    if (!before.has(commentId)) ensureAccepted.add(commentId);
-  }
+  for (const commentId of after) ensureAccepted.add(commentId);
   ensureAccepted.delete(triggerId);
   for (const commentId of ensureAccepted) {
     await setLifecycleReaction(owner, repo, commentId, "rocket", token);
