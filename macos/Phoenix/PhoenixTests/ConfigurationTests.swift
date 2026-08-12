@@ -72,6 +72,83 @@ final class ConfigurationTests: XCTestCase {
         )
     }
 
+    func testPopupPolicyKeepsSameOriginAndAboutBlankManaged() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "about:blank"),
+                sourceURL: URL(string: "https://phoenix.example.test/login"),
+                expectedOrigin: expected
+            ),
+            .allowManagedChild
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "https://phoenix.example.test/auth/popup"),
+                sourceURL: URL(string: "https://phoenix.example.test/login"),
+                expectedOrigin: expected
+            ),
+            .allowManagedChild
+        )
+    }
+
+    func testPopupPolicyRejectsAboutBlankFromUntrustedSource() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "about:blank"),
+                sourceURL: URL(string: "https://other.example.test"),
+                expectedOrigin: expected
+            ),
+            .cancel
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "about:blank"),
+                sourceURL: nil,
+                expectedOrigin: expected
+            ),
+            .cancel
+        )
+    }
+
+    func testPopupPolicyExternalizesOnlySafeCrossOriginURLs() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "https://accounts.example.com/oauth"),
+                sourceURL: URL(string: "https://phoenix.example.test/login"),
+                expectedOrigin: expected
+            ),
+            .externalize
+        )
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.popupDecision(
+                requestURL: URL(string: "file:///tmp/secret"),
+                sourceURL: URL(string: "https://phoenix.example.test/login"),
+                expectedOrigin: expected
+            ),
+            .cancel
+        )
+    }
+
+    func testDownloadNamingSanitizesDangerousSuggestedNames() {
+        XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename(" ../../quarterly?.pdf "), "____quarterly_.pdf")
+        XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("   "), "download")
+        XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("report\u{0000}.csv"), "report_.csv")
+    }
+
+    func testDownloadNamingPicksCollisionSafeSuffixWithoutOverwriting() {
+        let directory = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
+        let existing: Set<String> = ["report.pdf", "report 2.pdf", "report 3.pdf"]
+        let destination = PhoenixDownloadNaming.uniqueDestination(
+            in: directory,
+            suggestedFilename: "report.pdf",
+            fileExists: { existing.contains($0.lastPathComponent) }
+        )
+        XCTAssertEqual(destination.lastPathComponent, "report 4.pdf")
+    }
+
     func testLoadCandidateRejectsRemoteCleartextAttachedOrigin() {
         XCTAssertThrowsError(
             try ConfigurationStore.loadCandidate(

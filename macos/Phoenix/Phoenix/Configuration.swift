@@ -36,6 +36,12 @@ struct PhoenixWebViewPolicy {
         case deny
     }
 
+    enum PopupDecision: Equatable {
+        case allowManagedChild
+        case externalize
+        case cancel
+    }
+
     static func url(for securityOrigin: SecurityOriginDescriptor) -> URL? {
         let host = securityOrigin.host.contains(":") && !securityOrigin.host.hasPrefix("[")
             ? "[\(securityOrigin.host)]"
@@ -68,6 +74,83 @@ struct PhoenixWebViewPolicy {
             return .deny
         }
         return .grant
+    }
+
+    static func popupDecision(
+        requestURL: URL?,
+        sourceURL: URL?,
+        expectedOrigin: PhoenixOrigin
+    ) -> PopupDecision {
+        guard let requestURL,
+              let sourceURL,
+              expectedOrigin.exactlyMatches(sourceURL) else { return .cancel }
+        if requestURL.absoluteString == "about:blank" { return .allowManagedChild }
+        if expectedOrigin.exactlyMatches(requestURL) { return .allowManagedChild }
+        if requestURL.scheme?.lowercased() == nil {
+            return .allowManagedChild
+        }
+        if safeToExternalize(requestURL) { return .externalize }
+        return .cancel
+    }
+
+    static func safeToExternalize(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return ["http", "https", "mailto", "tel"].contains(scheme)
+    }
+}
+
+enum PhoenixDownloadNaming {
+    static func sanitizedFilename(_ suggestedFilename: String) -> String {
+        let trimmed = suggestedFilename.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "download" : trimmed
+        let invalidPunctuation = CharacterSet(charactersIn: "/:\\<>|?*")
+        let pieces = base.unicodeScalars.map { scalar -> String in
+            switch scalar.value {
+            case 0..<32, 127:
+                return "_"
+            default:
+                if invalidPunctuation.contains(scalar) || scalar == "\"" {
+                    return "_"
+                }
+                return String(scalar)
+            }
+        }
+        let collapsed = pieces.joined()
+            .replacingOccurrences(of: "..", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        return collapsed.isEmpty ? "download" : collapsed
+    }
+
+    static func uniqueDestination(
+        in directory: URL,
+        suggestedFilename: String,
+        fileExists: (URL) -> Bool
+    ) -> URL {
+        let safeName = sanitizedFilename(suggestedFilename)
+        let extensionPart = (safeName as NSString).pathExtension
+        let stem = (safeName as NSString).deletingPathExtension
+        let baseStem = stem.isEmpty ? "download" : stem
+
+        func candidate(_ index: Int?) -> URL {
+            let filename: String
+            if let index {
+                filename = extensionPart.isEmpty
+                    ? "\(baseStem) \(index)"
+                    : "\(baseStem) \(index).\(extensionPart)"
+            } else {
+                filename = extensionPart.isEmpty ? baseStem : "\(baseStem).\(extensionPart)"
+            }
+            return directory.appendingPathComponent(filename)
+        }
+
+        let initial = candidate(nil)
+        guard fileExists(initial) else { return initial }
+        var suffix = 2
+        while true {
+            let proposed = candidate(suffix)
+            if !fileExists(proposed) { return proposed }
+            suffix += 1
+        }
     }
 }
 

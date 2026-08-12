@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusWindow: NSWindow?
     private var webView: WKWebView?
+    private let browserEnvironment = BrowserEnvironment()
     private let hotkey = GlobalHotkeyManager()
     let serverManager = ServerManager()
     private var cancellables = Set<AnyCancellable>()
@@ -35,7 +36,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard case .bundled = serverManager.mode else { return .terminateNow }
+        guard case .bundled = serverManager.mode else {
+            browserEnvironment.shutdown()
+            return .terminateNow
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Quit Phoenix and stop the bundled server?"
@@ -43,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Quit and Stop Phoenix")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        browserEnvironment.shutdown()
         serverManager.stop { sender.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
@@ -114,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let wrapper = WebViewWrapper(
                 origin: origin,
                 operation: operation,
+                browserEnvironment: browserEnvironment,
                 onWebViewReady: { [weak self] value, _ in
                     self?.webView = value
                     self?.openPendingConversation()
