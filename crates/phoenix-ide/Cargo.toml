@@ -4,6 +4,10 @@ version = "0.11.2"
 edition = "2021"
 rust-version = "1.95"
 
+[features]
+default = []
+datadog-tracing = ["dep:datadog-opentelemetry"]
+
 [dependencies]
 # Shared domain vocabulary (acyclic base crate)
 phoenix-core = { path = "../phoenix-core" }
@@ -114,10 +118,10 @@ tracing-appender = "0.2"
 # gRPC transport; upstream proto messages still depend on tonic codegen types.
 # Version pinning: published datadog-opentelemetry 0.4 uses opentelemetry 0.31,
 # so tracing-opentelemetry must be 0.32 (not 0.33, which needs otel 0.32).
-datadog-opentelemetry = "0.4"
+datadog-opentelemetry = { version = "0.4", optional = true }
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+opentelemetry_sdk = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 base64 = "0.22"
 sha2 = "0.11"
@@ -172,6 +176,7 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 # Re-declared with test-support so runtime tests that spawn real tmux servers
 # use the same runner-death containment owner as phoenix-tools' own tests.
 phoenix-tools = { path = "../phoenix-tools", features = ["test-support"] }

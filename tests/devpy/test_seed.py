@@ -20,10 +20,10 @@ class ModernSeedTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.dev = load_devpy()
-        binary = ROOT / "target" / "release" / "phoenix_ide"
-        cls.dev.build_rust(release=True)
+        binary = ROOT / "target" / "debug" / "phoenix_ide"
+        cls.dev.build_rust()
         if not binary.exists():
-            raise AssertionError(f"release phoenix_ide binary was not built: {binary}")
+            raise AssertionError(f"debug phoenix_ide binary was not built: {binary}")
 
     def test_fresh_seed_and_fixture_repair_use_migrated_schema(self):
         with tempfile.TemporaryDirectory(prefix="phoenix-modern-seed-") as directory:
