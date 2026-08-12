@@ -50,12 +50,13 @@ function retired(workstream = "ios-vnext", supersedesCommentId = 1) {
   return `\`\`\`phoenix-roadmap-retirement\n${JSON.stringify({ kind: "workstream-retirement", version: 1, workstream, supersedes_comment_id: supersedesCommentId }, null, 2)}\n\`\`\``;
 }
 
-function event(action, trigger) {
+function event(action, trigger, overrides = {}) {
   return {
     action,
     issue: { number: 7 },
     comment: trigger,
     repository: { full_name: "owner/repo" },
+    ...overrides,
   };
 }
 
@@ -209,6 +210,23 @@ test("workstream overflow is deterministically omitted without wedging reduction
   assert.deepEqual(result.map(({ workstream }) => workstream), Array.from({ length: 12 }, (_, index) => `stream-${index}`));
 });
 
+test("reactivation outside the projection supersedes its retirement", async () => {
+  const base = Array.from({ length: 12 }, (_, index) =>
+    comment(index + 1, fenced(update({ workstream: `stream-${index}`, order: index }))),
+  );
+  const original = comment(13, fenced(update({ workstream: "overflow", order: 99 })), { user: { login: "owner" } });
+  const retirement = comment(14, retired("overflow", 13), { user: { login: "owner" } });
+  const trigger = comment(15, fenced(update({ workstream: "overflow", order: 99 })), { user: { login: "owner" } });
+  const mock = installGitHubMock([...base, original, retirement, trigger], [[], [], []]);
+  try {
+    const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 12, acknowledged: "accepted" });
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket"]);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("evidence URL uses its dedicated 500-character limit", () => {
   const longUrl = `https://example.test/${"x".repeat(470)}`;
   assert.equal(validateUpdate(update({ evidence: [{ label: "long", url: longUrl }] })).evidence[0].url.length > 200, true);
@@ -293,7 +311,7 @@ test("replacement update clears the displaced source rocket", async () => {
   const displaced = comment(1, fenced(update({ state: "Old" })));
   const trigger = comment(2, fenced(update({ state: "New" })));
   const oldRocket = { id: 51, content: "rocket", user: { login: "github-actions[bot]" } };
-  const mock = installGitHubMock([displaced, trigger], [[], [oldRocket], []]);
+  const mock = installGitHubMock([displaced, trigger], [[], [], [oldRocket]]);
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "accepted" });
@@ -336,7 +354,7 @@ test("accepted retirement clears the retired source rocket", async () => {
   const current = comment(1, fenced(update()), { user: { login: "owner" } });
   const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
   const oldRocket = { id: 61, content: "rocket", user: { login: "github-actions[bot]" } };
-  const mock = installGitHubMock([current, trigger], [[], [oldRocket], []]);
+  const mock = installGitHubMock([current, trigger], [[], [], [oldRocket]]);
   try {
     await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.ok(mock.requests.some(
@@ -355,7 +373,7 @@ test("stale retirement transitions from eyes to confused", async () => {
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "rejected" });
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "rocket", "confused"]);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
   } finally {
     mock.restore();
   }
@@ -436,7 +454,11 @@ test("editing a replacement away restores the reactivated source rocket", async 
   const trigger = comment(2, "Replacement removed.", { updated_at: "2026-08-09T17:00:00Z" });
   const mock = installGitHubMock([reactivated, trigger], [[], []]);
   try {
-    const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
+    const result = await run({
+      event: event("edited", trigger, { changes: { body: { from: fenced(update({ state: "New" })) } } }),
+      configuredIssueNumber: 7,
+      token: "token",
+    });
     assert.deepEqual(result, { changed: true, updates: 1 });
     assert.deepEqual(postedReactions(mock.requests), ["rocket"]);
   } finally {

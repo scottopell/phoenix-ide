@@ -194,7 +194,8 @@ export function reduceComments(comments) {
     }
   }
 
-  const orderedUpdates = [...latest.values()].sort((left, right) => {
+  const current = [...latest.values()];
+  const orderedUpdates = current.sort((left, right) => {
     const sectionOrder =
       SECTION_ORDER.findIndex(([key]) => key === left.section) -
       SECTION_ORDER.findIndex(([key]) => key === right.section);
@@ -205,7 +206,7 @@ export function reduceComments(comments) {
   if (orderedUpdates.length > MAX_WORKSTREAMS) {
     console.warn(`Roadmap has ${orderedUpdates.length} workstreams; projecting the first ${MAX_WORKSTREAMS} by explicit roadmap order`);
   }
-  return { updates: orderedUpdates.slice(0, MAX_WORKSTREAMS), outcomes };
+  return { updates: orderedUpdates.slice(0, MAX_WORKSTREAMS), current, outcomes };
 }
 
 export function updatesFromComments(comments) {
@@ -358,9 +359,9 @@ async function clearAcceptedReaction(owner, repo, commentId, token) {
   }
 }
 
-function reflectedCommentIds(updates, outcomes) {
-  const reflected = new Set(updates.map((update) => update.source.id));
-  const activeWorkstreams = new Set(updates.map((update) => update.workstream));
+function reflectedCommentIds(current, outcomes) {
+  const reflected = new Set(current.map((update) => update.source.id));
+  const activeWorkstreams = new Set(current.map((update) => update.workstream));
   const latestRetirements = new Map();
   for (const [commentId, outcome] of outcomes) {
     if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
@@ -371,13 +372,26 @@ function reflectedCommentIds(updates, outcomes) {
   return reflected;
 }
 
-async function reconcileAcceptedReactions(owner, repo, comments, reflected, triggerId, token) {
-  for (const comment of comments) {
-    if (!Number.isSafeInteger(comment.id) || comment.id === triggerId) continue;
-    if (reflected.has(comment.id)) {
-      await setLifecycleReaction(owner, repo, comment.id, "rocket", token);
-    } else if (TRUSTED_ASSOCIATIONS.has(comment.author_association) && roadmapPayload(comment.body) !== null) {
-      await clearAcceptedReaction(owner, repo, comment.id, token);
+function commentsBeforeEvent(comments, event) {
+  if (event.action === "created") return comments.filter((comment) => comment.id !== event.comment.id);
+  if (event.action === "deleted") return [...comments, event.comment];
+  if (event.action === "edited" && typeof event.changes?.body?.from === "string") {
+    return comments.map((comment) => comment.id === event.comment.id
+      ? { ...comment, body: event.changes.body.from }
+      : comment);
+  }
+  return comments;
+}
+
+async function reconcileAcceptedReactionDelta(owner, repo, before, after, triggerId, token) {
+  const changed = new Set([...before, ...after]);
+  changed.delete(triggerId);
+  for (const commentId of changed) {
+    if (before.has(commentId) === after.has(commentId)) continue;
+    if (after.has(commentId)) {
+      await setLifecycleReaction(owner, repo, commentId, "rocket", token);
+    } else {
+      await clearAcceptedReaction(owner, repo, commentId, token);
     }
   }
 }
@@ -408,6 +422,7 @@ export async function run({ event, configuredIssueNumber, token }) {
   const [owner, repo] = event.repository.full_name.split("/");
   const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
 
+  let projectionCommitted = false;
   try {
     if (tracksLifecycle) {
       await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
@@ -419,35 +434,43 @@ export async function run({ event, configuredIssueNumber, token }) {
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
       .map((comment) => comment.id);
     const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-    const { updates, outcomes } = reduceComments(comments);
+    const { updates, current, outcomes } = reduceComments(comments);
+    const before = reduceComments(commentsBeforeEvent(comments, event));
     const body = renderRoadmap(updates, snapshotThroughCommentId);
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
+    projectionCommitted = true;
 
-    const reflectedIds = reflectedCommentIds(updates, outcomes);
-    if (tracksLifecycle || event.action === "edited" || event.action === "deleted") {
-      await reconcileAcceptedReactions(
+    let reflected = false;
+    if (tracksLifecycle) {
+      const outcome = outcomes.get(event.comment.id);
+      reflected = outcome?.recordType === "retirement"
+        ? outcome.accepted && !current.some((update) => update.workstream === outcome.workstream)
+        : outcome?.accepted && current.some((update) => update.source.id === event.comment.id);
+      if (!reflected) {
+        const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
+        console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
+      }
+      await setLifecycleReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+    }
+
+    try {
+      await reconcileAcceptedReactionDelta(
         owner,
         repo,
-        comments,
-        reflectedIds,
+        reflectedCommentIds(before.current, before.outcomes),
+        reflectedCommentIds(current, outcomes),
         event.comment.id,
         token,
       );
+    } catch (error) {
+      console.error(`Roadmap projection committed but reaction reconciliation failed: ${error.message}`);
+      throw error;
     }
-    if (!tracksLifecycle) return { ...changed, updates: updates.length };
 
-    const outcome = outcomes.get(event.comment.id);
-    const reflected = outcome?.recordType === "retirement"
-      ? outcome.accepted && !updates.some((update) => update.workstream === outcome.workstream)
-      : outcome?.accepted && updates.some((update) => update.source.id === event.comment.id);
-    if (!reflected) {
-      const reason = outcome?.reason ?? "record was valid but is not present in the bounded current projection";
-      console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
-    }
-    await setLifecycleReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+    if (!tracksLifecycle) return { ...changed, updates: updates.length };
     return { ...changed, updates: updates.length, acknowledged: reflected ? "accepted" : "rejected" };
   } catch (error) {
-    if (tracksLifecycle) {
+    if (tracksLifecycle && !projectionCommitted) {
       try {
         await setLifecycleReaction(owner, repo, event.comment.id, "confused", token);
       } catch (reactionError) {
