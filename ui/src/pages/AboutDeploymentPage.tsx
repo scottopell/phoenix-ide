@@ -180,7 +180,7 @@ function DeploymentSummary({ info }: { info: DeploymentInfo }) {
           <span className="about-deployment-summary__eyebrow">Running Phoenix</span>
           <h3 id="deployment-summary-title">Version {info.build.version}</h3>
         </div>
-        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{info.build.git_sha}</code>
+        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{info.build.git_sha.slice(0, 12)}</code>
       </div>
       <div className="about-deployment-summary__facts">
         <div className="about-deployment-summary__fact">

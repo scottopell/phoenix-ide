@@ -613,7 +613,7 @@ function VersionFooter() {
   return (
     <div className="settings-version-footer">
       <span>v{info.version}</span>
-      <code title="Git SHA">{info.git_sha}</code>
+      <code title={`Git SHA ${info.git_sha}`}>{info.git_sha.slice(0, 12)}</code>
     </div>
   );
 }
