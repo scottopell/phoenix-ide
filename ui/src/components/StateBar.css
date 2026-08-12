@@ -374,6 +374,12 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.model-picker-speed-list .model-picker-item-description {
+  overflow: visible;
+  text-overflow: initial;
+  white-space: normal;
+}
+
 .model-picker-capability-note,
 .model-picker-error,
 .conv-model-lock-reason {

@@ -19,6 +19,7 @@ import {
   type ModelEffort,
   type ModelInfo,
   type PrStatusResponse,
+  type ServiceTier,
 } from "../api";
 import type { ConversationPrStatusHandle } from "../hooks/useConversationPrStatus";
 import type { ConnectionState } from "../hooks";
@@ -91,7 +92,7 @@ interface StateBarProps {
   onUpgradeModel?: (
     newModelId: string,
     effort?: ModelEffort | null,
-    serviceTier?: 'standard' | 'fast',
+    serviceTier?: ServiceTier,
   ) => void | Promise<void>;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
@@ -471,6 +472,7 @@ export function StateBar({
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const [stagedModel, setStagedModel] = useState('');
   const [stagedEffort, setStagedEffort] = useState<ModelEffort | null>(null);
+  const [stagedServiceTier, setStagedServiceTier] = useState<ServiceTier>('standard');
   const [modelMutationPending, setModelMutationPending] = useState(false);
   const [modelMutationError, setModelMutationError] = useState<string | null>(null);
   const usesCompactLayout = useIsCompactLayout();
@@ -859,6 +861,7 @@ export function StateBar({
     setPickerOpen(false);
     setStagedModel('');
     setStagedEffort(null);
+    setStagedServiceTier('standard');
     setModelMutationError(null);
   }, [canPickModel, pickerOpen]);
 
@@ -875,12 +878,16 @@ export function StateBar({
   })();
   const stagedModelInfo = availableModels?.find((model) => model.id === stagedModel);
   const stagedEffortCapabilities = stagedModelInfo?.effort_capabilities;
-  const modelSelectionChanged = stagedModel !== currentModel || stagedEffort !== persistedEffort;
+  const stagedSupportsFastMode = stagedModelInfo?.service_tier_capabilities === 'supported';
+  const modelSelectionChanged = stagedModel !== currentModel
+    || stagedEffort !== persistedEffort
+    || stagedServiceTier !== currentServiceTier;
 
   const openModelDialog = () => {
     if (!canPickModel) return;
     setStagedModel(currentModel);
     setStagedEffort(effortCompatible(currentEffortCapabilities, persistedEffort) ? persistedEffort : null);
+    setStagedServiceTier(supportsFastMode ? currentServiceTier : 'standard');
     setModelMutationError(null);
     setPickerOpen(true);
   };
@@ -892,9 +899,10 @@ export function StateBar({
   };
 
   const stageModel = (modelId: string) => {
-    const targetCapabilities = availableModels?.find((model) => model.id === modelId)?.effort_capabilities;
+    const targetModel = availableModels?.find((model) => model.id === modelId);
     setStagedModel(modelId);
-    setStagedEffort((effort) => effortCompatible(targetCapabilities, effort) ? effort : null);
+    setStagedEffort((effort) => effortCompatible(targetModel?.effort_capabilities, effort) ? effort : null);
+    setStagedServiceTier((tier) => targetModel?.service_tier_capabilities === 'supported' ? tier : 'standard');
     setModelMutationError(null);
   };
 
@@ -903,19 +911,13 @@ export function StateBar({
     setModelMutationPending(true);
     setModelMutationError(null);
     try {
-      await onUpgradeModel(stagedModel, stagedEffort);
+      await onUpgradeModel(stagedModel, stagedEffort, stagedServiceTier);
       setPickerOpen(false);
     } catch (error) {
-      setModelMutationError(error instanceof Error ? error.message : 'Failed to update model and effort');
+      setModelMutationError(error instanceof Error ? error.message : 'Failed to update model, effort, and speed');
     } finally {
       setModelMutationPending(false);
     }
-  };
-
-  const handleSelectServiceTier = (serviceTier: 'standard' | 'fast') => {
-    setPickerOpen(false);
-    if (!onUpgradeModel || !currentModel || currentServiceTier === serviceTier) return;
-    onUpgradeModel(currentModel, persistedEffort, serviceTier);
   };
 
   const baseBranch = identity?.branch.base ?? null;
@@ -1005,17 +1007,17 @@ export function StateBar({
             {(currentEffortCapabilities?.support !== 'unsupported' || effortIsStale) && (
               <span className="conv-model-effort"> · {currentEffort ? `${effortLabel(currentEffort)}${effortIsStale ? ' (unsupported)' : ''}` : effortTriggerLabel(null, currentEffortCapabilities).replace('Effort: ', '')}</span>
             )}
+            {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
           </span>
           {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && (
-            <span className="conv-model-lock-reason">Locked while the current operation is running. Finish or cancel it to change model or effort.</span>
+            <span className="conv-model-lock-reason">Locked while the current operation is running. Finish or cancel it to change model, effort, or speed.</span>
           )}
-          {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
         </span>
       )}
       {pickerOpen && canPickModel && (
         <SelectionDialog
-          title="Model and effort"
-          description="Choose the model and reasoning effort for the next turn. Changes apply together."
+          title="Model, effort, and speed"
+          description="Choose the model, reasoning effort, and request speed for the next turn. Changes apply together."
           onClose={closeModelDialog}
           dismissible={!modelMutationPending}
           restoreFocusRef={pickerTriggerRef}
@@ -1096,6 +1098,39 @@ export function StateBar({
           ) : stagedEffortCapabilities?.support === 'unknown' ? (
             <div className="model-picker-capability-note">Effort controls are unavailable because this model's effort capabilities are unknown.</div>
           ) : null}
+          {stagedSupportsFastMode && (
+            <fieldset className="model-picker-section">
+              <legend>Speed</legend>
+              <div className="model-picker-list model-picker-speed-list" role="radiogroup" aria-label="Select speed" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedServiceTier(index === 1 ? 'fast' : 'standard'))}>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={stagedServiceTier === 'standard'}
+                  className={`model-picker-item${stagedServiceTier === 'standard' ? ' model-picker-item--selected' : ''}`}
+                  onClick={() => setStagedServiceTier('standard')}
+                >
+                  <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'standard' ? <CheckIcon /> : null}</span>
+                  <span className="model-picker-item-main">
+                    <span className="model-picker-item-id">Standard</span>
+                    <span className="model-picker-item-description">Standard speed and usage</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={stagedServiceTier === 'fast'}
+                  className={`model-picker-item${stagedServiceTier === 'fast' ? ' model-picker-item--selected' : ''}`}
+                  onClick={() => setStagedServiceTier('fast')}
+                >
+                  <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'fast' ? <CheckIcon /> : null}</span>
+                  <span className="model-picker-item-main">
+                    <span className="model-picker-item-id">Fast</span>
+                    <span className="model-picker-item-description">Approximately 1.5x speed, increased usage</span>
+                  </span>
+                </button>
+              </div>
+            </fieldset>
+          )}
           {modelMutationError && <div className="model-picker-error" role="alert">{modelMutationError}</div>}
         </SelectionDialog>
       )}

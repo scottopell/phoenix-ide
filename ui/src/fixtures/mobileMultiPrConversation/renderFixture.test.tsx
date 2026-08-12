@@ -105,8 +105,9 @@ describe('MobileMultiPrConversationFixture', () => {
       expect(document.documentElement.dataset['mobileMultiPrConversationFixtureReady']).toBe(scenario.id);
     });
 
-    expect(screen.getByRole('dialog', { name: /model and effort/i })).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: /model, effort, and speed/i })).toBeInTheDocument();
     expect(screen.getByRole('radiogroup', { name: /select model/i })).toBeInTheDocument();
     expect(screen.getByRole('radiogroup', { name: /select effort/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toHaveAttribute('aria-checked', 'true');
   });
 });

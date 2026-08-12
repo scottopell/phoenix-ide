@@ -57,6 +57,14 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
       trigger.click();
       return;
     }
+    if (scenario.stateBarDialog === 'model') {
+      const fastOption = document.querySelector<HTMLButtonElement>('.model-selection-dialog [aria-label="Select speed"] [role="radio"]:last-child');
+      if (!fastOption) return;
+      if (fastOption.getAttribute('aria-checked') !== 'true') {
+        fastOption.click();
+        return;
+      }
+    }
 
     if (scenario.stateBarDialog && !document.querySelector('.selection-dialog[open]')) return;
     if (scenario.id === 'model-locked' && !document.querySelector('.conv-model-lock-reason')) return;
@@ -76,12 +84,13 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
 
 const fixtureModels: ModelInfo[] = [
   {
-    id: 'claude-sonnet-4-6',
-    provider: 'anthropic',
-    description: 'Fast model for everyday coding work',
-    context_window: 200_000,
+    id: 'gpt-5.6-sol',
+    provider: 'OpenAI',
+    description: 'GPT-5.6 Sol (frontier, 1M context)',
+    context_window: 272_000,
     recommended: true,
-    effort_capabilities: { support: 'supported', levels: ['low', 'medium', 'high'], native_default: { known: 'medium' } },
+    effort_capabilities: { support: 'supported', levels: ['none', 'low', 'medium', 'high', 'xhigh'], native_default: { known: 'medium' } },
+    service_tier_capabilities: 'supported',
   },
   {
     id: 'claude-opus-4-7',
@@ -90,6 +99,7 @@ const fixtureModels: ModelInfo[] = [
     context_window: 200_000,
     recommended: true,
     effort_capabilities: { support: 'supported', levels: ['medium', 'high', 'max'], native_default: { known: 'high' } },
+    service_tier_capabilities: 'unsupported',
   },
 ];
 
@@ -169,7 +179,7 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
             connectionAttempt={0}
             nextRetryIn={null}
             contextWindowUsed={48_000}
-            modelContextWindow={200_000}
+            modelContextWindow={272_000}
             availableModels={fixtureModels}
             onUpgradeModel={async () => undefined}
             onOpenFiles={() => undefined}
