@@ -47,13 +47,13 @@ def wrapper(fixture, version, git_sha, port, *, wrong=False):
 
 def transaction(
     layout, fixture, port, transaction_id, *, previous,
-    previous_version="1.0.0", previous_git_sha="aaaaaaaaaaaa", wrong=False,
+    previous_version="1.0.0", previous_git_sha="a" * 40, wrong=False,
 ):
     directory = layout.transactions / transaction_id
     directory.mkdir(parents=True, mode=0o700)
     candidate = directory / "candidate-binary"
     environment = directory / "candidate.env"
-    write(candidate, wrapper(fixture, "2.0.0", "bbbbbbbbbbbb", port, wrong=wrong), 0o700)
+    write(candidate, wrapper(fixture, "2.0.0", "b" * 40, port, wrong=wrong), 0o700)
     write(environment, "MODE=new\n")
     rollback_binary = None
     rollback_environment = None
@@ -67,7 +67,7 @@ def transaction(
     manifest = {
         "manifest_version": 1,
         "transaction_id": transaction_id,
-        "expected": {"version": "2.0.0", "git_sha": "bbbbbbbbbbbb"},
+        "expected": {"version": "2.0.0", "git_sha": "b" * 40},
         "previous": {"version": previous_version, "git_sha": previous_git_sha} if previous else None,
         "expected_health_url": f"http://127.0.0.1:{port}/api/version",
         "previous_health_url": f"http://127.0.0.1:{port}/api/version" if previous else None,
@@ -101,7 +101,7 @@ def main():
     module = load(args.supervisor)
     args.root.mkdir(mode=0o700)
     layout = module.Layout(args.root)
-    write(layout.binary, wrapper(args.fixture, "1.0.0", "aaaaaaaaaaaa", args.port), 0o700)
+    write(layout.binary, wrapper(args.fixture, "1.0.0", "a" * 40, args.port), 0o700)
     write(layout.environment, "MODE=old\n")
     write(layout.deployed_sha, "a" * 40 + "\n")
     launcher = (
@@ -132,7 +132,7 @@ def main():
         if success["state"] != "committed":
             raise RuntimeError("bare success transaction did not commit")
         committed = module.request(layout.socket, {"protocol_version": 1, "action": "status"})["child"]
-        if committed["runtime"]["git_sha"] != "bbbbbbbbbbbb":
+        if committed["runtime"]["git_sha"] != "b" * 40:
             raise RuntimeError("bare success transaction has wrong child identity")
         if parent_pid(committed["pid"]) != supervisor_pid:
             raise RuntimeError("detached supervisor is not the direct parent of Phoenix")
@@ -141,7 +141,7 @@ def main():
 
         rollback_id, rollback_hash = transaction(
             layout, args.fixture, args.port, "c" * 32, previous=True,
-            previous_version="2.0.0", previous_git_sha="bbbbbbbbbbbb", wrong=True,
+            previous_version="2.0.0", previous_git_sha="b" * 40, wrong=True,
         )
         rollback = module.request(layout.socket, {
             "protocol_version": 1, "action": "activate",
@@ -150,7 +150,7 @@ def main():
         if rollback["state"] != "activation_failed_rolled_back":
             raise RuntimeError("bare wrong-identity transaction did not roll back")
         restored = module.request(layout.socket, {"protocol_version": 1, "action": "status"})["child"]
-        if restored["runtime"] != {"version": "2.0.0", "git_sha": "bbbbbbbbbbbb"}:
+        if restored["runtime"] != {"version": "2.0.0", "git_sha": "b" * 40}:
             raise RuntimeError("bare rollback did not restore exact committed identity")
         if parent_pid(restored["pid"]) != supervisor_pid:
             raise RuntimeError("rollback runtime is not directly owned by detached supervisor")

@@ -14,8 +14,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-OLD = {"version": "1.0.0", "git_sha": "aaaaaaaaaaaa"}
-NEW = {"version": "2.0.0", "git_sha": "bbbbbbbbbbbb"}
+OLD = {"version": "1.0.0", "git_sha": "a" * 40}
+NEW = {"version": "2.0.0", "git_sha": "b" * 40}
 
 
 def load_helper(path):

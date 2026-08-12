@@ -8701,6 +8701,23 @@ class ProdSourceKind(enum.Enum):
     INSTALLED_RESTART = "installed_restart"
 
 
+_FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_LEGACY_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}")
+_EMBEDDED_GIT_SHA_RE = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
+
+
+def _is_full_git_sha(value: str) -> bool:
+    return _FULL_GIT_SHA_RE.fullmatch(value) is not None
+
+
+def _is_legacy_git_sha(value: str) -> bool:
+    return _LEGACY_GIT_SHA_RE.fullmatch(value) is not None
+
+
+def _is_embedded_git_sha(value: str) -> bool:
+    return _EMBEDDED_GIT_SHA_RE.fullmatch(value) is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class RuntimeIdentity:
     version: str
@@ -8832,7 +8849,7 @@ def _rollback_identity_matches(
     rollback_identity = RuntimeIdentity.from_value(rollback_identity)
     previous_identity = RuntimeIdentity.from_value(previous_identity)
     rollback_sha = rollback_identity.git_sha
-    if re.fullmatch(r"[0-9a-f]{12}", rollback_sha) is None:
+    if not _is_embedded_git_sha(rollback_sha):
         return False
     if previous_health_json:
         return rollback_identity == previous_identity
@@ -9046,13 +9063,18 @@ def _prepare_release_candidate(
         )
     if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
-    if not re.fullmatch(r"[0-9a-f]{12}", identity.git_sha):
+    if not _is_embedded_git_sha(identity.git_sha):
         raise SystemExit(
-            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 lowercase hex characters"
+            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 or 40 lowercase hex characters"
         )
-    if not release_commit.startswith(identity.git_sha):
+    if _is_full_git_sha(identity.git_sha):
+        if release_commit != identity.git_sha:
+            raise SystemExit(
+                f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
+            )
+    elif not release_commit.startswith(identity.git_sha):
         raise SystemExit(
-            f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
+            f"release {tag} resolves to {release_commit}, but the asset embeds legacy prefix {identity.git_sha}"
         )
     return PreparedCandidate(
         binary=binary,
@@ -9070,9 +9092,14 @@ def _prepare_local_candidate(*, target: str | None) -> PreparedCandidate:
         ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout.strip()
     identity = RuntimeIdentity.from_value(_binary_identity(binary))
-    if not source_commit.startswith(identity.git_sha.removesuffix("-dirty")):
+    normalized_identity_sha = identity.git_sha.removesuffix("-dirty")
+    if not _is_full_git_sha(normalized_identity_sha):
         raise SystemExit(
-            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit[:12]}"
+            f"local candidate identity {identity.git_sha} is malformed; expected full 40-character commit identity"
+        )
+    if source_commit != normalized_identity_sha:
+        raise SystemExit(
+            f"local candidate identity {identity.git_sha} does not match selected HEAD {source_commit}"
         )
     return PreparedCandidate(
         binary=binary,

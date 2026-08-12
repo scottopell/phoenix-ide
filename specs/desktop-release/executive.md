@@ -6,7 +6,7 @@ Phoenix release automation publishes architecture-specific, signed, notarized Ph
 
 | Requirement | Implementation and verification |
 |---|---|
-| REQ-DESKTOP-REL-001 | `build.rs` now embeds the full 40-character Git SHA; `build-macos-desktop` consumes the signed `build-macos` helper artifact and `package-desktop-release.sh` verifies embedded version plus full commit identity. |
+| REQ-DESKTOP-REL-001 | `build.rs` now embeds the full 40-character Git SHA; `build-macos-desktop` consumes the signed `build-macos` helper artifact and `package-desktop-release.sh` verifies embedded version plus full commit identity. Deployment helpers and `dev.py` now require exact 40-character candidate identities for new releases/local builds, while tolerating legacy 12-character identities only for rollback or previously deployed runtime contexts. |
 | REQ-DESKTOP-REL-002 | Existing Linux/macOS server jobs and asset names remain unchanged; desktop archives are additional artifacts. |
 | REQ-DESKTOP-REL-003 | `build-macos` imports the Developer ID certificate and signs the standalone helper once; `build-macos-desktop` verifies that signature, embeds byte-identical helper bytes, signs the outer app with hardened runtime, verifies the complete signature, notarizes, staples, validates, and assesses the app. Missing credentials or any signing/notarization failure fail the job. |
 | REQ-DESKTOP-REL-004 | Release matrices use matching arm64 and Intel runners; packaging verifies the helper architecture before and after embedding. |

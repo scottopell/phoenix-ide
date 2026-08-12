@@ -36,7 +36,9 @@ UNIT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}")
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+LEGACY_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
+EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
+FULL_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{40}")
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 RELEASE_TAG_RE = re.compile(r"v[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 SOURCE_KINDS = {"local_head", "published_release"}
@@ -296,14 +298,16 @@ def validate_manifest(manifest_path: Path, manifest: Manifest, policy: Validatio
         if manifest.release_commit != manifest.source_commit:
             raise ValidationError("published candidate release commit does not match source commit")
     validate_identity(manifest.expected, "candidate identity")
+    if not FULL_EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
+        raise ValidationError("candidate identity must use a full lowercase embedded git SHA")
     if manifest.previous is not None:
         validate_identity(manifest.previous, "previous identity")
     validate_health_url(manifest.expected_health_url, "candidate health URL")
     validate_health_url(manifest.previous_health_url, "previous health URL")
     if manifest.previous_deployed_sha is not None and not GIT_SHA_RE.fullmatch(manifest.previous_deployed_sha):
         raise ValidationError("previous deployed SHA is malformed")
-    if not manifest.source_commit.startswith(manifest.expected.git_sha):
-        raise ValidationError("candidate identity does not match source commit")
+    if manifest.expected.git_sha != manifest.source_commit:
+        raise ValidationError("candidate identity does not exactly match source commit")
     if manifest.targets != policy.targets:
         raise ValidationError("manifest target paths are not allowed")
     validate_service_user(manifest.service_user)

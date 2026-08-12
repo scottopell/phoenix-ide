@@ -124,6 +124,14 @@ class BareSupervisorUnitTests(unittest.TestCase):
             self.assertIn("candidate loader failure", snapshot)
             self.assertEqual("rollback warning", layout.direct_diagnostic.read_text())
 
+    def test_validate_runtime_identity_accepts_full_and_legacy_embedded_sha_lengths(self):
+        supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 40))
+        supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 12))
+
+    def test_validate_runtime_identity_rejects_malformed_sha_length(self):
+        with self.assertRaisesRegex(supervisor.SupervisorError, "runtime identity is malformed"):
+            supervisor.validate_runtime_identity(supervisor.RuntimeIdentity("1.0.0", "a" * 13))
+
 
 class BareTransactionTests(unittest.TestCase):
     def setUp(self):
@@ -151,7 +159,7 @@ class BareTransactionTests(unittest.TestCase):
         value = {
             "manifest_version": 1,
             "transaction_id": self.transaction_id,
-            "expected": {"version": "2.0.0", "git_sha": "b" * 12},
+            "expected": {"version": "2.0.0", "git_sha": "b" * 40},
             "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
             "expected_health_url": "http://127.0.0.1:49155/api/version",
             "previous_health_url": "http://127.0.0.1:49155/api/version" if previous else None,
@@ -250,6 +258,22 @@ class BareTransactionTests(unittest.TestCase):
         owner.activate(self.transaction_id, supervisor.sha256(path))
         with self.assertRaisesRegex(supervisor.SupervisorError, "already been used"):
             owner.activate(self.transaction_id, supervisor.sha256(path))
+
+    def test_rejects_candidate_manifest_with_legacy_twelve_char_expected_sha(self):
+        path = self.manifest()
+        value = __import__("json").loads(path.read_text())
+        value["expected"]["git_sha"] = "b" * 12
+        path.write_text(__import__("json").dumps(value))
+        path.chmod(0o600)
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "expected identity must use a full lowercase embedded git SHA"):
+            owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
+    def test_accepts_previous_manifest_identity_with_legacy_twelve_char_sha(self):
+        path = self.manifest(previous=True)
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_rest = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("a" * 12, manifest.previous.git_sha)
 
     def test_rollback_failure_preserves_claim_and_both_failures(self):
         self.layout.binary.parent.mkdir(parents=True)

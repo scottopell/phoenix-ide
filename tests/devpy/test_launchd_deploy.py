@@ -426,7 +426,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(candidate.binary.stat().st_mode & 0o100)
         self.assertEqual(self.dev.ProdSourceKind.PUBLISHED_RELEASE, candidate.source_kind)
         self.assertEqual(
-            ("v1.2.3", "abc123def456", release_commit),
+            ("v1.2.3", release_commit, release_commit),
             (candidate.release_tag, candidate.identity.git_sha, candidate.release_commit),
         )
         self.assertIn("v1.2.3", run.call_args_list[2].args[0])
@@ -434,7 +434,7 @@ class PreparationTests(unittest.TestCase):
     def test_release_rejects_asset_from_different_commit(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "bad123bad123"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "bad123bad123" + "0" * 28}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
@@ -448,7 +448,7 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "asset embeds"):
                 self.dev._prepare_release_candidate("latest", staging)
 
-    def test_release_rejects_truncated_embedded_identity(self):
+    def test_release_rejects_malformed_embedded_identity_length(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
              mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "a"}), \
@@ -467,7 +467,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_local_candidate_binds_exact_head_to_typed_identity(self):
         commit = "abc123def456" + "0" * 28
-        identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+        identity = self.dev.RuntimeIdentity("2.0.0", commit)
         with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")) as build, \
              mock.patch.object(self.dev, "_binary_identity", return_value=identity), \
              mock.patch.object(
@@ -488,7 +488,7 @@ class PreparationTests(unittest.TestCase):
              mock.patch.object(
                  self.dev,
                  "_binary_identity",
-                 return_value=self.dev.RuntimeIdentity("2.0.0", "bbbbbbbbbbbb"),
+                 return_value=self.dev.RuntimeIdentity("2.0.0", "b" * 40),
              ), \
              mock.patch.object(
                  self.dev.subprocess,
@@ -496,6 +496,21 @@ class PreparationTests(unittest.TestCase):
                  return_value=subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
              ):
             with self.assertRaisesRegex(SystemExit, "does not match selected HEAD"):
+                self.dev._prepare_local_candidate(target=None)
+
+    def test_local_candidate_rejects_legacy_twelve_char_identity(self):
+        with mock.patch.object(self.dev, "prod_build", return_value=Path("candidate")), \
+             mock.patch.object(
+                 self.dev,
+                 "_binary_identity",
+                 return_value=self.dev.RuntimeIdentity("2.0.0", "abc123def456"),
+             ), \
+             mock.patch.object(
+                 self.dev.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 0, "abc123def456" + "0" * 28 + "\n", ""),
+             ):
+            with self.assertRaisesRegex(SystemExit, "expected full 40-character commit identity"):
                 self.dev._prepare_local_candidate(target=None)
 
     def test_claim_release_is_transaction_owned(self):
@@ -719,7 +734,9 @@ class PreparationTests(unittest.TestCase):
             candidate.write_bytes(b"candidate")
             active_path = root / "deploy" / "active"
             status_path = root / "deploy" / "status.json"
-            identity = self.dev.RuntimeIdentity("2.0.0", "abc123def456")
+            commit = "abc123def456" + "0" * 28
+            identity = self.dev.RuntimeIdentity("2.0.0", commit)
+
             prepared = self.dev.PreparedCandidate(
                 binary=candidate,
                 source_kind=self.dev.ProdSourceKind.LOCAL_HEAD,
@@ -810,6 +827,9 @@ class PreparationTests(unittest.TestCase):
         ))
         self.assertFalse(self.dev._rollback_identity_matches(
             {"version": "1.0.0", "git_sha": "aaaaaa"}, running, True
+        ))
+        self.assertFalse(self.dev._rollback_identity_matches(
+            {"version": "1.0.0", "git_sha": "a" * 13}, running, True
         ))
 
     def test_legacy_rollback_allows_exact_twelve_char_commit_prefix(self):
