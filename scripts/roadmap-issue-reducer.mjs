@@ -485,10 +485,23 @@ function commentsBeforeEvent(comments, event) {
   return comments;
 }
 
-async function reconcileReactions(owner, repo, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
+async function reconcileReactions(owner, repo, comments, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
   for (const commentId of before) {
     if (commentId !== triggerId && commentId !== deletedId && !after.has(commentId)) {
       await setLifecycleReaction(owner, repo, commentId, "confused", token);
+    }
+  }
+
+  for (const comment of comments) {
+    if (
+      comment.id !== triggerId &&
+      comment.id !== deletedId &&
+      !after.has(comment.id) &&
+      TRUSTED_ASSOCIATIONS.has(comment.author_association) &&
+      roadmapPayload(comment.body) !== null &&
+      (comment.reactions?.rocket ?? 0) > 0
+    ) {
+      await clearAcceptedReaction(owner, repo, comment.id, token);
     }
   }
 
@@ -632,6 +645,7 @@ export async function run({ event, configuredIssueNumber, token }) {
       await reconcileReactions(
         owner,
         repo,
+        comments,
         acknowledgedCommentIds(before.updates, before.current, before.outcomes),
         acknowledgedCommentIds(updates, current, outcomes),
         updates,

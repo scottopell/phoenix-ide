@@ -415,6 +415,22 @@ test("replacement update clears the displaced source rocket", async () => {
   }
 });
 
+test("overlapping replacements clear rockets on every superseded source", async () => {
+  const oldest = comment(1, fenced(update({ state: "Old" })), { reactions: { rocket: 1 } });
+  const middle = comment(2, fenced(update({ state: "Middle" })));
+  const trigger = comment(3, fenced(update({ state: "New" })));
+  const oldRocket = { id: 52, content: "rocket", user: { login: "github-actions[bot]" } };
+  const mock = installGitHubMock([oldest, middle, trigger], [[], [], [], [oldRocket]]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/52"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
 test("invalid structured record transitions from eyes to confused", async () => {
   const trigger = comment(2, fenced(update({ evidence: [] })));
   const mock = installGitHubMock([trigger]);
