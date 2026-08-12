@@ -500,7 +500,7 @@ function commentsBeforeEvent(comments, event) {
   return comments;
 }
 
-async function reconcileReactions(owner, repo, comments, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
+async function reconcileReactions(owner, repo, issueNumber, comments, before, after, projectedUpdates, outcomes, triggerId, deletedId, token) {
   for (const commentId of before) {
     if (commentId !== triggerId && commentId !== deletedId && !after.has(commentId)) {
       await setLifecycleReaction(owner, repo, commentId, "confused", token);
@@ -526,6 +526,10 @@ async function reconcileReactions(owner, repo, comments, before, after, projecte
   for (const commentId of after) ensureAccepted.add(commentId);
   ensureAccepted.delete(triggerId);
   for (const commentId of ensureAccepted) {
+    const comment = comments.find((candidate) => candidate.id === commentId);
+    if (comment !== undefined) {
+      await ensureLifecycleReceipt(owner, repo, issueNumber, comments, comment, "accepted", token);
+    }
     await setLifecycleReaction(owner, repo, commentId, "rocket", token);
   }
 
@@ -588,10 +592,9 @@ export async function run({ event, configuredIssueNumber, token }) {
   const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
 
   let terminalReactionSet = false;
+  let processingReactionSet = false;
   try {
-    if (tracksLifecycle) {
-      await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
-    } else if (event.action === "edited") {
+    if (!tracksLifecycle && event.action === "edited") {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
     let comments;
@@ -626,6 +629,11 @@ export async function run({ event, configuredIssueNumber, token }) {
       }
       ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
       before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
+      const liveAttemptTrigger = comments.find((comment) => comment.id === event.comment.id);
+      if (tracksLifecycle && liveAttemptTrigger?.body === event.comment.body && !processingReactionSet) {
+        await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+        processingReactionSet = true;
+      }
       const body = renderRoadmap(updates, snapshotThroughCommentId);
       changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
 
@@ -673,6 +681,7 @@ export async function run({ event, configuredIssueNumber, token }) {
       await reconcileReactions(
         owner,
         repo,
+        configuredIssueNumber,
         comments,
         acknowledgedCommentIds(before.updates, before.current, before.outcomes),
         acknowledgedCommentIds(updates, current, outcomes),

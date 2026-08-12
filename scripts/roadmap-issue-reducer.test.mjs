@@ -531,6 +531,9 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
     new Response(JSON.stringify({}), { status: 200 }),
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([]), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
