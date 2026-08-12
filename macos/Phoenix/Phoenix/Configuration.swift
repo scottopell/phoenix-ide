@@ -150,6 +150,51 @@ struct DeepLinkConversationValidation {
     }
 }
 
+struct DeepLinkNavigationDecision {
+    static func shouldValidateQueuedConversation(
+        pendingConversationID: UUID?,
+        hasAuthenticatedPrimaryWebView: Bool,
+        hasPrimaryWebView: Bool,
+        hasConfiguredOrigin: Bool
+    ) -> Bool {
+        pendingConversationID != nil
+            && hasAuthenticatedPrimaryWebView
+            && hasPrimaryWebView
+            && hasConfiguredOrigin
+    }
+}
+
+enum BundledSecretState: Equatable {
+    case unloaded
+    case preserveUnloaded
+    case loaded(String?)
+
+    var value: String? {
+        switch self {
+        case .unloaded, .preserveUnloaded: nil
+        case .loaded(let value): value
+        }
+    }
+
+    var writeValue: String? {
+        switch self {
+        case .loaded(nil):
+            return ""
+        case .preserveUnloaded:
+            return nil
+        case .unloaded, .loaded:
+            return value
+        }
+    }
+
+    var draftValue: String {
+        switch self {
+        case .unloaded, .preserveUnloaded, .loaded(nil): ""
+        case .loaded(let value?): value
+        }
+    }
+}
+
 struct BundledSecretAccessPolicy {
     static func shouldReadKeychain(for mode: PendingServerModeKind?) -> Bool {
         mode == .bundled || mode == nil
@@ -175,16 +220,25 @@ private extension DeploymentInfo {
     }
 
     var originURL: URL {
+        let originString = currentMode?.webOrigin ?? networkOriginString
+        return URL(string: originString) ?? fallbackNetworkOriginURL
+    }
+
+    var networkOriginString: String {
         let hostPort = network.bindAddress
         let scheme = network.tls.enabled ? "https" : "http"
         if hostPort.hasPrefix("[") {
-            return URL(string: "\(scheme)://\(hostPort)")!
+            return "\(scheme)://\(hostPort)"
         }
         let parts = hostPort.split(separator: ":", maxSplits: 1).map(String.init)
         if parts.count == 2, parts[0].contains(":") {
-            return URL(string: "\(scheme)://[\(parts[0])]:\(parts[1])")!
+            return "\(scheme)://[\(parts[0])]:\(parts[1])"
         }
-        return URL(string: "\(scheme)://\(hostPort)")!
+        return "\(scheme)://\(hostPort)"
+    }
+
+    var fallbackNetworkOriginURL: URL {
+        URL(string: networkOriginString)!
     }
 }
 
@@ -255,9 +309,44 @@ struct PersistedPreferenceSnapshot: Equatable {
     let rustLogLevel: String?
 }
 
+private struct SecretWritePlan {
+    enum Outcome: Equatable {
+        case preserveExisting
+        case write(String)
+    }
+
+    enum Source: Equatable {
+        case preservedSnapshot
+        case explicitDelete
+        case explicitValue
+    }
+
+    let persistedState: BundledSecretState
+    let rollbackValue: String?
+    let outcome: Outcome
+    let source: Source
+
+    var writesKeychain: Bool {
+        switch outcome {
+        case .preserveExisting: false
+        case .write: true
+        }
+    }
+
+    var savedSecretValue: String? {
+        guard case .write(let value) = outcome else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var deletesSecret: Bool {
+        source == .explicitDelete
+    }
+}
+
 struct PersistedSettingsSnapshot: Equatable {
     let preferences: PersistedPreferenceSnapshot
-    let secrets: [ProviderSecret: String?]
+    let secrets: [ProviderSecret: BundledSecretState]
 
     func draft() -> SettingsDraft {
         let persistedMode = preferences.serverMode
@@ -269,8 +358,8 @@ struct PersistedSettingsSnapshot: Equatable {
             bundledPort: preferences.bundledPort ?? ConfigurationStore.defaultBundledPort,
             developmentBinaryOverride: preferences.developmentBinaryOverride ?? "",
             rustLogLevel: preferences.rustLogLevel ?? "phoenix_ide=info",
-            anthropicKey: (secrets[.anthropicAPIKey] ?? nil) ?? "",
-            openAIKey: (secrets[.openAIAPIKey] ?? nil) ?? ""
+            anthropicKey: (secrets[.anthropicAPIKey] ?? .unloaded).draftValue,
+            openAIKey: (secrets[.openAIAPIKey] ?? .unloaded).draftValue
         )
     }
 
@@ -321,14 +410,14 @@ struct SettingsPersistence {
     func persistedSnapshot() throws -> PersistedSettingsSnapshot {
         let preferences = persistedPreferences()
         let mode = preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)).map(PendingServerModeKind.init)
-        var secrets: [ProviderSecret: String?] = [:]
+        var secrets: [ProviderSecret: BundledSecretState] = [:]
         if BundledSecretAccessPolicy.shouldReadKeychain(for: mode) {
             for secret in ProviderSecret.allCases {
-                secrets[secret] = try keychain.read(secret)
+                secrets[secret] = .loaded(try keychain.read(secret))
             }
         } else {
             for secret in ProviderSecret.allCases {
-                secrets[secret] = nil
+                secrets[secret] = .unloaded
             }
         }
         return PersistedSettingsSnapshot(preferences: preferences, secrets: secrets)
@@ -345,21 +434,21 @@ struct SettingsPersistence {
             bundle: bundle
         )
         let priorAppliedSnapshot = try previous ?? persistedSnapshot()
-
         let keychainWritesActive = BundledSecretAccessPolicy.shouldWriteKeychain(for: draft.mode)
+        let plans = try secretWritePlans(for: draft, previous: priorAppliedSnapshot)
+
         let savedSecrets = keychainWritesActive ? ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
-            let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : secret
+            guard let value = plans[secret]?.savedSecretValue, !value.isEmpty else { return nil }
+            return secret
         } : []
         let deletedSecrets = keychainWritesActive ? ProviderSecret.allCases.compactMap { secret -> ProviderSecret? in
-            let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty && priorAppliedSnapshot.secrets[secret] != nil ? secret : nil
+            plans[secret]?.deletesSecret == true ? secret : nil
         } : []
 
         do {
-            try apply(draft: draft)
+            try apply(draft: draft, plans: plans)
         } catch {
-            if let rollbackFailure = rollback(to: priorAppliedSnapshot) {
+            if let rollbackFailure = rollback(to: priorAppliedSnapshot, plans: plans) {
                 throw SettingsPersistenceError.applyFailedWithRollbackFailure(cause: error, rollbackFailure: rollbackFailure)
             }
             throw error
@@ -374,9 +463,8 @@ struct SettingsPersistence {
                 rustLogLevel: draft.rustLogLevel
             ),
             secrets: Dictionary(uniqueKeysWithValues: ProviderSecret.allCases.map { secret in
-                guard keychainWritesActive else { return (secret, priorAppliedSnapshot.secrets[secret] ?? nil) }
-                let value = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
-                return (secret, value.isEmpty ? nil : value)
+                guard keychainWritesActive else { return (secret, priorAppliedSnapshot.secrets[secret] ?? .unloaded) }
+                return (secret, plans[secret]?.persistedState ?? .unloaded)
             })
         )
         return (candidate, SettingsPersistenceSummary(
@@ -386,11 +474,17 @@ struct SettingsPersistence {
         ), after)
     }
 
-    private func apply(draft: SettingsDraft) throws {
+    private func apply(draft: SettingsDraft, plans: [ProviderSecret: SecretWritePlan]) throws {
         writePreferences(for: draft)
         guard BundledSecretAccessPolicy.shouldWriteKeychain(for: draft.mode) else { return }
-        for secret in ProviderSecret.allCases {
-            try keychain.write(secretValue(in: draft, for: secret), for: secret)
+        for secret in orderedSecretsForApply(plans: plans) {
+            guard let plan = plans[secret] else { continue }
+            switch plan.outcome {
+            case .preserveExisting:
+                continue
+            case .write(let value):
+                try keychain.write(value, for: secret)
+            }
         }
     }
 
@@ -402,14 +496,36 @@ struct SettingsPersistence {
         defaults.set(draft.rustLogLevel, forKey: PreferenceKey.rustLogLevel)
     }
 
-    private func rollback(to snapshot: PersistedSettingsSnapshot) -> Error? {
+    private func orderedSecretsForApply(plans: [ProviderSecret: SecretWritePlan]) -> [ProviderSecret] {
+        ProviderSecret.allCases.sorted { lhs, rhs in
+            let lhsRank = applyOrderRank(for: plans[lhs])
+            let rhsRank = applyOrderRank(for: plans[rhs])
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    private func applyOrderRank(for plan: SecretWritePlan?) -> Int {
+        guard let plan else { return 3 }
+        switch plan.source {
+        case .explicitDelete:
+            return 0
+        case .explicitValue:
+            return 1
+        case .preservedSnapshot:
+            return 2
+        }
+    }
+
+    private func rollback(to snapshot: PersistedSettingsSnapshot, plans: [ProviderSecret: SecretWritePlan]) -> Error? {
         var rollbackFailures: [Error] = []
         restorePreferences(snapshot.preferences)
         let mode = snapshot.preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)).map(PendingServerModeKind.init)
-        guard BundledSecretAccessPolicy.shouldWriteKeychain(for: mode) else { return nil }
+        guard BundledSecretAccessPolicy.shouldWriteKeychain(for: mode) || plans.values.contains(where: { $0.writesKeychain }) else { return nil }
         for secret in ProviderSecret.allCases {
+            guard plans[secret]?.writesKeychain == true else { continue }
             do {
-                try keychain.write((snapshot.secrets[secret] ?? nil) ?? "", for: secret)
+                try keychain.write(plans[secret]?.rollbackValue ?? snapshot.secrets[secret]?.value ?? "", for: secret)
             } catch {
                 rollbackFailures.append(error)
             }
@@ -438,6 +554,71 @@ struct SettingsPersistence {
         switch secret {
         case .anthropicAPIKey: draft.anthropicKey
         case .openAIAPIKey: draft.openAIKey
+        }
+    }
+
+    private func secretWritePlans(
+        for draft: SettingsDraft,
+        previous: PersistedSettingsSnapshot
+    ) throws -> [ProviderSecret: SecretWritePlan] {
+        guard BundledSecretAccessPolicy.shouldWriteKeychain(for: draft.mode) else { return [:] }
+        return try Dictionary(uniqueKeysWithValues: ProviderSecret.allCases.map { secret in
+            (secret, try secretWritePlan(for: secret, draft: draft, previous: previous))
+        })
+    }
+
+    private func secretWritePlan(
+        for secret: ProviderSecret,
+        draft: SettingsDraft,
+        previous: PersistedSettingsSnapshot
+    ) throws -> SecretWritePlan {
+        let trimmed = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousState = previous.secrets[secret] ?? .unloaded
+        let switchingToBundled = draft.mode == .bundled
+            && previous.preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)) != .bundled
+        let previousValue = try previousSecretValue(for: secret, previousState: previousState)
+
+        if trimmed.isEmpty {
+            switch previousState {
+            case .unloaded, .preserveUnloaded:
+                if switchingToBundled {
+                    return SecretWritePlan(
+                        persistedState: .unloaded,
+                        rollbackValue: previousValue,
+                        outcome: .write(previousValue ?? ""),
+                        source: .preservedSnapshot
+                    )
+                }
+                return SecretWritePlan(
+                    persistedState: .unloaded,
+                    rollbackValue: previousValue,
+                    outcome: .preserveExisting,
+                    source: .preservedSnapshot
+                )
+            case .loaded:
+                return SecretWritePlan(
+                    persistedState: .loaded(nil),
+                    rollbackValue: previousValue,
+                    outcome: .write(""),
+                    source: .explicitDelete
+                )
+            }
+        }
+
+        return SecretWritePlan(
+            persistedState: .loaded(trimmed),
+            rollbackValue: previousValue,
+            outcome: .write(trimmed),
+            source: .explicitValue
+        )
+    }
+
+    private func previousSecretValue(for secret: ProviderSecret, previousState: BundledSecretState) throws -> String? {
+        switch previousState {
+        case .loaded(let value):
+            return value
+        case .unloaded, .preserveUnloaded:
+            return try keychain.read(secret)
         }
     }
 }
@@ -977,15 +1158,27 @@ struct VersionInfo: Codable, Equatable {
 struct DeploymentInfo: Codable, Equatable {
     let build: BuildInfo
     let network: NetworkInfo
+    let currentMode: CurrentModeInfo?
     let instanceID: String?
     let localAccess: Bool
     let installationOwnership: InstallationOwnership
 
     enum CodingKeys: String, CodingKey {
         case build, network
+        case currentMode = "current_mode"
         case instanceID = "instance_id"
         case localAccess = "local_access"
         case installationOwnership = "installation_ownership"
+    }
+}
+
+struct CurrentModeInfo: Codable, Equatable {
+    let serverMode: String?
+    let webOrigin: String?
+
+    enum CodingKeys: String, CodingKey {
+        case serverMode = "server_mode"
+        case webOrigin = "web_origin"
     }
 }
 

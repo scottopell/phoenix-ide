@@ -272,6 +272,11 @@ struct BundledReconnectQueue {
         defer { latestCandidate = nil }
         return latestCandidate
     }
+
+    mutating func cancel() {
+        stopScheduled = false
+        latestCandidate = nil
+    }
 }
 
 struct RollingLogWriter {
@@ -375,6 +380,7 @@ final class ServerManager: ObservableObject {
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
+    private var terminationInProgress = false
     private var launcherLogHandle: FileHandle?
     private var ownerLockDescriptor: Int32?
     struct ConnectionOperationToken: Equatable, Hashable {
@@ -394,6 +400,7 @@ final class ServerManager: ObservableObject {
     var currentOperationToken: ConnectionOperationToken { ConnectionOperationToken(id: operationID) }
 
     func connect() {
+        terminationInProgress = false
         resetBrowserOwnedStateForOperationTransition()
         readinessTask?.cancel()
         operationID = UUID()
@@ -469,6 +476,7 @@ final class ServerManager: ObservableObject {
 
     func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil) {
         if let completion { stopCompletions.append(completion) }
+        if preservedState == nil { bundledReconnectQueue.cancel() }
         readinessTask?.cancel()
         readinessTask = nil
 
@@ -496,6 +504,11 @@ final class ServerManager: ObservableObject {
         }
         stopDeadline = timer
         timer.resume()
+    }
+
+    func beginTermination() {
+        terminationInProgress = true
+        bundledReconnectQueue.cancel()
     }
 
     func statusSnapshot() -> ServerStatusSnapshot {
@@ -603,6 +616,7 @@ final class ServerManager: ObservableObject {
         state = .restarting
         stop { [weak self] in
             guard let self else { return }
+            guard !self.terminationInProgress else { return }
             guard let latestCandidate = self.bundledReconnectQueue.takeAfterStop() else { return }
             self.mode = latestCandidate
             self.webOrigin = latestCandidate.origin
@@ -773,6 +787,9 @@ final class ServerManager: ObservableObject {
     private func finishStopCallbacksOnly() {
         let callbacks = stopCompletions
         stopCompletions.removeAll()
+        if terminationInProgress {
+            terminationInProgress = false
+        }
         callbacks.forEach { $0() }
     }
 

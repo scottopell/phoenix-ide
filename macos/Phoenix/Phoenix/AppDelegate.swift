@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var pendingConversationID: UUID?
     private var pendingConversationValidationTask: Task<Void, Never>?
+    private var isPrimaryWebViewAuthenticated = false
     private var hotkeyError: HotkeyError?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -59,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Quit and Stop Phoenix")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        serverManager.beginTermination()
         serverManager.stop { [browserEnvironment] in
             browserEnvironment.shutdown()
             sender.reply(toApplicationShouldTerminate: true)
@@ -135,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if state.canDisplayWebView, let origin = serverManager.webOrigin {
             let operation = currentOperation
             if webView != nil { return }
+            isPrimaryWebViewAuthenticated = false
             browserOperation = operation
             let wrapper = WebViewWrapper(
                 origin: origin,
@@ -142,11 +145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 browserEnvironment: browserEnvironment,
                 onWebViewReady: { [weak self] value, _ in
                     self?.webView = value
-                    self?.openPendingConversation()
                 },
                 onDeployment: { [weak self] result, operation in
                     switch result {
-                    case .success(let deployment): self?.serverManager.deploymentReceived(deployment, operation: operation)
+                    case .success(let deployment):
+                        self?.isPrimaryWebViewAuthenticated = true
+                        self?.serverManager.deploymentReceived(deployment, operation: operation)
+                        self?.validateQueuedConversationNavigationIfPossible()
                     case .failure(let error): self?.serverManager.deploymentVerificationFailed(error.localizedDescription, operation: operation)
                     }
                 },
@@ -163,6 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             current.uiDelegate = nil
         }
         webView = nil
+        isPrimaryWebViewAuthenticated = false
         if let failure = state.failureViewModel {
             window.contentView = NSHostingView(rootView: ErrorView(message: failure.message) { [weak self] in
                 guard failure.allowsReconnect else { return }
@@ -187,25 +193,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func openPendingConversation() {
-        guard let webView, let id = pendingConversationID, let origin = serverManager.webOrigin else { return }
+        guard isPrimaryWebViewAuthenticated,
+              let webView,
+              let id = pendingConversationID,
+              let origin = serverManager.webOrigin else { return }
         pendingConversationID = nil
         webView.load(URLRequest(url: origin.url(path: "/c/\(id.uuidString.lowercased())")))
     }
 
     private func validateAndQueueConversationNavigation(_ id: UUID) {
+        pendingConversationID = id
+        validateQueuedConversationNavigationIfPossible()
+    }
+
+    private func validateQueuedConversationNavigationIfPossible() {
+        guard DeepLinkNavigationDecision.shouldValidateQueuedConversation(
+            pendingConversationID: pendingConversationID,
+            hasAuthenticatedPrimaryWebView: isPrimaryWebViewAuthenticated,
+            hasPrimaryWebView: webView != nil,
+            hasConfiguredOrigin: serverManager.webOrigin != nil
+        ), let queued = pendingConversationID else { return }
         pendingConversationValidationTask?.cancel()
         pendingConversationValidationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let conversationID = try await self.validatedConversationIDForNavigation(id)
+                let conversationID = try await self.validatedConversationIDForNavigation(queued)
                 guard !Task.isCancelled else { return }
+                guard self.pendingConversationID == queued else { return }
                 self.pendingConversationID = conversationID
                 self.openPendingConversation()
             } catch {
                 guard !Task.isCancelled else { return }
+                guard self.pendingConversationID == queued else { return }
                 self.pendingConversationID = nil
                 let message = error.localizedDescription
-                NSLog("Phoenix deep link rejected for %s: %s", id.uuidString.lowercased(), message)
+                NSLog("Phoenix deep link rejected for %s: %s", queued.uuidString.lowercased(), message)
                 self.presentDeepLinkError(message)
             }
         }

@@ -32,6 +32,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test typed macOS core
         run: swift test --package-path macos/Phoenix
+      - name: Run sidecar packaging regression shell test
+        run: macos/Phoenix/scripts/test-package-sidecar.sh
       - name: Build attached-capable Debug app
         run: |
           xcodebuild \

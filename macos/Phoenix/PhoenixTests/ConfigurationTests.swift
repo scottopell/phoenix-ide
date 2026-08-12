@@ -293,6 +293,60 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(loaded.draft.openAIKey, "")
     }
 
+    func testPersistedSnapshotMarksAttachedSecretsUnloadedInsteadOfEmpty() throws {
+        let suite = "SettingsPersistence.snapshot.attached-unloaded.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "preserved-secret",
+            .openAIAPIKey: "other-secret",
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+
+        let snapshot = try persistence.persistedSnapshot()
+
+        XCTAssertEqual(snapshot.secrets[.anthropicAPIKey], .unloaded)
+        XCTAssertEqual(snapshot.secrets[.openAIAPIKey], .unloaded)
+    }
+
+    func testBundledApplyPreservesUnloadedSecretWhenDraftLeavesFieldBlank() throws {
+        let suite = "SettingsPersistence.persist.unloaded-secret.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "preserved-secret",
+            .openAIAPIKey: nil,
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        let previous = PersistedSettingsSnapshot(
+            preferences: PersistedPreferenceSnapshot(
+                serverMode: ServerModeKind.attached.rawValue,
+                attachedOrigin: ConfigurationStore.defaultAttachedOrigin,
+                bundledPort: ConfigurationStore.defaultBundledPort,
+                developmentBinaryOverride: try bundledExecutableFixture(),
+                rustLogLevel: "phoenix_ide=info"
+            ),
+            secrets: [
+                .anthropicAPIKey: .unloaded,
+                .openAIAPIKey: .unloaded,
+            ]
+        )
+        var draft = previous.draft()
+        draft.mode = .bundled
+        draft.bundledPort = 8420
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
+        draft.anthropicKey = ""
+        draft.openAIKey = "new-openai"
+
+        let result = try persistence.persist(draft: draft, appliedSnapshot: previous)
+
+        XCTAssertEqual(try keychain.read(.anthropicAPIKey), "preserved-secret")
+        XCTAssertEqual(try keychain.read(.openAIAPIKey), "new-openai")
+        XCTAssertEqual(result.persistedSnapshot.secrets[.anthropicAPIKey], .unloaded)
+        XCTAssertEqual(result.persistedSnapshot.secrets[.openAIAPIKey], .loaded("new-openai"))
+    }
+
     func testConfigurationStoreLoadRejectsMissingSavedMode() {
         let suite = "ConfigurationStore.load.missing-mode.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -478,6 +532,48 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(try keychain.read(.openAIAPIKey), "old-openai")
     }
 
+    func testSettingsPersistenceRollbackRestoresEveryTouchedSecretAfterAttachedToBundledFailure() throws {
+        let suite = "SettingsPersistence.persist.rollback-attached-to-bundled.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(ServerModeKind.attached.rawValue, forKey: PreferenceKey.serverMode)
+        defaults.set("https://before.example.test", forKey: PreferenceKey.attachedOrigin)
+        let keychain = ScriptedSecretStore(values: [
+            .anthropicAPIKey: "preserved-anthropic",
+            .openAIAPIKey: nil,
+        ], scriptedWrites: [
+            .succeed(.openAIAPIKey),
+            .fail(.anthropicAPIKey, .status(errSecInteractionNotAllowed)),
+            .succeed(.anthropicAPIKey),
+            .succeed(.openAIAPIKey),
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        let previous = PersistedSettingsSnapshot(
+            preferences: PersistedPreferenceSnapshot(
+                serverMode: ServerModeKind.attached.rawValue,
+                attachedOrigin: "https://before.example.test",
+                bundledPort: ConfigurationStore.defaultBundledPort,
+                developmentBinaryOverride: "",
+                rustLogLevel: "phoenix_ide=info"
+            ),
+            secrets: [
+                .anthropicAPIKey: .preserveUnloaded,
+                .openAIAPIKey: .unloaded,
+            ]
+        )
+        var draft = SettingsDraft.defaults
+        draft.mode = .bundled
+        draft.attachedOrigin = "https://after.example.test"
+        draft.bundledPort = 8420
+        draft.developmentBinaryOverride = try bundledExecutableFixture()
+        draft.anthropicKey = ""
+        draft.openAIKey = "new-openai"
+
+        XCTAssertThrowsError(try persistence.persist(draft: draft, appliedSnapshot: previous))
+        XCTAssertEqual(try keychain.read(.anthropicAPIKey), "preserved-anthropic")
+        XCTAssertNil(try keychain.read(.openAIAPIKey))
+    }
+
     func testSettingsPersistenceDoesNotPerformFalliblePostWriteKeychainRead() throws {
         let suite = "SettingsPersistence.persist.no-post-read.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -493,8 +589,8 @@ final class ConfigurationTests: XCTestCase {
 
         let result = try persistence.persist(draft: draft)
         XCTAssertEqual(result.persistedSnapshot.preferences.serverMode, ServerModeKind.attached.rawValue)
-        XCTAssertNil(result.persistedSnapshot.secrets[.anthropicAPIKey] ?? nil)
-        XCTAssertNil(result.persistedSnapshot.secrets[.openAIAPIKey] ?? nil)
+        XCTAssertEqual(result.persistedSnapshot.secrets[.anthropicAPIKey], .loaded(nil))
+        XCTAssertEqual(result.persistedSnapshot.secrets[.openAIAPIKey], .loaded(nil))
     }
 
     func testSettingsPersistenceSurfacesRollbackFailureAsCompoundError() throws {
@@ -524,8 +620,8 @@ final class ConfigurationTests: XCTestCase {
                 rustLogLevel: nil
             ),
             secrets: [
-                .anthropicAPIKey: "old-anthropic",
-                .openAIAPIKey: "old-openai",
+                .anthropicAPIKey: .loaded("old-anthropic"),
+                .openAIAPIKey: .loaded("old-openai"),
             ]
         )
         var draft = SettingsDraft.defaults
@@ -566,8 +662,8 @@ final class ConfigurationTests: XCTestCase {
                 rustLogLevel: "phoenix_ide=info"
             ),
             secrets: [
-                .anthropicAPIKey: "current-secret",
-                .openAIAPIKey: nil,
+                .anthropicAPIKey: .loaded("current-secret"),
+                .openAIAPIKey: .unloaded,
             ]
         )
         var draft = priorAppliedSnapshot.draft()
@@ -621,8 +717,8 @@ final class ConfigurationTests: XCTestCase {
 
         let snapshot = try persistence.persistedSnapshot()
 
-        XCTAssertNil(snapshot.secrets[.anthropicAPIKey] ?? nil)
-        XCTAssertNil(snapshot.secrets[.openAIAPIKey] ?? nil)
+        XCTAssertEqual(snapshot.secrets[.anthropicAPIKey], .unloaded)
+        XCTAssertEqual(snapshot.secrets[.openAIAPIKey], .unloaded)
     }
 
     func testReopenDecisionShowsMainWindowOnlyWhenHidden() {
@@ -1022,6 +1118,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         let matching = DeploymentInfo(
             build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
             network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+            currentMode: nil,
             instanceID: instanceID.uuidString,
             localAccess: true,
             installationOwnership: .development
@@ -1029,6 +1126,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         let mismatched = DeploymentInfo(
             build: matching.build,
             network: matching.network,
+            currentMode: nil,
             instanceID: UUID().uuidString,
             localAccess: matching.localAccess,
             installationOwnership: matching.installationOwnership
@@ -1044,6 +1142,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         let deployment = DeploymentInfo(
             build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
             network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+            currentMode: nil,
             instanceID: nil,
             localAccess: true,
             installationOwnership: .systemdManaged
@@ -1055,12 +1154,67 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
     }
 
+    func testConnectionReapplyUsesCurrentConfiguredWebOriginNotBindAddress() throws {
+        let candidate = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test:8031")))
+        let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
+        let deployment = DeploymentInfo(
+            build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
+            network: NetworkInfo(bindAddress: "0.0.0.0:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+            currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test:8031"),
+            instanceID: nil,
+            localAccess: false,
+            installationOwnership: .launchdManaged
+        )
+
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, deployment), candidate: candidate).requiresReconnect)
+    }
+
+    func testBundledReconnectQueueCanBeCancelled() throws {
+        let candidate = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test:8031")))
+        var queue = BundledReconnectQueue()
+        XCTAssertTrue(queue.request(candidate))
+
+        queue.cancel()
+
+        XCTAssertFalse(queue.stopScheduled)
+        XCTAssertNil(queue.latestCandidate)
+        XCTAssertNil(queue.takeAfterStop())
+    }
+
+    func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {
+        XCTAssertFalse(DeepLinkNavigationDecision.shouldValidateQueuedConversation(
+            pendingConversationID: UUID(),
+            hasAuthenticatedPrimaryWebView: false,
+            hasPrimaryWebView: true,
+            hasConfiguredOrigin: true
+        ))
+        XCTAssertFalse(DeepLinkNavigationDecision.shouldValidateQueuedConversation(
+            pendingConversationID: UUID(),
+            hasAuthenticatedPrimaryWebView: true,
+            hasPrimaryWebView: false,
+            hasConfiguredOrigin: true
+        ))
+        XCTAssertFalse(DeepLinkNavigationDecision.shouldValidateQueuedConversation(
+            pendingConversationID: UUID(),
+            hasAuthenticatedPrimaryWebView: true,
+            hasPrimaryWebView: true,
+            hasConfiguredOrigin: false
+        ))
+        XCTAssertTrue(DeepLinkNavigationDecision.shouldValidateQueuedConversation(
+            pendingConversationID: UUID(),
+            hasAuthenticatedPrimaryWebView: true,
+            hasPrimaryWebView: true,
+            hasConfiguredOrigin: true
+        ))
+    }
+
     func testConnectionReapplySkipsOnlyHealthyMatchingConnection() throws {
         let candidate = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test:8031")))
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
         let healthyDeployment = DeploymentInfo(
             build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
             network: NetworkInfo(bindAddress: "phoenix.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1068,6 +1222,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         let wrongOriginDeployment = DeploymentInfo(
             build: healthyDeployment.build,
             network: NetworkInfo(bindAddress: "other.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
+            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
