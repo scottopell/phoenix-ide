@@ -854,6 +854,24 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "old-two\nold-three\n")
     }
 
+    func testRollingLogWriterReadsOnlyBoundedTailOfHugeExistingFile() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("launcher.log")
+        let prefix = Data(repeating: 0x41, count: 1_000_000)
+        var contents = prefix
+        contents.append(Data("\nlast-one\nlast-two\n".utf8))
+        try contents.write(to: url)
+        let writer = RollingLogWriter(url: url, maxBytes: 24)
+
+        let handle = try writer.openForAppend()
+        try handle.close()
+
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "last-one\nlast-two\n")
+        XCTAssertLessThanOrEqual((try Data(contentsOf: url)).count, 24)
+    }
+
     func testRollingLogWriterPreservesWholeRedactedLineWhenItFitsBound() {
         let data = Data(("prefix\n[REDACTED sensitive log line]\nnext\n").utf8)
         let bounded = RollingLogWriter.boundedTail(data, maxBytes: 64)
@@ -946,6 +964,20 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(buffer.append(Data([emojiBytes[2], emojiBytes[3], 0x0A]), redact: redact), [emoji])
         XCTAssertEqual(buffer.completeLines, [emoji])
         XCTAssertEqual(buffer.pendingFragment, "")
+    }
+
+    func testLogBufferHardBoundsOversizedAndNewlineFreeRecords() {
+        var buffer = ConnectionLogBuffer(maxLines: 4, maxRecordBytes: 8)
+        let secret = Data("ANTHROPIC_API_KEY=super-secret-without-newline".utf8)
+
+        XCTAssertEqual(buffer.append(secret, redact: { $0 }), [])
+        XCTAssertLessThanOrEqual(buffer.pendingBytes.count, 8)
+        XCTAssertTrue(buffer.discardingOversizedRecord)
+        XCTAssertEqual(buffer.flushPending(redact: { $0 }), ConnectionLogBuffer.oversizedRecordMarker)
+        XCTAssertFalse(buffer.completeLines.joined().contains("super-secret"))
+
+        let emitted = buffer.append(Data("123456789-too-long\nnormal\n".utf8), redact: { $0 })
+        XCTAssertEqual(emitted, [ConnectionLogBuffer.oversizedRecordMarker, "normal"])
     }
 
     func testLogBufferPreservesNonUTF8BytesLossilyWithoutDroppingLine() {

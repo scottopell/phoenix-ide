@@ -8,12 +8,17 @@ struct FailureState: Equatable {
 }
 
 struct ConnectionLogBuffer: Equatable {
+    static let oversizedRecordMarker = "[TRUNCATED oversized log record]"
+
     private(set) var completeLines: [String] = []
     private(set) var pendingBytes = Data()
+    private(set) var discardingOversizedRecord = false
     let maxLines: Int
+    let maxRecordBytes: Int
 
-    init(maxLines: Int = 80) {
+    init(maxLines: Int = 80, maxRecordBytes: Int = 64 * 1024) {
         self.maxLines = maxLines
+        self.maxRecordBytes = maxRecordBytes
     }
 
     var pendingFragment: String {
@@ -22,18 +27,27 @@ struct ConnectionLogBuffer: Equatable {
 
     mutating func append(_ data: Data, redact: (String) -> String) -> [String] {
         guard !data.isEmpty else { return [] }
-        pendingBytes.append(data)
 
         var emitted: [String] = []
-        while let newlineIndex = pendingBytes.firstIndex(of: 0x0A) {
-            let lineData = pendingBytes.prefix(upTo: newlineIndex)
-            pendingBytes.removeSubrange(...newlineIndex)
-
-            var normalized = Data(lineData)
-            if normalized.last == 0x0D {
-                normalized.removeLast()
+        for byte in data {
+            if discardingOversizedRecord {
+                if byte == 0x0A {
+                    emitted.append(Self.oversizedRecordMarker)
+                    discardingOversizedRecord = false
+                }
+                continue
             }
-            emitted.append(redact(String(decoding: normalized, as: UTF8.self)))
+            if byte == 0x0A {
+                var normalized = pendingBytes
+                pendingBytes.removeAll(keepingCapacity: true)
+                if normalized.last == 0x0D { normalized.removeLast() }
+                emitted.append(redact(String(decoding: normalized, as: UTF8.self)))
+            } else if pendingBytes.count < maxRecordBytes {
+                pendingBytes.append(byte)
+            } else {
+                pendingBytes.removeAll(keepingCapacity: true)
+                discardingOversizedRecord = true
+            }
         }
 
         if !emitted.isEmpty {
@@ -46,6 +60,13 @@ struct ConnectionLogBuffer: Equatable {
     }
 
     mutating func flushPending(redact: (String) -> String) -> String? {
+        if discardingOversizedRecord {
+            discardingOversizedRecord = false
+            pendingBytes.removeAll(keepingCapacity: true)
+            completeLines.append(Self.oversizedRecordMarker)
+            if completeLines.count > maxLines { completeLines = Array(completeLines.suffix(maxLines)) }
+            return Self.oversizedRecordMarker
+        }
         guard !pendingBytes.isEmpty else { return nil }
         let redacted = redact(String(decoding: pendingBytes, as: UTF8.self))
         pendingBytes.removeAll(keepingCapacity: true)
@@ -261,9 +282,10 @@ struct RollingLogWriter {
         if !fileManager.fileExists(atPath: url.path) {
             fileManager.createFile(atPath: url.path, contents: nil)
         }
-        let existing = (try? Data(contentsOf: url)) ?? Data()
+        let sourceSize = ((try? fileManager.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.intValue ?? 0
+        let existing = try readBoundedSource()
         let bounded = boundedTail(of: existing)
-        if bounded != existing {
+        if sourceSize != bounded.count || bounded != existing {
             try bounded.write(to: url, options: .atomic)
         }
         let handle = try FileHandle(forWritingTo: url)
@@ -273,7 +295,7 @@ struct RollingLogWriter {
 
     func append(_ data: Data) throws -> FileHandle? {
         guard !data.isEmpty else { return nil }
-        let existing = (try? Data(contentsOf: url)) ?? Data()
+        let existing = try readBoundedSource()
         var combined = existing
         combined.append(data)
         let bounded = boundedTail(of: combined)
@@ -284,11 +306,22 @@ struct RollingLogWriter {
     }
 
     func rewriteBoundedTail(fileManager: FileManager = .default) throws -> Data {
-        guard maxBytes > 0 else {
-            return (try? Data(contentsOf: url)) ?? Data()
+        boundedTail(of: try readBoundedSource())
+    }
+
+    private func readBoundedSource() throws -> Data {
+        guard FileManager.default.fileExists(atPath: url.path) else { return Data() }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        let readLimit = UInt64(max(1, maxBytes)) * 2
+        let offset = size > readLimit ? size - readLimit : 0
+        try handle.seek(toOffset: offset)
+        var data = try handle.read(upToCount: Int(min(readLimit, UInt64(Int.max)))) ?? Data()
+        if offset > 0, let firstNewline = data.firstIndex(of: 0x0A) {
+            data.removeSubrange(...firstNewline)
         }
-        let existing = (try? Data(contentsOf: url)) ?? Data()
-        return boundedTail(of: existing)
+        return data
     }
 
     static func boundedTail(_ data: Data, maxBytes: Int64) -> Data {
