@@ -273,8 +273,8 @@ function retirementReceipt(comment) {
 }
 
 function retirementReceiptSource(body) {
-  const match = body?.match(/^<!-- phoenix-roadmap-retirement-receipt:(\d+):[a-f0-9]{64} -->$/);
-  return match ? Number(match[1]) : null;
+  const match = body?.match(/^<!-- phoenix-roadmap-retirement-receipt:(\d+):([a-f0-9]{64}) -->$/);
+  return match ? { commentId: Number(match[1]), digest: match[2] } : null;
 }
 
 function retirementReceiptIds(comments) {
@@ -585,7 +585,15 @@ export async function run({ event, configuredIssueNumber, token }) {
         .map((comment) => comment.id);
       const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
       const retirementAcknowledgments = retirementReceiptIds(comments);
-      if (deletedReceiptSource !== null) retirementAcknowledgments.add(deletedReceiptSource);
+      if (deletedReceiptSource !== null) {
+        const sourceComment = comments.find((comment) => comment.id === deletedReceiptSource.commentId);
+        if (sourceComment !== undefined) {
+          const currentDigest = createHash("sha256").update(sourceComment.body).digest("hex");
+          if (currentDigest === deletedReceiptSource.digest) {
+            retirementAcknowledgments.add(deletedReceiptSource.commentId);
+          }
+        }
+      }
       ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
       before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
       const body = renderRoadmap(updates, snapshotThroughCommentId);
