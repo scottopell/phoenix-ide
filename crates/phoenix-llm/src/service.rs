@@ -394,7 +394,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
-            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+            service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: Some(crate::LlmRequestTelemetry {
                 conversation_id: "conversation".to_string(),
                 root_conversation_id: "root".to_string(),

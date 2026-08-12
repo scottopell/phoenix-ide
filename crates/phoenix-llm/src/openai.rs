@@ -11,6 +11,7 @@ use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, ModelEffo
 use super::LlmError;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
+use phoenix_core::domain::llm_types::ProviderRequestTier;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -1601,10 +1602,12 @@ fn translate_to_responses_request(
             .effective_effort
             .explicit_level()
             .map(platform_reasoning),
-        service_tier: use_codex_backend
-            .then(|| request.service_tier.codex_request_value())
-            .flatten()
-            .map(str::to_string),
+        service_tier: ProviderRequestTier::from_effective_service_tier(
+            request.service_tier,
+            use_codex_backend,
+        )
+        .codex_request_value()
+        .map(str::to_string),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -3495,7 +3498,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
-            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+            service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("integration"),
         }
@@ -4082,7 +4085,7 @@ mod tests {
             tools: vec![],
             max_tokens: None,
             effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
-            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+            service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
             telemetry: None,
             cache_key: PromptCacheKey::stable("test"),
         }

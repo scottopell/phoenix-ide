@@ -3106,30 +3106,10 @@ impl RuntimeManager {
         };
         context.mode_context = Some(mode_context);
         context.effort = conv.effort;
-        context.service_tier = if self
+        context.service_tier = self
             .llm_registry
-            .supports_service_tier(&model_id, conv.service_tier)
-        {
-            conv.service_tier
-        } else {
-            if conv.service_tier == ServiceTier::Fast {
-                self.db
-                    .update_conversation_service_tier(&conv.id, ServiceTier::Standard)
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "Failed to reset unsupported Fast mode for conversation '{}': {error}",
-                            conv.id
-                        )
-                    })?;
-                tracing::info!(
-                    conv_id = %conv.id,
-                    model = %model_id,
-                    "reset unsupported persisted Fast mode to Standard"
-                );
-            }
-            ServiceTier::Standard
-        };
+            .effective_service_tier(&model_id, conv.service_tier)
+            .into();
         context.effective_effort = self.llm_registry.effective_effort(&model_id, conv.effort);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();

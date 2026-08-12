@@ -322,7 +322,7 @@ fn make_llm_request(messages: Vec<LlmMessage>) -> LlmRequest {
         tools: vec![],
         max_tokens: None,
         effective_effort: phoenix_core::domain::llm_types::EffectiveEffort::native_unknown(),
-        service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+        service_tier: phoenix_core::domain::llm_types::EffectiveServiceTier::Standard,
         telemetry: None,
         cache_key: super::types::PromptCacheKey::stable("proptest"),
     }
@@ -698,22 +698,22 @@ mod codex_request_shape {
 
     #[test]
     fn codex_fast_service_tier_is_priority_and_platform_omits_it() {
-        use phoenix_core::domain::llm_types::ServiceTier;
+        use phoenix_core::domain::llm_types::EffectiveServiceTier;
 
         let mut req = make_llm_request(vec![user_msg("hi")]);
-        req.service_tier = ServiceTier::Fast;
+        req.service_tier = EffectiveServiceTier::Fast;
 
         let codex_lite =
             openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, true);
         assert_eq!(codex_lite["service_tier"], "priority");
 
         let codex_standard = {
-            req.service_tier = ServiceTier::Standard;
+            req.service_tier = EffectiveServiceTier::Standard;
             openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, true)
         };
         assert!(codex_standard.get("service_tier").is_none());
 
-        req.service_tier = ServiceTier::Fast;
+        req.service_tier = EffectiveServiceTier::Fast;
         let older_codex =
             openai::test_helpers::translate_to_backend_request_wire("gpt-5.5", &req, true);
         assert_eq!(older_codex["service_tier"], "priority");

@@ -3797,8 +3797,8 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     if conversation_for_runtime.service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast {
-        let stored_model = conversation_for_runtime
-            .model
+        let stale_model = conversation_for_runtime.model.clone();
+        let stored_model = stale_model
             .clone()
             .unwrap_or_else(|| state.llm_registry.default_model_id());
         let model_id = state.llm_registry.resolve_model_id(&stored_model);
@@ -3806,22 +3806,33 @@ async fn stream_conversation(
             &model_id,
             phoenix_core::domain::llm_types::ServiceTier::Fast,
         ) {
-            state
+            let normalized = state
                 .runtime
                 .db()
-                .update_conversation_service_tier(
+                .compare_and_set_conversation_service_tier(
                     &id,
+                    stale_model.as_deref(),
+                    phoenix_core::domain::llm_types::ServiceTier::Fast,
                     phoenix_core::domain::llm_types::ServiceTier::Standard,
                 )
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            conversation_for_runtime.service_tier =
-                phoenix_core::domain::llm_types::ServiceTier::Standard;
-            tracing::info!(
-                conv_id = %id,
-                model = %model_id,
-                "reset unsupported persisted Fast mode before SSE initialization"
-            );
+            if normalized {
+                conversation_for_runtime.service_tier =
+                    phoenix_core::domain::llm_types::ServiceTier::Standard;
+                tracing::info!(
+                    conv_id = %id,
+                    model = %model_id,
+                    "reset unsupported persisted Fast mode before SSE initialization"
+                );
+            } else {
+                conversation_for_runtime = state
+                    .runtime
+                    .db()
+                    .get_conversation(&id)
+                    .await
+                    .map_err(|e| AppError::NotFound(e.to_string()))?;
+            }
         }
     }
 
@@ -4573,24 +4584,25 @@ async fn upgrade_conversation_model(
     };
 
     let requested_service_tier = req.service_tier.unwrap_or(conv.service_tier);
-    let next_service_tier =
-        if requested_service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast {
-            if state
-                .llm_registry
-                .supports_service_tier(&req.model, requested_service_tier)
+    let next_service_tier = match state
+        .llm_registry
+        .effective_service_tier(&req.model, requested_service_tier)
+    {
+        phoenix_core::domain::llm_types::EffectiveServiceTier::Fast => {
+            phoenix_core::domain::llm_types::ServiceTier::Fast
+        }
+        phoenix_core::domain::llm_types::EffectiveServiceTier::Standard => {
+            if requested_service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast
+                && req.service_tier.is_some()
             {
-                requested_service_tier
-            } else if req.service_tier.is_some() {
                 return Err(AppError::BadRequest(format!(
                     "Fast mode is not supported by model '{}' on the active provider route",
                     req.model
                 )));
-            } else {
-                phoenix_core::domain::llm_types::ServiceTier::Standard
             }
-        } else {
             phoenix_core::domain::llm_types::ServiceTier::Standard
-        };
+        }
+    };
 
     // Update in DB
     state

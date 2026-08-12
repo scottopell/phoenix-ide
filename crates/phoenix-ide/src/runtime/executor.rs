@@ -5919,6 +5919,9 @@ where
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
         let service_tier = self.context.service_tier;
+        let effective_service_tier = self
+            .llm_registry
+            .effective_service_tier(&model_id, service_tier);
         if let Some(effort) = explicit_effort {
             if !self.llm_registry.supports_effort(&model_id, effort) {
                 return Err(format!(
@@ -6129,7 +6132,7 @@ where
                 tools,
                 max_tokens: Some(request_output_tokens),
                 effective_effort,
-                service_tier,
+                service_tier: effective_service_tier,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id.clone(),
@@ -6877,6 +6880,9 @@ where
         let model_id = self.context.model_id.clone();
         let explicit_effort = self.context.effort;
         let service_tier = self.context.service_tier;
+        let effective_service_tier = self
+            .llm_registry
+            .effective_service_tier(&model_id, service_tier);
         if let Some(effort) = explicit_effort {
             if !self.llm_registry.supports_effort(&model_id, effort) {
                 let error =
@@ -6998,7 +7004,7 @@ where
                 // thorough summary is not truncated mid-thought.
                 max_tokens: Some(u32::try_from(continuation_output_reserve).unwrap_or(u32::MAX)),
                 effective_effort,
-                service_tier,
+                service_tier: effective_service_tier,
                 telemetry: Some(phoenix_llm::LlmRequestTelemetry {
                     conversation_id: conv_id.clone(),
                     root_conversation_id: root_conv_id,

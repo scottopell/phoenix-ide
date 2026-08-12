@@ -1015,6 +1015,21 @@ impl ModelRegistry {
     }
 
     #[must_use]
+    pub fn effective_service_tier(
+        &self,
+        model_id: &str,
+        requested: phoenix_core::domain::llm_types::ServiceTier,
+    ) -> phoenix_core::domain::llm_types::EffectiveServiceTier {
+        phoenix_core::domain::llm_types::EffectiveServiceTier::from_preference(
+            requested,
+            self.supports_service_tier(
+                model_id,
+                phoenix_core::domain::llm_types::ServiceTier::Fast,
+            ),
+        )
+    }
+
+    #[must_use]
     pub fn supports_effort(
         &self,
         model_id: &str,

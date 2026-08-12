@@ -7138,28 +7138,40 @@ impl Database {
         Ok(())
     }
 
-    /// Reset the service tier without changing the model or effort.
+    /// Normalize a tier only if the model and tier still match a previously read snapshot.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the conversation is absent or the database update fails.
-    pub async fn update_conversation_service_tier(
+    pub async fn compare_and_set_conversation_service_tier(
         &self,
         id: &str,
+        expected_model: Option<&str>,
+        expected_service_tier: ServiceTier,
         service_tier: ServiceTier,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
         let result = sqlx::query(
-            "UPDATE conversations SET service_tier = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE conversations\n             SET service_tier = ?1, updated_at = ?2\n             WHERE id = ?3\n               AND service_tier = ?4\n               AND ((model IS NULL AND ?5 IS NULL) OR model = ?5)",
         )
         .bind(service_tier.as_wire_name())
         .bind(Utc::now().to_rfc3339())
         .bind(id)
+        .bind(expected_service_tier.as_wire_name())
+        .bind(expected_model)
         .execute(&self.pool)
         .await?;
-        if result.rows_affected() == 0 {
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        if exists == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Atomically update the model, effort, and service tier.
@@ -13125,6 +13137,35 @@ mod tests {
                 .map(|conversation| conversation.service_tier),
             Some(ServiceTier::Fast)
         );
+    }
+
+    #[tokio::test]
+    async fn compare_and_set_service_tier_preserves_concurrent_model_upgrade() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("tier-cas", "tier-cas", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort("tier-cas", "gpt-5.4", None, ServiceTier::Fast)
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort("tier-cas", "gpt-5.6-sol", None, ServiceTier::Fast)
+            .await
+            .unwrap();
+
+        let normalized = db
+            .compare_and_set_conversation_service_tier(
+                "tier-cas",
+                Some("gpt-5.4"),
+                ServiceTier::Fast,
+                ServiceTier::Standard,
+            )
+            .await
+            .unwrap();
+        assert!(!normalized);
+
+        let conversation = db.get_conversation("tier-cas").await.unwrap();
+        assert_eq!(conversation.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(conversation.service_tier, ServiceTier::Fast);
     }
 
     #[tokio::test]
