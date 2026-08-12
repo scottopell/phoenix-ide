@@ -3790,12 +3790,40 @@ async fn stream_conversation(
     if let Some(open_id) = query.open_id {
         init_trace.record_open_id(open_id);
     }
-    let conversation_for_runtime = state
+    let mut conversation_for_runtime = state
         .runtime
         .db()
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+    if conversation_for_runtime.service_tier == phoenix_core::domain::llm_types::ServiceTier::Fast {
+        let stored_model = conversation_for_runtime
+            .model
+            .clone()
+            .unwrap_or_else(|| state.llm_registry.default_model_id());
+        let model_id = state.llm_registry.resolve_model_id(&stored_model);
+        if !state.llm_registry.supports_service_tier(
+            &model_id,
+            phoenix_core::domain::llm_types::ServiceTier::Fast,
+        ) {
+            state
+                .runtime
+                .db()
+                .update_conversation_service_tier(
+                    &id,
+                    phoenix_core::domain::llm_types::ServiceTier::Standard,
+                )
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            conversation_for_runtime.service_tier =
+                phoenix_core::domain::llm_types::ServiceTier::Standard;
+            tracing::info!(
+                conv_id = %id,
+                model = %model_id,
+                "reset unsupported persisted Fast mode before SSE initialization"
+            );
+        }
+    }
 
     // Reserve and subscribe the conversation's stable broadcaster before any
     // snapshot read or runtime materialization. The eventual runtime inherits

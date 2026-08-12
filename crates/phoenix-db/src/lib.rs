@@ -9703,8 +9703,8 @@ async fn insert_conversation_tx(
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
-            runtime_role, work_scope_id
-        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+            runtime_role, work_scope_id, service_tier
+        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -9736,6 +9736,7 @@ async fn insert_conversation_tx(
     .bind(cm.next_taskmd_id_hint)
     .bind(conv.runtime_role.as_str())
     .bind(work_scope_id.map(WorkScopeId::as_str))
+    .bind(conv.service_tier.as_wire_name())
     .execute(&mut **tx)
     .await?;
     Ok(())
