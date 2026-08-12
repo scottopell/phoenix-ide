@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -266,7 +267,21 @@ function renderUpdate(update, open) {
   return `<details${open ? " open" : ""}>\n<summary><strong>${htmlText(update.title)}</strong> — ${htmlText(update.state)}</summary>\n\nOwner: ${markdownText(update.owner)}  \nBlocked by: ${blockers}  \nNext: ${markdownText(update.next)}  \nEvidence: ${renderEvidence(update.evidence)}  \nSource: [${markdownText(sourceLabel)}](${update.source.url})${renderContext(update.context)}\n\n</details>`;
 }
 
-export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
+function retirementReceipt(comment) {
+  const digest = createHash("sha256").update(comment.body).digest("hex");
+  return `<!-- phoenix-roadmap:retirement:${comment.id}:${digest} -->`;
+}
+
+function retirementReceiptIds(issueBody, comments) {
+  const acknowledged = new Set();
+  for (const comment of comments) {
+    if (!TRUSTED_ASSOCIATIONS.has(comment.author_association)) continue;
+    if (issueBody.includes(retirementReceipt(comment))) acknowledged.add(comment.id);
+  }
+  return acknowledged;
+}
+
+export function renderRoadmap(updates, snapshotThroughCommentId = 0, retirementReceipts = []) {
   const lines = [
     "# Phoenix delivery roadmap",
     "",
@@ -274,6 +289,7 @@ export function renderRoadmap(updates, snapshotThroughCommentId = 0) {
     "",
     PROJECTION_START,
     `<!-- phoenix-roadmap:snapshot-through:${snapshotThroughCommentId} -->`,
+    ...retirementReceipts,
     "",
     "## Current roadmap",
     "",
@@ -333,6 +349,10 @@ function trustedSnapshotKey(comments) {
     .join("|");
 }
 
+async function getIssue(owner, repo, issueNumber, token) {
+  return githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token);
+}
+
 async function replaceIssueBody(owner, repo, issueNumber, body, token) {
   await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}`, token, {
     method: "PATCH",
@@ -365,23 +385,16 @@ async function listReactions(owner, repo, commentId, token) {
   }
 }
 
-async function acknowledgedRetirementIds(owner, repo, comments, token) {
-  const acknowledged = new Set();
-  for (const comment of comments) {
-    if (!TRUSTED_ASSOCIATIONS.has(comment.author_association)) continue;
-    const record = roadmapPayload(comment.body);
-    if (record?.recordType !== "retirement") continue;
-    const reactions = await listReactions(owner, repo, comment.id, token);
-    const revisionTime = Date.parse(comment.updated_at ?? comment.created_at);
-    if (reactions.some((reaction) =>
-      reaction.user?.login === "github-actions[bot]" &&
-      reaction.content === "rocket" &&
-      Date.parse(reaction.created_at) >= revisionTime
-    )) {
-      acknowledged.add(comment.id);
+function authoritativeRetirementReceipts(comments, current, outcomes) {
+  const activeWorkstreams = new Set(current.map((update) => update.workstream));
+  const latest = new Map();
+  for (const [commentId, outcome] of outcomes) {
+    if (outcome.accepted && outcome.recordType === "retirement" && !activeWorkstreams.has(outcome.workstream)) {
+      latest.set(outcome.workstream, commentId);
     }
   }
-  return acknowledged;
+  const byId = new Map(comments.map((comment) => [comment.id, comment]));
+  return [...latest.values()].map((commentId) => retirementReceipt(byId.get(commentId)));
 }
 
 async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
@@ -519,10 +532,12 @@ export async function run({ event, configuredIssueNumber, token }) {
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
       .map((comment) => comment.id);
     const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-    const retirementAcknowledgments = await acknowledgedRetirementIds(owner, repo, comments, token);
+    const issue = await getIssue(owner, repo, configuredIssueNumber, token);
+    const retirementAcknowledgments = retirementReceiptIds(issue.body ?? "", comments);
     const { updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments);
     const before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
-    const body = renderRoadmap(updates, snapshotThroughCommentId);
+    const receipts = authoritativeRetirementReceipts(comments, current, outcomes);
+    const body = renderRoadmap(updates, snapshotThroughCommentId, receipts);
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
     projectionCommitted = true;
 

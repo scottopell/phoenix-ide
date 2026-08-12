@@ -79,6 +79,9 @@ function installGitHubMock(comments, reactionSnapshots = []) {
     if (String(url).includes("/comments?") && method === "GET") {
       return new Response(JSON.stringify(comments), { status: 200 });
     }
+    if (String(url).endsWith("/issues/7") && method === "GET") {
+      return new Response(JSON.stringify({ body: "" }), { status: 200 });
+    }
     if (method === "PATCH") return new Response(JSON.stringify({}), { status: 200 });
     throw new Error(`Unexpected mock request: ${method} ${url}`);
   };
@@ -440,7 +443,7 @@ test("accepted retirement clears the retired source rocket", async () => {
   const current = comment(1, fenced(update()), { user: { login: "owner" } });
   const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
   const oldRocket = { id: 61, content: "rocket", user: { login: "github-actions[bot]" } };
-  const mock = installGitHubMock([current, trigger], [[], [], [], [oldRocket]]);
+  const mock = installGitHubMock([current, trigger], [[], [], [oldRocket]]);
   try {
     await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.ok(mock.requests.some(
@@ -506,6 +509,7 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
   const responses = [
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
+    new Response(JSON.stringify({ body: "" }), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([]), { status: 200 }),
@@ -611,7 +615,7 @@ test("untrusted retirement comments do not fetch reactions", async () => {
   }
 });
 
-test("retirement acknowledgment must postdate the current comment revision", async () => {
+test("edited retirement cannot reuse a stale acknowledgment", async () => {
   const trigger = comment(2, retired("missing", 99), {
     updated_at: "2026-08-09T18:00:00Z",
     user: { login: "owner" },
