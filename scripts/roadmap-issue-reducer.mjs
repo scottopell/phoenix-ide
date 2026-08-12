@@ -146,6 +146,7 @@ function roadmapPayload(markdown) {
 
 export function reduceComments(comments) {
   const latest = new Map();
+  const retirements = new Map();
   const outcomes = new Map();
   const ordered = [...comments]
     .filter(
@@ -163,15 +164,23 @@ export function reduceComments(comments) {
       if (record.recordType === "retirement") {
         const retirement = validateRetirement(value);
         const current = latest.get(retirement.workstream);
+        const priorRetirement = retirements.get(retirement.workstream);
         const retirementAuthor = comment.user?.login ?? "unknown";
-        if (
-          current === undefined ||
-          (current.source.id <= retirement.supersedes_comment_id && current.source.author === retirementAuthor)
-        ) {
+        const retiresCurrent = current !== undefined &&
+          current.source.id <= retirement.supersedes_comment_id &&
+          current.source.author === retirementAuthor;
+        const repeatsOwnedRetirement = current === undefined &&
+          priorRetirement?.author === retirementAuthor &&
+          priorRetirement.supersedesCommentId === retirement.supersedes_comment_id;
+        if (retiresCurrent || repeatsOwnedRetirement) {
           latest.delete(retirement.workstream);
+          retirements.set(retirement.workstream, {
+            author: retirementAuthor,
+            supersedesCommentId: retirement.supersedes_comment_id,
+          });
           outcomes.set(comment.id, { accepted: true, recordType: "retirement", workstream: retirement.workstream });
         } else {
-          const reason = "retirement must supersede the same author's current source";
+          const reason = "retirement must supersede the same author's current source or owned retirement";
           outcomes.set(comment.id, { accepted: false, reason, recordType: "retirement", workstream: retirement.workstream });
           console.warn(`Ignoring retirement in comment ${comment.id}: ${reason}`);
         }
@@ -187,6 +196,7 @@ export function reduceComments(comments) {
           created_at: comment.created_at,
         },
       });
+      retirements.delete(update.workstream);
       outcomes.set(comment.id, { accepted: true, recordType: "update", workstream: update.workstream });
     } catch (error) {
       outcomes.set(comment.id, {
@@ -304,6 +314,13 @@ async function githubRequest(path, token, options = {}) {
   const response = await githubResponse(path, token, options);
   if (!response.ok) throw new Error(`GitHub ${options.method ?? "GET"} ${path}: ${response.status} ${await response.text()}`);
   return response.status === 204 ? null : response.json();
+}
+
+function trustedSnapshotKey(comments) {
+  return comments
+    .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
+    .map((comment) => `${comment.id}:${comment.updated_at ?? comment.created_at}`)
+    .join("|");
 }
 
 async function replaceIssueBody(owner, repo, issueNumber, body, token) {
@@ -465,6 +482,10 @@ export async function run({ event, configuredIssueNumber, token }) {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
     const comments = await listComments(owner, repo, configuredIssueNumber, token);
+    const confirmation = await listComments(owner, repo, configuredIssueNumber, token);
+    if (trustedSnapshotKey(comments) !== trustedSnapshotKey(confirmation)) {
+      throw new Error("roadmap comment snapshot changed during reduction; retrying from the next event");
+    }
     const trustedCommentIds = comments
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
       .map((comment) => comment.id);

@@ -142,6 +142,13 @@ test("retirement remains authoritative if its superseded source disappears", () 
   assert.equal(updatesFromComments([retiredCurrent]).length, 0);
 });
 
+test("later retirement retains the original retirement ownership", () => {
+  const current = comment(1, fenced(update()), { user: { login: "owner" } });
+  const retirement = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const takeover = comment(3, retired("ios-vnext", 1), { user: { login: "collaborator" } });
+  assert.deepEqual(updatesFromComments([current, retirement, takeover]), []);
+});
+
 test("edited comments remain current instead of silently deleting a workstream", () => {
   const edited = comment(1, fenced(update({ state: "Ready" })), {
     updated_at: "2026-08-09T17:00:00Z",
@@ -498,6 +505,7 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
   const remaining = comment(1, fenced(update()));
   const responses = [
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
+    new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
     new Response(JSON.stringify({}), { status: 201 }),
     new Response(JSON.stringify([]), { status: 200 }),
@@ -558,6 +566,34 @@ test("editing a replacement away restores the reactivated source rocket", async 
     assert.deepEqual(postedReactions(mock.requests), ["rocket"]);
   } finally {
     mock.restore();
+  }
+});
+
+test("changing trusted snapshot aborts before patching", async () => {
+  const trigger = comment(2, fenced(update()));
+  const changed = comment(3, fenced(update({ workstream: "new" })));
+  const requests = [];
+  const responses = [
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
+    new Response(JSON.stringify([trigger]), { status: 200 }),
+    new Response(JSON.stringify([trigger, changed]), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
+  ];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), method: options.method ?? "GET" });
+    return responses.shift();
+  };
+  try {
+    await assert.rejects(
+      run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" }),
+      /snapshot changed/,
+    );
+    assert.ok(!requests.some((request) => request.method === "PATCH"));
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

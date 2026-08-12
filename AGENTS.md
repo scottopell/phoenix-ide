@@ -79,7 +79,7 @@ When you own a workstream represented on the roadmap:
 - append a new structured update when its material state, blocker, owner, or next step changes;
 - append a retirement record when the workstream completes or is abandoned, removing it from the current projection;
 - link detailed evidence instead of copying plans into the roadmap;
-- poll the source comment through the reducer reaction lifecycle: 👀 means processing, 🚀 means accepted, and 😕 means rejected;
+- after creating a comment, poll its reducer reaction lifecycle: 👀 means processing, 🚀 means accepted, and 😕 means rejected; after editing a comment, first require a fresh 👀 observation before accepting a later 🚀 or 😕;
 - on 🚀, verify that the generated Issue body snapshot includes the comment and that an update links back to that exact source comment (or that a retirement removed the entry);
 - on 😕, inspect the roadmap reducer Actions log for the validation or application error; do not treat the snapshot marker alone as acceptance.
 
