@@ -26,4 +26,4 @@ The repository release environment must provide:
 - `APPLE_TEAM_ID`
 - `APPLE_APP_SPECIFIC_PASSWORD`
 
-These secrets are consumed only by the macOS desktop packaging jobs. Existing standalone server publication does not use them.
+`MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, and `MACOS_SIGNING_IDENTITY` are shared by both macOS jobs because the standalone helper is signed before it is published and embedded. `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD` are consumed only by the desktop packaging jobs for notarization. Linux publication does not use these secrets.

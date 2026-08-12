@@ -293,4 +293,5 @@ jobs:
           bash scripts/publish-release-assets.sh \
             scottopell/phoenix-ide \
             "${{ needs.gate.outputs.tag }}" \
+            "${{ needs.gate.outputs.commit }}" \
             "${assets[@]}"

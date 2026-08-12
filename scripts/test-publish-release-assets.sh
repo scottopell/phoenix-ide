@@ -328,6 +328,9 @@ if expression == '.id':
 if expression == '.assets[].name':
     for asset in payload.get('assets', []): print(asset.get('name'))
     raise SystemExit(0)
+if expression == '.assets | length':
+    print(len(payload.get('assets', [])))
+    raise SystemExit(0)
 for asset in payload.get('assets', []):
     if asset.get('name') == name:
         print(asset.get('id'))
@@ -335,11 +338,25 @@ for asset in payload.get('assets', []):
 raise SystemExit(1)
 EOF
 chmod +x "$tmp/bin/gh" "$tmp/bin/jq"
+cat >"$tmp/bin/git" <<'EOF'
+#!/bin/sh
+case "$1" in
+  fetch) exit 0 ;;
+  rev-list) echo "${FAKE_TAG_COMMIT:-${FAKE_RELEASE_COMMIT:?}}" ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$tmp/bin/git"
 
 export PATH="$tmp/bin:$PATH"
 export FAKE_REPO="owner/repo"
 export FAKE_GH_STATE="$state_dir"
 export FAKE_GH_LOG="$tmp/gh.log"
+export FAKE_RELEASE_COMMIT=0123456789abcdef0123456789abcdef01234567
+export GIT="$tmp/bin/git"
+publish() {
+  bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$FAKE_RELEASE_COMMIT" "$@"
+}
 
 write_release() {
   python3 - "$state_dir/release.json" "$state_dir/download" "$@" <<'PY'
@@ -397,11 +414,30 @@ asset_two="$tmp/assets/SHA 256 SUMS.txt"
 printf 'desktop-bytes' > "$asset_one"
 printf 'checksums' > "$asset_two"
 
+# publisher rejects a tag moved after the gate
+reset_env
+export FAKE_TAG_COMMIT=ffffffffffffffffffffffffffffffffffffffff
+if publish "$asset_one" "$asset_two" >/dev/null 2>&1; then
+  echo 'expected moved release tag to fail' >&2
+  exit 1
+fi
+unset FAKE_TAG_COMMIT
+
 # fresh create
 reset_env
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two"
+publish "$asset_one" "$asset_two"
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
-grep -F 'release create v1.2.3 --repo owner/repo --title v1.2.3 --generate-notes' "$tmp/gh.log" >/dev/null
+grep -F 'release create v1.2.3 --repo owner/repo --verify-tag --title v1.2.3 --generate-notes' "$tmp/gh.log" >/dev/null
+
+# an existing published release with zero assets is a valid empty backup
+reset_env
+write_release
+publish "$asset_one" "$asset_two"
+assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
+if grep -F 'release download' "$tmp/gh.log" >/dev/null; then
+  echo 'empty prior release should not invoke gh release download' >&2
+  exit 1
+fi
 
 # surviving draft is discarded and recreated as a complete published release
 reset_env
@@ -415,14 +451,14 @@ release['draft'] = True
 release['id'] = 42
 path.write_text(json.dumps(release))
 PY
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two"
+publish "$asset_one" "$asset_two"
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt'
 grep -F 'api --method DELETE repos/owner/repo/releases/42' "$tmp/gh.log" >/dev/null
 
 # exact-tag staged replacement success
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two"
+publish "$asset_one" "$asset_two"
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 grep -E 'release upload v1.2.3 --repo owner/repo .*/Phoenix Desktop\.zip\.staged-' "$tmp/gh.log" >/dev/null
 grep -E 'api repos/owner/repo/releases/tags/v1.2.3' "$tmp/gh.log" >/dev/null
@@ -440,7 +476,7 @@ reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 export FAKE_GH_UPLOAD_FAIL_AFTER=1
 status=0
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/stage-fail.err" || status=$?
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/stage-fail.err" || status=$?
 [[ "$status" -eq 1 ]]
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 if release_asset_names | grep -F '.staged-' >/dev/null; then
@@ -454,7 +490,7 @@ reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 write_state_file fail_delete_on_count 1
 status=0
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-success.err" || status=$?
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-success.err" || status=$?
 [[ "$status" -eq 1 ]]
 grep -F 'release asset replacement failed; restoring previous asset set' "$tmp/restore-success.err" >/dev/null
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
@@ -466,7 +502,7 @@ write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 write_state_file fail_patch_on_count 2
 write_state_file restore_skip_name 'SHA 256 SUMS.txt'
 set +e
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-partial.err"
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-partial.err"
 status=$?
 set -e
 [[ "$status" -eq 2 ]]
@@ -478,7 +514,7 @@ write_release 'old note.txt'
 write_state_file fail_patch_on_count 2
 write_state_file restore_keep_extra_name 'Phoenix Desktop.zip'
 set +e
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-extra.err"
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-extra.err"
 status=$?
 set -e
 [[ "$status" -eq 2 ]]
@@ -490,7 +526,7 @@ write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 write_state_file fail_delete_on_count 1
 export FAKE_GH_UPLOAD_CLOBBER_FAIL=1
 set +e
-bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-fail.err"
+publish "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-fail.err"
 status=$?
 set -e
 [[ "$status" -eq 2 ]]

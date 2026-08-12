@@ -267,6 +267,12 @@ class BareTransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(supervisor.SupervisorError, "expected identity must use a full lowercase embedded git SHA"):
             owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
 
+    def test_rejects_unknown_transaction_source_kind(self):
+        path = self.manifest(source_kind="publshed_release")
+        owner = supervisor.Supervisor(self.layout)
+        with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported transaction source kind"):
+            owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
     def test_installed_restart_accepts_legacy_twelve_char_expected_sha(self):
         path = self.manifest(expected_sha="b" * 12, source_kind="installed_restart")
         owner = supervisor.Supervisor(self.layout)

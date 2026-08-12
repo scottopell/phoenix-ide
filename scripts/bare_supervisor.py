@@ -34,6 +34,7 @@ GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 LEGACY_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}")
 EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{12}|[0-9a-f]{40}")
 FULL_EMBEDDED_SHA_RE = re.compile(r"[0-9a-f]{40}")
+SOURCE_KINDS = frozenset({"local_head", "published_release", "installed_restart"})
 VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 
 
@@ -526,6 +527,8 @@ class Supervisor:
         if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o200:
             raise SupervisorError("transaction directory ownership or mode is unsafe")
         validate_runtime_identity(manifest.expected)
+        if manifest.source_kind not in SOURCE_KINDS:
+            raise SupervisorError(f"unsupported transaction source kind: {manifest.source_kind}")
         if manifest.source_kind == "installed_restart":
             if not EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
                 raise SupervisorError("installed restart identity must use a lowercase embedded git SHA")

@@ -1,21 +1,34 @@
 #!/bin/bash
 set -euo pipefail
 
-[[ $# -ge 3 ]] || { echo "usage: publish-release-assets.sh REPO TAG ASSET..." >&2; exit 2; }
+GIT=${GIT:-git}
+
+[[ $# -ge 4 ]] || { echo "usage: publish-release-assets.sh REPO TAG EXPECTED_COMMIT ASSET..." >&2; exit 2; }
 repo=$1
 tag=$2
-shift 2
+expected_commit=$3
+shift 3
 assets=("$@")
+[[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "error: expected commit must be a full lowercase git SHA" >&2; exit 2; }
+"$GIT" fetch --force origin "refs/tags/$tag:refs/tags/$tag" >/dev/null 2>&1 || {
+  echo "error: release tag $tag no longer exists on origin" >&2
+  exit 1
+}
+actual_commit=$("$GIT" rev-list -n 1 "$tag")
+[[ "$actual_commit" == "$expected_commit" ]] || {
+  echo "error: release tag $tag points at $actual_commit, expected $expected_commit" >&2
+  exit 1
+}
 
 release_metadata=$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null || true)
 if [[ -z "$release_metadata" ]]; then
-  gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${assets[@]}"
+  gh release create "$tag" --repo "$repo" --verify-tag --title "$tag" --generate-notes "${assets[@]}"
   exit 0
 fi
 if [[ $(jq -r '.draft // false' <<<"$release_metadata") == true ]]; then
   draft_id=$(jq -er '.id' <<<"$release_metadata")
   gh api --method DELETE "repos/$repo/releases/$draft_id" >/dev/null
-  gh release create "$tag" --repo "$repo" --title "$tag" --generate-notes "${assets[@]}"
+  gh release create "$tag" --repo "$repo" --verify-tag --title "$tag" --generate-notes "${assets[@]}"
   exit 0
 fi
 
@@ -25,7 +38,10 @@ staged="$work/staged"
 mkdir -p "$backup" "$staged"
 trap 'rm -rf "$work"' EXIT
 
-gh release download "$tag" --repo "$repo" --dir "$backup"
+prior_asset_count=$(jq -r '.assets | length' <<<"$release_metadata")
+if ((prior_asset_count > 0)); then
+  gh release download "$tag" --repo "$repo" --dir "$backup"
+fi
 nonce="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
 staged_names=()
 for asset in "${assets[@]}"; do
