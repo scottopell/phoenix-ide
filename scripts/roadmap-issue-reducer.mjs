@@ -277,6 +277,21 @@ function retirementReceiptSource(body) {
   return match ? { commentId: Number(match[1]), digest: match[2] } : null;
 }
 
+function lifecycleReceipt(comment, outcome) {
+  const digest = createHash("sha256").update(comment.body).digest("hex");
+  return `<!-- phoenix-roadmap-lifecycle-receipt:${comment.id}:${digest}:${outcome} -->`;
+}
+
+async function ensureLifecycleReceipt(owner, repo, issueNumber, comments, comment, outcome, token) {
+  const body = lifecycleReceipt(comment, outcome);
+  if (comments.some((candidate) => candidate.user?.login === "github-actions[bot]" && candidate.body === body)) return;
+  await githubRequest(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
+
 function retirementReceiptIds(comments) {
   const receipts = new Set(
     comments
@@ -652,6 +667,15 @@ export async function run({ event, configuredIssueNumber, token }) {
       triggerRetirementReceiptPersisted = reflected && outcome?.recordType === "retirement";
       await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
       terminalReactionSet = true;
+      await ensureLifecycleReceipt(
+        owner,
+        repo,
+        configuredIssueNumber,
+        comments,
+        event.comment,
+        reflected ? "accepted" : "rejected",
+        token,
+      );
     }
 
     try {
