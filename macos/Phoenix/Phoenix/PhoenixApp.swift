@@ -26,6 +26,7 @@ struct SettingsView: View {
     @ObservedObject var serverManager: ServerManager
     @State private var draft = SettingsDraft.defaults
     @State private var savedDraft = SettingsDraft.defaults
+    @State private var savedAppliedSnapshot: PersistedSettingsSnapshot?
     @State private var hasSavedModeSelection = false
     @State private var keychainMessage: String?
     @State private var modeMessage: String?
@@ -85,8 +86,9 @@ struct SettingsView: View {
                 Spacer()
                 Button("Apply and Connect") {
                     do {
-                        let persisted = try persistence.persist(draft: draft)
-                        savedDraft = draft
+                        let persisted = try persistence.persist(draft: draft, appliedSnapshot: savedAppliedSnapshot)
+                        savedDraft = persisted.persistedSnapshot.draft()
+                        savedAppliedSnapshot = persisted.persistedSnapshot
                         hasSavedModeSelection = true
                         try serverManager.reconnect(to: persisted.candidate)
                         keychainMessage = keychainStatusMessage(summary: persisted.summary)
@@ -112,12 +114,17 @@ struct SettingsView: View {
         .padding(24)
         .frame(width: 540)
         .onAppear {
-            let loaded = persistence.loadDraft()
-            draft = loaded.draft
-            savedDraft = loaded.draft
-            hasSavedModeSelection = loaded.hasSavedModeSelection
-            if !hasSavedModeSelection {
-                modeMessage = "Choose a mode before Phoenix.app can connect."
+            do {
+                let loaded = try persistence.loadDraft()
+                draft = loaded.draft
+                savedDraft = loaded.draft
+                savedAppliedSnapshot = try persistence.persistedSnapshot()
+                hasSavedModeSelection = loaded.hasSavedModeSelection
+                if !hasSavedModeSelection {
+                    modeMessage = "Choose a mode before Phoenix.app can connect."
+                }
+            } catch {
+                keychainMessage = error.localizedDescription
             }
         }
     }

@@ -8,8 +8,14 @@ private final class ScriptedSecretStore: SecretStore {
     }
 
     enum WriteStep {
-        case succeed
-        case fail(KeychainError)
+        case succeed(ProviderSecret)
+        case fail(ProviderSecret, KeychainError)
+
+        var secret: ProviderSecret {
+            switch self {
+            case .succeed(let secret), .fail(let secret, _): secret
+            }
+        }
     }
 
     private(set) var values: [ProviderSecret: String?]
@@ -45,10 +51,11 @@ private final class ScriptedSecretStore: SecretStore {
     func write(_ value: String, for secret: ProviderSecret) throws {
         if !scriptedWrites.isEmpty {
             let step = scriptedWrites.removeFirst()
+            precondition(step.secret == secret, "Expected scripted write for \(step.secret), got \(secret)")
             switch step {
             case .succeed:
                 break
-            case .fail(let error):
+            case .fail(_, let error):
                 throw error
             }
         }
@@ -308,7 +315,12 @@ final class ConfigurationTests: XCTestCase {
         let keychain = ScriptedSecretStore(values: [
             .anthropicAPIKey: "old-anthropic",
             .openAIAPIKey: "old-openai",
-        ], scriptedWrites: [.succeed, .fail(.status(errSecInteractionNotAllowed)), .succeed, .succeed])
+        ], scriptedWrites: [
+            .succeed(.anthropicAPIKey),
+            .fail(.openAIAPIKey, .status(errSecInteractionNotAllowed)),
+            .succeed(.anthropicAPIKey),
+            .succeed(.openAIAPIKey),
+        ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
         var draft = SettingsDraft.defaults
         draft.mode = .attached
@@ -342,7 +354,12 @@ final class ConfigurationTests: XCTestCase {
         let keychain = ScriptedSecretStore(values: [
             .anthropicAPIKey: "old-anthropic",
             .openAIAPIKey: "old-openai",
-        ], scriptedWrites: [.succeed, .fail(.status(errSecInteractionNotAllowed)), .succeed, .succeed])
+        ], scriptedWrites: [
+            .succeed(.anthropicAPIKey),
+            .fail(.openAIAPIKey, .status(errSecInteractionNotAllowed)),
+            .succeed(.anthropicAPIKey),
+            .succeed(.openAIAPIKey),
+        ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
         var draft = SettingsDraft.defaults
         draft.mode = .attached
@@ -365,10 +382,10 @@ final class ConfigurationTests: XCTestCase {
             .anthropicAPIKey: "old-anthropic",
             .openAIAPIKey: "old-openai",
         ], scriptedWrites: [
-            .succeed,
-            .fail(.status(errSecInteractionNotAllowed)),
-            .fail(.status(errSecInteractionNotAllowed)),
-            .succeed,
+            .succeed(.anthropicAPIKey),
+            .fail(.openAIAPIKey, .status(errSecInteractionNotAllowed)),
+            .fail(.anthropicAPIKey, .status(errSecInteractionNotAllowed)),
+            .succeed(.openAIAPIKey),
         ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: failingWriteStore, bundle: .main)
         let snapshot = PersistedSettingsSnapshot(

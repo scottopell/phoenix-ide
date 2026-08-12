@@ -26,18 +26,23 @@ validate_packaged_sidecar() {
 
   case "$expected_signing" in
     none) ;;
-    adhoc)
-      authority_count="$(codesign -dv "$helper" 2>&1 | /usr/bin/grep -c '^Authority=' || true)"
-      if [ "$authority_count" -ne 0 ]; then
-        echo "error: packaged sidecar unexpectedly has an Authority chain; expected ad-hoc signing" >&2
+    adhoc|identity:*)
+      if ! codesign --verify --strict "$helper" >/dev/null 2>&1; then
+        echo "error: packaged sidecar failed codesign --verify --strict" >&2
         return 1
       fi
-      ;;
-    identity:*)
-      identity="${expected_signing#identity:}"
-      if ! codesign -dv "$helper" 2>&1 | /usr/bin/grep -F "Authority=$identity" >/dev/null; then
-        echo "error: packaged sidecar is not signed with expected identity: $identity" >&2
-        return 1
+      if [ "$expected_signing" = "adhoc" ]; then
+        authority_count="$(codesign -dv "$helper" 2>&1 | /usr/bin/grep -c '^Authority=' || true)"
+        if [ "$authority_count" -ne 0 ]; then
+          echo "error: packaged sidecar unexpectedly has an Authority chain; expected ad-hoc signing" >&2
+          return 1
+        fi
+      else
+        identity="${expected_signing#identity:}"
+        if ! codesign -dv "$helper" 2>&1 | /usr/bin/grep -F "Authority=$identity" >/dev/null; then
+          echo "error: packaged sidecar is not signed with expected identity: $identity" >&2
+          return 1
+        fi
       fi
       ;;
   esac
