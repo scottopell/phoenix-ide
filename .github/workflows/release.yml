@@ -252,6 +252,9 @@ jobs:
   publish:
     needs: [gate, build-linux, build-macos, build-macos-desktop]
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish-release-assets-${{ needs.gate.outputs.tag }}
+      cancel-in-progress: false
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -284,7 +287,7 @@ jobs:
           test "$(wc -l < SHA256SUMS)" -eq 8
 
           assets=(phoenix_ide-* Phoenix-macos-* SHA256SUMS)
-          scripts/publish-release-assets.sh \
+          bash scripts/publish-release-assets.sh \
             scottopell/phoenix-ide \
             "${{ needs.gate.outputs.tag }}" \
             "${assets[@]}"

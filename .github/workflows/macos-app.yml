@@ -13,6 +13,7 @@ on:
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
+      - "scripts/publish-release-assets.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
   push:
@@ -25,6 +26,7 @@ on:
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
       - ".github/workflows/release.yml"
+      - "scripts/publish-release-assets.sh"
       - "scripts/test-desktop-release-workflow.py"
       - "scripts/test-publish-release-assets.sh"
 

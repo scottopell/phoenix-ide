@@ -27,6 +27,7 @@ patch_fail = set(filter(None, os.environ.get('FAKE_GH_PATCH_FAIL_NAMES', '').spl
 upload_clobber = os.environ.get('FAKE_GH_UPLOAD_CLOBBER_FAIL', '') == '1'
 upload_fail_after = int(os.environ.get('FAKE_GH_UPLOAD_FAIL_AFTER', '0'))
 restore_skip = set(filter(None, os.environ.get('FAKE_GH_RESTORE_SKIP_NAMES', '').split(':')))
+restore_keep_extra = set(filter(None, os.environ.get('FAKE_GH_RESTORE_KEEP_EXTRA_NAMES', '').split(':')))
 
 
 def log(args):
@@ -177,6 +178,8 @@ if args[0] == 'api':
                 if asset['name'] in delete_fail:
                     print('delete failed', file=sys.stderr)
                     raise SystemExit(1)
+                if asset['name'] in restore_keep_extra:
+                    raise SystemExit(0)
                 release['assets'].remove(asset)
                 save_release(release)
                 raise SystemExit(0)
@@ -273,7 +276,7 @@ reset_env() {
   rm -rf "$state_dir"
   mkdir -p "$state_dir"
   : > "$tmp/gh.log"
-  unset FAKE_GH_DELETE_FAIL_NAMES FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_UPLOAD_CLOBBER_FAIL FAKE_GH_UPLOAD_FAIL_AFTER FAKE_GH_RESTORE_SKIP_NAMES
+  unset FAKE_GH_DELETE_FAIL_NAMES FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_UPLOAD_CLOBBER_FAIL FAKE_GH_UPLOAD_FAIL_AFTER FAKE_GH_RESTORE_SKIP_NAMES FAKE_GH_RESTORE_KEEP_EXTRA_NAMES
 }
 
 asset_one="$tmp/assets/Phoenix Desktop.zip"
@@ -329,7 +332,7 @@ assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 grep -E 'release upload v1.2.3 --repo owner/repo --clobber .*/old note\.txt' "$tmp/gh.log" >/dev/null
 unset FAKE_GH_DELETE_FAIL_NAMES
 
-# partial restore is detected by post-restore membership verification
+# partial restore is detected when a prior replacement name is missing after rollback
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 export FAKE_GH_PATCH_FAIL_NAMES='SHA 256 SUMS.txt'
@@ -341,6 +344,19 @@ set -e
 [[ "$status" -eq 2 ]]
 grep -F 'error: previous release asset restoration failed' "$tmp/restore-partial.err" >/dev/null
 unset FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_RESTORE_SKIP_NAMES
+
+# restore failure is detected when rollback leaves an extra final asset behind
+reset_env
+write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
+export FAKE_GH_PATCH_FAIL_NAMES='SHA 256 SUMS.txt'
+export FAKE_GH_RESTORE_KEEP_EXTRA_NAMES='Phoenix Desktop.zip'
+set +e
+bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-extra.err"
+status=$?
+set -e
+[[ "$status" -eq 2 ]]
+grep -F 'error: previous release asset restoration failed' "$tmp/restore-extra.err" >/dev/null
+unset FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_RESTORE_KEEP_EXTRA_NAMES
 
 # restore failure returns distinct failure
 reset_env
