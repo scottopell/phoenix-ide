@@ -61,6 +61,8 @@ value SubAgentSpec {
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
     persona: String?              -- resolved agent body; replaces the base preamble
+    parent_work_scope_kind: ParentWorkScopeKind
+    parent_work_scope_id: String when parent_work_scope_kind = attached
 }
 
 ------------------------------------------------------------
@@ -68,6 +70,7 @@ value SubAgentSpec {
 ------------------------------------------------------------
 
 enum SubAgentExecutionAuthority { read_only | write_capable }
+enum ParentWorkScopeKind { unattached | attached }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
@@ -277,6 +280,11 @@ rule SpawnedSubAgentCwdAssignment {
             sub_agent.working_dir = cwd_override
         else:
             sub_agent.working_dir = parent.working_dir
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.spec.parent_work_scope_kind = attached
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.spec.parent_work_scope_id = parent.attached_work_scope_id
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.attached_work_scope_id = sub_agent.spec.parent_work_scope_id
+    ensures: parent.attached_work_scope_id = absent implies sub_agent.spec.parent_work_scope_kind = unattached
+    ensures: parent.attached_work_scope_id = absent implies sub_agent.attached_work_scope_id = absent
 
     @guidance
         -- The Explore-sub-agent ConvMode is `Explore { worktree_path:
@@ -359,6 +367,11 @@ rule SubAgentSpecsResolved {
         --     t.cwd.blank_or_absent => parent.working_dir
         --     t.cwd.absolute        => t.cwd
         --     t.cwd.relative        => parent.working_dir / t.cwd
+        --
+        --   resolve_parent_work_scope(parent):
+        --     attached(id) with the parent's exact opaque WorkScope identity when
+        --     present; otherwise unattached. Every child mirrors that typed state.
+        --     cwd or worktree-path equality never infers attachment.
         --
         --   validate_cwd(resolve_cwd(t, parent)) must prove the path is an
         --   existing directory after canonicalisation and that the canonical

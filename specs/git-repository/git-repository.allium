@@ -82,6 +82,7 @@ entity RepositoryLocatorObservation {
 
 entity DefaultBranchObservation {
     repository: GitRepository
+    observation_generation: Integer
 }
 
 variant ResolvedDefaultBranchObservation : DefaultBranchObservation {
@@ -167,8 +168,11 @@ rule LocatorObservationsUpdateWithoutReplacingRepositoryIdentity {
 
 rule ResolvedDefaultBranchObservationIsAtomic {
     when: ResolvedDefaultBranchObserved(repository, branch_name, provenance, observed_at)
+    requires: default_branch_observation_is_not_stale(repository, observed_at)
+    let observation_generation = next_default_branch_observation_generation(repository)
     ensures: ResolvedDefaultBranchObservation.updated(
         repository: repository,
+        observation_generation: observation_generation,
         branch_name: branch_name,
         provenance: provenance,
         observed_at: observed_at
@@ -183,8 +187,11 @@ rule ResolvedDefaultBranchObservationIsAtomic {
 
 rule DefaultBranchObservationMayRemainUnresolved {
     when: DefaultBranchResolutionFailed(repository, observed_at)
+    requires: default_branch_observation_is_not_stale(repository, observed_at)
+    let observation_generation = next_default_branch_observation_generation(repository)
     ensures: UnresolvedDefaultBranchObservation.updated(
         repository: repository,
+        observation_generation: observation_generation,
         observed_at: observed_at
     )
 }
@@ -318,6 +325,21 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       local clones resolve independently even when remote, slug, or commit graph
 --       observations match.
 --
+--   default_branch_observation_is_not_stale(
+--       repository: GitRepository,
+--       observed_at: Timestamp
+--   ) -> Boolean
+--       True iff no current DefaultBranchObservation exists for repository or
+--       observed_at is not earlier than its observed_at. A delayed older success or
+--       failure is rejected before generation advances or current state changes.
+--
+--   next_default_branch_observation_generation(
+--       repository: GitRepository
+--   ) -> Integer
+--       One greater than the current observation_generation for that exact
+--       repository, or 1 when none exists. The caller cannot provide or override
+--       this generation; the accepted update supersedes the older current row.
+--
 --   next_restart_repair_generation(
 --       product_conversation: bedrock/ProductConversation,
 --       scope: WorkScopeRef
@@ -329,10 +351,13 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --   canonical_default_evidence_admissible(
 --       repository: GitRepository
 --   ) -> Boolean
---       True iff repository's current non-empty default-branch observation has
---       provenance remote_head_cache, or separate canonical evidence corroborates
---       the same branch identity. A local_checked_out_branch or user_selected
---       observation alone is never admissible canonical evidence.
+--       True iff exactly one complete DefaultBranchObservation exists at the
+--       highest observation_generation for repository, that observation is
+--       resolved, and its provenance is remote_head_cache; or separate canonical
+--       evidence corroborates the same branch identity. No observation, an
+--       unresolved or incomplete highest generation, or duplicate highest
+--       generations makes this false. local_checked_out_branch or user_selected
+--       alone is never admissible canonical evidence.
 --
 --   superseded_repository_writers_excluded(repository_fact) -> Boolean
 --       True iff every old binary, stale worker, or other superseded writer that
@@ -387,7 +412,7 @@ invariant OneLocatorObservationPerKind {
             count(RepositoryLocatorObservation{repository: r, locator_kind: k}) <= 1
 }
 
-invariant OneDefaultBranchObservation {
+invariant OneCurrentDefaultBranchObservation {
     for r in GitRepository:
         count(DefaultBranchObservation{repository: r}) <= 1
 }

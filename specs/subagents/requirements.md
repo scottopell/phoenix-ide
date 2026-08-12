@@ -164,14 +164,16 @@ AND grant write access to that same worktree
 AND allow only one write-authority sub-agent per parent conversation at a time
 AND place the parent conversation in AwaitingSubAgentResult state for the duration
 AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
-AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
+AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
+AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
 
 WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
 THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
 AND grant read-only authority there
 AND allow multiple read-only sub-agents in parallel
 AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
-AND SHALL attach the sub-agent to the parent's existing `WorkScope` and filesystem worktree instead
+AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
+AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
 
 WHEN a planning/read-only conversation spawns sub-agents
 THE SYSTEM SHALL configure those sub-agents with read-only authority

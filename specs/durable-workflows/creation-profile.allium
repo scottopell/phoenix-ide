@@ -50,7 +50,7 @@ enum CreationManualReason {
     | cleanup_deadline_exceeded
 }
 enum CreationLifecycleKind { cancel | delete }
-enum RepositoryKind { non_git | git }
+enum RepositoryKind { non_git | git_resolved | git_identity_unresolved }
 enum CanonicalDefaultOutcomeKind { resolved | unresolved | not_applicable }
 enum CanonicalDefaultFreshness { current | stale_cached }
 enum CreationEffectKind {
@@ -70,10 +70,10 @@ value CreationWorkspace {
 
 value CreationStart {
     variant: CreationVariant
-    origin: CreationOriginKind
+    initial_turn_origin: CreationOriginKind when variant = initial_turn
     initial_message: String when variant = initial_turn
-    approved_task: bedrock/ApprovedTaskObjective when origin = approved_task
-    source_work_scope_id: String when origin = approved_task
+    approved_task: bedrock/ApprovedTaskObjective when variant = initial_turn and initial_turn_origin = approved_task
+    source_work_scope_id: String when variant = initial_turn and initial_turn_origin = approved_task
     attachments: List<String>
 }
 
@@ -88,8 +88,9 @@ value RepositoryResolution {
     kind: RepositoryKind
     requested_directory: String
     canonical_working_directory: String
-    repository_root: String? when kind = git
-    hidden_repository: gitrep/GitRepository? when kind = git
+    repository_root: String when kind in {git_resolved, git_identity_unresolved}
+    hidden_repository: gitrep/GitRepository when kind = git_resolved
+    unresolved_reason: String when kind = git_identity_unresolved
 }
 
 value CanonicalDefaultOutcome {
@@ -190,10 +191,12 @@ config {
 -- hidden_repository_for_effect(effect): gitrep/GitRepository
 -- shell_for(intent), initial_creation_plan(binding), creation_effect_kind(effect): CreationEffectKind
 -- effect_is_declared(binding, kind), dependency_exists(binding, successor_kind, predecessor_kind)
--- no_effect_other_than(binding, kind), no_other_post_resolution_creation_dependencies(binding)
+-- no_effect_other_than(binding, kind), no_post_resolution_effects_declared(binding)
+-- no_other_post_resolution_creation_dependencies(binding)
 -- no_other_seeded_empty_post_resolution_dependencies(binding)
 -- readiness_members(binding), readiness_requires_dispatch(binding)
--- repository_resolution_observation(effect), canonical_default_outcome(effect, observation): CanonicalDefaultOutcome
+-- repository_resolution_observation(effect, observation): RepositoryResolution
+-- canonical_default_outcome(effect, observation): CanonicalDefaultOutcome
 -- hidden_repository_identity_proven(observation), transient_failure(evidence), permanent_failure(evidence)
 -- retry_deadline(effect), attempt_count(effect), reconciliation_result(effect, observation)
 -- matching_owned_resource(effect, observation), foreign_resource_evidence(effect, observation), indeterminate_evidence(effect, observation)
@@ -205,6 +208,20 @@ config {
 -- compensation_targets_only_owned_resources(binding, plan), all_compensations_terminal(binding)
 -- lifecycle_publication_precedes_cleanup_completion(binding, lifecycle_kind)
 -- stale_creation_result(effect), preserve_cancel_or_delete_outcome(binding)
+--
+--   no_post_resolution_effects_declared(binding: CreationWorkflowBinding) -> Boolean
+--       True iff unresolved Git identity leaves no canonical-default, reservation,
+--       worktree, WorkScope, metadata, artifact, runtime, or dispatch effect declared.
+--
+--   repository_resolution_observation(
+--       effect: dwf/Effect,
+--       observation
+--   ) -> RepositoryResolution
+--       The exact typed repository-resolution observation committed by
+--       resolve_repository: kind, requested directory, canonical working directory,
+--       repository root for Git, and hidden repository when local identity is
+--       proven. The binding stores this value atomically rather than reconstructing
+--       fields from intent, path heuristics, or later reads.
 --
 --   no_effect_other_than(binding: CreationWorkflowBinding, kind: CreationEffectKind) -> Boolean
 --       True iff kind is the sole declared effect in binding's current plan.
@@ -371,28 +388,29 @@ rule ResolvedInitialTurnCreationDagDeclared {
     requires: creation_effect_kind(effect) = resolve_repository
     requires: binding.outcome = provisioning
     requires: binding.intent.start.variant = initial_turn
+    requires: resolved_repository_kind(observation) in {non_git, git_resolved}
 
     ensures: effect_is_declared(binding, finalize_attachments)
     ensures: effect_is_declared(binding, commit_metadata)
     ensures: effect_is_declared(binding, expand_initial_message)
     ensures: effect_is_declared(binding, bootstrap_runtime)
     ensures: effect_is_declared(binding, dispatch_first_llm)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, reserve_worktree)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, materialize_or_adopt_worktree)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, attach_work_scope)
-    ensures: binding.intent.start.origin = approved_task implies effect_is_declared(binding, materialize_approved_artifact)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, attach_work_scope)
+    ensures: binding.intent.start.initial_turn_origin = approved_task implies effect_is_declared(binding, materialize_approved_artifact)
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, commit_metadata, attach_work_scope)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, commit_metadata, attach_work_scope)
     ensures: resolved_repository_kind(observation) = non_git implies dependency_exists(binding, commit_metadata, resolve_repository)
-    ensures: binding.intent.start.origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, attach_work_scope)
-    ensures: binding.intent.start.origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, commit_metadata)
-    ensures: binding.intent.start.origin = approved_task implies dependency_exists(binding, expand_initial_message, materialize_approved_artifact)
-    ensures: binding.intent.start.origin = ordinary implies dependency_exists(binding, expand_initial_message, commit_metadata)
+    ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, attach_work_scope)
+    ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, materialize_approved_artifact, commit_metadata)
+    ensures: binding.intent.start.initial_turn_origin = approved_task implies dependency_exists(binding, expand_initial_message, materialize_approved_artifact)
+    ensures: binding.intent.start.initial_turn_origin = ordinary implies dependency_exists(binding, expand_initial_message, commit_metadata)
     ensures: dependency_exists(binding, commit_metadata, finalize_attachments)
     ensures: dependency_exists(binding, bootstrap_runtime, expand_initial_message)
     ensures: dependency_exists(binding, dispatch_first_llm, bootstrap_runtime)
@@ -406,22 +424,23 @@ rule ResolvedSeededEmptyCreationDagDeclared {
     requires: creation_effect_kind(effect) = resolve_repository
     requires: binding.outcome = provisioning
     requires: binding.intent.start.variant = seeded_empty
+    requires: resolved_repository_kind(observation) in {non_git, git_resolved}
 
     ensures: effect_is_declared(binding, finalize_attachments)
     ensures: effect_is_declared(binding, commit_metadata)
     ensures: effect_is_declared(binding, bootstrap_runtime)
     ensures: not effect_is_declared(binding, expand_initial_message)
     ensures: not effect_is_declared(binding, dispatch_first_llm)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, reserve_worktree)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, materialize_or_adopt_worktree)
-    ensures: resolved_repository_kind(observation) = git implies effect_is_declared(binding, attach_work_scope)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies effect_is_declared(binding, attach_work_scope)
     ensures: dependency_exists(binding, finalize_attachments, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
-    ensures: resolved_repository_kind(observation) = git implies dependency_exists(binding, commit_metadata, attach_work_scope)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, resolve_canonical_default, resolve_repository)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, reserve_worktree, resolve_canonical_default)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, materialize_or_adopt_worktree, reserve_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, attach_work_scope, materialize_or_adopt_worktree)
+    ensures: resolved_repository_kind(observation) = git_resolved implies dependency_exists(binding, commit_metadata, attach_work_scope)
     ensures: resolved_repository_kind(observation) = non_git implies dependency_exists(binding, commit_metadata, resolve_repository)
     ensures: dependency_exists(binding, commit_metadata, finalize_attachments)
     ensures: dependency_exists(binding, bootstrap_runtime, commit_metadata)
@@ -430,18 +449,28 @@ rule ResolvedSeededEmptyCreationDagDeclared {
     ensures: readiness_requires_dispatch(binding) = false
 }
 
-rule RepositoryResolutionPreservesOptionalPreScopeIdentity {
+rule UnresolvedGitRepositoryIdentityPublishesTypedFailure {
     when: RepositoryObservationRecorded(adapter, effect, observation)
     let binding = CreationWorkflowBinding{workflow: effect.workflow}
     requires: creation_effect_kind(effect) = resolve_repository
-    ensures: binding.repository_resolution != null
-    ensures: binding.repository_resolution.hidden_repository != null implies hidden_repository_identity_proven(observation)
-    ensures: hidden_repository_identity_proven(observation) implies binding.repository_resolution.hidden_repository != null
+    requires: resolved_repository_kind(observation) = git_identity_unresolved
+    ensures: binding.repository_resolution = repository_resolution_observation(effect, observation)
+    ensures: CreationFailurePublished(effect.workflow.id, permanent_effect_failure)
+    ensures: not WorkScopeAttachmentCreated(binding)
+    ensures: no_post_resolution_effects_declared(binding)
+}
+
+rule RepositoryResolutionPersistsTypedPreScopeOutcome {
+    when: RepositoryObservationRecorded(adapter, effect, observation)
+    let binding = CreationWorkflowBinding{workflow: effect.workflow}
+    requires: creation_effect_kind(effect) = resolve_repository
+    ensures: binding.repository_resolution = repository_resolution_observation(effect, observation)
 
     @guidance
-        -- Git detection may prove hidden repository identity before any WorkScope
-        -- exists. Unresolved identity remains absent rather than fabricating a row or
-        -- copying repository identity onto ProductConversation.
+        -- Git detection yields either git_resolved with an exact hidden identity or
+        -- git_identity_unresolved with a typed reason before any WorkScope exists.
+        -- Unresolved identity never fabricates a row or copies repository identity
+        -- onto ProductConversation.
 }
 
 rule CanonicalDefaultResolutionIsTypedAndGatesWorktreeMaterialization {
@@ -462,8 +491,7 @@ rule CanonicalDefaultResolutionIsTypedAndGatesWorktreeMaterialization {
 rule SuccessfulWorktreeMaterializationPrecedesFreshScopeAttachment {
     when: MetadataEffectReceipted(adapter, binding, receipt)
     requires: creation_effect_kind(receipt.effect) = attach_work_scope
-    requires: binding.repository_resolution.kind = git
-    requires: binding.repository_resolution.hidden_repository != null
+    requires: binding.repository_resolution.kind = git_resolved
     requires: binding.canonical_default_outcome.kind = resolved
     requires: work_scope_attachment_receipt_matches_materialized_worktree(binding, receipt)
     ensures: FreshWorkScopeAttached(binding.product_conversation_id, binding.transcript_conversation_id, binding.repository_resolution.hidden_repository)
@@ -485,7 +513,7 @@ rule DirectCreationHasNoGitScopeOrCanonicalDefault {
 rule ApprovedArtifactMaterializesBeforeFirstDispatch {
     when: MetadataEffectReceipted(adapter, binding, receipt)
     requires: creation_effect_kind(receipt.effect) = materialize_approved_artifact
-    requires: binding.intent.start.origin = approved_task
+    requires: binding.intent.start.initial_turn_origin = approved_task
     requires: approved_artifact_receipt_matches_reviewed_source(binding, receipt)
     ensures: ApprovedArtifactMaterialized(binding.intent.start.approved_task, binding.transcript_conversation_id)
 }
