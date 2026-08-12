@@ -1271,6 +1271,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(deploymentMatchesBundledInstance(matching, instanceID: instanceID))
         XCTAssertFalse(deploymentMatchesBundledInstance(mismatched, instanceID: instanceID))
         XCTAssertFalse(deploymentMatchesBundledInstance(nil, instanceID: instanceID))
+        XCTAssertFalse(deploymentMatchesBundledInstance(matching, instanceID: nil))
     }
 
     func testDeploymentViolationCanLeaveAttachedDeploymentViewableButReadOnly() throws {

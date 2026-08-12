@@ -90,7 +90,7 @@ impl PhoenixRuntimeEnvironment {
             .map_or_else(|| phoenix_home.clone(), PathBuf::from);
         let db_path = std::env::var_os("PHOENIX_DB_PATH")
             .filter(|v| !v.is_empty())
-            .map_or_else(|| phoenix_home.join("phoenix.db"), PathBuf::from);
+            .map_or_else(|| data_dir.join("phoenix.db"), PathBuf::from);
         let tmp_root = std::env::temp_dir().join(TMP_NAMESPACE);
 
         Self {
@@ -243,10 +243,19 @@ impl PhoenixRuntimeEnvironment {
         )
     }
 
-    /// `data_dir/chromium-cache` — Phoenix-owned Chrome-for-Testing download cache.
+    /// Chrome-for-Testing download cache. Existing default installations retain
+    /// `home/.cache/phoenix-ide/chromium`; isolated data roots use their own cache.
     #[must_use]
     pub fn chromium_cache_dir(&self) -> PathBuf {
-        self.data_dir.join("chromium-cache")
+        let default_data_dir = self.home.join(PHOENIX_HOME_SUBDIR);
+        if self.data_dir == default_data_dir {
+            self.home
+                .join(".cache")
+                .join("phoenix-ide")
+                .join("chromium")
+        } else {
+            self.data_dir.join("chromium-cache")
+        }
     }
 
     /// `tmp_root/namespace`, created (`mkdir -p`) and returned. Use this
@@ -318,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             env.chromium_cache_dir(),
-            root.join(".phoenix-ide/chromium-cache")
+            root.join(".cache/phoenix-ide/chromium")
         );
         // Attachments live beside tmp_root (root/tmp here), not under it, so the
         // historical path is preserved.
@@ -351,6 +360,14 @@ mod tests {
         assert_eq!(
             env.builtin_skills_dir(),
             PathBuf::from("/private/sidecar/.phoenix-ide/builtin-skills")
+        );
+        assert_eq!(
+            env.chromium_cache_dir(),
+            PathBuf::from("/private/sidecar/.phoenix-ide/chromium-cache")
+        );
+        assert_eq!(
+            env.db_path(),
+            PathBuf::from("/private/sidecar/.phoenix-ide/phoenix.db")
         );
         let [claude, agents, builtin] = env.skill_viewer_roots();
         assert_eq!(claude, PathBuf::from("/Users/example/.claude/skills"));

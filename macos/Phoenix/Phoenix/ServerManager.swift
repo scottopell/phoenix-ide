@@ -252,7 +252,7 @@ private struct LaunchedBundledInstance {
 }
 
 func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID: UUID?) -> Bool {
-    guard let instanceID else { return true }
+    guard let instanceID else { return false }
     return deployment?.instanceID == instanceID.uuidString
 }
 
@@ -791,15 +791,7 @@ final class ServerManager: ObservableObject {
             guard let latestRequest = self.bundledReconnectQueue.takeAfterStop() else { return }
             self.mode = latestRequest.candidate
             self.webOrigin = latestRequest.candidate.origin
-            if latestRequest.forceRestart {
-                do {
-                    try self.reconnect(ServerReconnectRequest(candidate: latestRequest.candidate, requiresReconnect: true, forceRestart: true))
-                } catch {
-                    self.state = .failed(FailureState(version: self.currentVersion, message: error.localizedDescription))
-                }
-            } else {
-                self.connect()
-            }
+            self.connect()
         }, isTransitionStop: true)
     }
 
