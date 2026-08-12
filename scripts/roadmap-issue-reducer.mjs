@@ -529,6 +529,16 @@ async function reconcileReactions(owner, repo, comments, before, after, projecte
   }
 }
 
+async function restartProcessingReaction(owner, repo, commentId, token) {
+  await clearLifecycleReactions(owner, repo, commentId, token);
+  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
+  await githubRequest(path, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "eyes" }),
+  });
+}
+
 async function setLifecycleReaction(owner, repo, commentId, content, token) {
   const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
   await githubRequest(path, token, {
@@ -575,7 +585,11 @@ export async function run({ event, configuredIssueNumber, token }) {
   let terminalReactionSet = false;
   try {
     if (tracksLifecycle) {
-      await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+      if (event.action === "edited") {
+        await restartProcessingReaction(owner, repo, event.comment.id, token);
+      } else {
+        await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+      }
     } else if (event.action === "edited") {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
