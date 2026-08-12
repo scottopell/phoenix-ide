@@ -851,6 +851,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertNil(configuration.publicEnvironment["HOME"])
         XCTAssertEqual(configuration.publicEnvironment["CODEX_HOME"], "/tmp/Phoenix Tests/.codex")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DATA_DIR"], "/tmp/Phoenix Tests/.phoenix-ide")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TMP_DIR"], "/tmp/Phoenix Tests/tmp/phoenix-ide")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_PORT"], "8420")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.db")
@@ -1156,40 +1157,57 @@ final class ServerManagerHelpersTests: XCTestCase {
 
     func testSidecarLogRecorderPublishesOnlyFramedRecentLines() async {
         let recorder = SidecarLogRecorder()
-        await recorder.reset()
+        let operation = UUID()
+        await recorder.reset(operation: operation)
 
-        await recorder.enqueue(Data("alpha\nsecret=abc".utf8))
-        let first = await recorder.drain().last
+        await recorder.enqueue(Data("alpha\nsecret=abc".utf8), operation: operation)
+        let first = await recorder.drain(operation: operation).last
         XCTAssertEqual(first?.recentLines, ["alpha"])
         XCTAssertEqual(String(decoding: first?.logAppend ?? Data(), as: UTF8.self), "alpha\n")
 
-        await recorder.enqueue(Data("\nbeta\n".utf8))
-        let second = await recorder.drain().last
+        await recorder.enqueue(Data("\nbeta\n".utf8), operation: operation)
+        let second = await recorder.drain(operation: operation).last
         XCTAssertEqual(second?.recentLines, ["alpha", "secret= [REDACTED]", "beta"])
         XCTAssertEqual(String(decoding: second?.logAppend ?? Data(), as: UTF8.self), "secret= [REDACTED]\nbeta\n")
 
-        let eof = await recorder.finishPending()
+        let eof = await recorder.finishPending(operation: operation)
         XCTAssertNil(eof)
+    }
+
+    func testSidecarLogRecorderIgnoresStaleOperationEOF() async {
+        let recorder = SidecarLogRecorder()
+        let old = UUID()
+        let current = UUID()
+        await recorder.reset(operation: old)
+        await recorder.enqueue(Data("old-partial".utf8), operation: old)
+        await recorder.reset(operation: current)
+        await recorder.enqueue(Data("new-partial".utf8), operation: current)
+
+        let staleEOF = await recorder.finishPending(operation: old)
+        XCTAssertNil(staleEOF)
+        let currentEOF = await recorder.finishPending(operation: current)
+        XCTAssertEqual(String(decoding: currentEOF?.logAppend ?? Data(), as: UTF8.self), "new-partial\n")
     }
 
     func testSidecarLogRecorderBoundsIngressAndReportsDroppedChunks() async {
         let recorder = SidecarLogRecorder(maxPendingChunks: 2)
-        await recorder.reset()
+        let operation = UUID()
+        await recorder.reset(operation: operation)
 
-        await recorder.enqueue(Data("first\n".utf8))
-        await recorder.enqueue(Data("second\n".utf8))
-        await recorder.enqueue(Data("third\n".utf8))
+        await recorder.enqueue(Data("secret=prefix".utf8), operation: operation)
+        await recorder.enqueue(Data("tail-without-boundary".utf8), operation: operation)
+        await recorder.enqueue(Data("discarded-tail\nthird\n".utf8), operation: operation)
 
-        let snapshots = await recorder.drain()
+        let snapshots = await recorder.drain(operation: operation)
         XCTAssertEqual(
             snapshots.map { String(decoding: $0.logAppend, as: UTF8.self) },
             [
                 "[Phoenix dropped 1 sidecar log chunk before recording]\n",
-                "second\n",
                 "third\n",
             ]
         )
-        XCTAssertEqual(snapshots.last?.recentLines, ["second", "third"])
+        XCTAssertEqual(snapshots.last?.recentLines, ["third"])
+        XCTAssertFalse(snapshots.map { String(decoding: $0.logAppend, as: UTF8.self) }.joined().contains("tail-without-boundary"))
     }
 
     func testDownloadDestinationReservationStateAvoidsConcurrentCollisionsAndReleasesPaths() {
@@ -1484,7 +1502,7 @@ final class ServerManagerHelpersTests: XCTestCase {
         )
 
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate).requiresReconnect)
-        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate).requiresReconnect)
+        XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate).requiresReconnect)
     }

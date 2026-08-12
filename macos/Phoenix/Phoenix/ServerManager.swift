@@ -281,6 +281,8 @@ actor SidecarLogRecorder {
     private var buffer = ConnectionLogBuffer()
     private var pendingChunks: [Data] = []
     private var droppedChunkCount = 0
+    private var operation: UUID?
+    private var discardUntilRecordBoundary = false
 
     init(
         writer: RollingLogWriter? = nil,
@@ -292,9 +294,11 @@ actor SidecarLogRecorder {
         self.snapshotSink = snapshotSink
     }
 
-    func reset() async {
+    func reset(operation: UUID) async {
+        self.operation = operation
         pendingChunks.removeAll(keepingCapacity: true)
         droppedChunkCount = 0
+        discardUntilRecordBoundary = false
         buffer = ConnectionLogBuffer()
         if let writer {
             _ = try? writer.openForAppend()
@@ -302,19 +306,26 @@ actor SidecarLogRecorder {
         await snapshotSink(buffer.completeLines)
     }
 
-    func enqueue(_ data: Data) {
-        guard !data.isEmpty else { return }
+    func enqueue(_ data: Data, operation: UUID) {
+        guard self.operation == operation, !data.isEmpty else { return }
         if pendingChunks.count >= maxPendingChunks {
             pendingChunks.removeFirst(pendingChunks.count - maxPendingChunks + 1)
             droppedChunkCount += 1
+            discardUntilRecordBoundary = true
         }
         pendingChunks.append(data)
     }
 
-    func drain() async -> [Snapshot] {
+    func drain(operation: UUID) async -> [Snapshot] {
+        guard self.operation == operation else { return [] }
         var snapshots: [Snapshot] = []
         while !pendingChunks.isEmpty {
-            let chunk = pendingChunks.removeFirst()
+            var chunk = pendingChunks.removeFirst()
+            if discardUntilRecordBoundary {
+                guard let newline = chunk.firstIndex(of: 0x0A) else { continue }
+                chunk.removeSubrange(...newline)
+                discardUntilRecordBoundary = false
+            }
             let emitted = buffer.append(chunk, redact: Self.defaultRedact)
             if droppedChunkCount > 0 {
                 let droppedLine = droppedChunkCount == 1
@@ -335,8 +346,9 @@ actor SidecarLogRecorder {
         return snapshots
     }
 
-    func finishPending() async -> Snapshot? {
-        _ = await drain()
+    func finishPending(operation: UUID) async -> Snapshot? {
+        guard self.operation == operation else { return nil }
+        _ = await drain(operation: operation)
         if droppedChunkCount > 0 {
             let droppedLine = droppedChunkCount == 1
                 ? "[Phoenix dropped 1 sidecar log chunk before recording]"
@@ -639,13 +651,14 @@ final class ServerManager: ObservableObject {
         if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
         readinessTask?.cancel()
         readinessTask = nil
+        let operation = operationID
 
         guard case .bundled = mode, let process else {
             finishStop(finalState: preservedState ?? .stopped)
             return
         }
         guard process.isRunning else {
-            Task { await handleSidecarEOF() }
+            Task { await handleSidecarEOF(operation: operation) }
             releaseOwnerLock()
             self.process = nil
             launchedBundledInstance = nil
@@ -725,7 +738,7 @@ final class ServerManager: ObservableObject {
             try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
             try acquireOwnerLock(configuration.ownerLockURL)
             launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
-            Task { await logRecorder.reset() }
+            Task { await logRecorder.reset(operation: operation) }
 
             let inherited = ProcessInfo.processInfo.environment
             guard let instanceID = launchedBundledInstance?.instanceID else {
@@ -756,12 +769,12 @@ final class ServerManager: ObservableObject {
                     guard let self else { return }
                     if data.isEmpty {
                         handle.readabilityHandler = nil
-                        Task { await self.handleSidecarEOF() }
+                        Task { await self.handleSidecarEOF(operation: operation) }
                         return
                     }
                     Task {
-                        await self.logRecorder.enqueue(data)
-                        await self.handleBufferedSidecarOutput()
+                        await self.logRecorder.enqueue(data, operation: operation)
+                        await self.handleBufferedSidecarOutput(operation: operation)
                     }
                 }
             }
@@ -909,7 +922,7 @@ final class ServerManager: ObservableObject {
         guard process === terminated else { return }
         let priorState = state
         let version = currentVersion
-        Task { await handleSidecarEOF() }
+        Task { await handleSidecarEOF(operation: operation) }
         stopDeadline?.cancel()
         stopDeadline = nil
         releaseOwnerLock()
@@ -961,14 +974,14 @@ final class ServerManager: ObservableObject {
         callbacks.forEach { $0() }
     }
 
-    private func handleBufferedSidecarOutput() async {
-        let snapshots = await logRecorder.drain()
+    private func handleBufferedSidecarOutput(operation: UUID) async {
+        let snapshots = await logRecorder.drain(operation: operation)
         guard let latest = snapshots.last else { return }
         publishLogSnapshot(latest)
     }
 
-    private func handleSidecarEOF() async {
-        let snapshot = await logRecorder.finishPending()
+    private func handleSidecarEOF(operation: UUID) async {
+        let snapshot = await logRecorder.finishPending(operation: operation)
         publishLogSnapshot(snapshot)
     }
 

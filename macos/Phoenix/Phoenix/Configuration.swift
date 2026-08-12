@@ -96,9 +96,8 @@ struct ConnectionReapplyDecision: Equatable {
             return ConnectionReapplyDecision(requiresReconnect: true)
         }
         switch currentState {
-        case .ready(_, let deployment):
-            let healthyMatch = deployment.originExactlyMatches(candidate.origin)
-            return ConnectionReapplyDecision(requiresReconnect: !healthyMatch)
+        case .ready:
+            return ConnectionReapplyDecision(requiresReconnect: false)
         default:
             return ConnectionReapplyDecision(requiresReconnect: true)
         }
@@ -670,7 +669,15 @@ struct SettingsPersistence {
                     outcome: .preserveExisting,
                     source: .preservedSnapshot
                 )
-            case .loaded:
+            case .loaded(let value):
+                guard value != nil else {
+                    return SecretWritePlan(
+                        persistedState: .loaded(nil),
+                        rollbackValue: nil,
+                        outcome: .preserveExisting,
+                        source: .preservedSnapshot
+                    )
+                }
                 return SecretWritePlan(
                     persistedState: .loaded(nil),
                     rollbackValue: previousValue,
@@ -678,6 +685,16 @@ struct SettingsPersistence {
                     source: .explicitDelete
                 )
             }
+        }
+
+        if case .loaded(let previous?) = previousState,
+           previous.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed {
+            return SecretWritePlan(
+                persistedState: .loaded(previous),
+                rollbackValue: previous,
+                outcome: .preserveExisting,
+                source: .preservedSnapshot
+            )
         }
 
         return SecretWritePlan(
@@ -959,6 +976,7 @@ struct BundledServerConfiguration: Equatable {
         [
             "CODEX_HOME": runtimeRootURL.appendingPathComponent(".codex", isDirectory: true).path,
             "PHOENIX_DATA_DIR": dataDirectoryURL.path,
+            "PHOENIX_TMP_DIR": runtimeRootURL.appendingPathComponent("tmp", isDirectory: true).appendingPathComponent("phoenix-ide", isDirectory: true).path,
             "PHOENIX_BIND_ADDR": "127.0.0.1",
             "PHOENIX_TLS": "off",
             "PHOENIX_PORT": String(origin.url.port!),

@@ -91,7 +91,9 @@ impl PhoenixRuntimeEnvironment {
         let db_path = std::env::var_os("PHOENIX_DB_PATH")
             .filter(|v| !v.is_empty())
             .map_or_else(|| data_dir.join("phoenix.db"), PathBuf::from);
-        let tmp_root = std::env::temp_dir().join(TMP_NAMESPACE);
+        let tmp_root = std::env::var_os("PHOENIX_TMP_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| std::env::temp_dir().join(TMP_NAMESPACE), PathBuf::from);
 
         Self {
             home,
@@ -219,7 +221,7 @@ impl PhoenixRuntimeEnvironment {
         self.data_dir().join("tmux-sockets")
     }
 
-    /// `temp_dir()/phoenix-ide` — the root for Phoenix scratch namespaces.
+    /// `$PHOENIX_TMP_DIR` (or `temp_dir()/phoenix-ide`) — Phoenix scratch root.
     /// Prefer [`tmp_subdir`](Self::tmp_subdir), which validates the namespace
     /// and creates the directory; this accessor is for callers that only need
     /// the path (e.g. to build a child path they create themselves).
