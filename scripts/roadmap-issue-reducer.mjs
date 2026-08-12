@@ -492,17 +492,19 @@ async function reconcileReactions(owner, repo, comments, before, after, projecte
     }
   }
 
-  for (const comment of comments) {
-    if (
+  const staleCandidates = comments
+    .filter((comment) =>
       comment.id !== triggerId &&
       comment.id !== deletedId &&
       !after.has(comment.id) &&
       TRUSTED_ASSOCIATIONS.has(comment.author_association) &&
       roadmapPayload(comment.body) !== null &&
-      (comment.reactions?.rocket ?? 0) > 0
-    ) {
-      await clearAcceptedReaction(owner, repo, comment.id, token);
-    }
+      (comment.reactions?.rocket ?? 0) > 0,
+    )
+    .sort((left, right) => right.id - left.id)
+    .slice(0, MAX_WORKSTREAMS);
+  for (const comment of staleCandidates) {
+    await clearAcceptedReaction(owner, repo, comment.id, token);
   }
 
   const ensureAccepted = new Set(projectedUpdates.map((update) => update.source.id));
