@@ -2971,7 +2971,7 @@ impl WakeRepository {
         conversation_id: &str,
         timestamp: Timestamp,
     ) -> DbResult<WakeAdoptMaterializedPendingOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.workflow_repo.begin_immediate_tx().await?;
         let Some(conversation_row) =
             sqlx::query("SELECT state, archived FROM conversations WHERE id = ?1")
                 .bind(conversation_id)
