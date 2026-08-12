@@ -32,21 +32,25 @@ asset_id() {
   release_json | jq -er --arg name "$name" '.assets[] | select(.name == $name) | .id' | head -n 1
 }
 cleanup_staged() {
-  local name id
+  local name id failed=0
   for name in "${staged_names[@]}"; do
     if id=$(asset_id "$name" 2>/dev/null); then
-      gh api --method DELETE "repos/$repo/releases/assets/$id" >/dev/null || true
+      gh api --method DELETE "repos/$repo/releases/assets/$id" >/dev/null || failed=1
     fi
   done
+  ((failed == 0))
 }
 if ! gh release upload "$tag" --repo "$repo" "$staged"/*; then
-  cleanup_staged
+  if ! cleanup_staged; then
+    echo "error: staged upload failed and staged asset cleanup also failed" >&2
+    exit 2
+  fi
   echo "staged release asset upload failed; previous asset set remains active" >&2
   exit 1
 fi
 
 restore_previous() {
-  cleanup_staged
+  cleanup_staged || return 1
   local files=()
   local backup_names=()
   while IFS= read -r -d '' file; do
@@ -57,10 +61,10 @@ restore_previous() {
     gh release upload "$tag" --repo "$repo" --clobber "${files[@]}" || return 1
   fi
 
-  local current_names=()
-  mapfile -t current_names < <(release_json | jq -r '.assets[].name')
+  local current_names_file="$work/current-names"
+  release_json | jq -r '.assets[].name' > "$current_names_file"
   local name file found
-  for name in "${current_names[@]}"; do
+  while IFS= read -r name; do
     found=0
     for file in "${backup_names[@]}"; do
       if [[ "$file" == "$name" ]]; then
@@ -73,14 +77,15 @@ restore_previous() {
         gh api --method DELETE "repos/$repo/releases/assets/$id" >/dev/null || return 1
       fi
     fi
-  done
+  done < "$current_names_file"
   for file in "${backup_names[@]}"; do
     asset_id "$file" >/dev/null || return 1
   done
-  mapfile -t current_names < <(release_json | jq -r '.assets[].name' | sort)
-  mapfile -t backup_names < <(printf '%s
-' "${backup_names[@]}" | sort)
-  [[ "${current_names[*]}" == "${backup_names[*]}" ]]
+  local sorted_current="$work/current-names-sorted"
+  local sorted_backup="$work/backup-names-sorted"
+  release_json | jq -r '.assets[].name' | sort > "$sorted_current"
+  printf '%s\n' "${backup_names[@]}" | sort > "$sorted_backup"
+  cmp -s "$sorted_current" "$sorted_backup"
 }
 
 commit_failed=0
@@ -99,5 +104,5 @@ if ((commit_failed)); then
   restore_previous || { echo "error: previous release asset restoration failed" >&2; exit 2; }
   exit 1
 fi
-cleanup_staged
+cleanup_staged || { echo "error: committed assets but failed to remove staged release debris" >&2; exit 2; }
 for asset in "${assets[@]}"; do asset_id "$(basename "$asset")" >/dev/null; done

@@ -28,6 +28,94 @@ upload_clobber = os.environ.get('FAKE_GH_UPLOAD_CLOBBER_FAIL', '') == '1'
 upload_fail_after = int(os.environ.get('FAKE_GH_UPLOAD_FAIL_AFTER', '0'))
 restore_skip = set(filter(None, os.environ.get('FAKE_GH_RESTORE_SKIP_NAMES', '').split(':')))
 restore_keep_extra = set(filter(None, os.environ.get('FAKE_GH_RESTORE_KEEP_EXTRA_NAMES', '').split(':')))
+api_delete_count_path = state_dir / 'api_delete_count'
+api_patch_count_path = state_dir / 'api_patch_count'
+
+
+def read_counter(path):
+    if not path.exists():
+        return 0
+    return int(path.read_text())
+
+
+def bump_counter(path):
+    value = read_counter(path) + 1
+    path.write_text(str(value))
+    return value
+
+
+def state_file_value(name):
+    path = state_dir / name
+    if not path.exists():
+        return None
+    return path.read_text().strip()
+
+
+def state_file_matches(name, expected):
+    value = state_file_value(name)
+    return value is not None and value == expected
+
+
+def state_file_matches_count(name, count):
+    value = state_file_value(name)
+    return value is not None and value == str(count)
+
+
+def consume_state_file(name):
+    path = state_dir / name
+    if path.exists():
+        path.unlink()
+
+
+def should_fail_delete(asset_name, asset_id, delete_count):
+    if asset_name in delete_fail:
+        return True
+    if state_file_matches('fail_delete_name', asset_name):
+        consume_state_file('fail_delete_name')
+        return True
+    if state_file_matches('fail_delete_id', str(asset_id)):
+        consume_state_file('fail_delete_id')
+        return True
+    if state_file_matches_count('fail_delete_on_count', delete_count):
+        consume_state_file('fail_delete_on_count')
+        return True
+    return False
+
+
+def should_fail_patch(new_name, asset_id, patch_count):
+    if new_name in patch_fail:
+        return True
+    if state_file_matches('fail_patch_name', new_name):
+        consume_state_file('fail_patch_name')
+        return True
+    if state_file_matches('fail_patch_id', str(asset_id)):
+        consume_state_file('fail_patch_id')
+        return True
+    if state_file_matches_count('fail_patch_on_count', patch_count):
+        consume_state_file('fail_patch_on_count')
+        return True
+    return False
+
+
+def upload_count():
+    path = state_dir / 'upload_count'
+    return bump_counter(path)
+
+
+def is_restore_upload(clobber):
+    return clobber and upload_count() > 1
+
+
+def should_skip_restore_asset(name, restore_phase):
+    if not restore_phase:
+        return False
+    return name in restore_skip or state_file_matches('restore_skip_name', name)
+
+
+def should_keep_extra_asset(name, restore_phase):
+    if not restore_phase:
+        return False
+    return name in restore_keep_extra or state_file_matches('restore_keep_extra_name', name)
 
 
 def log(args):
@@ -118,16 +206,17 @@ if args[:2] == ['release', 'upload']:
     _, tag = parse_repo_tag(args[2:])
     release = ensure_release(tag)
     clobber = '--clobber' in args
+    restore_phase = is_restore_upload(clobber)
     upload_args = [
         Path(arg)
         for arg in args[2:]
         if not arg.startswith('-') and arg not in {tag, os.environ.get('FAKE_REPO')}
     ]
-    if clobber and upload_clobber:
+    if restore_phase and upload_clobber:
         print('restore upload failed', file=sys.stderr)
         raise SystemExit(1)
     for index, path in enumerate(upload_args, start=1):
-        if clobber and path.name in restore_skip:
+        if should_skip_restore_asset(path.name, restore_phase):
             continue
         existing = [a for a in release['assets'] if a['name'] == path.name]
         if existing and not clobber:
@@ -173,12 +262,13 @@ if args[0] == 'api':
     if method == 'DELETE' and '/releases/assets/' in endpoint:
         release = load_release()
         asset_id = int(endpoint.rsplit('/', 1)[1])
+        delete_count = bump_counter(api_delete_count_path)
         for asset in list(release['assets']):
             if asset['id'] == asset_id:
-                if asset['name'] in delete_fail:
+                if should_fail_delete(asset['name'], asset_id, delete_count):
                     print('delete failed', file=sys.stderr)
                     raise SystemExit(1)
-                if asset['name'] in restore_keep_extra:
+                if should_keep_extra_asset(asset['name'], restore_phase=True):
                     raise SystemExit(0)
                 release['assets'].remove(asset)
                 save_release(release)
@@ -187,13 +277,14 @@ if args[0] == 'api':
     if method == 'PATCH' and '/releases/assets/' in endpoint:
         release = load_release()
         asset_id = int(endpoint.rsplit('/', 1)[1])
+        patch_count = bump_counter(api_patch_count_path)
         for asset in release['assets']:
             if asset['id'] == asset_id:
                 new_name = fields['name']
                 if any(other['name'] == new_name and other['id'] != asset_id for other in release['assets']):
                     print('rename collision', file=sys.stderr)
                     raise SystemExit(1)
-                if new_name in patch_fail:
+                if should_fail_patch(new_name, asset_id, patch_count):
                     print('patch failed', file=sys.stderr)
                     raise SystemExit(1)
                 asset['name'] = new_name
@@ -279,6 +370,10 @@ reset_env() {
   unset FAKE_GH_DELETE_FAIL_NAMES FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_UPLOAD_CLOBBER_FAIL FAKE_GH_UPLOAD_FAIL_AFTER FAKE_GH_RESTORE_SKIP_NAMES FAKE_GH_RESTORE_KEEP_EXTRA_NAMES
 }
 
+write_state_file() {
+  printf '%s' "$2" > "$state_dir/$1"
+}
+
 asset_one="$tmp/assets/Phoenix Desktop.zip"
 asset_two="$tmp/assets/SHA 256 SUMS.txt"
 printf 'desktop-bytes' > "$asset_one"
@@ -323,45 +418,42 @@ unset FAKE_GH_UPLOAD_FAIL_AFTER
 # commit failure restores previous complete set and verifies
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-export FAKE_GH_DELETE_FAIL_NAMES='Phoenix Desktop.zip'
+write_state_file fail_delete_on_count 1
 status=0
 bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-success.err" || status=$?
 [[ "$status" -eq 1 ]]
 grep -F 'release asset replacement failed; restoring previous asset set' "$tmp/restore-success.err" >/dev/null
 assert_release_names 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
 grep -E 'release upload v1.2.3 --repo owner/repo --clobber .*/old note\.txt' "$tmp/gh.log" >/dev/null
-unset FAKE_GH_DELETE_FAIL_NAMES
 
 # partial restore is detected when a prior replacement name is missing after rollback
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-export FAKE_GH_PATCH_FAIL_NAMES='SHA 256 SUMS.txt'
-export FAKE_GH_RESTORE_SKIP_NAMES='SHA 256 SUMS.txt'
+write_state_file fail_patch_on_count 2
+write_state_file restore_skip_name 'SHA 256 SUMS.txt'
 set +e
 bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-partial.err"
 status=$?
 set -e
 [[ "$status" -eq 2 ]]
 grep -F 'error: previous release asset restoration failed' "$tmp/restore-partial.err" >/dev/null
-unset FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_RESTORE_SKIP_NAMES
 
 # restore failure is detected when rollback leaves an extra final asset behind
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-export FAKE_GH_PATCH_FAIL_NAMES='SHA 256 SUMS.txt'
-export FAKE_GH_RESTORE_KEEP_EXTRA_NAMES='Phoenix Desktop.zip'
+write_state_file fail_patch_on_count 2
+write_state_file restore_keep_extra_name 'Phoenix Desktop.zip'
 set +e
 bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-extra.err"
 status=$?
 set -e
 [[ "$status" -eq 2 ]]
 grep -F 'error: previous release asset restoration failed' "$tmp/restore-extra.err" >/dev/null
-unset FAKE_GH_PATCH_FAIL_NAMES FAKE_GH_RESTORE_KEEP_EXTRA_NAMES
 
-# restore failure returns distinct failure
+# restore upload failure returns distinct failure
 reset_env
 write_release 'Phoenix Desktop.zip' 'SHA 256 SUMS.txt' 'old note.txt'
-export FAKE_GH_DELETE_FAIL_NAMES='Phoenix Desktop.zip'
+write_state_file fail_delete_on_count 1
 export FAKE_GH_UPLOAD_CLOBBER_FAIL=1
 set +e
 bash "$root/scripts/publish-release-assets.sh" "$FAKE_REPO" v1.2.3 "$asset_one" "$asset_two" >/dev/null 2>"$tmp/restore-fail.err"
