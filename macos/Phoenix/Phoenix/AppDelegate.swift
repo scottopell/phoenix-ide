@@ -28,8 +28,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] state in self?.updateWindowContent(for: state) }
             .store(in: &cancellables)
         showWindow()
-        if persistence.loadConnectionDraft().hasSavedModeSelection {
+        let hasSavedModeSelection = persistence.loadConnectionDraft().hasSavedModeSelection
+        if hasSavedModeSelection {
             serverManager.connect()
+        } else if FirstRunDecision.shouldOpenSettings(hasSavedModeSelection: hasSavedModeSelection) {
+            DispatchQueue.main.async {
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
         }
     }
 

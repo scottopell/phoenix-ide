@@ -89,6 +89,12 @@ struct ReopenDecision {
         !mainWindowIsVisible
     }
 }
+enum FirstRunDecision {
+    static func shouldOpenSettings(hasSavedModeSelection: Bool) -> Bool {
+        !hasSavedModeSelection
+    }
+}
+
 
 struct SidecarPackagingValidation {
     enum SigningExpectation: Equatable {
@@ -247,7 +253,19 @@ struct SettingsPersistence {
             throw error
         }
 
-        let after = try persistedSnapshot()
+        let after = PersistedSettingsSnapshot(
+            preferences: PersistedPreferenceSnapshot(
+                serverMode: mode.persistedKind.rawValue,
+                attachedOrigin: draft.attachedOrigin,
+                bundledPort: draft.bundledPort,
+                developmentBinaryOverride: draft.developmentBinaryOverride,
+                rustLogLevel: draft.rustLogLevel
+            ),
+            secrets: Dictionary(uniqueKeysWithValues: ProviderSecret.allCases.map { secret in
+                let value = secretValue(in: draft, for: secret).trimmingCharacters(in: .whitespacesAndNewlines)
+                return (secret, value.isEmpty ? nil : value)
+            })
+        )
         return (candidate, SettingsPersistenceSummary(
             requiresReconnect: priorAppliedSnapshot.draft() != after.draft(),
             savedSecrets: savedSecrets,

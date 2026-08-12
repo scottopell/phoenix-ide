@@ -432,6 +432,25 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(try keychain.read(.openAIAPIKey), "old-openai")
     }
 
+    func testSettingsPersistenceDoesNotPerformFalliblePostWriteKeychainRead() throws {
+        let suite = "SettingsPersistence.persist.no-post-read.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ScriptedSecretStore(scriptedReads: [
+            .anthropicAPIKey: [.succeed(nil), .fail(.status(errSecInteractionNotAllowed))],
+            .openAIAPIKey: [.succeed(nil), .fail(.status(errSecInteractionNotAllowed))],
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: store, bundle: .main)
+        var draft = SettingsDraft.defaults
+        draft.mode = .attached
+        draft.attachedOrigin = "https://phoenix.example.test:8031"
+
+        let result = try persistence.persist(draft: draft)
+        XCTAssertEqual(result.persistedSnapshot.preferences.serverMode, ServerModeKind.attached.rawValue)
+        XCTAssertNil(result.persistedSnapshot.secrets[.anthropicAPIKey] ?? nil)
+        XCTAssertNil(result.persistedSnapshot.secrets[.openAIAPIKey] ?? nil)
+    }
+
     func testSettingsPersistenceSurfacesRollbackFailureAsCompoundError() throws {
         let suite = "SettingsPersistence.persist.rollback-compound.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -512,6 +531,11 @@ final class ConfigurationTests: XCTestCase {
     func testReopenDecisionShowsMainWindowOnlyWhenHidden() {
         XCTAssertTrue(ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: false))
         XCTAssertFalse(ReopenDecision.shouldShowMainWindow(mainWindowIsVisible: true))
+    }
+
+    func testFirstRunDecisionOpensSettingsOnlyWithoutSavedMode() {
+        XCTAssertTrue(FirstRunDecision.shouldOpenSettings(hasSavedModeSelection: false))
+        XCTAssertFalse(FirstRunDecision.shouldOpenSettings(hasSavedModeSelection: true))
     }
 
     func testSidecarPackagingValidationRequiresExactIdentityName() {
