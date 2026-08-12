@@ -348,7 +348,10 @@ async function githubRequest(path, token, options = {}) {
 function trustedSnapshotKey(comments) {
   return comments
     .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
-    .map((comment) => `${comment.id}:${comment.updated_at ?? comment.created_at}`)
+    .map((comment) => {
+      const digest = createHash("sha256").update(comment.body).digest("hex");
+      return `${comment.id}:${comment.updated_at ?? comment.created_at}:${digest}`;
+    })
     .join("|");
 }
 
@@ -386,7 +389,11 @@ async function listReactions(owner, repo, commentId, token) {
 
 async function ensureRetirementReceipts(owner, repo, issueNumber, comments, current, outcomes, token) {
   const activeWorkstreams = new Set(current.map((update) => update.workstream));
-  const existing = new Set(comments.map((comment) => comment.body));
+  const existing = new Set(
+    comments
+      .filter((comment) => comment.user?.login === "github-actions[bot]")
+      .map((comment) => comment.body),
+  );
   const byId = new Map(comments.map((comment) => [comment.id, comment]));
   const latest = new Map();
   for (const [commentId, outcome] of outcomes) {
@@ -567,7 +574,6 @@ export async function run({ event, configuredIssueNumber, token }) {
       before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
       const body = renderRoadmap(updates, snapshotThroughCommentId);
       changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
-      await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
 
       const after = await listComments(owner, repo, configuredIssueNumber, token);
       if (trustedSnapshotKey(comments) === trustedSnapshotKey(after)) {
@@ -591,6 +597,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     }
 
     try {
+      await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
       await reconcileReactions(
         owner,
         repo,
