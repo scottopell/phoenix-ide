@@ -15,9 +15,6 @@ jobs:
       vars.PHOENIX_ROADMAP_ISSUE_NUMBER != '' &&
       github.event.issue.number == fromJSON(vars.PHOENIX_ROADMAP_ISSUE_NUMBER) &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-    concurrency:
-      group: roadmap-issue-${{ github.event.issue.number }}
-      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
