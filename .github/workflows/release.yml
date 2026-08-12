@@ -29,6 +29,7 @@ jobs:
     outputs:
       release: ${{ steps.ver.outputs.release }}
       tag: ${{ steps.ver.outputs.tag }}
+      commit: ${{ steps.ver.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,9 +42,16 @@ jobs:
           [ -n "$VERSION" ] || { echo "Could not read version from crates/phoenix-ide/Cargo.toml"; exit 1; }
           TAG="v$VERSION"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "Tag $TAG already exists — nothing to release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG")
+            if [ "$TAG_COMMIT" = "$GITHUB_SHA" ]; then
+              echo "Tag $TAG already points at this exact commit — retrying its release."
+              echo "release=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag $TAG already points at $TAG_COMMIT, not $GITHUB_SHA — nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "Tagging $(git rev-parse --short HEAD) as $TAG"
             # Annotated tags need a committer identity; the runner has none.
@@ -154,8 +162,68 @@ jobs:
           name: macos-${{ matrix.target }}
           path: ${{ matrix.asset }}
 
+  build-macos-desktop:
+    needs: [gate, build-macos]
+    if: needs.gate.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            sidecar: phoenix_ide-aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            sidecar: phoenix_ide-x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: sidecar
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          : "${MACOS_CERTIFICATE_P12_BASE64:?MACOS_CERTIFICATE_P12_BASE64 is required}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?MACOS_CERTIFICATE_PASSWORD is required}"
+          CERTIFICATE_PATH="$RUNNER_TEMP/phoenix-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/phoenix-signing.keychain-db"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+      - name: Build, sign, notarize, and package Phoenix.app
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          chmod +x "sidecar/${{ matrix.sidecar }}"
+          macos/Phoenix/scripts/package-desktop-release.sh \
+            "sidecar/${{ matrix.sidecar }}" \
+            "${{ matrix.target }}" \
+            "${{ needs.gate.outputs.tag }}" \
+            "${{ needs.gate.outputs.commit }}" \
+            desktop-assets
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/phoenix-signing.keychain-db" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: desktop-assets/Phoenix-macos-${{ matrix.target }}-${{ needs.gate.outputs.tag }}.zip
+
   publish:
-    needs: [gate, build-linux, build-macos]
+    needs: [gate, build-linux, build-macos, build-macos-desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -166,6 +234,10 @@ jobs:
         with:
           pattern: 'macos-*'
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'desktop-*'
+          merge-multiple: true
       - name: Publish one checksummed asset set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,14 +247,23 @@ jobs:
             phoenix_ide-aarch64-unknown-linux-musl
             phoenix_ide-x86_64-apple-darwin
             phoenix_ide-aarch64-apple-darwin
+            Phoenix-macos-x86_64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
+            Phoenix-macos-aarch64-apple-darwin-${{ needs.gate.outputs.tag }}.zip
           )
           for asset in "${required[@]}"; do
             test -f "$asset" || { echo "missing required release asset: $asset"; exit 1; }
           done
-          sha256sum phoenix_ide-* > SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 6
-          gh release create "${{ needs.gate.outputs.tag }}" \
-            --repo scottopell/phoenix-ide \
-            --title "${{ needs.gate.outputs.tag }}" \
-            --generate-notes \
-            phoenix_ide-* SHA256SUMS
+          sha256sum phoenix_ide-* Phoenix-macos-* > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 8
+          if gh release view "${{ needs.gate.outputs.tag }}" --repo scottopell/phoenix-ide >/dev/null 2>&1; then
+            gh release upload "${{ needs.gate.outputs.tag }}" \
+              --repo scottopell/phoenix-ide \
+              --clobber \
+              phoenix_ide-* Phoenix-macos-* SHA256SUMS
+          else
+            gh release create "${{ needs.gate.outputs.tag }}" \
+              --repo scottopell/phoenix-ide \
+              --title "${{ needs.gate.outputs.tag }}" \
+              --generate-notes \
+              phoenix_ide-* Phoenix-macos-* SHA256SUMS
+          fi

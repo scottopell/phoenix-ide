@@ -12,6 +12,8 @@ on:
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/test-desktop-release-workflow.py"
   push:
     branches: [main]
     paths:
@@ -21,6 +23,8 @@ on:
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/test-desktop-release-workflow.py"
 
 concurrency:
   group: macos-app-${{ github.ref }}
@@ -34,8 +38,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test typed macOS core
         run: swift test --package-path macos/Phoenix
-      - name: Run sidecar packaging regression shell test
-        run: macos/Phoenix/scripts/test-package-sidecar.sh
+      - name: Test sidecar and desktop release packaging contracts
+        run: |
+          macos/Phoenix/scripts/test-package-sidecar.sh
+          macos/Phoenix/scripts/test-package-desktop-release.sh
+          python3 scripts/test-desktop-release-workflow.py
       - name: Build attached-capable Debug app
         run: |
           xcodebuild \
