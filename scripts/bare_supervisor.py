@@ -64,6 +64,7 @@ class Artifact:
 class TransactionManifest:
     manifest_version: int
     transaction_id: str
+    source_kind: str
     expected: RuntimeIdentity
     previous: Optional[RuntimeIdentity]
     expected_health_url: str
@@ -82,6 +83,7 @@ class TransactionManifest:
     def load(cls, path: Path) -> "TransactionManifest":
         try:
             raw = json.loads(path.read_text())
+            raw.setdefault("source_kind", "local_head")
             raw["expected"] = RuntimeIdentity(**raw["expected"])
             raw["previous"] = RuntimeIdentity(**raw["previous"]) if raw.get("previous") else None
             raw["candidate_binary"] = Artifact(**raw["candidate_binary"])
@@ -522,11 +524,17 @@ class Supervisor:
         if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o200:
             raise SupervisorError("transaction directory ownership or mode is unsafe")
         validate_runtime_identity(manifest.expected)
-        if not FULL_EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
-            raise SupervisorError("expected identity must use a full lowercase embedded git SHA")
+        if manifest.source_kind == "installed_restart":
+            if not EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
+                raise SupervisorError("installed restart identity must use a lowercase embedded git SHA")
+            if not GIT_SHA_RE.fullmatch(manifest.source_commit) or not manifest.source_commit.startswith(manifest.expected.git_sha):
+                raise SupervisorError("installed restart source commit does not match expected identity")
+        else:
+            if not FULL_EMBEDDED_SHA_RE.fullmatch(manifest.expected.git_sha):
+                raise SupervisorError("expected identity must use a full lowercase embedded git SHA")
+            if not GIT_SHA_RE.fullmatch(manifest.source_commit) or manifest.source_commit != manifest.expected.git_sha:
+                raise SupervisorError("source commit does not exactly match expected identity")
         validate_health_url(manifest.expected_health_url)
-        if not GIT_SHA_RE.fullmatch(manifest.source_commit) or manifest.source_commit != manifest.expected.git_sha:
-            raise SupervisorError("source commit does not exactly match expected identity")
         if manifest.previous is not None:
             validate_runtime_identity(manifest.previous)
             if manifest.previous_health_url is None:

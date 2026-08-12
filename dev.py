@@ -8200,6 +8200,7 @@ def _commit_bare_transaction(
     manifest = {
         "manifest_version": 1,
         "transaction_id": transaction_id,
+        "source_kind": prepared.source_kind.value,
         "expected": prepared.identity.as_dict(),
         "previous": previous_identity.as_dict() if previous_identity else None,
         "expected_health_url": _bare_api_health_url(env_snapshot),

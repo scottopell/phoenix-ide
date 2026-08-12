@@ -151,7 +151,7 @@ class BareTransactionTests(unittest.TestCase):
         path.chmod(0o600)
         return {"name": name, "sha256": supervisor.sha256(path)}
 
-    def manifest(self, *, previous=False, expected_sha=None):
+    def manifest(self, *, previous=False, expected_sha=None, source_kind="local_head"):
         candidate_binary = self.artifact("candidate-binary", "new binary")
         candidate_environment = self.artifact("candidate.env", "MODE=new\n")
         rollback_binary = self.artifact("rollback-binary", "old binary") if previous else None
@@ -159,6 +159,7 @@ class BareTransactionTests(unittest.TestCase):
         value = {
             "manifest_version": 1,
             "transaction_id": self.transaction_id,
+            "source_kind": source_kind,
             "expected": {"version": "2.0.0", "git_sha": expected_sha or "b" * 40},
             "previous": {"version": "1.0.0", "git_sha": "a" * 12} if previous else None,
             "expected_health_url": "http://127.0.0.1:49155/api/version",
@@ -264,6 +265,12 @@ class BareTransactionTests(unittest.TestCase):
         owner = supervisor.Supervisor(self.layout)
         with self.assertRaisesRegex(supervisor.SupervisorError, "expected identity must use a full lowercase embedded git SHA"):
             owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+
+    def test_installed_restart_accepts_legacy_twelve_char_expected_sha(self):
+        path = self.manifest(expected_sha="b" * 12, source_kind="installed_restart")
+        owner = supervisor.Supervisor(self.layout)
+        manifest, *_ = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
+        self.assertEqual("b" * 12, manifest.expected.git_sha)
 
     def test_accepts_previous_manifest_identity_with_legacy_twelve_char_sha(self):
         path = self.manifest(previous=True)
