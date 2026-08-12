@@ -90,7 +90,9 @@ struct SettingsView: View {
                         savedDraft = persisted.persistedSnapshot.draft()
                         savedAppliedSnapshot = persisted.persistedSnapshot
                         hasSavedModeSelection = true
-                        try serverManager.reconnect(to: persisted.candidate)
+                        if persisted.summary.requiresReconnect {
+                            try serverManager.reconnect(to: persisted.candidate)
+                        }
                         keychainMessage = keychainStatusMessage(summary: persisted.summary)
                         modeMessage = nil
                     } catch {
@@ -139,8 +141,10 @@ struct SettingsView: View {
         }
         if summary.requiresReconnect {
             parts.append("Saved settings now govern new connections.")
+        } else {
+            parts.append("Saved settings already match the active connection.")
         }
-        return parts.isEmpty ? "Saved settings." : parts.joined(separator: " ")
+        return parts.joined(separator: " ")
     }
 
     private var attachedSettings: some View {

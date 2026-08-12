@@ -245,6 +245,80 @@ struct BundledReconnectQueue {
     }
 }
 
+struct RollingLogWriter {
+    let url: URL
+    let maxBytes: Int64
+
+    func openForAppend(fileManager: FileManager = .default) throws -> FileHandle {
+        if !fileManager.fileExists(atPath: url.path) {
+            fileManager.createFile(atPath: url.path, contents: nil)
+        }
+        let existing = (try? Data(contentsOf: url)) ?? Data()
+        let bounded = boundedTail(of: existing)
+        if bounded != existing {
+            try bounded.write(to: url, options: .atomic)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        return handle
+    }
+
+    func append(_ data: Data) throws -> FileHandle? {
+        guard !data.isEmpty else { return nil }
+        let existing = (try? Data(contentsOf: url)) ?? Data()
+        var combined = existing
+        combined.append(data)
+        let bounded = boundedTail(of: combined)
+        try bounded.write(to: url, options: .atomic)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        return handle
+    }
+
+    func rewriteBoundedTail(fileManager: FileManager = .default) throws -> Data {
+        guard maxBytes > 0 else {
+            return (try? Data(contentsOf: url)) ?? Data()
+        }
+        let existing = (try? Data(contentsOf: url)) ?? Data()
+        return boundedTail(of: existing)
+    }
+
+    static func boundedTail(_ data: Data, maxBytes: Int64) -> Data {
+        Self(url: URL(fileURLWithPath: "/dev/null"), maxBytes: maxBytes).boundedTail(of: data)
+    }
+
+    private func boundedTail(of data: Data) -> Data {
+        guard maxBytes > 0, data.count > maxBytes else { return data }
+
+        let newline = UInt8(0x0A)
+        var lines: [Data] = []
+        var start = data.startIndex
+        while let newlineIndex = data[start...].firstIndex(of: newline) {
+            lines.append(Data(data[start...newlineIndex]))
+            start = data.index(after: newlineIndex)
+        }
+        if start < data.endIndex {
+            lines.append(Data(data[start...]))
+        }
+
+        guard !lines.isEmpty else { return Data(data.suffix(Int(maxBytes))) }
+
+        var kept: [Data] = []
+        var total = 0
+        for line in lines.reversed() {
+            if kept.isEmpty {
+                kept.append(line)
+                total += line.count
+                continue
+            }
+            guard total + line.count <= maxBytes else { break }
+            kept.append(line)
+            total += line.count
+        }
+        return kept.reversed().reduce(into: Data()) { $0.append($1) }
+    }
+}
+
 @MainActor
 final class ServerManager: ObservableObject {
     @Published private(set) var state: ConnectionState = .stopped
@@ -257,7 +331,7 @@ final class ServerManager: ObservableObject {
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
-    private var logFileHandle: FileHandle?
+    private var launcherLogHandle: FileHandle?
     private var ownerLockDescriptor: Int32?
     struct ConnectionOperationToken: Equatable, Hashable {
         fileprivate let id: UUID
@@ -307,10 +381,12 @@ final class ServerManager: ObservableObject {
     }
 
     func reconnect(to candidate: ServerMode) throws {
-        switch (mode, candidate) {
-        case (.bundled, .bundled):
-            restartBundled(with: candidate)
+        switch mode {
+        case .bundled?:
+            transitionFromBundled(to: candidate)
         default:
+            mode = candidate
+            webOrigin = candidate.origin
             connect()
         }
     }
@@ -386,7 +462,7 @@ final class ServerManager: ObservableObject {
             processID: process?.processIdentifier,
             executablePath: bundled?.executableURL.path,
             databasePath: bundled?.databaseURL.path,
-            logPath: bundled?.logURL.path,
+            logPath: bundled?.launcherLogURL.path,
             recentLogLines: recentLogLines
         )
     }
@@ -396,7 +472,6 @@ final class ServerManager: ObservableObject {
     private var currentDeployment: DeploymentInfo? { state.deploymentInfo }
 
     private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
-        try acquireOwnerLock(configuration.ownerLockURL)
         state = .startingSidecar
         logBuffer = ConnectionLogBuffer()
         recentLogLines = []
@@ -404,9 +479,11 @@ final class ServerManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: configuration.runtimeRootURL, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: configuration.logURL.path, contents: nil)
-            logFileHandle = try FileHandle(forWritingTo: configuration.logURL)
-            try logFileHandle?.seekToEnd()
+            try acquireOwnerLock(configuration.ownerLockURL)
+            launcherLogHandle = try RollingLogWriter(
+                url: configuration.launcherLogURL,
+                maxBytes: BundledServerConfiguration.launcherLogMaxBytes
+            ).openForAppend()
 
             let inherited = ProcessInfo.processInfo.environment
             let instanceID = UUID()
@@ -456,7 +533,7 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    private func restartBundled(with candidate: ServerMode) {
+    private func transitionFromBundled(to candidate: ServerMode) {
         guard case .bundled = mode else { return }
         guard bundledReconnectQueue.request(candidate) else { return }
         state = .restarting
@@ -586,8 +663,7 @@ final class ServerManager: ObservableObject {
         process = nil
         launchedBundledInstance = nil
         releaseOwnerLock()
-        try? logFileHandle?.close()
-        logFileHandle = nil
+        closeLauncherLog()
 
         switch state {
         case .stopping, .restarting:
@@ -604,8 +680,7 @@ final class ServerManager: ObservableObject {
 
     private func cleanupLaunchPreparationFailure() {
         launchedBundledInstance = nil
-        try? logFileHandle?.close()
-        logFileHandle = nil
+        closeLauncherLog()
         releaseOwnerLock()
     }
 
@@ -620,9 +695,11 @@ final class ServerManager: ObservableObject {
         process = nil
         launchedBundledInstance = nil
         releaseOwnerLock()
+        closeLauncherLog()
         state = .stopped
         finishStopCallbacksOnly()
     }
+
 
     private func finishStopCallbacksOnly() {
         let callbacks = stopCompletions
@@ -633,15 +710,29 @@ final class ServerManager: ObservableObject {
     private func recordOutput(_ data: Data) {
         let emitted = logBuffer.append(data, redact: redact)
         if !emitted.isEmpty {
-            try? logFileHandle?.write(contentsOf: Data((emitted.joined(separator: "\n") + "\n").utf8))
+            appendToLauncherLog(Data((emitted.joined(separator: "\n") + "\n").utf8))
             recentLogLines = logBuffer.completeLines
         }
     }
 
     private func flushPendingLogFragment() {
         guard let flushed = logBuffer.flushPending(redact: redact) else { return }
-        try? logFileHandle?.write(contentsOf: Data((flushed + "\n").utf8))
+        appendToLauncherLog(Data((flushed + "\n").utf8))
         recentLogLines = logBuffer.completeLines
+    }
+
+    private func appendToLauncherLog(_ data: Data) {
+        guard let configuration = launchedBundledInstance?.configuration else { return }
+        let writer = RollingLogWriter(
+            url: configuration.launcherLogURL,
+            maxBytes: BundledServerConfiguration.launcherLogMaxBytes
+        )
+        do {
+            try launcherLogHandle?.close()
+            launcherLogHandle = try writer.append(data)
+        } catch {
+            launcherLogHandle = nil
+        }
     }
 
     private func redact(_ line: String) -> String {
@@ -655,6 +746,11 @@ final class ServerManager: ObservableObject {
             return String(line[...separator]) + " [REDACTED]"
         }
         return "[REDACTED sensitive log line]"
+    }
+
+    private func closeLauncherLog() {
+        try? launcherLogHandle?.close()
+        launcherLogHandle = nil
     }
 
     private func acquireOwnerLock(_ url: URL) throws {

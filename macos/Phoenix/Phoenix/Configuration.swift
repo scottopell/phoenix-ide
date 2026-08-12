@@ -534,9 +534,12 @@ struct BundledServerConfiguration: Equatable {
     let runtimeRootURL: URL
     let dataDirectoryURL: URL
     let databaseURL: URL
-    let logURL: URL
+    let phoenixLogURL: URL
+    let launcherLogURL: URL
     let ownerLockURL: URL
     let rustLogLevel: String
+
+    static let launcherLogMaxBytes: Int64 = 512 * 1024
 
     var publicEnvironment: [String: String] {
         [
@@ -616,8 +619,9 @@ enum ConfigurationStore {
                 runtimeRootURL: runtimeRoot,
                 dataDirectoryURL: dataDir,
                 databaseURL: dataDir.appendingPathComponent("phoenix.db"),
-                logURL: dataDir.appendingPathComponent("phoenix.log"),
-                ownerLockURL: dataDir.appendingPathComponent("owner.lock"),
+                phoenixLogURL: dataDir.appendingPathComponent("phoenix.log"),
+                launcherLogURL: dataDir.appendingPathComponent("launcher.log"),
+                ownerLockURL: runtimeRoot.appendingPathComponent("owner.lock"),
                 rustLogLevel: rustLogLevel
             ))
         }

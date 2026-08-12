@@ -493,8 +493,9 @@ final class ConfigurationTests: XCTestCase {
             runtimeRootURL: root,
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
-            logURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
-            ownerLockURL: root.appendingPathComponent(".phoenix-ide/owner.lock"),
+            phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
+            ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "phoenix_ide=debug"
         )
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_BIND_ADDR"], "127.0.0.1")
@@ -506,6 +507,25 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.db")
         XCTAssertNil(configuration.publicEnvironment["ANTHROPIC_API_KEY"])
         XCTAssertNil(configuration.publicEnvironment["PHOENIX_PASSWORD"])
+    }
+
+    func testBundledPathsKeepOwnerLockOutsidePhoenixDataDir() throws {
+        let bundle = Bundle.main
+        let candidate = try ConfigurationStore.loadCandidate(
+            kind: .bundled,
+            attachedOrigin: ConfigurationStore.defaultAttachedOrigin,
+            bundledPort: 8420,
+            developmentBinaryOverride: "/bin/sh",
+            rustLogLevel: "phoenix_ide=info",
+            bundle: bundle
+        )
+        guard case .bundled(let configuration) = candidate else {
+            return XCTFail("Expected bundled configuration")
+        }
+        XCTAssertEqual(configuration.ownerLockURL.deletingLastPathComponent(), configuration.runtimeRootURL)
+        XCTAssertEqual(configuration.dataDirectoryURL.deletingLastPathComponent(), configuration.runtimeRootURL)
+        XCTAssertEqual(configuration.launcherLogURL.lastPathComponent, "launcher.log")
+        XCTAssertEqual(configuration.phoenixLogURL.lastPathComponent, "phoenix.log")
     }
 
     func testOwnershipDecoderFailsClosedForFutureKind() throws {
@@ -552,8 +572,9 @@ final class ConfigurationTests: XCTestCase {
             runtimeRootURL: root,
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
-            logURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
-            ownerLockURL: root.appendingPathComponent(".phoenix-ide/owner.lock"),
+            phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
+            ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "info"
         )
         let bundled = ServerMode.bundled(bundledConfig)
@@ -595,6 +616,47 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(queue.takeAfterStop(), latest)
         XCTAssertFalse(queue.stopScheduled)
         XCTAssertNil(queue.latestCandidate)
+    }
+
+    func testRollingLogWriterKeepsRecentTailWithinBound() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("launcher.log")
+        let writer = RollingLogWriter(url: url, maxBytes: 32)
+        let handle = try writer.openForAppend()
+        try handle.close()
+
+        let reopened = try XCTUnwrap(writer.append(Data("line-one\nline-two\nline-three\nline-four\n".utf8)))
+        defer { try? reopened.close() }
+
+        let logged = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(logged, "line-two\nline-three\nline-four\n")
+        let size = try XCTUnwrap((try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue)
+        XCTAssertLessThanOrEqual(size, 32)
+    }
+
+    func testRollingLogWriterReopenPreservesExistingBoundedTail() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("launcher.log")
+        try Data("old-one\nold-two\nold-three\n".utf8).write(to: url)
+        let writer = RollingLogWriter(url: url, maxBytes: 20)
+
+        let handle = try writer.openForAppend()
+        try handle.close()
+
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "old-two\nold-three\n")
+    }
+
+    func testRollingLogWriterPreservesWholeRedactedLineWhenItFitsBound() {
+        let data = Data(("prefix\n[REDACTED sensitive log line]\nnext\n").utf8)
+        let bounded = RollingLogWriter.boundedTail(data, maxBytes: 64)
+        let logged = String(decoding: bounded, as: UTF8.self)
+
+        XCTAssertEqual(logged, "prefix\n[REDACTED sensitive log line]\nnext\n")
+        XCTAssertFalse(logged.hasPrefix("\n"))
     }
 
     func testCertificateClassifierCoversFullCertificateFamily() {
