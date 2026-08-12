@@ -13,7 +13,7 @@
 --   - Intent-aware enforcement / overeagerness (needs the transcript).
 --   - The bash tool's own lifecycle (specs/bash/); its command-safety patterns
 --     are the seed entries of Layer 0's registry.
---   - Worktree / Landlock containment (specs/bash/, specs/projects/).
+--   - Worktree / Landlock containment (specs/bash/, specs/work-lifecycle/, specs/git-repository/).
 --
 -- Requirement traceability: REQ-PERM-001 through REQ-PERM-007.
 -- Dependencies: specs/bedrock/bedrock.allium

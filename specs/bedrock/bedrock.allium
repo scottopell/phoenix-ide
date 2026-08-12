@@ -83,8 +83,31 @@ value TaskProposalSnapshot {
     content_digest: String
 }
 
+value ReviewedProposalSnapshotIdentity {
+    repo_relative_path: String
+    task_kind: taskmd | plain_markdown
+    content_digest: String
+}
+
+value ApprovedTaskIdentity {
+    task_id: String?
+    priority: String?
+    slug: String?
+    plain_title: String?
+}
+
+value ApprovedTaskSource {
+    task_path: String
+    title: String
+    priority: String
+    body: String
+    identity: ApprovedTaskIdentity
+    reviewed_snapshot: ReviewedProposalSnapshotIdentity
+    kind: taskmd | plain_markdown
+}
+
 value ApprovedTaskObjective {
-    source: projects/ApprovedTaskSource
+    source: ApprovedTaskSource
 }
 
 value ApprovedTaskWriteAuthority {
@@ -261,7 +284,7 @@ entity Conversation {
     -- Filesystem cwd. For mode in { explore, work, branch } this equals
     -- worktree_path; for mode = direct it is the user-supplied directory.
     -- Persists with the conversation row (DB column `cwd`); referenced by
-    -- spawn rules and by the projects/ spec when comparing parent and
+    -- spawn rules and by the surviving repository/workscope specs when comparing parent and
     -- continuation environments.
     working_dir: String
 
@@ -1072,18 +1095,18 @@ rule UserApprovesTaskCurrentConversation {
         approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
     )
     ensures: conversation.approved_task_objective = ApprovedTaskObjective {
-        source: projects/ApprovedTaskSource {
+        source: ApprovedTaskSource {
             task_path: conversation.proposal_snapshot.task_file,
             title: conversation.proposal_snapshot.title,
             priority: conversation.proposal_snapshot.priority,
             body: reread_task_body(conversation.proposal_snapshot.task_file),
-            identity: projects/approved_task_identity(conversation.proposal_snapshot.task_file),
-            reviewed_snapshot: projects/ReviewedProposalSnapshotIdentity {
+            identity: approved_task_identity(conversation.proposal_snapshot.task_file),
+            reviewed_snapshot: ReviewedProposalSnapshotIdentity {
                 repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
                 task_kind: conversation.proposal_snapshot.task_kind,
                 content_digest: conversation.proposal_snapshot.content_digest
             },
-            kind: projects/approved_task_kind(conversation.proposal_snapshot.task_file)
+            kind: approved_task_kind(conversation.proposal_snapshot.task_file)
         }
     }
     ensures: conversation.approved_task_write_authority = ApprovedTaskWriteAuthority {
@@ -1113,6 +1136,8 @@ rule UserApprovesTaskNewConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_start_fresh
+    requires: conversation.environment_kind = git_backed
+    requires: attached_git_work_scope_id(conversation.product_conversation) != absent
     requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.repo_relative_path
     requires: reread_task_kind(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.task_kind
     requires: reread_task_digest(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.content_digest
@@ -1147,7 +1172,7 @@ rule UserApprovesTaskNewConversation {
         source_conversation: conversation,
         target_conversation: fresh_work_conversation,
         target_product_conversation: target_product_conversation,
-        repository_identity: conversation.project.repo
+        source_work_scope_id: attached_git_work_scope_id(conversation.product_conversation)
     )
     ensures: conversation.core_status = idle
 
@@ -1163,7 +1188,9 @@ rule UserApprovesTaskNewConversation {
         --
         -- Approval remains bound to the reviewed snapshot identity here too; Phoenix
         -- cannot seed a new conversation from arbitrary current file contents after a
-        -- post-review swap or edit.
+        -- post-review swap or edit. Repository context is resolved through the source
+        -- ProductConversation's attached WorkScope by the provisioning boundary; this
+        -- event does not copy repository identity onto ProductConversation.
 }
 
 rule UserRequestsTaskChanges {
@@ -1194,7 +1221,7 @@ rule CancelDuringTaskApproval {
 -- conversation creates a separate top-level lineage while the source stays Open.
 -- Continue here resumes the same ProductConversation, transcript context, attached
 -- WorkScope, and mode with typed approved-task objective/write-authority state.
--- A fork proposal is resolved entirely in projects/ and leaves its origin untouched.
+-- A fork proposal is resolved entirely in the surviving task-source workflow authority and leaves its origin untouched.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE
@@ -1705,7 +1732,7 @@ rule CloseNeedsRepairCanRetryRetirement {
     @guidance
         -- Retry is exposed on the same visible needs-repair attempt the user sees.
         -- It carries the exact attempt_id and requests retirement again without any
-        -- local project-surface lifecycle mutation. Automatic operator repair may also
+        -- local ProductConversation lifecycle mutation. Automatic operator repair may also
         -- complete by driving the same exact-attempt retirement request path, but no
         -- hidden synthetic attempt or phase change bypasses this authority.
 }
@@ -1897,9 +1924,8 @@ rule UserHardDeletesConversationRule {
         -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
     ensures: BrowserSessionsCleanedUp(aggregate)
         -- Direct call: aggregate-scoped browser lifecycle cascade.
-    ensures: ProjectWorktreeCleanedUp(aggregate)
-        -- Direct call: cascade_projects_on_delete
-        -- (specs/projects/ subscriber rule).
+    ensures: WorkScopeResourcesCleanedUp(aggregate)
+        -- Direct call: WorkScope resource cleanup subscriber.
     ensures: AggregateTranscriptRowsRemoved(aggregate)
     ensures: SolelyOwnedCloseObligationsRemoved(aggregate)
     ensures: SolelyOwnedCloseAttemptMembersRemoved(aggregate)
@@ -2067,6 +2093,30 @@ rule ModeChangeNotification {
 --       Returns an identity unequal to every historical or active
 --       CloseObligation.attempt_id. Freshness is global because attempt-bound
 --       evidence may survive aggregate deletion as an audit record.
+--
+--   approved_task_kind(task_file: String) -> taskmd | plain_markdown
+--       The approved-task source kind derived from the filename component of
+--       task_file: taskmd iff it matches the taskmd 1.0 filename pattern
+--       NNNNN-pX-status--slug.md; otherwise plain_markdown for another Markdown
+--       brief. It uses the same classification as TaskProposalSnapshot.task_kind
+--       and reread_task_kind.
+--
+--   approved_task_identity(task_file: String) -> ApprovedTaskIdentity
+--       For taskmd, parses the filename into task_id, priority, and slug, leaves
+--       plain_title absent, and excludes status from identity. For plain_markdown,
+--       leaves task_id, priority, and slug absent and sets plain_title to the same
+--       first-H1-or-title-cased-file-stem display title used by the reviewed
+--       proposal snapshot. It never invents taskmd fields for a plain brief.
+--
+--   attached_git_work_scope_id(
+--       product_conversation: ProductConversation
+--   ) -> String?
+--       The opaque persisted identity of the exact Git-backed WorkScope selected
+--       from the authoritative ProductConversation-to-WorkScope attachments owned
+--       by work-lifecycle, or absent unless exactly one eligible Git-backed source
+--       scope is proven. It does not assume one scope globally and never derives
+--       identity from mode, cwd, worktree path, transcript-row identity, transcript
+--       conversation id, or ProductConversation identity.
 
 -- REQ-BED-007: Persist state before effects (cross-cutting)
 -- Every rule that changes status implicitly requires state persistence

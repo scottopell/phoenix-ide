@@ -6,7 +6,7 @@ Conversation creation returns a durable shell before filesystem, Git, expansion,
 
 ## Current Reality
 
-The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable.
+The branch includes the shell-first API and UI flow. The durable protocol vocabulary, pure transition function, `CreationClaim`/`CompleteCreation` state-machine hooks, and deterministic operation-sequence tests are present (`crates/phoenix-state-machine/src/creation_protocol.rs`, `transition.rs`). Production persistence and worker orchestration still use the earlier unguarded phase-update model and remain to be migrated before the feature is mergeable. Git-backed creation also still enters through legacy Project/mode fields; hidden `GitRepository` identity, singular `WorkScope.repository` attachment, detached-default creation without a mode/branch picker, and typed unresolved default-branch evidence are normative targets rather than shipped authority.
 
 ## Verification Coverage
 
@@ -22,6 +22,10 @@ The branch includes the shell-first API and UI flow. The durable protocol vocabu
 | REQ-CCR-008 Deletion | Modelled | Hidden deletion-pending tombstone test |
 | REQ-CCR-009 Durable Scheduling | Not implemented | Deadline-aware production scheduler required |
 | REQ-CCR-010 Deterministic Verification | Partial | 512 generated protocol schedules plus checked-in minimized regressions |
+
+## Rehomed Project Requirements
+
+REQ-PROJ-000, REQ-PROJ-001, REQ-PROJ-002, REQ-PROJ-005, REQ-PROJ-005A, REQ-PROJ-017, REQ-PROJ-022, REQ-PROJ-028, and REQ-PROJ-029 retain their immutable IDs in this spec. Their unified Git-backed creation behavior is not fully implemented while legacy Project and mode surfaces remain reader/writer authority.
 
 ## Merge Gate
 

@@ -5,7 +5,7 @@
 --
 -- Scope: Spawn-time validation, per-authority configuration resolution, the
 --        cross-domain seam between bedrock's sub-agent state space and
---        projects' worktree ownership.
+--        WorkScope-owned worktree authority.
 -- Includes:
 --   - SubAgentExecutionAuthority (read_only/write_capable) and parent-mode rules
 --   - One-writer invariant (per-call AND across calls per parent)
@@ -22,7 +22,7 @@
 --       Conversation-level invariant, sub-agent terminal-tool semantics
 --       (submit_result/submit_error must be sole tool in response),
 --       SpawnLimit, NoRecursiveSubAgents.
---   - Worktree creation / branch lifecycle (see projects.allium).
+--   - Worktree creation / repository lifecycle (see git-repository.allium).
 --   - Tool implementations (bash, patch, etc.).
 --
 -- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-SA-011,
@@ -30,7 +30,6 @@
 -- read_first injection is outside this spawn-resolution model.
 
 use "../bedrock/bedrock.allium" as bedrock
-use "../projects/projects.allium" as projects
 
 ------------------------------------------------------------
 -- Value Types
@@ -246,7 +245,7 @@ rule SpawnRejectedSystemRootCwd {
 -- The Work sub-agent's *effective* cwd — including any per-task `cwd`
 -- override — must be inside the parent's worktree. Without this guard a
 -- Work sub-agent could write outside the worktree (defeating
--- projects.allium's WriteBlockedOutsideWorktree because the sub-agent
+-- REQ-PROJ-007's worktree write boundary because the sub-agent
 -- runtime would see a different working_dir).
 rule SpawnRejectedWorkCwdOutsideWorktree {
     when: SpawnAgentsToolInvoked(parent, tasks)
@@ -263,7 +262,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
         --
         -- When the task omits `cwd`, the effective cwd is the parent's
         -- working_dir, which for parent.mode in { work, branch } equals
-        -- worktree_path by the projects.allium worktree contract — that
+        -- worktree_path by REQ-PROJ-008's inherited-workspace contract — that
         -- case satisfies the invariant trivially.
 }
 
@@ -283,7 +282,7 @@ rule SpawnedSubAgentCwdAssignment {
         -- The Explore-sub-agent ConvMode is `Explore { worktree_path:
         -- None }` — Explore sub-agents do not own a worktree of their
         -- own; they read from the parent's worktree (when present) or
-        -- the parent's cwd. See projects.allium ExploreSubAgentDirectory
+        -- the parent's cwd. See REQ-PROJ-008's inherited-workspace contract
         -- for the cross-spec restatement.
         --
         -- For Work sub-agents the resolved cwd has already been verified
@@ -368,8 +367,7 @@ rule SubAgentSpecsResolved {
         --
         -- After this rule fires, bedrock's `SpawnAgentsCompletesAsLastTool`
         -- (or `SpawnAgentsCompletesWithMoreTools`) drives the parent into
-        -- `awaiting_sub_agents` and the projects-level worktree contract
-        -- (WorkSubAgentInheritsWorktree, ExploreSubAgentDirectory) covers
+        -- `awaiting_sub_agents` and REQ-PROJ-008's inherited-workspace contract covers
         -- the worktree-side seam.
 }
 
@@ -459,13 +457,13 @@ invariant OneWorkSubAgentPerParent {
 
 -- When the parent owns a worktree (Work or Branch mode), the effective
 -- cwd of any Work sub-agent it spawns is inside that worktree.
--- Combined with projects.allium's WriteBlockedOutsideWorktree, this
+-- Combined with REQ-PROJ-007's write boundary, this
 -- guarantees that sub-agent writes cannot escape the parent's
 -- isolation boundary.
 --
 -- Work sub-agents spawned from a Direct parent are out of scope here:
 -- Direct mode has no worktree to scope against, and Direct's writes are
--- unscoped by design (see WriteBlockedOutsideWorktree's
+-- unscoped by design (see REQ-PROJ-007's
 -- `parent.mode in { work, branch }` precondition). Explore sub-agents
 -- are read-only, so escape-via-cwd is not a write-safety concern.
 invariant WorkSubAgentCwdInsideWorktree {

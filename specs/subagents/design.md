@@ -54,13 +54,14 @@ Two layers cooperate:
    / `completed` / `failed` transitions, the `SubAgentResult` fan-in,
    cancellation propagation). Normative in `bedrock.allium`.
 
-3. **Cross-spec seam** — projects.allium owns the worktree contract
-   (`WorkSubAgentInheritsWorktree`, `ExploreSubAgentDirectory`) and the
-   universal working-directory root floor: a conversation or sub-agent cwd
-   must canonicalise to an existing non-root directory before it is persisted
-   or used to build a runtime context. The cwd-scoping invariant in
-   `subagents.allium` additionally keeps Work sub-agent writes inside the
-   parent's worktree boundary.
+3. **Cross-spec seam** — the surviving worktree contract now lives in
+   `specs/git-repository/git-repository.allium`, and the universal
+   working-directory root floor lives in
+   `specs/conversation-creation/requirements.md` REQ-PROJ-000: a
+   conversation or sub-agent cwd must canonicalise to an existing non-root
+   directory before it is persisted or used to build a runtime context.
+   The cwd-scoping invariant in `subagents.allium` additionally keeps Work
+   sub-agent writes inside the parent's worktree boundary.
 
 4. **Named-agent seam** — [`agents.allium`](../agents/agents.allium) owns
    agent discovery, the `agent_type` schema enum, and persona composition.

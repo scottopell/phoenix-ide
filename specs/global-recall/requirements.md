@@ -18,7 +18,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 
 The user must be able to answer:
 
-1. Which project owns an open work item?
+1. Which ProductConversation and WorkScope own an open work item?
 2. Which conversation is the current source of truth for the item?
 3. Why does the item's current state need attention or qualify as open work?
 4. Which source conversations or messages support a Coordinator claim about history?
@@ -103,7 +103,7 @@ THE Coordinator SHALL use the normal transcript, composer, streaming, continuati
 
 THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product conversations rather than encoding that difference as omitted lifecycle fields or nullable product-conversation links
 
-THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
+THE SYSTEM SHALL NOT present the Coordinator as ordinary repository-backed coding work or as a user-created open-work item
 AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, WorkScope attachment, Close control, or Delete control
 
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable

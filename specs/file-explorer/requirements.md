@@ -2,7 +2,7 @@
 
 ## User Story
 
-As a desktop user, I need a persistent file tree panel alongside my conversations so that I can browse project files, quickly open them for review, and maintain context of the codebase while chatting with the agent.
+As a desktop user, I need a persistent file tree panel alongside my conversations so that I can browse conversation-scoped files, quickly open them for review, and maintain context of the codebase while chatting with the agent.
 
 ## Requirements
 
@@ -47,7 +47,7 @@ THE SYSTEM SHALL reload the tree root and every visible expanded directory
 AND preserve the current directory expansion state
 AND SHALL NOT reload descendants hidden beneath a collapsed directory
 
-**Rationale:** The file tree reflects the conversation's project context. Expansion state helps users maintain their place when reviewing multiple files.
+**Rationale:** The file tree reflects the conversation's working context. Expansion state helps users maintain their place when reviewing multiple files.
 
 ---
 
@@ -224,7 +224,33 @@ WHEN the path is not a Git worktree or Git observation is unavailable
 THE SYSTEM SHALL keep file browsing operational
 AND show a neutral non-Git or unavailable state instead of a clean claim
 
-**Rationale:** Inline decorations make worktree state visible at the point of file navigation, while Workspace Diff remains the single detailed review surface. Live checkout identity follows `specs/projects/requirements.md` REQ-PROJ-038.
+**Rationale:** Inline decorations make worktree state visible at the point of file navigation, while Workspace Diff remains the single detailed review surface. Live checkout identity follows REQ-PROJ-038 in this spec.
+
+---
+
+### REQ-PROJ-038: Show the Live Worktree Checkout in Diff Review
+
+WHEN the system presents a conversation worktree diff
+THE SYSTEM SHALL identify the worktree's live Git checkout at the time the diff is read
+AND distinguish a named branch, detached HEAD, unborn branch, and unavailable observation
+AND SHALL NOT substitute the branch recorded when the conversation was created for the live checkout
+
+WHEN the live checkout is a named branch
+THE SYSTEM SHALL show the branch name
+AND, when a configured upstream or locally cached matching remote-tracking branch exists, show that ref and the checkout's ahead and behind counts relative to it
+AND distinguish a configured upstream from a matching remote-tracking branch that is not configured as the upstream
+AND, when neither is locally known, state that no remote branch is known from the last fetched state
+
+WHEN the live checkout is detached
+THE SYSTEM SHALL present detached HEAD as a valid checkout identified by its commit object ID
+AND MAY show bounded, deterministic local or remote-tracking refs that resolve exactly to that commit
+AND SHALL describe those refs as pointing to the commit rather than as the checkout's provenance
+
+THE SYSTEM SHALL derive remote relationship data only from local Git refs while opening the diff
+AND SHALL NOT fetch or otherwise perform network I/O as part of diff review
+AND SHALL keep the worktree checkout's remote relationship distinct from the base ref used to calculate the workspace diff
+
+**Rationale:** Diff review must report the checkout the user is actually inspecting, not the starting provenance Phoenix recorded earlier.
 
 ---
 

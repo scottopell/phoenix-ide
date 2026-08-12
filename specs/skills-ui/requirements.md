@@ -13,7 +13,7 @@ As a Phoenix user inside a conversation, I want to discover what slash-command s
 The Skills UI must let me confidently answer:
 
 1. What skills can I use here?
-2. Which are built-in vs project-specific vs from my user-level config?
+2. Which are built-in vs workspace-specific vs from my user-level config?
 3. What does `/<skill-name>` actually do (prompt + description)?
 4. Does it take arguments?
 5. Where does it come from (which file)?
@@ -41,13 +41,13 @@ THE SYSTEM SHALL render nothing — no header for an empty catalog
 
 ---
 
-### REQ-SKILLS-UI-002: Tell Built-in vs Project vs User at a Glance
+### REQ-SKILLS-UI-002: Tell Built-in vs Workspace vs User at a Glance
 
 WHEN the catalog has built-in skills
 THE SYSTEM SHALL render them in a "Built-in" group pulled to the top of the list
 
-WHEN the catalog has filesystem skills from project directories (e.g. `<repo>/.claude/skills/`, `<repo>/.agents/skills/`)
-THE SYSTEM SHALL group them under their project name (the directory above `.claude/skills` / `.agents/skills`)
+WHEN the catalog has filesystem skills from workspace directories (e.g. `<repo>/.claude/skills/`, `<repo>/.agents/skills/`)
+THE SYSTEM SHALL group them under their workspace name (the directory above `.claude/skills` / `.agents/skills`)
 
 WHEN the catalog has skills under `$HOME/.claude/skills/` or `$HOME/.agents/skills/`
 THE SYSTEM SHALL group them under "User"
@@ -55,7 +55,7 @@ THE SYSTEM SHALL group them under "User"
 WHEN displaying a group
 THE SYSTEM SHALL show the group name, count, and let me collapse/expand it independently
 
-**Rationale:** Source matters: a built-in is shipped by Phoenix and known-stable, a project skill belongs to the team I'm working with, a User skill is something I added myself for personal workflow. Grouping mirrors that mental hierarchy. Built-in pulled to the top because those are the longest-lived, most-likely-to-be-the-thing-I-want skills; per-project below because they're contextual to where I am; User last because it's the catch-all.
+**Rationale:** Source matters: a built-in is shipped by Phoenix and known-stable, a workspace skill belongs to the working context I'm in, and a User skill is something I added myself for personal workflow. Grouping mirrors that mental hierarchy. Built-ins appear first because they are longest-lived; workspace skills follow because they are contextual; User remains the catch-all.
 
 ---
 
@@ -65,7 +65,7 @@ WHEN I click a skill in the panel
 THE SYSTEM SHALL open a detail view showing:
 - The slash invocation (`/<skill-name>` as the header)
 - A short description (from frontmatter)
-- A "Project" field naming the origin (Built-in / project name / User)
+- An "Origin" field naming the source group (Built-in / workspace name / User)
 - A "Source" field showing the discovery root — either the literal `builtin` (for skills bundled with the Phoenix binary) or the directory marker the discovery walk hit (e.g. `.claude/skills`, `.agents/skills`)
 - An "Args" field, when the skill declares an `argument_hint`
 - The "Path" — for filesystem skills, the directory containing `SKILL.md`
@@ -90,10 +90,10 @@ WHEN I click it
 THE SYSTEM SHALL set the conversation's message draft to the text `/<skill-name> ` (with trailing space)
 AND SHALL return me to the panel list view (or close the viewer)
 
-WHEN the draft already contained text
-THE SYSTEM SHALL replace it (this is what the InputArea consumer of `phoenix:insert-draft` does today). The user explicitly chose to use this skill from the browse path; preserving prior draft text would conflate two intents
+WHEN the draft already contains text
+THE SYSTEM SHALL replace it because choosing a skill from the browse path is one explicit draft intent
 
-**Rationale:** Discoverability is half the value; the other half is "use what I just discovered." Without the button, I'd have to read the name, dismiss the viewer, and type it manually — every step a chance to typo or forget. The trailing space makes the cursor land where I'd start typing arguments, which is where most invocations need to continue. The draft-replace contract is deliberate: the browse path is "I went to find this skill on purpose"; if I had a different message in flight I'd dismiss the viewer rather than confirm. (Future iteration could prompt-confirm before overwriting non-empty drafts; the present spec accepts the simple replace.)
+**Rationale:** Discoverability is half the value; the other half is using what I just discovered. The trailing space places the cursor where arguments begin. Replacing the draft keeps browse insertion as one unambiguous intent rather than merging unrelated text.
 
 ---
 
@@ -108,4 +108,4 @@ THE SYSTEM SHALL hide the panel header (REQ-SKILLS-UI-001) so the "12 available"
 WHEN the new fetch is in flight
 THE SYSTEM MAY transiently show the previous conversation's count until the response arrives — the spec does not require a synchronous clear-on-conversationId-change. The transient stale during a single network round-trip is preferable to a flicker-to-empty followed by re-population
 
-**Rationale:** Skills are per-conversation (the discovery walk roots from the conversation's working directory). A stale catalog from a different repo would lie about what's invocable; re-fetching per conversation is the correct trade. The "may transiently stale during fetch" clause documents the actual implementation behaviour: `SkillsPanel.tsx:79-105` keeps the previous `skills` state until the new response replaces it. A future tightening could clear immediately on `conversationId` change to avoid the brief stale window; the present spec accepts the impl's trade for fewer flickers.
+**Rationale:** Skills are per-conversation because discovery roots from the conversation's working directory. Re-fetching prevents a settled catalog from another workspace from claiming skills are invocable here; permitting bounded in-flight staleness avoids an unnecessary empty-state flicker.

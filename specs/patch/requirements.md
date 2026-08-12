@@ -194,8 +194,8 @@ AND suggest breaking into smaller patches
 ### REQ-PATCH-009: Mode-Based Availability
 
 WHEN conversation is in Explore mode (Managed workflow)
-THE SYSTEM SHALL provide the patch tool restricted to the project's tasks directory
-  (typically `tasks/`, discovered per-project — see task 13008) so the agent can draft a
+THE SYSTEM SHALL provide the patch tool restricted to the repository's tasks directory
+  (typically `tasks/`, discovered per repository) so the agent can draft a
   task file before calling `propose_task`
 AND reject a patch operation targeting any path outside that directory
 AND return a descriptive error identifying the out-of-scope path and pointing at
@@ -217,7 +217,7 @@ AND return a descriptive error identifying the out-of-scope path
 
 **Rationale:** Read-only planning remains read-only for *source* files, but the agent still
 needs to write the task file it proposes — so the patch tool is present in that read-only
-planning context, allowlisted to the tasks directory only (REQ-PROJ-003). Out-of-scope
+planning context, allowlisted to the repository's tasks directory only (REQ-PROJ-003). Out-of-scope
 writes are rejected with a clear error. When a conversation has write authority through an
 attached `WorkScope`, the allowlist widens to that isolated worktree — a conversation
 cannot use patch to modify the main checkout or another conversation's worktree.

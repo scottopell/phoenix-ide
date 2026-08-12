@@ -2,11 +2,11 @@
 
 ## User Story
 
-As a user reviewing text files (markdown documentation, source code, or plain text), I need to browse project files, open them for review, annotate specific lines with notes, and send those notes as a bundled message to the AI agent, so that I can provide structured feedback without manually copying line numbers and content.
+As a user reviewing text files (markdown documentation, source code, or plain text), I need to browse files in the conversation's working context, open them for review, annotate specific lines with notes, and send those notes as a bundled message to the AI agent, so that I can provide structured feedback without manually copying line numbers and content.
 
 ## Requirements
 
-### REQ-PF-001: Browse Project Files
+### REQ-PF-001: Browse Conversation-Scoped Files
 
 > **Note:** File browsing UI is defined in `specs/file-explorer/`. This requirement describes the core browsing behavior; REQ-FE-001 and REQ-FE-010 define the desktop panel and mobile overlay hosts respectively.
 
@@ -28,7 +28,7 @@ AND update the listing
 WHEN user taps a text file (any extension)
 THE SYSTEM SHALL open the prose reader for that file
 
-**Rationale:** Users need to navigate the project structure to find files they want to review. Visual indicators help identify file types quickly.
+**Rationale:** Users need to navigate the conversation's working-directory structure to find files they want to review. Visual indicators help identify file types quickly.
 
 ---
 
@@ -66,7 +66,7 @@ WHEN path is too long for display
 THE SYSTEM SHALL show "..." at the beginning
 AND preserve the last 2-3 path segments visible
 
-WHEN user is at the project root
+WHEN user is at the working-directory root
 THE SYSTEM SHALL disable the up button
 
 WHEN user expands or collapses a directory

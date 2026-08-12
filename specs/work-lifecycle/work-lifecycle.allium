@@ -20,9 +20,11 @@
 --     (pr-association owns those authorities);
 --   - UI layout and copy.
 --
--- Requirement traceability: REQ-WL-001 through REQ-WL-003
+-- Requirement traceability: REQ-WL-001 through REQ-WL-003,
+-- REQ-PROJ-028a, REQ-PROJ-WS-001
 
 use "../bedrock/bedrock.allium" as bedrock
+use "../git-repository/git-repository.allium" as gitrep
 
 ------------------------------------------------------------
 -- Value Types
@@ -34,7 +36,9 @@ value WorkScope {
 }
 
 value WorktreeIdentity {
+    id: String
     path: String
+    fingerprint: String
 }
 
 value RetirementInspection {
@@ -153,6 +157,11 @@ external entity RetirementAbsenceEvidence {
     scope: WorkScope
     resource_kind: RetiredResourceKind
     resource_identity: String
+}
+
+external entity RestartRepairEvidenceAdoption {
+    attempt: RetirementAttempt
+    restart_repair_evidence: gitrep/RestartRepairEvidence
 }
 
 ------------------------------------------------------------
@@ -520,6 +529,77 @@ rule ResourceRetirementFailureProducesResidualRepairState {
         -- so partial completion remains visible across retries.
 }
 
+rule ExactAttemptAdoptsRestartRepairAbsenceEvidence {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    let repair_evidence = exact_restart_repair_evidence(product_conversation, attempt_id, scope_binding.scope)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists scope_binding
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: worktree_already_absent(product_conversation, scope_binding.scope)
+    requires: exists repair_evidence
+    requires: complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
+    requires: same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
+    requires: no_replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
+    requires: exact_active_retirement_attempt(product_conversation, attempt_id, scope_binding.scope)
+    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}}
+    ensures: RestartRepairEvidenceAdoption.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        restart_repair_evidence: repair_evidence
+    )
+    ensures: RetirementAbsenceEvidence.created(
+        attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope},
+        product_conversation: product_conversation,
+        scope: scope_binding.scope,
+        resource_kind: worktree,
+        resource_identity: repair_evidence.worktree.id
+    )
+    ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
+
+    @guidance
+        -- Adoption is fail-closed and exact-attempt-bound. Phoenix may adopt
+        -- retained restart repair evidence only when the active Close attempt,
+        -- ProductConversation, WorkScope, hidden repository identity, and
+        -- worktree identity/fingerprint all match; no replacement worktree has
+        -- appeared; and the source observation remains immutable. Adoption creates
+        -- new exact-attempt absence evidence plus a typed adoption relation without
+        -- rewriting the restart observation.
+}
+
+rule RestartRepairConflictRoutesTypedRepair {
+    when: ResourceRetirementRequested(product_conversation, attempt_id)
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    let repair_evidence = latest_restart_repair_evidence(product_conversation, scope_binding.scope)
+    requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
+        awaiting_retirement_inspection,
+        awaiting_loss_confirmation,
+        retirement_requested,
+        needs_repair
+    }
+    requires: exists scope_binding
+    requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
+    requires: worktree_already_absent(product_conversation, scope_binding.scope)
+    requires: exists repair_evidence
+    requires:
+        not complete_restart_repair_identity_available(repair_evidence, product_conversation, scope_binding.scope)
+        or not same_repository_and_worktree_identity(repair_evidence, product_conversation, attempt_id, scope_binding.scope)
+        or replacement_worktree_appeared_since_restart_observation(repair_evidence, scope_binding.scope)
+        or not exact_active_retirement_attempt(product_conversation, attempt_id, scope_binding.scope)
+    ensures: ResourceRetirementFailed(product_conversation, attempt_id)
+
+    @guidance
+        -- A later Close attempt may bind fresh retained restart evidence for the
+        -- same repository, but only from a new exact attempt. When identity is
+        -- incomplete, a replacement appears, or the active attempt does not match,
+        -- Phoenix routes to typed repair instead of guessing continuity from the
+        -- path or silently adopting a stale absence observation.
+}
+
 rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
     when: ResourceRetirementRequested(product_conversation, attempt_id)
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in {
@@ -528,18 +608,22 @@ rule AlreadyAbsentWorktreeNeedsIdentityEvidence {
         retirement_requested,
         needs_repair
     }
-    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
-    requires: worktree_already_absent(product_conversation)
+    requires: worktree_already_absent(product_conversation, scope_binding.scope)
     requires: not exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
+    requires: not exists RestartRepairEvidenceAdoption{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}}
     ensures: ResourceRetirementFailed(product_conversation, attempt_id)
 
     @guidance
         -- An already-absent worktree is accepted only when retained identity and
         -- evidence show this retirement is adopting that exact absence rather than
-        -- guessing over a missing path. Without that exact-attempt absence evidence,
-        -- report typed residual state instead of silently treating absence as success.
+        -- guessing over a missing path. Without exact-attempt absence evidence or
+        -- an exact-attempt adoption of immutable restart repair evidence, report
+        -- typed residual state instead of silently treating absence as success.
+        -- Duplicate or conflicting highest-generation evidence for this exact
+        -- WorkScope also follows this typed-repair path.
 }
 
 rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
@@ -550,16 +634,18 @@ rule AlreadyAbsentWorktreeWithExactAttemptEvidenceIsAccepted {
         retirement_requested,
         needs_repair
     }
-    let scope_binding = AttachedWorkScope{product_conversation: product_conversation}
-    requires: exists AttachedWorkScope{product_conversation: product_conversation}
+    let scope_binding = pending_worktree_retirement_scope(product_conversation, attempt_id)
+    requires: exists scope_binding
     requires: exists CloseRetirementAuthority{product_conversation: product_conversation, scope: scope_binding.scope}
-    requires: worktree_already_absent(product_conversation)
+    requires: worktree_already_absent(product_conversation, scope_binding.scope)
     requires: exists RetirementAbsenceEvidence{attempt: RetirementAttempt{attempt_id: attempt_id, product_conversation: product_conversation, scope: scope_binding.scope}, product_conversation: product_conversation, scope: scope_binding.scope, resource_kind: worktree, resource_identity: absent_worktree_identity(product_conversation, scope_binding.scope)}
     ensures: ResourceRetirementProgressRecorded(product_conversation, attempt_id)
 
     @guidance
-        -- Exact-attempt absence evidence lets retirement adopt an already-absent
-        -- worktree idempotently without synthesizing a new success shape.
+        -- Exact-attempt absence evidence lets retirement accept an already-absent
+        -- worktree idempotently after the active attempt has either created that
+        -- absence evidence directly or adopted immutable restart repair evidence
+        -- for that same exact attempt.
 }
 
 
@@ -573,6 +659,110 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
         -- and never closes, mutates, or retargets a PR.
 }
 
+------------------------------------------------------------
+-- Helpers (pure predicates referenced by restart-repair rules)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; this block defines the
+-- complete semantics of each bare helper used above.
+--
+--   pending_worktree_retirement_scope(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> AttachedWorkScope?
+--       The exact attached WorkScope selected for the current worktree-retirement
+--       step of attempt_id. This is step-local: one ProductConversation may have
+--       multiple attached scopes overall. Ambiguity returns absent so adoption
+--       fails closed rather than selecting an arbitrary scope.
+--
+--   same_work_scope_identity(
+--       scope_ref: gitrep/WorkScopeRef,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff scope_ref names the same opaque persisted WorkScope as scope.
+--       ProductConversation attachment, repository identity, or path equality alone
+--       never proves this cross-spec identity seam.
+--
+--   latest_restart_repair_evidence(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScope
+--   ) -> gitrep/RestartRepairEvidence?
+--       The unique complete retained observation at the highest integer generation
+--       for product_conversation whose WorkScopeRef satisfies
+--       same_work_scope_identity(evidence.scope, scope). Evidence for another scope
+--       is ignored. No row, a duplicate highest generation, conflicting identity,
+--       incomplete row, or scope ambiguity returns absent so adoption fails closed.
+--
+--   exact_restart_repair_evidence(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String,
+--       scope: WorkScope
+--   ) -> gitrep/RestartRepairEvidence?
+--       The latest_restart_repair_evidence row for product_conversation and scope
+--       when attempt_id is the sole active Close attempt for that exact scope and
+--       that attempt has not already adopted a restart observation; otherwise
+--       absent. A cancelled attempt never mutates or consumes the source row; a
+--       later attempt creates its own adoption after rechecking every guard.
+--
+--   complete_restart_repair_identity_available(
+--       evidence: gitrep/RestartRepairEvidence,
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff evidence names product_conversation and a WorkScopeRef satisfying
+--       same_work_scope_identity(evidence.scope, scope), and has non-empty
+--       repository identity, worktree id, retained path, worktree fingerprint,
+--       observation generation, and observation time.
+--
+--   same_repository_and_worktree_identity(
+--       evidence: gitrep/RestartRepairEvidence,
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff the active Close authority names product_conversation and scope,
+--       same_work_scope_identity(evidence.scope, scope) holds, scope's retained
+--       repository attachment equals evidence.repository, and scope's worktree id
+--       and fingerprint equal evidence.worktree.id and evidence.worktree.fingerprint.
+--       Path equality alone is insufficient.
+--
+--   no_replacement_worktree_appeared_since_restart_observation(
+--       evidence: gitrep/RestartRepairEvidence,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff no filesystem observation after evidence.observed_at proves a
+--       present worktree for scope. A path reappearing without matching identity
+--       evidence makes this false rather than proving continuity.
+--
+--   replacement_worktree_appeared_since_restart_observation(
+--       evidence: gitrep/RestartRepairEvidence,
+--       scope: WorkScope
+--   ) -> Boolean
+--       The logical negation of
+--       no_replacement_worktree_appeared_since_restart_observation for the same
+--       evidence and scope.
+--
+--   exact_active_retirement_attempt(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff attempt_id is the ProductConversation's sole non-completed Close
+--       attempt and its RetirementAttempt is bound to that exact scope.
+--
+--   worktree_already_absent(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScope
+--   ) -> Boolean
+--       True iff that exact scope's retained worktree is observed missing or
+--       inaccessible and no later observation proves a present replacement.
+--
+--   absent_worktree_identity(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScope
+--   ) -> String
+--       The retained opaque worktree id for scope; never a path-derived value.
+--
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
