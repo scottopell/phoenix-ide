@@ -544,16 +544,6 @@ async function reconcileReactions(owner, repo, comments, before, after, projecte
   }
 }
 
-async function restartProcessingReaction(owner, repo, commentId, token) {
-  await clearLifecycleReactions(owner, repo, commentId, token);
-  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
-  await githubRequest(path, token, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: "eyes" }),
-  });
-}
-
 async function setLifecycleReaction(owner, repo, commentId, content, token) {
   const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
   await githubRequest(path, token, {
@@ -600,11 +590,7 @@ export async function run({ event, configuredIssueNumber, token }) {
   let terminalReactionSet = false;
   try {
     if (tracksLifecycle) {
-      if (event.action === "edited") {
-        await restartProcessingReaction(owner, repo, event.comment.id, token);
-      } else {
-        await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
-      }
+      await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
     } else if (event.action === "edited") {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
@@ -653,7 +639,9 @@ export async function run({ event, configuredIssueNumber, token }) {
 
     let reflected = false;
     let triggerRetirementReceiptPersisted = false;
-    if (tracksLifecycle) {
+    const liveTrigger = comments.find((comment) => comment.id === event.comment.id);
+    const triggerRevisionIsCurrent = liveTrigger?.body === event.comment.body;
+    if (tracksLifecycle && triggerRevisionIsCurrent) {
       const outcome = outcomes.get(event.comment.id);
       const acknowledgedIds = acknowledgedCommentIds(updates, current, outcomes);
       reflected = outcome?.accepted && acknowledgedIds.has(event.comment.id);
@@ -665,17 +653,17 @@ export async function run({ event, configuredIssueNumber, token }) {
         await ensureRetirementReceipts(owner, repo, configuredIssueNumber, comments, current, outcomes, token);
       }
       triggerRetirementReceiptPersisted = reflected && outcome?.recordType === "retirement";
-      await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
-      terminalReactionSet = true;
       await ensureLifecycleReceipt(
         owner,
         repo,
         configuredIssueNumber,
         comments,
-        event.comment,
+        liveTrigger,
         reflected ? "accepted" : "rejected",
         token,
       );
+      await postTerminalReaction(owner, repo, event.comment.id, reflected ? "rocket" : "confused", token);
+      terminalReactionSet = true;
     }
 
     try {
@@ -700,6 +688,7 @@ export async function run({ event, configuredIssueNumber, token }) {
     }
 
     if (!tracksLifecycle) return { ...changed, updates: updates.length };
+    if (!triggerRevisionIsCurrent) return { ...changed, updates: updates.length, acknowledged: "superseded" };
     return { ...changed, updates: updates.length, acknowledged: reflected ? "accepted" : "rejected" };
   } catch (error) {
     if (tracksLifecycle && !terminalReactionSet) {
