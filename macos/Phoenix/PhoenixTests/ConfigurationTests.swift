@@ -979,11 +979,11 @@ final class ServerManagerHelpersTests: XCTestCase {
         let latest = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://latest.example.test")))
         var queue = BundledReconnectQueue()
 
-        XCTAssertTrue(queue.request(first))
-        XCTAssertFalse(queue.request(latest))
-        XCTAssertEqual(queue.takeAfterStop(), latest)
+        XCTAssertTrue(queue.request(.init(candidate: first, forceRestart: false)))
+        XCTAssertFalse(queue.request(.init(candidate: latest, forceRestart: true)))
+        XCTAssertEqual(queue.takeAfterStop(), .init(candidate: latest, forceRestart: true))
         XCTAssertFalse(queue.stopScheduled)
-        XCTAssertNil(queue.latestCandidate)
+        XCTAssertNil(queue.latestRequest)
     }
 
     func testRollingLogWriterKeepsRecentTailWithinBound() throws {
@@ -1158,16 +1158,38 @@ final class ServerManagerHelpersTests: XCTestCase {
         let recorder = SidecarLogRecorder()
         await recorder.reset()
 
-        let first = await recorder.record(Data("alpha\nsecret=abc".utf8))
+        await recorder.enqueue(Data("alpha\nsecret=abc".utf8))
+        let first = await recorder.drain().last
         XCTAssertEqual(first?.recentLines, ["alpha"])
         XCTAssertEqual(String(decoding: first?.logAppend ?? Data(), as: UTF8.self), "alpha\n")
 
-        let second = await recorder.record(Data("\nbeta\n".utf8))
+        await recorder.enqueue(Data("\nbeta\n".utf8))
+        let second = await recorder.drain().last
         XCTAssertEqual(second?.recentLines, ["alpha", "secret= [REDACTED]", "beta"])
         XCTAssertEqual(String(decoding: second?.logAppend ?? Data(), as: UTF8.self), "secret= [REDACTED]\nbeta\n")
 
         let eof = await recorder.finishPending()
         XCTAssertNil(eof)
+    }
+
+    func testSidecarLogRecorderBoundsIngressAndReportsDroppedChunks() async {
+        let recorder = SidecarLogRecorder(maxPendingChunks: 2)
+        await recorder.reset()
+
+        await recorder.enqueue(Data("first\n".utf8))
+        await recorder.enqueue(Data("second\n".utf8))
+        await recorder.enqueue(Data("third\n".utf8))
+
+        let snapshots = await recorder.drain()
+        XCTAssertEqual(
+            snapshots.map { String(decoding: $0.logAppend, as: UTF8.self) },
+            [
+                "[Phoenix dropped 1 sidecar log chunk before recording]\n",
+                "second\n",
+                "third\n",
+            ]
+        )
+        XCTAssertEqual(snapshots.last?.recentLines, ["second", "third"])
     }
 
     func testDownloadDestinationReservationStateAvoidsConcurrentCollisionsAndReleasesPaths() {
@@ -1183,6 +1205,20 @@ final class ServerManagerHelpersTests: XCTestCase {
         let reused = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { url in
             url.path == second.path
         }
+        XCTAssertEqual(reused.lastPathComponent, "report.pdf")
+    }
+
+    func testDownloadDestinationReservationStateReleasesSupersededReservation() {
+        let directory = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
+        var state = DownloadDestinationReservationState()
+        let first = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { _ in false }
+        let second = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { _ in false }
+
+        state.release(first)
+        let reused = state.reserveDestination(in: directory, suggestedFilename: "report.pdf") { url in
+            url.path == second.path
+        }
+
         XCTAssertEqual(reused.lastPathComponent, "report.pdf")
     }
 
@@ -1370,18 +1406,22 @@ final class ServerManagerHelpersTests: XCTestCase {
     func testBundledReconnectQueueCanBeCancelled() throws {
         let candidate = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("https://phoenix.example.test:8031")))
         var queue = BundledReconnectQueue()
-        XCTAssertTrue(queue.request(candidate))
+        XCTAssertTrue(queue.request(.init(candidate: candidate, forceRestart: false)))
 
         queue.cancel()
 
         XCTAssertFalse(queue.stopScheduled)
-        XCTAssertNil(queue.latestCandidate)
+        XCTAssertNil(queue.latestRequest)
         XCTAssertNil(queue.takeAfterStop())
     }
 
     func testDeepLinkValidationOutcomeRetainsQueuedConversationAcrossAuthenticationChallenge() {
         XCTAssertEqual(
             DeepLinkValidationOutcome.evaluate(.authenticationRequired),
+            DeepLinkValidationOutcome(shouldClearAuthenticationGate: true, shouldRetainPendingConversation: true)
+        )
+        XCTAssertEqual(
+            DeepLinkValidationOutcome.evaluate(.invalidHTTPStatus(401)),
             DeepLinkValidationOutcome(shouldClearAuthenticationGate: true, shouldRetainPendingConversation: true)
         )
         XCTAssertEqual(

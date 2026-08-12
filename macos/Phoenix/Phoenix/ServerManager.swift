@@ -262,11 +262,6 @@ actor SidecarLogRecorder {
         let recentLines: [String]
     }
 
-    private struct EnqueueResult {
-        let accepted: Bool
-        let processor: Task<Void, Never>?
-    }
-
     nonisolated static func defaultRedact(_ line: String) -> String {
         let sensitiveNames = [
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PHOENIX_PASSWORD", "secret",
@@ -285,7 +280,7 @@ actor SidecarLogRecorder {
     private let maxPendingChunks: Int
     private var buffer = ConnectionLogBuffer()
     private var pendingChunks: [Data] = []
-    private var processingTask: Task<Void, Never>?
+    private var droppedChunkCount = 0
 
     init(
         writer: RollingLogWriter? = nil,
@@ -298,10 +293,8 @@ actor SidecarLogRecorder {
     }
 
     func reset() async {
-        processingTask?.cancel()
-        _ = await processingTask?.value
-        processingTask = nil
         pendingChunks.removeAll(keepingCapacity: true)
+        droppedChunkCount = 0
         buffer = ConnectionLogBuffer()
         if let writer {
             _ = try? writer.openForAppend()
@@ -309,22 +302,50 @@ actor SidecarLogRecorder {
         await snapshotSink(buffer.completeLines)
     }
 
-    func record(_ data: Data) async -> Snapshot? {
-        let emitted = framedLines(from: data)
-        let started = enqueue(data)
-        if let processor = started.processor {
-            await processor.value
-        } else if started.accepted {
-            await processingTask?.value
+    func enqueue(_ data: Data) {
+        guard !data.isEmpty else { return }
+        if pendingChunks.count >= maxPendingChunks {
+            pendingChunks.removeFirst(pendingChunks.count - maxPendingChunks + 1)
+            droppedChunkCount += 1
         }
-        guard started.accepted else { return Snapshot(logAppend: emitted, recentLines: buffer.completeLines) }
-        guard !emitted.isEmpty else { return nil }
-        return Snapshot(logAppend: emitted, recentLines: buffer.completeLines)
+        pendingChunks.append(data)
+    }
+
+    func drain() async -> [Snapshot] {
+        var snapshots: [Snapshot] = []
+        while !pendingChunks.isEmpty {
+            let chunk = pendingChunks.removeFirst()
+            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
+            if droppedChunkCount > 0 {
+                let droppedLine = droppedChunkCount == 1
+                    ? "[Phoenix dropped 1 sidecar log chunk before recording]"
+                    : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
+                let droppedData = Data((droppedLine + "\n").utf8)
+                try? appendToLog(droppedData)
+                snapshots.append(Snapshot(logAppend: droppedData, recentLines: buffer.completeLines))
+                droppedChunkCount = 0
+            }
+            guard !emitted.isEmpty else { continue }
+            let append = Data((emitted.joined(separator: "\n") + "\n").utf8)
+            try? appendToLog(append)
+            let lines = buffer.completeLines
+            await snapshotSink(lines)
+            snapshots.append(Snapshot(logAppend: append, recentLines: lines))
+        }
+        return snapshots
     }
 
     func finishPending() async -> Snapshot? {
-        if let processor = processingTask {
-            await processor.value
+        _ = await drain()
+        if droppedChunkCount > 0 {
+            let droppedLine = droppedChunkCount == 1
+                ? "[Phoenix dropped 1 sidecar log chunk before recording]"
+                : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
+            let droppedData = Data((droppedLine + "\n").utf8)
+            try? appendToLog(droppedData)
+            droppedChunkCount = 0
+            await snapshotSink(buffer.completeLines)
+            return Snapshot(logAppend: droppedData, recentLines: buffer.completeLines)
         }
         guard let flushed = buffer.flushPending(redact: Self.defaultRedact) else { return nil }
         let append = Data((flushed + "\n").utf8)
@@ -334,38 +355,6 @@ actor SidecarLogRecorder {
         return Snapshot(logAppend: append, recentLines: lines)
     }
 
-    private func framedLines(from data: Data) -> Data {
-        var preview = buffer
-        let emitted = preview.append(data, redact: Self.defaultRedact)
-        guard !emitted.isEmpty else { return Data() }
-        return Data((emitted.joined(separator: "\n") + "\n").utf8)
-    }
-
-    private func enqueue(_ data: Data) -> EnqueueResult {
-        guard !data.isEmpty else { return EnqueueResult(accepted: true, processor: nil) }
-        if pendingChunks.count >= maxPendingChunks {
-            pendingChunks.removeFirst(pendingChunks.count - maxPendingChunks + 1)
-        }
-        pendingChunks.append(data)
-        guard processingTask == nil else { return EnqueueResult(accepted: true, processor: nil) }
-        let task = Task {
-            await self.drainPendingChunks()
-        }
-        processingTask = task
-        return EnqueueResult(accepted: true, processor: task)
-    }
-
-    private func drainPendingChunks() async {
-        while !pendingChunks.isEmpty {
-            let chunk = pendingChunks.removeFirst()
-            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
-            guard !emitted.isEmpty else { continue }
-            try? appendToLog(Data((emitted.joined(separator: "\n") + "\n").utf8))
-            await snapshotSink(buffer.completeLines)
-        }
-        processingTask = nil
-    }
-
     private func appendToLog(_ data: Data) throws {
         guard let writer, !data.isEmpty else { return }
         _ = try writer.append(data)
@@ -373,25 +362,30 @@ actor SidecarLogRecorder {
 }
 
 struct BundledReconnectQueue {
-    private(set) var latestCandidate: ServerMode?
+    struct PendingRequest: Equatable {
+        let candidate: ServerMode
+        let forceRestart: Bool
+    }
+
+    private(set) var latestRequest: PendingRequest?
     private(set) var stopScheduled = false
 
-    mutating func request(_ candidate: ServerMode) -> Bool {
-        latestCandidate = candidate
+    mutating func request(_ request: PendingRequest) -> Bool {
+        latestRequest = request
         guard !stopScheduled else { return false }
         stopScheduled = true
         return true
     }
 
-    mutating func takeAfterStop() -> ServerMode? {
+    mutating func takeAfterStop() -> PendingRequest? {
         stopScheduled = false
-        defer { latestCandidate = nil }
-        return latestCandidate
+        defer { latestRequest = nil }
+        return latestRequest
     }
 
     mutating func cancel() {
         stopScheduled = false
-        latestCandidate = nil
+        latestRequest = nil
     }
 }
 
@@ -524,6 +518,7 @@ final class ServerManager: ObservableObject {
     func connect() {
         terminationInProgress = false
         resetBrowserOwnedStateForOperationTransition()
+        bundledReconnectQueue.cancel()
         readinessTask?.cancel()
         operationID = UUID()
         let operation = operationID
@@ -737,15 +732,22 @@ final class ServerManager: ObservableObject {
             let pipe = Pipe()
             launched.standardOutput = pipe
             launched.standardError = pipe
+            let outputQueue = DispatchQueue(label: "Phoenix.SidecarOutput")
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 guard let self else { return }
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    Task { await self.handleSidecarEOF() }
-                    return
+                outputQueue.async { [weak self] in
+                    guard let self else { return }
+                    if data.isEmpty {
+                        handle.readabilityHandler = nil
+                        Task { await self.handleSidecarEOF() }
+                        return
+                    }
+                    Task {
+                        await self.logRecorder.enqueue(data)
+                        await self.handleBufferedSidecarOutput()
+                    }
                 }
-                Task { await self.handleSidecarOutput(data) }
             }
             launched.terminationHandler = { [weak self] terminated in
                 Task { @MainActor in self?.processExited(terminated, operation: operation) }
@@ -764,15 +766,24 @@ final class ServerManager: ObservableObject {
 
     private func transitionFromBundled(to request: ServerReconnectRequest) {
         guard case .bundled = mode else { return }
-        guard bundledReconnectQueue.request(request.candidate) else { return }
+        let pendingRequest = BundledReconnectQueue.PendingRequest(candidate: request.candidate, forceRestart: request.forceRestart)
+        guard bundledReconnectQueue.request(pendingRequest) else { return }
         state = .restarting
         stop(completion: { [weak self] in
             guard let self else { return }
             guard !self.terminationInProgress else { return }
-            guard let latestCandidate = self.bundledReconnectQueue.takeAfterStop() else { return }
-            self.mode = latestCandidate
-            self.webOrigin = latestCandidate.origin
-            self.connect()
+            guard let latestRequest = self.bundledReconnectQueue.takeAfterStop() else { return }
+            self.mode = latestRequest.candidate
+            self.webOrigin = latestRequest.candidate.origin
+            if latestRequest.forceRestart {
+                do {
+                    try self.reconnect(ServerReconnectRequest(candidate: latestRequest.candidate, requiresReconnect: true, forceRestart: true))
+                } catch {
+                    self.state = .failed(FailureState(version: self.currentVersion, message: error.localizedDescription))
+                }
+            } else {
+                self.connect()
+            }
         }, isTransitionStop: true)
     }
 
@@ -942,9 +953,10 @@ final class ServerManager: ObservableObject {
         callbacks.forEach { $0() }
     }
 
-    private func handleSidecarOutput(_ data: Data) async {
-        let snapshot = await logRecorder.record(data)
-        publishLogSnapshot(snapshot)
+    private func handleBufferedSidecarOutput() async {
+        let snapshots = await logRecorder.drain()
+        guard let latest = snapshots.last else { return }
+        publishLogSnapshot(latest)
     }
 
     private func handleSidecarEOF() async {

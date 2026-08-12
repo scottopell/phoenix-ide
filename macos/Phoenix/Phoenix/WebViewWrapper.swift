@@ -492,12 +492,15 @@ final class DownloadManager {
     private func reserveDestination(for download: WKDownload, response _: URLResponse, suggestedFilename: String) -> URL {
         let downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
+        let identifier = ObjectIdentifier(download)
+        if let existingReservation = activeDownloads[identifier]?.reservedDestination {
+            reservations.release(existingReservation)
+        }
         let destination = reservations.reserveDestination(
             in: downloadsDirectory,
             suggestedFilename: suggestedFilename,
             fileExists: { FileManager.default.fileExists(atPath: $0.path) }
         )
-        let identifier = ObjectIdentifier(download)
         if var entry = activeDownloads[identifier] {
             entry.reservedDestination = destination
             activeDownloads[identifier] = entry

@@ -130,12 +130,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateWindowContent(for state: ConnectionState) {
         guard let window else { return }
         let currentOperation = serverManager.currentOperationToken
-        if let browserOperation, browserOperation != currentOperation {
-            browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
-            self.browserOperation = nil
-        }
+        let staleBrowserOperation = browserOperation != nil && browserOperation != currentOperation
         if state.canDisplayWebView, let origin = serverManager.webOrigin {
             let operation = currentOperation
+            if staleBrowserOperation, let browserOperation {
+                browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
+                self.browserOperation = nil
+                webView = nil
+                isPrimaryWebViewAuthenticated = false
+            }
             if webView != nil { return }
             isPrimaryWebViewAuthenticated = false
             browserOperation = operation
@@ -169,6 +172,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if let browserOperation, browserOperation != currentOperation {
+            browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
+            self.browserOperation = nil
+        }
         if let current = webView {
             current.navigationDelegate = nil
             current.uiDelegate = nil
@@ -242,6 +249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     pendingConversationID: self.pendingConversationID
                 ) else { return }
                 let decision = DeepLinkValidationOutcome.evaluate(error as? DeepLinkValidationError ?? .decoding(error.localizedDescription))
+                if !DeepLinkNavigationDecision.validationResultIsCurrent(
+                    validatedID: queued,
+                    pendingConversationID: self.pendingConversationID
+                ) {
+                    return
+                }
                 if decision.shouldClearAuthenticationGate {
                     self.isPrimaryWebViewAuthenticated = false
                 }

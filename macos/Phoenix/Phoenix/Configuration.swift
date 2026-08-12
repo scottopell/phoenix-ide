@@ -225,7 +225,7 @@ struct DeepLinkValidationOutcome: Equatable {
 
     static func evaluate(_ error: DeepLinkValidationError) -> DeepLinkValidationOutcome {
         switch error {
-        case .authenticationRequired:
+        case .authenticationRequired, .invalidHTTPStatus(401):
             return DeepLinkValidationOutcome(
                 shouldClearAuthenticationGate: true,
                 shouldRetainPendingConversation: true
