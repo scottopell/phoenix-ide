@@ -221,6 +221,54 @@ test("reactivation outside the projection supersedes its retirement", async () =
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 12, acknowledged: "rejected" });
+    const reactions = postedReactions(mock.requests);
+    assert.deepEqual(reactions.slice(0, 2), ["eyes", "confused"]);
+    assert.equal(reactions.filter((reaction) => reaction === "rocket").length, 12);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("projection change acknowledges the promoted source", async () => {
+  const projected = Array.from({ length: 12 }, (_, index) =>
+    comment(index + 1, fenced(update({ workstream: `stream-${index}`, order: index }))),
+  );
+  const promoted = comment(13, fenced(update({ workstream: "promoted", order: 12 })));
+  const deleted = projected[0];
+  const remaining = [...projected.slice(1), promoted];
+  const mock = installGitHubMock(remaining, [[]]);
+  try {
+    await run({ event: event("deleted", deleted), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "POST" && request.url.includes("issues/comments/13/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("coalesced run repairs missing rockets on projected sources", async () => {
+  const existing = comment(1, fenced(update({ workstream: "existing", order: 0 })));
+  const trigger = comment(2, fenced(update({ workstream: "trigger", order: 1 })));
+  const mock = installGitHubMock([existing, trigger], [[], [], []]);
+  try {
+    await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.ok(mock.requests.some(
+      (request) => request.method === "POST" && request.url.includes("issues/comments/1/reactions"),
+    ));
+  } finally {
+    mock.restore();
+  }
+});
+
+test("editing an older retirement does not acknowledge it over the latest retirement", async () => {
+  const updateComment = comment(1, fenced(update()), { user: { login: "owner" } });
+  const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const latest = comment(3, retired("ios-vnext", 1), { user: { login: "owner" } });
+  const mock = installGitHubMock([updateComment, trigger, latest], [[], [], []]);
+  try {
+    const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
+    assert.deepEqual(result, { changed: true, updates: 0, acknowledged: "rejected" });
     assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
   } finally {
     mock.restore();
@@ -373,7 +421,7 @@ test("stale retirement transitions from eyes to confused", async () => {
   try {
     const result = await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 1, acknowledged: "rejected" });
-    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused"]);
+    assert.deepEqual(postedReactions(mock.requests), ["eyes", "confused", "rocket"]);
   } finally {
     mock.restore();
   }
@@ -420,6 +468,8 @@ test("ordinary trusted comments still rebuild from the live snapshot", async () 
   const responses = [
     new Response(JSON.stringify([remaining, trigger]), { status: 200 }),
     new Response(JSON.stringify({}), { status: 200 }),
+    new Response(JSON.stringify({}), { status: 201 }),
+    new Response(JSON.stringify([]), { status: 200 }),
   ];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => responses.shift();

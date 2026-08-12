@@ -359,8 +359,8 @@ async function clearAcceptedReaction(owner, repo, commentId, token) {
   }
 }
 
-function reflectedCommentIds(current, outcomes) {
-  const reflected = new Set(current.map((update) => update.source.id));
+function acknowledgedCommentIds(updates, current, outcomes) {
+  const acknowledged = new Set(updates.map((update) => update.source.id));
   const activeWorkstreams = new Set(current.map((update) => update.workstream));
   const latestRetirements = new Map();
   for (const [commentId, outcome] of outcomes) {
@@ -368,8 +368,8 @@ function reflectedCommentIds(current, outcomes) {
       latestRetirements.set(outcome.workstream, commentId);
     }
   }
-  for (const commentId of latestRetirements.values()) reflected.add(commentId);
-  return reflected;
+  for (const commentId of latestRetirements.values()) acknowledged.add(commentId);
+  return acknowledged;
 }
 
 function commentsBeforeEvent(comments, event) {
@@ -383,16 +383,20 @@ function commentsBeforeEvent(comments, event) {
   return comments;
 }
 
-async function reconcileAcceptedReactionDelta(owner, repo, before, after, triggerId, token) {
-  const changed = new Set([...before, ...after]);
-  changed.delete(triggerId);
-  for (const commentId of changed) {
-    if (before.has(commentId) === after.has(commentId)) continue;
-    if (after.has(commentId)) {
-      await setLifecycleReaction(owner, repo, commentId, "rocket", token);
-    } else {
+async function reconcileAcceptedReactions(owner, repo, before, after, projectedUpdates, triggerId, token) {
+  for (const commentId of before) {
+    if (commentId !== triggerId && !after.has(commentId)) {
       await clearAcceptedReaction(owner, repo, commentId, token);
     }
+  }
+
+  const ensureAccepted = new Set(projectedUpdates.map((update) => update.source.id));
+  for (const commentId of after) {
+    if (!before.has(commentId)) ensureAccepted.add(commentId);
+  }
+  ensureAccepted.delete(triggerId);
+  for (const commentId of ensureAccepted) {
+    await setLifecycleReaction(owner, repo, commentId, "rocket", token);
   }
 }
 
@@ -443,9 +447,8 @@ export async function run({ event, configuredIssueNumber, token }) {
     let reflected = false;
     if (tracksLifecycle) {
       const outcome = outcomes.get(event.comment.id);
-      reflected = outcome?.recordType === "retirement"
-        ? outcome.accepted && !current.some((update) => update.workstream === outcome.workstream)
-        : outcome?.accepted && updates.some((update) => update.source.id === event.comment.id);
+      const acknowledgedIds = acknowledgedCommentIds(updates, current, outcomes);
+      reflected = outcome?.accepted && acknowledgedIds.has(event.comment.id);
       if (!reflected) {
         const reason = outcome?.reason ?? "record is not authoritative in the current roadmap state";
         console.error(`Rejecting roadmap record in comment ${event.comment.id}: ${reason}`);
@@ -454,11 +457,12 @@ export async function run({ event, configuredIssueNumber, token }) {
     }
 
     try {
-      await reconcileAcceptedReactionDelta(
+      await reconcileAcceptedReactions(
         owner,
         repo,
-        reflectedCommentIds(before.current, before.outcomes),
-        reflectedCommentIds(current, outcomes),
+        acknowledgedCommentIds(before.updates, before.current, before.outcomes),
+        acknowledgedCommentIds(updates, current, outcomes),
+        updates,
         event.comment.id,
         token,
       );
