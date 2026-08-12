@@ -308,13 +308,21 @@ test("stale retirement transitions from eyes to confused", async () => {
   }
 });
 
-test("editing an update into invalid content removes it immediately", async () => {
+test("editing an update away removes its projection and lifecycle reaction", async () => {
   const trigger = comment(2, "No structured update remains.", { updated_at: "2026-08-09T17:00:00Z" });
-  const mock = installGitHubMock([]);
+  const rocket = { id: 42, content: "rocket", user: { login: "github-actions[bot]" } };
+  const otherUser = { id: 43, content: "rocket", user: { login: "reviewer" } };
+  const mock = installGitHubMock([], [[rocket, otherUser]]);
   try {
     const result = await run({ event: event("edited", trigger), configuredIssueNumber: 7, token: "token" });
     assert.deepEqual(result, { changed: true, updates: 0 });
     assert.deepEqual(postedReactions(mock.requests), []);
+    assert.ok(mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/42"),
+    ));
+    assert.ok(!mock.requests.some(
+      (request) => request.method === "DELETE" && request.url.endsWith("/reactions/43"),
+    ));
   } finally {
     mock.restore();
   }

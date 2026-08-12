@@ -320,25 +320,30 @@ async function listComments(owner, repo, issueNumber, token) {
 
 const LIFECYCLE_REACTIONS = new Set(["eyes", "rocket", "confused"]);
 
-async function setLifecycleReaction(owner, repo, commentId, content, token) {
+async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
   const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
   const reactions = await githubRequest(`${path}?per_page=100`, token);
-  await githubRequest(path, token, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
   for (const reaction of reactions) {
     if (
       reaction.user?.login === "github-actions[bot]" &&
       LIFECYCLE_REACTIONS.has(reaction.content) &&
-      reaction.content !== content
+      reaction.content !== except
     ) {
       await githubRequest(`/repos/${owner}/${repo}/issues/comments/${commentId}/reactions/${reaction.id}`, token, {
         method: "DELETE",
       });
     }
   }
+}
+
+async function setLifecycleReaction(owner, repo, commentId, content, token) {
+  const path = `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
+  await githubRequest(path, token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  await clearLifecycleReactions(owner, repo, commentId, token, content);
 }
 
 function isStructuredRoadmapComment(comment) {
@@ -358,7 +363,11 @@ export async function run({ event, configuredIssueNumber, token }) {
   const tracksLifecycle = event.action !== "deleted" && isStructuredRoadmapComment(event.comment);
 
   try {
-    if (tracksLifecycle) await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+    if (tracksLifecycle) {
+      await setLifecycleReaction(owner, repo, event.comment.id, "eyes", token);
+    } else if (event.action === "edited") {
+      await clearLifecycleReactions(owner, repo, event.comment.id, token);
+    }
     const comments = await listComments(owner, repo, configuredIssueNumber, token);
     const trustedCommentIds = comments
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
