@@ -144,8 +144,9 @@ function roadmapPayload(markdown) {
   return match ? { recordType: match[1], payload: match[2] } : null;
 }
 
-export function reduceComments(comments) {
+export function reduceComments(comments, acknowledgedRetirements = new Set()) {
   const latest = new Map();
+  const knownSources = new Map();
   const retirements = new Map();
   const outcomes = new Map();
   const ordered = [...comments]
@@ -172,7 +173,11 @@ export function reduceComments(comments) {
         const repeatsOwnedRetirement = current === undefined &&
           priorRetirement?.author === retirementAuthor &&
           priorRetirement.supersedesCommentId === retirement.supersedes_comment_id;
-        const establishesMissingSourceTombstone = current === undefined && priorRetirement === undefined;
+        const knownSource = knownSources.get(retirement.supersedes_comment_id);
+        const establishesMissingSourceTombstone = current === undefined &&
+          priorRetirement === undefined &&
+          ((knownSource?.workstream === retirement.workstream && knownSource.author === retirementAuthor) ||
+            acknowledgedRetirements.has(comment.id));
         if (retiresCurrent || repeatsOwnedRetirement || establishesMissingSourceTombstone) {
           latest.delete(retirement.workstream);
           retirements.set(retirement.workstream, {
@@ -188,6 +193,10 @@ export function reduceComments(comments) {
         continue;
       }
       const update = validateUpdate(value);
+      knownSources.set(comment.id, {
+        workstream: update.workstream,
+        author: comment.user?.login ?? "unknown",
+      });
       latest.set(update.workstream, {
         ...update,
         source: {
@@ -356,6 +365,19 @@ async function listReactions(owner, repo, commentId, token) {
   }
 }
 
+async function acknowledgedRetirementIds(owner, repo, comments, token) {
+  const acknowledged = new Set();
+  for (const comment of comments) {
+    const record = roadmapPayload(comment.body);
+    if (record?.recordType !== "retirement") continue;
+    const reactions = await listReactions(owner, repo, comment.id, token);
+    if (reactions.some((reaction) => reaction.user?.login === "github-actions[bot]" && reaction.content === "rocket")) {
+      acknowledged.add(comment.id);
+    }
+  }
+  return acknowledged;
+}
+
 async function clearLifecycleReactions(owner, repo, commentId, token, except = null) {
   const reactions = await listReactions(owner, repo, commentId, token);
   for (const reaction of reactions) {
@@ -491,8 +513,9 @@ export async function run({ event, configuredIssueNumber, token }) {
       .filter((comment) => Number.isSafeInteger(comment.id) && TRUSTED_ASSOCIATIONS.has(comment.author_association))
       .map((comment) => comment.id);
     const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
-    const { updates, current, outcomes } = reduceComments(comments);
-    const before = reduceComments(commentsBeforeEvent(comments, event));
+    const retirementAcknowledgments = await acknowledgedRetirementIds(owner, repo, comments, token);
+    const { updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments);
+    const before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
     const body = renderRoadmap(updates, snapshotThroughCommentId);
     const changed = await replaceIssueBody(owner, repo, configuredIssueNumber, body, token);
     projectionCommitted = true;

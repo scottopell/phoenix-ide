@@ -440,7 +440,7 @@ test("accepted retirement clears the retired source rocket", async () => {
   const current = comment(1, fenced(update()), { user: { login: "owner" } });
   const trigger = comment(2, retired("ios-vnext", 1), { user: { login: "owner" } });
   const oldRocket = { id: 61, content: "rocket", user: { login: "github-actions[bot]" } };
-  const mock = installGitHubMock([current, trigger], [[], [], [oldRocket]]);
+  const mock = installGitHubMock([current, trigger], [[], [], [], [oldRocket]]);
   try {
     await run({ event: event("created", trigger), configuredIssueNumber: 7, token: "token" });
     assert.ok(mock.requests.some(
