@@ -219,12 +219,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let conversationID = try await self.validatedConversationIDForNavigation(queued)
                 guard !Task.isCancelled else { return }
-                guard self.pendingConversationID == queued else { return }
+                guard DeepLinkNavigationDecision.validationResultIsCurrent(
+                    validatedID: queued,
+                    pendingConversationID: self.pendingConversationID
+                ) else { return }
                 self.pendingConversationID = conversationID
                 self.openPendingConversation()
             } catch {
                 guard !Task.isCancelled else { return }
-                guard self.pendingConversationID == queued else { return }
+                guard DeepLinkNavigationDecision.validationResultIsCurrent(
+                    validatedID: queued,
+                    pendingConversationID: self.pendingConversationID
+                ) else { return }
                 self.pendingConversationID = nil
                 let message = error.localizedDescription
                 NSLog("Phoenix deep link rejected for %s: %s", queued.uuidString.lowercased(), message)

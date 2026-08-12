@@ -459,6 +459,39 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testBundledApplyPreservesUntouchedUnloadedSecrets() throws {
+        let suite = "SettingsPersistence.persist.preserve-unloaded.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let keychain = ScriptedSecretStore(
+            values: [.anthropicAPIKey: "kept-anthropic", .openAIAPIKey: "kept-openai"],
+            scriptedWrites: [
+                .fail(.anthropicAPIKey, .status(errSecInteractionNotAllowed)),
+            ]
+        )
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+        var draft = SettingsDraft.defaults
+        draft.mode = .bundled
+        draft.developmentBinaryOverride = "/bin/sh"
+        let previous = PersistedSettingsSnapshot(
+            preferences: PersistedPreferenceSnapshot(
+                serverMode: ServerModeKind.bundled.rawValue,
+                attachedOrigin: draft.attachedOrigin,
+                bundledPort: draft.bundledPort,
+                developmentBinaryOverride: draft.developmentBinaryOverride,
+                rustLogLevel: draft.rustLogLevel
+            ),
+            secrets: [.anthropicAPIKey: .preserveUnloaded, .openAIAPIKey: .preserveUnloaded]
+        )
+
+        let result = try persistence.persist(draft: draft, appliedSnapshot: previous)
+
+        XCTAssertEqual(try keychain.read(.anthropicAPIKey), "kept-anthropic")
+        XCTAssertEqual(try keychain.read(.openAIAPIKey), "kept-openai")
+        XCTAssertEqual(result.persistedSnapshot.secrets[.anthropicAPIKey], .unloaded)
+        XCTAssertEqual(result.persistedSnapshot.secrets[.openAIAPIKey], .unloaded)
+    }
+
     func testSettingsPersistenceRollsBackPreferencesAndSecretsWhenSecondSecretWriteFails() throws {
         let suite = "SettingsPersistence.persist.rollback-second-write.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -1182,6 +1215,10 @@ final class ServerManagerHelpersTests: XCTestCase {
     }
 
     func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {
+        let first = UUID()
+        let latest = UUID()
+        XCTAssertFalse(DeepLinkNavigationDecision.validationResultIsCurrent(validatedID: first, pendingConversationID: latest))
+        XCTAssertTrue(DeepLinkNavigationDecision.validationResultIsCurrent(validatedID: latest, pendingConversationID: latest))
         XCTAssertFalse(DeepLinkNavigationDecision.shouldValidateQueuedConversation(
             pendingConversationID: UUID(),
             hasAuthenticatedPrimaryWebView: false,

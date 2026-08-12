@@ -151,6 +151,10 @@ struct DeepLinkConversationValidation {
 }
 
 struct DeepLinkNavigationDecision {
+    static func validationResultIsCurrent(validatedID: UUID, pendingConversationID: UUID?) -> Bool {
+        pendingConversationID == validatedID
+    }
+
     static func shouldValidateQueuedConversation(
         pendingConversationID: UUID?,
         hasAuthenticatedPrimaryWebView: Bool,
