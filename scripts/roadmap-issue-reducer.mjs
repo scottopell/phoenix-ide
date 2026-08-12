@@ -272,6 +272,11 @@ function retirementReceipt(comment) {
   return `<!-- phoenix-roadmap-retirement-receipt:${comment.id}:${digest} -->`;
 }
 
+function retirementReceiptSource(body) {
+  const match = body?.match(/^<!-- phoenix-roadmap-retirement-receipt:(\d+):[a-f0-9]{64} -->$/);
+  return match ? Number(match[1]) : null;
+}
+
 function retirementReceiptIds(comments) {
   const receipts = new Set(
     comments
@@ -560,6 +565,7 @@ export async function run({ event, configuredIssueNumber, token }) {
       await clearLifecycleReactions(owner, repo, event.comment.id, token);
     }
     let comments;
+    let deletedReceiptSource = null;
     let updates;
     let current;
     let outcomes;
@@ -568,6 +574,9 @@ export async function run({ event, configuredIssueNumber, token }) {
     let stable = false;
     for (let attempt = 1; attempt <= 5; attempt += 1) {
       comments = await listComments(owner, repo, configuredIssueNumber, token);
+      if (event.action === "deleted" && event.comment.user?.login === "github-actions[bot]") {
+        deletedReceiptSource = retirementReceiptSource(event.comment.body);
+      }
       const confirmation = await listComments(owner, repo, configuredIssueNumber, token);
       if (trustedSnapshotKey(comments) !== trustedSnapshotKey(confirmation)) continue;
 
@@ -576,6 +585,7 @@ export async function run({ event, configuredIssueNumber, token }) {
         .map((comment) => comment.id);
       const snapshotThroughCommentId = trustedCommentIds.length === 0 ? 0 : Math.max(...trustedCommentIds);
       const retirementAcknowledgments = retirementReceiptIds(comments);
+      if (deletedReceiptSource !== null) retirementAcknowledgments.add(deletedReceiptSource);
       ({ updates, current, outcomes } = reduceComments(comments, retirementAcknowledgments));
       before = reduceComments(commentsBeforeEvent(comments, event), retirementAcknowledgments);
       const body = renderRoadmap(updates, snapshotThroughCommentId);
