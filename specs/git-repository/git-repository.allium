@@ -82,9 +82,16 @@ entity RepositoryLocatorObservation {
 
 entity DefaultBranchObservation {
     repository: GitRepository
-    branch_name: String?
-    provenance: DefaultBranchProvenance?
-    observed_at: Timestamp?
+}
+
+variant ResolvedDefaultBranchObservation : DefaultBranchObservation {
+    branch_name: String
+    provenance: DefaultBranchProvenance
+    observed_at: Timestamp
+}
+
+variant UnresolvedDefaultBranchObservation : DefaultBranchObservation {
+    observed_at: Timestamp
 }
 
 external entity WorkScopeRepositoryAttachment {
@@ -133,9 +140,9 @@ rule LinkedWorktreesReuseOneHiddenRepositoryIdentity {
 }
 
 rule SeparateClonesRemainDistinctHiddenRepositories {
-    when: SeparateCloneObserved(left_repository, right_repository)
-    requires: left_repository.opaque_id != right_repository.opaque_id
-    ensures: DistinctHiddenRepositoriesRetained(left_repository, right_repository)
+    when: SeparateCloneObserved(left_clone_evidence, right_clone_evidence)
+    ensures: SeparateCloneRepositoriesResolved(left_clone_evidence, right_clone_evidence)
+    ensures: resolved_hidden_repository(left_clone_evidence).opaque_id != resolved_hidden_repository(right_clone_evidence).opaque_id
 
     @guidance
         -- Matching remotes, slugs, or commit graphs do not collapse separate clones
@@ -158,9 +165,9 @@ rule LocatorObservationsUpdateWithoutReplacingRepositoryIdentity {
         -- implies minting a replacement hidden repository identity.
 }
 
-rule DefaultBranchObservationMayRemainUnresolved {
-    when: DefaultBranchObserved(repository, branch_name?, provenance?, observed_at?)
-    ensures: DefaultBranchObservation.updated(
+rule ResolvedDefaultBranchObservationIsAtomic {
+    when: ResolvedDefaultBranchObserved(repository, branch_name, provenance, observed_at)
+    ensures: ResolvedDefaultBranchObservation.updated(
         repository: repository,
         branch_name: branch_name,
         provenance: provenance,
@@ -168,12 +175,18 @@ rule DefaultBranchObservationMayRemainUnresolved {
     )
 
     @guidance
-        -- `branch_name = null` means the canonical default branch is unresolved.
-        -- A checked-out-branch fallback is allowed only with provenance
-        -- `local_checked_out_branch`. `remote_head_cache` is admissible canonical
-        -- evidence; `local_checked_out_branch` and `user_selected` remain
-        -- observations rather than canonical proof unless separately corroborated.
-        -- Phoenix never fabricates `main`.
+        -- A resolved observation carries branch identity, provenance, and time as
+        -- one structural value. A checked-out-branch fallback uses provenance
+        -- `local_checked_out_branch`; only `remote_head_cache` is canonical evidence
+        -- without separate corroboration. Phoenix never fabricates `main`.
+}
+
+rule DefaultBranchObservationMayRemainUnresolved {
+    when: DefaultBranchResolutionFailed(repository, observed_at)
+    ensures: UnresolvedDefaultBranchObservation.updated(
+        repository: repository,
+        observed_at: observed_at
+    )
 }
 
 rule CanonicalDefaultConsumersRequireCanonicalEvidence {
@@ -249,7 +262,8 @@ rule PreScopeProvisioningEvidenceMayReferenceRepositoryDirectly {
 }
 
 rule RestartRepairEvidenceRecordsExactMissingOrInaccessibleObservation {
-    when: RestartRepairObservationRecorded(product_conversation, scope, repository, worktree, observation_kind, observation_generation, observed_at)
+    when: RestartRepairObservationRecorded(product_conversation, scope, repository, worktree, observation_kind, observed_at)
+    let observation_generation = next_restart_repair_generation(product_conversation, scope)
     ensures: RestartRepairEvidence.created(
         product_conversation: product_conversation,
         scope: scope,
@@ -298,7 +312,19 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
----- complete semantics of each bare helper used above.
+--
+--   resolved_hidden_repository(clone_evidence) -> GitRepository
+--       The hidden identity resolved from retained local clone evidence. Separate
+--       local clones resolve independently even when remote, slug, or commit graph
+--       observations match.
+--
+--   next_restart_repair_generation(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScopeRef
+--   ) -> Integer
+--       One greater than the greatest persisted observation_generation for that
+--       exact ProductConversation and WorkScopeRef, or 1 when none exists. The
+--       caller cannot provide or override this generation.
 --
 --   canonical_default_evidence_admissible(
 --       repository: GitRepository

@@ -339,9 +339,10 @@ explicitly reports done
 WHEN context exhaustion carries a continuation summary
 THE SYSTEM SHALL render that summary in the needs-action card
 
-WHEN a conversation snapshot is in History
+WHEN an ordinary conversation snapshot is in History
 THE SYSTEM SHALL keep its transcript readable
-AND SHALL disable chat and state-transition actions
+AND SHALL disable chat and Open-only state-transition actions
+AND SHALL preserve online-only permanent Delete
 
 WHEN a state variant is promoted from the catch-all to typed support
 THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,

@@ -754,8 +754,9 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       product_conversation: bedrock/ProductConversation,
 --       scope: WorkScope
 --   ) -> Boolean
---       True iff that exact scope's retained worktree is observed missing or
---       inaccessible and no later observation proves a present replacement.
+--       True iff that exact scope's retained worktree is observed missing and no
+--       later observation proves a present replacement. `inaccessible` is not
+--       absence authority and remains typed repair state.
 --
 --   absent_worktree_identity(
 --       product_conversation: bedrock/ProductConversation,

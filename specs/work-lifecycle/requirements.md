@@ -174,7 +174,9 @@ THE SYSTEM SHALL treat that typed condition as truthful persisted ownership evid
 AND SHALL NOT fabricate a replacement `WorkScope`, worktree attachment, detached branch label, branch owner, fallback branch selection, or guessed path continuity for the conversation
 
 THE SYSTEM SHALL integrate that typed condition with Close repair and retry semantics
-AND SHALL allow later Close inspection, Close retry, or manual repair flows to adopt the exact missing-worktree evidence idempotently only when exact identity evidence proves that adoption
+AND SHALL allow later Close inspection, Close retry, or manual repair flows to adopt an exact `missing` observation idempotently only when exact identity evidence proves that adoption
+AND SHALL NOT treat an `inaccessible` observation as absence authority
+AND SHALL keep inaccessible observations in typed repair until a later exact observation proves `missing` or the resource is retired normally
 AND SHALL otherwise route conflicts to typed repair rather than silently succeeding
 
 **Rationale:** A missing registered worktree after restart is a repair-class ownership problem, not a hidden terminal lifecycle. Keeping the product aggregate Open preserves the one Close/reconciliation contract while typed evidence lets later retries reason from persisted ownership without guessing.
