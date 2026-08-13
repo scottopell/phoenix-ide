@@ -18,7 +18,7 @@ enum WebKitStoragePartition: Equatable {
 
     private var attachedPersistentIdentifier: UUID {
         guard case .attached(let origin) = self else { return Self.bundledPersistentIdentifier }
-        let digest = Array(SHA256.hash(data: Data("phoenix-attached-webkit:\(origin.description)".utf8)))
+        let digest = Array(SHA256.hash(data: Data("phoenix-attached-webkit:\(origin.canonicalStorageKey)".utf8)))
         let bytes: uuid_t = (
             digest[0], digest[1], digest[2], digest[3],
             digest[4], digest[5], digest[6], digest[7],

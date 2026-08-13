@@ -292,6 +292,7 @@ actor SidecarLogRecorder {
     private let writer: RollingLogWriter?
     private let snapshotSink: @Sendable ([String]) async -> Void
     private let maxPendingChunks: Int
+    private let exactSecretValues: [String]
     private var buffer = ConnectionLogBuffer()
     private var pendingChunks: [Data] = []
     private var droppedChunkCount = 0
@@ -301,10 +302,12 @@ actor SidecarLogRecorder {
     init(
         writer: RollingLogWriter? = nil,
         maxPendingChunks: Int = 32,
+        exactSecretValues: [String] = [],
         snapshotSink: @escaping @Sendable ([String]) async -> Void = { _ in }
     ) {
         self.writer = writer
         self.maxPendingChunks = max(1, maxPendingChunks)
+        self.exactSecretValues = exactSecretValues.filter { !$0.isEmpty }
         self.snapshotSink = snapshotSink
     }
 
@@ -358,7 +361,7 @@ actor SidecarLogRecorder {
                 snapshots.append(Snapshot(logAppend: droppedData, recentLines: buffer.completeLines))
                 droppedChunkCount = 0
             }
-            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
+            let emitted = buffer.append(chunk, redact: redact)
             guard !emitted.isEmpty else { continue }
             let append = Data((emitted.joined(separator: "\n") + "\n").utf8)
             if let writeFailure = appendToLogFailure(append) {
@@ -386,12 +389,22 @@ actor SidecarLogRecorder {
             await snapshotSink(buffer.completeLines)
             return Snapshot(logAppend: droppedData, recentLines: buffer.completeLines)
         }
-        guard let flushed = buffer.flushPending(redact: Self.defaultRedact) else { return nil }
+        guard let flushed = buffer.flushPending(redact: redact) else { return nil }
         let append = Data((flushed + "\n").utf8)
-        try? appendToLog(append)
+        if let writeFailure = appendToLogFailure(append) {
+            buffer.appendDiagnosticLine(writeFailure)
+        }
         let lines = buffer.completeLines
         await snapshotSink(lines)
         return Snapshot(logAppend: append, recentLines: lines)
+    }
+
+    private func redact(_ line: String) -> String {
+        var redacted = Self.defaultRedact(line)
+        for secret in exactSecretValues {
+            redacted = redacted.replacingOccurrences(of: secret, with: "[REDACTED]")
+        }
+        return redacted
     }
 
     private func appendToLogFailure(_ data: Data) -> String? {
@@ -909,8 +922,10 @@ final class ServerManager: ObservableObject {
             try FileManager.default.createDirectory(at: configuration.dataDirectoryURL, withIntermediateDirectories: true)
             try acquireOwnerLock(configuration.ownerLockURL)
             launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
+            let sidecarSecrets = try keychain.sidecarEnvironment()
             let logRecorder = SidecarLogRecorder(
                 writer: currentLogWriter,
+                exactSecretValues: Array(sidecarSecrets.values),
                 snapshotSink: { [logSnapshotSink] lines in
                     await logSnapshotSink.publish(lines, operation: operation)
                 }
@@ -924,7 +939,7 @@ final class ServerManager: ObservableObject {
                 userHome: FileManager.default.homeDirectoryForCurrentUser,
                 instanceID: instanceID,
                 publicEnvironment: configuration.publicEnvironment,
-                sidecarSecrets: try keychain.sidecarEnvironment()
+                sidecarSecrets: sidecarSecrets
             )
 
             let launched = Process()

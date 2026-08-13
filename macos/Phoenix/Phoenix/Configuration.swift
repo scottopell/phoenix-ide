@@ -1099,6 +1099,14 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         url = normalized
     }
 
+    var canonicalStorageKey: String {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        let scheme = components.scheme!.lowercased()
+        let host = components.host!.lowercased()
+        let port = components.port ?? (scheme == "https" ? 443 : 80)
+        return "\(scheme)://\(host):\(port)"
+    }
+
     var description: String { url.absoluteString }
 
     func url(path: String) -> URL {

@@ -47,6 +47,10 @@ fn user_data_dir_for_key(tmp_root: &Path, scope_key: &str) -> PathBuf {
     tmp_root.join(format!("{USER_DATA_DIR_PREFIX}{prefix:016x}"))
 }
 
+fn legacy_user_data_dir_for_key(scope_key: &str) -> PathBuf {
+    user_data_dir_for_key(&std::env::temp_dir(), scope_key)
+}
+
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.
 const USER_DATA_DIR_PREFIX: &str = "phoenix-chrome-";
 
@@ -411,6 +415,10 @@ impl BrowserSession {
         // Remove stale user data directory to avoid Chrome SingletonLock conflicts
         // (e.g. from a previous crash or test run that didn't clean up)
         let _ = std::fs::remove_dir_all(&user_data_dir);
+        let legacy_user_data_dir = legacy_user_data_dir_for_key(session_key);
+        if legacy_user_data_dir != user_data_dir {
+            let _ = std::fs::remove_dir_all(legacy_user_data_dir);
+        }
 
         let mut builder = BrowserConfig::builder()
             .new_headless_mode()
