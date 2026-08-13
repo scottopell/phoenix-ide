@@ -1304,7 +1304,6 @@ impl Database {
         let observed_fingerprint = worktree_path
             .as_deref()
             .and_then(Self::observe_worktree_fingerprint);
-        let probe_succeeded = observed_fingerprint.is_some();
         let existing =
             sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
                 "SELECT environment_kind, worktree_path, worktree_id, worktree_fingerprint
@@ -1329,13 +1328,6 @@ impl Database {
                     uuid::Uuid::new_v4().to_string()
                 };
                 (Some(id), Some(fingerprint))
-            }
-            ("allocated_worktree", None)
-                if !probe_succeeded
-                    && existing.0 == "allocated_worktree"
-                    && existing.1.as_deref() == worktree_path.as_deref() =>
-            {
-                (existing.2, existing.3)
             }
             _ => (None, None),
         };

@@ -1641,19 +1641,30 @@ async fn route_unresolved_worktree_to_repair(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &CloseAttemptId,
 ) -> DbResult<()> {
-    let updated = sqlx::query(
-        "UPDATE close_obligations
-         SET phase = 'needs_repair', updated_at = ?2
-         WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
-    )
-    .bind(attempt_id.as_str())
-    .bind(Utc::now().to_rfc3339())
-    .execute(&mut **tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(close_precondition(format!(
-            "attempt {attempt_id} unresolved worktree repair requires retirement_requested"
-        )));
+    let phase: String =
+        sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
+            .bind(attempt_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.as_str().to_string()))?;
+    match phase.as_str() {
+        "retirement_requested" => {
+            sqlx::query(
+                "UPDATE close_obligations
+                 SET phase = 'needs_repair', updated_at = ?2
+                 WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+            )
+            .bind(attempt_id.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut **tx)
+            .await?;
+        }
+        "needs_repair" => {}
+        _ => {
+            return Err(close_precondition(format!(
+                "attempt {attempt_id} unresolved worktree repair requires retirement_requested or needs_repair"
+            )))
+        }
     }
     Ok(())
 }
@@ -3028,6 +3039,7 @@ mod tests {
         assert_eq!(members[0].role, CloseMemberRole::RootLatest);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn unresolved_allocated_worktree_admits_close_and_routes_inventory_to_repair() {
         let db = Database::open_in_memory().await.unwrap();
@@ -3106,6 +3118,33 @@ mod tests {
                 .unwrap()
                 .phase(),
             ClosePhase::NeedsRepair
+        );
+        let replay_error = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: CloseAttemptId::parse("attempt-unresolved").unwrap(),
+                snapshot: current_test_snapshot(&db, "attempt-unresolved").await,
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: None,
+                        bash_process_groups: std::collections::BTreeSet::new(),
+                        tmux_servers: std::collections::BTreeSet::new(),
+                        pty_sessions: std::collections::BTreeSet::new(),
+                        browser_sessions: std::collections::BTreeSet::new(),
+                        equivalent_live_resources: std::collections::BTreeSet::new(),
+                    },
+                }],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                replay_error,
+                DbError::CloseFoundationRepairRequired(
+                    CloseFoundationRepair::UnresolvedWorktreeIdentity { .. }
+                )
+            ),
+            "unexpected replay error: {replay_error:?}"
         );
     }
 
