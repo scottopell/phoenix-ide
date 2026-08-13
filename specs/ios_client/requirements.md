@@ -339,9 +339,10 @@ explicitly reports done
 WHEN context exhaustion carries a continuation summary
 THE SYSTEM SHALL render that summary in the needs-action card
 
-WHEN a conversation snapshot is archived
+WHEN an ordinary conversation snapshot is in History
 THE SYSTEM SHALL keep its transcript readable
-AND SHALL disable chat and state-transition actions
+AND SHALL disable chat and Open-only state-transition actions
+AND SHALL preserve online-only permanent Delete
 
 WHEN a state variant is promoted from the catch-all to typed support
 THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
@@ -364,7 +365,7 @@ THE SYSTEM SHALL declare its delivery policy in the action's type:
 - outboxed: persisted locally before any network I/O, idempotency-keyed,
   auto-retried (chat messages)
 - online-only: requires a live server answer because it reads or
-  transitions live server state (cancel, dismiss-error, archive)
+  transitions live server state (cancel, dismiss-error, Close conversation)
 
 WHEN an online-only action is invoked while offline
 THE SYSTEM SHALL disable the control or fail immediately with an
@@ -380,13 +381,13 @@ already cleared it and a newer action has begun
 THE SYSTEM SHALL ignore the earlier request's completion
 AND SHALL NOT unlock or overwrite the newer action
 
-WHEN archive is requested while the conversation has a visible outbox entry
-THE SYSTEM SHALL block archive until the user retries or discards that entry
-SO THAT archive cannot delete the only durable copy of user-authored text
+WHEN Close conversation is requested while the conversation has a visible outbox entry
+THE SYSTEM SHALL block Close conversation until the user retries or discards that entry
+SO THAT Close conversation cannot discard the only durable copy of user-authored text
 
-WHEN an archive request is in flight
+WHEN a Close conversation request is in flight
 THE SYSTEM SHALL disable new message submission for that conversation
-UNTIL archive fails or completes
+UNTIL Close conversation fails or completes
 
 WHEN the conversation is in a state that rejects ordinary chat
 THE SYSTEM SHALL disable the composer
@@ -394,7 +395,7 @@ AND SHALL continue allowing chat in working states where the server accepts
 the message as steering
 
 **Rationale:** Queuing an action against live server state fabricates a
-stale intent — an archive or cancel replayed minutes later can destroy
+stale intent — a Close conversation or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
 defer; the type forces each new action to make that choice explicitly.
 
@@ -575,7 +576,7 @@ WHEN the Coordinator appears in the conversation list
 THE SYSTEM SHALL badge it distinctly
 
 WHEN the user opens list actions for the Coordinator
-THE SYSTEM SHALL NOT offer archive
+THE SYSTEM SHALL NOT offer Close conversation or Delete
 
 The remembered Coordinator id is per-server state and SHALL be cleared on
 sign-out or when the local cache is cleared.
@@ -624,18 +625,18 @@ cadence (≥15 min, best-effort), so every nudge is explicitly non-authoritative
 
 ---
 
-### REQ-IOS-019: Inspect Conversation Grounding and Project Files
+### REQ-IOS-019: Inspect Conversation Grounding and Conversation-Scoped Files
 
 WHEN the user opens a conversation's grounding surface
-THE SYSTEM SHALL show every attached `WorkScope` that provides project or
+THE SYSTEM SHALL show every attached `WorkScope` that provides repository or
 working context for that conversation
 AND identify each context root by its exact attached `WorkScope`
 AND bind context selection, file navigation, and displayed contents to that
 exact scope
-AND SHALL NOT collapse different attached scopes into one implicit project root
+AND SHALL NOT collapse different attached scopes into one implicit shared root
 AND distinguish unavailable, loading, stale, empty, and failed context
 
-WHEN the user browses a supported project file
+WHEN the user browses a supported conversation-scoped file
 THE SYSTEM SHALL treat its path as a server-side location
 AND fetch and display the file's contents without offering phone-local file
 actions
@@ -651,13 +652,13 @@ AND SHALL NOT present an empty document as a successful load
 AND SHALL NOT retain another scope's or file's contents under the requested
 file's selection
 
-**Rationale:** Mobile decisions often depend on the files and project state the
+**Rationale:** Mobile decisions often depend on the files and working state the
 agent is using. Read-only server-backed context provides that evidence without
 pretending the phone owns the server's filesystem.
 
 ---
 
-### REQ-IOS-020: Read Project Prose Comfortably
+### REQ-IOS-020: Read Conversation-Scoped Prose Comfortably
 
 WHEN the user opens a supported Markdown or prose file
 THE SYSTEM SHALL render a dedicated reading surface with readable typography,
@@ -677,7 +678,7 @@ requires a reading surface rather than a transcript card or raw-file dump.
 
 ---
 
-### REQ-IOS-021: Comment on Project Prose Reliably
+### REQ-IOS-021: Comment on Conversation-Scoped Prose Reliably
 
 WHEN a chat-capable conversation's reader displays current contents from the
 exact `WorkScope` that is the server-declared live message target

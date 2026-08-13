@@ -26,6 +26,10 @@ This spec governs the **conversation experience** — list, chat view, compositi
 
 Surfaces that do not yet have their own spec (TerminalPanel, TasksPanel, SkillsPanel, ConversationSettings, RenameDialog, MessageContextMenu, ImageAttachments) are tracked as a follow-up; this document does NOT claim coverage of them just because they live in `ui/src/components/`.
 
+## Project-Retirement Current Reality
+
+The shipped new-conversation and sidebar surfaces still consume legacy Project suggestions/grouping and mode metadata. The normative target keeps recent repository-location suggestions only as a projection of surviving conversation/WorkScope activity (REQ-PROJ-001A), filters conversations without a Project product grouping (REQ-PROJ-019), and never exposes hidden `GitRepository` as a user-owned collection.
+
 ## Requirements Summary
 
 Within the scope above: a responsive interface for conversations with the AI agent across mobile and desktop. Users can view and manage conversations, compose messages with draft persistence, and monitor agent activity in real-time. The interface handles unreliable network connectivity gracefully with optimistic UI, automatic reconnection, and offline message queueing. Desktop users get a persistent sidebar layout with conversation list alongside the active chat. New conversation creation goes through a single dedicated route (`/new`) regardless of entry point — sidebar "+ New" navigates there, the responsive layout inside the page adapts to viewport (full-page form on desktop, bottom-sheet styling on mobile). The form supports "Send in Background" for spawning work without navigating away from a previous conversation.

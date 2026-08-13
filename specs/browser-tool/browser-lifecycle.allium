@@ -339,7 +339,7 @@ rule CascadePreservesOnScopeMatch {
 -- backstop for genuinely
 -- abandoned scopes, not a hard cap on live work: a conversation alive in the
 -- UI but quiet on browser tools keeps its session regardless of idle age.
--- specs/projects/ REQ-PROJ-025 (OneBranchOneActiveWorktree) guarantees at
+-- specs/git-repository/ REQ-PROJ-025 guarantees at
 -- most one non-terminal conversation per scope, so the liveness question has
 -- a single decisive answer. The gate mirrors the cascade path
 -- (CascadePreservesOnScopeMatch), which preserves a session whose scope is

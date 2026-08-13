@@ -416,7 +416,7 @@ first — lives in `executive.md`, not in these standing requirements.)
 - **Relevance feedback / learning from which answers the user kept.**
   Not defined.
 - **Scopes beyond `Conversations`, `Global`, and `GlobalExcluding`.**
-  `Project(id)` and `Since(timestamp)` are natural extensions of the scope
+  `Repository(identity)` and `Since(timestamp)` are natural extensions of the scope
   enum — they would apply as additional in-query predicates (REQ-RET-007)
   with no change to the primitive's shape — but this spec defines only the
   scopes its consumers require.

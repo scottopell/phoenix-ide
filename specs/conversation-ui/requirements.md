@@ -451,6 +451,42 @@ THE SYSTEM SHALL treat the click as a no-op (the new-conversation form is alread
 
 ---
 
+### REQ-PROJ-001A: Suggest Recent Repository Locations for New Conversations
+
+WHEN the user opens the new-conversation surface
+THE SYSTEM SHALL derive repository-location suggestions from surviving Open or History conversation activity and any surviving WorkScope attachment or pre-scope provisioning evidence that still resolves to a present server-side repository management-root locator
+AND SHALL project one suggested location per hidden `GitRepository` using that current management-root locator rather than a Phoenix-managed worktree path or arbitrary in-repository working directory
+AND SHALL collapse linked worktrees attached to the same hidden `GitRepository` into one suggestion
+AND SHALL keep separate local clones as separate suggestions even when their remotes, names, or commit graphs match
+AND SHALL allow an unresolved Git-backed creation failure to contribute only through still-surviving conversation-side evidence that resolves to a present management-root locator
+AND SHALL rank suggestions first by the number of distinct surviving Open or History conversations supporting the hidden `GitRepository` and then by the most recent supporting conversation or WorkScope activity
+AND SHALL allow the user to select a suggested server-side location as the conversation working directory
+
+WHEN deletion removes all conversation and WorkScope activity that supported a suggestion
+THE SYSTEM MAY forget that suggestion
+AND SHALL NOT retain a hidden user-visible repository catalog solely to preserve it
+
+**Rationale:** Recent locations reduce repeated path entry without recreating a Project or Repository product collection. The suggestion is a derived convenience, not lifecycle or ownership authority.
+
+---
+
+### REQ-PROJ-019: Conversation List Filtering and Explicit Close
+
+WHEN the conversation list contains more than 20 conversations
+THE SYSTEM SHALL provide filtering by lifecycle and conversation shape
+AND provide filtering by repository
+
+WHEN the user applies a filter
+THE SYSTEM SHALL show only conversations matching the selected filter
+AND persist the filter selection across page navigation
+
+THE SYSTEM SHALL NOT automatically archive or auto-close conversations based on age alone
+AND SHALL keep closed conversations accessible through History after explicit Close
+
+**Rationale:** Users need list controls as activity grows, but the unified lifecycle requires an explicit Close decision rather than age-based automatic archival.
+
+---
+
 ### REQ-CONV-019: Streaming Text Display
 
 WHEN LLM is generating a text response

@@ -411,6 +411,9 @@ async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult),
     phoenix_db::run_pending_migrations(db.pool())
         .await
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    db.reconcile_worktree_identities()
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     db.restrict_file_permissions();
     Ok((db, DatabaseResult::File { path }))
 }
@@ -575,6 +578,42 @@ mod tests {
             parent_directory(std::path::Path::new("results/run.db")),
             Some(std::path::Path::new("results"))
         );
+    }
+
+    #[tokio::test]
+    async fn file_database_bootstrap_reconciles_worktree_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("drive-turn.db");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/linked-worktree\n").unwrap();
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd, worktree_path,
+                 created_at, updated_at, worktree_id, worktree_fingerprint
+             ) VALUES ('drive-turn-scope', 'work', 'active', 'allocated_worktree',
+                       ?1, ?1, ?2, ?2, NULL, NULL)",
+        )
+        .bind(worktree.to_str().unwrap())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        drop(db);
+
+        let (reopened, _) = open_file_database(db_path).await.unwrap();
+        let identity = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT worktree_id, worktree_fingerprint
+             FROM work_scopes WHERE id = 'drive-turn-scope'",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+        assert!(identity.0.is_some());
+        assert!(identity.1.is_some());
     }
 
     #[test]

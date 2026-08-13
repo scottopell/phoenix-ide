@@ -1,0 +1,465 @@
+-- allium: 3
+-- git-repository.allium
+--
+-- Phoenix Hidden Git Repository: Behavioural Specification
+--
+-- Scope: hidden Phoenix-local GitRepository identity, mutable locator and
+--        default-branch observations, singular repository attachment to
+--        WorkScope, immutable restart repair evidence, and repository-backed
+--        worktree registry/reuse rules.
+--
+-- Excludes:
+--   - SQL tables and migration shape.
+--   - Creation worker claims and retry scheduling (conversation-creation).
+--   - Close retirement orchestration (work-lifecycle).
+--   - User-facing repository management UI.
+--
+-- Requirement traceability: REQ-GITREP-001 through REQ-GITREP-008,
+-- REQ-PROJ-015, REQ-PROJ-020, REQ-PROJ-021, REQ-PROJ-024, REQ-PROJ-025.
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value WorkScopeRef {
+    id: String
+}
+
+value WorktreeIdentity {
+    id: String
+    path: String
+    fingerprint: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum LocatorKind {
+    git_common_dir
+    | management_root
+}
+
+enum LocatorStatus {
+    present
+    | missing
+    | inaccessible
+}
+
+enum DefaultBranchProvenance {
+    remote_head_cache
+    | local_checked_out_branch
+    | user_selected
+}
+
+enum RestartRepairObservationKind {
+    missing
+    | inaccessible
+}
+
+enum ProvisioningEvidenceKind {
+    canonical_default_resolved
+    | canonical_default_unresolved
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity GitRepository {
+    opaque_id: String
+}
+
+entity RepositoryLocatorObservation {
+    repository: GitRepository
+    locator_kind: LocatorKind
+    observed_path: String
+    status: LocatorStatus
+    observed_at: Timestamp
+}
+
+entity DefaultBranchObservation {
+    repository: GitRepository
+    observation_generation: Integer
+}
+
+variant ResolvedDefaultBranchObservation : DefaultBranchObservation {
+    branch_name: String
+    provenance: DefaultBranchProvenance
+    observed_at: Timestamp
+}
+
+variant UnresolvedDefaultBranchObservation : DefaultBranchObservation {
+    observed_at: Timestamp
+}
+
+external entity WorkScopeRepositoryAttachment {
+    scope: WorkScopeRef
+    repository: GitRepository
+}
+
+external entity ProductConversationScopeAttachment {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScopeRef
+}
+
+external entity RepositoryProvisioningEvidence {
+    product_conversation: bedrock/ProductConversation
+    transcript_conversation_id: String
+    repository: GitRepository
+    evidence_kind: ProvisioningEvidenceKind
+}
+
+entity RestartRepairEvidence {
+    product_conversation: bedrock/ProductConversation
+    scope: WorkScopeRef
+    repository: GitRepository
+    worktree: WorktreeIdentity
+    observation_kind: RestartRepairObservationKind
+    observation_generation: Integer
+    observed_at: Timestamp
+}
+
+external entity ProductConversationDeletion {
+    product_conversation: bedrock/ProductConversation
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule LinkedWorktreesReuseOneHiddenRepositoryIdentity {
+    when: LinkedWorktreesObserved(left_worktree, right_worktree, shared_git_common_dir)
+    let left_repository = resolved_hidden_repository(left_worktree)
+    let right_repository = resolved_hidden_repository(right_worktree)
+    requires: retained_git_common_dir(left_worktree) = shared_git_common_dir
+    requires: retained_git_common_dir(right_worktree) = shared_git_common_dir
+    ensures: left_repository.opaque_id = right_repository.opaque_id
+    ensures: GitRepository.created(opaque_id: left_repository.opaque_id)
+
+    @guidance
+        -- Phoenix keys hidden repository sameness from retained local repository
+        -- identity evidence, not from worktree paths. Linked worktrees that share
+        -- one Git common directory reuse one hidden GitRepository identity.
+}
+
+rule SeparateClonesRemainDistinctHiddenRepositories {
+    when: SeparateCloneObserved(left_clone_evidence, right_clone_evidence)
+    ensures: SeparateCloneRepositoriesResolved(left_clone_evidence, right_clone_evidence)
+    ensures: resolved_hidden_repository(left_clone_evidence).opaque_id != resolved_hidden_repository(right_clone_evidence).opaque_id
+
+    @guidance
+        -- Matching remotes, slugs, or commit graphs do not collapse separate clones
+        -- into one hidden identity.
+}
+
+rule LocatorObservationsUpdateWithoutReplacingRepositoryIdentity {
+    when: RepositoryLocatorObserved(repository, locator_kind, observed_path, status, observed_at)
+    requires: repository_locator_observation_is_not_stale(repository, locator_kind, observed_at)
+    ensures: RepositoryLocatorObservation.updated(
+        repository: repository,
+        locator_kind: locator_kind,
+        observed_path: observed_path,
+        status: status,
+        observed_at: observed_at
+    )
+
+    @guidance
+        -- Locator paths are mutable observations. `missing` and `inaccessible`
+        -- remain distinct states, and recording a new locator observation never
+        -- implies minting a replacement hidden repository identity.
+}
+
+rule ResolvedDefaultBranchObservationIsAtomic {
+    when: ResolvedDefaultBranchObserved(repository, branch_name, provenance, observed_at)
+    requires: default_branch_observation_is_not_stale(repository, observed_at)
+    let observation_generation = next_default_branch_observation_generation(repository)
+    ensures: ResolvedDefaultBranchObservation.updated(
+        repository: repository,
+        observation_generation: observation_generation,
+        branch_name: branch_name,
+        provenance: provenance,
+        observed_at: observed_at
+    )
+
+    @guidance
+        -- A resolved observation carries branch identity, provenance, and time as
+        -- one structural value. A checked-out-branch fallback uses provenance
+        -- `local_checked_out_branch`; only `remote_head_cache` is canonical evidence
+        -- without separate corroboration. Phoenix never fabricates `main`.
+}
+
+rule DefaultBranchObservationMayRemainUnresolved {
+    when: DefaultBranchResolutionFailed(repository, observed_at)
+    requires: default_branch_observation_is_not_stale(repository, observed_at)
+    let observation_generation = next_default_branch_observation_generation(repository)
+    ensures: UnresolvedDefaultBranchObservation.updated(
+        repository: repository,
+        observation_generation: observation_generation,
+        observed_at: observed_at
+    )
+}
+
+rule CanonicalDefaultConsumersRequireCanonicalEvidence {
+    when: CanonicalDefaultBranchConsumerRequested(repository, consumer_kind)
+    requires: canonical_default_evidence_admissible(repository)
+    ensures: CanonicalDefaultBranchConsumerResolved(repository, consumer_kind)
+
+    @guidance
+        -- A consumer such as creation or provisioning that promises canonical-
+        -- default behavior may proceed only from remote-head canonical evidence or
+        -- separate corroboration that establishes the same canonical branch without
+        -- rewriting the original observation's provenance.
+}
+
+rule ProductConversationDerivesRepositoryContextFromAttachedScope {
+    when: ProductConversationRepositoryContextRequested(product_conversation)
+    requires: exists ProductConversationScopeAttachment{product_conversation: product_conversation, scope: ProductConversationScopeAttachment.scope}
+    ensures: ProductConversationRepositoryContextResolved(product_conversation)
+
+    @guidance
+        -- The ProductConversation reads repository context through its attached
+        -- WorkScope. There is no second independent writable ProductConversation-
+        -- to-repository authority.
+}
+
+rule DeterministicLegacyProjectBackfillSeedsHiddenRepositoryIdentity {
+    when: LegacyProjectRepositoryBackfillRequested(legacy_project_id, repository)
+    ensures: LegacyProjectRepositoryBackfillRecorded(legacy_project_id, repository)
+
+    @guidance
+        -- Backfill is deterministic and replay-stable: the same retained legacy
+        -- Project identity resolves to the same hidden GitRepository identity every
+        -- time. Seeding GitRepository identity from legacy Project identity is
+        -- migration-only and never authorizes runtime substitution between domains.
+}
+
+rule ConflictingLegacyProjectAssignmentsFailRepositoryMigration {
+    when: LegacyProjectAssignmentConflictObserved(scope)
+    ensures: RepositoryAuthorityMigrationFailed(scope)
+
+    @guidance
+        -- If one WorkScope resolves to conflicting retained legacy Project
+        -- assignments, migration fails rather than selecting one heuristically.
+}
+
+rule RepositoryAuthorityCutoverMovesReadersAndWritersTogether {
+    when: RepositoryAuthorityCutoverRequested(repository_fact)
+    requires: superseded_repository_writers_excluded(repository_fact)
+    ensures: RepositoryAuthorityCutoverCompleted(repository_fact)
+
+    @guidance
+        -- Each repository fact has exactly one writable authority at a time.
+        -- GitRepository and WorkScope.repository become authoritative only in a
+        -- coordinated cutover that moves every relevant reader and writer together.
+        -- Legacy Project-shaped carriers may remain read-only, but old binaries,
+        -- stale workers, and other superseded writers are excluded first.
+}
+
+rule PreScopeProvisioningEvidenceMayReferenceRepositoryDirectly {
+    when: RepositoryProvisioningRecorded(product_conversation, transcript_conversation_id, repository, evidence_kind)
+    ensures: RepositoryProvisioningEvidence.created(
+        product_conversation: product_conversation,
+        transcript_conversation_id: transcript_conversation_id,
+        repository: repository,
+        evidence_kind: evidence_kind
+    )
+
+    @guidance
+        -- Provisioning, unresolved canonical-default failure, or other pre-scope
+        -- evidence may truthfully reference a hidden GitRepository before any
+        -- WorkScope exists. Phoenix must not fabricate a scope just to carry
+        -- repository identity.
+}
+
+rule RestartRepairEvidenceRecordsExactMissingOrInaccessibleObservation {
+    when: RestartRepairObservationRecorded(product_conversation, scope, repository, worktree, observation_kind, observed_at)
+    requires: restart_repair_observation_is_not_stale(product_conversation, scope, observed_at)
+    let observation_generation = next_restart_repair_generation(product_conversation, scope)
+    ensures: RestartRepairEvidence.created(
+        product_conversation: product_conversation,
+        scope: scope,
+        repository: repository,
+        worktree: worktree,
+        observation_kind: observation_kind,
+        observation_generation: observation_generation,
+        observed_at: observed_at
+    )
+
+    @guidance
+        -- Restart repair evidence is immutable source observation. It binds one
+        -- ProductConversation, one WorkScope, one hidden GitRepository, and one
+        -- retained worktree identity/fingerprint to an exact `missing` or
+        -- `inaccessible` observation without guessing path continuity.
+}
+
+rule RestartRepairEvidenceSelectionIsDeterministicOrFailsClosed {
+    when: RestartRepairEvidenceSelectionRequested(product_conversation, scope)
+    requires: unique_complete_latest_restart_repair_evidence(product_conversation, scope)
+    ensures: RestartRepairEvidenceSelectionResolved(product_conversation, scope)
+
+    @guidance
+        -- Later repair, Close, or retry consumers select independently for the
+        -- exact ProductConversation and exact WorkScopeRef supplied by the request.
+        -- Multiple attached scopes never collapse into one conversation-global
+        -- latest row. A duplicate highest generation, conflicting identity,
+        -- incomplete row, or scope ambiguity leaves selection unresolved.
+}
+
+rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
+    when: ProductConversationDeleted(product_conversation)
+    requires: exists ProductConversationDeletion{product_conversation: product_conversation}
+    requires: hidden_repository_still_needed_after_deletion(product_conversation)
+    ensures: HiddenRepositoryRetainedAfterConversationDeletion(product_conversation)
+
+    @guidance
+        -- Hidden repository identity survives deletion when Phoenix still needs it
+        -- for orphan recovery, default-branch observation history, restart repair,
+        -- or repository-scoped mutation locking.
+}
+
+------------------------------------------------------------
+-- Helpers (pure predicates referenced by retention rules)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; this block defines the
+-- complete semantics of each bare helper used above.
+--
+--   resolved_hidden_repository(clone_evidence) -> GitRepository
+--       The hidden identity resolved from retained local clone evidence. Separate
+--       local clones resolve independently even when remote, slug, or commit graph
+--       observations match.
+--
+--   default_branch_observation_is_not_stale(
+--       repository: GitRepository,
+--       observed_at: Timestamp
+--   ) -> Boolean
+--       True iff no current DefaultBranchObservation exists for repository or
+--       observed_at is not earlier than its observed_at. A delayed older success or
+--       failure is rejected before generation advances or current state changes.
+--
+--   next_default_branch_observation_generation(
+--       repository: GitRepository
+--   ) -> Integer
+--       One greater than the current observation_generation for that exact
+--       repository, or 1 when none exists. The caller cannot provide or override
+--       this generation; the accepted update supersedes the older current row.
+--
+--   repository_locator_observation_is_not_stale(
+--       repository: GitRepository,
+--       locator_kind: RepositoryLocatorKind,
+--       observed_at: Timestamp
+--   ) -> Boolean
+--       True iff no retained observation exists for that exact repository and
+--       locator kind, or observed_at is not earlier than its observed_at. Delayed
+--       older observations are rejected before current path or status changes.
+--
+--   restart_repair_observation_is_not_stale(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScopeRef,
+--       observed_at: Timestamp
+--   ) -> Boolean
+--       True iff no current RestartRepairEvidence exists for that exact
+--       ProductConversation and WorkScopeRef, or observed_at is not earlier than
+--       its observed_at. A delayed older observation is rejected before generation
+--       advances or current state changes. An equal timestamp is admissible and is
+--       resolved by the exact evidence identity and generation constraints.
+--
+--   next_restart_repair_generation(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScopeRef
+--   ) -> Integer
+--       One greater than the greatest persisted observation_generation for that
+--       exact ProductConversation and WorkScopeRef, or 1 when none exists. The
+--       caller cannot provide or override this generation.
+--
+--   canonical_default_evidence_admissible(
+--       repository: GitRepository
+--   ) -> Boolean
+--       True iff exactly one complete DefaultBranchObservation exists at the
+--       highest observation_generation for repository, that observation is
+--       resolved, and its provenance is remote_head_cache; or separate canonical
+--       evidence corroborates the same branch identity. No observation, an
+--       unresolved or incomplete highest generation, or duplicate highest
+--       generations makes this false. local_checked_out_branch or user_selected
+--       alone is never admissible canonical evidence.
+--
+--   superseded_repository_writers_excluded(repository_fact) -> Boolean
+--       True iff every old binary, stale worker, or other superseded writer that
+--       could recreate or mutate the retired Project authority for repository_fact
+--       is unable to write before the GitRepository authority is enabled.
+--
+--   unique_complete_latest_restart_repair_evidence(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScopeRef
+--   ) -> Boolean
+--       True iff exactly one RestartRepairEvidence row exists at the highest
+--       observation_generation for product_conversation and that exact scope, and
+--       that row has complete repository identity, worktree id/path/fingerprint,
+--       observation kind, generation, and observation time. Evidence for another
+--       WorkScopeRef never satisfies this predicate. Duplicate highest generations,
+--       conflicting identities, incomplete rows, or scope ambiguity make it false.
+--
+--   hidden_repository_still_needed_after_deletion(
+--       product_conversation: bedrock/ProductConversation
+--   ) -> Boolean
+--       True iff deleting product_conversation leaves at least one surviving
+--       WorkScope attachment, pre-scope provisioning/repair evidence, orphan
+--       resource, default-branch observation required by a consumer, or active
+--       repository-scoped mutation lock that references the same GitRepository.
+--
+--   hidden_repository_needed_for_operational_truth(
+--       repository: GitRepository
+--   ) -> Boolean
+--       True iff at least one surviving WorkScope attachment, provisioning or
+--       repair evidence, orphan resource, required default-branch observation,
+--       or active repository-scoped mutation lock references repository. A
+--       recent-location suggestion, favorite, title, grouping, branch, PR, or
+--       conversation list projection does not satisfy this predicate.
+--
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant WorkScopeHasAtMostOneRepositoryAttachment {
+    for s in WorkScopeRepositoryAttachment.scope:
+        count(WorkScopeRepositoryAttachment{scope: s}) <= 1
+}
+
+invariant ProductConversationRepositoryContextFlowsThroughScope {
+    for a in ProductConversationScopeAttachment:
+        count(WorkScopeRepositoryAttachment{scope: a.scope}) <= 1
+}
+
+invariant OneLocatorObservationPerKind {
+    for r in GitRepository:
+        for k in LocatorKind:
+            count(RepositoryLocatorObservation{repository: r, locator_kind: k}) <= 1
+}
+
+invariant OneCurrentDefaultBranchObservation {
+    for r in GitRepository:
+        count(DefaultBranchObservation{repository: r}) <= 1
+}
+
+invariant RestartRepairEvidenceIsUniquePerScopeGeneration {
+    for e in RestartRepairEvidence:
+        count(RestartRepairEvidence{
+            product_conversation: e.product_conversation,
+            scope: e.scope,
+            observation_generation: e.observation_generation
+        }) <= 1
+}
+
+invariant UnneededHiddenRepositoryDoesNotFeedProductCatalog {
+    for r in GitRepository:
+        if not hidden_repository_needed_for_operational_truth(r):
+            not UserFacingRepositoryCatalogEntry(r)
+}
+
+invariant HiddenRepositoryHasNoUserFacingLifecycleSurface {
+    for r in GitRepository:
+        not UserFacingRepositoryLifecycleOwned(r)
+}

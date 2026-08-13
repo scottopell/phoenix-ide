@@ -42,6 +42,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
+| [031](031_productconversation-persistence-uses-staged-single-authority.md) | ProductConversation persistence uses staged single authority | Accepted | REQ-BED-029, REQ-BED-030, REQ-BED-030A, REQ-BED-031B, REQ-CHN-002/003/005/007/008/009/010, REQ-GR-001/002/005/009/011, REQ-PROJ-014/015/019, REQ-PROJ-WS-001, REQ-WL-001/002; `ProductConversation`, `Conversation`, `CloseObligation`, `CloseAttemptMember`, `AttachedWorkScope` |
+| [032](032_gitrepository-is-hidden-infrastructure-project-is-retired.md) | GitRepository is hidden infrastructure; Project is retired | Accepted | REQ-GITREP-001–008, REQ-PROJ-015/020/021/024/025/028a, REQ-WL-002b; `GitRepository`, `WorkScope.repository`, `RestartRepairEvidence`, `RetirementAbsenceEvidence` |
 
 ## For agents: which decisions bind your task
 
@@ -65,6 +67,8 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
+| Specifying ProductConversation persistence identity, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031, then 026 |
+| Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, retained restart-repair evidence, or repository survival beyond one deleted conversation | 032, then 031 and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
@@ -107,9 +111,11 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
-          └── ADR-028 (iOS companion adds read-only project context and prose review)
-              └── ADR-029 (iOS companion uses session-scoped prose feedback)
-                  └── ADR-030 (iOS prose-review authority survives the composer handoff)
+          ├── ADR-028 (iOS companion adds read-only project context and prose review)
+          │   └── ADR-029 (iOS companion uses session-scoped prose feedback)
+          │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
+          └── ADR-031 (ProductConversation persistence uses staged single authority)
+              └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
 ```
 
 ## Conventions

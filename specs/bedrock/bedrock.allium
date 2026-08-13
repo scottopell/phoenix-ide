@@ -29,8 +29,8 @@
 --
 --   ConvState (the union of all states) remains as the serialization format.
 --
--- Requirement traceability: REQ-BED-001 through REQ-BED-030, plus REQ-BED-005a
--- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
+-- Requirement traceability: rule sections carry exact REQ anchors from
+-- specs/bedrock/requirements.md.
 
 ------------------------------------------------------------
 -- External Entities
@@ -83,8 +83,31 @@ value TaskProposalSnapshot {
     content_digest: String
 }
 
+value ReviewedProposalSnapshotIdentity {
+    repo_relative_path: String
+    task_kind: taskmd | plain_markdown
+    content_digest: String
+}
+
+value ApprovedTaskIdentity {
+    task_id: String?
+    priority: String?
+    slug: String?
+    plain_title: String?
+}
+
+value ApprovedTaskSource {
+    task_path: String
+    title: String
+    priority: String
+    body: String
+    identity: ApprovedTaskIdentity
+    reviewed_snapshot: ReviewedProposalSnapshotIdentity
+    kind: taskmd | plain_markdown
+}
+
 value ApprovedTaskObjective {
-    source: projects/ApprovedTaskSource
+    source: ApprovedTaskSource
 }
 
 value ApprovedTaskWriteAuthority {
@@ -120,22 +143,23 @@ enum ClosePhase {
     | completed
 }
 
+enum CloseOutcome { archived | cancelled }
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
 
--- Conversation uses a sum type to structurally separate parent and sub-agent
--- conversations. The kind discriminator determines which states are reachable.
+-- REQ-BED-030A: ProductConversation owns aggregate identity and ordinary
+-- lifecycle. Transcript rows own runtime state and continuation topology only.
 entity ProductConversation {
     kind: ordinary | coordinator
     lifecycle: open | history when kind = ordinary
 
-    -- Aggregate membership is singular by construction: each durable
-    -- transcript row belongs to exactly one product conversation. Only
-    -- ordinary product conversations own Open/History lifecycle; the
-    -- Coordinator keeps the same durable transcript/runtime identity without
-    -- entering that lifecycle.
-    transcript_rows: Conversation with product_conversation = this
+    -- Every durable conversation row has one aggregate membership. Parent rows
+    -- form the user-visible transcript topology; subordinate execution rows are
+    -- aggregate participants but never transcript-topology members.
+    participants: Conversation with product_conversation = this
+    transcript_rows: Parent with product_conversation = this
 }
 
 -- Navigation/list identity is the durable ProductConversation aggregate. Member
@@ -150,20 +174,25 @@ entity CloseObligation {
     attempt_id: String
     product_conversation: ProductConversation
     phase: ClosePhase
-    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair }
-    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair }
+    outcome: CloseOutcome when phase = completed
+    inspection_generation: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
+    inspection_fingerprint: String? when phase in { awaiting_retirement_inspection, awaiting_loss_confirmation, retirement_requested, needs_repair } or (phase = completed and outcome = archived)
 
     transitions phase {
         awaiting_blocker_resolution -> awaiting_stop_work_confirmation
         awaiting_blocker_resolution -> settling_active_work
+        awaiting_blocker_resolution -> completed
         awaiting_stop_work_confirmation -> settling_active_work
+        awaiting_stop_work_confirmation -> completed
         settling_active_work -> cancel_requested_during_settlement
         settling_active_work -> awaiting_retirement_inspection
         cancel_requested_during_settlement -> completed
         awaiting_retirement_inspection -> awaiting_loss_confirmation
         awaiting_retirement_inspection -> retirement_requested
+        awaiting_retirement_inspection -> completed
         awaiting_loss_confirmation -> awaiting_retirement_inspection
         awaiting_loss_confirmation -> retirement_requested
+        awaiting_loss_confirmation -> completed
         retirement_requested -> needs_repair
         needs_repair -> retirement_requested
         retirement_requested -> completed
@@ -172,8 +201,17 @@ entity CloseObligation {
     }
 }
 
+entity CloseAttemptMember {
+    obligation: CloseObligation
+    transcript_row: Parent
+    continuation_ordinal: Integer
+}
+
+-- Conversation uses a sum type to structurally separate parent and sub-agent
+-- conversations. The kind discriminator determines which states are reachable.
 entity Conversation {
     kind: Parent | SubAgent
+    product_conversation: ProductConversation
 
     -- Seed metadata (REQ-SEED-003, REQ-SEED-004)
     seed_parent: Conversation?
@@ -195,14 +233,6 @@ entity Conversation {
     context_usage_ratio: Decimal
     model_context_window: Integer
 
-    lifecycle: open | history
-
-    -- Conversation rows linked by continued_in_conv_id form one product
-    -- conversation rooted at the durable first row. Lifecycle belongs to that
-    -- root-owned product conversation, not independently to each transcript row.
-    -- Bedrock derives the live/latest row from topology: the latest row is the
-    -- row with no continuation successor.
-    seed_parent: Conversation?
 
     -- Core status transitions (shared)
     transitions core_status {
@@ -258,17 +288,9 @@ entity Conversation {
     -- Filesystem cwd. For mode in { explore, work, branch } this equals
     -- worktree_path; for mode = direct it is the user-supplied directory.
     -- Persists with the conversation row (DB column `cwd`); referenced by
-    -- spawn rules and by the projects/ spec when comparing parent and
+    -- spawn rules and by the surviving repository/workscope specs when comparing parent and
     -- continuation environments.
     working_dir: String
-
-    -- REQ-BED-030: continuation pointer. When set, this conversation has
-    -- been continued and the live `WorkScope` ownership (and inherited
-    -- worktree, if any) belongs to the continuation. This row remains as
-    -- history/navigation only. Used by reconcile, abandon/mark-merged gates, and
-    -- the FE "Continued in X" affordance. Single-valued by construction
-    -- (see TerminalActionRequiresNoContinuation in projects).
-    continued_in_conv_id: Conversation?
 
     -- True iff at least one SSE subscriber is currently listening.
     -- Pollers gate on this to avoid waking the runtime for nobody —
@@ -306,6 +328,10 @@ entity Conversation {
 -- errors, reach terminal via task resolution or context exhaustion.
 -- CANNOT reach Completed or Failed (sub-agent-only).
 variant Parent : Conversation {
+    -- REQ-BED-030: parent-only continuation pointer. Aggregate membership,
+    -- linearity, and acyclicity are constrained below.
+    continued_in_conv_id: Parent?
+
     parent_status: awaiting_recovery | awaiting_task_approval
                   | awaiting_user_response | context_exhausted | handed_off
 
@@ -323,14 +349,14 @@ variant Parent : Conversation {
     recovery_resume_target: RecoveryResumeTarget when parent_status = awaiting_recovery
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
-    successor: Conversation when parent_status = handed_off
+    successor: Parent when parent_status = handed_off
     continuation_boundary_summary: String when parent_status = handed_off
 
     open_row_condition: parent_status in { context_exhausted, handed_off }
     is_latest_row: continued_in_conv_id = absent
     predecessor: continuation_predecessor(product_conversation, this)
     root_conversation: continuation_root(product_conversation, this)
-    product_lifecycle: open | history when product_conversation.kind = ordinary
+    product_lifecycle: product_conversation.lifecycle when product_conversation.kind = ordinary
     row_accepts_user_messages:
         if product_conversation.kind = coordinator:
             is_latest_row
@@ -529,6 +555,8 @@ rule SpawnAgentsCompletesWithMoreTools {
     ensures:
         for agent in spawned_agents:
             conversation.accumulated_sub_agents.add(agent)
+            agent.product_conversation = conversation.product_conversation
+            agent.parent = conversation
     ensures: ToolExecutionStarted(conversation, conversation.tool_queue.first)
 }
 
@@ -540,6 +568,8 @@ rule SpawnAgentsCompletesAsLastTool {
     ensures:
         for agent in spawned_agents:
             conversation.accumulated_sub_agents.add(agent)
+            agent.product_conversation = conversation.product_conversation
+            agent.parent = conversation
     ensures: conversation.core_status = awaiting_sub_agents
     ensures: conversation.sub_agents_pending = conversation.accumulated_sub_agents
     ensures: conversation.sub_agents_completed = {}
@@ -1069,18 +1099,18 @@ rule UserApprovesTaskCurrentConversation {
         approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
     )
     ensures: conversation.approved_task_objective = ApprovedTaskObjective {
-        source: projects/ApprovedTaskSource {
+        source: ApprovedTaskSource {
             task_path: conversation.proposal_snapshot.task_file,
             title: conversation.proposal_snapshot.title,
             priority: conversation.proposal_snapshot.priority,
             body: reread_task_body(conversation.proposal_snapshot.task_file),
-            identity: projects/approved_task_identity(conversation.proposal_snapshot.task_file),
-            reviewed_snapshot: projects/ReviewedProposalSnapshotIdentity {
+            identity: approved_task_identity(conversation.proposal_snapshot.task_file),
+            reviewed_snapshot: ReviewedProposalSnapshotIdentity {
                 repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
                 task_kind: conversation.proposal_snapshot.task_kind,
                 content_digest: conversation.proposal_snapshot.content_digest
             },
-            kind: projects/approved_task_kind(conversation.proposal_snapshot.task_file)
+            kind: approved_task_kind(conversation.proposal_snapshot.task_file)
         }
     }
     ensures: conversation.approved_task_write_authority = ApprovedTaskWriteAuthority {
@@ -1110,6 +1140,8 @@ rule UserApprovesTaskNewConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_start_fresh
+    requires: conversation.environment_kind = git_backed
+    requires: attached_git_work_scope_id(conversation.product_conversation) != absent
     requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.repo_relative_path
     requires: reread_task_kind(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.task_kind
     requires: reread_task_digest(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.content_digest
@@ -1144,7 +1176,7 @@ rule UserApprovesTaskNewConversation {
         source_conversation: conversation,
         target_conversation: fresh_work_conversation,
         target_product_conversation: target_product_conversation,
-        repository_identity: conversation.project.repo
+        source_work_scope_id: attached_git_work_scope_id(conversation.product_conversation)
     )
     ensures: conversation.core_status = idle
 
@@ -1160,7 +1192,9 @@ rule UserApprovesTaskNewConversation {
         --
         -- Approval remains bound to the reviewed snapshot identity here too; Phoenix
         -- cannot seed a new conversation from arbitrary current file contents after a
-        -- post-review swap or edit.
+        -- post-review swap or edit. Repository context is resolved through the source
+        -- ProductConversation's attached WorkScope by the provisioning boundary; this
+        -- event does not copy repository identity onto ProductConversation.
 }
 
 rule UserRequestsTaskChanges {
@@ -1191,7 +1225,7 @@ rule CancelDuringTaskApproval {
 -- conversation creates a separate top-level lineage while the source stays Open.
 -- Continue here resumes the same ProductConversation, transcript context, attached
 -- WorkScope, and mode with typed approved-task objective/write-authority state.
--- A fork proposal is resolved entirely in projects/ and leaves its origin untouched.
+-- A fork proposal is resolved entirely in the surviving task-source workflow authority and leaves its origin untouched.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE
@@ -1331,6 +1365,8 @@ rule UserStartsContinuationConversation {
     requires:
         conversation.product_conversation.kind = coordinator
         or conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
     ensures: conversation.continued_in_conv_id = new_conv
     ensures: new_conv.product_conversation = conversation.product_conversation
     ensures: new_conv.mode = conversation.mode
@@ -1345,6 +1381,8 @@ rule ContinuationHandoffBecomesBoundary {
     requires:
         conversation.product_conversation.kind = coordinator
         or conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
     ensures: conversation.parent_status = handed_off
     ensures: conversation.continuation_boundary_summary = conversation.continuation_summary
 
@@ -1362,6 +1400,8 @@ rule ContinuationBoundaryPersistenceSignature {
     requires: conversation.continued_in_conv_id = absent
     requires: conversation.product_conversation.kind = ordinary
     requires: conversation.product_lifecycle = open
+    requires: not exists CloseObligation{product_conversation: conversation.product_conversation}
+        where phase != completed
     ensures: ContinuationBoundaryPersisted(
         root_conversation_id: conversation.product_conversation,
         predecessor_conversation_id: conversation,
@@ -1370,7 +1410,11 @@ rule ContinuationBoundaryPersistenceSignature {
     )
 
     @guidance
-        -- Persistence owns only the durable continuation boundary fact: root identity,
+        -- Persistence owns only the durable continuation boundary fact. The
+        -- compatibility-named root_conversation_id is the established shared
+        -- carrier for ProductConversation stream identity; predecessor and
+        -- successor fields carry Parent-row identities. Consumers distinguish
+        -- these domains by field contract, never by equal underlying bytes.
         -- predecessor/successor join, and exact stored summary. It does not mint a
         -- root-stream sequence id itself. Live SSE projection must bridge this
         -- persisted boundary through the RootStreamLedger before broadcast so the
@@ -1461,7 +1505,7 @@ rule ProductConversationListProjectsOncePerRoot {
 
     @guidance
         -- Ordinary and Coordinator product conversations both list once per durable
-        -- root, but only ordinary rows participate in the Open/History lifecycle
+        -- aggregate, but only ordinary rows participate in the Open/History lifecycle
         -- facets and actions.
 }
 
@@ -1492,13 +1536,28 @@ rule UserRequestsCloseConversation {
         product_conversation: conversation.product_conversation,
         phase: awaiting_blocker_resolution
     )
+    ensures:
+        for transcript_row in Parent{product_conversation: conversation.product_conversation}:
+            CloseAttemptMember.created(
+                obligation: CloseObligation{
+                    attempt_id: attempt_id,
+                    product_conversation: conversation.product_conversation
+                },
+                transcript_row: transcript_row,
+                continuation_ordinal: continuation_ordinal(
+                    conversation.product_conversation,
+                    transcript_row
+                )
+            )
     ensures: CloseEvaluationRequested(conversation.product_conversation, attempt_id)
 
     @guidance
-        -- Close is a durable root-owned obligation separate from the row-local
-        -- message-admission state. Each request carries one durable attempt_id,
-        -- and at most one non-completed attempt may exist per ProductConversation.
-        -- Creation of the durable obligation and emission of the aggregate-scoped
+        -- Close is a durable aggregate-owned obligation separate from row-local
+        -- message-admission state. Admission atomically snapshots the aggregate's
+        -- ordered transcript topology for this exact attempt. Each request carries
+        -- one durable attempt_id, and at most one non-completed attempt may exist
+        -- per ProductConversation. Creation of the durable obligation and emission
+        -- of the aggregate-scoped
         -- CloseEvaluationRequested(product_conversation, attempt_id) event are one
         -- atomic decision boundary so busy and idle branches advance from the same
         -- committed attempt without an emit-vs-persist race.
@@ -1533,6 +1592,7 @@ rule CloseObligationCanBeCancelledBeforeSettlementStarts {
         awaiting_loss_confirmation
     }
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = cancelled
     ensures: CloseObligationCancelled(product_conversation, attempt_id)
 }
 
@@ -1591,6 +1651,7 @@ rule CloseSettlementCancellationCompletesAfterBusyOwnershipReleased {
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = cancel_requested_during_settlement
     requires: all_close_owned_authorities_released(product_conversation)
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = cancelled
     ensures: CloseObligationCancelled(product_conversation, attempt_id)
 
     @guidance
@@ -1643,10 +1704,11 @@ rule CloseRetirementCompletionFinalizesAggregateHistory {
     when: ResourceRetirementCompleted(product_conversation, attempt_id)
     requires: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase in { retirement_requested, needs_repair }
     requires: product_conversation.lifecycle = open
-    ensures: CloseOutcomeSystemMessagePersisted(product_conversation)
+    ensures: CloseOutcomeSystemMessagePersisted(product_conversation, attempt_id)
     ensures: product_conversation.lifecycle = history
     ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.phase = completed
     ensures: ProductConversationEnteredHistory(product_conversation, attempt_id)
+    ensures: CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.outcome = archived
 
     @guidance
         -- Close finalization is one transaction boundary: first persist the durable
@@ -1674,7 +1736,7 @@ rule CloseNeedsRepairCanRetryRetirement {
     @guidance
         -- Retry is exposed on the same visible needs-repair attempt the user sees.
         -- It carries the exact attempt_id and requests retirement again without any
-        -- local project-surface lifecycle mutation. Automatic operator repair may also
+        -- local ProductConversation lifecycle mutation. Automatic operator repair may also
         -- complete by driving the same exact-attempt retirement request path, but no
         -- hidden synthetic attempt or phase change bypasses this authority.
 }
@@ -1866,10 +1928,16 @@ rule UserHardDeletesConversationRule {
         -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
     ensures: BrowserSessionsCleanedUp(aggregate)
         -- Direct call: aggregate-scoped browser lifecycle cascade.
-    ensures: ProjectWorktreeCleanedUp(aggregate)
-        -- Direct call: cascade_projects_on_delete
-        -- (specs/projects/ subscriber rule).
+    ensures: WorkScopeResourcesCleanedUp(aggregate)
+        -- Direct call: WorkScope resource cleanup subscriber.
     ensures: AggregateTranscriptRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseObligationsRemoved(aggregate)
+    ensures: SolelyOwnedCloseAttemptMembersRemoved(aggregate)
+    ensures: SolelyOwnedCloseInspectionRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseInventoryRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseLossRowsRemoved(aggregate)
+    ensures: SolelyOwnedCloseRetirementEvidenceRowsRemoved(aggregate)
+    ensures: SolelyOwnedLineageQaRowsRemoved(aggregate)
     ensures: SolelyOwnedConversationMessagesRemoved(aggregate)
     ensures: SolelyOwnedConversationToolCallRowsRemoved(aggregate)
     ensures: SolelyOwnedConversationApprovalRowsRemoved(aggregate)
@@ -1902,9 +1970,10 @@ rule UserHardDeletesConversationRule {
         --      unless another live owner retains the same WorkScope.
         --   6. db.delete_product_conversation(product_conversation_id) — remove
         --      every transcript row and solely-owned child row in the History
-        --      aggregate, including message rows, tool-call rows, approval rows,
-        --      attachment rows, retrieval chunk rows, retrieval locator rows,
-        --      and FTS rows, while retaining typed tombstones for surviving
+        --      aggregate, including Close obligations/members/evidence,
+        --      lineage Q&A, message rows, tool-call rows, approval rows,
+        --      message/file-attachment rows, retrieval chunk/locator rows, and
+        --      FTS rows, while retaining typed tombstones for surviving
         --      provenance links and leaving separately-owned branch /
         --      pull-request relations untouched.
         --      Re-running the same delete after rows are already gone still
@@ -1986,6 +2055,72 @@ rule ModeChangeNotification {
 --       or other later transcript row makes the predicate false. Acceptance
 --       identity alone is insufficient: the qualifying transcript tail and
 --       exact queue-row absence are both required.
+--
+--   continuation_predecessor(
+--       product_conversation: ProductConversation,
+--       transcript_row: Parent
+--   ) -> Parent?
+--       The unique same-aggregate Parent whose continued_in_conv_id equals
+--       transcript_row, or absent for the root.
+--
+--   continuation_root(
+--       product_conversation: ProductConversation,
+--       transcript_row: Parent
+--   ) -> Parent
+--       The unique root reached by repeatedly following continuation_predecessor
+--       from transcript_row.
+--
+--   sole_conversation_without_predecessor(
+--       product_conversation: ProductConversation
+--   ) -> Parent
+--       The unique Parent returned by continuation_root for every transcript row
+--       in the aggregate.
+--
+--   sole_conversation_without_successor(
+--       product_conversation: ProductConversation
+--   ) -> Parent
+--       The unique same-aggregate Parent whose continued_in_conv_id is absent.
+--
+--   continuation_ordinal(
+--       product_conversation: ProductConversation,
+--       transcript_row: Parent
+--   ) -> Integer
+--       Zero-based position reached by following same-aggregate Parent
+--       continued_in_conv_id edges from the unique root to transcript_row.
+--
+--   continuation_reaches(from: Parent, target: Parent) -> Boolean
+--       True iff following one or more continued_in_conv_id edges from `from`
+--       reaches `target`. The relation is transitive and never treats a row as
+--       reachable from itself without traversing an actual cycle.
+--
+--   next_close_attempt_id(product_conversation: ProductConversation) -> String
+--       Returns an identity unequal to every historical or active
+--       CloseObligation.attempt_id. Freshness is global because attempt-bound
+--       evidence may survive aggregate deletion as an audit record.
+--
+--   approved_task_kind(task_file: String) -> taskmd | plain_markdown
+--       The approved-task source kind derived from the filename component of
+--       task_file: taskmd iff it matches the taskmd 1.0 filename pattern
+--       NNNNN-pX-status--slug.md; otherwise plain_markdown for another Markdown
+--       brief. It uses the same classification as TaskProposalSnapshot.task_kind
+--       and reread_task_kind.
+--
+--   approved_task_identity(task_file: String) -> ApprovedTaskIdentity
+--       For taskmd, parses the filename into task_id, priority, and slug, leaves
+--       plain_title absent, and excludes status from identity. For plain_markdown,
+--       leaves task_id, priority, and slug absent and sets plain_title to the same
+--       first-H1-or-title-cased-file-stem display title used by the reviewed
+--       proposal snapshot. It never invents taskmd fields for a plain brief.
+--
+--   attached_git_work_scope_id(
+--       product_conversation: ProductConversation
+--   ) -> String?
+--       The opaque persisted identity of the exact Git-backed WorkScope selected
+--       from the authoritative ProductConversation-to-WorkScope attachments owned
+--       by work-lifecycle, or absent unless exactly one eligible Git-backed source
+--       scope is proven. It does not assume one scope globally and never derives
+--       identity from mode, cwd, worktree path, transcript-row identity, transcript
+--       conversation id, or ProductConversation identity.
 
 -- REQ-BED-007: Persist state before effects (cross-cutting)
 -- Every rule that changes status implicitly requires state persistence
@@ -2084,11 +2219,6 @@ invariant SpawnLimit {
             implies c.accumulated_sub_agents.count <= config.max_sub_agents_per_spawn
 }
 
-invariant RootLifecycleAuthority {
-    for c in Parent:
-        c.product_conversation.kind = ordinary implies c.product_lifecycle = c.product_conversation.lifecycle
-}
-
 invariant LatestRowDerivedFromTopology {
     for c in Parent:
         c.is_latest_row = (c.continued_in_conv_id = absent)
@@ -2096,12 +2226,57 @@ invariant LatestRowDerivedFromTopology {
 
 invariant ProductConversationHasSingleRootRow {
     for pc in ProductConversation:
-        count(Parent{product_conversation: pc} where not exists Parent{product_conversation: pc, continued_in_conv_id: this}) = 1
+        count(Parent{product_conversation: pc} where predecessor = absent) = 1
 }
 
 invariant ProductConversationHasSingleTopologyLatestRow {
     for pc in ProductConversation:
         count(Parent{product_conversation: pc, continued_in_conv_id: absent}) = 1
+}
+
+invariant ContinuationEdgesStayWithinParentTopology {
+    for predecessor in Parent:
+        predecessor.continued_in_conv_id != absent implies
+            predecessor.continued_in_conv_id.product_conversation = predecessor.product_conversation
+}
+
+invariant ContinuationTopologyHasAtMostOnePredecessor {
+    for successor in Parent:
+        count(Parent{continued_in_conv_id: successor}) <= 1
+}
+
+invariant ContinuationTopologyIsAcyclic {
+    for transcript_row in Parent:
+        not continuation_reaches(transcript_row, transcript_row)
+}
+
+invariant CloseAttemptMembersBelongToAttemptProductConversation {
+    for member in CloseAttemptMember:
+        member.transcript_row.product_conversation = member.obligation.product_conversation
+}
+
+invariant CloseAttemptMemberRowsUniqueWithinAttempt {
+    for a in CloseAttemptMember:
+        for b in CloseAttemptMember:
+            a != b and a.obligation = b.obligation implies a.transcript_row != b.transcript_row
+}
+
+invariant CloseAttemptMemberOrdinalsUniqueWithinAttempt {
+    for a in CloseAttemptMember:
+        for b in CloseAttemptMember:
+            a != b and a.obligation = b.obligation implies a.continuation_ordinal != b.continuation_ordinal
+}
+
+invariant CloseAttemptMemberOrdinalsAreContiguous {
+    for member in CloseAttemptMember:
+        member.continuation_ordinal >= 0
+        and member.continuation_ordinal < count(CloseAttemptMember where obligation = member.obligation)
+}
+
+invariant CloseAttemptIdentityIsGloballyUnique {
+    for a in CloseObligation:
+        for b in CloseObligation:
+            a != b implies a.attempt_id != b.attempt_id
 }
 
 invariant ProductConversationHasAtMostOneActiveCloseAttempt {
@@ -2193,6 +2368,8 @@ surface UserConversation {
                     conversation.product_conversation.kind = coordinator
                     or conversation.product_lifecycle = open
                  )
+                 and not exists CloseObligation{product_conversation: conversation.product_conversation}
+                     where phase != completed
         UserRequestsCloseConversation(
             conversation,
             next_close_attempt_id(conversation.product_conversation)

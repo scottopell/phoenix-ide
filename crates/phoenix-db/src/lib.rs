@@ -2,6 +2,7 @@
 //!
 //! Provides persistence for conversations and messages.
 
+mod close_foundation;
 mod coordinator_query;
 mod ddl;
 mod migrations;
@@ -22,6 +23,7 @@ use phoenix_core::work_scope::{
     WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
+pub use close_foundation::*;
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
 };
@@ -42,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -120,6 +122,15 @@ fn approved_task_handoff_summary(
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseFoundationRepair {
+    UnresolvedWorktreeIdentity {
+        attempt_id: phoenix_core::domain::close::CloseAttemptId,
+        scope: WorkScopeId,
+        locator: phoenix_core::domain::close::GitPathIdentity,
+    },
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
@@ -134,6 +145,14 @@ pub enum DbError {
     SlugExists(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Close foundation conflict: {0}")]
+    CloseFoundationConflict(String),
+    #[error("Close foundation precondition failed: {0}")]
+    CloseFoundationPrecondition(String),
+    #[error("Close foundation repair required: {0:?}")]
+    CloseFoundationRepairRequired(CloseFoundationRepair),
+    #[error("Close foundation record not found: {0}")]
+    CloseFoundationNotFound(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
     /// A fork-proposal resolution was attempted but the proposal is already
@@ -1154,6 +1173,14 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
+const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \r\n".len() as u64;
+const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + GIT_POINTER_FORMAT_OVERHEAD;
+
+enum ExpectedParentScope<'a> {
+    NotChecked,
+    Snapshot(Option<&'a WorkScopeId>),
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -1175,6 +1202,62 @@ impl Database {
         restrict_db_permissions(&self.path);
     }
 
+    fn observe_worktree_fingerprint(worktree_path: &str) -> Option<String> {
+        use std::fmt::Write as _;
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let marker = std::path::Path::new(worktree_path).join(".git");
+        let metadata = std::fs::symlink_metadata(&marker).ok()?;
+        let marker_is_file = metadata.is_file();
+        let marker_bytes = if marker_is_file {
+            if metadata.len() > MAX_GIT_POINTER_BYTES {
+                return None;
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+            std::fs::File::open(&marker)
+                .ok()?
+                .take(MAX_GIT_POINTER_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
+                return None;
+            }
+            let pointer = std::str::from_utf8(&bytes).ok()?;
+            let git_dir = pointer
+                .strip_suffix("\r\n")
+                .or_else(|| pointer.strip_suffix('\n'))
+                .unwrap_or(pointer)
+                .strip_prefix("gitdir: ")?;
+            if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
+                return None;
+            }
+            git_dir.as_bytes().to_vec()
+        } else if metadata.is_dir() {
+            Vec::new()
+        } else {
+            return None;
+        };
+        let mut encoded = String::with_capacity(marker_bytes.len() * 2);
+        for byte in marker_bytes {
+            write!(&mut encoded, "{byte:02x}").ok()?;
+        }
+        let created_nanos = metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().to_string());
+        if created_nanos.is_none() && !marker_is_file {
+            return None;
+        }
+        let created_nanos = created_nanos.unwrap_or_else(|| "unavailable".to_string());
+        Some(format!(
+            "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+
     async fn insert_work_scope_tx(
         tx: &mut Transaction<'_, Sqlite>,
         scope_id: &WorkScopeId,
@@ -1184,22 +1267,61 @@ impl Database {
     ) -> DbResult<()> {
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
+        let observed_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let prewrite_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let worktree_fingerprint = if observed_fingerprint == prewrite_fingerprint {
+            observed_fingerprint
+        } else {
+            None
+        };
+        let worktree_id = worktree_fingerprint
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4().to_string());
         sqlx::query(
             "INSERT INTO work_scopes (
                  id, authority_kind, lifecycle, environment_kind, cwd,
-                 worktree_path, branch_name, base_branch, created_at, updated_at
-             ) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                 worktree_path, branch_name, base_branch, created_at, updated_at,
+                 worktree_id, worktree_fingerprint
+             ) VALUES (
+                 ?1, ?2, 'active', ?3, ?4, ?5, ?6, ?7, ?8, ?8,
+                 CASE WHEN ?10 IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM work_scopes WHERE worktree_fingerprint = ?10
+                 ) THEN ?9 END,
+                 CASE WHEN ?10 IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM work_scopes WHERE worktree_fingerprint = ?10
+                 ) THEN ?10 END
+             )",
         )
         .bind(scope_id.as_str())
         .bind(authority_kind.as_str())
         .bind(kind)
         .bind(cwd)
-        .bind(worktree_path)
+        .bind(&worktree_path)
         .bind(branch_name)
         .bind(base_branch)
         .bind(now)
+        .bind(worktree_id)
+        .bind(&worktree_fingerprint)
         .execute(&mut **tx)
         .await?;
+        let commit_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if worktree_fingerprint.is_some() && worktree_fingerprint != commit_fingerprint {
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL, updated_at = ?2
+                 WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
         Ok(())
     }
 
@@ -1211,21 +1333,87 @@ impl Database {
     ) -> DbResult<()> {
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
+        let observed_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let existing =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                "SELECT environment_kind, worktree_path, worktree_id, worktree_fingerprint
+             FROM work_scopes WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::Serialization(format!(
+                    "work scope {scope_id} has no normalized environment"
+                ))
+            })?;
+        let (mut worktree_id, mut observed_fingerprint) = match (kind, observed_fingerprint) {
+            ("allocated_worktree", Some(fingerprint)) => {
+                let id = if existing.3.as_ref() == Some(&fingerprint) {
+                    existing
+                        .2
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
+                (Some(id), Some(fingerprint))
+            }
+            _ => (None, None),
+        };
+        let prewrite_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if observed_fingerprint != prewrite_fingerprint {
+            worktree_id = None;
+            observed_fingerprint = None;
+        }
         let result = sqlx::query(
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
-                 branch_name = ?4, base_branch = ?5, updated_at = ?6
+                 branch_name = ?4, base_branch = ?5, updated_at = ?6,
+                 worktree_id = CASE WHEN ?9 IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM work_scopes owner
+                     WHERE owner.worktree_fingerprint = ?9 AND owner.id <> ?7
+                 ) THEN ?8 END,
+                 worktree_fingerprint = CASE WHEN ?9 IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM work_scopes owner
+                     WHERE owner.worktree_fingerprint = ?9 AND owner.id <> ?7
+                 ) THEN ?9 END
              WHERE id = ?7",
         )
         .bind(kind)
         .bind(cwd)
-        .bind(worktree_path)
+        .bind(&worktree_path)
         .bind(branch_name)
         .bind(base_branch)
         .bind(now)
         .bind(scope_id.as_str())
+        .bind(worktree_id)
+        .bind(observed_fingerprint)
         .execute(&mut **tx)
         .await?;
+        let persisted_fingerprint: Option<String> =
+            sqlx::query_scalar("SELECT worktree_fingerprint FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(&mut **tx)
+                .await?;
+        let commit_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if persisted_fingerprint.is_some() && persisted_fingerprint != commit_fingerprint {
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL, updated_at = ?2
+                 WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
         if result.rows_affected() != 1 {
             return Err(DbError::Serialization(format!(
                 "work scope {scope_id} has no normalized environment"
@@ -2157,6 +2345,141 @@ impl Database {
         .transpose()
     }
 
+    /// Reconcile persisted worktree identity with the current Git administrative marker.
+    ///
+    /// Inaccessible worktrees remain unresolved instead of receiving fabricated continuity.
+    /// # Errors
+    /// Returns a database error when an observed identity cannot be persisted.
+    #[allow(clippy::too_many_lines)]
+    pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let scopes = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, worktree_path
+             FROM work_scopes
+             WHERE lifecycle = 'active'
+               AND environment_kind = 'allocated_worktree'
+               AND worktree_path IS NOT NULL
+             ORDER BY id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let observations = scopes
+            .into_iter()
+            .map(|(scope_id, path)| {
+                let observed_fingerprint = Self::observe_worktree_fingerprint(&path);
+                (scope_id, path, observed_fingerprint)
+            })
+            .collect::<Vec<_>>();
+
+        for (scope_id, path, observed_fingerprint) in &observations {
+            let revalidated = Self::observe_worktree_fingerprint(path);
+            let stable_fingerprint = match (observed_fingerprint, revalidated) {
+                (Some(observed), Some(revalidated)) if observed == &revalidated => Some(observed),
+                _ => None,
+            };
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL
+                 WHERE id = ?1
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?2
+                   AND (?3 IS NULL OR NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?3))
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase <> 'completed'
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(scope_id)
+            .bind(path)
+            .bind(stable_fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (scope_id, path, observed_fingerprint) in &observations {
+            let Some(observed_fingerprint) = observed_fingerprint else {
+                continue;
+            };
+            let Some(revalidated_fingerprint) = Self::observe_worktree_fingerprint(path) else {
+                continue;
+            };
+            if &revalidated_fingerprint != observed_fingerprint {
+                continue;
+            }
+            let result = sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = ?1, worktree_fingerprint = ?2
+                 WHERE id = ?3
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?4
+                   AND worktree_id IS NULL
+                   AND worktree_fingerprint IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM work_scopes owner
+                       WHERE owner.worktree_fingerprint = ?2 AND owner.id <> ?3
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase <> 'completed'
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(observed_fingerprint)
+            .bind(scope_id)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() == 0 {
+                tracing::debug!(
+                    work_scope_id = %scope_id,
+                    "worktree identity reconciliation deferred or unresolved"
+                );
+            }
+        }
+
+        for (scope_id, path, observed_fingerprint) in &observations {
+            if Self::observe_worktree_fingerprint(path).as_ref() == observed_fingerprint.as_ref() {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL
+                 WHERE id = ?1
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?2
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase <> 'completed'
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(scope_id)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Open or create database at the given path
     ///
     /// # Errors
@@ -2987,7 +3310,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_conversation_with_project(
         &self,
         id: &str,
@@ -3003,27 +3326,97 @@ impl Database {
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_inner(
+            id,
+            slug,
+            cwd,
+            user_initiated,
+            parent_id,
+            model,
+            project_id,
+            conv_mode,
+            desired_base_branch,
+            seed_parent_id,
+            seed_label,
+            llm_language,
+            ExpectedParentScope::NotChecked,
+        )
+        .await
+    }
+
+    /// Creates a sub-agent conversation attached to the exact parent scope captured at spawn.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the parent no longer owns the captured scope or persistence fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_subagent_conversation(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        parent_id: &str,
+        model: &str,
+        conv_mode: &ConvMode,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        parent_scope: Option<&WorkScopeId>,
+    ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_inner(
+            id,
+            slug,
+            cwd,
+            false,
+            Some(parent_id),
+            Some(model),
+            None,
+            conv_mode,
+            None,
+            None,
+            None,
+            llm_language,
+            ExpectedParentScope::Snapshot(parent_scope),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn create_conversation_with_project_inner(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        parent_id: Option<&str>,
+        model: Option<&str>,
+        project_id: Option<&str>,
+        conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        expected_parent_scope: ExpectedParentScope<'_>,
+    ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
         let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
-            let row = sqlx::query(
-                "SELECT work_scope_id AS work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
-            )
-            .bind(parent_id)
-            .fetch_optional(&self.pool)
-            .await?;
+            let row = sqlx::query("SELECT work_scope_id, effort FROM conversations WHERE id = ?1")
+                .bind(parent_id)
+                .fetch_optional(&self.pool)
+                .await?;
             match row {
                 Some(row) => {
-                    let scope = WorkScopeId::parse(row.try_get::<String, _>("work_scope_id")?)
+                    let scope = row
+                        .try_get::<Option<String>, _>("work_scope_id")?
+                        .map(WorkScopeId::parse)
+                        .transpose()
                         .map_err(|error| DbError::Serialization(error.to_string()))?;
                     let effort = row
                         .try_get::<Option<String>, _>("effort")?
                         .map(|value| ModelEffort::from_str(&value))
                         .transpose()
                         .map_err(|error| DbError::Serialization(error.clone()))?;
-                    (Some(scope), effort)
+                    (scope, effort)
                 }
                 None => (None, None),
             }
@@ -3039,17 +3432,42 @@ impl Database {
         // Retry with a random suffix on slug collision (UNIQUE constraint).
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
+        let preserve_unattached_parent =
+            matches!(expected_parent_scope, ExpectedParentScope::Snapshot(None));
         let created_work_scope_id = loop {
             let title_str = schema::title_from_slug(&actual_slug);
-            let generated_scope = inherited_scope.is_none().then(|| {
-                let (scope_id, authority_kind, environment) =
-                    Self::new_scope_for_conversation(cwd, &cm);
-                (scope_id, authority_kind, environment)
+            let generated_scope =
+                (inherited_scope.is_none() && !preserve_unattached_parent).then(|| {
+                    let (scope_id, authority_kind, environment) =
+                        Self::new_scope_for_conversation(cwd, &cm);
+                    (scope_id, authority_kind, environment)
+                });
+            let work_scope_id = inherited_scope.clone().or_else(|| {
+                generated_scope
+                    .as_ref()
+                    .map(|(scope_id, _, _)| scope_id.clone())
             });
-            let work_scope_id = inherited_scope
-                .clone()
-                .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
             let mut tx = self.pool.begin().await?;
+            if let (Some(parent_id), ExpectedParentScope::Snapshot(expected_scope)) =
+                (parent_id, &expected_parent_scope)
+            {
+                let parent_matches: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM conversations
+                         WHERE id = ?1 AND work_scope_id IS ?2
+                     )",
+                )
+                .bind(parent_id)
+                .bind(expected_scope.map(WorkScopeId::as_str))
+                .fetch_one(&mut *tx)
+                .await?;
+                if !parent_matches {
+                    tx.rollback().await?;
+                    return Err(DbError::CloseFoundationConflict(format!(
+                        "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                    )));
+                }
+            }
             if let Some((scope_id, authority_kind, environment)) = generated_scope {
                 Self::insert_work_scope_tx(
                     &mut tx,
@@ -3084,7 +3502,7 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(runtime_role.as_str())
-            .bind(work_scope_id.as_str())
+            .bind(work_scope_id.as_ref().map(WorkScopeId::as_str))
             .bind(parent_id.map(|_| cwd))
             .bind(ServiceTier::Standard.as_wire_name())
             .execute(&mut *tx)
@@ -3140,7 +3558,7 @@ impl Database {
             service_tier: ServiceTier::Standard,
             conv_mode: conv_mode.clone(),
             runtime_role,
-            attached_work_scope_id: Some(created_work_scope_id),
+            attached_work_scope_id: created_work_scope_id,
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             transcript_generation: 1,
@@ -6133,8 +6551,7 @@ impl Database {
 
     /// Create a continuation conversation for a context-exhausted parent, atomically.
     ///
-    /// Implements REQ-BED-030 and the continuation rules in
-    /// `specs/projects/projects.allium`.
+    /// Implements REQ-BED-030 and bedrock.allium continuation rules.
     ///
     /// Within a single `SQLite` transaction:
     ///   1. INSERT a new `conversations` row with the parent's `conv_mode` cloned
@@ -10458,6 +10875,139 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    #[test]
+    fn worktree_fingerprint_tracks_git_administrative_incarnation() {
+        let root = std::env::temp_dir().join(format!(
+            "phoenix-worktree-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join(".git");
+        std::fs::write(&marker, "gitdir: /tmp/first\n").unwrap();
+        let first = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
+        let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        assert_ne!(first, replacement);
+        let max_pointer_bytes = usize::try_from(MAX_GIT_POINTER_BYTES).unwrap();
+        let mut maximum_pointer = b"gitdir: ".to_vec();
+        maximum_pointer.resize(max_pointer_bytes - 1, b'x');
+        maximum_pointer.push(b'\n');
+        std::fs::write(&marker, maximum_pointer).unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
+        std::fs::write(&marker, vec![b'x'; max_pointer_bytes + 1]).unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "not-a-git-pointer\n").unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "gitdir: \n").unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "gitdir: /tmp/windows-linked-worktree\r\n").unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
+        let crlf = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        std::fs::write(&marker, "gitdir: /tmp/windows-linked-worktree\n").unwrap();
+        let lf = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        assert_eq!(crlf, lf);
+        std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
+        std::fs::rename(&root, root.with_extension("moved")).unwrap();
+        let moved = root.with_extension("moved");
+        assert_eq!(
+            replacement,
+            Database::observe_worktree_fingerprint(moved.to_str().unwrap()).unwrap()
+        );
+        std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_reconciliation_releases_stale_owner_before_claim_arbitration() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let claimant = temp.path().join("claimant");
+        let stale_owner = temp.path().join("stale-owner");
+        std::fs::create_dir_all(&claimant).unwrap();
+        std::fs::create_dir_all(&stale_owner).unwrap();
+        std::fs::write(claimant.join(".git"), "gitdir: /tmp/original\n").unwrap();
+        std::fs::write(stale_owner.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
+        let released_fingerprint =
+            Database::observe_worktree_fingerprint(claimant.to_str().unwrap()).unwrap();
+        let replacement_fingerprint =
+            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).unwrap();
+
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd, worktree_path,
+                 created_at, updated_at, worktree_id, worktree_fingerprint
+             ) VALUES
+                 ('a-claimant', 'work', 'active', 'allocated_worktree', ?1, ?1,
+                  ?3, ?3, NULL, NULL),
+                 ('b-stale-owner', 'work', 'active', 'allocated_worktree', ?2, ?2,
+                  ?3, ?3, 'stale-id', ?4)",
+        )
+        .bind(claimant.to_str().unwrap())
+        .bind(stale_owner.to_str().unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .bind(&released_fingerprint)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.reconcile_worktree_identities().await.unwrap();
+
+        let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT id, worktree_id, worktree_fingerprint
+             FROM work_scopes
+             WHERE id IN ('a-claimant', 'b-stale-owner')
+             ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities[0].1.is_some());
+        assert_eq!(
+            identities[0].2.as_deref(),
+            Some(released_fingerprint.as_str())
+        );
+        assert!(identities[1].1.is_some());
+        assert_eq!(
+            identities[1].2.as_deref(),
+            Some(replacement_fingerprint.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_reconciliation_preserves_retired_identity_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("retired-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd, worktree_path,
+                 created_at, updated_at, retired_at, worktree_id, worktree_fingerprint
+             ) VALUES ('retired-scope', 'work', 'retired', 'allocated_worktree',
+                       ?1, ?1, ?2, ?2, ?2, 'retired-id', 'retired-fingerprint')",
+        )
+        .bind(worktree.to_str().unwrap())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.reconcile_worktree_identities().await.unwrap();
+
+        let identity = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT worktree_id, worktree_fingerprint
+             FROM work_scopes WHERE id = 'retired-scope'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(identity.0.as_deref(), Some("retired-id"));
+        assert_eq!(identity.1.as_deref(), Some("retired-fingerprint"));
+    }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
@@ -16085,6 +16635,46 @@ mod tests {
         .await
         .unwrap();
         let child = db.get_conversation("effort-child").await.unwrap();
+        assert_eq!(child.effort, Some(ModelEffort::High));
+    }
+
+    #[tokio::test]
+    async fn unattached_sub_agent_inherits_parent_effort_without_a_work_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort(
+            &parent.id,
+            "gpt-5.4",
+            Some(ModelEffort::High),
+            ServiceTier::Standard,
+        )
+        .await
+        .unwrap();
+
+        let child = db
+            .create_subagent_conversation(
+                "unattached-effort-child",
+                "unattached-effort-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(child.attached_work_scope_id, None);
         assert_eq!(child.effort, Some(ModelEffort::High));
     }
 

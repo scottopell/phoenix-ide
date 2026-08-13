@@ -23,6 +23,22 @@ AND SHALL NOT require a separate row-local `conversation_became_terminal` event 
 
 ---
 
+### REQ-API-001A: Recent Conversation Location Suggestions
+
+WHEN a client requests working-directory suggestions for new conversation creation
+THE SYSTEM SHALL return server-side repository locations derived from surviving Open or History conversation activity and any surviving WorkScope attachment or pre-scope provisioning evidence that still resolves to a present server-side repository management-root locator
+AND SHALL return at most one current management-root path per hidden `GitRepository` rather than a Phoenix-managed worktree path or arbitrary in-repository working directory
+AND SHALL collapse linked worktrees attached to the same hidden `GitRepository` into one suggestion
+AND SHALL keep separate local clones as separate suggestions even when their remotes, names, or commit graphs match
+AND SHALL allow an unresolved Git-backed creation failure to contribute only through still-surviving conversation-side evidence that resolves to a present management-root locator
+AND SHALL order suggestions first by the number of distinct surviving Open or History conversations supporting the hidden `GitRepository` and then by the most recent supporting conversation or WorkScope activity
+AND SHALL NOT require or expose a Project or user-visible Repository collection
+AND SHALL treat each returned path as a server-filesystem locator rather than as client-local filesystem identity
+
+**Rationale:** Clients need a portable way to offer useful recent server locations without restoring the retired Project API collection or pretending server paths belong to the viewing device.
+
+---
+
 ### REQ-API-002: Conversation Creation
 
 WHEN client requests new conversation with working directory path

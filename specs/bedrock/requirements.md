@@ -32,6 +32,154 @@ AND inform user they can cancel current operation
 
 ---
 
+### REQ-PROJ-003: Propose a Task for Blocking Review
+
+WHILE a Git-backed conversation is in a planning/read-only phase
+THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch` tool, scoped to the discovered tasks directory when task drafting rules require it
+
+WHEN the agent calls the `propose_task` tool with a `task_file` path to a markdown file inside the conversation's allowed workspace
+THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
+AND require it to be the only tool call in the response
+AND NOT execute any immediate Git side effects
+AND read the file and persist the assistant message and a synthetic tool result atomically
+AND transition the conversation to AwaitingTaskApproval state
+AND pause ordinary agent execution until the user responds
+
+WHEN the task file's name parses as a taskmd filename but the path is **not** under the conversation repository's discovered tasks directory
+THE SYSTEM SHALL reject the call
+
+WHEN the task file's name parses as taskmd but its status is not `ready` / `in-progress` / `brainstorming`
+THE SYSTEM SHALL reject the call
+
+THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of the title, priority, and body
+AND SHALL persist one reviewed proposal snapshot identity containing the intended repo-relative path, task kind, and content digest bound to that reviewed body
+AND, on approval, the executor SHALL re-read the file from disk only for that same reviewed path and task kind
+AND SHALL compare the re-read body, path, and task kind against the reviewed snapshot identity before approving
+AND SHALL require the user to request changes and capture a new reviewed snapshot before a changed path, changed task kind, or changed body can be approved
+
+WHEN `propose_task` is called in a non-Git Direct conversation
+THE SYSTEM SHALL NOT provide the tool at all
+
+WHEN `propose_task` is called by a sub-agent
+THE SYSTEM SHALL reject the call because task-management authority belongs to the parent conversation
+
+**Rationale:** The task file is a real file the agent edits with `patch`, so revisions are normal file edits rather than plan text hidden in tool arguments. Blocking review preserves user approval without making task approval synonymous with lifecycle mode changes.
+
+---
+
+### REQ-PROJ-004: Review and Place an Approved Task
+
+WHEN a conversation enters AwaitingTaskApproval state
+THE SYSTEM SHALL open the prose reader with the plan content from the state
+AND present **Continue here**, **Start in new conversation**, and **Request changes / discard** actions alongside the standard annotation feedback
+
+WHEN the user sends annotation feedback
+THE SYSTEM SHALL close the prose reader
+AND deliver the annotations to the agent as a user message
+AND return the conversation to its prior Open planning state
+AND the agent MAY revise the plan and call `propose_task` again
+
+WHEN the user approves the task and chooses **Continue here**
+THE SYSTEM SHALL commit the approved task artifact according to REQ-PROJ-006
+AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
+AND SHALL persist one typed approved-task objective that references the normalized approved-task source record
+AND SHALL persist Git-backed write authority by referencing that approved-task objective on the same Open conversation and the same attached `WorkScope`
+AND keep the same Open conversation and the same `WorkScope`
+AND resume execution in that conversation without changing its mode
+AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
+
+WHEN the user approves the task and chooses **Start in new conversation**
+THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
+AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
+AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
+AND SHALL treat that spawned conversation as an independent ProductConversation with its own fresh `WorkScope`, not as a sub-agent attachment to the source conversation's worktree
+AND seed only the exact approved task as the spawned conversation's starting context
+AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
+AND SHALL complete that materialization before dispatching the spawned conversation's first LLM request
+AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
+AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation, concrete spawned transcript conversation, attached `WorkScope`/worktree, and approved-artifact materialization
+AND leave the source conversation Open and no longer blocked in task-approval state
+AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
+AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement
+AND SHALL NOT dispatch the spawned conversation when provisioning finishes in an unresolved failure result
+
+WHEN the user rejects or discards the task
+THE SYSTEM SHALL return a rejection result to the agent
+AND SHALL NOT perform any Git side effects
+
+**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The system offers two deliberate placements — continue in the same conversation or start in a new conversation — while keeping branch ownership out of the approval contract.
+
+---
+
+### REQ-PROJ-006: Task Files as Versioned Living Contracts
+
+WHEN the agent drafts a task file for `propose_task`
+THE SYSTEM SHALL place taskmd-named drafts in the conversation repository's discovered tasks directory: Phoenix scans immediate children of the repository root for taskmd sentinel files and prefers `tasks/`, otherwise the lexically-first discovered taskmd directory, otherwise literal `tasks/`
+AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md` when the repository uses taskmd naming
+AND the **filename** SHALL remain the sole authoritative source of taskmd metadata
+AND the body SHALL be free-form markdown
+
+WHEN the user approves a taskmd task
+THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
+AND rename the file to `...-in-progress--{slug}.md` if its status is not already `in-progress`
+AND persist the approved content so the chosen conversation placement can continue to use the exact approved task
+AND SHALL persist the exact approved body together with the reviewed snapshot identity that justified that approval
+
+WHEN the agent later updates the task file during active work
+THE SYSTEM SHALL allow edits to it like any other workspace file
+AND the agent MAY rename it to `...-done--{slug}.md` or `...-wont-do--{slug}.md` when the work is complete
+
+WHEN the task file is not taskmd-named
+THE SYSTEM SHALL treat it as a plain task brief: the display title is the body's first `# H1` (falling back to a title-cased file stem), the display priority defaults to `p2`, and there is no structured id/status/slug contract
+
+**Rationale:** The task artifact is the durable handoff, regardless of whether the user continues in the same conversation or starts a new one. taskmd metadata remains filename-based, but task approval no longer depends on creating or owning a dedicated Phoenix branch lifecycle.
+
+---
+
+### REQ-PROJ-007: Git-Backed Write Authority Is Scoped to the Conversation Worktree
+
+WHILE a Git-backed conversation has write authority
+THE SYSTEM SHALL configure tools to operate within the conversation's worktree directory
+AND enable file-write tools within that worktree
+AND allow bash commands that read and write files within that worktree
+
+WHEN a tool with write authority attempts to write outside the worktree directory
+THE SYSTEM SHALL block the write
+AND return a descriptive error
+
+**Rationale:** Write authority is scoped to the disposable worktree, not to the whole filesystem and not to a lifecycle mode name. This preserves isolation without requiring a separate writing lifecycle label as a product concept.
+
+---
+
+### REQ-PROJ-012: Provide propose_task Tool to Parent Conversations
+
+WHEN a parent conversation is allowed to request task review or derived follow-up work
+THE SYSTEM SHALL provide the `propose_task` tool
+WHICH accepts `task_file` (required string): a path, relative to the agent's working directory, to an existing markdown (`.md`) file inside the allowed workspace
+
+WHEN `propose_task` is called from a planning/read-only phase
+THE SYSTEM SHALL treat it as the blocking review path defined by REQ-PROJ-003 and REQ-PROJ-004
+
+WHEN `propose_task` is called from a Git-backed conversation that already has write authority
+THE SYSTEM SHALL treat it as the same blocking review path used for planning/read-only conversations
+AND SHALL NOT reinterpret that call as a nonblocking derived-conversation proposal
+
+WHEN `propose_task` is called in a chat-only Direct conversation
+THE SYSTEM SHALL NOT provide the tool, even if its working directory happens to be inside a Git repository
+
+WHEN `propose_task` is called by a sub-agent
+THE SYSTEM SHALL reject the call
+AND explain that task-management authority belongs to the parent conversation
+
+WHEN `propose_task` is not the only tool call in the response
+THE SYSTEM SHALL reject it
+
+`propose_task` is a pure data carrier intercepted at the LlmResponse handler. It never performs Git side effects directly.
+
+**Rationale:** `propose_task` is the agent's way of saying “here's a task artifact for human review.” The key distinction is whether the parent is asking for blocking approval in place or proposing a separate derived conversation — not whether the product is in one named lifecycle mode or another.
+
+---
+
 ### REQ-BED-013: Image Handling
 
 WHEN user sends message with attached images
@@ -383,6 +531,27 @@ reflect read-only planning versus write-capable execution authority and `propose
 
 ---
 
+### REQ-PROJ-018: Direct Mode
+
+Direct mode is the chat-only / non-worktree conversation shape.
+
+WHEN a conversation is created in Direct mode
+THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
+AND set the working directory to the target directory (not a Phoenix-owned worktree)
+AND SHALL NOT include `propose_task`
+AND NOT create worktrees, branches, or task files for the Direct conversation itself
+
+THE SYSTEM SHALL visually distinguish Direct mode from Git-backed worktree conversations in the UI
+
+WHEN a Direct conversation targets a Git repository
+THE SYSTEM MAY attach its `WorkScope` to the hidden `GitRepository` for discovery and configuration context
+AND SHALL derive the ProductConversation's repository context through that `WorkScope`
+AND SHALL NOT treat that association as ownership of a Phoenix worktree lifecycle
+
+**Rationale:** Direct mode remains useful for chat-only and ad hoc workflows, while Git-backed conversations use the disposable-worktree model. The important distinction is worktree ownership, not a branching lifecycle picker.
+
+---
+
 ### REQ-BED-018: Sub-Agent Mode Enforcement
 
 WHEN sub-agent is spawned by an Explore conversation
@@ -587,7 +756,7 @@ THE SYSTEM SHALL NOT wait for the sub-agent to finish its current operation
 
 ### REQ-BED-027: Conversation Execution Authority
 
-WHEN a conversation is created for a project (git-backed directory)
+WHEN a conversation is created for a Git-backed directory
 THE SYSTEM SHALL initialize the conversation with read-only planning authority
 until a later approval or creation path attaches write capability to a
 `WorkScope`
@@ -735,21 +904,32 @@ THE SYSTEM SHALL expose the initial Close conversation action
 AND SHALL create the durable Close attempt without stopping work immediately
 AND SHALL require explicit stop-work confirmation before settlement begins
 
-WHEN Close conversation completes for an Open conversation that owns a `WorkScope`
-THE SYSTEM SHALL transition the product conversation to History state
-AND the latest transcript row SHALL NOT accept new user messages
+WHEN Close conversation completes for an ordinary Open ProductConversation with an attached `WorkScope`
+THE SYSTEM SHALL transition that ProductConversation aggregate to History state
+AND the latest transcript row in that aggregate SHALL NOT accept new user messages
 AND SHALL durably persist one Close-outcome system message in the finalization transaction before the aggregate lifecycle announcement is emitted
 
-WHEN a conversation enters History after successful Close completion
+WHEN a ProductConversation enters History after successful Close completion
 THE SYSTEM SHALL emit one aggregate lifecycle announcement for downstream consumers
-AND the conversation SHALL remain visible in the sidebar for reference
-AND the user SHALL be able to start a new conversation on the same project
+AND that ProductConversation SHALL remain visible in the sidebar for reference
+AND the user SHALL be able to start a new ProductConversation on the same project
 
-EACH Close operation SHALL carry one durable Close-attempt identity bound to that ProductConversation
+EACH Close operation SHALL carry one durable Close-attempt identity bound to that exact ProductConversation identity
 AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
 AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, retry, and finalization event to that exact Close-attempt identity
-AND MAY retain completed Close attempts as historical records
+AND SHALL retain completed Close attempts as historical records until permanent Delete removes their ProductConversation aggregate
 AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
+AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
+AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
+AND SHALL retain the last bound inspection generation and fingerprint on a completed `archived` attempt
+AND SHALL omit that aggregate inspection pair from a completed `cancelled` attempt while preserving any normalized exact-attempt inspection and loss evidence already recorded before cancellation
+AND SHALL snapshot the exact ordered parent transcript-row continuation topology of that ProductConversation when the attempt is admitted
+AND SHALL bind every snapshot member to both that exact Close attempt and the parent transcript row's explicit ProductConversation membership
+AND SHALL treat subordinate execution conversations as aggregate participants rather than continuation-topology members
+AND SHALL preserve that admitted snapshot unchanged when later topology changes are permitted
+
+WHILE a non-completed Close attempt exists for a ProductConversation
+THE SYSTEM SHALL NOT permit a continuation successor to be created for that ProductConversation
 
 **Rationale:** Closing is the one product-facing way to retire active work. The
 conversation moves to History because its owned live environment is gone; there is no
@@ -760,7 +940,7 @@ separate in-Phoenix merged-versus-abandoned lifecycle.
 ### REQ-BED-030: Context Continuation Inherits Parent Environment
 
 WHEN user initiates continuation from a context-exhausted conversation
-THE SYSTEM SHALL create a new transcript row within the same product conversation that inherits:
+THE SYSTEM SHALL create a new transcript row that explicitly belongs to the same ProductConversation and inherits:
   - the parent's execution authority, preserving whether the latest live row is read-only planning, write-capable against an attached `WorkScope`, or chat-only
   - the parent's working directory
   - the parent's worktree, if any, without destroy-and-recreate
@@ -801,6 +981,29 @@ and therefore one inherited worktree.
 
 ---
 
+### REQ-BED-030A: ProductConversation Owns Aggregate Identity and Lifecycle
+
+EACH ProductConversation SHALL have a typed durable identity whose domain is independent of every transcript-row identity
+AND THE SYSTEM SHALL allocate that identity without deriving it from a root or latest transcript-row identity during runtime creation
+AND SHALL NOT substitute a ProductConversation identity for a transcript-row identity, or the reverse, based on equal underlying bytes
+AND SHALL require every durable conversation row to explicitly belong to exactly one ProductConversation
+AND SHALL distinguish parent transcript rows from subordinate execution participants within that aggregate
+AND SHALL derive root and latest parent transcript rows from the continuation topology within the ProductConversation rather than storing either as a second mutable aggregate authority
+
+WHEN a parent transcript row has a continuation successor
+THE SYSTEM SHALL require that successor to be a parent transcript row in the same ProductConversation
+AND SHALL permit at most one predecessor and one successor for each parent transcript row
+AND SHALL reject cyclic continuation topology
+
+EACH ProductConversation SHALL have exactly one typed kind: ordinary or coordinator
+AND THE SYSTEM SHALL model Open/History lifecycle for ordinary ProductConversations only
+AND SHALL make Open/History lifecycle structurally inapplicable to coordinator ProductConversations rather than representing coordinator lifecycle as an optionally absent ordinary value
+AND SHALL expose ProductConversation lifecycle through one writable authority rather than parallel writable aggregate and transcript-row values
+
+**Rationale:** Aggregate identity, transcript membership, topology, and lifecycle are distinct facts. Keeping one authority for each prevents a transcript segment from becoming a second ProductConversation or lifecycle owner.
+
+---
+
 ### REQ-BED-031: Exhausted Parent Post-Handoff Behavior
 
 WHILE a conversation is in context-exhausted state
@@ -809,7 +1012,7 @@ AND preserve its worktree, if any, across server restarts
 AND preserve its branch in git
 
 WHEN a context-exhausted conversation has no continuation
-THE SYSTEM SHALL permit user-initiated Close conversation on that latest row
+THE SYSTEM SHALL permit user-initiated Close on that latest row of the same ordinary Open ProductConversation
 AND SHALL apply the same close contract and worktree/resource disposition as Close from a non-terminal state
 AND SHALL route any direct-turn-owned runtime work, wake deliveries, tool execution, sub-agent execution, and other child work through the durable workflow profile's typed effects and reconciliation machinery rather than through parent-row callbacks that mutate conversation state directly
 
@@ -842,8 +1045,8 @@ boundaries so restart/replay and Close settlement share one authority.
 
 ### REQ-BED-031A: Start Follow-up Creates a Fresh Open Conversation from History
 
-WHEN the user starts a follow-up from a History conversation
-THE SYSTEM SHALL create a separate Open conversation rather than reopening or continuing the historical one
+WHEN the user starts a follow-up from a History ProductConversation
+THE SYSTEM SHALL create a separate Open ProductConversation rather than reopening or continuing the historical one
 AND SHALL attach a fresh `WorkScope`
 AND SHALL provision a fresh detached-default-branch disposable worktree when the follow-up is Git-backed
 AND SHALL treat that follow-up as an independent ProductConversation rather than as a sub-agent or continuation attachment to the source `WorkScope`
@@ -861,7 +1064,7 @@ AND SHALL render that Follow-up relationship visibly from the source conversatio
 
 WHEN the user permanently deletes a History conversation
 THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus every solely-owned normalized child row required by that aggregate
-AND SHALL explicitly delete solely-owned message rows, tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
+AND SHALL explicitly delete solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
 AND SHALL preserve typed tombstone-grade source identity needed by surviving provenance consumers
 AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
 
@@ -875,6 +1078,46 @@ WHEN the same permanent Delete request is retried after the aggregate has alread
 THE SYSTEM SHALL treat the operation as idempotent success rather than recreating work, failing because rows are already gone, or cascading into unrelated records
 
 **Rationale:** Permanent Delete is about one conversation aggregate and its solely-owned data, not about erasing every related object in the repository or navigation graph. Tombstone-grade source identity preserves truthful surviving provenance.
+
+---
+
+### REQ-PROJ-033: Propose a Derived Task from an Already-Active Conversation
+
+WHILE a Git-backed conversation already has write authority
+THE SYSTEM SHALL provide `propose_task` as the same blocking approval tool used in planning/read-only conversations
+
+WHEN the agent calls `propose_task` with a markdown file inside its allowed workspace
+THE SYSTEM SHALL intercept it at the LlmResponse handler
+AND require it to be the only tool call in the response
+AND validate the file by the same taskmd/plain-brief rules as REQ-PROJ-003
+AND read and persist the proposal as the blocking approval artifact defined by REQ-PROJ-003/004
+AND transition the conversation to AwaitingTaskApproval rather than leaving it running
+
+WHEN `propose_task` is called from a planning/read-only phase
+THE SYSTEM SHALL keep the same blocking review behavior
+
+WHEN `propose_task` is called in Direct mode
+THE SYSTEM SHALL NOT provide the tool
+
+WHEN `propose_task` is called by a sub-agent
+THE SYSTEM SHALL reject the call
+
+**Rationale:** Approved product behavior uses one blocking human-review checkpoint for all Git-backed `propose_task` calls. Write authority changes what approval can grant or preserve; it does not create a second nonblocking proposal meaning.
+
+---
+
+### REQ-PROJ-036: propose_task Availability by Conversation Capability
+
+THE `propose_task` tool SHALL be available as follows:
+
+| Conversation capability shape | `propose_task` behavior |
+|-------------------------------|-------------------------|
+| Git-backed planning/read-only conversation | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
+| Git-backed conversation with write authority | Blocking review path (REQ-PROJ-003 / REQ-PROJ-004) |
+| Any Direct conversation | Not provided |
+| Any sub-agent | Not provided |
+
+**Rationale:** Availability depends on whether the host conversation itself is Git-backed and therefore eligible for the one blocking approval flow. Chat-only/direct conversations and sub-agents remain excluded, even if a chat-only working directory happens to sit inside a repository.
 
 ---
 
@@ -900,8 +1143,7 @@ following sequence of direct calls in order:
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
    Chrome session for the scope unless another still-live owner retains the
    same `WorkScope` (REQ-BROWSER-WS-003)
-6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned message rows,
-   tool-call rows, approval rows, attachment rows, retrieval chunk rows, retrieval locator rows, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
+6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
    separately-owned conversations, branches, and pull requests untouched
 7. Broadcast `ConversationHardDeleted` for UI consumers
 
@@ -934,7 +1176,7 @@ browser side).
 History after Close is NOT reversible in place. Close moves the conversation to History through the separate Close lifecycle; permanent Delete later removes that retained aggregate entirely. There is
 no `unarchive` operation because Archive is not a normative lifecycle concept.
 
-THE `ConversationHardDeleted` SSE wire event (step 6) SHALL be emitted
+THE `ConversationHardDeleted` SSE wire event (step 7) SHALL be emitted
 exactly once per hard-delete operation, after all cascade steps have
 completed. UI consumers use it to refresh sidebar, navigation, and
 related views. It is NOT a subscriber-dispatch hook for cleanup logic;
@@ -961,12 +1203,12 @@ materially improving reliability. Operators who do encounter orphans
 have the WARN-level structured logs to act on.
 
 The not-busy precondition mirrors the Close confirmation contract in
-`specs/projects/`. Hard-delete during a live tool execution would race
+`specs/work-lifecycle/`. Hard-delete during a live tool execution would race
 the tool's own cleanup code; canceling first is the deterministic order.
 The permissive choice between (a) reject and (b) cancel-first leaves
 that policy to the API layer; the bedrock contract is the not-busy
 postcondition before cascade fires.
 
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
-(`specs/tmux-integration/`), REQ-PROJ-`<new subscriber>`
-(`specs/projects/`).
+(`specs/tmux-integration/`), REQ-PROJ-WS-001
+(`specs/work-lifecycle/`), and REQ-GITREP-007 (`specs/git-repository/`).

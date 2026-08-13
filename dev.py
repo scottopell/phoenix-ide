@@ -2470,8 +2470,9 @@ def cmd_seed(
             conn.execute(
                 "INSERT INTO work_scopes ("
                 " id, authority_kind, lifecycle, created_at, updated_at,"
-                " environment_kind, cwd, worktree_path, branch_name, base_branch"
-                ") VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+                " environment_kind, cwd, worktree_path, branch_name, base_branch,"
+                " worktree_id, worktree_fingerprint"
+                ") VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     scope_id,
                     authority_kind,
@@ -2482,6 +2483,8 @@ def cmd_seed(
                     worktree_path,
                     branch_name,
                     base_branch,
+                    None,
+                    None,
                 ),
             )
 

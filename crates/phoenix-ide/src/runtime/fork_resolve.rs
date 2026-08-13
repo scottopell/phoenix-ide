@@ -1572,6 +1572,10 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
         | DbError::Serialization(_)
+        | DbError::CloseFoundationConflict(_)
+        | DbError::CloseFoundationPrecondition(_)
+        | DbError::CloseFoundationRepairRequired(_)
+        | DbError::CloseFoundationNotFound(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::DirectTurnConflict(_) => ForkResolveError::Internal(e.to_string()),
     }

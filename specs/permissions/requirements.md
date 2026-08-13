@@ -154,7 +154,7 @@ one — which is a second reason it sits outside intent-agnostic Layer 0.)
   threat that motivates user/managed config scoping.
 - **A security boundary at the tool layer.** The seam is enforcement of intended
   behaviour, not containment. Primary containment is git-worktree isolation and
-  (on Linux) Landlock; see `specs/bash` and `specs/projects`.
+  (on Linux) Landlock; see `specs/bash`, `specs/work-lifecycle`, and `specs/git-repository`.
 
 ## Related Specs
 

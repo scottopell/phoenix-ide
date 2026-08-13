@@ -32,6 +32,25 @@ Persistence across Phoenix restart is what `tmux` is for.
 
 ## Requirements
 
+### REQ-PROJ-013: Platform Capability Detection
+
+WHEN the server starts
+THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an enforceable OS sandbox backend capable of applying the read-only planning bash network-block and unrelated-process signal-isolation policy
+
+THE SYSTEM SHALL re-check capabilities on every startup
+
+WHILE sandbox is not available
+THE SYSTEM SHALL provide top-level planning/read-only conversations with read-only/planning tools, browser tools, scoped task-proposal `patch`, `propose_task`, and parent coordination tools including `spawn_agents`
+AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, or any tool that can execute arbitrary unsandboxed commands
+
+WHILE sandbox is available
+THE SYSTEM SHALL provide top-level planning/read-only conversations with read-only/planning tools, scoped task-proposal `patch`, `propose_task`, browser tools, parent coordination tools including `spawn_agents`, and sandboxed `bash`
+AND SHALL NOT provide `tmux` or `tmux_run`
+
+**Rationale:** Capabilities are a property of the running environment, not the application. Sandbox capability gates bash, not delegation. Planning/read-only conversations and their sub-agents can still investigate locally without write authority when the host can enforce network blocking and unrelated-process signal isolation; otherwise withholding bash preserves that promise structurally. Re-checking on startup keeps the tool set aligned with the current host.
+
+---
+
 ### REQ-BASH-001: Command Execution
 
 WHEN agent calls `bash(cmd=<command>, ...)`

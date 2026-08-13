@@ -5,7 +5,7 @@
 --
 -- Scope: Spawn-time validation, per-authority configuration resolution, the
 --        cross-domain seam between bedrock's sub-agent state space and
---        projects' worktree ownership.
+--        WorkScope-owned worktree authority.
 -- Includes:
 --   - SubAgentExecutionAuthority (read_only/write_capable) and parent-mode rules
 --   - One-writer invariant (per-call AND across calls per parent)
@@ -22,7 +22,7 @@
 --       Conversation-level invariant, sub-agent terminal-tool semantics
 --       (submit_result/submit_error must be sole tool in response),
 --       SpawnLimit, NoRecursiveSubAgents.
---   - Worktree creation / branch lifecycle (see projects.allium).
+--   - Worktree creation / repository lifecycle (see git-repository.allium).
 --   - Tool implementations (bash, patch, etc.).
 --
 -- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-SA-011,
@@ -30,7 +30,6 @@
 -- read_first injection is outside this spawn-resolution model.
 
 use "../bedrock/bedrock.allium" as bedrock
-use "../projects/projects.allium" as projects
 
 ------------------------------------------------------------
 -- Value Types
@@ -62,6 +61,8 @@ value SubAgentSpec {
     max_turns: Integer            -- > 0
     agent_name: String?           -- named agent that produced this spec (see specs/agents/)
     persona: String?              -- resolved agent body; replaces the base preamble
+    parent_work_scope_kind: ParentWorkScopeKind
+    parent_work_scope_id: String when parent_work_scope_kind = attached
 }
 
 ------------------------------------------------------------
@@ -69,6 +70,7 @@ value SubAgentSpec {
 ------------------------------------------------------------
 
 enum SubAgentExecutionAuthority { read_only | write_capable }
+enum ParentWorkScopeKind { unattached | attached }
 
 -- Tool registries selectable for a sub-agent. The registry shape itself
 -- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
@@ -246,7 +248,7 @@ rule SpawnRejectedSystemRootCwd {
 -- The Work sub-agent's *effective* cwd — including any per-task `cwd`
 -- override — must be inside the parent's worktree. Without this guard a
 -- Work sub-agent could write outside the worktree (defeating
--- projects.allium's WriteBlockedOutsideWorktree because the sub-agent
+-- REQ-PROJ-007's worktree write boundary because the sub-agent
 -- runtime would see a different working_dir).
 rule SpawnRejectedWorkCwdOutsideWorktree {
     when: SpawnAgentsToolInvoked(parent, tasks)
@@ -263,7 +265,7 @@ rule SpawnRejectedWorkCwdOutsideWorktree {
         --
         -- When the task omits `cwd`, the effective cwd is the parent's
         -- working_dir, which for parent.mode in { work, branch } equals
-        -- worktree_path by the projects.allium worktree contract — that
+        -- worktree_path by REQ-PROJ-008's inherited-workspace contract — that
         -- case satisfies the invariant trivially.
 }
 
@@ -278,12 +280,17 @@ rule SpawnedSubAgentCwdAssignment {
             sub_agent.working_dir = cwd_override
         else:
             sub_agent.working_dir = parent.working_dir
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.spec.parent_work_scope_kind = attached
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.spec.parent_work_scope_id = parent.attached_work_scope_id
+    ensures: parent.attached_work_scope_id != absent implies sub_agent.attached_work_scope_id = sub_agent.spec.parent_work_scope_id
+    ensures: parent.attached_work_scope_id = absent implies sub_agent.spec.parent_work_scope_kind = unattached
+    ensures: parent.attached_work_scope_id = absent implies sub_agent.attached_work_scope_id = absent
 
     @guidance
         -- The Explore-sub-agent ConvMode is `Explore { worktree_path:
         -- None }` — Explore sub-agents do not own a worktree of their
         -- own; they read from the parent's worktree (when present) or
-        -- the parent's cwd. See projects.allium ExploreSubAgentDirectory
+        -- the parent's cwd. See REQ-PROJ-008's inherited-workspace contract
         -- for the cross-spec restatement.
         --
         -- For Work sub-agents the resolved cwd has already been verified
@@ -361,6 +368,11 @@ rule SubAgentSpecsResolved {
         --     t.cwd.absolute        => t.cwd
         --     t.cwd.relative        => parent.working_dir / t.cwd
         --
+        --   resolve_parent_work_scope(parent):
+        --     attached(id) with the parent's exact opaque WorkScope identity when
+        --     present; otherwise unattached. Every child mirrors that typed state.
+        --     cwd or worktree-path equality never infers attachment.
+        --
         --   validate_cwd(resolve_cwd(t, parent)) must prove the path is an
         --   existing directory after canonicalisation and that the canonical
         --   directory is not the filesystem root. Failure rejects the entire
@@ -368,8 +380,7 @@ rule SubAgentSpecsResolved {
         --
         -- After this rule fires, bedrock's `SpawnAgentsCompletesAsLastTool`
         -- (or `SpawnAgentsCompletesWithMoreTools`) drives the parent into
-        -- `awaiting_sub_agents` and the projects-level worktree contract
-        -- (WorkSubAgentInheritsWorktree, ExploreSubAgentDirectory) covers
+        -- `awaiting_sub_agents` and REQ-PROJ-008's inherited-workspace contract covers
         -- the worktree-side seam.
 }
 
@@ -459,13 +470,13 @@ invariant OneWorkSubAgentPerParent {
 
 -- When the parent owns a worktree (Work or Branch mode), the effective
 -- cwd of any Work sub-agent it spawns is inside that worktree.
--- Combined with projects.allium's WriteBlockedOutsideWorktree, this
+-- Combined with REQ-PROJ-007's write boundary, this
 -- guarantees that sub-agent writes cannot escape the parent's
 -- isolation boundary.
 --
 -- Work sub-agents spawned from a Direct parent are out of scope here:
 -- Direct mode has no worktree to scope against, and Direct's writes are
--- unscoped by design (see WriteBlockedOutsideWorktree's
+-- unscoped by design (see REQ-PROJ-007's
 -- `parent.mode in { work, branch }` precondition). Explore sub-agents
 -- are read-only, so escape-via-cwd is not a write-safety concern.
 invariant WorkSubAgentCwdInsideWorktree {

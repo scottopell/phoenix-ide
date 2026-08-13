@@ -58,6 +58,7 @@ impl FromStr for WorkScopeId {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ResourceScopeKey {
     Work(WorkScopeId),
+    Unattached(String),
     Coordinator,
     GlobalTerminal,
 }
@@ -67,6 +68,7 @@ impl ResourceScopeKey {
     pub fn stable_key(&self) -> String {
         match self {
             Self::Work(id) => format!("work:{}", id.as_str()),
+            Self::Unattached(conversation_id) => format!("unattached:{conversation_id}"),
             Self::Coordinator => "coordinator".to_string(),
             Self::GlobalTerminal => "global_terminal".to_string(),
         }
@@ -80,6 +82,11 @@ impl ResourceScopeKey {
         if key == "coordinator" {
             return Some(Self::Coordinator);
         }
+        if let Some(conversation_id) = key.strip_prefix("unattached:") {
+            if !conversation_id.is_empty() {
+                return Some(Self::Unattached(conversation_id.to_string()));
+            }
+        }
         key.strip_prefix("work:")
             .and_then(|id| WorkScopeId::parse(id).ok())
             .map(Self::Work)
@@ -89,7 +96,7 @@ impl ResourceScopeKey {
     pub fn work_scope_id(&self) -> Option<&WorkScopeId> {
         match self {
             Self::Work(id) => Some(id),
-            Self::Coordinator | Self::GlobalTerminal => None,
+            Self::Unattached(_) | Self::Coordinator | Self::GlobalTerminal => None,
         }
     }
 }

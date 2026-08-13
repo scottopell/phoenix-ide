@@ -21,7 +21,7 @@ It does **not** own:
 - PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context — the `pr-association` spec;
 - UI placement, wording variants, or action-bar composition — the `work-actions-bar` spec owns those concerns.
 
-Historical compatibility note: earlier Phoenix surfaces exposed **Abandon** and **Mark as merged** as separate lifecycle actions. That product split is deprecated. Any migration-time adapter that still recognizes those legacy verbs SHALL map them into the one Close flow while preserving Close's current confirmation and loss-safety contract; the legacy verbs are not current user-facing actions.
+Compatibility adapters for `abandon` and `mark_merged` SHALL map those inputs into the one Close flow, preserving the confirmation and loss-safety contract, and SHALL NOT expose them as writable lifecycle choices.
 
 ---
 
@@ -116,15 +116,15 @@ THE SYSTEM SHALL treat it as a typed inspection-mismatch path that returns the C
 ### REQ-WL-002b: Retirement Retires Owned Resources Stepwise, Idempotently, and Without Automatic Recovery Artifacts
 
 WHEN bedrock requests resource retirement for one exact Close attempt
-THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
+THE SYSTEM SHALL retire the owned worktree and WorkScope-scoped resources for every attached `WorkScope` targeted by that ProductConversation operation, including each worktree itself, bash/process-group resources, tmux resources, PTY/terminal resources, browser resources, and equivalent live execution resources owned by that exact WorkScope
 
 THE SYSTEM SHALL treat the attached `WorkScope` as the owner of the retireable resources
-AND SHALL derive cleanup authority only from the root product conversation's committed Close retirement operation targeting that attached `WorkScope`
+AND SHALL derive cleanup authority only from the exact ProductConversation's committed Close retirement operation targeting that attached `WorkScope`
 
-THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same open product conversation as participants in that one aggregate rather than as independent WorkScope owners
-AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the product conversation's attached `WorkScope`
+THE SYSTEM SHALL treat transcript rows and subordinate execution conversations within the same ordinary Open ProductConversation as participants in that one aggregate rather than as independent WorkScope owners
+AND SHALL NOT let those subordinate participants independently own, veto, or delay destructive retirement of the ProductConversation's attached `WorkScope`
 
-THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate open product conversation that also resolves to the same `WorkScope`, or from unresolved conversation-identity evidence that prevents Phoenix from proving whether another open product aggregate exists
+THE SYSTEM SHALL distinguish those same-aggregate participants from a genuinely separate ordinary Open ProductConversation that also resolves to the same `WorkScope`, or from unresolved ProductConversation-identity evidence that prevents Phoenix from proving whether another Open product aggregate exists
 AND SHALL block destructive teardown only for that distinct-open-aggregate or unresolved-identity-conflict case
 
 THE SYSTEM SHALL perform retirement as a stepwise idempotent operation that records per-owned-resource completion or residual-error evidence as each step is attempted so retries can safely continue from the exact prior state
@@ -163,6 +163,33 @@ AND SHALL NOT create, rename, move, fast-forward, merge, delete, push, close, or
 
 ---
 
+### REQ-PROJ-028a: Restart Reconciles a Missing Registered Worktree as Open Repair Evidence
+
+WHEN Phoenix restarts and the latest Open row of a Git-backed `ProductConversation` still has a registered attached `WorkScope`/worktree tuple but that registered worktree path is missing on disk
+THE SYSTEM SHALL keep the owning `ProductConversation` in lifecycle `Open`
+AND SHALL record immutable typed restart repair evidence bound to that owning `ProductConversation`, its already-attached `WorkScope`, the attached hidden `GitRepository`, the retained worktree identity, the observed worktree path, the retained worktree fingerprint, one exact observation kind of `missing` or `inaccessible`, one repair-observation generation, and the exact observation time
+AND SHALL NOT assign a removed row-terminal state to the latest row as restart classification
+
+THE SYSTEM SHALL treat that typed condition as truthful persisted ownership evidence only
+AND SHALL NOT fabricate a replacement `WorkScope`, worktree attachment, detached branch label, branch owner, fallback branch selection, or guessed path continuity for the conversation
+
+THE SYSTEM SHALL integrate that typed condition with Close repair and retry semantics
+AND SHALL allow later Close inspection, Close retry, or manual repair flows to adopt an exact `missing` observation idempotently only when exact identity evidence proves that adoption
+AND SHALL NOT treat an `inaccessible` observation as absence authority
+AND SHALL keep inaccessible observations in typed repair until a later exact observation proves `missing` or the resource is retired normally
+AND SHALL otherwise route conflicts to typed repair rather than silently succeeding
+
+**Rationale:** A missing registered worktree after restart is a repair-class ownership problem, not a hidden terminal lifecycle. Keeping the product aggregate Open preserves the one Close/reconciliation contract while typed evidence lets later retries reason from persisted ownership without guessing.
+
+---
+
+### REQ-PROJ-WS-001: WorkScope as Resource Owner
+
+Work-affine resources SHOULD be owned by the opaque persisted `work_scope_id`. Resource ownership MUST NOT be derived from ProductConversation ids, transcript-row ids, sub-agent ids, working directories, or worktree paths. ProductConversations, transcript rows, and subordinate execution conversations MAY have a `WorkScope` attached, but attachment is not ownership. THE SYSTEM SHALL expose ProductConversation-to-WorkScope attachments through exactly one authoritative writable representation and SHALL treat every other attachment representation as a read-only derivation rather than a parallel writable authority. When continuation creates a new execution row within the same ProductConversation, the ProductConversation keeps the same attached `WorkScope`; Phoenix SHALL NOT describe that step as transferring WorkScope ownership from one row to another or as electing a latest row owner. Attachments and other work-affine execution resources share that same WorkScope ownership model. Distinct ProductConversations remain isolated by distinct WorkScope identities even when their environments use the same path.
+
+
+---
+
 ### REQ-WL-002c: Needs-Repair Retry Reuses the Same Exact Close Attempt
 
 WHEN resource retirement for one exact Close attempt fails and leaves the product conversation in a visible needs-repair state
@@ -172,7 +199,7 @@ AND SHALL issue `CloseRetirementRetryRequested(product_conversation, attempt_id)
 WHEN the user invokes retry from needs-repair
 THE SYSTEM SHALL request retirement again for that same exact Close attempt
 AND SHALL preserve the attempt-bound retirement evidence and residual state already recorded for prior steps
-AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate project-surface lifecycle state outside the typed Close retry command
+AND SHALL NOT mint a new Close attempt, silently complete the Close obligation, or mutate ProductConversation lifecycle state outside the typed Close retry command
 
 WHEN repair completes automatically through operator action or an idempotent external precondition change
 THE SYSTEM SHALL converge by driving the same exact-attempt retry/completion authority rather than by fabricating an unbound success path that bypasses the visible needs-repair attempt

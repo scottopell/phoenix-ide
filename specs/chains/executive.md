@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-The chains spec describes Phoenix's existing continuation-chain product surface: derived chain identity over `continued_in_conv_id`, a dedicated chain page, persisted chain Q&A, editable chain naming, and chain-scoped retrieval for read-only recall.
+The chains spec describes the normative unified ProductConversation surface for continuation-linked transcript history and read-only recall. The shipped implementation still uses a derived root-keyed chain identity, dedicated chain page, persisted chain Q&A, and editable chain naming as compatibility behavior.
 
 ## Current Reality
 
@@ -19,15 +19,15 @@ Chains remain a derived layer over `conversations.continued_in_conv_id` plus per
 | Requirement | Status | Notes |
 |---|---|---|
 | **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ✅ Complete (legacy current reality) | Chain-scoped read-only Q&A remains shipped |
-| **REQ-CHN-002:** Continuation Chains Surface as First-Class Entities | ✅ Complete (legacy current reality) | Derived chain identity and sidebar grouping remain shipped |
-| **REQ-CHN-003:** Chain Page as a Navigable Place | ✅ Complete (legacy current reality) | Dedicated chain route/page still exists |
-| **REQ-CHN-004:** Ask the Chain, Get a Streamed Answer | ✅ Complete (legacy current reality) | Chain Q&A SSE remains shipped |
-| **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete (legacy current reality) | `chain_qa` persistence remains shipped |
-| **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete (legacy current reality) | Stateless per-question invocation remains shipped |
-| **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete (legacy current reality) | Editable/regenerated `chain_name` remains shipped |
-| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | ✅ Complete (legacy current reality) | Chain dock/work-identity surfaces remain shipped |
-| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | ✅ Complete (legacy current reality) | Retrieval-backed loop remains shipped |
-| **REQ-CHN-010:** Regenerate Chain Name From Member Content | ✅ Complete (legacy current reality) | Regenerate endpoint/button remains shipped |
+| **REQ-CHN-002:** Continuation Lineage Is Navigation Topology, Not a Separate Product Entity | Not implemented | Shipped derived root-keyed chain identity and sidebar grouping remain; first-class ProductConversation aggregate identity is not yet the navigation authority. |
+| **REQ-CHN-003:** The Normal Conversation Surface Hosts Lineage History | Not implemented | Shipped behavior still uses the dedicated chain route/page. |
+| **REQ-CHN-004:** Lineage Q&A Streams on the Normal Conversation Surface | 🟡 Partial | Streaming lineage Q&A is shipped on the legacy chain page, not the normal ProductConversation surface. |
+| **REQ-CHN-005:** Q&A History Persists With the Product Conversation | 🟡 Partial | `chain_qa` persistence remains root-row/chain keyed rather than aggregate-owned. |
+| **REQ-CHN-006:** Independent Q&A Quality As History Accumulates | ✅ Complete (legacy current reality) | Stateless per-question invocation remains shipped. |
+| **REQ-CHN-007:** Conversation Title Belongs to the ProductConversation Aggregate | Not implemented | Editable/regenerated `chain_name` remains a separate shipped authority. |
+| **REQ-CHN-008:** The Normal Conversation Surface Shows Work Identity for the Live Attached Scope | 🟡 Partial | Work identity is shipped on the legacy chain page rather than the normal ProductConversation surface. |
+| **REQ-CHN-009:** Lineage Q&A Is a Read-Only Agentic Loop Scoped to One Product Conversation | 🟡 Partial | The retrieval-backed loop is shipped but remains bound to root-keyed chain identity. |
+| **REQ-CHN-010:** No Separate Chain-Specific Lifecycle or Management Actions | Not implemented | Dedicated chain naming, archive/delete, and management endpoints remain shipped. |
 
 ## Reconciliation Note
 

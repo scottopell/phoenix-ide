@@ -11,7 +11,7 @@
 --           failures; disk-persistence acknowledgement; and acknowledged
 --           invalidation of rejected or deleted pending payloads.
 --
--- Excludes: Markdown rendering, project-file transport, server execution, and
+-- Excludes: Markdown rendering, conversation-scoped file transport, server execution, and
 --           local queue retry/reconciliation after durable enqueue (see
 --           ../user_message_queue/user_message_queue.allium).
 
@@ -80,7 +80,7 @@ value WorkScopeIdentity {
     stable_key: String
 }
 
-value ProjectFileIdentity {
+value ScopedFileIdentity {
     absolute_path: String
 }
 
@@ -178,7 +178,7 @@ external entity ReaderReanchorRequest {
 entity ProseReviewSession {
     conversation: IosProductConversation
     work_scope: WorkScopeIdentity
-    file: ProjectFileIdentity
+    file: ScopedFileIdentity
     content_revision: ContentRevision
 
     notes: ProseReviewNote with session = this
@@ -215,7 +215,7 @@ entity ProseReviewAuthority {
     contribution: ReviewContributionIdentity
     text: String
     work_scope: WorkScopeIdentity
-    file: ProjectFileIdentity
+    file: ScopedFileIdentity
     content_revision: ContentRevision
 }
 

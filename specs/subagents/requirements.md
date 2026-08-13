@@ -30,8 +30,8 @@ AND execute all sub-agent conversations in parallel
 
 WHEN spawning sub-agents
 THE SYSTEM SHALL assign a mandatory time limit to each sub-agent
-AND default mode to Explore if not specified (see REQ-PROJ-008)
-AND enforce a max turn limit per sub-agent (Explore: 20, Work: 50, overridable)
+AND default execution authority to read-only if not specified (see REQ-PROJ-008)
+AND enforce a max turn limit per sub-agent (read-only: 20, write-capable: 50, overridable)
 
 WHEN more than 10 sub-agents are requested in a single spawn call
 THE SYSTEM SHALL reject the call with an error
@@ -156,6 +156,32 @@ added complexity without benefit.
 
 ---
 
+### REQ-PROJ-008: Sub-Agent Capabilities Inherit the Parent Workspace Authority
+
+WHEN a Git-backed parent conversation spawns a sub-agent with write authority requested
+THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
+AND grant write access to that same worktree
+AND allow only one write-authority sub-agent per parent conversation at a time
+AND place the parent conversation in AwaitingSubAgentResult state for the duration
+AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
+AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
+AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
+
+WHEN a Git-backed parent conversation spawns a sub-agent with read-only authority requested
+THE SYSTEM SHALL configure the sub-agent's working directory as the parent's worktree
+AND grant read-only authority there
+AND allow multiple read-only sub-agents in parallel
+AND SHALL NOT provision a fresh detached-default-branch disposable worktree for that sub-agent
+AND SHALL resolve and carry the parent's exact durable `WorkScope` identity in the spawned sub-agent specification
+AND SHALL attach the sub-agent to that exact `WorkScope` identity rather than inferring attachment from filesystem path equality
+
+WHEN a planning/read-only conversation spawns sub-agents
+THE SYSTEM SHALL configure those sub-agents with read-only authority
+
+**Rationale:** The important distinction is execution authority, not lifecycle naming. Phoenix must preserve the single-writer guarantee for one worktree while still allowing parallel read-only analysis.
+
+---
+
 ### REQ-SA-008: Context Injection via Read-First Files
 
 WHEN a sub-agent spawn spec includes a list of file paths in `read_first`
@@ -271,4 +297,4 @@ AND SHALL reject an unknown or stale id before spawning any task in the batch
 
 **Rationale:** Defaults should be the easiest valid representation. Empty
 placeholder strings and server-process-relative paths must not turn inheritance
-into a validation failure or move a child outside the parent's project context.
+into a validation failure or move a child outside the parent's working context.

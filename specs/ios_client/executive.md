@@ -17,6 +17,8 @@ and hard-deletion lifecycle is normative in `ios_client_lifecycle.allium`.
 It composes with the existing server SSE and user-message queue contracts
 rather than duplicating their state machines.
 
+The shipped client still consumes legacy server project/mode vocabulary where the server emits it. The normative grounding surface instead binds files to exact attached WorkScopes and does not expose Project or hidden GitRepository as a mobile grouping or lifecycle object; REQ-IOS-019 through REQ-IOS-021 remain unimplemented.
+
 Unit coverage follows a contract-test pattern (see `ios/README.md`
 "Testing"): pure components get one test per rule of the contract they
 implement. An opt-in live-server XCUITest covers first-run TLS setup, mock

@@ -6,7 +6,7 @@ The File Explorer Panel provides persistent browsing and live Git grounding on d
 
 ## Technical Summary
 
-`FileExplorerPanel` and `FileBrowserOverlay` share `FileTree`. A conversation-scoped endpoint captures bounded porcelain-v2 status without network access or index mutation, while the checkout model is shared with Workspace Diff. `FileTree` owns the existing visible-page refresh cadence and refreshes the Git snapshot through the same tick. Typed path states preserve index and worktree semantics; the UI derives one compact file badge and ancestor counts. Viewer-slot commands open Workspace Diff from desktop and mobile grounding summaries.
+`FileExplorerPanel` and `FileBrowserOverlay` share `FileTree`. A conversation-scoped endpoint captures bounded porcelain-v2 status without network access or index mutation, while the checkout model is shared with Workspace Diff. The shipped surfaces still receive some legacy Project/mode context, but the normative file root and live-checkout identity are conversation/WorkScope-scoped; hidden `GitRepository` is not a file-browser grouping. `FileTree` owns the existing visible-page refresh cadence and refreshes the Git snapshot through the same tick. Typed path states preserve index and worktree semantics; the UI derives one compact file badge and ancestor counts. Viewer-slot commands open Workspace Diff from desktop and mobile grounding summaries.
 
 ## Status Summary
 
@@ -24,5 +24,6 @@ The File Explorer Panel provides persistent browsing and live Git grounding on d
 | **REQ-FE-010:** Mobile File Browser Overlay | ✅ Complete | FileBrowserOverlay hosts FileTree |
 | **REQ-FE-011:** Context Menu, Drag-and-Drop, Keyboard Nav | ✅ Complete | FileTreeContextMenu + custom drag type + focus scope |
 | **REQ-FE-012:** Live Git Status Grounding | ✅ Complete | Typed status snapshot, tree badges, ancestor counts, desktop/mobile summaries |
+| **REQ-PROJ-038:** Show the Live Worktree Checkout in Diff Review | ✅ Complete | Rehomed immutable ID; diff review reads the live checkout instead of legacy persisted branch assumptions |
 
-**Progress:** 12 of 12 complete
+**Progress:** 13 of 13 complete

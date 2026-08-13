@@ -10,27 +10,27 @@ The `/global` surface is the standard transcript and composer without a separate
 
 ## Technical Summary
 
-Coordinator LLM requests keep the stable language-specific prompt as their cached prefix and append a bounded snapshot of raw continuation-leaf facts. The snapshot identifies both root and current conversations, exact runtime state, state and conversation timestamps, available task metadata, WorkScope identity, and authoritative active WorkScope paths. It applies no open, stalled, closed, or attention classification.
+Coordinator LLM requests keep the stable language-specific prompt as their cached prefix and append a bounded snapshot of raw continuation-leaf facts. The shipped snapshot identifies root and current transcript rows, exact runtime state, state and conversation timestamps, available task metadata, WorkScope identity, and authoritative active WorkScope paths. First-class ProductConversation identity remains a migration target. The snapshot applies no open, stalled, closed, or attention classification.
 
-The host-bound `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
+The host-bound `query_database` tool provides operator-level forensic reads of Phoenix application tables, including hidden messages and sensitive records that may not be visible in normal UI. The shipped snapshot and database still expose legacy project-named rows and fields; normative orientation now identifies ProductConversation and WorkScope, with repository context derived through WorkScope rather than a Project grouping. It executes one statement on a separate read-only connection. SQLite authorization denies mutation, connection-changing operations, internal and FTS shadow storage, filesystem and extension functions, while SQL/column/row/serialized-output/time bounds protect system stability. Results use typed cells and report truncation.
 
-Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. Durable reference resolution remains Coordinator-only. Restricted planning conversations and sub-agents receive none of these global tools. When the host supports the Explore `nono` sandbox, Coordinator also receives the existing sandboxed Bash path with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. The Coordinator registry remains builtin-only and excludes writable shell/filesystem access, browser, MCP, task, project, workspace, conversation creation, approval, and lifecycle mutation tools.
+Natural-language message search, bounded transcript reads, and the shared cross-conversation message service are available to write-capable ordinary ProductConversations and the Coordinator. Durable reference resolution remains Coordinator-only. Restricted planning conversations and sub-agents receive none of these global tools. When the host supports the Explore `nono` sandbox, Coordinator also receives the existing sandboxed Bash path with an explicit active WorkScope ID whose canonical cwd Phoenix resolves server-side. The Coordinator registry remains builtin-only and excludes writable shell/filesystem access, browser, MCP, task, repository, workspace, conversation creation, approval, and lifecycle mutation tools.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-GR-001:** Provide Transparent Current Activity Facts | ✅ Complete | Each turn receives raw current-leaf state, timestamps, WorkScope identity, and active environment paths without inferred work labels |
-| **REQ-GR-002:** Expose Continuation Identity Without Collapsing Evidence | ✅ Complete | Snapshot and reference resolution expose both durable root and current conversation IDs |
+| **REQ-GR-001:** Provide Transparent Current Activity Facts | 🟡 Partial | Each turn receives raw current-leaf state, timestamps, WorkScope identity, and active environment paths; explicit first-class ProductConversation identity remains a migration target. |
+| **REQ-GR-002:** Expose Continuation Identity Without Collapsing Evidence | 🟡 Partial | Snapshot and reference resolution expose root/current transcript IDs; explicit first-class ProductConversation identity remains a migration target. |
 | **REQ-GR-003:** Interpret Activity From Explicit Evidence | ✅ Complete | Prompt requires current relational state, timestamps, and recent evidence for status conclusions |
 | **REQ-GR-004:** Provide Bounded Read-Only Relational Queries | ✅ Complete | Engine-authorized one-statement SQLite reads have work, row, and byte budgets |
-| **REQ-GR-005:** Provide Stable References and App-Local Links | ✅ Complete | Work, chain, conversation, and message references remain durable and resolvable; Coordinator citations navigate within the current Phoenix context and expose the existing parent-style return breadcrumb |
+| **REQ-GR-005:** Provide Stable References and App-Local Links | 🟡 Partial | Existing work, chain, conversation, and message references remain resolvable; typed ProductConversation/transcript domains and chain-alias normalization remain migration targets. |
 | **REQ-GR-006:** Provide One Durable Coordinator Identity | ✅ Complete | `/api/global/coordinator` resolves the singleton through the standard runtime and UI |
 | **REQ-GR-007:** Bound Phoenix-Wide Agent Capabilities | ✅ Complete | Write-capable ordinary ProductConversations and Coordinator share bounded database/history reads and singular messaging; reference resolution and WorkScope-targeted sandboxed Bash remain Coordinator-only |
 | **REQ-GR-008:** Answer With Source Citations | ✅ Complete | Transcript reads expose citation metadata and the prompt requires stable citations |
-| **REQ-GR-009:** Resolve Durable Targets Without Guessing | ✅ Complete | Typed resolution supports work/conversation handles, links, IDs, and chain checks |
+| **REQ-GR-009:** Resolve Durable Targets Without Guessing | 🟡 Partial | Existing resolution supports work/conversation handles and links; typed ProductConversation/transcript domains and ambiguous-bare-ID rejection remain migration targets. |
 | **REQ-GR-010:** Keep the Coordinator Surface Chat-Only | ✅ Complete | `/global` mounts only the shared conversation runtime and inline briefing action |
-| **REQ-GR-011:** Inject a Bounded Relational Snapshot | ✅ Complete | Requests append transparent turn-current facts and active WorkScope paths after the cached stable prompt |
+| **REQ-GR-011:** Inject a Bounded Relational Snapshot | 🟡 Partial | Requests append transparent turn-current facts and active WorkScope paths, but do not yet expose first-class ProductConversation identity. |
 | **REQ-GR-011A:** Bound Database Integrity and Resource Use | ✅ Complete | Application data is readable; SQLite authority and resource budgets protect integrity and stability |
 | **REQ-GR-012:** Commit and Report One Message Outcome | ✅ Complete | HTTP chat and agent cross-conversation actions share typed delivery, steering, rejection, and self-target rejection outcomes |
 
@@ -50,6 +50,6 @@ The Coordinator runs only on user turns. It does not monitor work in the backgro
 - Phoenix-wide tools for restricted planning conversations or sub-agents.
 - Images, files, skills, user-agent metadata, or lifecycle commands in cross-conversation messages.
 - Batch-action transactions or atomic fan-out.
-- Conversation creation, task lifecycle, approval, repository, filesystem, project, or workspace mutation from the Coordinator.
+- Conversation creation, task lifecycle, approval, repository, filesystem, or workspace mutation from the Coordinator.
 - Background monitoring or proactive intervention without a user turn.
 - A separate transcript/composer runtime for the Coordinator.

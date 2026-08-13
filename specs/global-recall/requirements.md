@@ -18,7 +18,7 @@ The Coordinator is an open-ended cross-conversation console, not a manager for o
 
 The user must be able to answer:
 
-1. Which project owns an open work item?
+1. Which ProductConversation and WorkScope own an open work item?
 2. Which conversation is the current source of truth for the item?
 3. Why does the item's current state need attention or qualify as open work?
 4. Which source conversations or messages support a Coordinator claim about history?
@@ -37,17 +37,17 @@ THE SYSTEM SHALL provide bounded relational facts rather than application-inferr
 WHEN a user opens the Coordinator surface
 THE surface SHALL present only the normal Coordinator conversation
 
-THE facts SHALL distinguish durable root identity from latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
+THE facts SHALL distinguish durable ProductConversation identity, derived root transcript-row identity, and latest execution-row identity and SHALL include current state, state-update time, conversation-update time, available task metadata, attached WorkScope identity, and authoritative active WorkScope cwd and worktree paths without suppressing runtime state when task metadata disagrees
 
 ---
 
 ### REQ-GR-002: Expose Continuation Identity Without Collapsing Evidence
 
-WHEN conversations form a continuation chain
-THE SYSTEM SHALL expose both the durable root conversation and the current/latest execution row
+WHEN transcript rows form a continuation chain
+THE SYSTEM SHALL expose the durable ProductConversation, its derived root transcript row, and the current/latest execution row
 
 WHEN the Coordinator requests current transcript evidence
-THE SYSTEM SHALL direct it to the current/latest conversation rather than silently reading only the historical root
+THE SYSTEM SHALL direct it to the current/latest transcript row rather than silently reading only the historical root row
 
 Historical chain members SHALL remain addressable through durable references
 
@@ -79,13 +79,14 @@ THE SYSTEM SHALL return typed cells, explicit truncation, and stable policy or b
 
 ### REQ-GR-005: Provide Stable References and App-Local Links
 
-WHEN a work identity, chain, conversation, or source message is displayed as a source
-THE SYSTEM SHALL provide an app-local navigation target or stable reference handle that can be copied or cited
+WHEN a work identity, ProductConversation, transcript row, or source message is displayed as a source
+THE SYSTEM SHALL provide an app-local navigation target or stable typed reference handle that can be copied or cited
 
-THE reference syntax SHALL distinguish chains, conversations, and open-work items
+THE reference syntax SHALL distinguish ProductConversation identities, transcript-row identities, and open-work views
+AND SHALL treat previously issued chain references as compatibility aliases that normalize to one ProductConversation plus derived transcript topology rather than as a second mutable identity
 
 WHEN a previously issued work-item reference is resolved
-THE SYSTEM SHALL continue to resolve it to the durable root and current conversation identities and SHALL report raw current state and timestamps without inferring open or closed status
+THE SYSTEM SHALL continue to resolve it to the durable ProductConversation, derived root transcript row, and current execution-row identities and SHALL report raw current state and timestamps without inferring open or closed status
 
 THE navigation targets SHALL be app-relative so deployment hostnames and browser gateways do not determine reference validity
 
@@ -102,7 +103,7 @@ THE Coordinator SHALL use the normal transcript, composer, streaming, continuati
 
 THE SYSTEM SHALL structurally distinguish the Coordinator from ordinary product conversations rather than encoding that difference as omitted lifecycle fields or nullable product-conversation links
 
-THE SYSTEM SHALL NOT present the Coordinator as ordinary project coding work or as a user-created open-work item
+THE SYSTEM SHALL NOT present the Coordinator as ordinary repository-backed coding work or as a user-created open-work item
 AND SHALL NOT give the Coordinator an ordinary ProductConversation Open/History lifecycle, WorkScope attachment, Close control, or Delete control
 
 THE SYSTEM SHALL reject archive and hard-delete operations targeting any member of the Coordinator continuation chain so its transcript and singleton identity remain durable
@@ -154,11 +155,12 @@ THE SYSTEM SHALL distinguish current relational facts from transcript evidence a
 
 ### REQ-GR-009: Resolve Durable Targets Without Guessing
 
-WHEN a user or the Coordinator provides a supported work reference, conversation reference, app-local conversation link, or conversation id
+WHEN a user or the Coordinator provides a supported work reference, typed ProductConversation reference, typed transcript-row reference, or app-local link
 THE SYSTEM SHALL resolve it to one durable target kind, target id, app-local navigation target when available, title when available, and concise summary
+AND SHALL reject a bare identifier whose identity domain is ambiguous rather than resolving it by equal underlying bytes
 
 WHEN an open-work reference is used for messaging
-THE SYSTEM SHALL target its current/latest conversation without silently retargeting a terminal current conversation to a historical member
+THE SYSTEM SHALL target its topology-derived latest parent transcript row without silently retargeting a terminal latest row to a historical member
 
 IF the reference has unsupported or ambiguous syntax
 THE SYSTEM SHALL return a clear error instead of guessing
@@ -183,7 +185,7 @@ THE briefing action SHALL preserve the user's draft and SHALL NOT create a separ
 WHEN the Coordinator dispatches an LLM turn
 THE SYSTEM SHALL attach a bounded current-activity snapshot after the stable cached Coordinator prompt
 
-THE snapshot SHALL expose raw current continuation leaves with root and current identifiers, state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths
+THE snapshot SHALL expose raw current continuation leaves with ProductConversation, root transcript-row, and current transcript-row identifiers, state, state-update time, conversation-update time, available task metadata, WorkScope identity, and authoritative active WorkScope cwd and worktree paths
 
 THE snapshot SHALL order active runtime states first and then by conversation update time, SHALL state its row limit and selection rule, and SHALL explicitly report result truncation
 
