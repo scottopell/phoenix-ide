@@ -256,6 +256,13 @@ func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID:
     return deployment?.instanceID == instanceID.uuidString
 }
 
+func attachedDeploymentOwnershipViolation(_ ownership: InstallationOwnership) -> String? {
+    guard ownership.grantsManagedAuthority else {
+        return "Attached Phoenix is \(ownership.label). Phoenix.app manages only launchd-owned deployments; this deployment remains viewable but read-only."
+    }
+    return nil
+}
+
 actor SidecarLogRecorder {
     struct Snapshot: Equatable {
         let logAppend: Data
@@ -569,7 +576,7 @@ final class SidecarOutputPump: @unchecked Sendable {
     }
 }
 
-func logSnapshotBelongsToCurrentOperation(current: UUID, source: UUID) -> Bool {
+func logSnapshotBelongsToCurrentOperation(current: UUID?, source: UUID) -> Bool {
     current == source
 }
 
@@ -621,6 +628,7 @@ final class ServerManager: ObservableObject {
     }
 
     private var operationAuthority = ConnectionOperationAuthority()
+    private var logPublicationOperation: UUID?
     private var launchedBundledInstance: LaunchedBundledInstance?
     private let keychain: any PackagedSidecarSecretProvider
 
@@ -637,6 +645,7 @@ final class ServerManager: ObservableObject {
         bundledReconnectQueue.cancel()
         readinessTask?.cancel()
         let operation = operationAuthority.replace()
+        logPublicationOperation = nil
         do {
             let selected = try ConfigurationStore.load()
             mode = selected
@@ -698,7 +707,7 @@ final class ServerManager: ObservableObject {
     }
 
     fileprivate func publishRecentLogLines(_ lines: [String], operation: UUID) {
-        guard logSnapshotBelongsToCurrentOperation(current: operationAuthority.id, source: operation) else { return }
+        guard logSnapshotBelongsToCurrentOperation(current: logPublicationOperation, source: operation) else { return }
         recentLogLines = lines
     }
 
@@ -824,6 +833,7 @@ final class ServerManager: ObservableObject {
     private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
         state = .startingSidecar
         recentLogLines = []
+        logPublicationOperation = operation
 
         do {
             try FileManager.default.createDirectory(at: configuration.runtimeRootURL, withIntermediateDirectories: true)
@@ -988,7 +998,7 @@ final class ServerManager: ObservableObject {
         }
         switch selected {
         case .attached:
-            return nil
+            return attachedDeploymentOwnershipViolation(deployment.installationOwnership)
         case .bundled:
             guard LoopbackAddressPolicy.bundledBindAddressIsLoopback(deployment.network.bindAddress) else {
                 return "Bundled Phoenix reported a non-loopback listener: \(deployment.network.bindAddress)"

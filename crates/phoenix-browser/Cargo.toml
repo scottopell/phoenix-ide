@@ -36,5 +36,9 @@ thiserror = "2"
 
 tracing = "0.1"
 
+[dev-dependencies]
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+tempfile = "3"
+
 [lints]
 workspace = true

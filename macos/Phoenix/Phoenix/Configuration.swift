@@ -923,6 +923,13 @@ struct PhoenixWebViewPolicy {
     }
 }
 
+enum PhoenixDownloadPolicy {
+    static func shouldAccept(responseURL: URL?, canShowMIMEType: Bool, expectedOrigin: PhoenixOrigin) -> Bool {
+        guard !canShowMIMEType, let responseURL else { return false }
+        return expectedOrigin.exactlyMatches(responseURL)
+    }
+}
+
 enum PhoenixDownloadNaming {
     static func sanitizedFilename(_ suggestedFilename: String) -> String {
         let trimmed = suggestedFilename.trimmingCharacters(in: .whitespacesAndNewlines)

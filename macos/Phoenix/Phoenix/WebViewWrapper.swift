@@ -185,8 +185,14 @@ struct WebViewWrapper: NSViewRepresentable {
         ) {
             if navigationResponse.canShowMIMEType {
                 decisionHandler(.allow)
-            } else {
+            } else if PhoenixDownloadPolicy.shouldAccept(
+                responseURL: navigationResponse.response.url,
+                canShowMIMEType: navigationResponse.canShowMIMEType,
+                expectedOrigin: origin
+            ) {
                 decisionHandler(.download)
+            } else {
+                decisionHandler(.cancel)
             }
         }
 

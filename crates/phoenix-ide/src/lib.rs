@@ -74,7 +74,6 @@ use db::Database;
 use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_http::{
@@ -427,7 +426,7 @@ fn build_disk_locations(
     locations.push(DiskLocation {
         category: DiskCategory::BrowserProfiles,
         label: "Browser profiles".to_string(),
-        path: PathBuf::from(tools::browser::session::user_data_dir_glob()),
+        path: tools::browser::session::user_data_dir_glob(runtime_env),
         mode: MeasureMode::Pattern,
     });
 

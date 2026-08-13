@@ -229,6 +229,31 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "file:///tmp/secret")!, expectedOrigin: expected), .cancel)
     }
 
+    func testDownloadPolicyAcceptsOnlyUnshowableResponsesFromExactConfiguredOrigin() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+
+        XCTAssertTrue(PhoenixDownloadPolicy.shouldAccept(
+            responseURL: URL(string: "https://phoenix.example.test/files/report.pdf"),
+            canShowMIMEType: false,
+            expectedOrigin: expected
+        ))
+        XCTAssertFalse(PhoenixDownloadPolicy.shouldAccept(
+            responseURL: URL(string: "https://external.example.test/report.pdf"),
+            canShowMIMEType: false,
+            expectedOrigin: expected
+        ))
+        XCTAssertFalse(PhoenixDownloadPolicy.shouldAccept(
+            responseURL: URL(string: "https://phoenix.example.test/files/report.pdf"),
+            canShowMIMEType: true,
+            expectedOrigin: expected
+        ))
+        XCTAssertFalse(PhoenixDownloadPolicy.shouldAccept(
+            responseURL: nil,
+            canShowMIMEType: false,
+            expectedOrigin: expected
+        ))
+    }
+
     func testDownloadNamingSanitizesDangerousSuggestedNames() {
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename(" ../../quarterly?.pdf "), "____quarterly_.pdf")
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("   "), "download")
@@ -1321,6 +1346,26 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(authority.invalidate(launchOperation))
     }
 
+    func testExitedLaunchKeepsLogPublicationAuthorityUntilEOFDrainCompletes() {
+        var verificationAuthority = ConnectionOperationAuthority()
+        let launchOperation = verificationAuthority.id
+        let logPublicationOperation: UUID? = launchOperation
+
+        XCTAssertTrue(verificationAuthority.invalidate(launchOperation))
+        XCTAssertFalse(logSnapshotBelongsToCurrentOperation(
+            current: verificationAuthority.id,
+            source: launchOperation
+        ))
+        XCTAssertTrue(logSnapshotBelongsToCurrentOperation(
+            current: logPublicationOperation,
+            source: launchOperation
+        ))
+        XCTAssertFalse(logSnapshotBelongsToCurrentOperation(
+            current: logPublicationOperation,
+            source: UUID()
+        ))
+    }
+
     @MainActor
     func testWebKitStoragePartitionsAttachedAndBundledAuthorityAtIdenticalOrigin() {
         let attached = WebKitStoragePartition(serverMode: .attached)
@@ -1400,6 +1445,25 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(state.versionInfo, version)
         XCTAssertEqual(state.deploymentInfo, deployment)
         XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
+    }
+
+    func testAttachedDeploymentManagementRequiresLaunchdOwnership() {
+        XCTAssertNil(attachedDeploymentOwnershipViolation(.launchdManaged))
+
+        let unsupportedOwnerships: [InstallationOwnership] = [
+            .systemdManaged,
+            .bareSupervisorManaged,
+            .development,
+            .unmanaged("no activation evidence"),
+            .ambiguous("conflicting evidence"),
+            .unsupported("linux"),
+            .unknown("future_managed_kind"),
+        ]
+        for ownership in unsupportedOwnerships {
+            let violation = attachedDeploymentOwnershipViolation(ownership)
+            XCTAssertNotNil(violation, "\(ownership) must remain viewable but read-only")
+            XCTAssertTrue(violation?.contains("viewable but read-only") == true)
+        }
     }
 
     func testConnectionReapplyUsesCurrentConfiguredWebOriginNotBindAddress() throws {
