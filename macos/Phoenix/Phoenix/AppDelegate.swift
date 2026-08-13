@@ -285,7 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.pendingConversationID = nil
                 }
                 let message = error.localizedDescription
-                NSLog("Phoenix deep link rejected for %s: %s", queued.uuidString.lowercased(), message)
+                NSLog("Phoenix deep link rejected for %@: %@", queued.uuidString.lowercased(), message)
                 if !decision.shouldRetainPendingConversation {
                     self.presentDeepLinkError(message)
                 }
