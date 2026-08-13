@@ -261,8 +261,8 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id))
+        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id))
     )
 
     @guidance
@@ -291,8 +291,8 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)),
-        inspection_fingerprint: aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id))
+        inspection_generation: aggregate_inspection_generation(attempt_bound_scope_inspections(product_conversation, attempt_id)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(attempt_bound_scope_inspections(product_conversation, attempt_id))
     )
 
     @guidance
@@ -670,6 +670,15 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
+--
+--   attempt_bound_scope_inspections(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> List<(WorkScope, RetirementInspection)>
+--       Returns exactly the persisted inspections bound to the attempt that
+--       produced its RetirementLossCategoryRow set, ordered by the opaque
+--       WorkScope identity's canonical bytes. Inspection values and category rows
+--       are one atomic evidence snapshot; this helper never observes live state.
 --
 --   recompute_all_targeted_scope_inspections(
 --       product_conversation: bedrock/ProductConversation,
