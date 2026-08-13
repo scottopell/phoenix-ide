@@ -1,596 +1,579 @@
-# General high-effort, low-cost coding-worker design
+# General high-effort, low-cost implementation-worker design
 
 ## Outcome
 
-**Recommendation:** do not add a special `coding-agent` runtime and do not make Codex's collaboration control plane authoritative for Phoenix lifecycle. Extend Phoenix's existing named-agent and sub-agent model in two independent increments:
+**Recommendation:** implement this as a general **delegated workflow profile** above Phoenix's target authority stack, not as a special `coding-agent` and not as an extension of today's `Work`/`Explore` mode taxonomy.
 
-1. Add optional explicit reasoning effort beside the existing model field in named-agent defaults and per-spawn overrides, then resolve the pair atomically into Phoenix's existing child conversation fields. “Execution profile” is useful terminology for that pair, not a required new runtime aggregate. This is the smallest change that expresses “run this role on Terra at medium effort” or “run this role on GLM 5.2 at high effort.”
-2. If deterministic implementation delegation proves useful, add a typed **implementation brief** whose validation plan is structurally required, then let the Phoenix state machine execute that plan after the worker returns. Do not treat developer-instruction prose or a worker's claim that tests passed as deterministic validation.
+The user-visible idea decomposes into four independent values:
 
-The first increment supplies the requested model/effort behavior. The second is a separate workflow capability and should not block the first.
+1. **Role** — implementation-oriented instructions and expected behavior.
+2. **Execution profile** — a registered model plus optional explicit reasoning effort.
+3. **Authority request** — read-only or write-capable access to the parent's attached environment.
+4. **Delegation contract** — a bounded objective plus an explicit acceptance method.
 
-The terms “cheap” and “fast” remain operator judgments, not Phoenix domain values. Phoenix selects a configured model ID and effort; it does not infer price or quality from model names.
+The target implementation worker is a first-class durable sub-agent workflow whose stable identity is its child conversation/agent ID. It attaches to the parent's `WorkScope`, derives repository and execution-root authority through that scope, executes tools through durable tool effects, and delivers one durable terminal outcome through the wake plane. Terra, GLM 5.2, or another model are configuration choices for the execution profile, never worker types.
+
+This corrects an earlier version of this design that treated today's mode-oriented `SubAgentSpec` and one-writer executor as the enduring architecture. Those are compatibility implementation details, not the stack new work should design against.
 
 ## Evidence classification
 
-- **Confirmed** statements below are backed by current Phoenix specs/code or pinned upstream Codex code.
-- **Recommended** statements are proposed design choices, not current behavior.
+- **Target authority** means accepted normative specifications or active roadmap delivery authority.
+- **Current compatibility** means behavior in today's runtime that may remain temporarily but must not shape the new domain model.
+- **Recommendation** means a proposed design choice.
 
 Upstream Codex citations are pinned to `openai/codex@f898ebcafdeb0052abc844d9e11b5e754b8ec4af`.
 
 ---
 
-## 1. Concept model
+## 1. Roadmap position and dependency stack
 
-The prior art combines several independent dimensions. Phoenix should name them separately:
+Issue #651 currently places this work above several active or sequenced authorities:
 
-| Concept | Question answered | Owner | Example |
-|---|---|---|---|
-| **Agent role** | What behavior and expertise should the child have? | Named-agent catalog | `implementation-worker` |
-| **Execution authority** | May it write, and where? | Phoenix mode/worktree policy | `write_capable` in parent's worktree |
-| **Execution profile** | Which model and explicit reasoning setting should run it? | Registry-validated spawn resolution | Terra + medium; GLM 5.2 + high |
-| **Delegation brief** | What outcome is delegated? | Coordinator/tool call | “Implement parser behavior X” |
-| **Acceptance plan** | What machine-observable condition proves the outcome? | Delegation workflow | selected test/check commands |
-| **Resource budget** | How much execution may it consume? | Parent/session policy | max turns, timeout, concurrency |
-| **Result** | What did the child report? | Child terminal lifecycle | summary/error |
-| **Validation evidence** | What did Phoenix independently observe? | Validation effect | command, exit status, bounded output |
-
-Two distinctions are especially important:
-
-- A role is not a model. `implementation-worker` can run on Terra, GLM 5.2, or a future model.
-- A result is not validation evidence. A model-generated statement such as “all tests pass” is useful narrative, but only a Phoenix-observed validator result is deterministic evidence.
-
-Suggested terminology avoids “cheap model agent” in persisted/API types:
-
-```text
-NamedAgentDefinition
-  ├── role instructions
-  ├── default execution authority
-  └── default execution profile
-
-DelegationBrief
-  ├── ExploratoryBrief
-  └── ImplementationBrief + AcceptancePlan
-```
-
----
-
-## 2. Current Phoenix model
-
-### Confirmed flow
-
-```mermaid
-flowchart LR
-    C["Coordinator LLM"] -->|"spawn_agents tasks[]"| E["Runtime executor"]
-    E --> R["Resolve frozen named-agent catalog"]
-    R --> V["Validate model, authority, cwd, one-writer rule"]
-    V --> S["Create child conversation and SubAgentSpec"]
-    S --> A["Child state machine"]
-    A -->|"submit_result or submit_error"| F["Persist and fan in child outcome"]
-    F --> C
-```
-
-- `SpawnAgentsTool` exposes a dynamically typed `agent_type` enum and known model IDs. The tool parser itself does not spawn; `ToolRegistryExecutor::handle_spawn_agents_tool` performs authoritative resolution and dispatch (`crates/phoenix-tools/src/subagent.rs`, `crates/phoenix-ide/src/runtime/executor.rs`).
-- Named agents are discovered once and frozen per conversation. `AgentDefinition` currently carries name, description, persona body, optional model, optional authority/mode compatibility data, and parsed-but-inert tools (`crates/phoenix-agents/src/lib.rs`; `specs/agents/agents.allium`, `InjectAgentTypeEnum`).
-- A named persona replaces only the generic prompt preamble; grounding and the terminal submission suffix remain (`specs/agents/agents.allium`, `ComposeSubAgentPersona`; `crates/phoenix-ide/src/system_prompt.rs`).
-- Spawn resolution already separates authority and model. Read-only children default to a provider-associated cheap model; write-capable children default to the parent model. Explicit model overrides must exist in the frozen registry (`specs/subagents/subagents.allium`, `SubAgentSpecsResolved`; `ToolRegistryExecutor::handle_spawn_agents_tool`).
-- Write-capable children inherit the parent's worktree authority. Phoenix allows at most one active writer per parent, while read-only children may run concurrently (`specs/subagents/subagents.allium`, `SpawnRejectedMultipleWorkInBatch` and `SpawnRejectedWorkSubAgentAlreadyActive`).
-- A child must terminate through `submit_result` or `submit_error`; fan-in is part of the parent state machine (`specs/subagents/requirements.md`, REQ-SA-003/004; `phoenix-state-machine/src/transition.rs`).
-- Child persona and conversation state are persisted. On process restart, currently running children do not continue executing; Phoenix synthesizes interrupted fan-in outcomes while preserving already-finished outcomes (`crates/phoenix-db/src/lib.rs`, `set_sub_agent_persona`, `synthesize_spawn_fan_ins`; `specs/subagents/subagents.allium`).
-
-### Current model/effort behavior
-
-Phoenix already has the provider-neutral effort vocabulary and conversation/provider plumbing needed as a base, but it does **not** yet expose sub-agent role defaults or spawn overrides for effort:
-
-- `EffortCapabilities` distinguishes `Supported`, `Unknown`, and `Unsupported` (`crates/phoenix-llm/src/models.rs`; REQ-LLM-003b).
-- `EffectiveEffort` records value and provenance (`crates/phoenix-core/src/domain/llm_types.rs`).
-- Provider translation emits a native effort field only for known support and records omission reasons (REQ-LLM-004a/e/f and REQ-LLM-008a).
-- A child inherits only an explicit parent effort override, not the parent's resolved model-native default (REQ-LLM-004d).
-
-What is missing for the requested use case is a named-agent effort default or per-task effort override. Today a named agent can select a model and authority, but cannot independently say “use this explicit effort when this role is spawned.”
-
-### Current gaps relevant to this design
-
-1. **No role-level effort default.** The requested pairing can only be approximated by changing parent state or model defaults.
-2. **Task intent is unstructured.** The surrounding spawn shape and terminal lifecycle are already typed, but `TaskSpec.task` and terminal output remain strings; Phoenix cannot structurally distinguish an implementation brief with required acceptance from ordinary research.
-3. **Validation is model-owned.** A persona can ask the worker to run tests, but the state machine does not independently execute or persist an acceptance plan.
-4. **Persona is opaque prompt text.** This is appropriate for behavioral guidance, but it must not become the authority for execution permissions or validation requirements.
-5. **Model economics are not registry facts.** `cheap_model_id_for_provider` is a built-in routing convenience, not a general cost/latency policy for external models.
-
----
-
-## 3. What Codex's agent model demonstrates
-
-### Confirmed upstream behavior
-
-Codex has a session-scoped collaboration control plane with recursive thread-spawn support:
-
-- `[agents]` supports a session thread limit, default sub-agent model, and default sub-agent reasoning effort in `codex-rs/config/src/config_toml.rs` (`AgentsToml` fields `max_concurrent_threads_per_session`, `default_subagent_model`, and `default_subagent_reasoning_effort`).
-- Named roles are config layers. `AgentRoleToml` points to a role-specific config file. `apply_role_to_config*` overlays that layer while preserving caller-owned provider, service tier, model, effort, base instructions, sandbox, approval policy, and cwd unless overridden. Developer-instruction preservation differs between the standard and multi-agent-v2 paths (`codex-rs/core/src/agent/role.rs`; `codex-rs/core/src/tools/handlers/multi_agents_common.rs`).
-- `spawn_agent` accepts an `agent_type`, model, reasoning effort, service tier, and optional history fork. Call overrides fall back to configured sub-agent defaults; when a model changes without explicit effort, its native default is selected, while explicit effort is validated against the selected model (`codex-rs/core/src/tools/handlers/multi_agents/spawn.rs`, `SpawnAgentArgs`; `multi_agents_common.rs`, `apply_requested_spawn_agent_model_overrides`).
-- `AgentControl` is session-shared and persists parent/child spawn edges. The collaboration tool surface can spawn descendants, send input, wait, resume, and close agents (`codex-rs/core/src/agent/control.rs`; `codex-rs/core/src/tools/handlers/multi_agents.rs`).
-- Agent lifecycle is thread-oriented: `PendingInit`, `Running`, `Interrupted`, `Completed`, `Errored`, `Shutdown`, or `NotFound` (`codex-rs/protocol/src/protocol.rs`, `AgentStatus`).
-- Spawn edges and role metadata are persisted, and Codex can reload/resume descendants (`codex-rs/core/src/agent/control/spawn.rs`).
-- A session-wide spawn-count reservation and a separate execution-capacity limiter bound different resource dimensions (`codex-rs/core/src/agent/registry.rs`; `codex-rs/core/src/agent/control/execution.rs`).
-- Multi-agent usage hints are conditional developer messages and can vary between root and child sessions; disabled/empty hints are omitted (`codex-rs/core/src/session/multi_agents.rs`; `codex-rs/core/src/session/world_state.rs`). `effective_multi_agent_mode` selects proactive mode at `Ultra` effort when no explicit mode hint is configured, and suppresses collaboration mode for non-thread-spawn sub-agents.
-
-Stable source examples:
-
-- [`AgentsToml`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/config/src/config_toml.rs#L660-L695)
-- [`AgentRoleToml`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/config/src/config_toml.rs#L697-L710)
-- [`apply_role_to_config`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/role.rs)
-- [`SpawnAgentArgs` and spawn flow](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs)
-- [`build_agent_spawn_config` and effort validation](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/tools/handlers/multi_agents_common.rs)
-- [`AgentControl`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/control.rs)
-- [`AgentRegistry`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/registry.rs)
-- [`AgentStatus`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/protocol/src/protocol.rs#L1736-L1755)
-
-### Important lesson, not a template
-
-Codex confirms that model and effort are useful role defaults and spawn overrides. It does **not** establish that Phoenix should adopt Codex's recursive spawn-edge control plane, history forking, inter-agent messaging, or layered TOML config as domain concepts.
-
-Phoenix deliberately has a different model:
-
-- children cannot recursively spawn children (REQ-BED-009);
-- the parent awaits bounded fan-in rather than managing an open-ended agent graph;
-- write authority is tied to Phoenix-owned worktrees and one-writer invariants;
-- lifecycle is driven by pure state-machine transitions and effects;
-- provider translation is behind `LlmService`, including Phoenix's Codex bridge.
-
-### Responsibility matrix
-
-| Concern | Phoenix domain/runtime | Provider or Codex adapter |
+| Layer | Roadmap authority | Consequence for this design |
 |---|---|---|
-| Role discovery and selection | Owns | No |
-| Delegation brief and acceptance plan | Owns | No |
-| Worktree/write authority | Owns | No |
-| Child lifecycle, persistence, cancellation, fan-in | Owns | No |
-| Concurrency and max-turn/timeout budgets | Owns | No |
-| Internal effort selection and provenance | Owns | No |
-| Supported/unknown/unsupported capability | Owns registry classification | Adapter reports/translates facts |
-| Native effort field/value vocabulary | No | Owns |
-| OpenAI Responses/Codex auth and wire events | No | Owns |
-| Provider-specific omission/fallback logging | Requires observable behavior | Performs translation/logging |
-| Codex `AgentControl`, role layers, thread graph | Do not import | Remains an upstream Codex runtime detail |
+| Hidden repository substrate | R1, task 55006 / PR #677 | Repository identity and observations become typed hidden infrastructure. |
+| Repository authority cutover | R2, task 59004 | Correctness-sensitive repository decisions flow through `ProductConversation → WorkScope.repository → hidden GitRepository`; Project/path fallback is forbidden. |
+| Product lifecycle | ProductConversation task 92009 and ADR-026 | ProductConversation owns Open/History; WorkScope owns resources; transcript rows own execution history. |
+| Durable workflow authority | durable-workflow roadmap, including tasks 47007 and 78009 | Child lifecycle and tool execution move to durable workflow claims/effects rather than process-local orchestration. |
+| Parallel write-capable children | task 14003 | Multiple implementation children require a structural conflict boundary; today's single-writer rule is not the final product architecture. |
 
-**Translation boundary:** Phoenix resolves one concrete child `ExecutionProfile` before invoking the LLM service. The adapter receives the resolved internal effort and capability classification, translates it if supported, or omits it with structured telemetry if unknown/unsupported. The adapter never selects the worker role or decides whether to delegate.
+The roadmap reports R1 implementation active, R2 planned and blocked on R1, ProductConversation implementation intentionally paused for sequencing, and the durable-workflow program active. Therefore this task should define a consumer of those target boundaries, not add another mode-owned authority that R2/ProductConversation/durable-workflow must later unwind.
+
+### Target authority graph
+
+```mermaid
+flowchart TD
+    PC["ProductConversation — Open or History lifecycle"] --> WS["Attached WorkScope — resource ownership"]
+    WS --> GR["WorkScope.repository — hidden GitRepository authority"]
+    WS --> ER["Authoritative worktree and execution root"]
+    PC --> CR["Child durable workflow identity"]
+    CR --> AR["Authority request resolved against WorkScope"]
+    CR --> EP["Model and effort execution profile"]
+    CR --> DC["Delegation contract"]
+    CR --> TE["Durable tool effects"]
+    TE --> EV["Acceptance evidence"]
+    CR --> WH["Durable wake terminal handle"]
+    WH --> PC
+```
+
+### Ownership boundaries
+
+- **ProductConversation** owns the user-facing Open/History lifecycle and Close orchestration.
+- **Conversation rows** remain transcript/execution segments; continuation topology is `continued_in_conv_id`.
+- **WorkScope** owns worktrees, terminals, processes, browser state, and equivalent resources.
+- **WorkScope.repository → hidden GitRepository** is the sole repository authority after R2. Paths, branches, remotes, slugs, and legacy Project values are observations/projections, never identity.
+- **Child conversation/agent ID** is the durable sub-agent workflow identity. Parent WorkScope is attachment/authority metadata, not child identity.
+- **Durable workflow claims and effects** own attempts, deadlines, cancellation, terminal cause, and tool execution/recovery.
+- **Model adapters** translate the resolved model/effort request; they do not select roles, authority, or delegation policy.
+
+Sources:
+
+- Issue #651 current roadmap projection.
+- R1 task 55006 / PR #677.
+- R2 task 59004: atomic authority path `ProductConversation → WorkScope.repository → hidden GitRepository`.
+- `specs/adrs/026_workscope-owned-lifecycle-unifies-conversation-handoffs.md`.
+- `tasks/92009-p1-in-progress--unify-conversation-workstream-lifecycle.md`.
+- `tasks/47007-p1-ready--durable-subagent-workflow-migration.md`.
+- `tasks/78009-p0-ready--durable-turn-tool-effects.md`.
+- `tasks/14003-p1-blocked--parallel-work-subagent-lifecycle.md`.
 
 ---
 
-## 4. Proposed flow
+## 2. Provider- and model-neutral concept model
 
-### Minimal execution-profile increment
+| Concept | Question answered | Authoritative owner | Example |
+|---|---|---|---|
+| **Role** | What behavior/expertise should the child apply? | Named-agent definition | `implementation-worker` |
+| **Execution profile** | Which registered model and explicit effort run it? | Resolved workflow input | Terra + medium; GLM 5.2 + high |
+| **Authority request** | Which capabilities does this child need? | Workflow admission against attached WorkScope | read-only; write-capable |
+| **Delegation contract** | What bounded outcome is requested? | Persisted child workflow input | implement parser behavior X |
+| **Acceptance method** | What observable evidence demonstrates completion? | Delegation contract | test argv, check target, typed predicate |
+| **Resource budget** | How much may the workflow consume? | Durable workflow policy | deadline, max turns, attempts, concurrency |
+| **Terminal outcome** | How did execution end? | Durable child terminal cause | completed, error, timeout, cancellation |
+| **Acceptance evidence** | What did authoritative effects observe? | Durable tool-effect results | command, exit code, bounded output |
+
+### Critical distinctions
+
+- Role is not model identity.
+- Model identity is not economic classification. “Cheap” and “fast” remain operator judgments until Phoenix has measured or operator-authored routing metadata.
+- Authority is not a conversation mode.
+- WorkScope attachment is not child identity or lifecycle ownership.
+- A worker's prose claim is not acceptance evidence. A persisted durable tool result can be evidence.
+- A branch, PR, path, or legacy Project ID never grants repository authority.
+
+---
+
+## 3. Current compatibility model versus target model
+
+### Current compatibility flow
 
 ```mermaid
 flowchart LR
-    C["Coordinator"] -->|"role + brief + optional profile override"| R["Spawn resolver"]
-    D["Named-agent defaults"] --> R
-    M["Frozen model registry"] --> R
-    R -->|"ResolvedSubAgentSpec with model and effort provenance"| S["Existing child state machine"]
-    S --> F["Existing terminal result and fan-in"]
+    C["Parent LLM"] -->|"spawn_agents with mode"| E["Process-local executor"]
+    E --> V["Resolve Explore or Work, model, cwd"]
+    V --> S["Create child runtime"]
+    S --> T["In-process tools"]
+    S --> F["State-machine fan-in"]
     F --> C
 ```
 
-This changes resolution, not lifecycle.
+Today:
 
-### Later validated-implementation increment
+- `spawn_agents` exposes `mode: explore | work`.
+- write-capable admission is expressed through Work mode and a process-local active-writer count;
+- model defaults are mode-derived;
+- spawn/fan-in is special-cased in the executor;
+- in-flight child runtimes do not survive restart;
+- restart synthesis converts unfinished children to interrupted fan-in outcomes.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Resolving
-    Resolving --> RunningWorker: valid role, authority, profile, brief
-    RunningWorker --> Failed: worker error or timeout
-    RunningWorker --> Validating: worker result persisted
-    Validating --> Completed: all validators pass
-    Validating --> ValidationFailed: validator fails
-    Completed --> [*]
-    ValidationFailed --> [*]
-    Failed --> [*]
-```
+These facts remain relevant for compatibility and migration tests, but they are not the proposed domain vocabulary.
+
+### Target flow
 
 ```mermaid
 flowchart LR
-    C["Coordinator"] -->|"ImplementationBrief"| W["Worker in parent worktree"]
-    W -->|"narrative result"| P["Persist worker result"]
-    P --> X["Phoenix executes AcceptancePlan"]
-    X -->|"observed pass/fail evidence"| H["Fan in typed DelegationOutcome"]
+    C["Parent durable workflow"] -->|"DelegatedWorkflowRequest"| A["Durable admission"]
+    A -->|"resolve child ID, WorkScope attachment, authority, profile"| W["Child durable workflow"]
+    W --> T["Durable tool intents and effects"]
+    T --> E["Persisted acceptance evidence"]
+    W --> O["Persist exact terminal cause"]
+    O --> H["Wake handle keyed by child ID"]
     H --> C
 ```
 
-The validator runs only after the worker terminal transition, so there is still one writer. It uses the same bounded worktree/cwd authority as the child and is a state-machine effect, not an ad hoc loop.
+The current `spawn_agents` tool can remain compatibility sugar and lower onto this flow, as REQ-SA-009 already permits. It should not remain the lifecycle authority.
 
 ---
 
-## 5. Architecture options
+## 4. General delegated-workflow request
 
-### Option A — Persona prose only
-
-Create an `implementation-worker` named agent with Terra or GLM 5.2 as its default model and instructions requiring a task plus deterministic validation.
-
-**Pros**
-- Almost no runtime change.
-- Immediately improves coordinator behavior.
-- Existing named-agent selection, worktree isolation, and fan-in remain intact.
-
-**Cons**
-- Current Phoenix named agents cannot set explicit effort.
-- “Require validation” is only prompt discipline.
-- The task and validation method remain one opaque string.
-- A worker can incorrectly claim success and Phoenix cannot distinguish it from observed success.
-
-**Use:** local experiment or bootstrap fixture, not the final general abstraction.
-
-### Option B — General execution profiles on existing named agents (**recommended first**)
-
-Add optional effort to named-agent defaults and per-spawn overrides. Resolve model and effort atomically into `SubAgentSpec`; keep the existing child lifecycle.
-
-**Pros**
-- Directly enables Terra/medium, GLM 5.2/high, and future combinations.
-- Provider-neutral and small.
-- Uses Phoenix's existing effort capability model and observability.
-- Role, authority, and profile remain independent.
-- No new persistence aggregate or agent runtime.
-
-**Cons**
-- Validation is still worker-directed unless Option C follows.
-- Requires careful precedence and capability tests.
-- A named role with an unsupported effort must produce a visible, defined result.
-
-**Use:** default next implementation.
-
-### Option C — Typed implementation brief with orchestrator-owned validation (**recommended later, evidence-gated**)
-
-Extend delegation with a sum type that distinguishes open-ended work from implementation work. Implementation work requires a non-empty acceptance plan. Persist and execute validators after the worker completes.
-
-**Pros**
-- Makes “implementation requires validation” structurally true.
-- Produces trustworthy, durable evidence.
-- Supports retries and clear `validation_failed` outcomes without prompt parsing.
-- General across roles and models.
-
-**Cons**
-- Adds state-machine states/effects, persistence, tool schema, result UI, and security policy.
-- Commands are executable authority and need strict cwd/environment/output bounds.
-- Substantially more work than selecting a high-effort fast model.
-
-**Use:** only after Option B usage shows value in first-class validated delegation.
-
-### Rejected option — Import or wrap Codex multi-agent runtime
-
-This would create two orchestration authorities: Phoenix's durable conversation state machine and Codex's thread/agent graph. Cancellation, worktree ownership, persistence, concurrency, and recovery would have parallel representations. It also would not serve non-Codex providers such as GLM. Keep Codex as an LLM/provider transport, not Phoenix's coordinator runtime.
-
----
-
-## 6. Proposed typed shapes
-
-These are illustrative Rust domain shapes; exact crate placement should follow the implementation phase's spec work.
-
-### Model and effort fields
-
-The minimal Phase 1 shape is one new optional value at each existing boundary, not three new wrapper types:
+The request should be typed around durable workflow semantics rather than modes:
 
 ```rust
-pub struct AgentDefinition {
-    // existing fields
-    pub model: Option<String>,
+pub struct DelegatedWorkflowRequest {
+    pub role: Option<AgentRoleId>,
+    pub objective: NonEmptyString,
+    pub capability: RequestedCapability,
+    pub execution: ExecutionProfileOverride,
+    pub acceptance: AcceptanceRequirement,
+}
+
+pub enum RequestedCapability {
+    ReadOnly,
+    WriteAttachedEnvironment,
+}
+
+pub struct ExecutionProfileOverride {
+    pub model: Option<RegisteredModelId>,
     pub reasoning_effort: Option<ModelEffort>,
 }
 
-pub struct SpawnTask {
-    // existing fields
-    pub model: Option<String>,
-    pub reasoning_effort: Option<ModelEffort>,
-}
-
-pub struct SubAgentSpec {
-    // existing resolved fields
-    pub model_id: String,
-    pub effort: EffectiveEffort,
-}
-```
-
-`model` and `reasoning_effort` are complementary dimensions, not parallel representations. The authoritative execution-time representation is the resolved pair on the existing `SubAgentSpec`/child conversation, not an additional profile object.
-
-Suggested agent file:
-
-```yaml
----
-name: implementation-worker
-description: Implements a bounded task with an explicit acceptance method
-execution_authority: write_capable
-model: gpt-5.6-terra
-reasoning_effort: medium
----
-Implement only the supplied task. Run the supplied acceptance method before reporting.
-```
-
-Equivalent GLM configuration changes only the data:
-
-```yaml
-model: gateway-provider/z-ai/glm-5.2
-reasoning_effort: high
-```
-
-No model-specific branch is introduced.
-
-### Resolution precedence
-
-Recommended single atomic resolver:
-
-```text
-model = spawn override
-     ?? named-agent default
-     ?? authority-derived default (read-only cheap model or write-capable parent model)
-
-effort = spawn override
-      ?? named-agent default
-      ?? explicit parent override (existing REQ-LLM-004d behavior)
-      ?? selected model native default/omission
-
-then validate the final pair against the frozen model registry
-```
-
-The resolver validates the final `(model, effort)` pair against the frozen registry. Model selection and effort reset/replacement happen together, matching REQ-LLM-004c's atomicity principle.
-
-### Capability handling
-
-Recommended behavior:
-
-| Capability | Explicit role/spawn effort | Result |
-|---|---|---|
-| Known supported and level allowed | present | Resolve and translate |
-| Known supported but level invalid | present | Reject spawn with allowed levels |
-| Unsupported | present | Reject spawn; do not silently erase requested semantics |
-| Unknown | present | Permit internal selection but omit native provider field, emit structured debug/warn telemetry, and return omission provenance in the resolved snapshot |
-| Any | absent | Use existing native-default/omission rules |
-
-There is a product choice around `Unknown`; the recommendation above preserves Phoenix's existing REQ-LLM-004e semantics. Rejection would be stricter but would prevent useful external models whose metadata is incomplete.
-
-### Typed delegation brief (speculative later option)
-
-If pursued, this must **replace** the string-only task as the authoritative input variant, not accompany a duplicate task description side-channel. The worker prompt is a rendered view of this typed source.
-
-```rust
-pub enum DelegationBrief {
-    Exploratory {
-        objective: NonEmptyString,
-    },
-    Implementation {
-        objective: NonEmptyString,
-        acceptance: NonEmpty<AcceptanceCheck>,
-    },
+pub enum AcceptanceRequirement {
+    Narrative,
+    Deterministic(NonEmpty<AcceptanceCheck>),
 }
 
 pub enum AcceptanceCheck {
     Command {
         program: String,
         args: Vec<String>,
-        cwd: ValidatedRelativePath,
+        cwd: WorkScopeRelativePath,
         timeout: BoundedDuration,
     },
 }
-
-pub enum DelegationOutcome {
-    Completed {
-        worker_summary: String,
-        validation: NonEmpty<ValidationEvidence>,
-    },
-    ValidationFailed {
-        worker_summary: String,
-        validation: NonEmpty<ValidationEvidence>,
-    },
-    WorkerFailed(SubAgentFailure),
-}
 ```
 
-Why not `validation_command: Option<String>`:
+### Why this is not another parallel representation
 
-- `None` would make invalid implementation tasks representable.
-- A shell string introduces quoting and injection ambiguity.
-- A typed argv plus validated relative cwd is easier to authorize and replay.
-- `DelegationOutcome` prevents “completed but no validation evidence.”
+- This request becomes the authoritative persisted input to the child durable workflow.
+- The model prompt is rendered from it; prompt prose is a view, not a second authority.
+- `spawn_agents` compatibility input is translated once at admission and discarded as authority.
+- The request expresses intent only. The admitted durable workflow snapshot—not this request—owns concrete model, effort, granted authority, attached WorkScope identity/generation, execution root, attempt/deadline, and role version.
+- Repository identity is not present in the LLM-visible/tool input. Runtime authority resolves it internally through the exact WorkScope attachment.
 
-The acceptance plan must not be duplicated into persona text as an authoritative representation. The prompt can render the typed plan for worker context, while the typed value remains authoritative for execution.
+### Role definition
+
+A named implementation role can remain a discovered configuration artifact:
+
+```yaml
+---
+name: implementation-worker
+description: Implements a bounded objective with an explicit acceptance method
+model: gpt-5.6-terra
+reasoning_effort: medium
+---
+Implement the supplied objective within granted authority.
+Use the supplied acceptance method and report incomplete work as incomplete.
+```
+
+An operator can choose GLM 5.2 instead without changing the role or runtime:
+
+```yaml
+model: gateway-provider/z-ai/glm-5.2
+reasoning_effort: high
+```
+
+Role files supply defaults and behavior, never authority. They cannot grant write access, select a WorkScope, identify a repository, extend deadlines, or redefine terminal success.
 
 ---
 
-## 7. Persistence and crash recovery
+## 5. Atomic model and effort resolution
 
-### Option B
+Codex's strongest reusable idea is that role defaults and spawn overrides may jointly select model and reasoning effort. Phoenix should adopt that configuration capability at the durable workflow admission boundary, not its recursive agent control plane.
 
-No new lifecycle table is needed.
-
-- Persist the resolved model and explicit effort/provenance on the child conversation using existing conversation effort fields.
-- Persist agent identity/persona as today.
-- On resume, reconstruct the child from persisted resolved values, not from re-reading mutable agent files.
-- Existing restart behavior remains: in-flight workers become interrupted fan-in outcomes; completed workers remain completed.
-
-This avoids storing both unresolved defaults and resolved values as competing authorities. The named-agent catalog is the spawn-time source; the child conversation's resolved profile is the execution-time source.
-
-### Option C
-
-Validation introduces durable addressable structure and therefore belongs in relational tables, not a JSON array:
+Recommended precedence:
 
 ```text
-delegations
-  id, parent_conversation_id, child_conversation_id,
-  kind, state, worker_summary, created_at, updated_at
+model = request override
+     ?? role default
+     ?? authority-policy default
 
-delegation_acceptance_checks
-  delegation_id, ordinal, kind, program, cwd, timeout_ms
+effort = request override
+      ?? role default
+      ?? explicit parent override required by REQ-LLM-004d
+      ?? selected model native default or omission
 
-delegation_validation_runs
-  delegation_id, check_ordinal, attempt, status,
-  exit_code, bounded_output, started_at, finished_at
+validate final pair against the frozen model registry snapshot
+persist the resolved pair and provenance on the child workflow/conversation
 ```
 
-Required recovery rules:
+The authority-policy default is phrased without modes:
 
-1. A persisted worker terminal result and pending checks resume at the first check without terminal evidence.
-2. A validation run is committed exactly once per `(delegation, check, attempt)`.
-3. Restart during a command produces an interrupted validation outcome or a new explicitly numbered attempt; it must not fabricate pass/fail.
-4. Parent fan-in occurs only after the delegation has one terminal `DelegationOutcome`.
-5. Cancellation terminates worker or validator effects and persists a terminal cancellation/interruption outcome.
+- read-only delegation may default to the configured low-cost model for the provider family;
+- write-capable delegation may default to the parent's model;
+- either can be overridden with a registered model.
 
-The current string-based synthesized spawn fan-in should not be extended to infer acceptance state. A typed delegation identity must link parent, child, checks, and evidence.
+### Capability handling
 
----
+| Effort capability | Explicit effort | Admission/translation |
+|---|---|---|
+| Supported and level allowed | present | Accept and translate |
+| Supported but level invalid | present | Reject with allowed levels |
+| Unsupported | present | Reject; do not silently erase requested semantics |
+| Unknown | present | Preserve internal selection, omit native field, emit structured omission provenance |
+| Any | absent | Use existing native-default/omission behavior |
 
-## 8. Security, authority, concurrency, retries, and cost
-
-### Tool and filesystem authority
-
-- Role config never grants authority. The parent mode plus resolved `execution_authority` remains the authority source.
-- An implementation worker uses `for_subagent_work`; it does not gain recursive spawn, task approval, or user-question tools.
-- Validation runs inside the parent's owned worktree and under the same path containment checks.
-- Validators should initially be argv-based commands, not arbitrary shell scripts. Environment inheritance must be bounded and explicit.
-- Validator output is bounded and content-sensitive telemetry remains excluded, consistent with LLM/tool observability policy.
-
-### Concurrency
-
-- Preserve the one-writer invariant. A worker and its validator are consecutive phases of the same write-capable delegation slot.
-- Do not release `active_work_subagents` between worker completion and validator completion if Option C is implemented.
-- Read-only exploration fan-out remains independent.
-- A configurable global/session child limit is reasonable later, but is orthogonal to model price. Codex's thread limiter is useful evidence, not a reason to weaken Phoenix's one-writer rule.
-
-### Retry semantics
-
-- Model/provider retry remains owned by the LLM runtime.
-- Worker retry should create an explicit attempt tied to the same delegation or a new delegation; it must not silently overwrite prior evidence.
-- Validation failure is not provider failure and should not trigger automatic LLM retries by default.
-- A future “repair after validation failure” loop must be bounded by an explicit attempt budget and represented in state. Do not add it in the first validation increment.
-
-### Cost and latency control
-
-- Do not add `cheap: bool`, `fast: bool`, or model-name tests.
-- Initially, users/operators choose concrete role defaults.
-- Existing max turns and timeout cap runaway work.
-- Record model, effective effort, token usage, and elapsed time so later routing policy can use evidence.
-- If automatic routing is later desired, add measured model metadata or an operator-defined routing class in one registry source of truth. Do not infer economics from `terra`, `glm`, or provider prefixes.
-
-### Delegation guidance
-
-Prompt guidance remains useful for a judgment that cannot be made purely structural:
-
-> Delegate a write-capable implementation only when the task is bounded, acceptance is explicit, and parallel setup cost is justified. Perform trivial edits directly.
-
-However, Phoenix should also provide structural friction:
-
-- named work roles are explicit tool enum choices;
-- only one write-capable child can run;
-- Option C requires a non-empty acceptance plan;
-- max turns and timeout are bounded.
-
-Do not attempt to encode “long enough to delegate” as a hard line-count or token-count heuristic. That would be brittle and easy to game.
+This preserves the `Supported` / `Unknown` / `Unsupported` distinction and REQ-LLM-004e behavior. The adapter owns only native field translation and capability-gap telemetry.
 
 ---
 
-## 9. Incremental delivery and verification
+## 6. Acceptance without a second validation engine
 
-### Phase 1 — Execution-profile defaults (first user value)
+The previous design proposed a new post-worker validator subsystem too early. The durable-effects roadmap provides a smaller and stronger boundary.
 
-**User journey:** define one named implementation worker with a chosen model and effort; coordinators can select it through the existing `agent_type` enum.
+### Recommended first contract
 
-1. Amend agents/subagents/LLM requirements and Allium before code.
-2. Add `reasoning_effort` to agent discovery and schema validation.
-3. Add optional effort to the spawn task schema.
-4. Introduce one atomic resolver for model + effort precedence/capability validation.
-5. Store resolved explicit effort on the child conversation and expose it in traces/tool result diagnostics.
-6. Add a project fixture named `implementation-worker`; keep its model configurable rather than hard-coded as a product default.
+For an implementation role, admission requires `AcceptanceRequirement::Deterministic` with at least one check. The worker receives a rendered view of those checks and executes them through ordinary durable tool intents. Completion admission then requires persisted matching tool-effect evidence.
 
-**Tests:**
+```mermaid
+stateDiagram-v2
+    [*] --> Admitted
+    Admitted --> Running
+    Running --> Checking: implementation effects complete
+    Checking --> Completed: required durable evidence passes
+    Checking --> Incomplete: missing or failed required evidence
+    Running --> Failed: exact terminal failure
+    Running --> Cancelled: durable cancellation wins
+    Running --> TimedOut: deadline wins
+```
 
-- discovery parses valid effort and rejects malformed/blank values visibly;
-- schema advertises supported effort values without duplicating the agent catalog in prompt prose;
-- per-spawn override beats agent default;
-- agent default beats explicit parent inheritance according to the chosen precedence;
-- model override with incompatible effort rejects atomically;
-- unsupported effort rejects; unknown effort omits provider field and logs provenance;
-- Terra and an external GLM-style registry fixture follow the same resolver path;
-- restart reconstructs the resolved child profile;
-- existing anonymous-agent behavior and one-writer tests remain unchanged.
+The worker may decide when to run checks, but it cannot manufacture the authoritative result: the tool-effect lifecycle persists command identity, completion, exit status, and bounded output. The terminal reducer admits `Completed` only when every required check has lineage-proven passing evidence: durable tool-effect references must match the admitted child ID, exact attempt ID, acceptance-check identity, and authoritative WorkScope generation. “Any passing command from this child” is never sufficient.
 
-### Post-launch observation (not a separate delivery phase)
+This avoids:
 
-Refine tool/persona guidance, include effective model/effort in spawn diagnostics, and dogfood bounded repository tasks. Compare direct execution with delegation setup cost, latency, and quality. This evidence determines whether first-class validation is warranted.
+- trusting a prose claim that tests passed;
+- running every validator twice;
+- introducing a separate validation process/lifecycle/table before durable tool effects land;
+- allowing stale evidence from another attempt or worktree generation to count.
 
-**Tests:** schema snapshot/cache stability, no duplicate role representation, telemetry contains no prompt contents.
+### Later independent verification
 
-### Phase 2 — Typed implementation briefs (only if evidence supports it)
+If product evidence shows that independent re-verification is valuable, model it as another durable workflow/effect consuming the same typed acceptance contract. Do not embed an ad hoc validator loop in the sub-agent executor.
 
-**User journey:** coordinator supplies objective plus acceptance checks; Phoenix reports independently observed evidence.
+### When no deterministic method exists
 
-1. Add spEARS requirements and an Allium lifecycle before implementation.
-2. Add normalized delegation/check/run tables and migration tests.
-3. Extend the state machine with validation effects and terminal outcomes.
-4. Add bounded argv validator execution under inherited worktree authority.
-5. Render validation state/evidence in fan-in and UI.
+Use a different contract/role:
 
-**Tests:** property tests for terminality/exactly-once fan-in; restart at every worker/validation boundary; cancellation; path traversal/symlink escape; timeout as liveness guard; output truncation; validator failure; no-check implementation rejected by deserialization/construction.
+- exploratory or advisory delegation may use `AcceptanceRequirement::Narrative`;
+- an implementation-worker request is rejected if deterministic acceptance is absent;
+- the coordinator can perform the trivial edit directly or reformulate a bounded acceptance method.
 
-### Phase 3 — Optional repair loop
-
-Only after validated delegation exists and failure data justifies it: return failed evidence to the worker for a bounded repair attempt. This is explicitly not part of the minimal design.
+This makes the prior-art requirement structural for the implementation role without imposing command validation on every sub-agent.
 
 ---
 
-## 10. Concrete product choices
+## 7. Repository, WorkScope, and filesystem authority
 
-These choices are presented explicitly rather than hidden as unresolved prose. Recommended defaults are bold.
+After R2, a write-capable child is admitted only when the parent ProductConversation has an attached WorkScope with:
 
-### Choice A — What ships first?
+1. a present authoritative worktree identity/execution root;
+2. a `WorkScope.repository` attachment to hidden GitRepository authority where Git-backed;
+3. an authority generation valid for the child claim;
+4. no unresolved, stale, inaccessible, or conflicting identity evidence.
 
-1. Persona prose only.
-2. **Execution-profile defaults on existing named agents.**
-3. Full typed validated delegation.
+The child receives a capability to the attached environment, not repository IDs or path-derived authority.
 
-Recommendation: 2. It directly solves model + effort pairing without pretending prose is validation or committing to a new workflow.
+### Required invariants
 
-### Choice B — What happens when explicit effort capability is unknown?
-
-1. Reject spawn.
-2. **Preserve internal effort, omit provider-native field, and expose omission provenance.**
-3. Silently omit.
-
-Recommendation: 2, matching REQ-LLM-004e. Option 3 is prohibited by Phoenix's capability-gap observability principle.
-
-### Choice C — Is deterministic validation required for every write-capable child?
-
-1. Yes, immediately.
-2. **No for the execution-profile increment; yes only for the later `ImplementationBrief` variant.**
-3. Never; leave it to prompts.
-
-Recommendation: 2. Existing generic work sub-agents have valid uses without command-based acceptance, while a type named `ImplementationBrief` can enforce the stronger contract.
-
-### Choice D — Who executes acceptance checks?
-
-1. Worker only.
-2. **Worker may run them for feedback, but Phoenix independently runs the authoritative plan after worker completion.**
-3. Coordinator after fan-in.
-
-Recommendation: 2. It yields deterministic evidence without trusting narration and preserves one-writer sequencing.
-
-### Choice E — How is “fast/cheap” selected?
-
-1. Phoenix hard-coded model list.
-2. Automatic model-name/provider heuristics.
-3. **Operator-chosen concrete execution profile, with evidence collected for a future typed routing policy.**
-
-Recommendation: 3. It works for Terra, GLM 5.2, and future providers without subjective labels in domain types.
+- Every tool execution root derives from the exact WorkScope and authoritative worktree registry.
+- `cwd` overrides are WorkScope-relative typed paths, never arbitrary authority-bearing strings.
+- Path canonicalization and containment are revalidated before persistence/execution.
+- A Direct non-repository scope remains an explicit typed case; it never fabricates Git authority.
+- A repository created after scope creation uses R2's shared typed WorkScope attachment transition before repository-sensitive capabilities execute.
+- Hidden GitRepository IDs never enter agent prompts, tool schemas, public DTOs, or compatibility projections.
+- Branches and PRs remain observed artifacts. The implementation worker may operate Git normally within authority, but its workflow does not own branch/PR lifecycle.
+- Close settles/cancels child workflows through one typed durable operation before WorkScope retirement.
 
 ---
 
-## 11. Final recommendation
+## 8. Concurrency and write-conflict policy
 
-Implement Phase 1 as a general extension of named-agent spawn resolution:
+Today's one-write-child rule is a safe compatibility policy, not the final abstraction.
+
+The durable request expresses `WriteAttachedWorkScope`; a separate admission policy decides how concurrent write-capable children are made safe. Task 14003 requires one structural boundary covering patch, bash, Git, and every writable path:
+
+1. serialize write effects;
+2. isolate children into distinct write targets and reconcile;
+3. use enforceable ownership/leases over disjoint paths/resources; or
+4. detect and reject conflicts before mutation.
+
+Prompt instructions and “these tasks touch different files” are not correctness boundaries.
+
+### Recommended delivery posture
+
+- Initially lower write-capable workflows onto serialization while the durable child/result-delivery migration lands.
+- Do **not** encode `max_one_writer` into role, request, persisted identity, or product vocabulary.
+- Let task 14003 choose the eventual write-conflict boundary after the ProductConversation Close/sub-agent settlement seam stabilizes.
+- Read-only workflows remain independently parallel subject to session/resource budgets.
+
+This lets the implementation-worker design survive the desired parallel-work-child feature rather than opposing it.
+
+---
+
+## 9. Durable lifecycle, persistence, and recovery
+
+Build on task 47007's sub-agent durable workflow profile:
+
+- child conversation/agent ID is stable resource identity;
+- parent ID and WorkScope are routing/ownership metadata;
+- child materialization has one typed completion and exactly-once objective bootstrap;
+- claims, attempts, deadlines, cancellation, continuation, and runtime acceptance use durable workflow authority;
+- exact terminal causes persist across restart/replay;
+- parent result delivery remains durable until exact parent acceptance;
+- route replacement/reconstruction cannot lose terminal delivery;
+- `spawn_agents` fan-in becomes a projection over durable wake contracts.
+
+### Suggested persisted responsibilities
+
+Use the existing durable workflow/child/effect schemas as they land; do not pre-freeze duplicate tables in this task. The authoritative records must nevertheless represent:
+
+- immutable admitted request and role/version snapshot;
+- resolved model/effort and provenance;
+- child ID, parent ID, attached WorkScope identity and authority generation;
+- attempt, deadline, cancellation, and exact terminal cause;
+- durable acceptance checks;
+- matching durable tool intents/results used as evidence;
+- parent delivery ownership and acceptance.
+
+Acceptance checks form an addressable child collection and therefore belong in rows if persistence is added; never serialize them as a JSON array blob.
+
+### Restart rules
+
+1. Persisted terminal outcome remains deliverable after restart.
+2. A running process disappearing is not automatically success or generic failure; recovery resolves from durable claim/effect state and exact terminal taxonomy.
+3. Acceptance evidence counts only for the admitted attempt and WorkScope authority generation.
+4. A claimed tool effect with uncertain completion follows durable tool-effect recovery; no duplicate command is launched merely because the process restarted.
+5. Close and cancellation use the same durable child settlement operation; no parallel cancellation lifecycle is introduced.
+
+---
+
+## 10. Codex comparison and translation boundary
+
+### Confirmed upstream behavior
+
+Codex provides useful configuration evidence:
+
+- `[agents]` supports a session thread limit, default sub-agent model, and default sub-agent reasoning effort in [`AgentsToml`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/config/src/config_toml.rs#L660-L695).
+- Named roles are layered config files in [`AgentRoleToml`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/config/src/config_toml.rs#L697-L710) and [`apply_role_to_config`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/role.rs).
+- `spawn_agent` accepts role, model, reasoning effort, service tier, and optional context fork in [`SpawnAgentArgs`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs).
+- Model and effort defaults/overrides are validated together in [`multi_agents_common.rs`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/tools/handlers/multi_agents_common.rs).
+- Codex has a session-scoped collaboration control plane with spawn edges, messaging, waiting, resumption, closure, and resource limits in [`AgentControl`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/control.rs) and [`AgentRegistry`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/core/src/agent/registry.rs).
+- Lifecycle status is thread-oriented in [`AgentStatus`](https://github.com/openai/codex/blob/f898ebcafdeb0052abc844d9e11b5e754b8ec4af/codex-rs/protocol/src/protocol.rs#L1736-L1755).
+
+### Responsibility matrix
+
+| Concern | Phoenix target stack | Codex/provider adapter |
+|---|---|---|
+| Product lifecycle and Close | Owns | No |
+| WorkScope/resource authority | Owns | No |
+| Hidden repository identity and worktree root | Owns | No |
+| Role selection and delegation contract | Owns | No |
+| Child durable identity/claims/wake delivery | Owns | No |
+| Tool-effect durability and acceptance evidence | Owns | No |
+| Concurrency/write-conflict policy | Owns | No |
+| Internal effort selection/provenance | Owns | No |
+| Native reasoning field/value mapping | No | Owns |
+| Provider auth, wire events, stream normalization | No | Owns |
+| Codex AgentControl/thread graph | Do not import as authority | Upstream implementation detail |
+
+**Translation boundary:** durable workflow admission resolves one concrete model and `EffectiveEffort`. `LlmService` receives those values. The provider adapter translates supported native fields or emits structured omission provenance. It never decides whether a child may write, which WorkScope/repository it targets, whether acceptance passed, or how results are delivered.
+
+---
+
+## 11. Architecture options
+
+### Option A — Persona-only compatibility configuration
+
+Add an implementation persona with model and effort defaults and instruct it to require tests.
+
+**Advantages:** quick experiment; no workflow change.
+
+**Problems:** authority remains mode-shaped; acceptance remains prompt discipline; terminal claims are not bound to durable evidence; migration debt is created against tasks 47007/78009.
+
+**Use:** temporary dogfood only, not the target implementation.
+
+### Option B — Extend today's mode-oriented spawn executor
+
+Add `reasoning_effort` to `TaskSpec`, resolve it beside model, and preserve the current special-cased fan-in/one-writer runtime.
+
+**Advantages:** smallest code diff today.
+
+**Problems:** designs directly against compatibility boundaries the roadmap is replacing; encodes mode defaults and process-local admission more deeply; still lacks durable effect evidence and restart-safe delivery.
+
+**Recommendation:** do not choose as the implementation architecture. A narrow compatibility adapter may temporarily translate this schema to Option C.
+
+### Option C — Durable delegated workflow profile (**recommended**)
+
+Add role/model/effort/authority/acceptance fields to the durable sub-agent workflow input, lower existing `spawn_agents` onto it, and use durable tool effects as acceptance evidence.
+
+**Advantages:** aligned with roadmap authorities; provider-neutral; correct-by-construction implementation contract; restart-safe terminal delivery; compatible with future parallel write policy; no second validator engine.
+
+**Cost:** must sequence after or with the relevant durable sub-agent/tool-effect boundaries and consume the post-R2 WorkScope repository API rather than freezing current names.
+
+### Rejected — Import Codex collaboration runtime
+
+Making Codex AgentControl authoritative would duplicate Phoenix lifecycle, WorkScope, repository, effect, cancellation, and wake authorities and would exclude non-Codex providers. Codex remains provider/runtime evidence, not Phoenix orchestration authority.
+
+---
+
+## 12. Incremental delivery plan
+
+### Slice 0 — Compatibility preparation and guardrails
+
+Before implementation:
+
+1. Re-read Issue #651 and consume whichever R1/R2, ProductConversation, durable child-workflow, and durable tool-effect APIs have landed.
+2. Update `specs/agents`, `specs/subagents`, and `specs/llm` to remove mode wording from this path and define role/profile/capability/acceptance precedence.
+3. Add or amend Allium for durable child admission, evidence-bound completion, and terminal delivery.
+4. Confirm the stable ProductConversation Close/sub-agent settlement seam with task 14003/Close owners.
+
+This is a non-blocking preparation slice, not a new authority or a requirement to wait for the entire roadmap. Model/effort parsing and compatibility translation may land independently, but this slice must not add lifecycle authority, freeze duplicate persistence structures, or deepen mode-owned runtime semantics.
+
+### Slice 1 — Model/effort role configuration
+
+**User value:** operators can define an implementation role using Terra, GLM 5.2, or any registered model at an explicit supported effort.
+
+- add optional `reasoning_effort` beside existing named-agent model defaults;
+- validate model/effort atomically against one frozen registry snapshot;
+- persist resolved pair/provenance in the durable child input;
+- expose effective model/effort in bounded diagnostics.
+
+**Tests:** role parsing; override precedence; invalid pair rejection; unknown/unsupported behavior; external GLM-style fixture and Terra fixture use the same code path; restart reproduces the resolved pair without rereading mutable role files.
+
+### Slice 2 — Implementation delegation contract
+
+**User value:** coordinators can delegate a bounded implementation only with an explicit deterministic acceptance method.
+
+- add requested capability and `AcceptanceRequirement` intent to durable workflow input; admission resolves the actual authority;
+- make implementation role admission reject narrative-only acceptance;
+- render the authoritative contract into the child prompt;
+- resolve attached WorkScope and generation through post-R2 authority;
+- initially serialize write-capable child execution as policy, without encoding serialization into domain identity.
+
+**Tests:** no-check implementation request unconstructable/rejected; role cannot escalate authority; stale/missing/conflicting WorkScope/repository evidence fails closed; Direct non-Git remains typed; hidden repository identity never reaches prompt/tool wire.
+
+### Slice 3 — Evidence-bound completion
+
+**Hard dependency:** durable tool-effect persistence and child-ID wake/result delivery must already be authoritative. Otherwise this slice would create a process-local compatibility authority and must not land.
+
+**User value:** Phoenix reports completion only when the configured acceptance checks have authoritative passing tool-effect evidence.
+
+- bind acceptance checks to durable tool intents/results;
+- admit successful terminal completion only with current-attempt/current-generation evidence;
+- preserve failed/missing checks as typed incomplete outcomes;
+- deliver through child-ID wake contracts and durable parent result sink.
+
+**Tests:** crash at each claim/effect/terminal/delivery boundary; duplicate suppression; stale attempt/generation evidence rejection; timeout/cancel/result deterministic winner; parent reconstruction does not lose delivery; Close settles through one operation.
+
+### Slice 4 — Parallel write policy integration
+
+Owned primarily by task 14003. Replace initial serialization only after an enforceable conflict/isolation boundary covers all writable tools. The implementation-worker request shape remains unchanged.
+
+---
+
+## 13. Product choices
+
+Recommended choices are bold.
+
+### A. Where does the feature live?
+
+1. Special coding-agent runtime.
+2. Today's Work-mode spawn executor.
+3. **Durable delegated sub-agent workflow profile.**
+
+### B. What identifies a worker?
+
+1. Parent WorkScope.
+2. Role name.
+3. **Stable child conversation/agent ID; role and WorkScope are metadata.**
+
+### C. What grants write access?
+
+1. Persona prose.
+2. Work mode.
+3. **Typed authority request admitted against the exact attached WorkScope and authority generation.**
+
+### D. What proves implementation completion?
+
+1. Worker prose.
+2. Always rerun validators in a new subsystem.
+3. **Persisted matching durable tool-effect evidence; independent re-verification may be another workflow later.**
+
+### E. What if no deterministic acceptance method exists?
+
+1. Let implementation role proceed anyway.
+2. **Reject that role contract; use exploratory delegation or execute directly after reformulation.**
+3. Invent a generic test automatically.
+
+### F. How is “cheap/fast” selected?
+
+1. Hard-coded model list.
+2. Model-name/provider heuristics.
+3. **Operator-selected registered model/effort now; measured or operator-authored routing metadata only if automatic policy is later justified.**
+
+### G. What is the write concurrency rule?
+
+1. Permanent one-writer domain invariant.
+2. Prompt-assigned disjoint files.
+3. **Policy-backed serialization initially; task 14003 may replace it with a structural conflict/isolation boundary without changing the request model.**
+
+---
+
+## 14. Final recommendation
+
+Build the idea on the target stack:
 
 ```text
-implementation-worker role
-+ operator-selected model
-+ explicit supported reasoning effort
-+ existing write authority and one-writer lifecycle
+ProductConversation parent
+→ attached WorkScope
+→ WorkScope.repository / authoritative worktree root
+→ durable child workflow keyed by child ID
+→ role + registered model + explicit effort
+→ requested capability resolved to typed authority + deterministic acceptance contract
+→ durable tool effects as acceptance evidence
+→ durable terminal cause and wake delivery
 ```
 
-Keep the supplied prior-art persona as guidance, but do not mistake it for an enforced task contract. If dogfooding shows that coordinator/worker handoffs routinely need trustworthy acceptance, implement `ImplementationBrief` and orchestrator-owned validation as a separate durable state-machine feature.
+Do not add a special `coding-agent`, a model-name branch, a Work-mode-owned execution profile, a second validator lifecycle, or a Codex-owned collaboration runtime.
 
-This approach reuses Phoenix's strongest existing boundaries—frozen named-agent catalogs, typed model capability metadata, worktree authority, one-writer enforcement, terminal child tools, and durable fan-in—while learning from Codex's model/effort role configuration without importing Codex's provider-specific recursive agent runtime.
+This preserves the useful part of the prior art—coordinator-directed bounded implementation on a cost-effective model at deliberate reasoning effort—while composing with Phoenix's planned repository authority, ProductConversation lifecycle, durable child workflow, durable tool-effect, and future parallel-write architecture.
