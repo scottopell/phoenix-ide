@@ -88,9 +88,10 @@ impl PhoenixRuntimeEnvironment {
         let data_dir = std::env::var_os("PHOENIX_DATA_DIR")
             .filter(|v| !v.is_empty())
             .map_or_else(|| phoenix_home.clone(), PathBuf::from);
-        let db_path = std::env::var_os("PHOENIX_DB_PATH")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| data_dir.join("phoenix.db"), PathBuf::from);
+        let db_path = resolve_db_path(
+            &phoenix_home,
+            std::env::var_os("PHOENIX_DB_PATH").filter(|v| !v.is_empty()),
+        );
         let tmp_root = std::env::var_os("PHOENIX_TMP_DIR")
             .filter(|v| !v.is_empty())
             .map_or_else(|| std::env::temp_dir().join(TMP_NAMESPACE), PathBuf::from);
@@ -151,7 +152,7 @@ impl PhoenixRuntimeEnvironment {
         &self.data_dir
     }
 
-    /// `SQLite` database path (`$PHOENIX_DB_PATH` or `phoenix_home/phoenix.db`).
+    /// `SQLite` database path (`$PHOENIX_DB_PATH` or `home/.phoenix-ide/phoenix.db`).
     #[must_use]
     pub fn db_path(&self) -> PathBuf {
         self.db_path.clone()
@@ -287,6 +288,10 @@ impl PhoenixRuntimeEnvironment {
     }
 }
 
+fn resolve_db_path(phoenix_home: &Path, override_path: Option<std::ffi::OsString>) -> PathBuf {
+    override_path.map_or_else(|| phoenix_home.join("phoenix.db"), PathBuf::from)
+}
+
 /// True iff `s` is exactly one normal path component — no `/` or `\`, not
 /// `.`/`..`, not absolute, not empty. Used to keep [`PhoenixRuntimeEnvironment::tmp_subdir`]
 /// from escaping its temp root.
@@ -334,6 +339,22 @@ mod tests {
         // Attachments live beside tmp_root (root/tmp here), not under it, so the
         // historical path is preserved.
         assert_eq!(env.attachments_dir(), root.join("phoenix-ide-attachments"));
+    }
+
+    #[test]
+    fn custom_data_dir_does_not_change_historical_database_default() {
+        let phoenix_home = Path::new("/Users/example/.phoenix-ide");
+        assert_eq!(
+            resolve_db_path(phoenix_home, None),
+            PathBuf::from("/Users/example/.phoenix-ide/phoenix.db")
+        );
+        assert_eq!(
+            resolve_db_path(
+                phoenix_home,
+                Some(std::ffi::OsString::from("/private/sidecar/phoenix.db"))
+            ),
+            PathBuf::from("/private/sidecar/phoenix.db")
+        );
     }
 
     #[test]
