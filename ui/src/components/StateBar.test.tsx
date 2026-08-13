@@ -527,6 +527,53 @@ describe('StateBar PR badge', () => {
     expect(screen.getByTestId('active-pr-choice-12')).toHaveAttribute('data-selection-dialog-autofocus');
   });
 
+  it('does not carry active-PR dialog or pending mutation state across conversations', async () => {
+    let resolveFirstPin!: () => void;
+    const firstSelection = makeSelection();
+    const firstHandle = {
+      ...makePrStatusHandle(mockPrStatus({ found: true, number: 12, display_state: 'open' }), firstSelection),
+      pinActivePr: vi.fn(() => new Promise<void>((resolve) => { resolveFirstPin = resolve; })),
+    };
+    const secondSelection = makeSelection({
+      associated_prs: [{
+        ...makeSelection().associated_prs[0]!,
+        pr_number: 34,
+        title: 'Conversation B PR',
+        url: 'https://github.com/o/r/pull/34',
+      }],
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 34 }, provenance: 'pinned' },
+    });
+    const secondHandle = makePrStatusHandle(mockPrStatus({ found: true, number: 34, display_state: 'open' }), secondSelection);
+    const renderSelector = (conversationId: string, handle: ConversationPrStatusHandle) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation({ id: conversationId, conv_mode_label: 'Direct' })}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderSelector('conversation-a', firstHandle));
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    fireEvent.click(screen.getByTestId('active-pr-choice-12'));
+    expect(screen.getByRole('status')).toHaveTextContent('Saving active PR…');
+
+    rerender(renderSelector('conversation-b', secondHandle));
+
+    expect(screen.queryByRole('dialog', { name: /choose active pull request/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    expect(screen.getByTestId('active-pr-choice-34')).toBeEnabled();
+
+    resolveFirstPin();
+    await waitFor(() => expect(screen.getByRole('dialog', { name: /choose active pull request/i })).toBeInTheDocument());
+    expect(screen.getByTestId('active-pr-choice-34')).toBeEnabled();
+  });
+
   it('shows pending and visible error state for selector mutations and mobile-safe auto summary', async () => {
     const selection = makeSelection({
       latest_observed_branch: { branch_name: 'task-123-pr-status', repository_identity: 'o/r' },
@@ -1684,6 +1731,44 @@ describe('StateBar mobile layout', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     expect(onUpgradeModel).toHaveBeenCalledWith('gpt-5.6-sol', null, 'standard');
+  });
+
+  it('keeps the submitted tuple frozen until a pending update settles', async () => {
+    let rejectUpdate!: (error: Error) => void;
+    const onUpgradeModel = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectUpdate = reject; }));
+    const conversation = makeConversation({ model: 'gpt-5.6-sol', effort: null, service_tier: 'standard' });
+    const stateBar = (models: ModelInfo[]) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={conversation}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={models}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(stateBar(pickerModels));
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    const refreshedModels = pickerModels.filter((model) => model.id !== 'gpt-5.6-sol');
+    act(() => rerender(stateBar(refreshedModels)));
+
+    expect(screen.getByRole('radio', { name: /gpt-5.6-sol/i })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toHaveAttribute('aria-checked', 'true');
+
+    rejectUpdate(new Error('Update failed'));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Update failed');
+    expect(screen.getByRole('radio', { name: /claude-sonnet-5/i })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByRole('radiogroup', { name: /select speed/i })).not.toBeInTheDocument();
   });
 
   it('discards staged configuration when the mounted conversation identity changes', () => {

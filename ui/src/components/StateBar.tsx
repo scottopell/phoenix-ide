@@ -218,6 +218,13 @@ function resolveAvailableModel(models: ModelInfo[], selectedId: string): ModelIn
     ?? models[0];
 }
 
+interface PendingModelSelection {
+  catalog: ModelInfo[];
+  model: ModelInfo;
+  effort: ModelEffort | null;
+  serviceTier: ServiceTier;
+}
+
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   if (!pr.url) return null;
   const stopPropagation = (event: ReactMouseEvent<HTMLAnchorElement>) => {
@@ -510,7 +517,8 @@ export function StateBar({
   const [stagedModel, setStagedModel] = useState('');
   const [stagedEffort, setStagedEffort] = useState<ModelEffort | null>(null);
   const [stagedServiceTier, setStagedServiceTier] = useState<ServiceTier>('standard');
-  const [modelMutationPending, setModelMutationPending] = useState(false);
+  const [pendingModelSelection, setPendingModelSelection] = useState<PendingModelSelection | null>(null);
+  const modelMutationPending = pendingModelSelection !== null;
   const [modelMutationError, setModelMutationError] = useState<string | null>(null);
   const usesCompactLayout = useIsCompactLayout();
   const [mobileExpanded, setMobileExpanded] = useState(false);
@@ -532,7 +540,7 @@ export function StateBar({
     setStagedModel('');
     setStagedEffort(null);
     setStagedServiceTier('standard');
-    setModelMutationPending(false);
+    setPendingModelSelection(null);
     setModelMutationError(null);
   }, [conversation?.id]);
 
@@ -907,16 +915,16 @@ export function StateBar({
   );
 
   useEffect(() => {
-    if (canPickModel || !pickerOpen) return;
+    if (canPickModel || !pickerOpen || modelMutationPending) return;
     setPickerOpen(false);
     setStagedModel('');
     setStagedEffort(null);
     setStagedServiceTier('standard');
     setModelMutationError(null);
-  }, [canPickModel, pickerOpen]);
+  }, [canPickModel, modelMutationPending, pickerOpen]);
 
   useLayoutEffect(() => {
-    if (!pickerOpen || pickerConversationId !== conversation?.id || !availableModels?.length) return;
+    if (modelMutationPending || !pickerOpen || pickerConversationId !== conversation?.id || !availableModels?.length) return;
     const reconciledModel = resolveAvailableModel(availableModels, stagedModel);
     if (!reconciledModel) return;
     if (reconciledModel.id !== stagedModel) setStagedModel(reconciledModel.id);
@@ -927,6 +935,7 @@ export function StateBar({
   }, [
     availableModels,
     conversation?.id,
+    modelMutationPending,
     pickerConversationId,
     pickerOpen,
     stagedEffort,
@@ -934,18 +943,19 @@ export function StateBar({
     stagedServiceTier,
   ]);
 
+  const pickerCatalog = pendingModelSelection?.catalog ?? availableModels;
   const pickerModels: ModelInfo[] = (() => {
-    if (!availableModels) return [];
-    if (pickerShowAll) return availableModels;
-    const recommended = availableModels.filter((model) => model.recommended);
+    if (!pickerCatalog) return [];
+    if (pickerShowAll) return pickerCatalog;
+    const recommended = pickerCatalog.filter((model) => model.recommended);
     const selectedId = stagedModel || currentModel;
     if (selectedId && !recommended.some((model) => model.id === selectedId)) {
-      const selected = availableModels.find((model) => model.id === selectedId);
+      const selected = pickerCatalog.find((model) => model.id === selectedId);
       if (selected) return [selected, ...recommended];
     }
-    return recommended.length > 0 ? recommended : availableModels;
+    return recommended.length > 0 ? recommended : pickerCatalog;
   })();
-  const stagedModelInfo = availableModels?.find((model) => model.id === stagedModel);
+  const stagedModelInfo = pickerCatalog?.find((model) => model.id === stagedModel);
   const stagedEffortCapabilities = stagedModelInfo?.effort_capabilities;
   const stagedSupportsFastMode = stagedModelInfo?.service_tier_capabilities === 'supported';
   const modelSelectionChanged = stagedModel !== currentModel
@@ -975,7 +985,7 @@ export function StateBar({
   };
 
   const stageModel = (modelId: string) => {
-    const targetModel = availableModels?.find((model) => model.id === modelId);
+    const targetModel = pickerCatalog?.find((model) => model.id === modelId);
     setStagedModel(modelId);
     setStagedEffort((effort) => effortCompatible(targetModel?.effort_capabilities, effort) ? effort : null);
     setStagedServiceTier((tier) => targetModel?.service_tier_capabilities === 'supported' ? tier : 'standard');
@@ -988,14 +998,24 @@ export function StateBar({
     const submittedServiceTier = stagedModelInfo.service_tier_capabilities === 'supported'
       ? stagedServiceTier
       : 'standard';
+    const submittedSelection: PendingModelSelection = {
+      catalog: [...(availableModels ?? [stagedModelInfo])],
+      model: stagedModelInfo,
+      effort: submittedEffort,
+      serviceTier: submittedServiceTier,
+    };
     const submittedConversationId = conversation?.id;
     const operationGeneration = ++modelMutationGenerationRef.current;
     const ownsMutation = () => conversationIdentityRef.current === submittedConversationId
       && modelMutationGenerationRef.current === operationGeneration;
-    setModelMutationPending(true);
+    setPendingModelSelection(submittedSelection);
     setModelMutationError(null);
     try {
-      await onUpgradeModel(stagedModelInfo.id, submittedEffort, submittedServiceTier);
+      await onUpgradeModel(
+        submittedSelection.model.id,
+        submittedSelection.effort,
+        submittedSelection.serviceTier,
+      );
       if (ownsMutation()) {
         setPickerOpen(false);
         setPickerConversationId(undefined);
@@ -1005,7 +1025,7 @@ export function StateBar({
         setModelMutationError(error instanceof Error ? error.message : 'Failed to update model, effort, and speed');
       }
     } finally {
-      if (ownsMutation()) setModelMutationPending(false);
+      if (ownsMutation()) setPendingModelSelection(null);
     }
   };
 
@@ -1048,7 +1068,9 @@ export function StateBar({
   const prStatusContent = (
     <>
       {prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
-      {!workActionsPrRailOwnsSelection && prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
+      {!workActionsPrRailOwnsSelection && prStatusHandle && (
+        <ActivePrSelector key={conversation?.id} handle={prStatusHandle} />
+      )}
       {prHint && !prLoading && (
         <span
           className="pr-hint"
@@ -1065,7 +1087,9 @@ export function StateBar({
     || (prHint && !prLoading),
   );
 
-  const modelDialog = pickerOpen && pickerConversationId === conversation?.id && canPickModel ? (
+  const modelDialog = pickerOpen
+    && pickerConversationId === conversation?.id
+    && (canPickModel || modelMutationPending) ? (
       <SelectionDialog
         title="Model, effort, and speed"
         description="Choose the model, reasoning effort, and request speed for the next turn. Changes apply together."
