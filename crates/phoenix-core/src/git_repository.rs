@@ -13,7 +13,7 @@ impl GitRepositoryId {
     /// Returns [`GitRepositoryIdError`] when the supplied identifier is empty.
     pub fn parse(value: impl Into<String>) -> Result<Self, GitRepositoryIdError> {
         let value = value.into();
-        if value.trim().is_empty() {
+        if value.is_empty() {
             return Err(GitRepositoryIdError::Empty);
         }
         Ok(Self(value))
@@ -59,17 +59,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_rejects_empty_or_blank() {
+    fn parse_rejects_empty_text() {
         assert_eq!(GitRepositoryId::parse(""), Err(GitRepositoryIdError::Empty));
-        assert_eq!(
-            GitRepositoryId::parse("  \t"),
-            Err(GitRepositoryIdError::Empty)
-        );
+    }
+
+    #[test]
+    fn parse_preserves_whitespace_only_legacy_identity() {
+        let id = GitRepositoryId::parse("  \t").unwrap();
+        assert_eq!(id.as_str(), "  \t");
     }
 
     #[test]
     fn parse_accepts_opaque_non_empty_text() {
         let id = GitRepositoryId::parse("repo-opaque").unwrap();
         assert_eq!(id.as_str(), "repo-opaque");
+    }
+
+    #[test]
+    fn parse_preserves_legacy_project_identity_bytes_exactly() {
+        let id = GitRepositoryId::parse("  repo-opaque  ").unwrap();
+        assert_eq!(id.as_str(), "  repo-opaque  ");
     }
 }

@@ -5,6 +5,7 @@
 mod close_foundation;
 mod coordinator_query;
 mod ddl;
+mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
 pub mod workflow;
@@ -26,6 +27,9 @@ use phoenix_core::work_scope::{
 pub use close_foundation::*;
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
+};
+pub(crate) use git_repository_reconciliation::{
+    DormantGitRepositoryCatchupPermit, DormantGitRepositoryCatchupStats,
 };
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
@@ -160,6 +164,11 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
+    #[error("git repository work-scope project conflict for {work_scope_id}: {repository_ids:?}")]
+    GitRepositoryWorkScopeProjectConflict {
+        work_scope_id: WorkScopeId,
+        repository_ids: Vec<phoenix_core::git_repository::GitRepositoryId>,
+    },
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -1186,6 +1195,13 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub(crate) async fn catch_up_dormant_git_repositories(
+        &self,
+        permit: DormantGitRepositoryCatchupPermit,
+    ) -> DbResult<DormantGitRepositoryCatchupStats> {
+        git_repository_reconciliation::catch_up_dormant_git_repositories(self, permit).await
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
