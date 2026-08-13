@@ -1231,7 +1231,7 @@ impl Database {
             if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
                 return None;
             }
-            bytes
+            git_dir.as_bytes().to_vec()
         } else if metadata.is_dir() {
             Vec::new()
         } else {
@@ -1243,10 +1243,10 @@ impl Database {
         }
         let created_nanos = metadata
             .created()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
         Some(format!(
             "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
             metadata.dev(),
@@ -3427,16 +3427,21 @@ impl Database {
         // Retry with a random suffix on slug collision (UNIQUE constraint).
         let mut actual_slug = slug.to_string();
         let mut attempts = 0u8;
+        let preserve_unattached_parent =
+            matches!(expected_parent_scope, ExpectedParentScope::Snapshot(None));
         let created_work_scope_id = loop {
             let title_str = schema::title_from_slug(&actual_slug);
-            let generated_scope = inherited_scope.is_none().then(|| {
-                let (scope_id, authority_kind, environment) =
-                    Self::new_scope_for_conversation(cwd, &cm);
-                (scope_id, authority_kind, environment)
+            let generated_scope =
+                (inherited_scope.is_none() && !preserve_unattached_parent).then(|| {
+                    let (scope_id, authority_kind, environment) =
+                        Self::new_scope_for_conversation(cwd, &cm);
+                    (scope_id, authority_kind, environment)
+                });
+            let work_scope_id = inherited_scope.clone().or_else(|| {
+                generated_scope
+                    .as_ref()
+                    .map(|(scope_id, _, _)| scope_id.clone())
             });
-            let work_scope_id = inherited_scope
-                .clone()
-                .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
             let mut tx = self.pool.begin().await?;
             if let (Some(parent_id), ExpectedParentScope::Snapshot(expected_scope)) =
                 (parent_id, &expected_parent_scope)
@@ -3492,7 +3497,7 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(runtime_role.as_str())
-            .bind(work_scope_id.as_str())
+            .bind(work_scope_id.as_ref().map(WorkScopeId::as_str))
             .bind(parent_id.map(|_| cwd))
             .bind(ServiceTier::Standard.as_wire_name())
             .execute(&mut *tx)
@@ -3548,7 +3553,7 @@ impl Database {
             service_tier: ServiceTier::Standard,
             conv_mode: conv_mode.clone(),
             runtime_role,
-            attached_work_scope_id: Some(created_work_scope_id),
+            attached_work_scope_id: created_work_scope_id,
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
             transcript_generation: 1,
@@ -10894,6 +10899,10 @@ mod tests {
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
         std::fs::write(&marker, "gitdir: /tmp/windows-linked-worktree\r\n").unwrap();
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
+        let crlf = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        std::fs::write(&marker, "gitdir: /tmp/windows-linked-worktree\n").unwrap();
+        let lf = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
+        assert_eq!(crlf, lf);
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         std::fs::rename(&root, root.with_extension("moved")).unwrap();
         let moved = root.with_extension("moved");
