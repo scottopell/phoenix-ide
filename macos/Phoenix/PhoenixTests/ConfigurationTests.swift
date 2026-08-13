@@ -206,11 +206,13 @@ final class ConfigurationTests: XCTestCase {
         )
     }
 
-    func testAuthPopupNavigationAllowsWebOAuthButRejectsPrivilegedSchemes() {
-        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "https://accounts.example.test/oauth")!), .allowManagedChild)
-        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "about:blank")!), .allowManagedChild)
-        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "mailto:help@example.test")!), .externalize)
-        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "file:///tmp/secret")!), .cancel)
+    func testAuthPopupNavigationExternalizesOAuthToDefaultBrowser() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "https://accounts.example.test/oauth")!, expectedOrigin: expected), .externalize)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "about:blank")!, expectedOrigin: expected), .allowManagedChild)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "https://phoenix.example.test/oauth/callback")!, expectedOrigin: expected), .allowManagedChild)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "mailto:help@example.test")!, expectedOrigin: expected), .externalize)
+        XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "file:///tmp/secret")!, expectedOrigin: expected), .cancel)
     }
 
     func testDownloadNamingSanitizesDangerousSuggestedNames() {

@@ -109,10 +109,11 @@ struct WebViewWrapper: NSViewRepresentable {
                 return
             }
             if role == .authPopup {
-                switch PhoenixWebViewPolicy.popupNavigationDecision(url) {
+                switch PhoenixWebViewPolicy.popupNavigationDecision(url, expectedOrigin: origin) {
                 case .allowManagedChild: decisionHandler(.allow)
                 case .externalize:
                     openExternallyIfSafe(url)
+                    browserEnvironment.popupManager.webViewDidClose(webView)
                     decisionHandler(.cancel)
                 case .cancel: decisionHandler(.cancel)
                 }

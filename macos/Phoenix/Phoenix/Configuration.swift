@@ -868,11 +868,13 @@ struct PhoenixWebViewPolicy {
         return ["http", "https", "mailto", "tel"].contains(scheme)
     }
 
-    static func popupNavigationDecision(_ url: URL) -> PopupDecision {
+    static func popupNavigationDecision(_ url: URL, expectedOrigin: PhoenixOrigin) -> PopupDecision {
+        if url.absoluteString == "about:blank" || expectedOrigin.exactlyMatches(url) {
+            return .allowManagedChild
+        }
         guard let scheme = url.scheme?.lowercased() else { return .cancel }
         switch scheme {
-        case "about", "http", "https": return .allowManagedChild
-        case "mailto", "tel": return .externalize
+        case "http", "https", "mailto", "tel": return .externalize
         default: return .cancel
         }
     }

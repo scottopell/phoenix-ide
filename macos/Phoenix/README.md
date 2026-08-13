@@ -65,7 +65,7 @@ Conversation links activate Phoenix.app and navigate the existing authenticated 
 
 Phoenix.app uses normal macOS TLS trust. It does not bypass certificate validation. Install the Phoenix-managed local CA through the supported Phoenix deployment flow when needed. Identity verification rejects cross-origin redirects instead of silently rebinding the configured origin. Activated links, popup `window.open` requests, microphone permission, and notification permission are internal only when scheme, host, and effective port exactly match the configured origin.
 
-Same-origin `window.open` authentication uses managed child WebKit windows with WebKit's supplied opener configuration. Auth popups may navigate through HTTP(S) OAuth pages but cannot request microphone/notification permission, download files, or mutate the primary deployment-verification state.
+Same-origin `window.open` flows may use a managed child WebKit window, but the first cross-origin OAuth navigation opens in the user's default browser and closes the blank child. This preserves enterprise Chrome/Google sessions. OAuth callbacks return to Phoenix's server endpoint; Phoenix.app never needs the browser's cookies or callback handling. Managed child windows cannot request microphone/notification permission, download files, or mutate primary deployment-verification state.
 
 ## Manual compatibility matrix
 
@@ -73,7 +73,7 @@ Run a signed Finder-launched build, not only Xcode:
 
 - Managed launchd deployment: login, shared Safari/iOS conversation history, reconnect, and quit without process changes.
 - Bundled sidecar: private history, verified loopback/non-TLS/non-socket-activated deployment, second-owner refusal, occupied-port failure, intentional restart, graceful quit, and force-stop fallback.
-- Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, popup authentication windows, and Web Inspector.
+- Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, default-browser OAuth handoff, and Web Inspector.
 - Failures: offline, wrong service, auth required, TLS trust failure, unknown/unmanaged/ambiguous ownership, no models, sidecar crash, missing sidecar, and hotkey conflict.
 - Deep links: an existing conversation UUID opens in the authenticated app; malformed and unknown UUIDs do not navigate or mutate server state. `phoenix://new` remains unsupported.
 - Security: no key/token/password/custom secret header in preferences, diagnostics, app logs, error text, or process arguments.
