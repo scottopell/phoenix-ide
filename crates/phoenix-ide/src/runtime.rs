@@ -2502,6 +2502,18 @@ impl RuntimeManager {
         })
     }
 
+    async fn cleanup_terminal_subagent_resources(&self, conv: &crate::db::Conversation) {
+        if let Err(error) =
+            crate::api::handlers::run_runtime_resource_cleanup_cascade(self, conv).await
+        {
+            tracing::warn!(
+                conv_id = %conv.id,
+                ?error,
+                "Sub-agent terminal resource cleanup failed"
+            );
+        }
+    }
+
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
@@ -2810,6 +2822,7 @@ impl RuntimeManager {
         // 9. Start runtime task
         let conv_id = conv.id.clone();
         let task_text = spec.task.clone();
+        let cleanup_conversation = conv.clone();
         let manager_for_cleanup = Arc::clone(self);
         tokio::spawn(async move {
             // Send initial UserMessage event to start the conversation
@@ -2830,6 +2843,10 @@ impl RuntimeManager {
 
             // Cancel timeout — sub-agent finished before its limit
             timeout_task.abort();
+
+            manager_for_cleanup
+                .cleanup_terminal_subagent_resources(&cleanup_conversation)
+                .await;
 
             // Only remove this sub-agent's entry. The identity check guards
             // against the (unlikely) case where a replacement was inserted
@@ -5157,6 +5174,45 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_cleanup_tears_down_unattached_scope() {
+        let manager = test_manager().await;
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "unattached-cleanup-child",
+                "unattached-cleanup-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+        let _ = manager.bash_handles().get_or_create(&scope).await;
+
+        manager.cleanup_terminal_subagent_resources(&child).await;
+
+        assert!(matches!(
+            manager.bash_handles().reserve_spawn(&scope).await,
+            Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
     }
 
     struct RecordingLlm {

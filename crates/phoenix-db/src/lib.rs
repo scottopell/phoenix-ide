@@ -3400,22 +3400,23 @@ impl Database {
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
         let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
-            let row = sqlx::query(
-                "SELECT work_scope_id AS work_scope_id, effort FROM conversations WHERE id = ?1 AND work_scope_id IS NOT NULL",
-            )
-            .bind(parent_id)
-            .fetch_optional(&self.pool)
-            .await?;
+            let row = sqlx::query("SELECT work_scope_id, effort FROM conversations WHERE id = ?1")
+                .bind(parent_id)
+                .fetch_optional(&self.pool)
+                .await?;
             match row {
                 Some(row) => {
-                    let scope = WorkScopeId::parse(row.try_get::<String, _>("work_scope_id")?)
+                    let scope = row
+                        .try_get::<Option<String>, _>("work_scope_id")?
+                        .map(WorkScopeId::parse)
+                        .transpose()
                         .map_err(|error| DbError::Serialization(error.to_string()))?;
                     let effort = row
                         .try_get::<Option<String>, _>("effort")?
                         .map(|value| ModelEffort::from_str(&value))
                         .transpose()
                         .map_err(|error| DbError::Serialization(error.clone()))?;
-                    (Some(scope), effort)
+                    (scope, effort)
                 }
                 None => (None, None),
             }
@@ -16634,6 +16635,46 @@ mod tests {
         .await
         .unwrap();
         let child = db.get_conversation("effort-child").await.unwrap();
+        assert_eq!(child.effort, Some(ModelEffort::High));
+    }
+
+    #[tokio::test]
+    async fn unattached_sub_agent_inherits_parent_effort_without_a_work_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent = db
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort(
+            &parent.id,
+            "gpt-5.4",
+            Some(ModelEffort::High),
+            ServiceTier::Standard,
+        )
+        .await
+        .unwrap();
+
+        let child = db
+            .create_subagent_conversation(
+                "unattached-effort-child",
+                "unattached-effort-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(child.attached_work_scope_id, None);
         assert_eq!(child.effort, Some(ModelEffort::High));
     }
 

@@ -367,6 +367,29 @@ ON work_scopes(worktree_id) WHERE worktree_id IS NOT NULL;
 CREATE UNIQUE INDEX work_scopes_unique_worktree_fingerprint
 ON work_scopes(worktree_fingerprint) WHERE worktree_fingerprint IS NOT NULL;
 
+DROP TRIGGER IF EXISTS conversations_role_scope_insert;
+DROP TRIGGER IF EXISTS conversations_role_scope_update;
+CREATE TRIGGER conversations_role_scope_insert
+BEFORE INSERT ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL)
+  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
+  OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
+  OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+CREATE TRIGGER conversations_role_scope_update
+BEFORE UPDATE OF runtime_role, work_scope_id, coordinator_head, continued_in_conv_id ON conversations
+WHEN NEW.runtime_role NOT IN ('user', 'sub_agent', 'coordinator')
+  OR (NEW.runtime_role = 'user' AND NEW.work_scope_id IS NULL)
+  OR (NEW.runtime_role = 'coordinator' AND NEW.work_scope_id IS NOT NULL)
+  OR (NEW.coordinator_head = 1 AND NEW.runtime_role <> 'coordinator')
+  OR (NEW.coordinator_head = 1 AND NEW.continued_in_conv_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid conversation runtime role/work scope');
+END;
+
 CREATE TRIGGER work_scope_stable_worktree_shape_insert
 BEFORE INSERT ON work_scopes
 WHEN (NEW.environment_kind <> 'allocated_worktree'
@@ -5672,6 +5695,7 @@ mod tests {
                  user_initiated BOOLEAN NOT NULL DEFAULT 1,
                  state_kind TEXT,
                  runtime_role TEXT,
+                 coordinator_head INTEGER NOT NULL DEFAULT 0,
                  archived BOOLEAN NOT NULL DEFAULT 0
              );
              CREATE TABLE conversation_creation_jobs (
@@ -5806,6 +5830,7 @@ mod tests {
                  user_initiated BOOLEAN NOT NULL DEFAULT 1,
                  state_kind TEXT,
                  runtime_role TEXT,
+                 coordinator_head INTEGER NOT NULL DEFAULT 0,
                  archived BOOLEAN NOT NULL DEFAULT 0
              );
              CREATE TABLE conversation_creation_jobs (
@@ -5872,6 +5897,33 @@ mod tests {
         .unwrap();
         stamp_migrations_except(&pool, 64).await;
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        sqlx::query(
+            "INSERT INTO conversations (id, state_kind, runtime_role, work_scope_id)
+             VALUES ('unattached-sub-agent', 'idle', 'sub_agent', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("typed unattached sub-agent must be representable");
+        assert!(sqlx::query(
+            "INSERT INTO conversations (id, state_kind, runtime_role, work_scope_id)
+             VALUES ('unattached-user', 'idle', 'user', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = 'scope-a'
+             WHERE id = 'unattached-sub-agent'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query("DELETE FROM conversations WHERE id = 'unattached-sub-agent'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
         sqlx::query(
             "UPDATE work_scopes
              SET worktree_id = id || '-worktree', worktree_fingerprint = id || '-fingerprint'

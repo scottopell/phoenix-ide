@@ -804,6 +804,9 @@ fn conversation_resource_scope(
         None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
             crate::work_scope::ResourceScopeKey::Coordinator
         }
+        None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
+            crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
+        }
         None => panic!("ordinary persisted conversation is missing its work scope"),
     }
 }
@@ -5285,14 +5288,14 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 /// is healthy. This runs BEFORE any cleanup side effect, so an early return
 /// leaves no partial state.
 async fn scope_still_owned_after_delete(
-    state: &AppState,
+    runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
 ) -> Result<bool, AppError> {
     let id = conv.id.as_str();
 
     if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
-        match state.runtime.db().get_conversation(cont_id).await {
+        match runtime.db().get_conversation(cont_id).await {
             Ok(continuation) => {
                 let cont_scope = conversation_resource_scope(&continuation);
                 if &cont_scope == work_scope {
@@ -5318,8 +5321,7 @@ async fn scope_still_owned_after_delete(
     let Some(work_scope_id) = work_scope.work_scope_id() else {
         return Ok(false);
     };
-    let conversations = state
-        .runtime
+    let conversations = runtime
         .db()
         .list_conversations_for_work_scope(work_scope_id)
         .await
@@ -5330,12 +5332,12 @@ async fn scope_still_owned_after_delete(
 }
 
 async fn cleanup_browser_with_retry(
-    state: &AppState,
+    runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     work_scope: &crate::work_scope::ResourceScopeKey,
     inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
 ) {
-    let browser_manager = state.runtime.browser_sessions();
+    let browser_manager = runtime.browser_sessions();
     let browser_actor = crate::work_scope::EffectiveResourceAccess::new(
         conv.id.clone(),
         match conv.conv_mode {
@@ -5366,7 +5368,7 @@ async fn cleanup_browser_with_retry(
 }
 
 #[derive(Debug)]
-pub(super) struct ResourceCleanupReceipt {
+pub(crate) struct ResourceCleanupReceipt {
     work_scope: crate::work_scope::ResourceScopeKey,
     bash_teardown_generation: Option<phoenix_tools::bash::registry::BashTeardownGeneration>,
 }
@@ -5427,19 +5429,26 @@ pub(super) async fn run_resource_cleanup_cascade(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<ResourceCleanupReceipt, AppError> {
+    run_runtime_resource_cleanup_cascade(&state.runtime, conv).await
+}
+
+pub(crate) async fn run_runtime_resource_cleanup_cascade(
+    runtime: &crate::runtime::RuntimeManager,
+    conv: &crate::db::Conversation,
+) -> Result<ResourceCleanupReceipt, AppError> {
     let id = conv.id.as_str();
     let work_scope = conversation_resource_scope(conv);
 
     // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
     // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
     // terminal, browser) so they all honor the same any-live-owner signal.
-    let scope_still_owned = scope_still_owned_after_delete(state, conv, &work_scope).await?;
+    let scope_still_owned = scope_still_owned_after_delete(runtime, conv, &work_scope).await?;
     let inheritor_scope = scope_still_owned.then_some(&work_scope);
 
     // Step 2: bash handles. Preserve iff the scope is still owned by a live
     // conversation other than this one (REQ-BASH-WS-002).
     let bash_report = crate::tools::bash::registry::cascade_bash_on_delete(
-        state.runtime.bash_handles(),
+        runtime.bash_handles(),
         &work_scope,
         &crate::work_scope::EffectiveResourceAccess::new(
             conv.id.clone(),
@@ -5479,7 +5488,7 @@ pub(super) async fn run_resource_cleanup_cascade(
     let legacy_worktree_path = conv.conv_mode.worktree_path().map(std::path::Path::new);
     let legacy_conversation_id = legacy_worktree_path.is_none().then_some(conv.id.as_str());
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
-        state.runtime.tmux_registry(),
+        runtime.tmux_registry(),
         &work_scope,
         inheritor_scope,
         legacy_worktree_path,
@@ -5501,14 +5510,14 @@ pub(super) async fn run_resource_cleanup_cascade(
     // (REQ-TERM-WS-001, REQ-TERM-012). Sub-agent / no-terminal scopes
     // hit the no-op fast path inside the cascade — registry miss is the
     // common case during conversation cleanup.
-    crate::terminal::cascade_terminal_on_delete(&state.terminals, &work_scope, inheritor_scope)
+    crate::terminal::cascade_terminal_on_delete(&runtime.terminals, &work_scope, inheritor_scope)
         .await;
 
     // Step 5: project worktree. Preserve iff the scope is still owned by a
     // live conversation other than this one — a Work sub-agent inherits the
     // parent's `worktree_path`, so removing the worktree / deleting the
     // branch here would destroy the live parent's checkout (REQ-PROJ-029).
-    let project_report = cascade_projects_on_delete(state, conv, inheritor_scope).await;
+    let project_report = cascade_projects_on_delete(runtime, conv, inheritor_scope).await;
     if let Some(err) = &project_report.error {
         tracing::warn!(
             conv_id = %id,
@@ -5521,7 +5530,7 @@ pub(super) async fn run_resource_cleanup_cascade(
 
     // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
-    cleanup_browser_with_retry(state, conv, &work_scope, inheritor_scope).await;
+    cleanup_browser_with_retry(runtime, conv, &work_scope, inheritor_scope).await;
 
     Ok(ResourceCleanupReceipt {
         work_scope,
@@ -5815,7 +5824,7 @@ struct CascadeProjectsReport {
 /// conversation, or `None` when there is no worktree/branch to reap (Direct,
 /// or Explore with no worktree). `is_work_mode` gates the `branch -D`.
 async fn cascade_project_target(
-    state: &AppState,
+    runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
 ) -> Result<Option<(String, String, bool)>, crate::db::DbError> {
     let target = match &conv.conv_mode {
@@ -5833,8 +5842,8 @@ async fn cascade_project_target(
             worktree_path: Some(wt),
             ..
         } => {
-            let mut conversations = state
-                .db
+            let mut conversations = runtime
+                .db()
                 .list_conversations_for_worktree(wt.as_str())
                 .await?;
             if !conversations
@@ -5859,7 +5868,7 @@ async fn cascade_project_target(
 }
 
 async fn cascade_projects_on_delete(
-    state: &AppState,
+    runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
     inheritor_scope: Option<&crate::work_scope::ResourceScopeKey>,
 ) -> CascadeProjectsReport {
@@ -5893,7 +5902,7 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     }
 
-    let target = match cascade_project_target(state, conv).await {
+    let target = match cascade_project_target(runtime, conv).await {
         Ok(target) => target,
         Err(error) => {
             return CascadeProjectsReport {
@@ -5918,7 +5927,7 @@ async fn cascade_projects_on_delete(
     // project-scoped, we can't run `git worktree remove` against the
     // correct repo. The worktree path is still removable from disk.
     let repo_root: Option<PathBuf> = if let Some(project_id) = conv.project_id.as_deref() {
-        match state.db.get_project(project_id).await {
+        match runtime.db().get_project(project_id).await {
             Ok(p) => Some(PathBuf::from(p.canonical_path)),
             Err(e) => {
                 tracing::debug!(
@@ -13151,7 +13160,7 @@ pub(crate) mod hard_delete_cascade_tests {
             build_workmode_chain_with_shared_worktree(&state, &[ids[0], ids[1], "pc-a3"]).await;
 
         let root_conv = state.db.get_conversation("pc-a").await.expect("root");
-        let report = cascade_projects_on_delete(&state, &root_conv, None).await;
+        let report = cascade_projects_on_delete(&state.runtime, &root_conv, None).await;
         assert!(
             report.worktree_path.is_none(),
             "cascade on chain root must report no worktree work (continuation owns it), got {report:?}"

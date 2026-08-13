@@ -3413,11 +3413,16 @@ mod tests {
         .execute(db.pool())
         .await
         .is_err());
-        assert!(
-            sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'latest'",)
-                .execute(db.pool())
+        sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'latest'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_conversation("latest")
                 .await
-                .is_err()
+                .unwrap()
+                .attached_work_scope_id,
+            None
         );
         assert!(
             sqlx::query("UPDATE work_scopes SET worktree_path = '/tmp/rebound' WHERE id = ?1",)
