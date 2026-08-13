@@ -35,13 +35,15 @@ struct WebViewWrapper: NSViewRepresentable {
 
     private static let authenticationBridgeScript = """
     (() => {
+      let deploymentRequestSequence = 0;
       const reportDeployment = async () => {
+        const sequence = ++deploymentRequestSequence;
         try {
           const response = await window.fetch('/api/deployment', { credentials: 'same-origin' });
           const body = response.ok ? await response.json() : null;
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ status: response.status, body });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ sequence, status: response.status, body });
         } catch (_) {
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ status: 0, body: null });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ sequence, status: 0, body: null });
         }
       };
       window.__phoenixMacReportDeployment = reportDeployment;
@@ -104,6 +106,7 @@ struct WebViewWrapper: NSViewRepresentable {
         let onDeployment: (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void
         let onAuthenticationRequired: (ServerManager.ConnectionOperationToken) -> Void
         weak var webView: WKWebView?
+        private var latestDeploymentSequence = 0
 
         init(
             origin: PhoenixOrigin,
@@ -325,10 +328,17 @@ struct WebViewWrapper: NSViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard role == .primary else { return }
+            guard role == .primary,
+                  message.webView === webView,
+                  message.frameInfo.isMainFrame,
+                  let sourceURL = message.frameInfo.request.url,
+                  origin.exactlyMatches(sourceURL) else { return }
             guard message.name == "phoenixDeployment",
                   let body = message.body as? [String: Any],
+                  let sequence = body["sequence"] as? Int,
+                  sequence > latestDeploymentSequence,
                   let status = body["status"] as? Int else { return }
+            latestDeploymentSequence = sequence
             if status == 401 {
                 onAuthenticationRequired(operation)
                 return
@@ -407,7 +417,9 @@ final class PopupWindowManager: NSObject, NSWindowDelegate {
         onDeployment: @escaping (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void,
         onAuthenticationRequired: @escaping (ServerManager.ConnectionOperationToken) -> Void
     ) -> WKWebView {
-        let childWebView = WKWebView(frame: .zero, configuration: configuration)
+        let isolatedConfiguration = configuration.copy() as! WKWebViewConfiguration
+        isolatedConfiguration.userContentController = WKUserContentController()
+        let childWebView = WKWebView(frame: .zero, configuration: isolatedConfiguration)
         let coordinator = WebViewWrapper.Coordinator(
             origin: origin,
             role: role,

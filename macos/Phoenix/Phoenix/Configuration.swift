@@ -238,6 +238,12 @@ struct DeepLinkConversationValidation {
     }
 }
 
+struct QueuedDeepLinkAuthorityDecision {
+    static func shouldRetain(pendingOrigin: PhoenixOrigin?, nextOrigin: PhoenixOrigin?) -> Bool {
+        pendingOrigin != nil && pendingOrigin == nextOrigin
+    }
+}
+
 struct DeepLinkNavigationDecision {
     static func validationResultIsCurrent(validatedID: UUID, pendingConversationID: UUID?) -> Bool {
         pendingConversationID == validatedID

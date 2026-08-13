@@ -137,6 +137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
                 self.browserOperation = nil
                 webView = nil
+                pendingConversationValidationTask?.cancel()
+                pendingConversationID = nil
                 isPrimaryWebViewAuthenticated = false
             }
             if webView != nil { return }
@@ -181,6 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pendingConversationValidationTask?.cancel()
             browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
             self.browserOperation = nil
+            pendingConversationID = nil
         }
         if let current = webView {
             current.navigationDelegate = nil
