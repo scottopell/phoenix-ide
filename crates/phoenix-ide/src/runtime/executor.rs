@@ -4499,6 +4499,15 @@ where
             let request = SubAgentSpawnRequest {
                 spec,
                 parent_conversation_id: self.context.conversation_id.clone(),
+                parent_scope: self
+                    .context
+                    .resource_scope
+                    .work_scope_id()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "sub-agents require a parent conversation with an attached WorkScope"
+                            .to_string()
+                    })?,
                 parent_event_tx: self.event_tx.clone(),
                 parent_turn_link: parent_turn_link.clone(),
             };

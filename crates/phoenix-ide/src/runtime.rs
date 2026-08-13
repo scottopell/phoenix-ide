@@ -37,7 +37,7 @@ use crate::tools::{
     ExploreToolPolicy, TmuxLifecycleEvent, TmuxRegistry, ToolRegistry, WakeRegistrar,
 };
 use phoenix_core::domain::llm_types::ServiceTier;
-use phoenix_core::work_scope::ResourceScopeKey;
+use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId};
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -101,6 +101,7 @@ fn deposit_turn_trigger(handle: &ConversationHandle) {
 pub struct SubAgentSpawnRequest {
     pub spec: SubAgentSpec,
     pub parent_conversation_id: String,
+    pub parent_scope: WorkScopeId,
     pub parent_event_tx: mpsc::Sender<Event>,
     /// The parent's `conversation.turn` span context at spawn time
     /// (invalid when tracing export is disabled). Seeded into the sub-agent's
@@ -2505,6 +2506,7 @@ impl RuntimeManager {
         let SubAgentSpawnRequest {
             spec,
             parent_conversation_id,
+            parent_scope,
             parent_event_tx,
             parent_turn_link,
         } = req;
@@ -2533,6 +2535,20 @@ impl RuntimeManager {
                 return;
             }
         };
+        if parent_conv.attached_work_scope_id.as_ref() != Some(&parent_scope) {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: format!(
+                            "Parent WorkScope changed before sub-agent persistence: expected {parent_scope}"
+                        ),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         if let Some(effort) = parent_conv.effort {
             if !self.llm_registry.supports_effort(&spec.model_id, effort) {
@@ -2584,19 +2600,15 @@ impl RuntimeManager {
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
             .db
-            .create_conversation_with_project(
+            .create_subagent_conversation(
                 &spec.agent_id,
                 &slug,
                 spec_cwd.raw(),
-                false, // user_initiated = false
-                Some(&parent_conversation_id),
-                Some(&spec.model_id), // inherit parent's model
-                None,                 // project_id
+                &parent_conversation_id,
+                &spec.model_id,
                 &sub_conv_mode,
-                None,                     // desired_base_branch
-                None, // seed_parent_id (sub-agents use `parent_conversation_id` above)
-                None, // seed_label
-                parent_conv.llm_language, // inherit language from parent
+                parent_conv.llm_language,
+                &parent_scope,
             )
             .await
         {

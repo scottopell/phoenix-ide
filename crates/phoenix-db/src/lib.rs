@@ -1317,7 +1317,7 @@ impl Database {
                     "work scope {scope_id} has no normalized environment"
                 ))
             })?;
-        let (worktree_id, observed_fingerprint) = match (kind, observed_fingerprint) {
+        let (mut worktree_id, mut observed_fingerprint) = match (kind, observed_fingerprint) {
             ("allocated_worktree", Some(fingerprint)) => {
                 let id = if existing.3.as_ref() == Some(&fingerprint) {
                     existing
@@ -1331,6 +1331,13 @@ impl Database {
             }
             _ => (None, None),
         };
+        let prewrite_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if observed_fingerprint != prewrite_fingerprint {
+            worktree_id = None;
+            observed_fingerprint = None;
+        }
         let result = sqlx::query(
             "UPDATE work_scopes
              SET environment_kind = ?1, cwd = ?2, worktree_path = ?3,
@@ -1347,7 +1354,7 @@ impl Database {
         )
         .bind(kind)
         .bind(cwd)
-        .bind(worktree_path)
+        .bind(&worktree_path)
         .bind(branch_name)
         .bind(base_branch)
         .bind(now)
@@ -1356,6 +1363,25 @@ impl Database {
         .bind(observed_fingerprint)
         .execute(&mut **tx)
         .await?;
+        let persisted_fingerprint: Option<String> =
+            sqlx::query_scalar("SELECT worktree_fingerprint FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(&mut **tx)
+                .await?;
+        let commit_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if persisted_fingerprint.is_some() && persisted_fingerprint != commit_fingerprint {
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL, updated_at = ?2
+                 WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
         if result.rows_affected() != 1 {
             return Err(DbError::Serialization(format!(
                 "work scope {scope_id} has no normalized environment"
@@ -3252,7 +3278,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if persisted JSON columns cannot be (de)serialized.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_conversation_with_project(
         &self,
         id: &str,
@@ -3267,6 +3293,75 @@ impl Database {
         seed_parent_id: Option<&str>,
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
+    ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_inner(
+            id,
+            slug,
+            cwd,
+            user_initiated,
+            parent_id,
+            model,
+            project_id,
+            conv_mode,
+            desired_base_branch,
+            seed_parent_id,
+            seed_label,
+            llm_language,
+            None,
+        )
+        .await
+    }
+
+    /// Creates a sub-agent conversation attached to the exact parent scope captured at spawn.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when the parent no longer owns the captured scope or persistence fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_subagent_conversation(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        parent_id: &str,
+        model: &str,
+        conv_mode: &ConvMode,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        parent_scope: &WorkScopeId,
+    ) -> DbResult<Conversation> {
+        self.create_conversation_with_project_inner(
+            id,
+            slug,
+            cwd,
+            false,
+            Some(parent_id),
+            Some(model),
+            None,
+            conv_mode,
+            None,
+            None,
+            None,
+            llm_language,
+            Some(parent_scope),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn create_conversation_with_project_inner(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        parent_id: Option<&str>,
+        model: Option<&str>,
+        project_id: Option<&str>,
+        conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        expected_parent_scope: Option<&WorkScopeId>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -3315,6 +3410,24 @@ impl Database {
                 .clone()
                 .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
             let mut tx = self.pool.begin().await?;
+            if let (Some(parent_id), Some(expected_scope)) = (parent_id, expected_parent_scope) {
+                let parent_matches: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM conversations
+                         WHERE id = ?1 AND work_scope_id = ?2
+                     )",
+                )
+                .bind(parent_id)
+                .bind(expected_scope.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                if !parent_matches {
+                    tx.rollback().await?;
+                    return Err(DbError::CloseFoundationConflict(format!(
+                        "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope}"
+                    )));
+                }
+            }
             if let Some((scope_id, authority_kind, environment)) = generated_scope {
                 Self::insert_work_scope_tx(
                     &mut tx,
