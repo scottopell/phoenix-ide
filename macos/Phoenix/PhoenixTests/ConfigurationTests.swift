@@ -359,6 +359,21 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testInvalidSavedModeDoesNotReadKeychain() {
+        let suite = "SettingsPersistence.invalid-mode-no-keychain.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("removed-mode", forKey: PreferenceKey.serverMode)
+        let keychain = ScriptedSecretStore(scriptedReads: [
+            .anthropicAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+            .openAIAPIKey: [.fail(.status(errSecInteractionNotAllowed))],
+        ])
+        let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
+
+        XCTAssertNoThrow(try persistence.loadDraft())
+        XCTAssertFalse(persistence.loadConnectionDraft().hasSavedModeSelection)
+    }
+
     func testSettingsPersistenceTreatsInvalidSavedModeAsUnselected() {
         let suite = "SettingsPersistence.invalid-mode.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -382,7 +397,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(loaded.draft.bundledPort, ConfigurationStore.defaultBundledPort)
     }
 
-    func testSettingsPersistenceLoadDraftPropagatesSecretReadFailure() {
+    func testSettingsPersistenceUnselectedDraftDoesNotReadKeychain() {
         let suite = "SettingsPersistence.load.failure.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -391,9 +406,7 @@ final class ConfigurationTests: XCTestCase {
         ])
         let persistence = SettingsPersistence(defaults: defaults, keychain: keychain, bundle: .main)
 
-        XCTAssertThrowsError(try persistence.loadDraft()) { error in
-            XCTAssertEqual(error as? KeychainError, .status(errSecInteractionNotAllowed))
-        }
+        XCTAssertNoThrow(try persistence.loadDraft())
     }
 
     func testSettingsPersistencePersistsOnlyOnApply() throws {
@@ -634,8 +647,8 @@ final class ConfigurationTests: XCTestCase {
 
         let result = try persistence.persist(draft: draft)
         XCTAssertEqual(result.persistedSnapshot.preferences.serverMode, ServerModeKind.attached.rawValue)
-        XCTAssertEqual(result.persistedSnapshot.secrets[.anthropicAPIKey], .loaded(nil))
-        XCTAssertEqual(result.persistedSnapshot.secrets[.openAIAPIKey], .loaded(nil))
+        XCTAssertEqual(result.persistedSnapshot.secrets[.anthropicAPIKey], .unloaded)
+        XCTAssertEqual(result.persistedSnapshot.secrets[.openAIAPIKey], .unloaded)
     }
 
     func testSettingsPersistenceSurfacesRollbackFailureAsCompoundError() throws {
@@ -965,6 +978,12 @@ final class ConfigurationTests: XCTestCase {
 
 @MainActor
 final class ServerManagerHelpersTests: XCTestCase {
+    func testLogSnapshotOperationOwnership() {
+        let current = UUID()
+        XCTAssertTrue(logSnapshotBelongsToCurrentOperation(current: current, source: current))
+        XCTAssertFalse(logSnapshotBelongsToCurrentOperation(current: current, source: UUID()))
+    }
+
     func testIdentityHTTPStatusClassifiesWrongEndpointSeparatelyFromOutage() {
         XCTAssertEqual(
             classifyServerIdentityError(IdentityHTTPStatusError(statusCode: 404)),
@@ -1518,6 +1537,17 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .statusReconnect).requiresReconnect)
+    }
+
+    func testSidecarLaunchEnvironmentAugmentsFinderPathWithoutDuplicates() {
+        XCTAssertEqual(
+            SidecarLaunchEnvironment.executableSearchPath(inherited: "/usr/bin:/bin"),
+            "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin"
+        )
+        XCTAssertEqual(
+            SidecarLaunchEnvironment.executableSearchPath(inherited: "/opt/homebrew/bin:/usr/bin:/bin"),
+            "/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin"
+        )
     }
 
     func testSidecarLaunchEnvironmentPreservesRealUserHomeAndSafeSessionVars() {

@@ -53,10 +53,7 @@ struct SettingsView: View {
                     "Phoenix server",
                     selection: Binding(
                         get: { selectedKind },
-                        set: {
-                            draft.mode = $0
-                            modeMessage = nil
-                        }
+                        set: { selectMode($0) }
                     )
                 ) {
                     Text("Choose one").tag(Optional<PendingServerModeKind>.none)
@@ -144,6 +141,22 @@ struct SettingsView: View {
     }
 
 
+
+    private func selectMode(_ mode: PendingServerModeKind?) {
+        draft.mode = mode
+        modeMessage = nil
+        guard mode == .bundled,
+              let savedAppliedSnapshot,
+              savedAppliedSnapshot.secrets.values.contains(.unloaded) || savedAppliedSnapshot.secrets.values.contains(.preserveUnloaded) else { return }
+        do {
+            self.savedAppliedSnapshot = try persistence.loadBundledSecrets(
+                into: &draft,
+                appliedSnapshot: savedAppliedSnapshot
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
 
     private var attachedSettings: some View {
         VStack(alignment: .leading, spacing: 8) {

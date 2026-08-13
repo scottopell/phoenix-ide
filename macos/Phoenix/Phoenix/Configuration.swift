@@ -177,6 +177,14 @@ struct DeepLinkAuthDecision {
 }
 
 struct SidecarLaunchEnvironment {
+    static func executableSearchPath(inherited: String?) -> String {
+        var entries = (inherited ?? "").split(separator: ":").map(String.init).filter { !$0.isEmpty }
+        for path in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            if !entries.contains(path) { entries.append(path) }
+        }
+        return entries.joined(separator: ":")
+    }
+
     static let safeInheritedKeys = ["SHELL", "USER", "LOGNAME", "SSH_AUTH_SOCK"]
 
     static func build(
@@ -187,7 +195,7 @@ struct SidecarLaunchEnvironment {
         sidecarSecrets: [String: String]
     ) -> [String: String] {
         var environment = [
-            "PATH": inherited["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": executableSearchPath(inherited: inherited["PATH"]),
             "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
             "LANG": inherited["LANG"] ?? "en_US.UTF-8",
             "HOME": userHome.path,
@@ -325,7 +333,7 @@ enum BundledSecretState: Equatable {
 
 struct BundledSecretAccessPolicy {
     static func shouldReadKeychain(for mode: PendingServerModeKind?) -> Bool {
-        mode == .bundled || mode == nil
+        mode == .bundled
     }
 
     static func shouldWriteKeychain(for mode: PendingServerModeKind?) -> Bool {
@@ -549,6 +557,22 @@ struct SettingsPersistence {
             }
         }
         return PersistedSettingsSnapshot(preferences: preferences, secrets: secrets)
+    }
+
+    func loadBundledSecrets(
+        into draft: inout SettingsDraft,
+        appliedSnapshot: PersistedSettingsSnapshot
+    ) throws -> PersistedSettingsSnapshot {
+        var secrets: [ProviderSecret: BundledSecretState] = [:]
+        for secret in ProviderSecret.allCases {
+            let value = try keychain.read(secret)
+            secrets[secret] = .loaded(value)
+            switch secret {
+            case .anthropicAPIKey: draft.anthropicKey = value ?? ""
+            case .openAIAPIKey: draft.openAIKey = value ?? ""
+            }
+        }
+        return PersistedSettingsSnapshot(preferences: appliedSnapshot.preferences, secrets: secrets)
     }
 
     func persist(draft: SettingsDraft, appliedSnapshot previous: PersistedSettingsSnapshot? = nil) throws -> (candidate: ServerMode, summary: SettingsPersistenceSummary, persistedSnapshot: PersistedSettingsSnapshot) {

@@ -569,6 +569,10 @@ final class SidecarOutputPump: @unchecked Sendable {
     }
 }
 
+func logSnapshotBelongsToCurrentOperation(current: UUID, source: UUID) -> Bool {
+    current == source
+}
+
 @MainActor
 private final class SidecarLogSnapshotSink {
     weak var manager: ServerManager?
@@ -577,8 +581,8 @@ private final class SidecarLogSnapshotSink {
         self.manager = manager
     }
 
-    func publish(_ lines: [String]) {
-        manager?.publishRecentLogLines(lines)
+    func publish(_ lines: [String], operation: UUID) {
+        manager?.publishRecentLogLines(lines, operation: operation)
     }
 }
 
@@ -679,7 +683,8 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    fileprivate func publishRecentLogLines(_ lines: [String]) {
+    fileprivate func publishRecentLogLines(_ lines: [String], operation: UUID) {
+        guard logSnapshotBelongsToCurrentOperation(current: operationID, source: operation) else { return }
         recentLogLines = lines
     }
 
@@ -814,7 +819,7 @@ final class ServerManager: ObservableObject {
             let logRecorder = SidecarLogRecorder(
                 writer: currentLogWriter,
                 snapshotSink: { [logSnapshotSink] lines in
-                    await logSnapshotSink.publish(lines)
+                    await logSnapshotSink.publish(lines, operation: operation)
                 }
             )
             let inherited = ProcessInfo.processInfo.environment

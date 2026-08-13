@@ -83,9 +83,15 @@ for arch in $ARCHS; do
 done
 
 expected_signing=none
-if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+if [ "${EXPANDED_CODE_SIGN_IDENTITY:-}" = "-" ] && [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+  codesign --force --sign - --options runtime --timestamp=none "$destination"
+  expected_signing=adhoc
+elif [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
   codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --options runtime --timestamp=none "$destination"
   expected_signing="identity:$EXPANDED_CODE_SIGN_IDENTITY"
+elif [ "${AD_HOC_CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ]; then
+  codesign --force --sign - --timestamp=none "$destination"
+  expected_signing=adhoc
 elif [ "${CODE_SIGNING_ALLOWED:-YES}" != "NO" ] && [ "${CODE_SIGN_STYLE:-}" = "Automatic" ]; then
   codesign --force --sign - --timestamp=none "$destination"
   expected_signing=adhoc

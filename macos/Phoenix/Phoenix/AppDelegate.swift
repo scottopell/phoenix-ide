@@ -173,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let browserOperation, browserOperation != currentOperation {
+            pendingConversationValidationTask?.cancel()
             browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
             self.browserOperation = nil
         }
@@ -231,12 +232,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hasPrimaryWebView: webView != nil,
             hasConfiguredOrigin: serverManager.webOrigin != nil
         ), let queued = pendingConversationID else { return }
+        let operation = serverManager.currentOperationToken
+        guard let validationWebView = webView, let validationOrigin = serverManager.webOrigin else { return }
         pendingConversationValidationTask?.cancel()
         pendingConversationValidationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let conversationID = try await self.validatedConversationIDForNavigation(queued)
-                guard !Task.isCancelled else { return }
+                let conversationID = try await self.validatedConversationIDForNavigation(
+                    queued,
+                    webView: validationWebView,
+                    origin: validationOrigin
+                )
+                guard !Task.isCancelled,
+                      self.isCurrentBrowserOperation(operation),
+                      self.browserOperation == operation,
+                      self.serverManager.webOrigin == validationOrigin else { return }
                 guard DeepLinkNavigationDecision.validationResultIsCurrent(
                     validatedID: queued,
                     pendingConversationID: self.pendingConversationID
@@ -244,7 +254,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.pendingConversationID = conversationID
                 self.openPendingConversation()
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      self.isCurrentBrowserOperation(operation),
+                      self.browserOperation == operation,
+                      self.serverManager.webOrigin == validationOrigin else { return }
                 guard DeepLinkNavigationDecision.validationResultIsCurrent(
                     validatedID: queued,
                     pendingConversationID: self.pendingConversationID
@@ -279,10 +292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    private func validatedConversationIDForNavigation(_ id: UUID) async throws -> UUID {
-        guard let webView, let origin = serverManager.webOrigin else {
-            throw DeepLinkValidationError.noAuthenticatedWebView
-        }
+    private func validatedConversationIDForNavigation(
+        _ id: UUID,
+        webView: WKWebView,
+        origin: PhoenixOrigin
+    ) async throws -> UUID {
         let script = Self.conversationRouteValidationScript(uuid: id.uuidString.lowercased())
         let result = try await webView.evaluateJavaScript(script)
         guard let payload = result as? [String: Any],
