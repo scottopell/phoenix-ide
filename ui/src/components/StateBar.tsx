@@ -2,6 +2,7 @@ import {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -209,6 +210,12 @@ function effortTriggerLabel(effort: ModelEffort | null | undefined, capabilities
 function effortCompatible(capabilities: EffortCapabilities | undefined, effort: ModelEffort | null | undefined): boolean {
   if (!effort) return true;
   return capabilities?.support === 'supported' && capabilities.levels.includes(effort);
+}
+
+function resolveAvailableModel(models: ModelInfo[], selectedId: string): ModelInfo | undefined {
+  return models.find((model) => model.id === selectedId)
+    ?? models.find((model) => model.recommended)
+    ?? models[0];
 }
 
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
@@ -908,6 +915,25 @@ export function StateBar({
     setModelMutationError(null);
   }, [canPickModel, pickerOpen]);
 
+  useLayoutEffect(() => {
+    if (!pickerOpen || pickerConversationId !== conversation?.id || !availableModels?.length) return;
+    const reconciledModel = resolveAvailableModel(availableModels, stagedModel);
+    if (!reconciledModel) return;
+    if (reconciledModel.id !== stagedModel) setStagedModel(reconciledModel.id);
+    if (!effortCompatible(reconciledModel.effort_capabilities, stagedEffort)) setStagedEffort(null);
+    if (reconciledModel.service_tier_capabilities !== 'supported' && stagedServiceTier !== 'standard') {
+      setStagedServiceTier('standard');
+    }
+  }, [
+    availableModels,
+    conversation?.id,
+    pickerConversationId,
+    pickerOpen,
+    stagedEffort,
+    stagedModel,
+    stagedServiceTier,
+  ]);
+
   const pickerModels: ModelInfo[] = (() => {
     if (!availableModels) return [];
     if (pickerShowAll) return availableModels;
@@ -931,9 +957,7 @@ export function StateBar({
 
   const openModelDialog = () => {
     if (!canPickModel || !availableModels) return;
-    const initialModel = availableModels.find((model) => model.id === currentModel)
-      ?? availableModels.find((model) => model.recommended)
-      ?? availableModels[0];
+    const initialModel = resolveAvailableModel(availableModels, currentModel);
     if (!initialModel) return;
     setStagedModel(initialModel.id);
     setStagedEffort(effortCompatible(initialModel.effort_capabilities, persistedEffort) ? persistedEffort : null);
@@ -959,7 +983,11 @@ export function StateBar({
   };
 
   const applyModelSelection = async () => {
-    if (!onUpgradeModel || !stagedModel || !modelSelectionChanged || modelMutationPending) return;
+    if (!onUpgradeModel || !stagedModelInfo || !modelSelectionChanged || modelMutationPending) return;
+    const submittedEffort = effortCompatible(stagedModelInfo.effort_capabilities, stagedEffort) ? stagedEffort : null;
+    const submittedServiceTier = stagedModelInfo.service_tier_capabilities === 'supported'
+      ? stagedServiceTier
+      : 'standard';
     const submittedConversationId = conversation?.id;
     const operationGeneration = ++modelMutationGenerationRef.current;
     const ownsMutation = () => conversationIdentityRef.current === submittedConversationId
@@ -967,7 +995,7 @@ export function StateBar({
     setModelMutationPending(true);
     setModelMutationError(null);
     try {
-      await onUpgradeModel(stagedModel, stagedEffort, stagedServiceTier);
+      await onUpgradeModel(stagedModelInfo.id, submittedEffort, submittedServiceTier);
       if (ownsMutation()) {
         setPickerOpen(false);
         setPickerConversationId(undefined);
@@ -1049,7 +1077,7 @@ export function StateBar({
         footer={
           <>
             <button type="button" className="selection-dialog__cancel" onClick={closeModelDialog} disabled={modelMutationPending}>Cancel</button>
-            <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!modelSelectionChanged || modelMutationPending}>
+            <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!stagedModelInfo || !modelSelectionChanged || modelMutationPending}>
               {modelMutationPending ? 'Applying…' : 'Apply'}
             </button>
           </>

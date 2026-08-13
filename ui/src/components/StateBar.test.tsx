@@ -1455,7 +1455,7 @@ describe('StateBar mobile layout', () => {
     expect(modelRadios[modelRadios.indexOf(selectedModel) + 1]).toHaveAttribute('tabindex', '0');
   });
 
-  it('keeps staged configuration open across compact-layout changes', async () => {
+  it('keeps staged configuration open and restores the replacement trigger across compact-layout changes', async () => {
     const updateCompactLayout = setMobileViewport(true);
     renderStateBar({
       availableModels: pickerModels,
@@ -1464,14 +1464,20 @@ describe('StateBar mobile layout', () => {
     });
 
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
-    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    const compactTrigger = screen.getByTitle(/Model: gpt-5.6-sol/i);
+    fireEvent.click(compactTrigger);
     fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
     const dialog = screen.getByRole('dialog', { name: /model, effort, and speed/i });
 
     act(() => updateCompactLayout(false));
 
+    const desktopTrigger = screen.getByTitle(/Model: gpt-5.6-sol/i);
+    expect(desktopTrigger).not.toBe(compactTrigger);
     expect(screen.getByRole('dialog', { name: /model, effort, and speed/i })).toBe(dialog);
     expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toHaveAttribute('aria-checked', 'true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(desktopTrigger).toHaveFocus());
   });
 
   it('sends explicit effort changes from the state bar', () => {
@@ -1600,6 +1606,84 @@ describe('StateBar mobile layout', () => {
     expect(within(modelGroup).queryByText('removed-model')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
     expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', null, 'standard');
+  });
+
+  it('reconciles the staged tuple when the model catalog refreshes', async () => {
+    const onUpgradeModel = vi.fn();
+    const conversation = makeConversation({ model: 'gpt-5.6-sol', effort: 'high', service_tier: 'fast' });
+    const stateBar = (models: ModelInfo[]) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={conversation}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={models}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(stateBar(pickerModels));
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toHaveAttribute('aria-checked', 'true');
+
+    const refreshedModels = pickerModels.filter((model) => model.id !== 'gpt-5.6-sol');
+    act(() => rerender(stateBar(refreshedModels)));
+
+    const modelGroup = screen.getByRole('radiogroup', { name: /select model/i });
+    const selected = await within(modelGroup).findByRole('radio', { checked: true });
+    expect(selected).toHaveAccessibleName(/claude-sonnet-5/i);
+    expect(selected).toHaveAttribute('tabindex', '0');
+    expect(screen.queryByRole('radiogroup', { name: /select speed/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', 'high', 'standard');
+  });
+
+  it('reconciles staged effort and speed when catalog capabilities change', () => {
+    const onUpgradeModel = vi.fn();
+    const conversation = makeConversation({ model: 'gpt-5.6-sol', effort: 'high', service_tier: 'fast' });
+    const stateBar = (models: ModelInfo[]) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={conversation}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={models}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(stateBar(pickerModels));
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+
+    const refreshedModels = pickerModels.map((model) => model.id === 'gpt-5.6-sol'
+      ? {
+          ...model,
+          effort_capabilities: { support: 'supported' as const, levels: ['low' as const], native_default: { known: 'low' as const } },
+          service_tier_capabilities: 'unsupported' as const,
+        }
+      : model);
+    act(() => rerender(stateBar(refreshedModels)));
+
+    expect(screen.getByRole('radio', { name: /gpt-5.6-sol/i })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('radio', { name: /Effort: default \(Low\)/i })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByRole('radio', { name: 'High' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('radiogroup', { name: /select speed/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(onUpgradeModel).toHaveBeenCalledWith('gpt-5.6-sol', null, 'standard');
   });
 
   it('discards staged configuration when the mounted conversation identity changes', () => {

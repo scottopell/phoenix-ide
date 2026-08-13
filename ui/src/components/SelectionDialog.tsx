@@ -14,6 +14,16 @@ interface SelectionDialogProps {
   className?: string;
 }
 
+function resolveRestoreTarget(
+  restoreFocusRef: React.RefObject<HTMLElement | null> | undefined,
+  initialRestoreTarget: HTMLElement | null,
+): HTMLElement | null {
+  const currentRestoreTarget = restoreFocusRef?.current;
+  return currentRestoreTarget && document.contains(currentRestoreTarget)
+    ? currentRestoreTarget
+    : initialRestoreTarget;
+}
+
 export function SelectionDialog({
   title,
   description,
@@ -36,7 +46,7 @@ export function SelectionDialog({
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
-    const restoreTarget = restoreFocusRef?.current ?? previousFocusRef.current;
+    const initialRestoreTarget = restoreFocusRef?.current ?? previousFocusRef.current;
 
     const inertSiblings: Array<{ element: HTMLElement; wasInert: boolean }> = [];
     if (typeof dialog.showModal === 'function') {
@@ -60,6 +70,7 @@ export function SelectionDialog({
       fallbackModalRef.current = false;
       for (const { element, wasInert } of inertSiblings) element.inert = wasInert;
       requestAnimationFrame(() => {
+        const restoreTarget = resolveRestoreTarget(restoreFocusRef, initialRestoreTarget);
         if (restoreTarget && document.contains(restoreTarget)) {
           restoreTarget.focus({ preventScroll: true });
         }
