@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from './StateBar';
@@ -196,6 +196,9 @@ function setMobileViewport(matches = true) {
       dispatchEvent: vi.fn(),
     })),
   });
+  return (nextMatches: boolean) => {
+    listeners.forEach((listener) => listener({ matches: nextMatches } as MediaQueryListEvent));
+  };
 }
 
 const pickerModels: ModelInfo[] = [
@@ -485,6 +488,42 @@ describe('StateBar PR badge', () => {
     fireEvent.click(screen.getByTestId('active-pr-choice-34'));
     await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('clamps the roving PR focus when actionable choices shrink', async () => {
+    const firstSelection = makeSelection({
+      associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/o/r/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'a', feedback_status: 'open' },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Follow-up', url: 'https://github.com/o/r/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'b', feedback_status: 'open' },
+      ],
+    });
+    delete firstSelection.active_pr;
+    const firstHandle = makePrStatusHandle(mockPrStatus({ found: false }), firstSelection);
+    const renderSelector = (handle: ConversationPrStatusHandle) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation({ conv_mode_label: 'Direct' })}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderSelector(firstHandle));
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'End' });
+    expect(screen.getByTestId('active-pr-choice-34')).toHaveAttribute('tabindex', '0');
+
+    const shrunkSelection = makeSelection({ associated_prs: [firstSelection.associated_prs[0]!] });
+    delete shrunkSelection.active_pr;
+    rerender(renderSelector(makePrStatusHandle(mockPrStatus({ found: false }), shrunkSelection)));
+
+    await waitFor(() => expect(screen.getByTestId('active-pr-choice-12')).toHaveAttribute('tabindex', '0'));
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveAttribute('data-selection-dialog-autofocus');
   });
 
   it('shows pending and visible error state for selector mutations and mobile-safe auto summary', async () => {
@@ -1415,6 +1454,25 @@ describe('StateBar mobile layout', () => {
     expect(modelRadios[modelRadios.indexOf(selectedModel) + 1]).toHaveAttribute('tabindex', '0');
   });
 
+  it('keeps staged configuration open across compact-layout changes', async () => {
+    const updateCompactLayout = setMobileViewport(true);
+    renderStateBar({
+      availableModels: pickerModels,
+      conversation: makeConversation({ model: 'gpt-5.6-sol' }),
+      onUpgradeModel: vi.fn(),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+    const dialog = screen.getByRole('dialog', { name: /model, effort, and speed/i });
+
+    act(() => updateCompactLayout(false));
+
+    expect(screen.getByRole('dialog', { name: /model, effort, and speed/i })).toBe(dialog);
+    expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toHaveAttribute('aria-checked', 'true');
+  });
+
   it('sends explicit effort changes from the state bar', () => {
     const onUpgradeModel = vi.fn();
     renderStateBar({
@@ -1484,6 +1542,43 @@ describe('StateBar mobile layout', () => {
 
     expect(onUpgradeModel).not.toHaveBeenCalled();
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('ignores a late mutation completion after navigating away and back', async () => {
+    let rejectFirst!: (error: Error) => void;
+    const onUpgradeModel = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectFirst = reject; }));
+    const { rerender } = renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ id: 'conversation-a', model: 'gpt-5.6-sol' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    const stateBar = (id: string) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation({ id, model: 'gpt-5.6-sol' })}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={pickerModels}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>
+    );
+    rerender(stateBar('conversation-b'));
+    rerender(stateBar('conversation-a'));
+    rejectFirst(new Error('stale failure'));
+
+    await waitFor(() => expect(screen.queryByText('stale failure')).not.toBeInTheDocument());
+    expect(screen.queryByRole('dialog', { name: /model, effort, and speed/i })).not.toBeInTheDocument();
   });
 
   it('stages an available model when the persisted model is no longer in the catalog', () => {

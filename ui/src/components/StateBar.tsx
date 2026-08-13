@@ -319,6 +319,14 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   }, [selectedActionableIndex]);
 
   useEffect(() => {
+    if (actionablePrs.length === 0) {
+      setFocusIndex(0);
+      return;
+    }
+    setFocusIndex((current) => Math.min(current, actionablePrs.length - 1));
+  }, [actionablePrs.length]);
+
+  useEffect(() => {
     const intent: ActivePrSelectorIntent = {
       owner: Symbol('active-pr-selector-intent'),
       requestOpen: () => openDialog(document.activeElement instanceof HTMLElement ? document.activeElement : null),
@@ -507,8 +515,10 @@ export function StateBar({
   }, [usesCompactLayout]);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
   const conversationIdentityRef = useRef(conversation?.id);
+  const modelMutationGenerationRef = useRef(0);
   useEffect(() => {
     conversationIdentityRef.current = conversation?.id;
+    modelMutationGenerationRef.current += 1;
     setPickerOpen(false);
     setPickerShowAll(false);
     setPickerConversationId(undefined);
@@ -951,20 +961,23 @@ export function StateBar({
   const applyModelSelection = async () => {
     if (!onUpgradeModel || !stagedModel || !modelSelectionChanged || modelMutationPending) return;
     const submittedConversationId = conversation?.id;
+    const operationGeneration = ++modelMutationGenerationRef.current;
+    const ownsMutation = () => conversationIdentityRef.current === submittedConversationId
+      && modelMutationGenerationRef.current === operationGeneration;
     setModelMutationPending(true);
     setModelMutationError(null);
     try {
       await onUpgradeModel(stagedModel, stagedEffort, stagedServiceTier);
-      if (conversationIdentityRef.current === submittedConversationId) {
+      if (ownsMutation()) {
         setPickerOpen(false);
         setPickerConversationId(undefined);
       }
     } catch (error) {
-      if (conversationIdentityRef.current === submittedConversationId) {
+      if (ownsMutation()) {
         setModelMutationError(error instanceof Error ? error.message : 'Failed to update model, effort, and speed');
       }
     } finally {
-      if (conversationIdentityRef.current === submittedConversationId) setModelMutationPending(false);
+      if (ownsMutation()) setModelMutationPending(false);
     }
   };
 
@@ -1024,6 +1037,132 @@ export function StateBar({
     || (prHint && !prLoading),
   );
 
+  const modelDialog = pickerOpen && pickerConversationId === conversation?.id && canPickModel ? (
+      <SelectionDialog
+        title="Model, effort, and speed"
+        description="Choose the model, reasoning effort, and request speed for the next turn. Changes apply together."
+        onClose={closeModelDialog}
+        dismissible={!modelMutationPending}
+        restoreFocusRef={pickerTriggerRef}
+        ariaBusy={modelMutationPending}
+        className="model-selection-dialog"
+        footer={
+          <>
+            <button type="button" className="selection-dialog__cancel" onClick={closeModelDialog} disabled={modelMutationPending}>Cancel</button>
+            <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!modelSelectionChanged || modelMutationPending}>
+              {modelMutationPending ? 'Applying…' : 'Apply'}
+            </button>
+          </>
+        }
+      >
+        <fieldset className="model-picker-section" disabled={modelMutationPending}>
+          <legend>Model</legend>
+          <div className="model-picker-list" role="radiogroup" aria-label="Select model" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => { const model = pickerModels[index]; if (model) stageModel(model.id); })}>
+            {pickerModels.map((model, index) => {
+              const selected = model.id === stagedModel;
+              return (
+                <button
+                  key={model.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  className={`model-picker-item${selected ? " model-picker-item--selected" : ""}`}
+                  onClick={() => stageModel(model.id)}
+                  title={model.description || model.id}
+                  data-selection-dialog-autofocus={selected || (!stagedModel && index === 0) ? '' : undefined}
+                  tabIndex={selected || (!stagedModel && index === 0) ? 0 : -1}
+                >
+                  <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
+                  <span className="model-picker-item-main">
+                    <span className="model-picker-item-id">{model.id}</span>
+                    {model.description && <span className="model-picker-item-description">{model.description}</span>}
+                  </span>
+                  <span className="model-picker-item-ctx">{formatContextWindow(model.context_window)}</span>
+                </button>
+              );
+            })}
+          </div>
+          <label className="model-picker-show-all-toggle">
+            <input type="checkbox" checked={pickerShowAll} onChange={(event) => setPickerShowAll(event.target.checked)} />
+            <span>Show all models</span>
+          </label>
+        </fieldset>
+        {stagedEffortCapabilities?.support === 'supported' ? (
+          <fieldset className="model-picker-section" disabled={modelMutationPending}>
+            <legend>Effort</legend>
+            <div className="model-picker-list model-picker-effort-list" role="radiogroup" aria-label="Select effort" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedEffort(index === 0 ? null : stagedEffortCapabilities.levels[index - 1] ?? null))}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={stagedEffort === null}
+                tabIndex={stagedEffort === null ? 0 : -1}
+                className={`model-picker-item${stagedEffort === null ? ' model-picker-item--selected' : ''}`}
+                onClick={() => setStagedEffort(null)}
+              >
+                <span className="model-picker-item-check" aria-hidden="true">{stagedEffort === null ? <CheckIcon /> : null}</span>
+                <span className="model-picker-item-id">{effortTriggerLabel(null, stagedEffortCapabilities)}</span>
+              </button>
+              {stagedEffortCapabilities.levels.map((level) => {
+                const selected = stagedEffort === level;
+                return (
+                  <button
+                    key={level}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    tabIndex={selected ? 0 : -1}
+                    className={`model-picker-item${selected ? ' model-picker-item--selected' : ''}`}
+                    onClick={() => setStagedEffort(level)}
+                  >
+                    <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
+                    <span className="model-picker-item-id">{effortLabel(level)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </fieldset>
+        ) : stagedEffortCapabilities?.support === 'unknown' ? (
+          <div className="model-picker-capability-note">Effort controls are unavailable because this model's effort capabilities are unknown.</div>
+        ) : null}
+        {stagedSupportsFastMode && (
+          <fieldset className="model-picker-section" disabled={modelMutationPending}>
+            <legend>Speed</legend>
+            <div className="model-picker-list model-picker-speed-list" role="radiogroup" aria-label="Select speed" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedServiceTier(index === 1 ? 'fast' : 'standard'))}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={stagedServiceTier === 'standard'}
+                tabIndex={stagedServiceTier === 'standard' ? 0 : -1}
+                className={`model-picker-item${stagedServiceTier === 'standard' ? ' model-picker-item--selected' : ''}`}
+                onClick={() => setStagedServiceTier('standard')}
+              >
+                <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'standard' ? <CheckIcon /> : null}</span>
+                <span className="model-picker-item-main">
+                  <span className="model-picker-item-id">Standard</span>
+                  <span className="model-picker-item-description">Standard speed and usage</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={stagedServiceTier === 'fast'}
+                tabIndex={stagedServiceTier === 'fast' ? 0 : -1}
+                className={`model-picker-item${stagedServiceTier === 'fast' ? ' model-picker-item--selected' : ''}`}
+                onClick={() => setStagedServiceTier('fast')}
+              >
+                <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'fast' ? <CheckIcon /> : null}</span>
+                <span className="model-picker-item-main">
+                  <span className="model-picker-item-id">Fast</span>
+                  <span className="model-picker-item-description">Approximately 1.5x speed, increased usage</span>
+                </span>
+              </button>
+            </div>
+          </fieldset>
+        )}
+        {modelMutationError && <div className="model-picker-error" role="alert">{modelMutationError}</div>}
+      </SelectionDialog>
+  ) : null;
+
   const renderModelControl = (variant: "desktop" | "mobile" = "desktop") => (
     <span className={`conv-model-wrapper${variant === "mobile" ? " conv-model-wrapper--mobile" : ""}`}>
       {canPickModel ? (
@@ -1061,131 +1200,6 @@ export function StateBar({
             <span className="conv-model-lock-reason">{currentModelLockReason}</span>
           )}
         </span>
-      )}
-      {pickerOpen && pickerConversationId === conversation?.id && canPickModel && (
-        <SelectionDialog
-          title="Model, effort, and speed"
-          description="Choose the model, reasoning effort, and request speed for the next turn. Changes apply together."
-          onClose={closeModelDialog}
-          dismissible={!modelMutationPending}
-          restoreFocusRef={pickerTriggerRef}
-          ariaBusy={modelMutationPending}
-          className="model-selection-dialog"
-          footer={
-            <>
-              <button type="button" className="selection-dialog__cancel" onClick={closeModelDialog} disabled={modelMutationPending}>Cancel</button>
-              <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!modelSelectionChanged || modelMutationPending}>
-                {modelMutationPending ? 'Applying…' : 'Apply'}
-              </button>
-            </>
-          }
-        >
-          <fieldset className="model-picker-section" disabled={modelMutationPending}>
-            <legend>Model</legend>
-            <div className="model-picker-list" role="radiogroup" aria-label="Select model" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => { const model = pickerModels[index]; if (model) stageModel(model.id); })}>
-              {pickerModels.map((model, index) => {
-                const selected = model.id === stagedModel;
-                return (
-                  <button
-                    key={model.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    className={`model-picker-item${selected ? " model-picker-item--selected" : ""}`}
-                    onClick={() => stageModel(model.id)}
-                    title={model.description || model.id}
-                    data-selection-dialog-autofocus={selected || (!stagedModel && index === 0) ? '' : undefined}
-                    tabIndex={selected || (!stagedModel && index === 0) ? 0 : -1}
-                  >
-                    <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
-                    <span className="model-picker-item-main">
-                      <span className="model-picker-item-id">{model.id}</span>
-                      {model.description && <span className="model-picker-item-description">{model.description}</span>}
-                    </span>
-                    <span className="model-picker-item-ctx">{formatContextWindow(model.context_window)}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <label className="model-picker-show-all-toggle">
-              <input type="checkbox" checked={pickerShowAll} onChange={(event) => setPickerShowAll(event.target.checked)} />
-              <span>Show all models</span>
-            </label>
-          </fieldset>
-          {stagedEffortCapabilities?.support === 'supported' ? (
-            <fieldset className="model-picker-section" disabled={modelMutationPending}>
-              <legend>Effort</legend>
-              <div className="model-picker-list model-picker-effort-list" role="radiogroup" aria-label="Select effort" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedEffort(index === 0 ? null : stagedEffortCapabilities.levels[index - 1] ?? null))}>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={stagedEffort === null}
-                  tabIndex={stagedEffort === null ? 0 : -1}
-                  className={`model-picker-item${stagedEffort === null ? ' model-picker-item--selected' : ''}`}
-                  onClick={() => setStagedEffort(null)}
-                >
-                  <span className="model-picker-item-check" aria-hidden="true">{stagedEffort === null ? <CheckIcon /> : null}</span>
-                  <span className="model-picker-item-id">{effortTriggerLabel(null, stagedEffortCapabilities)}</span>
-                </button>
-                {stagedEffortCapabilities.levels.map((level) => {
-                  const selected = stagedEffort === level;
-                  return (
-                    <button
-                      key={level}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      tabIndex={selected ? 0 : -1}
-                      className={`model-picker-item${selected ? ' model-picker-item--selected' : ''}`}
-                      onClick={() => setStagedEffort(level)}
-                    >
-                      <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
-                      <span className="model-picker-item-id">{effortLabel(level)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </fieldset>
-          ) : stagedEffortCapabilities?.support === 'unknown' ? (
-            <div className="model-picker-capability-note">Effort controls are unavailable because this model's effort capabilities are unknown.</div>
-          ) : null}
-          {stagedSupportsFastMode && (
-            <fieldset className="model-picker-section" disabled={modelMutationPending}>
-              <legend>Speed</legend>
-              <div className="model-picker-list model-picker-speed-list" role="radiogroup" aria-label="Select speed" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedServiceTier(index === 1 ? 'fast' : 'standard'))}>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={stagedServiceTier === 'standard'}
-                  tabIndex={stagedServiceTier === 'standard' ? 0 : -1}
-                  className={`model-picker-item${stagedServiceTier === 'standard' ? ' model-picker-item--selected' : ''}`}
-                  onClick={() => setStagedServiceTier('standard')}
-                >
-                  <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'standard' ? <CheckIcon /> : null}</span>
-                  <span className="model-picker-item-main">
-                    <span className="model-picker-item-id">Standard</span>
-                    <span className="model-picker-item-description">Standard speed and usage</span>
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={stagedServiceTier === 'fast'}
-                  tabIndex={stagedServiceTier === 'fast' ? 0 : -1}
-                  className={`model-picker-item${stagedServiceTier === 'fast' ? ' model-picker-item--selected' : ''}`}
-                  onClick={() => setStagedServiceTier('fast')}
-                >
-                  <span className="model-picker-item-check" aria-hidden="true">{stagedServiceTier === 'fast' ? <CheckIcon /> : null}</span>
-                  <span className="model-picker-item-main">
-                    <span className="model-picker-item-id">Fast</span>
-                    <span className="model-picker-item-description">Approximately 1.5x speed, increased usage</span>
-                  </span>
-                </button>
-              </div>
-            </fieldset>
-          )}
-          {modelMutationError && <div className="model-picker-error" role="alert">{modelMutationError}</div>}
-        </SelectionDialog>
       )}
     </span>
   );
@@ -1409,6 +1423,7 @@ export function StateBar({
             </div>
           )}
         </header>
+        {modelDialog}
         {showOfflineBanner && (
           <div className="offline-banner">
             <span className="offline-banner-text">
@@ -1546,6 +1561,7 @@ export function StateBar({
           </button>
         )}
       </header>
+      {modelDialog}
       {showOfflineBanner && (
         <div className="offline-banner">
           <span className="offline-banner-text">
