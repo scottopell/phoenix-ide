@@ -1416,6 +1416,19 @@ pub(crate) fn conversation_attachment_retains_work_scope(conv: &crate::db::Conve
     }
 }
 
+fn conversation_resource_scope(conv: &crate::db::Conversation) -> Option<ResourceScopeKey> {
+    match conv.attached_work_scope_id.clone() {
+        Some(scope) => Some(ResourceScopeKey::Work(scope)),
+        None if conv.runtime_role == crate::work_scope::RuntimeRole::SubAgent => {
+            Some(ResourceScopeKey::Unattached(conv.id.clone()))
+        }
+        None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
+            Some(ResourceScopeKey::Coordinator)
+        }
+        None => None,
+    }
+}
+
 fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
     let owner_id = worktree_path.file_name()?.to_str()?;
     let id_prefix: String = owner_id.chars().take(8).collect();
@@ -1731,14 +1744,8 @@ impl RuntimeManager {
                     let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
                         continue;
                     };
-                    let conv_scope = match conv.attached_work_scope_id.clone() {
-                        Some(scope) => ResourceScopeKey::Work(scope),
-                        None if conv.runtime_role
-                            == crate::work_scope::RuntimeRole::Coordinator =>
-                        {
-                            ResourceScopeKey::Coordinator
-                        }
-                        None => continue,
+                    let Some(conv_scope) = conversation_resource_scope(&conv) else {
+                        continue;
                     };
                     if conv_scope != work_scope
                         || matches!(
@@ -2143,10 +2150,9 @@ impl RuntimeManager {
             let Ok(conv) = self.db().get_conversation(&conv_id).await else {
                 continue;
             };
-            let Some(scope_id) = conv.attached_work_scope_id.clone() else {
+            let Some(conv_scope) = conversation_resource_scope(&conv) else {
                 continue;
             };
-            let conv_scope = ResourceScopeKey::Work(scope_id);
             if &conv_scope != work_scope {
                 continue;
             }
@@ -2219,12 +2225,9 @@ impl RuntimeManager {
         conversation_id: &str,
         work_scope: &ResourceScopeKey,
     ) -> Result<bool, crate::db::DbError> {
-        let Some(work_scope_id) = work_scope.work_scope_id() else {
-            return Ok(false);
-        };
         let conversation = self.db().get_conversation(conversation_id).await?;
         Ok(
-            conversation.attached_work_scope_id.as_ref() == Some(work_scope_id)
+            conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
                 && conversation_attachment_retains_work_scope(&conversation),
         )
     }
@@ -2261,6 +2264,16 @@ impl RuntimeManager {
         work_scope: &ResourceScopeKey,
         excluded_conv_id: Option<&str>,
     ) -> Result<bool, crate::db::DbError> {
+        if let ResourceScopeKey::Unattached(conversation_id) = work_scope {
+            if excluded_conv_id == Some(conversation_id.as_str()) {
+                return Ok(false);
+            }
+            let conversation = self.db().get_conversation(conversation_id).await?;
+            return Ok(
+                conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
+                    && conversation_attachment_retains_work_scope(&conversation),
+            );
+        }
         let Some(work_scope_id) = work_scope.work_scope_id() else {
             return Ok(false);
         };
@@ -2521,6 +2534,19 @@ impl RuntimeManager {
                 "Sub-agent terminal resource cleanup failed"
             );
         }
+    }
+
+    fn schedule_runtime_reconstruction(self: &Arc<Self>, conversation_id: String) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = manager.get_or_create(&conversation_id).await {
+                tracing::warn!(
+                    conv_id = %conversation_id,
+                    %error,
+                    "Failed to reconstruct interrupted conversation runtime"
+                );
+            }
+        });
     }
 
     /// Handle a sub-agent spawn request
@@ -2860,13 +2886,23 @@ impl RuntimeManager {
             // Only remove this sub-agent's entry. The identity check guards
             // against the (unlikely) case where a replacement was inserted
             // under the same key between run() finishing and this write lock.
-            let mut runtimes = manager_for_cleanup.runtimes.write().await;
-            if runtimes
-                .get(&conv_id)
-                .is_some_and(|h| Arc::ptr_eq(&h.identity, &sub_agent_identity))
-            {
-                runtimes.remove(&conv_id);
+            let removed = {
+                let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                if runtimes
+                    .get(&conv_id)
+                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &sub_agent_identity))
+                {
+                    runtimes.remove(&conv_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
                 tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
+                if disposition == executor::RuntimeExitDisposition::Reconstruct {
+                    manager_for_cleanup.schedule_runtime_reconstruction(conv_id.clone());
+                }
             } else {
                 tracing::debug!(
                     conv_id = %conv_id,
@@ -3557,13 +3593,23 @@ impl RuntimeManager {
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
             // not evict that replacement.
-            let mut runtimes = manager_for_cleanup.runtimes.write().await;
-            if runtimes
-                .get(&conv_id)
-                .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
-            {
-                runtimes.remove(&conv_id);
+            let removed = {
+                let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                if runtimes
+                    .get(&conv_id)
+                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
+                {
+                    runtimes.remove(&conv_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
                 tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
+                if disposition == executor::RuntimeExitDisposition::Reconstruct {
+                    manager_for_cleanup.schedule_runtime_reconstruction(conv_id.clone());
+                }
             } else {
                 tracing::debug!(
                     conv_id = %conv_id,
@@ -5231,6 +5277,52 @@ mod scope_liveness_tests {
         assert!(matches!(
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn work_scope_updates_route_to_unattached_subagent_scope() {
+        let manager = Arc::new(test_manager().await);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "unattached-update-child",
+                "unattached-update-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        manager
+            .inject_handle_for_test(&child.id, ConvState::Idle)
+            .await;
+        let handle = manager
+            .try_get_handle(&child.id)
+            .await
+            .expect("injected runtime");
+        let mut events = handle.broadcast_tx.subscribe();
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+
+        manager.broadcast_work_scope_update(&scope).await;
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::WorkScopeUpdate { .. })
         ));
     }
 

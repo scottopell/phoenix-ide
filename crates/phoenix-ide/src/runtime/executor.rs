@@ -58,6 +58,7 @@ enum StartupSteeringDrainOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeExitDisposition {
     Terminal,
+    Reconstruct,
     Interrupted,
 }
 
@@ -2319,7 +2320,7 @@ where
                     conversation_id = %self.context.conversation_id,
                     "Exiting runtime to reconstruct an uncommitted operation from database truth"
                 );
-                return RuntimeExitDisposition::Interrupted;
+                return RuntimeExitDisposition::Reconstruct;
             }
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
@@ -3223,6 +3224,10 @@ where
                         self.manage_deadline(&failed_state);
                         if let Some(tx) = &self.state_watcher {
                             let _ = tx.send(self.state.clone());
+                        }
+                        if terminal_subagent_transition && !state_committed {
+                            self.recovery_disposition =
+                                RuntimeRecoveryDisposition::RecreateFromDatabase;
                         }
                         return Err(error);
                     }
@@ -12619,6 +12624,11 @@ mod steer_drain_detector_tests {
         assert!(rt.apply_transition_result(result).await.is_err());
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert_eq!(storage.get_current_state("terminal-persist-failure"), None);
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+        assert_eq!(rt.run_inner().await, RuntimeExitDisposition::Reconstruct);
     }
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
