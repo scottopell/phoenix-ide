@@ -111,6 +111,7 @@ entity ReleasePublication {
     transitions state {
         idle -> creating
         idle -> replacing
+        idle -> failed
         replacing -> committing
         replacing -> interrupted
         replacing -> failed
@@ -316,12 +317,16 @@ rule PublishCreatesFreshReleaseFromCompleteAssetSet {
     requires: publication.state = creating
     requires: required_release_assets_complete(publication)
     requires: checksum_membership_complete(publication)
+    requires: release_contains_only_required_assets(publication)
+    requires: release_checksums_match_required_assets(publication)
     ensures: publication.state = completed
 }
 
 rule PublishReplacementStartsOnlyForExactTagRetry {
-    when: ReplacementUploadStarted(publication)
+    when: ReplacementUploadStarted(gate, publication)
     requires: publication.state = idle or publication.state = interrupted or publication.state = mixed
+    requires: gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
     ensures: publication.state = replacing
 }
 
