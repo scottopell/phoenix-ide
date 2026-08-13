@@ -4650,13 +4650,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        crate::Database {
-            pool: pool.clone(),
-            path: String::new(),
-        }
-        .run_migrations()
-        .await
-        .unwrap();
+        crate::Database::from_pool_for_tests(pool.clone(), String::new())
+            .run_migrations()
+            .await
+            .unwrap();
         run_pending_migrations(pool).await.unwrap();
         sqlx::query(
             "INSERT OR IGNORE INTO work_scopes

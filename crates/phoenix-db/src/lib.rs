@@ -29,7 +29,7 @@ pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
 };
 pub(crate) use git_repository_reconciliation::{
-    DormantGitRepositoryCatchupPermit, DormantGitRepositoryCatchupStats,
+    DormantGitRepositoryCatchupOutcome, DormantGitRepositoryCatchupPermit,
 };
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
@@ -169,6 +169,10 @@ pub enum DbError {
         work_scope_id: WorkScopeId,
         repository_ids: Vec<phoenix_core::git_repository::GitRepositoryId>,
     },
+    #[error("dormant git repository catch-up permit targeted a different database")]
+    DormantGitRepositoryCatchupPermitTargetMismatch,
+    #[error("dormant git repository catch-up operation is stale")]
+    DormantGitRepositoryCatchupStaleOperation,
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -1114,12 +1118,25 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
-#[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
+    dormant_git_repository_catchup_authority_state:
+        std::sync::Arc<git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState>,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            path: self.path.clone(),
+            dormant_git_repository_catchup_authority_state: self
+                .dormant_git_repository_catchup_authority_state
+                .clone(),
+        }
+    }
 }
 
 fn sqlite_constraint_code_is(code: Option<&str>, expected: &str) -> bool {
@@ -1200,8 +1217,31 @@ impl Database {
     pub(crate) async fn catch_up_dormant_git_repositories(
         &self,
         permit: DormantGitRepositoryCatchupPermit,
-    ) -> DbResult<DormantGitRepositoryCatchupStats> {
+    ) -> DbResult<DormantGitRepositoryCatchupOutcome> {
         git_repository_reconciliation::catch_up_dormant_git_repositories(self, permit).await
+    }
+
+    pub(crate) fn dormant_git_repository_target_binding(
+        &self,
+    ) -> git_repository_reconciliation::DormantGitRepositoryTargetBinding {
+        git_repository_reconciliation::DormantGitRepositoryTargetBinding::for_state(
+            self.dormant_git_repository_catchup_authority_state.clone(),
+        )
+    }
+
+    fn new_with_generated_target_binding(pool: SqlitePool, path: String) -> Self {
+        Self {
+            pool,
+            path,
+            dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
+                git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pool_for_tests(pool: SqlitePool, path: String) -> Self {
+        Self::new_with_generated_target_binding(pool, path)
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
@@ -2519,10 +2559,7 @@ impl Database {
         // can leave it world-readable, so tighten to owner-only. Best-effort:
         // a chmod failure is logged, never fatal to startup.
         restrict_db_permissions(path);
-        let db = Self {
-            pool,
-            path: path.to_string(),
-        };
+        let db = Self::new_with_generated_target_binding(pool, path.to_string());
         db.run_migrations().await?;
         // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
         // early chmod above could not see. Re-tighten now they exist. The prod
@@ -2570,10 +2607,7 @@ impl Database {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        let db = Self {
-            pool,
-            path: String::new(),
-        };
+        let db = Self::new_with_generated_target_binding(pool, String::new());
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)
@@ -19467,10 +19501,7 @@ mod tests {
         .await
         .unwrap();
 
-        let db = Database {
-            pool,
-            path: String::new(),
-        };
+        let db = Database::from_pool_for_tests(pool, String::new());
         db.run_migrations().await.unwrap();
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

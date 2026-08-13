@@ -3,22 +3,103 @@ use phoenix_core::git_repository::GitRepositoryId;
 use phoenix_core::work_scope::WorkScopeId;
 use sqlx::{Row, Sqlite, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
-pub(crate) struct DormantGitRepositoryCatchupPermit {
-    _private: DormantGitRepositoryCatchupPermitMarker,
+#[derive(Debug, Default)]
+pub(crate) struct DormantGitRepositoryCatchupAuthorityState {
+    current_marker: Mutex<Option<Arc<LegacyWriterExclusionMarker>>>,
 }
 
 #[derive(Debug)]
-struct DormantGitRepositoryCatchupPermitMarker(());
+struct LegacyWriterExclusionMarker;
+
+#[derive(Debug, Clone)]
+pub(crate) struct DormantGitRepositoryTargetBinding {
+    state: Arc<DormantGitRepositoryCatchupAuthorityState>,
+}
+
+impl DormantGitRepositoryTargetBinding {
+    pub(crate) fn for_state(state: Arc<DormantGitRepositoryCatchupAuthorityState>) -> Self {
+        Self { state }
+    }
+
+    fn points_to(&self, state: &Arc<DormantGitRepositoryCatchupAuthorityState>) -> bool {
+        Arc::ptr_eq(&self.state, state)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DormantGitRepositoryCatchupPermit {
+    target: Arc<DormantGitRepositoryCatchupAuthorityState>,
+    marker: Arc<LegacyWriterExclusionMarker>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DormantGitRepositoryCatchupReceipt {
+    target: Arc<DormantGitRepositoryCatchupAuthorityState>,
+    marker: Arc<LegacyWriterExclusionMarker>,
+}
+
+impl DormantGitRepositoryCatchupReceipt {
+    #[cfg(test)]
+    fn same_operation_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.target, &other.target) && Arc::ptr_eq(&self.marker, &other.marker)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestDormantGitRepositoryExclusionProof {
+    marker: Arc<LegacyWriterExclusionMarker>,
+}
+
+#[cfg(test)]
+impl TestDormantGitRepositoryExclusionProof {
+    fn new() -> Self {
+        Self {
+            marker: Arc::new(LegacyWriterExclusionMarker),
+        }
+    }
+}
 
 impl DormantGitRepositoryCatchupPermit {
     #[cfg(test)]
-    fn test_only() -> Self {
+    fn test_only_mint(db: &Database, proof: TestDormantGitRepositoryExclusionProof) -> Self {
+        db.install_dormant_git_repository_catchup_marker(proof.marker.clone());
         Self {
-            _private: DormantGitRepositoryCatchupPermitMarker(()),
+            target: db.dormant_git_repository_target_binding().state,
+            marker: proof.marker,
         }
     }
+}
+
+impl Database {
+    fn install_dormant_git_repository_catchup_marker(
+        &self,
+        marker: Arc<LegacyWriterExclusionMarker>,
+    ) {
+        let mut current_marker = self
+            .dormant_git_repository_catchup_authority_state
+            .current_marker
+            .lock()
+            .expect("catch-up authority mutex poisoned");
+        *current_marker = Some(marker);
+    }
+
+    fn lock_dormant_git_repository_catchup_marker(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<Arc<LegacyWriterExclusionMarker>>> {
+        self.dormant_git_repository_catchup_authority_state
+            .current_marker
+            .lock()
+            .expect("catch-up authority mutex poisoned")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DormantGitRepositoryCatchupOutcome {
+    pub stats: DormantGitRepositoryCatchupStats,
+    pub receipt: DormantGitRepositoryCatchupReceipt,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -40,14 +121,34 @@ struct ExpectedAttachment {
 
 pub(crate) async fn catch_up_dormant_git_repositories(
     db: &Database,
-    _permit: DormantGitRepositoryCatchupPermit,
-) -> DbResult<DormantGitRepositoryCatchupStats> {
+    permit: DormantGitRepositoryCatchupPermit,
+) -> DbResult<DormantGitRepositoryCatchupOutcome> {
+    let database_target = db.dormant_git_repository_target_binding();
+    if !database_target.points_to(&permit.target) {
+        return Err(DbError::DormantGitRepositoryCatchupPermitTargetMismatch);
+    }
+
+    {
+        let mut current_marker = db.lock_dormant_git_repository_catchup_marker();
+        let matches_current = current_marker
+            .as_ref()
+            .is_some_and(|marker| Arc::ptr_eq(marker, &permit.marker));
+        if !matches_current {
+            return Err(DbError::DormantGitRepositoryCatchupStaleOperation);
+        }
+        current_marker.take();
+    }
+
+    let receipt = DormantGitRepositoryCatchupReceipt {
+        target: permit.target,
+        marker: permit.marker,
+    };
     let mut tx = db.pool().begin().await?;
     let result = catch_up_dormant_git_repositories_tx(&mut tx).await;
     match result {
         Ok(stats) => {
             tx.commit().await?;
-            Ok(stats)
+            Ok(DormantGitRepositoryCatchupOutcome { stats, receipt })
         }
         Err(error) => {
             tx.rollback().await?;
@@ -489,8 +590,176 @@ mod tests {
         assert!(repository_ids(&db).await.is_empty());
     }
 
+    #[tokio::test]
+    async fn cloned_database_handles_share_authority_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        let cloned = db.clone();
+        insert_project(&db, "repo-shared").await;
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &db,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+
+        let outcome = cloned
+            .catch_up_dormant_git_repositories(permit)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.stats.inserted_git_repositories, 1);
+        assert_eq!(repository_ids(&db).await, vec!["repo-shared".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn catchup_rejects_different_in_memory_database_before_mutation_and_leaves_rows_unchanged(
+    ) {
+        let db = Database::open_in_memory().await.unwrap();
+        let other_db = Database::open_in_memory().await.unwrap();
+        insert_project(&db, "repo-a").await;
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &other_db,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+
+        let error = db
+            .catch_up_dormant_git_repositories(permit)
+            .await
+            .unwrap_err();
+
+        assert_target_mismatch(error);
+        assert!(repository_ids(&db).await.is_empty());
+        assert_eq!(count_locator_rows(&db).await, 0);
+        assert_eq!(count_default_branch_rows(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn catchup_rejects_independently_reopened_file_database_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopened-catchup.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(reopened.pool()).await.unwrap();
+        insert_project(&db, "repo-a").await;
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &reopened,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+
+        let error = db
+            .catch_up_dormant_git_repositories(permit)
+            .await
+            .unwrap_err();
+
+        assert_target_mismatch(error);
+        assert!(repository_ids(&db).await.is_empty());
+        assert_eq!(count_locator_rows(&db).await, 0);
+        assert_eq!(count_default_branch_rows(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn newer_mint_supersedes_older_and_stale_rejection_leaves_newer_usable() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_project(&db, "repo-b").await;
+        let permit_a = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &db,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+        let permit_b = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &db,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+
+        let stale = db
+            .catch_up_dormant_git_repositories(permit_a)
+            .await
+            .unwrap_err();
+        assert_stale_operation(stale);
+        assert!(repository_ids(&db).await.is_empty());
+
+        let outcome = db
+            .catch_up_dormant_git_repositories(permit_b)
+            .await
+            .unwrap();
+        assert_eq!(outcome.stats.inserted_git_repositories, 1);
+        assert_eq!(repository_ids(&db).await, vec!["repo-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn distinct_operation_permits_produce_non_substitutable_receipts() {
+        let db = Database::open_in_memory().await.unwrap();
+        let first = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+        let second = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+
+        assert!(!first.receipt.same_operation_as(&second.receipt));
+        assert_eq!(first.stats, DormantGitRepositoryCatchupStats::default());
+        assert_eq!(second.stats, DormantGitRepositoryCatchupStats::default());
+    }
+
+    #[tokio::test]
+    async fn successful_catchup_spends_operation_and_another_permit_for_same_marker_goes_stale() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_project(&db, "repo-spent").await;
+        let proof = TestDormantGitRepositoryExclusionProof::new();
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof.clone());
+        let stale_retry = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof);
+
+        let outcome = db.catch_up_dormant_git_repositories(permit).await.unwrap();
+        assert_eq!(outcome.stats.inserted_git_repositories, 1);
+
+        let stale = db
+            .catch_up_dormant_git_repositories(stale_retry)
+            .await
+            .unwrap_err();
+        assert_stale_operation(stale);
+    }
+
+    #[tokio::test]
+    async fn begin_failure_spends_operation_without_restoring_marker() {
+        let db = Database::open_in_memory().await.unwrap();
+        let proof = TestDormantGitRepositoryExclusionProof::new();
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof.clone());
+        let stale_retry = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof);
+        db.pool().close().await;
+
+        let begin_error = db
+            .catch_up_dormant_git_repositories(permit)
+            .await
+            .unwrap_err();
+        assert!(matches!(begin_error, DbError::Sqlx(_)));
+
+        let stale = db
+            .catch_up_dormant_git_repositories(stale_retry)
+            .await
+            .unwrap_err();
+        assert_stale_operation(stale);
+    }
+
+    #[tokio::test]
+    async fn permit_consumption_prevents_reuse_by_move() {
+        let db = Database::open_in_memory().await.unwrap();
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
+            &db,
+            TestDormantGitRepositoryExclusionProof::new(),
+        );
+        let consume = |_: DormantGitRepositoryCatchupPermit| {};
+        consume(permit);
+    }
+
     async fn run_catchup(db: &Database) -> DbResult<DormantGitRepositoryCatchupStats> {
-        let permit = DormantGitRepositoryCatchupPermit::test_only();
+        let outcome =
+            run_catchup_with_proof(db, TestDormantGitRepositoryExclusionProof::new()).await?;
+        Ok(outcome.stats)
+    }
+
+    async fn run_catchup_with_proof(
+        db: &Database,
+        proof: TestDormantGitRepositoryExclusionProof,
+    ) -> DbResult<DormantGitRepositoryCatchupOutcome> {
+        let permit = DormantGitRepositoryCatchupPermit::test_only_mint(db, proof);
         db.catch_up_dormant_git_repositories(permit).await
     }
 
@@ -634,13 +903,31 @@ mod tests {
             .unwrap()
     }
 
+    fn assert_target_mismatch(error: DbError) {
+        assert!(matches!(
+            error,
+            DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        ));
+    }
+
+    fn assert_stale_operation(error: DbError) {
+        assert!(matches!(
+            error,
+            DbError::DormantGitRepositoryCatchupStaleOperation
+        ));
+    }
+
     #[test]
-    fn permit_test_only_constructor_is_zero_arg_under_cfg_test_and_one_shot_by_move() {
-        let make: fn() -> DormantGitRepositoryCatchupPermit =
-            DormantGitRepositoryCatchupPermit::test_only;
-        let consume = |_: DormantGitRepositoryCatchupPermit| {};
-        let permit = make();
-        consume(permit);
+    fn api_shape_requires_database_and_proof_and_keeps_types_private_to_module() {
+        let _mint: fn(
+            &Database,
+            TestDormantGitRepositoryExclusionProof,
+        ) -> DormantGitRepositoryCatchupPermit = DormantGitRepositoryCatchupPermit::test_only_mint;
+        let _proof_new: fn() -> TestDormantGitRepositoryExclusionProof =
+            TestDormantGitRepositoryExclusionProof::new;
+        let _target_for_state: fn(
+            std::sync::Arc<DormantGitRepositoryCatchupAuthorityState>,
+        ) -> DormantGitRepositoryTargetBinding = DormantGitRepositoryTargetBinding::for_state;
     }
 
     #[test]

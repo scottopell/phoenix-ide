@@ -2722,13 +2722,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        crate::Database {
-            pool: pool.clone(),
-            path: String::new(),
-        }
-        .run_migrations()
-        .await
-        .unwrap();
+        crate::Database::from_pool_for_tests(pool.clone(), String::new())
+            .run_migrations()
+            .await
+            .unwrap();
         run_pending_migrations(pool).await.unwrap();
     }
 
@@ -3328,13 +3325,10 @@ mod tests {
     #[tokio::test]
     async fn generic_delivery_resolution_rejects_direct_turn_workflow() {
         let (_dir, repo, _) = open_repo_pair().await;
-        crate::Database {
-            pool: repo.pool.clone(),
-            path: String::new(),
-        }
-        .create_conversation("conv-a", "A", "/tmp", true, None, None)
-        .await
-        .unwrap();
+        crate::Database::from_pool_for_tests(repo.pool.clone(), String::new())
+            .create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let accepted_at = Timestamp(7);
         let created = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
@@ -3377,13 +3371,10 @@ mod tests {
     #[tokio::test]
     async fn generic_head_cas_rejects_direct_turn_workflow() {
         let (_dir, repo, _) = open_repo_pair().await;
-        crate::Database {
-            pool: repo.pool.clone(),
-            path: String::new(),
-        }
-        .create_conversation("conv-a", "A", "/tmp", true, None, None)
-        .await
-        .unwrap();
+        crate::Database::from_pool_for_tests(repo.pool.clone(), String::new())
+            .create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
         let accepted_at = Timestamp(7);
         let created = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
