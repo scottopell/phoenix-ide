@@ -618,6 +618,49 @@ struct ConnectionOperationAuthority {
     }
 }
 
+final class BundledOwnerLease {
+    private(set) var descriptor: Int32?
+
+    private init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    static func acquire(_ url: URL, ownerPID: Int32 = ProcessInfo.processInfo.processIdentifier) throws -> BundledOwnerLease {
+        let descriptor = open(url.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw ConfigurationError.bundledDataInUse }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            close(descriptor)
+            throw ConfigurationError.bundledDataInUse
+        }
+        ftruncate(descriptor, 0)
+        let bytes = Array("\(ownerPID)\n".utf8)
+        _ = bytes.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+        return BundledOwnerLease(descriptor: descriptor)
+    }
+
+    func childStandardInput() -> FileHandle? {
+        guard let descriptor else { return nil }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+    }
+
+    func closeLauncherReferenceWithoutUnlock() {
+        guard let descriptor else { return }
+        close(descriptor)
+        self.descriptor = nil
+    }
+
+    func release() {
+        guard let descriptor else { return }
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+        self.descriptor = nil
+    }
+
+    deinit {
+        release()
+    }
+}
+
 @MainActor
 final class ServerManager: ObservableObject {
     @Published private(set) var state: ConnectionState = .stopped
@@ -631,7 +674,7 @@ final class ServerManager: ObservableObject {
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
     private var terminationInProgress = false
-    private var ownerLockDescriptor: Int32?
+    private var ownerLease: BundledOwnerLease?
     private lazy var logSnapshotSink = SidecarLogSnapshotSink(manager: self)
     struct ConnectionOperationToken: Equatable, Hashable {
         fileprivate let id: UUID
@@ -873,6 +916,10 @@ final class ServerManager: ObservableObject {
             launched.environment = environment
             launched.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
             launched.qualityOfService = .userInitiated
+            guard let childLease = ownerLease?.childStandardInput() else {
+                throw ConfigurationError.bundledDataInUse
+            }
+            launched.standardInput = childLease
 
             let pipe = Pipe()
             launched.standardOutput = pipe
@@ -1102,22 +1149,11 @@ final class ServerManager: ObservableObject {
     }
 
     private func acquireOwnerLock(_ url: URL) throws {
-        let descriptor = open(url.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)
-        guard descriptor >= 0 else { throw ConfigurationError.bundledDataInUse }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            close(descriptor)
-            throw ConfigurationError.bundledDataInUse
-        }
-        ftruncate(descriptor, 0)
-        let bytes = Array("\(ProcessInfo.processInfo.processIdentifier)\n".utf8)
-        _ = bytes.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
-        ownerLockDescriptor = descriptor
+        ownerLease = try BundledOwnerLease.acquire(url)
     }
 
     private func releaseOwnerLock() {
-        guard let descriptor = ownerLockDescriptor else { return }
-        flock(descriptor, LOCK_UN)
-        close(descriptor)
-        ownerLockDescriptor = nil
+        ownerLease?.release()
+        ownerLease = nil
     }
 }

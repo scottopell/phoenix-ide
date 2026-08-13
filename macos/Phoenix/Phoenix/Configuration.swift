@@ -150,6 +150,16 @@ struct SettingsFeedback: Equatable {
     let statusMessage: String?
     let errorMessage: String?
 
+    static let empty = SettingsFeedback(statusMessage: nil, errorMessage: nil)
+
+    static func success(summary: SettingsPersistenceSummary) -> SettingsFeedback {
+        SettingsFeedback(statusMessage: statusMessage(summary: summary), errorMessage: nil)
+    }
+
+    static func failure(_ error: Error) -> SettingsFeedback {
+        SettingsFeedback(statusMessage: nil, errorMessage: error.localizedDescription)
+    }
+
     static func statusMessage(summary: SettingsPersistenceSummary) -> String {
         var parts: [String] = []
         if !summary.savedSecrets.isEmpty {
@@ -923,6 +933,31 @@ struct PhoenixWebViewPolicy {
     }
 }
 
+enum PhoenixNavigationResponseDecision: Equatable {
+    case allow
+    case download
+    case externalize(URL)
+    case cancel
+}
+
+enum PhoenixNavigationResponsePolicy {
+    static func decide(
+        role: BrowserSurfaceRole,
+        responseURL: URL?,
+        canShowMIMEType: Bool,
+        expectedOrigin: PhoenixOrigin
+    ) -> PhoenixNavigationResponseDecision {
+        guard let responseURL else { return .cancel }
+        guard expectedOrigin.exactlyMatches(responseURL) else {
+            if role == .authPopup, PhoenixWebViewPolicy.safeToExternalize(responseURL) {
+                return .externalize(responseURL)
+            }
+            return .cancel
+        }
+        return canShowMIMEType ? .allow : .download
+    }
+}
+
 enum PhoenixDownloadPolicy {
     static func shouldAccept(responseURL: URL?, canShowMIMEType: Bool, expectedOrigin: PhoenixOrigin) -> Bool {
         guard !canShowMIMEType, let responseURL else { return false }
@@ -931,6 +966,9 @@ enum PhoenixDownloadPolicy {
 }
 
 enum PhoenixDownloadNaming {
+    static let maximumComponentBytes = 255
+    static let reservedCollisionSuffixBytes = 24
+
     static func sanitizedFilename(_ suggestedFilename: String) -> String {
         let trimmed = suggestedFilename.trimmingCharacters(in: .whitespacesAndNewlines)
         let base = trimmed.isEmpty ? "download" : trimmed
@@ -949,7 +987,40 @@ enum PhoenixDownloadNaming {
         let collapsed = pieces.joined()
             .replacingOccurrences(of: "..", with: "_")
             .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-        return collapsed.isEmpty ? "download" : collapsed
+        return boundedFilename(collapsed.isEmpty ? "download" : collapsed, collisionSuffix: "")
+    }
+
+    static func collisionSafeFilename(_ sanitizedFilename: String, collisionIndex: Int?) -> String {
+        let suffix = collisionIndex.map { " (\($0))" } ?? ""
+        return boundedFilename(sanitizedFilename, collisionSuffix: suffix)
+    }
+
+    private static func boundedFilename(_ filename: String, collisionSuffix: String) -> String {
+        let value = filename as NSString
+        let rawExtension = value.pathExtension
+        let rawStem = value.deletingPathExtension.isEmpty ? "download" : value.deletingPathExtension
+        let suffixBudget = max(reservedCollisionSuffixBytes, collisionSuffix.utf8.count)
+        let contentBudget = maximumComponentBytes - suffixBudget
+        let extensionWithDot = rawExtension.isEmpty ? "" : ".\(rawExtension)"
+        let minimumStemBytes = "download".utf8.count
+        let boundedExtension = utf8Prefix(extensionWithDot, maximumBytes: max(0, contentBudget - minimumStemBytes))
+        let stemBudget = max(1, contentBudget - boundedExtension.utf8.count)
+        let boundedStem = utf8Prefix(rawStem, maximumBytes: stemBudget)
+        let usableStem = boundedStem.isEmpty ? utf8Prefix("download", maximumBytes: stemBudget) : boundedStem
+        return usableStem + collisionSuffix + boundedExtension
+    }
+
+    private static func utf8Prefix(_ value: String, maximumBytes: Int) -> String {
+        guard maximumBytes > 0 else { return "" }
+        var result = ""
+        var byteCount = 0
+        for character in value {
+            let bytes = String(character).utf8.count
+            guard byteCount + bytes <= maximumBytes else { break }
+            result.append(character)
+            byteCount += bytes
+        }
+        return result
     }
 
     static func uniqueDestination(

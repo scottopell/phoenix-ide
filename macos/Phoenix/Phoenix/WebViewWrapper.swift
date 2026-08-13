@@ -183,15 +183,21 @@ struct WebViewWrapper: NSViewRepresentable {
             decidePolicyFor navigationResponse: WKNavigationResponse,
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void
         ) {
-            if navigationResponse.canShowMIMEType {
-                decisionHandler(.allow)
-            } else if PhoenixDownloadPolicy.shouldAccept(
+            switch PhoenixNavigationResponsePolicy.decide(
+                role: role,
                 responseURL: navigationResponse.response.url,
                 canShowMIMEType: navigationResponse.canShowMIMEType,
                 expectedOrigin: origin
             ) {
+            case .allow:
+                decisionHandler(.allow)
+            case .download:
                 decisionHandler(.download)
-            } else {
+            case .externalize(let url):
+                openExternallyIfSafe(url)
+                browserEnvironment.popupManager.webViewDidClose(webView)
+                decisionHandler(.cancel)
+            case .cancel:
                 decisionHandler(.cancel)
             }
         }
@@ -454,18 +460,12 @@ struct DownloadDestinationReservationState {
 
     mutating func reserveDestination(in directory: URL, suggestedFilename: String, fileExists: (URL) -> Bool) -> URL {
         let sanitized = PhoenixDownloadNaming.sanitizedFilename(suggestedFilename)
-        let ext = (sanitized as NSString).pathExtension
-        let base = (sanitized as NSString).deletingPathExtension
         var suffix = 0
         while true {
-            let candidateName: String
-            if suffix == 0 {
-                candidateName = sanitized
-            } else if ext.isEmpty {
-                candidateName = "\(base) (\(suffix))"
-            } else {
-                candidateName = "\(base) (\(suffix)).\(ext)"
-            }
+            let candidateName = PhoenixDownloadNaming.collisionSafeFilename(
+                sanitized,
+                collisionIndex: suffix == 0 ? nil : suffix
+            )
             let candidate = directory.appendingPathComponent(candidateName)
             let reservationKey = Self.reservationKey(for: candidate)
             if !reservedPaths.contains(reservationKey) && !fileExists(candidate) {

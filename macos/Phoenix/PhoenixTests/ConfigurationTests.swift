@@ -1,5 +1,14 @@
 import XCTest
+import Darwin
 @testable import PhoenixMacCore
+
+private extension Array where Element == String {
+    func withCStringArray<Result>(_ body: ([UnsafeMutablePointer<CChar>?]) -> Result) -> Result {
+        let storage = map { strdup($0) }
+        defer { storage.forEach { free($0) } }
+        return body(storage + [nil])
+    }
+}
 
 private final class ScriptedSecretStore: SecretStore, PackagedSidecarSecretProvider {
     enum ReadStep {
@@ -229,6 +238,42 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(PhoenixWebViewPolicy.popupNavigationDecision(URL(string: "file:///tmp/secret")!, expectedOrigin: expected), .cancel)
     }
 
+    func testNavigationResponsePolicyNeverDisplaysOffOriginPrimaryContent() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        let external = URL(string: "https://accounts.example.test/oauth")!
+
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .primary, responseURL: external, canShowMIMEType: true, expectedOrigin: expected),
+            .cancel
+        )
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .primary, responseURL: external, canShowMIMEType: false, expectedOrigin: expected),
+            .cancel
+        )
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .primary, responseURL: expected.url(path: "/app"), canShowMIMEType: true, expectedOrigin: expected),
+            .allow
+        )
+    }
+
+    func testNavigationResponsePolicyExternalizesOnlySafeOffOriginPopupResponses() throws {
+        let expected = try PhoenixOrigin("https://phoenix.example.test")
+        let oauth = URL(string: "https://accounts.example.test/oauth")!
+
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .authPopup, responseURL: oauth, canShowMIMEType: true, expectedOrigin: expected),
+            .externalize(oauth)
+        )
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .authPopup, responseURL: URL(string: "file:///tmp/secret"), canShowMIMEType: true, expectedOrigin: expected),
+            .cancel
+        )
+        XCTAssertEqual(
+            PhoenixNavigationResponsePolicy.decide(role: .authPopup, responseURL: expected.url(path: "/export"), canShowMIMEType: false, expectedOrigin: expected),
+            .download
+        )
+    }
+
     func testDownloadPolicyAcceptsOnlyUnshowableResponsesFromExactConfiguredOrigin() throws {
         let expected = try PhoenixOrigin("https://phoenix.example.test")
 
@@ -258,6 +303,17 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename(" ../../quarterly?.pdf "), "____quarterly_.pdf")
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("   "), "download")
         XCTAssertEqual(PhoenixDownloadNaming.sanitizedFilename("report\u{0000}.csv"), "report_.csv")
+    }
+
+    func testDownloadNamingBoundsUTF8ComponentWithExtensionAndCollisionRoom() {
+        let overlong = String(repeating: "🦊", count: 100) + ".archive.tar.gz"
+        let sanitized = PhoenixDownloadNaming.sanitizedFilename(overlong)
+        let collided = PhoenixDownloadNaming.collisionSafeFilename(sanitized, collisionIndex: 9_223_372_036_854_775_807)
+
+        XCTAssertLessThanOrEqual(sanitized.utf8.count, PhoenixDownloadNaming.maximumComponentBytes - PhoenixDownloadNaming.reservedCollisionSuffixBytes)
+        XCTAssertLessThanOrEqual(collided.utf8.count, PhoenixDownloadNaming.maximumComponentBytes)
+        XCTAssertTrue(collided.hasSuffix(" (9223372036854775807).gz"))
+        XCTAssertNotNil(collided.data(using: .utf8))
     }
 
     func testDownloadNamingPicksCollisionSafeSuffixWithoutOverwriting() {
@@ -1555,16 +1611,15 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(unchangedBundledRequest.forceRestart)
     }
 
-    func testSettingsFeedbackSeparatesStatusFromError() {
+    func testSettingsFeedbackAtomicallyReplacesOppositeOutcome() {
         let summary = SettingsPersistenceSummary(requiresReconnect: false, savedSecrets: [], deletedSecrets: [.openAIAPIKey])
-        XCTAssertEqual(
-            SettingsFeedback.statusMessage(summary: summary),
-            "Deleted cleared provider secrets from Keychain. Saved settings already match the saved configuration."
-        )
-        XCTAssertEqual(
-            SettingsFeedback(statusMessage: "ok", errorMessage: "nope"),
-            SettingsFeedback(statusMessage: "ok", errorMessage: "nope")
-        )
+        let success = SettingsFeedback.success(summary: summary)
+        let failure = SettingsFeedback.failure(ConfigurationError.missingModeSelection)
+
+        XCTAssertEqual(success.statusMessage, "Deleted cleared provider secrets from Keychain. Saved settings already match the saved configuration.")
+        XCTAssertNil(success.errorMessage)
+        XCTAssertNil(failure.statusMessage)
+        XCTAssertNotNil(failure.errorMessage)
     }
 
     func testDeepLinkAuthDecisionKeepsQueuedConversationOnlyAcrossAuthenticationStop() {
@@ -1580,6 +1635,48 @@ final class ServerManagerHelpersTests: XCTestCase {
             pendingConversationID: nil,
             stopWasForTransition: false
         ))
+    }
+
+    func testBundledOwnerLeaseRemainsHeldByInheritedChildDescriptor() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lockURL = root.appendingPathComponent("owner.lock")
+
+        let owner = try BundledOwnerLease.acquire(lockURL, ownerPID: 4242)
+        _ = try XCTUnwrap(owner.childStandardInput())
+        var childPID: pid_t = 0
+        var actions: posix_spawn_file_actions_t?
+        XCTAssertEqual(posix_spawn_file_actions_init(&actions), 0)
+        XCTAssertEqual(posix_spawn_file_actions_adddup2(&actions, owner.descriptor!, STDIN_FILENO), 0)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        let executable = "/bin/sleep"
+        let arguments = ["sleep", "0.2"]
+        let spawnResult = arguments.withCStringArray { argv in
+            posix_spawn(&childPID, executable, &actions, nil, argv, environ)
+        }
+        XCTAssertEqual(spawnResult, 0)
+        XCTAssertGreaterThan(childPID, 0)
+
+        owner.closeLauncherReferenceWithoutUnlock()
+        XCTAssertThrowsError(try BundledOwnerLease.acquire(lockURL))
+
+        var status: Int32 = 0
+        XCTAssertEqual(waitpid(childPID, &status, 0), childPID)
+        let replacement = try BundledOwnerLease.acquire(lockURL)
+        replacement.release()
+    }
+
+    func testBundledOwnerLeaseNormalReleaseAllowsNextOwner() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lockURL = root.appendingPathComponent("owner.lock")
+
+        let owner = try BundledOwnerLease.acquire(lockURL)
+        owner.release()
+        let replacement = try BundledOwnerLease.acquire(lockURL)
+        replacement.release()
     }
 
     func testBundledReconnectQueueCanBeCancelled() throws {
