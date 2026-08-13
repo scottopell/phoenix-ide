@@ -206,13 +206,16 @@ struct WebViewWrapper: NSViewRepresentable {
             decidePolicyFor navigationResponse: WKNavigationResponse,
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void
         ) {
-            switch PhoenixNavigationResponsePolicy.decide(
+            let responseIsForMainFrame = navigationResponse.isForMainFrame
+            let responseDecision = PhoenixNavigationResponsePolicy.decide(
                 role: role,
                 responseURL: navigationResponse.response.url,
                 canShowMIMEType: navigationResponse.canShowMIMEType,
                 expectedOrigin: origin,
-                userActivated: userActivatedMainNavigation
-            ) {
+                userActivated: responseIsForMainFrame && userActivatedMainNavigation
+            )
+            if responseIsForMainFrame { userActivatedMainNavigation = false }
+            switch responseDecision {
             case .allow:
                 decisionHandler(.allow)
             case .download:

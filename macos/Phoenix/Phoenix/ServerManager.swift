@@ -546,6 +546,7 @@ final class SidecarOutputPump: @unchecked Sendable {
     private var draining = false
     private var finished = false
     private var prepared = false
+    private var completionWaiters: [CheckedContinuation<Void, Never>] = []
     private let maxChunks: Int
     private let recorder: SidecarLogRecorder
     private let operation: UUID
@@ -578,6 +579,19 @@ final class SidecarOutputPump: @unchecked Sendable {
         if shouldStart { Task { await drain() } }
     }
 
+    func waitUntilFinished() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if finished && !draining {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                completionWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
     private func takeNext() -> (dropped: Int, chunk: Data?, shouldFinish: Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -587,6 +601,15 @@ final class SidecarOutputPump: @unchecked Sendable {
         let shouldFinish = chunk == nil && finished
         if chunk == nil { draining = false }
         return (droppedNow, chunk, shouldFinish)
+    }
+
+    private func completeWaiters() {
+        lock.lock()
+        let waiters = completionWaiters
+        completionWaiters.removeAll()
+        draining = false
+        lock.unlock()
+        waiters.forEach { $0.resume() }
     }
 
     private func drain() async {
@@ -606,7 +629,10 @@ final class SidecarOutputPump: @unchecked Sendable {
                 _ = await recorder.drain(operation: operation)
                 continue
             }
-            if shouldFinish { _ = await recorder.finishPending(operation: operation) }
+            if shouldFinish {
+                _ = await recorder.finishPending(operation: operation)
+                completeWaiters()
+            }
             return
         }
     }
@@ -700,6 +726,7 @@ final class ServerManager: ObservableObject {
     @Published private(set) var recentLogLines: [String] = []
 
     private var process: Process?
+    private var outputPump: SidecarOutputPump?
     private var readinessTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
@@ -835,6 +862,7 @@ final class ServerManager: ObservableObject {
         if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
         readinessTask?.cancel()
         readinessTask = nil
+        _ = operationAuthority.invalidate(operationAuthority.id)
 
         guard case .bundled = mode, let process else {
             finishStop(finalState: preservedState ?? .stopped)
@@ -956,6 +984,7 @@ final class ServerManager: ObservableObject {
             launched.standardOutput = pipe
             launched.standardError = pipe
             let outputPump = SidecarOutputPump(recorder: logRecorder, operation: operation)
+            self.outputPump = outputPump
             pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
@@ -1110,6 +1139,21 @@ final class ServerManager: ObservableObject {
     }
 
     private func processExited(_ terminated: Process, operation: UUID) {
+        guard process === terminated else { return }
+        let pump = outputPump
+        outputPump = nil
+        if let pump {
+            pump.finish()
+            Task { @MainActor [weak self] in
+                await pump.waitUntilFinished()
+                self?.completeProcessExit(terminated, operation: operation)
+            }
+            return
+        }
+        completeProcessExit(terminated, operation: operation)
+    }
+
+    private func completeProcessExit(_ terminated: Process, operation: UUID) {
         guard process === terminated else { return }
         let priorState = state
         let version = currentVersion
