@@ -51,7 +51,7 @@ pub struct PhoenixRuntimeEnvironment {
     state_dir: PathBuf,
     /// `$PHOENIX_DB_PATH` if set, else `phoenix_home/phoenix.db`.
     db_path: PathBuf,
-    /// `temp_dir()/phoenix-ide` — root for Phoenix scratch namespaces.
+    /// `$PHOENIX_TMP_DIR` if set, else `temp_dir()/phoenix-ide`.
     tmp_root: PathBuf,
 }
 
@@ -64,8 +64,9 @@ impl PhoenixRuntimeEnvironment {
     ///   only warning this type ever logs.
     /// - `codex_home`: `$CODEX_HOME`, else `home/.codex`.
     /// - `data_dir`: `$PHOENIX_DATA_DIR`, else `phoenix_home` (`home/.phoenix-ide`).
+    /// - `state_dir`: `$PHOENIX_STATE_DIR`, else `phoenix_home`.
     /// - `db_path`: `$PHOENIX_DB_PATH`, else `phoenix_home/phoenix.db`.
-    /// - `tmp_root`: `std::env::temp_dir()/phoenix-ide`.
+    /// - `tmp_root`: `$PHOENIX_TMP_DIR`, else `std::env::temp_dir()/phoenix-ide`.
     #[must_use]
     pub fn detect() -> Self {
         let (home, used_tmp_fallback) = std::env::var_os("HOME")
@@ -254,12 +255,12 @@ impl PhoenixRuntimeEnvironment {
         )
     }
 
-    /// Chrome-for-Testing download cache. Existing default installations retain
-    /// `home/.cache/phoenix-ide/chromium`; isolated data roots use their own cache.
+    /// Chrome-for-Testing download cache. Existing installations retain
+    /// `home/.cache/phoenix-ide/chromium`; isolated state roots use their own cache.
     #[must_use]
     pub fn chromium_cache_dir(&self) -> PathBuf {
-        let default_data_dir = self.home.join(PHOENIX_HOME_SUBDIR);
-        if self.data_dir == default_data_dir {
+        let default_state_dir = self.home.join(PHOENIX_HOME_SUBDIR);
+        if self.state_dir == default_state_dir {
             self.home
                 .join(".cache")
                 .join("phoenix-ide")
@@ -366,6 +367,23 @@ mod tests {
                 Some(std::ffi::OsString::from("/private/sidecar/.phoenix-ide"))
             ),
             PathBuf::from("/private/sidecar/.phoenix-ide")
+        );
+    }
+
+    #[test]
+    fn legacy_data_dir_does_not_move_chromium_cache() {
+        let env = PhoenixRuntimeEnvironment {
+            home: PathBuf::from("/Users/example"),
+            codex_home: PathBuf::from("/Users/example/.codex"),
+            data_dir: PathBuf::from("/custom/tmux-data"),
+            state_dir: PathBuf::from("/Users/example/.phoenix-ide"),
+            db_path: PathBuf::from("/Users/example/.phoenix-ide/phoenix.db"),
+            tmp_root: PathBuf::from("/tmp/phoenix-ide"),
+        };
+
+        assert_eq!(
+            env.chromium_cache_dir(),
+            PathBuf::from("/Users/example/.cache/phoenix-ide/chromium")
         );
     }
 
