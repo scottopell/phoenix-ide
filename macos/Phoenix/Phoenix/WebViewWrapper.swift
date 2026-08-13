@@ -35,15 +35,16 @@ struct WebViewWrapper: NSViewRepresentable {
 
     private static let authenticationBridgeScript = """
     (() => {
+      const deploymentDocumentGeneration = crypto.randomUUID();
       let deploymentRequestSequence = 0;
       const reportDeployment = async () => {
         const sequence = ++deploymentRequestSequence;
         try {
           const response = await window.fetch('/api/deployment', { credentials: 'same-origin' });
           const body = response.ok ? await response.json() : null;
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ sequence, status: response.status, body });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, status: response.status, body });
         } catch (_) {
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ sequence, status: 0, body: null });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, status: 0, body: null });
         }
       };
       window.__phoenixMacReportDeployment = reportDeployment;
@@ -106,6 +107,8 @@ struct WebViewWrapper: NSViewRepresentable {
         let onDeployment: (Result<DeploymentInfo, Error>, ServerManager.ConnectionOperationToken) -> Void
         let onAuthenticationRequired: (ServerManager.ConnectionOperationToken) -> Void
         weak var webView: WKWebView?
+        private var latestDeploymentGeneration: String?
+        private var retiredDeploymentGenerations = Set<String>()
         private var latestDeploymentSequence = 0
 
         init(
@@ -335,9 +338,19 @@ struct WebViewWrapper: NSViewRepresentable {
                   origin.exactlyMatches(sourceURL) else { return }
             guard message.name == "phoenixDeployment",
                   let body = message.body as? [String: Any],
+                  let generation = body["generation"] as? String,
                   let sequence = body["sequence"] as? Int,
-                  sequence > latestDeploymentSequence,
                   let status = body["status"] as? Int else { return }
+            guard !retiredDeploymentGenerations.contains(generation) else { return }
+            if generation == latestDeploymentGeneration {
+                guard sequence > latestDeploymentSequence else { return }
+            } else {
+                if let latestDeploymentGeneration {
+                    retiredDeploymentGenerations.insert(latestDeploymentGeneration)
+                }
+                latestDeploymentGeneration = generation
+                latestDeploymentSequence = 0
+            }
             latestDeploymentSequence = sequence
             if status == 401 {
                 onAuthenticationRequired(operation)
@@ -541,24 +554,22 @@ final class DownloadManager {
     }
 
     func cancelAll(for operation: ServerManager.ConnectionOperationToken) {
-        let matching = activeDownloads.filter { $0.value.operation == operation }
-        let identifiers = Set(matching.keys)
-        let downloads = matching.values.map(\.download)
-        let reservationsToRelease = matching.values.compactMap(\.reservedDestination)
-        activeDownloads = activeDownloads.filter { !identifiers.contains($0.key) }
-        reservationsToRelease.forEach { reservations.release($0) }
-        downloads.forEach { download in
-            download.cancel { _ in }
+        let downloads = activeDownloads.values
+            .filter { $0.operation == operation }
+            .map(\.download)
+        downloads.forEach { [weak self] download in
+            download.cancel { _ in
+                Task { @MainActor in self?.finishDownload(download) }
+            }
         }
     }
 
     func cancelAll() {
         let downloads = activeDownloads.values.map(\.download)
-        let reservationsToRelease = activeDownloads.values.compactMap(\.reservedDestination)
-        activeDownloads.removeAll()
-        reservationsToRelease.forEach { reservations.release($0) }
-        downloads.forEach { download in
-            download.cancel { _ in }
+        downloads.forEach { [weak self] download in
+            download.cancel { _ in
+                Task { @MainActor in self?.finishDownload(download) }
+            }
         }
     }
 
