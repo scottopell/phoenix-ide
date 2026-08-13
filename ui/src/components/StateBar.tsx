@@ -13,6 +13,7 @@ import { FolderTree, TerminalSquare } from "lucide-react";
 import type { TerminalPanelStatus } from "./TerminalPanel";
 import {
   canChangeModelInState,
+  isTerminalConversationState,
   type Conversation,
   type ConversationState,
   type EffortCapabilities,
@@ -251,6 +252,18 @@ function autoInferenceSummary(selection: NonNullable<ConversationPrStatusHandle[
   return `Auto follows the latest observed branch: ${observed.branch_name} · ${observed.repository_identity}.`;
 }
 
+function modelLockReason(state: ConversationState): string | null {
+  if (canChangeModelInState(state) || isTerminalConversationState(state)) return null;
+  switch (state.type) {
+    case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
+    case 'awaiting_user_response':
+      return 'Model, effort, and speed are locked while this conversation awaits your response or approval.';
+    default:
+      return 'Model, effort, and speed are locked until the current operation settles.';
+  }
+}
+
 function handleChoiceGroupKeyDown(
   event: ReactKeyboardEvent<HTMLElement>,
   selectIndex?: (index: number) => void,
@@ -477,6 +490,7 @@ export function StateBar({
   // in Stage A — the destructured value is intentionally unused here.
   void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerConversationId, setPickerConversationId] = useState<string>();
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const [stagedModel, setStagedModel] = useState('');
   const [stagedEffort, setStagedEffort] = useState<ModelEffort | null>(null);
@@ -492,6 +506,18 @@ export function StateBar({
     if (!usesCompactLayout) setMobileExpanded(false);
   }, [usesCompactLayout]);
   const pickerTriggerRef = useRef<HTMLButtonElement>(null);
+  const conversationIdentityRef = useRef(conversation?.id);
+  useEffect(() => {
+    conversationIdentityRef.current = conversation?.id;
+    setPickerOpen(false);
+    setPickerShowAll(false);
+    setPickerConversationId(undefined);
+    setStagedModel('');
+    setStagedEffort(null);
+    setStagedServiceTier('standard');
+    setModelMutationPending(false);
+    setModelMutationError(null);
+  }, [conversation?.id]);
 
   // Live elapsed-time counter, generalized for every working phase
   // (REQ-WPV-001 / REQ-WPV-003). The source of truth is the server-
@@ -890,6 +916,7 @@ export function StateBar({
   const modelSelectionChanged = stagedModel !== currentModel
     || stagedEffort !== persistedEffort
     || stagedServiceTier !== currentServiceTier;
+  const currentModelLockReason = modelLockReason(convState);
 
   const openModelDialog = () => {
     if (!canPickModel) return;
@@ -898,12 +925,14 @@ export function StateBar({
     setStagedServiceTier(supportsFastMode ? currentServiceTier : 'standard');
     setModelMutationError(null);
     setPickerOpen(true);
+    setPickerConversationId(conversation?.id);
   };
 
   const closeModelDialog = () => {
     if (modelMutationPending) return;
     setPickerOpen(false);
     setModelMutationError(null);
+    setPickerConversationId(undefined);
   };
 
   const stageModel = (modelId: string) => {
@@ -916,15 +945,21 @@ export function StateBar({
 
   const applyModelSelection = async () => {
     if (!onUpgradeModel || !stagedModel || !modelSelectionChanged || modelMutationPending) return;
+    const submittedConversationId = conversation?.id;
     setModelMutationPending(true);
     setModelMutationError(null);
     try {
       await onUpgradeModel(stagedModel, stagedEffort, stagedServiceTier);
-      setPickerOpen(false);
+      if (conversationIdentityRef.current === submittedConversationId) {
+        setPickerOpen(false);
+        setPickerConversationId(undefined);
+      }
     } catch (error) {
-      setModelMutationError(error instanceof Error ? error.message : 'Failed to update model, effort, and speed');
+      if (conversationIdentityRef.current === submittedConversationId) {
+        setModelMutationError(error instanceof Error ? error.message : 'Failed to update model, effort, and speed');
+      }
     } finally {
-      setModelMutationPending(false);
+      if (conversationIdentityRef.current === submittedConversationId) setModelMutationPending(false);
     }
   };
 
@@ -1017,12 +1052,12 @@ export function StateBar({
             )}
             {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
           </span>
-          {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && isAgentWorking(convState) && (
-            <span className="conv-model-lock-reason">Model, effort, and speed are locked until the current operation settles.</span>
+          {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && currentModelLockReason && (
+            <span className="conv-model-lock-reason">{currentModelLockReason}</span>
           )}
         </span>
       )}
-      {pickerOpen && canPickModel && (
+      {pickerOpen && pickerConversationId === conversation?.id && canPickModel && (
         <SelectionDialog
           title="Model, effort, and speed"
           description="Choose the model, reasoning effort, and request speed for the next turn. Changes apply together."
@@ -1043,7 +1078,7 @@ export function StateBar({
           <fieldset className="model-picker-section" disabled={modelMutationPending}>
             <legend>Model</legend>
             <div className="model-picker-list" role="radiogroup" aria-label="Select model" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => { const model = pickerModels[index]; if (model) stageModel(model.id); })}>
-              {pickerModels.map((model) => {
+              {pickerModels.map((model, index) => {
                 const selected = model.id === stagedModel;
                 return (
                   <button
@@ -1054,8 +1089,8 @@ export function StateBar({
                     className={`model-picker-item${selected ? " model-picker-item--selected" : ""}`}
                     onClick={() => stageModel(model.id)}
                     title={model.description || model.id}
-                    data-selection-dialog-autofocus={selected ? '' : undefined}
-                    tabIndex={selected ? 0 : -1}
+                    data-selection-dialog-autofocus={selected || (!stagedModel && index === 0) ? '' : undefined}
+                    tabIndex={selected || (!stagedModel && index === 0) ? 0 : -1}
                   >
                     <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
                     <span className="model-picker-item-main">

@@ -724,6 +724,19 @@ describe('StateBar model picker enablement (task 02713)', () => {
     expect(screen.queryByText(/locked until the current operation settles/i)).not.toBeInTheDocument();
   });
 
+  it('explains response-gated model locks without implying background work', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      convState: { type: 'awaiting_user_response', questions: [] },
+      availableModels: pickerModels,
+      onUpgradeModel: vi.fn(),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.getByText(/awaits your response or approval/i)).toBeInTheDocument();
+    expect(screen.queryByText(/operation settles/i)).not.toBeInTheDocument();
+  });
+
   it('discards staged model edits if the conversation starts work', () => {
     setMobileViewport(true);
     const onUpgradeModel = vi.fn();
@@ -1471,6 +1484,44 @@ describe('StateBar mobile layout', () => {
 
     expect(onUpgradeModel).not.toHaveBeenCalled();
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('discards staged configuration when the mounted conversation identity changes', () => {
+    const onUpgradeModel = vi.fn();
+    const { rerender } = renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ id: 'conversation-a', model: 'gpt-5.6-sol' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+
+    const legacyConversation = makeConversation({ id: 'conversation-b' });
+    delete (legacyConversation as Partial<Conversation>).model;
+
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={legacyConversation}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={pickerModels}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('dialog', { name: /model, effort, and speed/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle(/Model: default/i));
+    const modelGroup = screen.getByRole('radiogroup', { name: /select model/i });
+    expect(within(modelGroup).getAllByRole('radio').filter((radio) => radio.tabIndex === 0)).toHaveLength(1);
+    expect(within(modelGroup).getAllByRole('radio')[0]).toHaveAttribute('tabindex', '0');
   });
 
   it('freezes staged controls while the atomic update is pending', async () => {
