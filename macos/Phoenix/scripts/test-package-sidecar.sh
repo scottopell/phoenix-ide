@@ -95,6 +95,13 @@ if ! FAKE_CODESIGN_REQUIREMENT_RESULT=ok CODE_SIGNING_ALLOWED_OVERRIDE=YES EXPAN
   exit 1
 fi
 
+# Xcode's '-' expanded identity is ad-hoc, not a certificate subject named '-'
+if ! CODE_SIGNING_ALLOWED_OVERRIDE=YES EXPANDED_CODE_SIGN_IDENTITY_OVERRIDE='-' PHOENIX_SIDECAR_PATH="$dummy_sidecar" \
+  run_script >/dev/null 2>"$tmpdir/adhoc.err"; then
+  echo 'error: expected expanded ad-hoc identity to validate as ad-hoc' >&2
+  exit 1
+fi
+
 # strict codesign verification runs before metadata checks when signing is expected
 if FAKE_CODESIGN_VERIFY_RESULT=fail CODE_SIGNING_ALLOWED_OVERRIDE=YES CODE_SIGN_STYLE_OVERRIDE=Automatic PHOENIX_SIDECAR_PATH="$dummy_sidecar" \
   run_script >/dev/null 2>"$tmpdir/strict.err"; then
