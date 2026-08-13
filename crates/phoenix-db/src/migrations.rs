@@ -2210,6 +2210,14 @@ WHEN OLD.phase = 'retirement_requested'
         AND resource.inspection_fingerprint = OLD.inspection_fingerprint
         AND resource.proof_kind = 'residual'
   )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM close_attempt_scopes captured
+      WHERE captured.attempt_id = OLD.attempt_id
+        AND captured.captured_worktree_identity IS NULL
+        AND captured.captured_worktree_fingerprint IS NULL
+        AND captured.captured_worktree_locator IS NOT NULL
+  )
 BEGIN
     SELECT RAISE(ABORT, 'needs_repair requires current-snapshot residual evidence');
 END;

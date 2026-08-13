@@ -1365,14 +1365,15 @@ impl Database {
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
                 (None, None, Some(locator)) => {
-                    return Err(DbError::CloseFoundationRepairRequired(
-                        CloseFoundationRepair::UnresolvedWorktreeIdentity {
-                            attempt_id: request.attempt_id.clone(),
-                            scope: scope.scope.clone(),
-                            locator: GitPathIdentity::decode_exact(&locator)
-                                .map_err(|error| DbError::Serialization(error.to_string()))?,
-                        },
-                    ))
+                    let repair = CloseFoundationRepair::UnresolvedWorktreeIdentity {
+                        attempt_id: request.attempt_id.clone(),
+                        scope: scope.scope.clone(),
+                        locator: GitPathIdentity::decode_exact(&locator)
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    };
+                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    tx.commit().await?;
+                    return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
                 (None, None, None) => None,
                 _ => {
@@ -1535,14 +1536,15 @@ impl Database {
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
                 (None, None, Some(locator)) => {
-                    return Err(DbError::CloseFoundationRepairRequired(
-                        CloseFoundationRepair::UnresolvedWorktreeIdentity {
-                            attempt_id: request.attempt_id.clone(),
-                            scope: scope.scope.clone(),
-                            locator: GitPathIdentity::decode_exact(&locator)
-                                .map_err(|error| DbError::Serialization(error.to_string()))?,
-                        },
-                    ))
+                    let repair = CloseFoundationRepair::UnresolvedWorktreeIdentity {
+                        attempt_id: request.attempt_id.clone(),
+                        scope: scope.scope.clone(),
+                        locator: GitPathIdentity::decode_exact(&locator)
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    };
+                    route_unresolved_worktree_to_repair(&mut tx, &request.attempt_id).await?;
+                    tx.commit().await?;
+                    return Err(DbError::CloseFoundationRepairRequired(repair));
                 }
                 (None, None, None) => None,
                 _ => {
@@ -1633,6 +1635,27 @@ impl Database {
         tx.commit().await?;
         Ok(resources)
     }
+}
+
+async fn route_unresolved_worktree_to_repair(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &CloseAttemptId,
+) -> DbResult<()> {
+    let updated = sqlx::query(
+        "UPDATE close_obligations
+         SET phase = 'needs_repair', updated_at = ?2
+         WHERE attempt_id = ?1 AND phase = 'retirement_requested'",
+    )
+    .bind(attempt_id.as_str())
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(close_precondition(format!(
+            "attempt {attempt_id} unresolved worktree repair requires retirement_requested"
+        )));
+    }
+    Ok(())
 }
 
 async fn list_close_expected_retirement_resources_tx(
@@ -3077,6 +3100,13 @@ mod tests {
                 && repair_scope == scope
                 && locator.as_bytes() == b"/tmp/worktree"
         ));
+        assert_eq!(
+            db.get_close_obligation("attempt-unresolved")
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::NeedsRepair
+        );
     }
 
     #[tokio::test]

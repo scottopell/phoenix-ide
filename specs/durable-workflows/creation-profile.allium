@@ -552,11 +552,41 @@ rule WorktreeReconciliationInspectsBeforeReplay {
 rule RepositoryMutationUsesPhysicalLock {
     when: CreationEffectStarted(adapter, effect)
     requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: no_active_physical_repository_lock(hidden_repository_for_effect(effect))
     ensures: PhysicalRepositoryLock.created(
         repository: hidden_repository_for_effect(effect),
         holder_effect: effect,
-        acquired_at: now()
+        acquired_at: now(),
+        released_at: null
     )
+}
+
+rule RepositoryMutationWaitsForExistingPhysicalLock {
+    when: CreationEffectStarted(adapter, effect)
+    requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: active_physical_repository_lock(hidden_repository_for_effect(effect))
+    ensures: dwf/Effect{id: effect.id}.status = retry_wait
+    ensures: not PhysicalRepositoryLock.created(holder_effect: effect)
+}
+
+rule RepositoryMutationReleasesPhysicalLock {
+    when: CreationEvidenceRecorded(adapter, effect, evidence)
+    requires: creation_effect_kind(effect) in {reserve_worktree, materialize_or_adopt_worktree, remove_owned_worktree}
+    requires: PhysicalRepositoryLock{holder_effect: effect}.released_at = null
+    requires: effect_attempt_finished(effect, evidence)
+    ensures: PhysicalRepositoryLock{holder_effect: effect}.released_at = now()
+}
+
+rule RepositoryMutationCancellationReleasesPhysicalLock {
+    when: CreationLifecycleRequested(manager, binding, request)
+    requires: request in {cancel, delete}
+    ensures: release_active_physical_repository_locks(binding.workflow)
+}
+
+invariant OneActivePhysicalLockPerRepository {
+    -- Atomic acquisition permits at most one unreleased lock row for each hidden
+    -- repository identity. Contending effects remain in retry_wait until release.
+    true
 }
 
 rule TransientCreationFailureRetriesWithDurableDeadline {
@@ -621,3 +651,9 @@ rule StaleCreationResultsCannotOverwriteLaterLifecycleOutcome {
     requires: stale_creation_result(effect)
     ensures: preserve_cancel_or_delete_outcome(effect.workflow)
 }
+
+
+-- PhysicalRepositoryLock acquisition is an atomic compare-and-create operation
+-- keyed by the hidden repository identity. Release is terminal for that lock row;
+-- retries acquire a new row only after no active lock remains.
+-- release_active_physical_repository_locks(workflow)
