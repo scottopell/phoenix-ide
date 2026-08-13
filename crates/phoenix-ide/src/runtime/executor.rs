@@ -55,6 +55,12 @@ enum StartupSteeringDrainOutcome {
     ResumeLlm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeExitDisposition {
+    Terminal,
+    Interrupted,
+}
+
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -2184,12 +2190,16 @@ where
         self
     }
 
-    pub fn run(self) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'static>> {
+    pub(crate) fn run(
+        self,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = RuntimeExitDisposition> + Send + 'static>,
+    > {
         Box::pin(self.run_inner())
     }
 
     #[allow(clippy::too_many_lines)] // Sequential event loop owns the runtime state.
-    async fn run_inner(mut self) {
+    async fn run_inner(mut self) -> RuntimeExitDisposition {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
         let startup_drain = match self.commit_startup_steering_queue().await {
@@ -2206,7 +2216,7 @@ where
                         "recover queued steering messages",
                     ),
                 });
-                return;
+                return RuntimeExitDisposition::Interrupted;
             }
         };
 
@@ -2238,7 +2248,7 @@ where
                                 "resume the LLM request",
                             ),
                         });
-                        return;
+                        return RuntimeExitDisposition::Interrupted;
                     }
                 }
             };
@@ -2309,7 +2319,7 @@ where
                     conversation_id = %self.context.conversation_id,
                     "Exiting runtime to reconstruct an uncommitted operation from database truth"
                 );
-                return;
+                return RuntimeExitDisposition::Interrupted;
             }
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
@@ -2324,7 +2334,7 @@ where
                     }
                     let _ = acknowledgement.send(result);
                     if terminal {
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 Some(event) = self.event_rx.recv() => {
@@ -2336,7 +2346,7 @@ where
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; exiting executor loop"
                         );
-                        return;
+                        return RuntimeExitDisposition::Interrupted;
                     }
                     if let Err(e) = self.process_event(event).await {
                         // process_event already broadcast a typed
@@ -2352,7 +2362,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
@@ -2366,7 +2376,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 Some((generation, tool_outcome)) = self.tool_outcome_rx.recv() => {
@@ -2398,7 +2408,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 Some((generation, attempt)) = self.retry_outcome_rx.recv() => {
@@ -2430,7 +2440,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 // Unified liveness backstop (REQ-SA-006, REQ-BED-005a): one arm
@@ -2451,7 +2461,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 // REQ-BED-030: credential helper settled while awaiting recovery
@@ -2469,7 +2479,7 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return;
+                        return RuntimeExitDisposition::Terminal;
                     }
                 }
                 else => break,
@@ -2477,6 +2487,7 @@ where
         }
 
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
+        RuntimeExitDisposition::Interrupted
     }
 
     /// REQ-BED-030: credential helper settled while in `AwaitingRecovery`.

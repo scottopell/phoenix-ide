@@ -2502,7 +2502,16 @@ impl RuntimeManager {
         })
     }
 
-    async fn cleanup_terminal_subagent_resources(&self, conv: &crate::db::Conversation) {
+    async fn handle_runtime_exit(
+        &self,
+        conv: &crate::db::Conversation,
+        disposition: executor::RuntimeExitDisposition,
+    ) {
+        if disposition != executor::RuntimeExitDisposition::Terminal
+            || conv.runtime_role != crate::work_scope::RuntimeRole::SubAgent
+        {
+            return;
+        }
         if let Err(error) =
             crate::api::handlers::run_runtime_resource_cleanup_cascade(self, conv).await
         {
@@ -2839,13 +2848,13 @@ impl RuntimeManager {
                 })
                 .await;
 
-            runtime.run().await;
+            let disposition = runtime.run().await;
 
-            // Cancel timeout — sub-agent finished before its limit
+            // Its sender targets this exited runtime's event channel.
             timeout_task.abort();
 
             manager_for_cleanup
-                .cleanup_terminal_subagent_resources(&cleanup_conversation)
+                .handle_runtime_exit(&cleanup_conversation, disposition)
                 .await;
 
             // Only remove this sub-agent's entry. The identity check guards
@@ -3068,7 +3077,8 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Check if this is a sub-agent being resumed (shouldn't happen normally)
+        let cleanup_conversation = conv.clone();
+
         let is_sub_agent = conv.parent_conversation_id.is_some();
         let is_coordinator =
             !is_sub_agent && conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator;
@@ -3539,7 +3549,10 @@ impl RuntimeManager {
         }
 
         tokio::spawn(async move {
-            runtime.run().await;
+            let disposition = runtime.run().await;
+            manager_for_cleanup
+                .handle_runtime_exit(&cleanup_conversation, disposition)
+                .await;
 
             // Only remove this runtime's HashMap entry. After evict_runtime()
             // a new runtime may have been inserted under the same key; we must
@@ -5177,7 +5190,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn terminal_subagent_cleanup_tears_down_unattached_scope() {
+    async fn terminal_subagent_cleanup_is_gated_by_typed_exit_disposition() {
         let manager = test_manager().await;
         let parent = manager
             .db()
@@ -5207,8 +5220,14 @@ mod scope_liveness_tests {
         let scope = ResourceScopeKey::Unattached(child.id.clone());
         let _ = manager.bash_handles().get_or_create(&scope).await;
 
-        manager.cleanup_terminal_subagent_resources(&child).await;
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Interrupted)
+            .await;
+        assert!(manager.bash_handles().reserve_spawn(&scope).await.is_ok());
 
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+            .await;
         assert!(matches!(
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
