@@ -559,6 +559,10 @@ final class SidecarOutputPump: @unchecked Sendable {
 
     func offer(_ data: Data) {
         lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
         if chunks.count >= maxChunks {
             chunks.removeFirst()
             dropped += 1
@@ -1171,7 +1175,7 @@ final class ServerManager: ObservableObject {
         switch priorState {
         case .stopping, .restarting:
             finishStop(finalState: .stopped)
-        case .failed(let failure) where exitedCurrentOperation:
+        case .failed(let failure):
             finishStop(finalState: .failed(failure))
         default:
             let finalState: ConnectionState

@@ -914,6 +914,10 @@ struct PhoenixWebViewPolicy {
               let sourceURL,
               expectedOrigin.exactlyMatches(sourceURL) else { return .cancel }
         if requestURL.absoluteString == "about:blank" { return .allowManagedChild }
+        if requestURL.scheme?.lowercased() == "blob",
+           requestURL.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
+            return .allowManagedChild
+        }
         if expectedOrigin.exactlyMatches(requestURL) { return .allowManagedChild }
         if requestURL.scheme?.lowercased() == nil {
             return .allowManagedChild
@@ -929,6 +933,10 @@ struct PhoenixWebViewPolicy {
 
     static func popupNavigationDecision(_ url: URL, expectedOrigin: PhoenixOrigin) -> PopupDecision {
         if url.absoluteString == "about:blank" || expectedOrigin.exactlyMatches(url) {
+            return .allowManagedChild
+        }
+        if url.scheme?.lowercased() == "blob",
+           url.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
             return .allowManagedChild
         }
         guard let scheme = url.scheme?.lowercased() else { return .cancel }
