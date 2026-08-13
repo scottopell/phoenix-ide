@@ -2526,17 +2526,6 @@ mod tests {
         };
         if phase == ClosePhase::Completed {
             let generation = generation.as_deref().unwrap();
-            sqlx::query(
-                "UPDATE conversations SET archived = 1
-                 WHERE id IN (
-                     SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
-                 )",
-            )
-            .bind(attempt_id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-
             let fingerprint = fingerprint.as_deref().unwrap();
             sqlx::query(
                 "INSERT INTO close_retirement_inventories (
@@ -2627,6 +2616,16 @@ mod tests {
                 "retired"
             })
             .bind((phase == ClosePhase::NeedsRepair).then_some("manual_repair_required"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE conversations SET archived = 1
+                 WHERE id IN (
+                     SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1
+                 )",
+            )
+            .bind(attempt_id)
             .execute(db.pool())
             .await
             .unwrap();

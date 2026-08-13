@@ -2464,17 +2464,50 @@ WHEN OLD.archived = 0
       FROM close_attempt_members member
       JOIN close_obligations obligation ON obligation.attempt_id = member.attempt_id
       WHERE member.conversation_id = OLD.id
-        AND obligation.phase IN (
-            'awaiting_blocker_resolution',
-            'awaiting_stop_work_confirmation',
-            'settling_active_work',
-            'cancel_requested_during_settlement',
-            'awaiting_retirement_inspection',
-            'awaiting_loss_confirmation'
+        AND obligation.phase <> 'completed'
+        AND (
+            obligation.phase NOT IN ('retirement_requested', 'needs_repair')
+            OR EXISTS (
+                SELECT 1 FROM close_attempt_scopes target
+                WHERE target.attempt_id = obligation.attempt_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM close_retirement_inventories inventory
+                      WHERE inventory.attempt_id = target.attempt_id
+                        AND inventory.scope = target.scope
+                        AND inventory.inspection_generation = obligation.inspection_generation
+                        AND inventory.inspection_fingerprint = obligation.inspection_fingerprint
+                        AND inventory.sealed = 1
+                  )
+            )
+            OR EXISTS (
+                SELECT 1 FROM close_expected_retirement_resources expected
+                WHERE expected.attempt_id = obligation.attempt_id
+                  AND expected.inspection_generation = obligation.inspection_generation
+                  AND expected.inspection_fingerprint = obligation.inspection_fingerprint
+                  AND NOT EXISTS (
+                      SELECT 1 FROM close_retirement_resources proof
+                      WHERE proof.attempt_id = expected.attempt_id
+                        AND proof.scope = expected.scope
+                        AND proof.inspection_generation = expected.inspection_generation
+                        AND proof.inspection_fingerprint = expected.inspection_fingerprint
+                        AND proof.resource_kind = expected.resource_kind
+                        AND proof.identity_kind = expected.identity_kind
+                        AND proof.identity_codec = expected.identity_codec
+                        AND proof.identity_value = expected.identity_value
+                        AND proof.proof_kind IN ('retired', 'absence_adopted')
+                  )
+            )
+            OR EXISTS (
+                SELECT 1 FROM close_retirement_resources resource
+                WHERE resource.attempt_id = obligation.attempt_id
+                  AND resource.inspection_generation = obligation.inspection_generation
+                  AND resource.inspection_fingerprint = obligation.inspection_fingerprint
+                  AND resource.proof_kind = 'residual'
+            )
         )
   )
 BEGIN
-    SELECT RAISE(ABORT, 'cancellable Close preserves open captured members');
+    SELECT RAISE(ABORT, 'active Close preserves open captured members until retirement proof is complete');
 END;
 
 CREATE TRIGGER conversations_reject_owner_reactivation_during_close
@@ -2521,6 +2554,24 @@ END;
 
 CREATE TRIGGER close_retirement_losses_reject_nul_git_path
 BEFORE INSERT ON close_retirement_losses
+FOR EACH ROW
+WHEN NEW.identity_kind = 'git_path'
+  AND EXISTS (
+      WITH RECURSIVE byte_pos(pos) AS (
+          SELECT LENGTH('git_path_bytes_hex_v1:') + 1
+          UNION ALL
+          SELECT pos + 2 FROM byte_pos
+          WHERE pos + 2 <= LENGTH(NEW.identity_value)
+      )
+      SELECT 1 FROM byte_pos
+      WHERE SUBSTR(NEW.identity_value, pos, 2) = '00'
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'Git path identity cannot contain a NUL byte');
+END;
+
+CREATE TRIGGER close_retirement_losses_reject_nul_git_path_on_update
+BEFORE UPDATE OF identity_kind, identity_value ON close_retirement_losses
 FOR EACH ROW
 WHEN NEW.identity_kind = 'git_path'
   AND EXISTS (
@@ -6391,6 +6442,17 @@ mod tests {
         .await
         .unwrap_err();
         assert!(nul_loss_error
+            .to_string()
+            .contains("Git path identity cannot contain a NUL byte"));
+        let nul_loss_update_error = sqlx::query(
+            "UPDATE close_retirement_losses
+             SET identity_value = 'git_path_bytes_hex_v1:00'
+             WHERE attempt_id = 'attempt-3' AND scope = 'scope-a' AND generation = 'g1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(nul_loss_update_error
             .to_string()
             .contains("Git path identity cannot contain a NUL byte"));
         sqlx::query(

@@ -1214,12 +1214,22 @@ impl Database {
                 .take(MAX_GIT_POINTER_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .ok()?;
-            if bytes.len() as u64 > MAX_GIT_POINTER_BYTES {
+            if u64::try_from(bytes.len()).ok()? > MAX_GIT_POINTER_BYTES {
+                return None;
+            }
+            let pointer = std::str::from_utf8(&bytes).ok()?;
+            let git_dir = pointer
+                .strip_suffix('\n')
+                .unwrap_or(pointer)
+                .strip_prefix("gitdir: ")?;
+            if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
                 return None;
             }
             bytes
-        } else {
+        } else if metadata.is_dir() {
             Vec::new()
+        } else {
+            return None;
         };
         let mut encoded = String::with_capacity(marker_bytes.len() * 2);
         for byte in marker_bytes {
@@ -10742,6 +10752,10 @@ mod tests {
         std::fs::write(&marker, maximum_pointer).unwrap();
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
         std::fs::write(&marker, vec![b'x'; max_pointer_bytes + 1]).unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "not-a-git-pointer\n").unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "gitdir: \n").unwrap();
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         std::fs::rename(&root, root.with_extension("moved")).unwrap();
