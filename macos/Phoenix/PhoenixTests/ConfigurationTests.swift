@@ -1255,6 +1255,18 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(snapshots.map { String(decoding: $0.logAppend, as: UTF8.self) }.joined().contains("tail-without-boundary"))
     }
 
+    func testWebViewNavigationFailureDecisionIgnoresOnlyCanceledLoads() {
+        XCTAssertFalse(WebViewNavigationFailureDecision.shouldReport(
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        ))
+        XCTAssertTrue(WebViewNavigationFailureDecision.shouldReport(
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost)
+        ))
+        XCTAssertTrue(WebViewNavigationFailureDecision.shouldReport(
+            NSError(domain: "PhoenixTests", code: NSURLErrorCancelled)
+        ))
+    }
+
     func testDownloadDestinationReservationStateAvoidsConcurrentCollisionsAndReleasesPaths() {
         let directory = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
         var state = DownloadDestinationReservationState()
@@ -1269,6 +1281,20 @@ final class ServerManagerHelpersTests: XCTestCase {
             url.path == second.path
         }
         XCTAssertEqual(reused.lastPathComponent, "report.pdf")
+    }
+
+    func testDownloadDestinationReservationStateNormalizesCaseAndUnicode() {
+        let directory = URL(fileURLWithPath: "/tmp/downloads", isDirectory: true)
+        var state = DownloadDestinationReservationState()
+        let first = state.reserveDestination(in: directory, suggestedFilename: "RÉSUMÉ.pdf") { _ in false }
+        let second = state.reserveDestination(in: directory, suggestedFilename: "re\u{301}sume\u{301}.pdf") { _ in false }
+
+        XCTAssertEqual(first.lastPathComponent, "RÉSUMÉ.pdf")
+        XCTAssertEqual(second.lastPathComponent, "re\u{301}sume\u{301} (1).pdf")
+
+        state.release(first)
+        let reused = state.reserveDestination(in: directory, suggestedFilename: "résumé.pdf") { _ in false }
+        XCTAssertEqual(reused.lastPathComponent, "résumé.pdf")
     }
 
     func testDownloadDestinationReservationStateReleasesSupersededReservation() {

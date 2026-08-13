@@ -269,6 +269,13 @@ struct DeepLinkValidationOutcome: Equatable {
     }
 }
 
+struct WebViewNavigationFailureDecision {
+    static func shouldReport(_ error: Error) -> Bool {
+        let failure = error as NSError
+        return !(failure.domain == NSURLErrorDomain && failure.code == NSURLErrorCancelled)
+    }
+}
+
 struct BrowserSurfaceOwnershipDecision {
     static func shouldCloseOwnedSurfaces(
         hasBrowserOperation: Bool,

@@ -177,7 +177,7 @@ struct WebViewWrapper: NSViewRepresentable {
             didFailProvisionalNavigation navigation: WKNavigation!,
             withError error: Error
         ) {
-            guard role == .primary else { return }
+            guard role == .primary, WebViewNavigationFailureDecision.shouldReport(error) else { return }
             onDeployment(.failure(error), operation)
         }
 
@@ -186,7 +186,7 @@ struct WebViewWrapper: NSViewRepresentable {
             didFail navigation: WKNavigation!,
             withError error: Error
         ) {
-            guard role == .primary else { return }
+            guard role == .primary, WebViewNavigationFailureDecision.shouldReport(error) else { return }
             onDeployment(.failure(error), operation)
         }
 
@@ -437,9 +437,9 @@ struct DownloadDestinationReservationState {
                 candidateName = "\(base) (\(suffix)).\(ext)"
             }
             let candidate = directory.appendingPathComponent(candidateName)
-            let path = candidate.path
-            if !reservedPaths.contains(path) && !fileExists(candidate) {
-                reservedPaths.insert(path)
+            let reservationKey = Self.reservationKey(for: candidate)
+            if !reservedPaths.contains(reservationKey) && !fileExists(candidate) {
+                reservedPaths.insert(reservationKey)
                 return candidate
             }
             suffix += 1
@@ -448,7 +448,11 @@ struct DownloadDestinationReservationState {
 
     mutating func release(_ url: URL?) {
         guard let url else { return }
-        reservedPaths.remove(url.path)
+        reservedPaths.remove(Self.reservationKey(for: url))
+    }
+
+    private static func reservationKey(for url: URL) -> String {
+        url.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
     }
 }
 
