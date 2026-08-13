@@ -547,6 +547,10 @@ final class DownloadManager {
             },
             onFinish: { [weak self] finishedDownload in
                 self?.finishDownload(finishedDownload)
+            },
+            onFailure: { [weak self] failedDownload, error in
+                self?.presentDownloadFailure(error)
+                self?.finishDownload(failedDownload)
             }
         )
         activeDownloads[ObjectIdentifier(download)] = ActiveDownload(operation: operation, download: download, delegate: delegate, reservedDestination: nil)
@@ -592,6 +596,14 @@ final class DownloadManager {
         return destination
     }
 
+    private func presentDownloadFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Download failed"
+        alert.informativeText = error.localizedDescription
+        alert.runModal()
+    }
+
     private func finishDownload(_ download: WKDownload) {
         let identifier = ObjectIdentifier(download)
         let reservation = activeDownloads.removeValue(forKey: identifier)?.reservedDestination
@@ -601,13 +613,16 @@ final class DownloadManager {
     private final class DownloadDelegate: NSObject, WKDownloadDelegate {
         private let reserveDestination: (WKDownload, URLResponse, String) -> URL?
         private let onFinish: (WKDownload) -> Void
+        private let onFailure: (WKDownload, Error) -> Void
 
         init(
             reserveDestination: @escaping (WKDownload, URLResponse, String) -> URL?,
-            onFinish: @escaping (WKDownload) -> Void
+            onFinish: @escaping (WKDownload) -> Void,
+            onFailure: @escaping (WKDownload, Error) -> Void
         ) {
             self.reserveDestination = reserveDestination
             self.onFinish = onFinish
+            self.onFailure = onFailure
         }
 
         @available(macOS 11.3, *)
@@ -625,7 +640,7 @@ final class DownloadManager {
         }
 
         func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-            onFinish(download)
+            onFailure(download, error)
         }
 
         func downloadDidCancel(_ download: WKDownload) {

@@ -1544,7 +1544,7 @@ impl BrowserSessionManager {
         &self,
         key: &str,
         attempt: &Arc<KillAttempt>,
-        user_data_dir: &str,
+        user_data_dir: &Path,
     ) -> Result<(), BrowserError> {
         let failure = match tokio::time::timeout(
             SESSION_INIT_TIMEOUT,
@@ -1554,8 +1554,14 @@ impl BrowserSessionManager {
         {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Ok(Err(error)) => format!("failed to remove browser profile {user_data_dir}: {error}"),
-            Err(_) => format!("timed out removing browser profile {user_data_dir}"),
+            Ok(Err(error)) => format!(
+                "failed to remove browser profile {}: {error}",
+                user_data_dir.display()
+            ),
+            Err(_) => format!(
+                "timed out removing browser profile {}",
+                user_data_dir.display()
+            ),
         };
         self.complete_kill_failure(key, attempt, failure.clone())
             .await;
@@ -1665,11 +1671,7 @@ impl BrowserSessionManager {
 
                 let user_data_dir = user_data_dir_for_key(&manager.tmp_root, &user_data_key);
                 manager
-                    .remove_profile_for_attempt(
-                        &key,
-                        &task_attempt,
-                        &user_data_dir.to_string_lossy(),
-                    )
+                    .remove_profile_for_attempt(&key, &task_attempt, &user_data_dir)
                     .await?;
 
                 let removed = manager.remove_session_if_current(&key, &session).await;
