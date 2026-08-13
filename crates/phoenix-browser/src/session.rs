@@ -48,7 +48,7 @@ fn user_data_dir_for_key(tmp_root: &Path, scope_key: &str) -> PathBuf {
 }
 
 fn legacy_user_data_dir_for_key(scope_key: &str) -> PathBuf {
-    user_data_dir_for_key(&std::env::temp_dir(), scope_key)
+    user_data_dir_for_key(Path::new("/tmp"), scope_key)
 }
 
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.

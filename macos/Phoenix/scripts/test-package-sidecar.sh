@@ -13,6 +13,10 @@ mkdir -p "$helpers"
 dummy_sidecar="$tmpdir/phoenix_ide"
 cat > "$dummy_sidecar" <<'EOF'
 #!/bin/sh
+if [ "${1:-}" = "--build-identity" ]; then
+  printf '%s\n' '{"version":"0.11.2","git_sha":"0123456789abcdef0123456789abcdef01234567"}'
+  exit 0
+fi
 exit 0
 EOF
 chmod +x "$dummy_sidecar"
@@ -81,6 +85,16 @@ FAKE_LIPO_ARCHS='arm64 x86_64'
 CODE_SIGNING_ALLOWED_OVERRIDE=NO
 run_script >/dev/null
 [ -x "$helpers/phoenix_ide" ]
+
+# non-Phoenix executable is rejected before packaging succeeds
+non_phoenix="$tmpdir/not-phoenix"
+printf '#!/bin/sh\nexit 0\n' > "$non_phoenix"
+chmod +x "$non_phoenix"
+if PHOENIX_SIDECAR_PATH="$non_phoenix" run_script >/dev/null 2>"$tmpdir/non-phoenix.err"; then
+  echo 'error: expected non-Phoenix sidecar to be rejected' >&2
+  exit 1
+fi
+/usr/bin/grep 'invalid Phoenix build identity' "$tmpdir/non-phoenix.err" >/dev/null
 
 # source inspection regression: keep stale-helper cleanup and packaged validation in the script
 /usr/bin/grep '/bin/rm -f "\$destination"' "$script" >/dev/null

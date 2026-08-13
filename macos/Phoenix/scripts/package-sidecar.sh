@@ -16,6 +16,14 @@ validate_packaged_sidecar() {
   expected_signing="$3"
 
   [ -f "$helper" ] || { echo "error: packaged sidecar missing at $helper" >&2; return 1; }
+  build_identity="$($helper --build-identity 2>/dev/null)" || {
+    echo "error: packaged sidecar does not expose Phoenix build identity" >&2
+    return 1
+  }
+  printf '%s' "$build_identity" | /usr/bin/grep -Eq '^\{"version":"[^"]+","git_sha":"[0-9a-f]{12,40}(-dirty)?"\}$' || {
+    echo "error: packaged sidecar returned invalid Phoenix build identity" >&2
+    return 1
+  }
   helper_archs="$(lipo -archs "$helper")"
   for arch in $required_archs; do
     case " $helper_archs " in
