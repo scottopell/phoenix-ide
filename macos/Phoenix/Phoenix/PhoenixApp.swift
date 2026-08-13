@@ -91,6 +91,7 @@ struct SettingsView: View {
                             changedBundledSecrets: persisted.summary.changedBundledSecrets
                         )
                         savedDraft = persisted.persistedSnapshot.draft()
+                        draft = savedDraft
                         savedAppliedSnapshot = persisted.persistedSnapshot
                         hasSavedModeSelection = true
                         if reconnectDecision.requiresReconnect {
@@ -115,6 +116,11 @@ struct SettingsView: View {
                 Text("Settings changed locally. Phoenix.app keeps using the saved configuration until you click Apply and Connect.")
                     .font(.caption)
                     .foregroundStyle(.orange)
+            }
+            if let statusMessage = feedback.statusMessage {
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if let errorMessage = feedback.errorMessage {
                 Text(errorMessage)
@@ -202,9 +208,6 @@ struct SettingsView: View {
                     Text("Stored in this Mac's Keychain only when you click Apply and Connect. Clearing a field deletes that saved secret from Keychain on the next apply.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    if let statusMessage = feedback.statusMessage {
-                        Text(statusMessage).font(.caption).foregroundStyle(.secondary)
-                    }
                 }
                 .padding(.top, 6)
             }

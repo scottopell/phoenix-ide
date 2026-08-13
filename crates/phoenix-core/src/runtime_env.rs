@@ -88,15 +88,15 @@ impl PhoenixRuntimeEnvironment {
         let codex_home = std::env::var_os("CODEX_HOME")
             .filter(|v| !v.is_empty())
             .map_or_else(|| home.join(".codex"), PathBuf::from);
-        let data_dir = std::env::var_os("PHOENIX_DATA_DIR")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| phoenix_home.clone(), PathBuf::from);
         let state_dir = resolve_state_dir(
             &phoenix_home,
             std::env::var_os("PHOENIX_STATE_DIR").filter(|v| !v.is_empty()),
         );
+        let data_dir = std::env::var_os("PHOENIX_DATA_DIR")
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| state_dir.clone(), PathBuf::from);
         let db_path = resolve_db_path(
-            &phoenix_home,
+            &state_dir,
             std::env::var_os("PHOENIX_DB_PATH").filter(|v| !v.is_empty()),
         );
         let tmp_root = std::env::var_os("PHOENIX_TMP_DIR")

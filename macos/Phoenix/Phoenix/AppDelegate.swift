@@ -146,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             browserOperation = operation
             let wrapper = WebViewWrapper(
                 origin: origin,
-                storagePartition: WebKitStoragePartition(serverMode: mode.kind),
+                storagePartition: WebKitStoragePartition(serverMode: mode.kind, origin: origin),
                 operation: operation,
                 browserEnvironment: browserEnvironment,
                 onWebViewReady: { [weak self] value, operation in

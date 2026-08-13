@@ -639,8 +639,13 @@ final class BundledOwnerLease {
     }
 
     static func acquire(_ url: URL, ownerPID: Int32 = ProcessInfo.processInfo.processIdentifier) throws -> BundledOwnerLease {
-        let descriptor = open(url.path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR)
+        let descriptor = open(url.path, O_RDWR | O_CREAT | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw ConfigurationError.bundledDataInUse }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0, (metadata.st_mode & S_IFMT) == S_IFREG else {
+            close(descriptor)
+            throw ConfigurationError.bundledDataInUse
+        }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             close(descriptor)
             throw ConfigurationError.bundledDataInUse

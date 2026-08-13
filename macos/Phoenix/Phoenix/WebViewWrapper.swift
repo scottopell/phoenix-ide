@@ -1,24 +1,37 @@
 import SwiftUI
 import WebKit
 import UserNotifications
+import CryptoKit
 
 enum WebKitStoragePartition: Equatable {
-    case attached
+    case attached(PhoenixOrigin)
     case bundled
 
-    init(serverMode: ServerModeKind) {
+    init(serverMode: ServerModeKind, origin: PhoenixOrigin) {
         switch serverMode {
-        case .attached: self = .attached
+        case .attached: self = .attached(origin)
         case .bundled: self = .bundled
         }
     }
 
     static let bundledPersistentIdentifier = UUID(uuidString: "DB535D27-91C2-42A0-9DF7-DC959C80D4D4")!
 
+    private var attachedPersistentIdentifier: UUID {
+        guard case .attached(let origin) = self else { return Self.bundledPersistentIdentifier }
+        let digest = Array(SHA256.hash(data: Data("phoenix-attached-webkit:\(origin.description)".utf8)))
+        let bytes: uuid_t = (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        )
+        return UUID(uuid: bytes)
+    }
+
     @MainActor
     var dataStore: WKWebsiteDataStore {
         switch self {
-        case .attached: WKWebsiteDataStore.default()
+        case .attached: WKWebsiteDataStore(forIdentifier: attachedPersistentIdentifier)
         case .bundled: WKWebsiteDataStore(forIdentifier: Self.bundledPersistentIdentifier)
         }
     }

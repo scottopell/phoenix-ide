@@ -1429,10 +1429,14 @@ final class ServerManagerHelpersTests: XCTestCase {
 
     @MainActor
     func testWebKitStoragePartitionsAttachedAndBundledAuthorityAtIdenticalOrigin() {
-        let attached = WebKitStoragePartition(serverMode: .attached)
-        let bundled = WebKitStoragePartition(serverMode: .bundled)
+        let attachedOrigin = try! PhoenixOrigin("https://phoenix.example.test:8031")
+        let otherOrigin = try! PhoenixOrigin("https://phoenix.example.test:8032")
+        let attached = WebKitStoragePartition(serverMode: .attached, origin: attachedOrigin)
+        let otherAttached = WebKitStoragePartition(serverMode: .attached, origin: otherOrigin)
+        let bundled = WebKitStoragePartition(serverMode: .bundled, origin: attachedOrigin)
 
-        XCTAssertNil(attached.dataStore.identifier)
+        XCTAssertNotNil(attached.dataStore.identifier)
+        XCTAssertNotEqual(attached.dataStore.identifier, otherAttached.dataStore.identifier)
         XCTAssertEqual(bundled.dataStore.identifier, WebKitStoragePartition.bundledPersistentIdentifier)
         XCTAssertNotEqual(attached.dataStore, bundled.dataStore)
         XCTAssertTrue(attached.dataStore.isPersistent)
