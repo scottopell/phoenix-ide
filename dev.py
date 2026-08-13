@@ -8198,7 +8198,7 @@ def _commit_bare_transaction(
         rollback_binary.chmod(0o600)
         rollback_env.chmod(0o600)
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "transaction_id": transaction_id,
         "source_kind": prepared.source_kind.value,
         "expected": prepared.identity.as_dict(),

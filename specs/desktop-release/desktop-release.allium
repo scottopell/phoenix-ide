@@ -177,6 +177,9 @@ surface DesktopReleaseWorkflow {
 -- release_checksums_match_required_assets(publication) -> Boolean
 --   the published SHA256SUMS matches the exact required asset set and bytes for
 --   publication.identity.
+-- release_builds_verified(publication) -> Boolean
+--   every helper/desktop asset in publication is backed by matching identity builds
+--   whose helper signature, app signature, and notarization are verified/validated.
 -- publish_interrupted_mid_commit(publication) -> Boolean
 --   an interruption occurred after replacement began but before the exact final
 --   asset and checksum set was fully committed.
@@ -313,8 +316,11 @@ rule NotarizationValidationFailureStopsRelease {
 }
 
 rule PublishCreatesFreshReleaseFromCompleteAssetSet {
-    when: ReleaseCreated(publication)
+    when: ReleaseCreated(gate, publication)
     requires: publication.state = creating
+    requires: gate.state = new_tag_created or gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
+    requires: release_builds_verified(publication)
     requires: required_release_assets_complete(publication)
     requires: checksum_membership_complete(publication)
     requires: release_contains_only_required_assets(publication)
@@ -366,6 +372,7 @@ rule RetryFromInterruptedOrMixedStateMustRestageExactSet {
 rule SuccessfulReplacementRequiresExactPublishedSet {
     when: ReplacementUploadCompleted(publication)
     requires: publication.state = committing or publication.state = mixed
+    requires: release_builds_verified(publication)
     requires: release_contains_only_required_assets(publication)
     requires: release_checksums_match_required_assets(publication)
     ensures: publication.state = completed
