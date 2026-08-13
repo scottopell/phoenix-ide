@@ -163,7 +163,7 @@ struct WebViewWrapper: NSViewRepresentable {
                 return
             }
             if navigationAction.shouldPerformDownload {
-                decisionHandler(.download)
+                decisionHandler(origin.exactlyMatches(url) ? .download : .cancel)
                 return
             }
             if navigationAction.targetFrame == nil {

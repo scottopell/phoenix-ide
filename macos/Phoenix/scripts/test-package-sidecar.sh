@@ -67,6 +67,7 @@ run_script() {
   ARCHS="${ARCHS_OVERRIDE:-arm64 x86_64}" \
   CONFIGURATION="${CONFIGURATION_OVERRIDE:-Debug}" \
   PHOENIX_SIDECAR_PATH="${PHOENIX_SIDECAR_PATH:-}" \
+  PHOENIX_EXPECTED_BUILD_IDENTITY="${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" \
   CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED_OVERRIDE:-NO}" \
   CODE_SIGN_STYLE="${CODE_SIGN_STYLE_OVERRIDE:-Manual}" \
   EXPANDED_CODE_SIGN_IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY_OVERRIDE:-}" \
@@ -85,6 +86,15 @@ FAKE_LIPO_ARCHS='arm64 x86_64'
 CODE_SIGNING_ALLOWED_OVERRIDE=NO
 run_script >/dev/null
 [ -x "$helpers/phoenix_ide" ]
+
+expected_identity='{"version":"0.11.2","git_sha":"0123456789abcdef0123456789abcdef01234567"}'
+PHOENIX_EXPECTED_BUILD_IDENTITY="$expected_identity" run_script >/dev/null
+if PHOENIX_EXPECTED_BUILD_IDENTITY='{"version":"9.9.9","git_sha":"ffffffffffffffffffffffffffffffffffffffff"}' run_script >/dev/null 2>"$tmpdir/mismatch.err"; then
+  echo 'error: expected mismatched Phoenix sidecar identity to be rejected' >&2
+  exit 1
+fi
+/usr/bin/grep 'does not match expected build' "$tmpdir/mismatch.err" >/dev/null
+unset PHOENIX_EXPECTED_BUILD_IDENTITY
 
 # non-Phoenix executable is rejected before packaging succeeds
 non_phoenix="$tmpdir/not-phoenix"

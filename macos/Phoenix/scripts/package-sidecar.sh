@@ -24,6 +24,10 @@ validate_packaged_sidecar() {
     echo "error: packaged sidecar returned invalid Phoenix build identity" >&2
     return 1
   }
+  if [ -n "${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" ] && [ "$build_identity" != "$PHOENIX_EXPECTED_BUILD_IDENTITY" ]; then
+    echo "error: packaged sidecar build identity does not match expected build" >&2
+    return 1
+  fi
   helper_archs="$(lipo -archs "$helper")"
   for arch in $required_archs; do
     case " $helper_archs " in
@@ -75,6 +79,11 @@ fi
 
 if [ ! -f "$PHOENIX_SIDECAR_PATH" ] || [ ! -x "$PHOENIX_SIDECAR_PATH" ]; then
   echo "error: PHOENIX_SIDECAR_PATH must name an executable file" >&2
+  exit 1
+fi
+
+if [ "${CONFIGURATION:-Debug}" = "Release" ] && [ -z "${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" ]; then
+  echo "error: Release builds require PHOENIX_EXPECTED_BUILD_IDENTITY" >&2
   exit 1
 fi
 
