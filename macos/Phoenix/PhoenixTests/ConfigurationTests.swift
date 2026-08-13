@@ -1277,7 +1277,10 @@ final class ServerManagerHelpersTests: XCTestCase {
                 "third\n",
             ]
         )
-        XCTAssertEqual(snapshots.last?.recentLines, ["third"])
+        XCTAssertEqual(
+            snapshots.last?.recentLines,
+            ["[Phoenix dropped 1 sidecar log chunk before recording]", "third"]
+        )
         XCTAssertFalse(snapshots.map { String(decoding: $0.logAppend, as: UTF8.self) }.joined().contains("tail-without-boundary"))
     }
 

@@ -59,6 +59,13 @@ struct ConnectionLogBuffer: Equatable {
         return emitted
     }
 
+    mutating func appendDiagnosticLine(_ line: String) {
+        completeLines.append(line)
+        if completeLines.count > maxLines {
+            completeLines = Array(completeLines.suffix(maxLines))
+        }
+    }
+
     mutating func flushPending(redact: (String) -> String) -> String? {
         if discardingOversizedRecord {
             discardingOversizedRecord = false
@@ -339,16 +346,18 @@ actor SidecarLogRecorder {
                 chunk.removeSubrange(...newline)
                 discardUntilRecordBoundary = false
             }
-            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
             if droppedChunkCount > 0 {
                 let droppedLine = droppedChunkCount == 1
                     ? "[Phoenix dropped 1 sidecar log chunk before recording]"
                     : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
                 let droppedData = Data((droppedLine + "\n").utf8)
                 try? appendToLog(droppedData)
+                buffer.appendDiagnosticLine(droppedLine)
+                await snapshotSink(buffer.completeLines)
                 snapshots.append(Snapshot(logAppend: droppedData, recentLines: buffer.completeLines))
                 droppedChunkCount = 0
             }
+            let emitted = buffer.append(chunk, redact: Self.defaultRedact)
             guard !emitted.isEmpty else { continue }
             let append = Data((emitted.joined(separator: "\n") + "\n").utf8)
             try? appendToLog(append)
@@ -368,6 +377,7 @@ actor SidecarLogRecorder {
                 : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
             let droppedData = Data((droppedLine + "\n").utf8)
             try? appendToLog(droppedData)
+            buffer.appendDiagnosticLine(droppedLine)
             droppedChunkCount = 0
             await snapshotSink(buffer.completeLines)
             return Snapshot(logAppend: droppedData, recentLines: buffer.completeLines)
