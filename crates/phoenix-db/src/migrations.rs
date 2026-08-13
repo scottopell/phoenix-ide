@@ -2055,6 +2055,32 @@ BEGIN
     SELECT RAISE(ABORT, 'retirement evidence identity is immutable');
 END;
 
+CREATE TRIGGER close_retirement_resources_created_at_is_immutable
+BEFORE UPDATE OF created_at ON close_retirement_resources
+FOR EACH ROW
+WHEN OLD.created_at <> NEW.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence creation timestamp is immutable');
+END;
+
+CREATE TRIGGER close_retirement_resources_reject_invalid_updated_at
+BEFORE UPDATE OF updated_at ON close_retirement_resources
+FOR EACH ROW
+WHEN (
+      NEW.updated_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.updated_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR date(SUBSTR(NEW.updated_at, 1, 10), '+0 days') <> SUBSTR(NEW.updated_at, 1, 10)
+  OR CAST(SUBSTR(NEW.updated_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.updated_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.updated_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.updated_at) IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'Close retirement evidence update timestamp must be valid RFC 3339');
+END;
+
 CREATE TRIGGER close_retirement_resources_outcome_is_monotonic
 BEFORE UPDATE OF proof_kind, absence_basis, residual_reason, detail ON close_retirement_resources
 FOR EACH ROW
@@ -6639,6 +6665,22 @@ mod tests {
         assert!(sqlx::query(
             "UPDATE close_retirement_resources
              SET inspection_generation = 'retagged', inspection_fingerprint = 'retagged'
+             WHERE attempt_id = 'attempt-3' AND identity_value = 'pg-9'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_retirement_resources
+             SET created_at = '2030-01-01T00:00:00Z'
+             WHERE attempt_id = 'attempt-3' AND identity_value = 'pg-9'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_retirement_resources
+             SET updated_at = 'not-rfc3339'
              WHERE attempt_id = 'attempt-3' AND identity_value = 'pg-9'",
         )
         .execute(&pool)

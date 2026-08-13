@@ -27,11 +27,9 @@ use std::path::{Path as StdPath, PathBuf};
 // Terminal-action gate (REQ-BED-031)
 // ============================================================
 
-/// Reject terminal user actions (abandon / mark-as-merged) when the
-/// conversation has an existing continuation. REQ-BED-031, enforced by
-/// the Allium `TerminalActionRequiresNoContinuation` invariant and the
-/// `continued_in_conv_id = absent` clause on the `ConfirmAbandon` and
-/// `MarkAsMerged` rules in `specs/projects/projects.allium`.
+/// Reject terminal user actions when the conversation has an existing
+/// continuation, as required by REQ-BED-031 and
+/// `bedrock.allium::TerminalActionRequiresNoContinuation`.
 ///
 /// `action` is a human-readable verb phrase (e.g. `"abandon"`,
 /// `"mark as merged"`) that appears in the error message so the UI can

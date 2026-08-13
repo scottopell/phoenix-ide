@@ -21,7 +21,7 @@ It does **not** own:
 - PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context — the `pr-association` spec;
 - UI placement, wording variants, or action-bar composition — the `work-actions-bar` spec owns those concerns.
 
-Historical compatibility note: earlier Phoenix surfaces exposed **Abandon** and **Mark as merged** as separate lifecycle actions. That product split is deprecated. Any migration-time adapter that still recognizes those legacy verbs SHALL map them into the one Close flow while preserving Close's current confirmation and loss-safety contract; the legacy verbs are not current user-facing actions.
+Compatibility adapters for `abandon` and `mark_merged` SHALL map those inputs into the one Close flow, preserving the confirmation and loss-safety contract, and SHALL NOT expose them as writable lifecycle choices.
 
 ---
 

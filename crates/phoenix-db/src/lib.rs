@@ -6345,8 +6345,7 @@ impl Database {
 
     /// Create a continuation conversation for a context-exhausted parent, atomically.
     ///
-    /// Implements REQ-BED-030 and the continuation rules in
-    /// `specs/projects/projects.allium`.
+    /// Implements REQ-BED-030 and bedrock.allium continuation rules.
     ///
     /// Within a single `SQLite` transaction:
     ///   1. INSERT a new `conversations` row with the parent's `conv_mode` cloned

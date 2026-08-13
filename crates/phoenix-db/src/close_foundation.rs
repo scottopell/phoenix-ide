@@ -1699,7 +1699,8 @@ impl Database {
         &self,
         request: RecordCloseRetirementEvidenceRequest,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let phase_record = sqlx::query(
             "SELECT phase, inspection_generation, inspection_fingerprint FROM close_obligations WHERE attempt_id = ?1",
         )
@@ -4934,6 +4935,58 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].outcome, RetirementOutcome::Retired);
         assert!(evidence[0].detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_retirement_evidence_is_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation("root", "attempt-concurrent-evidence")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-concurrent-evidence",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        let snapshot = current_test_snapshot(&db, "attempt-concurrent-evidence").await;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::BrowserSession,
+            LossItemIdentity::Opaque(OpaqueIdentity::parse("browser-1").unwrap()),
+        )
+        .unwrap();
+        capture_test_inventory(
+            &db,
+            "attempt-concurrent-evidence",
+            &scope,
+            &snapshot,
+            vec![resource.clone()],
+        )
+        .await;
+        let request = RecordCloseRetirementEvidenceRequest {
+            attempt_id: CloseAttemptId::parse("attempt-concurrent-evidence").unwrap(),
+            snapshot,
+            scope,
+            resource,
+            outcome: RetirementOutcome::Retired,
+            detail: None,
+        };
+
+        let (first, second) = tokio::join!(
+            db.record_close_retirement_evidence(request.clone()),
+            db.record_close_retirement_evidence(request)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            db.list_close_retirement_evidence("attempt-concurrent-evidence")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

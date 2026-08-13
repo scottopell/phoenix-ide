@@ -14315,21 +14315,9 @@ mod subagent_grace_tool_surface_tests {
     }
 }
 
-// ============================================================
-// Work-sub-agent cwd-scoping guard}
-
-// ============================================================
-// Work-sub-agent cwd-scoping guard (REQ-PROJ-008)
-// ============================================================
-//
-// Distilled from specs/subagents/subagents.allium
-// (SpawnRejectedWorkCwdOutsideWorktree). A Work sub-agent's overridden
-// `cwd` must stay inside the parent's worktree -- without the guard, the
-// sub-agent's runtime would see a different working_dir than the parent
-// and writes could escape projects.allium's WriteBlockedOutsideWorktree.
-
 #[cfg(test)]
 mod work_subagent_cwd_guard_tests {
+    // Covers REQ-PROJ-007 and subagents.allium::SpawnRejectedWorkCwdOutsideWorktree.
     use super::*;
     use crate::db::ToolOutcome;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};

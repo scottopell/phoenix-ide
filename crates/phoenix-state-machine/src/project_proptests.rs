@@ -1,4 +1,5 @@
-//! Property-based tests derived from specs/projects/projects.allium
+//! Property-based tests for legacy `ConvMode` and worktree invariants retained by
+//! `specs/bedrock/bedrock.allium` and `specs/bedrock/requirements.md`.
 //!
 //! These properties verify structural invariants of the project lifecycle:
 //! mode-dependent field presence, worktree uniqueness, branch/work mode
@@ -59,8 +60,7 @@ mod tests {
     // Work mode ALWAYS has task_id. Branch mode NEVER has task_id.
     // If a type allows a Work mode without task_id, the type is wrong.
     //
-    // Traces to: projects.allium invariants TaskFileExistsForManagedWorktrees,
-    // BranchModeHasNoTaskFile
+    // Traces to: bedrock.allium's ConvMode structure and REQ-PROJ-007.
     // ========================================================================
 
     proptest! {
@@ -283,7 +283,7 @@ mod tests {
     // ========================================================================
 
     // This property is best verified by code audit (grep for "fetch" without refspec)
-    // rather than a proptest. See the invariant in projects.allium.
+    // rather than a proptest. REQ-PROJ-020/022 are the authority.
 
     // ========================================================================
     // Scenario: Branch conflict detection (REQ-PROJ-025)
