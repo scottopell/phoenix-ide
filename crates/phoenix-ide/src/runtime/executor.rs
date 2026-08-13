@@ -58,8 +58,19 @@ enum StartupSteeringDrainOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeExitDisposition {
     Terminal,
-    Reconstruct,
     Interrupted,
+}
+
+struct TerminalLlmOutcomeRetry {
+    generation: u64,
+    outcome: LlmOutcome,
+    retry_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalSettlementAttempt {
+    Initial,
+    Retry,
 }
 
 impl Drop for AbortTaskOnDrop {
@@ -621,6 +632,7 @@ const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
 /// real cancelled result wins the race in the common case, leaving this 6s as a
 /// true last resort for a sub-agent runtime that has genuinely vanished.
 const CANCELLING_SUBAGENTS_DEADLINE: Duration = Duration::from_secs(6);
+const TERMINAL_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Hard byte cap on the LLM-bound text of a single tool result.
 ///
@@ -1795,6 +1807,8 @@ where
     /// never leaks into the pure `EffectOutcome` type.
     llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
     llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    terminal_llm_outcome_retry: Option<TerminalLlmOutcomeRetry>,
+    terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
     /// `llm_request_generation`. Incremented at each tool dispatch (the
     /// `tool_task_handle` spawn site) and at the `CancellingTool` backstop's
@@ -2017,6 +2031,8 @@ where
             llm_request_generation: 0,
             llm_outcome_tx,
             llm_outcome_rx,
+            terminal_llm_outcome_retry: None,
+            terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
             tool_request_generation: 0,
             tool_outcome_tx,
             tool_outcome_rx,
@@ -2320,13 +2336,18 @@ where
                     conversation_id = %self.context.conversation_id,
                     "Exiting runtime to reconstruct an uncommitted operation from database truth"
                 );
-                return RuntimeExitDisposition::Reconstruct;
+                return RuntimeExitDisposition::Interrupted;
             }
+            let terminal_retry_at = self
+                .terminal_llm_outcome_retry
+                .as_ref()
+                .map(|retry| retry.retry_at);
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
+                biased;
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
@@ -2374,6 +2395,23 @@ where
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
                             ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        self.emit_terminal_lifecycle_event().await;
+                        return RuntimeExitDisposition::Terminal;
+                    }
+                }
+                () = async {
+                    match terminal_retry_at {
+                        Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if terminal_retry_at.is_some() => {
+                    self.retry_terminal_llm_outcome().await;
+                    if matches!(self.state.step_result(), StepResult::Terminal(_)) {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            state = self.state.variant_name(),
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
@@ -2627,8 +2665,30 @@ where
 
         self.llm_task_handle = None;
         self.active_llm_attempt = None;
+        let retry_outcome = llm_outcome.clone();
         if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
-            tracing::warn!(%error, "Outcome rejected by state machine");
+            if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase
+                && self.context.is_sub_agent
+            {
+                self.recovery_disposition = RuntimeRecoveryDisposition::Continue;
+                self.terminal_llm_outcome_retry = Some(TerminalLlmOutcomeRetry {
+                    generation,
+                    outcome: retry_outcome,
+                    retry_at: tokio::time::Instant::now() + TERMINAL_SETTLEMENT_RETRY_DELAY,
+                });
+                tracing::warn!(%error, "Terminal sub-agent settlement failed; retrying in place");
+            } else {
+                tracing::warn!(%error, "Outcome rejected by state machine");
+            }
+        }
+    }
+
+    async fn retry_terminal_llm_outcome(&mut self) {
+        if let Some(retry) = self.terminal_llm_outcome_retry.take() {
+            self.terminal_settlement_attempt = TerminalSettlementAttempt::Retry;
+            self.process_generation_tagged_llm_outcome(retry.generation, retry.outcome)
+                .await;
+            self.terminal_settlement_attempt = TerminalSettlementAttempt::Initial;
         }
     }
 
@@ -2794,6 +2854,9 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
+            self.terminal_llm_outcome_retry = None;
+        }
         if matches!(self.state, ConvState::Idle)
             && matches!(
                 &event,
@@ -4701,7 +4764,10 @@ where
             } => {
                 // Idempotent recovery paths skip an already-persisted identity;
                 // ordinary message effects avoid the extra existence query.
-                if idempotent && self.storage.message_exists(&message_id).await? {
+                if (idempotent
+                    || self.terminal_settlement_attempt == TerminalSettlementAttempt::Retry)
+                    && self.storage.message_exists(&message_id).await?
+                {
                     tracing::debug!(
                         message_id = %message_id,
                         "Skipping PersistMessage; message already exists"
@@ -12628,7 +12694,72 @@ mod steer_drain_detector_tests {
             rt.recovery_disposition,
             RuntimeRecoveryDisposition::RecreateFromDatabase
         );
-        assert_eq!(rt.run_inner().await, RuntimeExitDisposition::Reconstruct);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_subagent_retries_failed_settlement_in_place() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "terminal-settlement-retry",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.context.is_sub_agent = true;
+        storage.set_fail_state_update(true);
+        let (parent_tx, mut parent_rx) = mpsc::channel(1);
+        rt.parent_event_tx = Some(parent_tx);
+        let outcome = LlmOutcome::Response {
+            content: vec![ContentBlock::text("done")],
+            tool_calls: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "terminal-retry-response".to_string(),
+        };
+
+        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(rt.terminal_llm_outcome_retry.is_some());
+        assert!(rt.parent_event_tx.is_some());
+
+        storage.set_fail_state_update(false);
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        rt.retry_terminal_llm_outcome().await;
+
+        assert!(matches!(rt.state, ConvState::Completed { .. }));
+        assert!(rt.terminal_llm_outcome_retry.is_none());
+        assert!(matches!(
+            storage.get_current_state("terminal-settlement-retry"),
+            Some(ConvState::Completed { .. })
+        ));
+        assert!(matches!(
+            parent_rx.try_recv(),
+            Ok(Event::SubAgentResult { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_discards_pending_terminal_settlement_retry() {
+        let (mut rt, _) = build_runtime_with_state_and_queue(
+            "terminal-settlement-cancel",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.context.is_sub_agent = true;
+        rt.terminal_llm_outcome_retry = Some(TerminalLlmOutcomeRetry {
+            generation: 0,
+            outcome: LlmOutcome::NetworkError {
+                message: "retry".to_string(),
+            },
+            retry_at: tokio::time::Instant::now(),
+        });
+
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .unwrap();
+
+        assert!(rt.terminal_llm_outcome_retry.is_none());
     }
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued

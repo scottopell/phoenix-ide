@@ -2268,7 +2268,11 @@ impl RuntimeManager {
             if excluded_conv_id == Some(conversation_id.as_str()) {
                 return Ok(false);
             }
-            let conversation = self.db().get_conversation(conversation_id).await?;
+            let conversation = match self.db().get_conversation(conversation_id).await {
+                Ok(conversation) => conversation,
+                Err(crate::db::DbError::ConversationNotFound(_)) => return Ok(false),
+                Err(error) => return Err(error),
+            };
             return Ok(
                 conversation_resource_scope(&conversation).as_ref() == Some(work_scope)
                     && conversation_attachment_retains_work_scope(&conversation),
@@ -2534,19 +2538,6 @@ impl RuntimeManager {
                 "Sub-agent terminal resource cleanup failed"
             );
         }
-    }
-
-    fn schedule_runtime_reconstruction(self: &Arc<Self>, conversation_id: String) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(error) = manager.get_or_create(&conversation_id).await {
-                tracing::warn!(
-                    conv_id = %conversation_id,
-                    %error,
-                    "Failed to reconstruct interrupted conversation runtime"
-                );
-            }
-        });
     }
 
     /// Handle a sub-agent spawn request
@@ -2900,9 +2891,6 @@ impl RuntimeManager {
             };
             if removed {
                 tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
-                if disposition == executor::RuntimeExitDisposition::Reconstruct {
-                    manager_for_cleanup.schedule_runtime_reconstruction(conv_id.clone());
-                }
             } else {
                 tracing::debug!(
                     conv_id = %conv_id,
@@ -3607,9 +3595,6 @@ impl RuntimeManager {
             };
             if removed {
                 tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
-                if disposition == executor::RuntimeExitDisposition::Reconstruct {
-                    manager_for_cleanup.schedule_runtime_reconstruction(conv_id.clone());
-                }
             } else {
                 tracing::debug!(
                     conv_id = %conv_id,
@@ -5324,6 +5309,17 @@ mod scope_liveness_tests {
             events.try_recv(),
             Ok(SseEvent::WorkScopeUpdate { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn deleted_unattached_owner_is_not_live() {
+        let manager = test_manager().await;
+        assert!(!manager
+            .scope_has_live_conversation(&ResourceScopeKey::Unattached(
+                "deleted-unattached-owner".to_string(),
+            ))
+            .await
+            .unwrap());
     }
 
     struct RecordingLlm {
