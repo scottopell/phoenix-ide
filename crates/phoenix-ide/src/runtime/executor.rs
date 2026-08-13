@@ -61,9 +61,8 @@ pub(crate) enum RuntimeExitDisposition {
     Interrupted,
 }
 
-struct TerminalLlmOutcomeRetry {
-    generation: u64,
-    outcome: LlmOutcome,
+struct TerminalTransitionRetry {
+    transition: crate::state_machine::transition::TransitionResult,
     retry_at: tokio::time::Instant,
 }
 
@@ -1807,7 +1806,7 @@ where
     /// never leaks into the pure `EffectOutcome` type.
     llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
     llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
-    terminal_llm_outcome_retry: Option<TerminalLlmOutcomeRetry>,
+    terminal_transition_retry: Option<TerminalTransitionRetry>,
     terminal_settlement_attempt: TerminalSettlementAttempt,
     /// Generation/epoch tag for the in-flight tool task, mirroring
     /// `llm_request_generation`. Incremented at each tool dispatch (the
@@ -2031,7 +2030,7 @@ where
             llm_request_generation: 0,
             llm_outcome_tx,
             llm_outcome_rx,
-            terminal_llm_outcome_retry: None,
+            terminal_transition_retry: None,
             terminal_settlement_attempt: TerminalSettlementAttempt::Initial,
             tool_request_generation: 0,
             tool_outcome_tx,
@@ -2339,7 +2338,7 @@ where
                 return RuntimeExitDisposition::Interrupted;
             }
             let terminal_retry_at = self
-                .terminal_llm_outcome_retry
+                .terminal_transition_retry
                 .as_ref()
                 .map(|retry| retry.retry_at);
             // Copy deadline before select to avoid borrow conflict
@@ -2347,7 +2346,6 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
-                biased;
                 Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
@@ -2407,7 +2405,7 @@ where
                         None => std::future::pending::<()>().await,
                     }
                 }, if terminal_retry_at.is_some() => {
-                    self.retry_terminal_llm_outcome().await;
+                    self.retry_terminal_transition().await;
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
@@ -2665,29 +2663,17 @@ where
 
         self.llm_task_handle = None;
         self.active_llm_attempt = None;
-        let retry_outcome = llm_outcome.clone();
         if let Err(error) = self.process_outcome(EffectOutcome::Llm(llm_outcome)).await {
-            if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase
-                && self.context.is_sub_agent
-            {
-                self.recovery_disposition = RuntimeRecoveryDisposition::Continue;
-                self.terminal_llm_outcome_retry = Some(TerminalLlmOutcomeRetry {
-                    generation,
-                    outcome: retry_outcome,
-                    retry_at: tokio::time::Instant::now() + TERMINAL_SETTLEMENT_RETRY_DELAY,
-                });
-                tracing::warn!(%error, "Terminal sub-agent settlement failed; retrying in place");
-            } else {
-                tracing::warn!(%error, "Outcome rejected by state machine");
-            }
+            tracing::warn!(%error, "Outcome rejected by state machine");
         }
     }
 
-    async fn retry_terminal_llm_outcome(&mut self) {
-        if let Some(retry) = self.terminal_llm_outcome_retry.take() {
+    async fn retry_terminal_transition(&mut self) {
+        if let Some(retry) = self.terminal_transition_retry.take() {
             self.terminal_settlement_attempt = TerminalSettlementAttempt::Retry;
-            self.process_generation_tagged_llm_outcome(retry.generation, retry.outcome)
-                .await;
+            if let Err(error) = self.apply_transition_result(retry.transition).await {
+                tracing::warn!(%error, "Terminal sub-agent settlement retry failed");
+            }
             self.terminal_settlement_attempt = TerminalSettlementAttempt::Initial;
         }
     }
@@ -2855,7 +2841,7 @@ where
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
-            self.terminal_llm_outcome_retry = None;
+            self.terminal_transition_retry = None;
         }
         if matches!(self.state, ConvState::Idle)
             && matches!(
@@ -3097,6 +3083,9 @@ where
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
+        let terminal_retry_transition = (self.context.is_sub_agent
+            && matches!(result.new_state.step_result(), StepResult::Terminal(_)))
+        .then(|| result.clone());
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -3289,8 +3278,14 @@ where
                             let _ = tx.send(self.state.clone());
                         }
                         if terminal_subagent_transition && !state_committed {
-                            self.recovery_disposition =
-                                RuntimeRecoveryDisposition::RecreateFromDatabase;
+                            self.recovery_disposition = RuntimeRecoveryDisposition::Continue;
+                            self.terminal_transition_retry = Some(TerminalTransitionRetry {
+                                transition: terminal_retry_transition.expect(
+                                    "terminal sub-agent transition captured before effects",
+                                ),
+                                retry_at: tokio::time::Instant::now()
+                                    + TERMINAL_SETTLEMENT_RETRY_DELAY,
+                            });
                         }
                         return Err(error);
                     }
@@ -12692,8 +12687,9 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_current_state("terminal-persist-failure"), None);
         assert_eq!(
             rt.recovery_disposition,
-            RuntimeRecoveryDisposition::RecreateFromDatabase
+            RuntimeRecoveryDisposition::Continue
         );
+        assert!(rt.terminal_transition_retry.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -12717,15 +12713,15 @@ mod steer_drain_detector_tests {
 
         rt.process_generation_tagged_llm_outcome(0, outcome).await;
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
-        assert!(rt.terminal_llm_outcome_retry.is_some());
+        assert!(rt.terminal_transition_retry.is_some());
         assert!(rt.parent_event_tx.is_some());
 
         storage.set_fail_state_update(false);
         tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
-        rt.retry_terminal_llm_outcome().await;
+        rt.retry_terminal_transition().await;
 
         assert!(matches!(rt.state, ConvState::Completed { .. }));
-        assert!(rt.terminal_llm_outcome_retry.is_none());
+        assert!(rt.terminal_transition_retry.is_none());
         assert!(matches!(
             storage.get_current_state("terminal-settlement-retry"),
             Some(ConvState::Completed { .. })
@@ -12744,11 +12740,14 @@ mod steer_drain_detector_tests {
             vec![],
         );
         rt.context.is_sub_agent = true;
-        rt.terminal_llm_outcome_retry = Some(TerminalLlmOutcomeRetry {
-            generation: 0,
-            outcome: LlmOutcome::NetworkError {
-                message: "retry".to_string(),
-            },
+        rt.terminal_transition_retry = Some(TerminalTransitionRetry {
+            transition: crate::state_machine::transition::TransitionResult::new(
+                ConvState::Failed {
+                    error: "retry".to_string(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
+            )
+            .with_effect(Effect::PersistState),
             retry_at: tokio::time::Instant::now(),
         });
 
@@ -12759,7 +12758,7 @@ mod steer_drain_detector_tests {
         .await
         .unwrap();
 
-        assert!(rt.terminal_llm_outcome_retry.is_none());
+        assert!(rt.terminal_transition_retry.is_none());
     }
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued

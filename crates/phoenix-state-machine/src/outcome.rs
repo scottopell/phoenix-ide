@@ -18,7 +18,7 @@ use std::time::Duration;
 // ============================================================================
 
 /// Outcome of an LLM request, sent through a typed oneshot channel.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum LlmOutcome {
     /// LLM responded successfully
     Response {
