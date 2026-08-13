@@ -2901,6 +2901,7 @@ dependencies = [
  "base64 0.22.1",
  "chromiumoxide",
  "futures",
+ "libc",
  "phoenix-core",
  "serde",
  "serde_json",

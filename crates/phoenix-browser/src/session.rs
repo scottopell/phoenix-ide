@@ -51,6 +51,22 @@ fn legacy_user_data_dir_for_key(scope_key: &str) -> PathBuf {
     user_data_dir_for_key(Path::new("/tmp"), scope_key)
 }
 
+fn legacy_profile_has_live_owner(profile: &Path) -> bool {
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(lock) else {
+        return false;
+    };
+    let Some(pid) = target
+        .to_string_lossy()
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return true;
+    };
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM }
+}
+
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.
 const USER_DATA_DIR_PREFIX: &str = "phoenix-chrome-";
 
@@ -416,7 +432,9 @@ impl BrowserSession {
         // (e.g. from a previous crash or test run that didn't clean up)
         let _ = std::fs::remove_dir_all(&user_data_dir);
         let legacy_user_data_dir = legacy_user_data_dir_for_key(session_key);
-        if legacy_user_data_dir != user_data_dir {
+        if legacy_user_data_dir != user_data_dir
+            && !legacy_profile_has_live_owner(&legacy_user_data_dir)
+        {
             let _ = std::fs::remove_dir_all(legacy_user_data_dir);
         }
 

@@ -951,11 +951,12 @@ enum PhoenixNavigationResponsePolicy {
         role: BrowserSurfaceRole,
         responseURL: URL?,
         canShowMIMEType: Bool,
-        expectedOrigin: PhoenixOrigin
+        expectedOrigin: PhoenixOrigin,
+        userActivated: Bool = false
     ) -> PhoenixNavigationResponseDecision {
         guard let responseURL else { return .cancel }
         guard expectedOrigin.exactlyMatches(responseURL) else {
-            if role == .authPopup, PhoenixWebViewPolicy.safeToExternalize(responseURL) {
+            if (role == .authPopup || userActivated), PhoenixWebViewPolicy.safeToExternalize(responseURL) {
                 return .externalize(responseURL)
             }
             return .cancel

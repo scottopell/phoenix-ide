@@ -123,6 +123,7 @@ struct WebViewWrapper: NSViewRepresentable {
         private var latestDeploymentGeneration: String?
         private var retiredDeploymentGenerations = Set<String>()
         private var latestDeploymentSequence = 0
+        private var userActivatedMainNavigation = false
 
         init(
             origin: PhoenixOrigin,
@@ -150,6 +151,9 @@ struct WebViewWrapper: NSViewRepresentable {
             guard let url = navigationAction.request.url else {
                 decisionHandler(.cancel)
                 return
+            }
+            if navigationAction.targetFrame?.isMainFrame == true {
+                userActivatedMainNavigation = navigationAction.navigationType == .linkActivated
             }
             if role == .authPopup {
                 switch PhoenixWebViewPolicy.popupNavigationDecision(url, expectedOrigin: origin) {
@@ -206,7 +210,8 @@ struct WebViewWrapper: NSViewRepresentable {
                 role: role,
                 responseURL: navigationResponse.response.url,
                 canShowMIMEType: navigationResponse.canShowMIMEType,
-                expectedOrigin: origin
+                expectedOrigin: origin,
+                userActivated: userActivatedMainNavigation
             ) {
             case .allow:
                 decisionHandler(.allow)
