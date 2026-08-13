@@ -102,6 +102,8 @@ final class ConfigurationTests: XCTestCase {
             "https://example.com/a/path",
             "https://example.com?query=1",
             "https://example.com/#fragment",
+            "https://example.com:0",
+            "https://example.com:65536",
         ] {
             XCTAssertThrowsError(try PhoenixOrigin(invalid), invalid)
         }

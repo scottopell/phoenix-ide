@@ -1083,6 +1083,7 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
+              components.port.map({ (1...65_535).contains($0) }) ?? true,
               components.path.isEmpty || components.path == "/" else {
             throw ConfigurationError.invalidOrigin
         }

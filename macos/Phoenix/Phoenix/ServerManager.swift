@@ -351,8 +351,9 @@ actor SidecarLogRecorder {
                     ? "[Phoenix dropped 1 sidecar log chunk before recording]"
                     : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
                 let droppedData = Data((droppedLine + "\n").utf8)
-                try? appendToLog(droppedData)
+                let writeFailure = appendToLogFailure(droppedData)
                 buffer.appendDiagnosticLine(droppedLine)
+                if let writeFailure { buffer.appendDiagnosticLine(writeFailure) }
                 await snapshotSink(buffer.completeLines)
                 snapshots.append(Snapshot(logAppend: droppedData, recentLines: buffer.completeLines))
                 droppedChunkCount = 0
@@ -360,7 +361,9 @@ actor SidecarLogRecorder {
             let emitted = buffer.append(chunk, redact: Self.defaultRedact)
             guard !emitted.isEmpty else { continue }
             let append = Data((emitted.joined(separator: "\n") + "\n").utf8)
-            try? appendToLog(append)
+            if let writeFailure = appendToLogFailure(append) {
+                buffer.appendDiagnosticLine(writeFailure)
+            }
             let lines = buffer.completeLines
             await snapshotSink(lines)
             snapshots.append(Snapshot(logAppend: append, recentLines: lines))
@@ -376,8 +379,9 @@ actor SidecarLogRecorder {
                 ? "[Phoenix dropped 1 sidecar log chunk before recording]"
                 : "[Phoenix dropped \(droppedChunkCount) sidecar log chunks before recording]"
             let droppedData = Data((droppedLine + "\n").utf8)
-            try? appendToLog(droppedData)
+            let writeFailure = appendToLogFailure(droppedData)
             buffer.appendDiagnosticLine(droppedLine)
+            if let writeFailure { buffer.appendDiagnosticLine(writeFailure) }
             droppedChunkCount = 0
             await snapshotSink(buffer.completeLines)
             return Snapshot(logAppend: droppedData, recentLines: buffer.completeLines)
@@ -388,6 +392,15 @@ actor SidecarLogRecorder {
         let lines = buffer.completeLines
         await snapshotSink(lines)
         return Snapshot(logAppend: append, recentLines: lines)
+    }
+
+    private func appendToLogFailure(_ data: Data) -> String? {
+        do {
+            try appendToLog(data)
+            return nil
+        } catch {
+            return "[Phoenix could not write launcher log: \(error.localizedDescription)]"
+        }
     }
 
     private func appendToLog(_ data: Data) throws {
@@ -779,8 +792,6 @@ final class ServerManager: ObservableObject {
         } else {
             nextState = .ready(version, deployment)
         }
-        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
-        state = .verifyingDeployment(version)
         guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         state = nextState
     }
