@@ -356,8 +356,10 @@ rule MixedReleaseStateIsObservableAfterPartialCommit {
 }
 
 rule RetryFromInterruptedOrMixedStateMustRestageExactSet {
-    when: ReplacementRetryStarted(publication)
+    when: ReplacementRetryStarted(gate, publication)
     requires: publication.state = interrupted or publication.state = mixed
+    requires: gate.state = exact_tag_match
+    requires: gate.identity = publication.identity
     ensures: publication.state = replacing
 }
 

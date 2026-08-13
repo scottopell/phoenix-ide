@@ -25,7 +25,7 @@ import urllib.parse
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_DIRECT_DIAGNOSTIC_BYTES = 64 * 1024
 TRANSACTION_RE = re.compile(r"[0-9a-f]{32}")

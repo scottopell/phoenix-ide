@@ -13,6 +13,7 @@ import {
   YAxis,
 } from 'recharts';
 import { api } from '../api';
+import { compactGitIdentity } from '../utils/gitIdentity';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
@@ -180,7 +181,7 @@ function DeploymentSummary({ info }: { info: DeploymentInfo }) {
           <span className="about-deployment-summary__eyebrow">Running Phoenix</span>
           <h3 id="deployment-summary-title">Version {info.build.version}</h3>
         </div>
-        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{info.build.git_sha.slice(0, 12)}</code>
+        <code aria-label={`Running git commit ${info.build.git_sha}`} title={info.build.git_sha}>{compactGitIdentity(info.build.git_sha)}</code>
       </div>
       <div className="about-deployment-summary__facts">
         <div className="about-deployment-summary__fact">

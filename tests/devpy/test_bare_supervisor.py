@@ -46,7 +46,7 @@ class BareSupervisorUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
             owner.stop_child = mock.Mock()
-            response = owner.dispatch({"protocol_version": 1, "action": "stop"})
+            response = owner.dispatch({"protocol_version": supervisor.PROTOCOL_VERSION, "action": "stop"})
             self.assertTrue(response["ok"])
             self.assertTrue(owner.running)
             owner.stop_child.assert_called_once()
@@ -158,7 +158,7 @@ class BareTransactionTests(unittest.TestCase):
         rollback_binary = self.artifact("rollback-binary", "old binary") if previous else None
         rollback_environment = self.artifact("rollback.env", "MODE=old\n") if previous else None
         value = {
-            "manifest_version": 1,
+            "manifest_version": supervisor.PROTOCOL_VERSION,
             "transaction_id": self.transaction_id,
             "source_kind": source_kind,
             "expected": {"version": "2.0.0", "git_sha": expected_sha or "b" * 40},
@@ -594,7 +594,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
             try:
                 supervisor.request(
                     socket_path,
-                    {"protocol_version": 1, "action": "status"},
+                    {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "status"},
                 )
                 break
             except (FileNotFoundError, ConnectionRefusedError):
@@ -607,7 +607,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
             try:
                 supervisor.request(
                     self.root / "run/supervisor.sock",
-                    {"protocol_version": 1, "action": "shutdown-supervisor"},
+                    {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "shutdown-supervisor"},
                 )
                 self.process.wait(timeout=5)
             except Exception:
@@ -618,7 +618,7 @@ class BareSupervisorLinuxIntegrationTests(unittest.TestCase):
     def test_supervisor_directly_owns_exact_fixture_and_stop_leaves_owner_alive(self):
         supervisor.request(
             self.root / "run/supervisor.sock",
-            {"protocol_version": 1, "action": "shutdown-supervisor"},
+            {"protocol_version": supervisor.PROTOCOL_VERSION, "action": "shutdown-supervisor"},
         )
         self.process.wait(timeout=5)
         ready_port = 49321

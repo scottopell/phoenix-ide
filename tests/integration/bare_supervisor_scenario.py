@@ -65,7 +65,7 @@ def transaction(
         rollback_binary.chmod(0o600)
         rollback_environment.chmod(0o600)
     manifest = {
-        "manifest_version": 1,
+        "manifest_version": module.PROTOCOL_VERSION,
         "transaction_id": transaction_id,
         "expected": {"version": "2.0.0", "git_sha": "b" * 40},
         "previous": {"version": previous_version, "git_sha": previous_git_sha} if previous else None,
@@ -119,7 +119,7 @@ def main():
     if not layout.socket.exists():
         raise RuntimeError("detached supervisor did not survive launcher exit")
     try:
-        initial = module.request(layout.socket, {"protocol_version": 1, "action": "status"})
+        initial = module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "status"})
         supervisor_pid = initial["supervisor_pid"]
         if parent_pid(supervisor_pid) == os.getpid():
             raise RuntimeError("supervisor remained attached to scenario initiator")
@@ -131,7 +131,7 @@ def main():
         })
         if success["state"] != "committed":
             raise RuntimeError("bare success transaction did not commit")
-        committed = module.request(layout.socket, {"protocol_version": 1, "action": "status"})["child"]
+        committed = module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "status"})["child"]
         if committed["runtime"]["git_sha"] != "b" * 40:
             raise RuntimeError("bare success transaction has wrong child identity")
         if parent_pid(committed["pid"]) != supervisor_pid:
@@ -149,14 +149,14 @@ def main():
         })
         if rollback["state"] != "activation_failed_rolled_back":
             raise RuntimeError("bare wrong-identity transaction did not roll back")
-        restored = module.request(layout.socket, {"protocol_version": 1, "action": "status"})["child"]
+        restored = module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "status"})["child"]
         if restored["runtime"] != {"version": "2.0.0", "git_sha": "b" * 40}:
             raise RuntimeError("bare rollback did not restore exact committed identity")
         if parent_pid(restored["pid"]) != supervisor_pid:
             raise RuntimeError("rollback runtime is not directly owned by detached supervisor")
 
-        module.request(layout.socket, {"protocol_version": 1, "action": "stop"})
-        stopped = module.request(layout.socket, {"protocol_version": 1, "action": "status"})
+        module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "stop"})
+        stopped = module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "status"})
         if stopped["child"] is not None or stopped["supervisor_pid"] != supervisor_pid:
             raise RuntimeError("child-only stop did not preserve detached supervisor")
         print(json.dumps({
@@ -169,7 +169,7 @@ def main():
         }))
     finally:
         if layout.socket.exists():
-            module.request(layout.socket, {"protocol_version": 1, "action": "shutdown-supervisor"})
+            module.request(layout.socket, {"protocol_version": module.PROTOCOL_VERSION, "action": "shutdown-supervisor"})
     return 0
 
 

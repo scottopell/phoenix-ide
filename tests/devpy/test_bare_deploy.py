@@ -152,10 +152,10 @@ class BareDeployCommandTests(unittest.TestCase):
             with mock.patch.object(
                 self.dev.subprocess,
                 "run",
-                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 1}), ""),
+                return_value=subprocess.CompletedProcess([], 0, json.dumps({"protocol_version": 2}), ""),
             ) as run, mock.patch.object(self.dev.subprocess, "Popen") as started:
                 with self.assertRaisesRegex(SystemExit, "production was left running"):
-                    self.dev._start_bare_supervisor(layout, "1", selected)
+                    self.dev._start_bare_supervisor(layout, "2", selected)
 
             self.assertEqual("old supervisor", installed.read_text())
             self.assertEqual(1, run.call_count)
@@ -247,7 +247,7 @@ class BareDeployCommandTests(unittest.TestCase):
                 binary=candidate_binary,
                 source_kind=self.dev.ProdSourceKind.PUBLISHED_RELEASE,
                 source_commit="b" * 40,
-                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 12),
+                identity=self.dev.RuntimeIdentity("2.0.0", "b" * 40),
                 release_tag="v2.0.0",
                 release_commit="b" * 40,
             )
@@ -256,11 +256,11 @@ class BareDeployCommandTests(unittest.TestCase):
             def run(command, *args, **kwargs):
                 commands.append(command)
                 if "--protocol-version" in command:
-                    return subprocess.CompletedProcess(command, 0, "1\n", "")
+                    return subprocess.CompletedProcess(command, 0, "2\n", "")
                 if "activate" in command:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"ok": True, "state": "committed"}), "")
                 if "status" in command:
-                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 1, "child": None}), "")
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"protocol_version": 2, "child": None}), "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def materialize(_commit, _source, destination, _kind):

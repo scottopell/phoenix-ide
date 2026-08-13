@@ -8272,7 +8272,7 @@ def prod_daemon_deploy(
             [sys.executable, str(supervisor_source), "--protocol-version"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        if protocol != "1":
+        if protocol != "2":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
         _start_bare_supervisor(
