@@ -1173,8 +1173,13 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
-const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \n".len() as u64;
+const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \r\n".len() as u64;
 const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + GIT_POINTER_FORMAT_OVERHEAD;
+
+enum ExpectedParentScope<'a> {
+    NotChecked,
+    Snapshot(Option<&'a WorkScopeId>),
+}
 
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
@@ -1219,7 +1224,8 @@ impl Database {
             }
             let pointer = std::str::from_utf8(&bytes).ok()?;
             let git_dir = pointer
-                .strip_suffix('\n')
+                .strip_suffix("\r\n")
+                .or_else(|| pointer.strip_suffix('\n'))
                 .unwrap_or(pointer)
                 .strip_prefix("gitdir: ")?;
             if git_dir.is_empty() || git_dir.contains('\n') || git_dir.contains('\r') {
@@ -1257,9 +1263,17 @@ impl Database {
     ) -> DbResult<()> {
         let (kind, cwd, worktree_path, branch_name, base_branch) =
             Self::environment_columns(context);
-        let worktree_fingerprint = worktree_path
+        let observed_fingerprint = worktree_path
             .as_deref()
             .and_then(Self::observe_worktree_fingerprint);
+        let prewrite_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        let worktree_fingerprint = if observed_fingerprint == prewrite_fingerprint {
+            observed_fingerprint
+        } else {
+            None
+        };
         let worktree_id = worktree_fingerprint
             .as_ref()
             .map(|_| uuid::Uuid::new_v4().to_string());
@@ -1282,14 +1296,28 @@ impl Database {
         .bind(authority_kind.as_str())
         .bind(kind)
         .bind(cwd)
-        .bind(worktree_path)
+        .bind(&worktree_path)
         .bind(branch_name)
         .bind(base_branch)
         .bind(now)
         .bind(worktree_id)
-        .bind(worktree_fingerprint)
+        .bind(&worktree_fingerprint)
         .execute(&mut **tx)
         .await?;
+        let commit_fingerprint = worktree_path
+            .as_deref()
+            .and_then(Self::observe_worktree_fingerprint);
+        if worktree_fingerprint.is_some() && worktree_fingerprint != commit_fingerprint {
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL, updated_at = ?2
+                 WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
         Ok(())
     }
 
@@ -3307,7 +3335,7 @@ impl Database {
             seed_parent_id,
             seed_label,
             llm_language,
-            None,
+            ExpectedParentScope::NotChecked,
         )
         .await
     }
@@ -3326,7 +3354,7 @@ impl Database {
         model: &str,
         conv_mode: &ConvMode,
         llm_language: phoenix_core::llm_language::LlmLanguage,
-        parent_scope: &WorkScopeId,
+        parent_scope: Option<&WorkScopeId>,
     ) -> DbResult<Conversation> {
         self.create_conversation_with_project_inner(
             id,
@@ -3341,7 +3369,7 @@ impl Database {
             None,
             None,
             llm_language,
-            Some(parent_scope),
+            ExpectedParentScope::Snapshot(parent_scope),
         )
         .await
     }
@@ -3361,7 +3389,7 @@ impl Database {
         seed_parent_id: Option<&str>,
         seed_label: Option<&str>,
         llm_language: phoenix_core::llm_language::LlmLanguage,
-        expected_parent_scope: Option<&WorkScopeId>,
+        expected_parent_scope: ExpectedParentScope<'_>,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -3410,21 +3438,23 @@ impl Database {
                 .clone()
                 .unwrap_or_else(|| generated_scope.as_ref().expect("generated scope").0.clone());
             let mut tx = self.pool.begin().await?;
-            if let (Some(parent_id), Some(expected_scope)) = (parent_id, expected_parent_scope) {
+            if let (Some(parent_id), ExpectedParentScope::Snapshot(expected_scope)) =
+                (parent_id, &expected_parent_scope)
+            {
                 let parent_matches: bool = sqlx::query_scalar(
                     "SELECT EXISTS(
                          SELECT 1 FROM conversations
-                         WHERE id = ?1 AND work_scope_id = ?2
+                         WHERE id = ?1 AND work_scope_id IS ?2
                      )",
                 )
                 .bind(parent_id)
-                .bind(expected_scope.as_str())
+                .bind(expected_scope.map(WorkScopeId::as_str))
                 .fetch_one(&mut *tx)
                 .await?;
                 if !parent_matches {
                     tx.rollback().await?;
                     return Err(DbError::CloseFoundationConflict(format!(
-                        "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope}"
+                        "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
                     )));
                 }
             }
@@ -10862,6 +10892,8 @@ mod tests {
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
         std::fs::write(&marker, "gitdir: \n").unwrap();
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
+        std::fs::write(&marker, "gitdir: /tmp/windows-linked-worktree\r\n").unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         std::fs::rename(&root, root.with_extension("moved")).unwrap();
         let moved = root.with_extension("moved");

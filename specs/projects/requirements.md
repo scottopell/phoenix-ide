@@ -1,61 +1,61 @@
 # Projects — Deprecated Requirements
 
-The Project-specific requirements below are canonical standing deprecations. Surviving repository, conversation, lifecycle, UI, and tool behavior is specified by its owning feature requirements.
+The Project-specific identifiers below are canonical standing deprecations. Surviving repository, conversation, lifecycle, UI, and tool behavior is specified by its owning feature requirements.
 
 ## Deprecated Project-specific requirements
 
-### REQ-PROJ-009: DEPRECATED
+### REQ-PROJ-009: Project-owned squash-merge contract is unavailable
 
-**DEPRECATED.** Historical lifecycle authority moved long ago; the old squash-merge contract remains retired.
+THE SYSTEM SHALL NOT expose Project as the authority for squash-merge completion
 
-### REQ-PROJ-010: DEPRECATED
+### REQ-PROJ-010: Project-owned abandon command is unavailable
 
-**DEPRECATED.** The Project-owned abandon command is retired. ProductConversation Close and History now own the surviving user need in `specs/work-lifecycle/` and `specs/bedrock/`.
+THE SYSTEM SHALL NOT expose a Project-owned abandon command
 
-### REQ-PROJ-011: DEPRECATED
+### REQ-PROJ-011: Project-owned PR health is unavailable
 
-**DEPRECATED.** Project-owned PR health is retired. WorkScope-associated PR observation and advisory guidance now own the surviving user need in `specs/pr-association/` and `specs/work-actions-bar/`.
+THE SYSTEM SHALL NOT expose Project as the authority for PR health
 
-### REQ-PROJ-014: DEPRECATED
+### REQ-PROJ-014: Project grouping surfaces are unavailable
 
-**DEPRECATED.** Project switchers, grouping, tabs, and active counts are retired product behavior. Conversation capability/lifecycle visibility and repository filtering remain owned by `specs/conversation-ui/`; task counts remain owned by task surfaces. No repository-level grouping/count replacement is defined.
+THE SYSTEM SHALL NOT expose Project switchers, grouping, tabs, or active counts
 
-### REQ-PROJ-016: DEPRECATED
+### REQ-PROJ-016: Standalone Project naming is unavailable
 
-**DEPRECATED.** Historical standalone naming.
+THE SYSTEM SHALL NOT expose standalone Project naming as product authority
 
-### REQ-PROJ-023: DEPRECATED
+### REQ-PROJ-023: Reserved compatibility identifier
 
-**DEPRECATED.** Reserved compatibility slot.
+THE SYSTEM SHALL NOT assign behavior to REQ-PROJ-023
 
-### REQ-PROJ-026: DEPRECATED
+### REQ-PROJ-026: Project-owned branch lifecycle verbs are unavailable
 
-**DEPRECATED.** Branch-mode lifecycle verbs are retired. ProductConversation Close/History and WorkScope retirement own the surviving lifecycle need in `specs/bedrock/` and `specs/work-lifecycle/`; branches remain observed repository state.
+THE SYSTEM SHALL NOT expose Project-owned branch lifecycle verbs
 
-### REQ-PROJ-027: DEPRECATED
+### REQ-PROJ-027: Project-owned managed-mode completion is unavailable
 
-**DEPRECATED.** Managed-mode completion is retired. ProductConversation Close/History and WorkScope retirement own the surviving lifecycle need in `specs/bedrock/` and `specs/work-lifecycle/`.
+THE SYSTEM SHALL NOT expose Project-owned managed-mode completion
 
-### REQ-PROJ-030: DEPRECATED
+### REQ-PROJ-030: Project-scoped PR freshness is unavailable
 
-**DEPRECATED.** Historical Project-scoped PR freshness wording. Current normative authority lives in `specs/pr-association/`.
+THE SYSTEM SHALL NOT expose Project-scoped PR freshness authority
 
-### REQ-PROJ-031: DEPRECATED
+### REQ-PROJ-031: Project-scoped PR context is unavailable
 
-**DEPRECATED.** Historical Project-scoped PR context wording. Current normative authority lives in `specs/pr-association/`.
+THE SYSTEM SHALL NOT expose Project-scoped PR context authority
 
-### REQ-PROJ-032: DEPRECATED
+### REQ-PROJ-032: Project-scoped PR refresh is unavailable
 
-**DEPRECATED.** Historical Project-scoped PR refresh wording. Current normative authority lives in `specs/pr-association/`.
+THE SYSTEM SHALL NOT expose Project-scoped PR refresh authority
 
-### REQ-PROJ-034: DEPRECATED
+### REQ-PROJ-034: Reserved compatibility identifier
 
-**DEPRECATED.** Reserved compatibility slot.
+THE SYSTEM SHALL NOT assign behavior to REQ-PROJ-034
 
-### REQ-PROJ-035: DEPRECATED
+### REQ-PROJ-035: Reserved compatibility identifier
 
-**DEPRECATED.** Reserved compatibility slot.
+THE SYSTEM SHALL NOT assign behavior to REQ-PROJ-035
 
-### REQ-PROJ-037: DEPRECATED
+### REQ-PROJ-037: Reserved compatibility identifier
 
-**DEPRECATED.** Reserved compatibility slot.
+THE SYSTEM SHALL NOT assign behavior to REQ-PROJ-037

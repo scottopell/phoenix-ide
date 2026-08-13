@@ -101,7 +101,7 @@ fn deposit_turn_trigger(handle: &ConversationHandle) {
 pub struct SubAgentSpawnRequest {
     pub spec: SubAgentSpec,
     pub parent_conversation_id: String,
-    pub parent_scope: WorkScopeId,
+    pub parent_scope: Option<WorkScopeId>,
     pub parent_event_tx: mpsc::Sender<Event>,
     /// The parent's `conversation.turn` span context at spawn time
     /// (invalid when tracing export is disabled). Seeded into the sub-agent's
@@ -2535,13 +2535,13 @@ impl RuntimeManager {
                 return;
             }
         };
-        if parent_conv.attached_work_scope_id.as_ref() != Some(&parent_scope) {
+        if parent_conv.attached_work_scope_id != parent_scope {
             let _ = parent_event_tx
                 .send(Event::SubAgentResult {
                     agent_id: spec.agent_id,
                     outcome: SubAgentOutcome::Failure {
                         error: format!(
-                            "Parent WorkScope changed before sub-agent persistence: expected {parent_scope}"
+                            "Parent WorkScope changed before sub-agent persistence: expected {parent_scope:?}"
                         ),
                         error_kind: crate::db::ErrorKind::SubAgentError,
                     },
@@ -2608,7 +2608,7 @@ impl RuntimeManager {
                 &spec.model_id,
                 &sub_conv_mode,
                 parent_conv.llm_language,
-                &parent_scope,
+                parent_scope.as_ref(),
             )
             .await
         {
