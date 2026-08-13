@@ -52,7 +52,7 @@ This task is the frozen implementation authority for R1 after its prerequisites 
 | After R1 | Project | Hidden GitRepository rows and nullable WorkScope attachments populated only by migration/backfill; observation rows exist only where retained source evidence is complete and exact; all are inspected only by read-only validation |
 | After later R2 | `WorkScope.repository → GitRepository` | Project becomes read-only compatibility/retained legacy data until downstream deletion owner removes it |
 
-R1 does **not** change authority. The only production path permitted to create the R1 rows is the deterministic schema migration/backfill running during database upgrade. No steady-state application writer is enabled.
+R1 does **not** change authority. R1 rows may be mutated only by two non-steady-state deployment operations using the same deterministic source-to-shadow reconciliation: the initial schema migration/backfill during database upgrade, and the post-quiescence transactional catch-up that R2 invokes unconditionally before final validation. No request path, normal runtime work, concurrent legacy-writer interval, trigger, observer, or steady-state application writer may mutate them.
 
 ## Merged-main invariant
 
@@ -213,7 +213,7 @@ The frozen brief was read specifically to falsify its migration boundary:
 
 | Attack | Finding | Closure in brief |
 |---|---|---|
-| Single-authority violation | A migration-populated duplicate or a “current observation” could become a second writable/fallback authority. | Restricted row creation to upgrade migration; prohibited steady-state observation capture, writers, triggers, fallback, runtime repair, and all live reads; Project remains sole authority. |
+| Single-authority violation | A migration-populated duplicate, deployment catch-up, or “current observation” could become a second writable/fallback authority. | Restricts mutation to initial upgrade and one post-quiescence transactional catch-up using the same deterministic reconciliation; prohibits request-path/runtime observation capture, concurrent writers, triggers, fallback, repair from shadow, and all live reads; Project remains sole authority. |
 | Projects 2.0 leakage | Hidden identity could accrete title/grouping/lifecycle/branch/PR ownership, become a collection API, or indirectly feed path-bearing compatibility payloads. | Explicitly forbids every new product surface/identity exposure and any R1 influence on existing Project/path/grouping/suggestion/usage/analytics/provisioning/conversation payloads; ProductConversation context has only the WorkScope attachment path after R2. |
 | False API lock | Freezing a public validator endpoint or table/module spelling would constrain R2 without user value. | Locks only normative observation semantics and validation categories/read-only contract; leaves CLI/internal entry point, Rust modules, SQL names, and client API unstated; forbids a public Repository API. |
 | Migration ambiguity | Linked worktree/separate-clone topology, multiple Project rows, duplicate source rows, observation precedence/timestamps, missing branches, and conflicting scope assignments permitted heuristic choices. | Defines Project ID as the complete R1 partition even for linked worktrees/separate clones; requires one complete locator source with path/status/time; selects only a unique complete highest-generation default observation; performs no live probes or heuristic tie-break; leaves zero-source state absent; and makes ambiguous/incomplete candidates transaction-fatal. |
