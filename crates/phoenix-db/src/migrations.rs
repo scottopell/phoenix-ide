@@ -2109,6 +2109,23 @@ CREATE TABLE close_retirement_resource_history (
         resource_kind, identity_kind, identity_value
     ) ON DELETE CASCADE
 );
+CREATE TRIGGER close_retirement_resource_history_reject_invalid_timestamp
+BEFORE INSERT ON close_retirement_resource_history
+FOR EACH ROW
+WHEN (
+      NEW.recorded_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.recorded_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.recorded_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.recorded_at, 21, LENGTH(NEW.recorded_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.recorded_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.recorded_at, 21, LENGTH(NEW.recorded_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR date(SUBSTR(NEW.recorded_at, 1, 10), '+0 days') <> SUBSTR(NEW.recorded_at, 1, 10)
+  OR CAST(SUBSTR(NEW.recorded_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.recorded_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.recorded_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.recorded_at) IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close retirement resource history timestamp must be valid RFC 3339');
+END;
 CREATE UNIQUE INDEX close_retirement_resource_history_idempotent_replay
 ON close_retirement_resource_history (
     attempt_id, scope, inspection_generation, inspection_fingerprint,

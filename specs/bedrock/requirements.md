@@ -107,7 +107,7 @@ WHEN the user rejects or discards the task
 THE SYSTEM SHALL return a rejection result to the agent
 AND SHALL NOT perform any Git side effects
 
-**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The current product offers two deliberate placements — continue in the same conversation or start fresh in a new one — while keeping branch ownership out of the approval contract.
+**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The system offers two deliberate placements — continue in the same conversation or start in a new conversation — while keeping branch ownership out of the approval contract.
 
 ---
 

@@ -1227,9 +1227,10 @@ impl Database {
         }
         let created_nanos = metadata
             .created()
-            .ok()
-            .and_then(|instant| instant.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_nanos());
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
         Some(format!(
             "git_admin_incarnation_v1:{}:{}:{created_nanos}:{encoded}",
             metadata.dev(),

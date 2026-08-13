@@ -346,6 +346,17 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       repository, or 1 when none exists. The caller cannot provide or override
 --       this generation; the accepted update supersedes the older current row.
 --
+--   restart_repair_observation_is_not_stale(
+--       product_conversation: bedrock/ProductConversation,
+--       scope: WorkScopeRef,
+--       observed_at: Timestamp
+--   ) -> Boolean
+--       True iff no current RestartRepairEvidence exists for that exact
+--       ProductConversation and WorkScopeRef, or observed_at is not earlier than
+--       its observed_at. A delayed older observation is rejected before generation
+--       advances or current state changes. An equal timestamp is admissible and is
+--       resolved by the exact evidence identity and generation constraints.
+--
 --   next_restart_repair_generation(
 --       product_conversation: bedrock/ProductConversation,
 --       scope: WorkScopeRef

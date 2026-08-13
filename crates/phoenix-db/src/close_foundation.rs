@@ -1118,30 +1118,41 @@ impl Database {
         )
         .map_err(|error| DbError::Serialization(error.to_string()))?;
 
-        let phase: String =
-            sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
-                .bind(request.attempt_id.as_str())
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(|| {
-                    DbError::CloseFoundationNotFound(request.attempt_id.as_str().to_string())
-                })?;
-        if phase != ClosePhase::AwaitingRetirementInspection.as_str() {
-            let obligation = self
-                .get_close_obligation(request.attempt_id.as_str())
-                .await?;
-            let mut persisted_inspections = self
-                .list_close_retirement_inspections(request.attempt_id.as_str())
-                .await?
-                .into_iter()
-                .map(|inspection| {
-                    (
-                        inspection.target.scope.as_str().to_string(),
-                        inspection.snapshot.generation().to_string(),
-                        inspection.snapshot.fingerprint().to_string(),
-                    )
-                })
-                .collect::<Vec<_>>();
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = sqlx::query(
+            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+                    inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
+             FROM close_obligations WHERE attempt_id = ?1",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(parse_close_obligation_row)
+        .transpose()?
+        .ok_or_else(|| DbError::CloseFoundationNotFound(request.attempt_id.as_str().to_string()))?;
+        if obligation.phase() != ClosePhase::AwaitingRetirementInspection {
+            let mut persisted_inspections = sqlx::query(
+                "SELECT attempt_id, scope, generation, fingerprint, inspected_at
+                 FROM close_retirement_inspections
+                 WHERE attempt_id = ?1
+                 ORDER BY scope, inspected_at",
+            )
+            .bind(request.attempt_id.as_str())
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(parse_close_inspection_row)
+            .collect::<DbResult<Vec<_>>>()?
+            .into_iter()
+            .map(|inspection| {
+                (
+                    inspection.target.scope.as_str().to_string(),
+                    inspection.snapshot.generation().to_string(),
+                    inspection.snapshot.fingerprint().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
             persisted_inspections.sort();
             let mut requested_inspections = request
                 .scopes
@@ -1155,20 +1166,35 @@ impl Database {
                 })
                 .collect::<Vec<_>>();
             requested_inspections.sort();
-            let mut persisted_losses = self
-                .list_close_retirement_losses(request.attempt_id.as_str())
-                .await?
-                .into_iter()
-                .map(|loss| {
-                    (
-                        loss.scope.as_str().to_string(),
-                        loss.snapshot.generation().to_string(),
-                        loss.item.category().as_str().to_string(),
-                        loss.item.identity().identity_kind().to_string(),
-                        loss.item.identity().value(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut persisted_losses = sqlx::query(
+                "SELECT loss.attempt_id, loss.scope, loss.generation, inspection.fingerprint,
+                        loss.category, loss.identity_kind, loss.identity_codec, loss.identity_value
+                 FROM close_retirement_losses loss
+                 JOIN close_retirement_inspections inspection
+                   ON inspection.attempt_id = loss.attempt_id
+                  AND inspection.scope = loss.scope
+                  AND inspection.generation = loss.generation
+                 WHERE loss.attempt_id = ?1
+                 ORDER BY loss.scope, loss.generation, loss.category, loss.identity_kind,
+                          loss.identity_value",
+            )
+            .bind(request.attempt_id.as_str())
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(parse_close_inspection_loss_row)
+            .collect::<DbResult<Vec<_>>>()?
+            .into_iter()
+            .map(|loss| {
+                (
+                    loss.scope.as_str().to_string(),
+                    loss.snapshot.generation().to_string(),
+                    loss.item.category().as_str().to_string(),
+                    loss.item.identity().identity_kind().to_string(),
+                    loss.item.identity().value(),
+                )
+            })
+            .collect::<Vec<_>>();
             persisted_losses.sort();
             let mut requested_losses = request
                 .scopes
@@ -1190,6 +1216,7 @@ impl Database {
                 && persisted_inspections == requested_inspections
                 && persisted_losses == requested_losses
             {
+                tx.commit().await?;
                 return Ok(());
             }
             return Err(close_precondition(format!(
@@ -1198,7 +1225,6 @@ impl Database {
             )));
         }
 
-        let mut tx = self.pool.begin().await?;
         self.ensure_inspection_replacement_allowed(&mut tx, &request)
             .await?;
         self.clear_retirement_inspection_rows(&mut tx, request.attempt_id.as_str())
@@ -3639,6 +3665,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_identical_inspection_replacements_are_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation("root", "attempt-concurrent-inspection")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-concurrent-inspection",
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        let request = ReplaceCloseInspectionRequest {
+            attempt_id: CloseAttemptId::parse("attempt-concurrent-inspection").unwrap(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope,
+                snapshot: CloseRetirementSnapshot::parse("g1", "fp1").unwrap(),
+                losses: Vec::new(),
+            }],
+        };
+
+        let (first, second) = tokio::join!(
+            db.replace_close_inspection(request.clone()),
+            db.replace_close_inspection(request)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            db.list_close_retirement_inspections("attempt-concurrent-inspection")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn list_close_retirement_losses_rejects_invalid_category_identity_pairing() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -5123,6 +5187,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replay_history_count, 2);
+        let invalid_history_timestamp = sqlx::query(
+            "INSERT INTO close_retirement_resource_history (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 proof_kind, absence_basis, residual_reason, detail, recorded_at
+             )
+             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
+                    resource_kind, identity_kind, identity_codec, identity_value,
+                    proof_kind, absence_basis, residual_reason, 'invalid timestamp replay',
+                    'not-rfc3339'
+             FROM close_retirement_resource_history
+             WHERE attempt_id = 'attempt-1'
+             LIMIT 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(invalid_history_timestamp
+            .to_string()
+            .contains("must be valid RFC 3339"));
 
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
