@@ -916,7 +916,9 @@ export function StateBar({
   const modelSelectionChanged = stagedModel !== currentModel
     || stagedEffort !== persistedEffort
     || stagedServiceTier !== currentServiceTier;
-  const currentModelLockReason = modelLockReason(convState);
+  const currentModelLockReason = onUpgradeModel && availableModels && availableModels.length > 0
+    ? modelLockReason(convState)
+    : null;
 
   const openModelDialog = () => {
     if (!canPickModel) return;
