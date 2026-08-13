@@ -104,6 +104,23 @@ The validator is a **typed sink** and read-only diagnostic, not a product reader
 
 The validator's CLI or internal entry-point spelling is implementation detail; its semantic output categories and non-mutating behavior are acceptance contracts. Tests must prove read-only behavior, including mismatch cases.
 
+## R1 readiness evidence handoff
+
+R1 produces one canonical **R1 readiness evidence bundle** for each candidate R1 implementation and target database. The bundle is one semantic aggregate: its members cannot be selected from different candidate R1 implementation heads, candidate schema states, target database snapshots, or validator runs. The old-binary exercise intentionally names one different, pinned preceding binary as its test subject; its result must be produced against this bundle's candidate R1 expanded schema and cannot be borrowed from another candidate. A later run supersedes an earlier bundle as a whole rather than allowing evidence to be mixed across runs.
+
+The bundle binds:
+
+- the exact R1 implementation identity and the exact schema/migration identity it expects;
+- the target database identity, one validator run identity, and the single query-only SQLite transaction/snapshot boundary from which every database-derived result was read;
+- the validator's typed overall result plus every typed category and bounded count, distinguishing valid absence from mismatch or incomplete/conflicting evidence;
+- the production repository-authority census revision evaluated against that exact R1 implementation, including the conclusion that Project remains the sole live authority and that no R1 production reader, writer, fallback, repair, or dual-write path exists;
+- the old-binary compatibility exercise result, identifying the exact preceding binary test subject and the candidate R1 expanded schema against which its representative Project-authoritative journeys passed; and
+- the applicable binary-rollback posture, including that additive R1 schema is retained and destructive down-migration is prohibited.
+
+A bundle is complete only when all members are evaluated for that same candidate R1 implementation/schema and target readiness run—with the exact preceding binary named solely as the compatibility test subject—the validator result is clean under this task's semantics, the census has no authority leak, the compatibility exercise passes against the candidate expanded schema, and the rollback posture remains applicable. Valid absence is recorded as typed/countable evidence and does not make the bundle unclean. The bundle records evidence only: it performs no live probe, repair, synchronization, authority selection, or cutover and introduces no required serialization format, path, CI provider, or storage product.
+
+R2 consumes the complete bundle as its R1 handoff input, but the bundle does not authorize activation. R2 owns final post-quiescence revalidation against the then-current target database, superseded-writer exclusion, and the atomic authority activation gate.
+
 ## Deployment, old-binary, and rollback posture
 
 R1 is an expand-only database change:
@@ -132,6 +149,7 @@ R1 must be followed promptly by R2. Its dormant duplicate representation is temp
 - [ ] Tests prove no production caller reads or writes hidden repository facts and no runtime path dual-writes Project/GitRepository.
 - [ ] A production reader/writer census names every Project authority path and confirms none moved in R1; the census becomes the R2 cutover checklist.
 - [ ] Shadow validation passes on valid upgraded fixtures and emits each stable mismatch category on adversarial fixtures without changing any row.
+- [ ] One complete R1 readiness evidence bundle binds the exact implementation/schema, target database snapshot and validator transaction/run, typed result/categories/counts, production authority census, old-binary compatibility result, and rollback posture without mixing evidence across runs.
 - [ ] Old-binary compatibility is exercised: upgrade with R1, run the immediately preceding #633-era binary against the expanded database on representative read/write journeys, then redeploy R1 and obtain the same validation result.
 - [ ] Binary rollback documentation explicitly retains additive schema and blocks destructive down-migration.
 - [ ] No UI/API snapshots, generated client types, or user-visible routes expose Repository or hidden identity.
@@ -182,6 +200,7 @@ The frozen brief was read specifically to falsify its migration boundary:
 | Migration ambiguity | Linked worktree/separate-clone topology, multiple Project rows, duplicate source rows, observation precedence/timestamps, missing branches, and conflicting scope assignments permitted heuristic choices. | Defines Project ID as the complete R1 partition even for linked worktrees/separate clones; copies an observation only from exactly one complete retained source row including persisted generation/time; performs no live probes or tie-break; leaves incomplete state absent; and makes duplicate/contradictory candidates transaction-fatal. |
 | Old-binary rollback gap | Additive tables can still break old writes through constraints/triggers or required columns, and R1 coexistence could be misread as permission past cutover. | Forbids old-table reinterpretation and mirroring/rejection triggers; requires compatible defaults, binary rollback test, retained expansion, no destructive down-migration, and explicit old-writer exclusion before R2. |
 | R1 becomes permanent parallel representation | A dormant phase can linger and accrue readers, while a combined-PR escape hatch could let R1 absorb R2. | Requires prompt R2; if strict dormancy/old-binary safety fails, R1 stops and returns authority to the coordinator/R2 owner for a replacement combined R1+R2 cutover authority with separate commits. |
+| R1→R2 handoff ambiguity | Individually valid validator, census, compatibility, and rollback artifacts could come from different heads, schema states, database snapshots, or runs. | Defines one non-composable readiness bundle tied to an exact implementation/schema and one target validator transaction/run; valid absence remains explicit, and R2 still owns post-quiescence revalidation and activation. |
 | Downstream scope absorption | Restart evidence, Close adoption, UI removal, or Delete could enter because nearby types exist. | Makes each a named non-goal with owner and routing classification. |
 
 No open adversarial finding remains in the brief. Implementation review may discover a #633 prerequisite; such a finding must be returned upstream rather than weakened locally.
