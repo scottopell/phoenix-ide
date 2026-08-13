@@ -266,6 +266,23 @@ struct WebViewWrapper: NSViewRepresentable {
 
         func webView(
             _ webView: WKWebView,
+            runJavaScriptConfirmPanelWithMessage message: String,
+            initiatedByFrame frame: WKFrameInfo
+        ) async -> Bool {
+            guard role == .primary,
+                  frame.isMainFrame,
+                  let frameURL = frame.request.url,
+                  origin.exactlyMatches(frameURL) else { return false }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = message
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
+
+        func webView(
+            _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures

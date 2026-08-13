@@ -200,7 +200,7 @@ enum ConnectionState: Equatable {
 
     var canDisplayWebView: Bool {
         switch self {
-        case .identityVerified, .authenticationRequired, .verifyingDeployment, .ready, .unsupportedOwnership: true
+        case .identityVerified, .authenticationRequired, .ready, .unsupportedOwnership: true
         default: false
         }
     }
@@ -934,12 +934,15 @@ final class ServerManager: ObservableObject {
                     outputPump.offer(data)
                 }
             }
+            try launched.run()
+            process = launched
             launched.terminationHandler = { [weak self] terminated in
                 Task { @MainActor in self?.processExited(terminated, operation: operation) }
             }
-
-            try launched.run()
-            process = launched
+            if !launched.isRunning {
+                processExited(launched, operation: operation)
+                return
+            }
             readinessTask = Task { [weak self] in
                 await self?.waitForBundledIdentity(operation: operation)
             }
@@ -968,11 +971,13 @@ final class ServerManager: ObservableObject {
         do {
             let version: VersionInfo = try await requestJSON(selected.origin.url(path: "/api/version"), expectedOrigin: selected.origin)
             guard operation == operationAuthority.id else { return }
-            state = .identityVerified(version)
             if case .bundled = selected {
+                state = .verifyingDeployment(version)
                 let deployment: DeploymentInfo = try await requestJSON(selected.origin.url(path: "/api/deployment"), expectedOrigin: selected.origin)
                 guard operation == operationAuthority.id else { return }
                 deploymentReceived(deployment, operation: ConnectionOperationToken(id: operation))
+            } else {
+                state = .identityVerified(version)
             }
         } catch {
             guard operation == operationAuthority.id else { return }

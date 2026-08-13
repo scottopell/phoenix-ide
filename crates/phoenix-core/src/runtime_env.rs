@@ -266,7 +266,7 @@ impl PhoenixRuntimeEnvironment {
                 .join("phoenix-ide")
                 .join("chromium")
         } else {
-            self.data_dir.join("chromium-cache")
+            self.state_dir.join("chromium-cache")
         }
     }
 
