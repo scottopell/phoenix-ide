@@ -51,6 +51,31 @@ describe('SelectionDialog', () => {
     await waitFor(() => expect(trigger).toHaveFocus());
   });
 
+  it('makes the document inert and traps focus when showModal is unavailable', async () => {
+    const originalShowModal = HTMLDialogElement.prototype.showModal;
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: undefined });
+    const { container } = render(<DialogHarness />);
+    const trigger = screen.getByRole('button', { name: 'Open chooser' });
+    fireEvent.click(trigger);
+
+    const dialog = screen.getByRole('dialog', { name: 'Choose a value' });
+    const close = screen.getByRole('button', { name: 'Close Choose a value' });
+    const second = screen.getByRole('button', { name: 'Second choice' });
+    expect(dialog).toHaveAttribute('data-fallback-modal');
+    expect(container.inert).toBe(true);
+
+    second.focus();
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+    expect(close).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
+    expect(second).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(container.inert).toBe(false);
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: originalShowModal });
+  });
+
   it('blocks dismissal while its owner is pending', () => {
     render(<DialogHarness dismissible={false} />);
     fireEvent.click(screen.getByRole('button', { name: 'Open chooser' }));

@@ -31,16 +31,25 @@ export function SelectionDialog({
   const previousFocusRef = useRef<HTMLElement | null>(
     document.activeElement instanceof HTMLElement ? document.activeElement : null,
   );
+  const fallbackModalRef = useRef(false);
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
     const restoreTarget = restoreFocusRef?.current ?? previousFocusRef.current;
 
+    const inertSiblings: Array<{ element: HTMLElement; wasInert: boolean }> = [];
     if (typeof dialog.showModal === 'function') {
       dialog.showModal();
     } else {
+      fallbackModalRef.current = true;
       dialog.setAttribute('open', '');
+      dialog.dataset['fallbackModal'] = '';
+      for (const child of Array.from(document.body.children)) {
+        if (!(child instanceof HTMLElement) || child === dialog) continue;
+        inertSiblings.push({ element: child, wasInert: child.inert });
+        child.inert = true;
+      }
     }
 
     const firstFocus = dialog.querySelector<HTMLElement>('[data-selection-dialog-autofocus]');
@@ -48,6 +57,8 @@ export function SelectionDialog({
 
     return () => {
       if (dialog.open && typeof dialog.close === 'function') dialog.close();
+      fallbackModalRef.current = false;
+      for (const { element, wasInert } of inertSiblings) element.inert = wasInert;
       requestAnimationFrame(() => {
         if (restoreTarget && document.contains(restoreTarget)) {
           restoreTarget.focus({ preventScroll: true });
@@ -75,6 +86,25 @@ export function SelectionDialog({
         if (event.key === 'Escape') {
           event.preventDefault();
           requestClose();
+          return;
+        }
+        if (event.key !== 'Tab' || !fallbackModalRef.current) return;
+        const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ));
+        if (focusable.length === 0) {
+          event.preventDefault();
+          event.currentTarget.focus();
+          return;
+        }
+        const first = focusable[0]!;
+        const last = focusable[focusable.length - 1]!;
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
         }
       }}
       onMouseDown={(event) => {
