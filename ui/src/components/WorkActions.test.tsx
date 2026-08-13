@@ -129,6 +129,19 @@ function primaryCount() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: vi.fn().mockImplementation((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
   vi.mocked(api.getPrStatus).mockResolvedValue({
     found: false,
     refresh: { state: 'fresh', stale: false, last_attempted_at: '', last_refreshed_at: '' },
@@ -740,6 +753,52 @@ describe('WorkControlBar — active PR interactions', () => {
     expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /#12 Fix CI open task-123/ }));
     await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 12 }));
+  });
+
+  it('uses the compact PR rail as selector owner on tablet widths', () => {
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: query === '(max-width: 1024px)',
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+    const handle = prStatusHandle();
+
+    renderWithProviders(
+      <>
+        <StateBar
+          conversation={{
+            id: 'conv-tablet', slug: 'slug', model: 'claude-sonnet-5', cwd: '/repo/.phoenix/worktrees/conv-tablet', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', message_count: 1, state: { type: 'idle' }, branch_name: 'task-123', base_branch: 'main', worktree_path: '/repo/.phoenix/worktrees/conv-tablet', task_title: 'Task', conv_mode_label: 'Work', browser_session_active: false, terminal_uses_tmux: false, work_scope_key: 'worktree:/repo/.phoenix/worktrees/conv-tablet',
+          }}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+        <WorkControlBar
+          conversationId="conv-tablet"
+          convModeLabel="Work"
+          phaseType="idle"
+          continuedInConvId={null}
+          onSendMessage={vi.fn()}
+          prStatusHandle={handle}
+        />
+      </>,
+    );
+
+    expect(screen.queryByTestId('active-pr-selector-trigger')).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-controls')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#12 open/i })).toBeInTheDocument();
   });
 
   it('commits a newly ambiguous safety refresh before opening the selector', async () => {
@@ -1390,7 +1449,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
       value: vi.fn().mockImplementation((query: string) => ({
-        matches: query === '(max-width: 768px)',
+        matches: query === '(max-width: 1024px)',
         media: query,
         onchange: null,
         addEventListener: vi.fn(),

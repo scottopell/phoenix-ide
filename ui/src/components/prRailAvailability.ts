@@ -15,7 +15,7 @@ function samePr(left: AssociatedPrSummaryResponse, right: AssociatedPrSummaryRes
 
 export function derivePrRailAvailability(
   handle: ConversationPrStatusHandle,
-  isMobile: boolean,
+  usesCompactLayout: boolean,
 ): PrRailAvailability {
   const actionablePrs = handle.activeSelection?.associated_prs.filter(
     (pr) => pr.display_state === 'open' || pr.display_state === 'draft',
@@ -30,6 +30,6 @@ export function derivePrRailAvailability(
   return {
     actionablePrs,
     canRepresentActiveSelection,
-    shouldRender: canRepresentActiveSelection && (isMobile || actionablePrs.length > 1),
+    shouldRender: canRepresentActiveSelection && (usesCompactLayout || actionablePrs.length > 1),
   };
 }
