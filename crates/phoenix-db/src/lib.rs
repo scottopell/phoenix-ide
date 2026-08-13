@@ -122,6 +122,15 @@ fn approved_task_handoff_summary(
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseFoundationRepair {
+    UnresolvedWorktreeIdentity {
+        attempt_id: phoenix_core::domain::close::CloseAttemptId,
+        scope: WorkScopeId,
+        locator: phoenix_core::domain::close::GitPathIdentity,
+    },
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
@@ -140,6 +149,8 @@ pub enum DbError {
     CloseFoundationConflict(String),
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
+    #[error("Close foundation repair required: {0:?}")]
+    CloseFoundationRepairRequired(CloseFoundationRepair),
     #[error("Close foundation record not found: {0}")]
     CloseFoundationNotFound(String),
     #[error("Direct-turn conflict: {0:?}")]
@@ -1162,6 +1173,9 @@ async fn insert_creation_job_images_tx(
     Ok(())
 }
 
+const GIT_POINTER_FORMAT_OVERHEAD: u64 = b"gitdir: \n".len() as u64;
+const MAX_GIT_POINTER_BYTES: u64 = libc::PATH_MAX as u64 + GIT_POINTER_FORMAT_OVERHEAD;
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -1191,11 +1205,10 @@ impl Database {
         let marker = std::path::Path::new(worktree_path).join(".git");
         let metadata = std::fs::symlink_metadata(&marker).ok()?;
         let marker_bytes = if metadata.is_file() {
-            const MAX_GIT_POINTER_BYTES: u64 = 4096;
             if metadata.len() > MAX_GIT_POINTER_BYTES {
                 return None;
             }
-            let mut bytes = Vec::with_capacity(4096);
+            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
             std::fs::File::open(&marker)
                 .ok()?
                 .take(MAX_GIT_POINTER_BYTES + 1)
@@ -2277,27 +2290,52 @@ impl Database {
     /// # Errors
     /// Returns a database error when an observed identity cannot be persisted.
     pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
-        let scopes = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-            "SELECT id, worktree_path, worktree_id, worktree_fingerprint
+        let scopes = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, worktree_path
              FROM work_scopes
-             WHERE environment_kind = 'allocated_worktree' AND worktree_path IS NOT NULL",
+             WHERE environment_kind = 'allocated_worktree' AND worktree_path IS NOT NULL
+             ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await?;
-        for (scope_id, path, existing_id, existing_fingerprint) in scopes {
-            let Some(observed_fingerprint) = Self::observe_worktree_fingerprint(&path) else {
-                continue;
-            };
-            if existing_fingerprint.as_deref() == Some(observed_fingerprint.as_str())
-                && existing_id.is_some()
-            {
-                continue;
-            }
-            let worktree_id = uuid::Uuid::new_v4().to_string();
+        let observations = scopes
+            .into_iter()
+            .filter_map(|(scope_id, path)| {
+                Self::observe_worktree_fingerprint(&path)
+                    .map(|observed_fingerprint| (scope_id, observed_fingerprint))
+            })
+            .collect::<Vec<_>>();
+        let mut tx = self.pool.begin().await?;
+
+        for (scope_id, observed_fingerprint) in &observations {
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL
+                 WHERE id = ?1
+                   AND NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?2)
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase <> 'completed'
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(scope_id)
+            .bind(observed_fingerprint)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (scope_id, observed_fingerprint) in observations {
             let result = sqlx::query(
                 "UPDATE work_scopes
                  SET worktree_id = ?1, worktree_fingerprint = ?2
                  WHERE id = ?3
+                   AND worktree_id IS NULL
+                   AND worktree_fingerprint IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM work_scopes owner
                        WHERE owner.worktree_fingerprint = ?2 AND owner.id <> ?3
@@ -2312,41 +2350,19 @@ impl Database {
                          AND obligation.topology_sealed = 1
                    )",
             )
-            .bind(worktree_id)
+            .bind(uuid::Uuid::new_v4().to_string())
             .bind(&observed_fingerprint)
             .bind(&scope_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
-                let cleared = sqlx::query(
-                    "UPDATE work_scopes
-                     SET worktree_id = NULL, worktree_fingerprint = NULL
-                     WHERE id = ?1
-                       AND EXISTS (
-                           SELECT 1 FROM work_scopes owner
-                           WHERE owner.worktree_fingerprint = ?2 AND owner.id <> ?1
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM close_attempt_scopes captured
-                           JOIN close_obligations obligation
-                             ON obligation.attempt_id = captured.attempt_id
-                           WHERE captured.scope = work_scopes.id
-                             AND obligation.phase <> 'completed'
-                             AND obligation.topology_sealed = 1
-                       )",
-                )
-                .bind(&scope_id)
-                .bind(&observed_fingerprint)
-                .execute(&self.pool)
-                .await?;
                 tracing::debug!(
                     work_scope_id = %scope_id,
-                    duplicate_unresolved = cleared.rows_affected() == 1,
                     "worktree identity reconciliation deferred or unresolved"
                 );
             }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -10666,7 +10682,13 @@ mod tests {
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         let replacement = Database::observe_worktree_fingerprint(root.to_str().unwrap()).unwrap();
         assert_ne!(first, replacement);
-        std::fs::write(&marker, vec![b'x'; 4097]).unwrap();
+        let max_pointer_bytes = usize::try_from(MAX_GIT_POINTER_BYTES).unwrap();
+        let mut maximum_pointer = b"gitdir: ".to_vec();
+        maximum_pointer.resize(max_pointer_bytes - 1, b'x');
+        maximum_pointer.push(b'\n');
+        std::fs::write(&marker, maximum_pointer).unwrap();
+        assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_some());
+        std::fs::write(&marker, vec![b'x'; max_pointer_bytes + 1]).unwrap();
         assert!(Database::observe_worktree_fingerprint(root.to_str().unwrap()).is_none());
         std::fs::write(&marker, "gitdir: /tmp/second\n").unwrap();
         std::fs::rename(&root, root.with_extension("moved")).unwrap();
@@ -10676,6 +10698,63 @@ mod tests {
             Database::observe_worktree_fingerprint(moved.to_str().unwrap()).unwrap()
         );
         std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_reconciliation_releases_stale_owner_before_claim_arbitration() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let claimant = temp.path().join("claimant");
+        let stale_owner = temp.path().join("stale-owner");
+        std::fs::create_dir_all(&claimant).unwrap();
+        std::fs::create_dir_all(&stale_owner).unwrap();
+        std::fs::write(claimant.join(".git"), "gitdir: /tmp/original\n").unwrap();
+        std::fs::write(stale_owner.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
+        let released_fingerprint =
+            Database::observe_worktree_fingerprint(claimant.to_str().unwrap()).unwrap();
+        let replacement_fingerprint =
+            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).unwrap();
+
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd, worktree_path,
+                 created_at, updated_at, worktree_id, worktree_fingerprint
+             ) VALUES
+                 ('a-claimant', 'work', 'active', 'allocated_worktree', ?1, ?1,
+                  ?3, ?3, NULL, NULL),
+                 ('b-stale-owner', 'work', 'active', 'allocated_worktree', ?2, ?2,
+                  ?3, ?3, 'stale-id', ?4)",
+        )
+        .bind(claimant.to_str().unwrap())
+        .bind(stale_owner.to_str().unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .bind(&released_fingerprint)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.reconcile_worktree_identities().await.unwrap();
+
+        let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT id, worktree_id, worktree_fingerprint
+             FROM work_scopes
+             WHERE id IN ('a-claimant', 'b-stale-owner')
+             ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities[0].1.is_some());
+        assert_eq!(
+            identities[0].2.as_deref(),
+            Some(released_fingerprint.as_str())
+        );
+        assert!(identities[1].1.is_some());
+        assert_eq!(
+            identities[1].2.as_deref(),
+            Some(replacement_fingerprint.as_str())
+        );
     }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {

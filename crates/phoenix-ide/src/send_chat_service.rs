@@ -537,6 +537,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
         | crate::db::DbError::DirectTurnConflict(_)) => map_db_internal_error(&other),
@@ -566,6 +567,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::Serialization(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
+        | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)) => map_db_internal_error(&other),
     }

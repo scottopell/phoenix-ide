@@ -16,7 +16,8 @@ use sqlx::{Connection, Row, Sqlite, Transaction};
 use std::fmt::Write as _;
 
 use crate::{
-    conv_state_kind, parse_conversation_row, ConvState, Conversation, Database, DbError, DbResult,
+    conv_state_kind, parse_conversation_row, CloseFoundationRepair, ConvState, Conversation,
+    Database, DbError, DbResult,
 };
 
 #[derive(Debug, Clone)]
@@ -1336,11 +1337,15 @@ impl Database {
                     GitPathIdentity::decode_exact(&locator)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
-                (None, None, Some(_)) => {
-                    return Err(close_precondition(format!(
-                        "attempt {} scope {} has unresolved worktree identity",
-                        request.attempt_id, scope.scope
-                    )))
+                (None, None, Some(locator)) => {
+                    return Err(DbError::CloseFoundationRepairRequired(
+                        CloseFoundationRepair::UnresolvedWorktreeIdentity {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            locator: GitPathIdentity::decode_exact(&locator)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        },
+                    ))
                 }
                 (None, None, None) => None,
                 _ => {
@@ -1501,11 +1506,15 @@ impl Database {
                     GitPathIdentity::decode_exact(&locator)
                         .map_err(|error| DbError::Serialization(error.to_string()))?,
                 )),
-                (None, None, Some(_)) => {
-                    return Err(close_precondition(format!(
-                        "scope {} has unresolved worktree identity",
-                        scope.scope
-                    )))
+                (None, None, Some(locator)) => {
+                    return Err(DbError::CloseFoundationRepairRequired(
+                        CloseFoundationRepair::UnresolvedWorktreeIdentity {
+                            attempt_id: request.attempt_id.clone(),
+                            scope: scope.scope.clone(),
+                            locator: GitPathIdentity::decode_exact(&locator)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        },
+                    ))
                 }
                 (None, None, None) => None,
                 _ => {
@@ -2993,7 +3002,7 @@ mod tests {
                 attempt_id: CloseAttemptId::parse("attempt-unresolved").unwrap(),
                 snapshot: current_test_snapshot(&db, "attempt-unresolved").await,
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
-                    scope,
+                    scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
                         worktree: None,
                         bash_process_groups: std::collections::BTreeSet::new(),
@@ -3006,7 +3015,18 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+        assert!(matches!(
+            error,
+            DbError::CloseFoundationRepairRequired(
+                CloseFoundationRepair::UnresolvedWorktreeIdentity {
+                    attempt_id,
+                    scope: repair_scope,
+                    locator,
+                }
+            ) if attempt_id.as_str() == "attempt-unresolved"
+                && repair_scope == scope
+                && locator.as_bytes() == b"/tmp/worktree"
+        ));
     }
 
     #[tokio::test]

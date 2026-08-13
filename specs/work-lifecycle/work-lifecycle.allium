@@ -261,8 +261,8 @@ rule GitBackedInspectionWithoutLossRequestsRetirement {
     ensures: RetirementInspectionCompletedWithoutConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
-        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
+        inspection_generation: aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id))
     )
 
     @guidance
@@ -291,8 +291,8 @@ rule GitBackedInspectionWithLossRequiresConfirmation {
     ensures: RetirementInspectionRequiresConfirmation(
         product_conversation,
         attempt_id,
-        inspection_generation: aggregate_inspection_generation(product_conversation, attempt_id),
-        inspection_fingerprint: aggregate_inspection_fingerprint(product_conversation, attempt_id)
+        inspection_generation: aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)),
+        inspection_fingerprint: aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id))
     )
 
     @guidance
@@ -311,8 +311,8 @@ rule LossConfirmationRecomputesInspectionBeforeRetirement {
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation = inspection_generation
     requires: bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint = inspection_fingerprint
     let fresh_scope_inspections = recompute_all_targeted_scope_inspections(product_conversation, attempt_id)
-    let fresh_generation = aggregate_generation(fresh_scope_inspections)
-    let fresh_fingerprint = aggregate_fingerprint(fresh_scope_inspections)
+    let fresh_generation = aggregate_inspection_generation(fresh_scope_inspections)
+    let fresh_fingerprint = aggregate_inspection_fingerprint(fresh_scope_inspections)
     requires: fresh_generation = inspection_generation
     requires: fresh_fingerprint = inspection_fingerprint
     ensures: RetirementInspectionRecomputed(product_conversation, attempt_id, fresh_generation, fresh_fingerprint)
@@ -335,8 +335,8 @@ rule LossConfirmationDetectsChangedInspection {
     requires:
         bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_generation != inspection_generation
         or bedrock/CloseObligation{product_conversation: product_conversation, attempt_id: attempt_id}.inspection_fingerprint != inspection_fingerprint
-        or aggregate_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_generation
-        or aggregate_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_fingerprint
+        or aggregate_inspection_generation(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_generation
+        or aggregate_inspection_fingerprint(recompute_all_targeted_scope_inspections(product_conversation, attempt_id)) != inspection_fingerprint
     ensures: RetirementInspectionChanged(product_conversation, attempt_id)
 
     @guidance
@@ -670,6 +670,30 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
+--
+--   recompute_all_targeted_scope_inspections(
+--       product_conversation: bedrock/ProductConversation,
+--       attempt_id: String
+--   ) -> List<(WorkScope, RetirementInspection)>
+--       Recomputes one exact RetirementInspection for every distinct attached
+--       worktree-owning scope captured by attempt_id, and no other scope. The list
+--       is ordered by the opaque WorkScope identity's canonical bytes. A missing,
+--       duplicate, ambiguous, or uninspectable captured target fails closed rather
+--       than returning a partial list.
+--
+--   aggregate_inspection_generation(
+--       inspections: List<(WorkScope, RetirementInspection)>
+--   ) -> String
+--       A deterministic digest of the canonical length-prefixed sequence of each
+--       ordered scope identity and inspection generation. Any target-set, order, or
+--       per-scope generation change produces a different aggregate generation.
+--
+--   aggregate_inspection_fingerprint(
+--       inspections: List<(WorkScope, RetirementInspection)>
+--   ) -> String
+--       A deterministic digest of the canonical length-prefixed sequence of each
+--       ordered scope identity and inspection fingerprint. Any target-set, order, or
+--       per-scope fingerprint change produces a different aggregate fingerprint.
 --
 --   pending_worktree_retirement_scope(
 --       product_conversation: bedrock/ProductConversation,

@@ -460,10 +460,10 @@ WHERE id IN (
         AND job.status = 'deletion_pending'
   );
 
-CREATE TEMP TABLE migration_063_scope_fk_guard (
+CREATE TEMP TABLE migration_064_scope_fk_guard (
     missing_scope_rows INTEGER NOT NULL CHECK (missing_scope_rows = 0)
 );
-INSERT INTO migration_063_scope_fk_guard
+INSERT INTO migration_064_scope_fk_guard
 SELECT COUNT(*)
 FROM conversations c
 WHERE c.work_scope_id IS NOT NULL
@@ -471,10 +471,10 @@ WHERE c.work_scope_id IS NOT NULL
       SELECT 1 FROM work_scopes scope WHERE scope.id = c.work_scope_id
   );
 
-CREATE TEMP TABLE migration_063_continued_fk_guard (
+CREATE TEMP TABLE migration_064_continued_fk_guard (
     missing_continued_rows INTEGER NOT NULL CHECK (missing_continued_rows = 0)
 );
-INSERT INTO migration_063_continued_fk_guard
+INSERT INTO migration_064_continued_fk_guard
 SELECT COUNT(*)
 FROM conversations c
 WHERE c.continued_in_conv_id IS NOT NULL
@@ -482,8 +482,8 @@ WHERE c.continued_in_conv_id IS NOT NULL
       SELECT 1 FROM conversations next WHERE next.id = c.continued_in_conv_id
   );
 
-DROP TABLE migration_063_scope_fk_guard;
-DROP TABLE migration_063_continued_fk_guard;
+DROP TABLE migration_064_scope_fk_guard;
+DROP TABLE migration_064_continued_fk_guard;
 
 
 CREATE TABLE close_obligations (
@@ -5544,7 +5544,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_063_creates_close_retirement_tables_and_preserves_chain_topology() {
+    async fn migration_064_creates_close_retirement_tables_and_preserves_chain_topology() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE work_scopes (
@@ -5596,7 +5596,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 63).await;
+        stamp_migrations_except(&pool, 64).await;
 
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
 
@@ -5678,7 +5678,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_063_enforces_close_retirement_constraints() {
+    async fn migration_064_enforces_close_retirement_constraints() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE work_scopes (
@@ -5758,7 +5758,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        stamp_migrations_except(&pool, 63).await;
+        stamp_migrations_except(&pool, 64).await;
         assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
         sqlx::query(
             "UPDATE work_scopes
@@ -7533,7 +7533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_063_rooted_cycle_is_bounded_and_live_topology_still_rejects() {
+    async fn migration_064_rooted_cycle_is_bounded_and_live_topology_still_rejects() {
         let pool = test_pool().await;
         sqlx::raw_sql(
             "CREATE TABLE work_scopes (
@@ -7583,7 +7583,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            sqlx::raw_sql(MIGRATION_063).execute(&pool),
+            sqlx::raw_sql(MIGRATION_064).execute(&pool),
         )
         .await
         .expect("migration must not hang")
