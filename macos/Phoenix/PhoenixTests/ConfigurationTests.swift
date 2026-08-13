@@ -1312,6 +1312,27 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(reused.lastPathComponent, "report.pdf")
     }
 
+    func testExactConnectionOperationInvalidationRejectsSuspendedLaunchResult() {
+        var authority = ConnectionOperationAuthority()
+        let launchOperation = authority.id
+
+        XCTAssertTrue(authority.invalidate(launchOperation))
+        XCTAssertNotEqual(authority.id, launchOperation)
+        XCTAssertFalse(authority.invalidate(launchOperation))
+    }
+
+    @MainActor
+    func testWebKitStoragePartitionsAttachedAndBundledAuthorityAtIdenticalOrigin() {
+        let attached = WebKitStoragePartition(serverMode: .attached)
+        let bundled = WebKitStoragePartition(serverMode: .bundled)
+
+        XCTAssertNil(attached.dataStore.identifier)
+        XCTAssertEqual(bundled.dataStore.identifier, WebKitStoragePartition.bundledPersistentIdentifier)
+        XCTAssertNotEqual(attached.dataStore, bundled.dataStore)
+        XCTAssertTrue(attached.dataStore.isPersistent)
+        XCTAssertTrue(bundled.dataStore.isPersistent)
+    }
+
     func testConnectionStateFailureVersionSurvivesPreservedStop() {
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
         let failure = FailureState(version: version, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")

@@ -586,6 +586,21 @@ private final class SidecarLogSnapshotSink {
     }
 }
 
+struct ConnectionOperationAuthority {
+    private(set) var id = UUID()
+
+    mutating func replace() -> UUID {
+        id = UUID()
+        return id
+    }
+
+    mutating func invalidate(_ operation: UUID) -> Bool {
+        guard operation == id else { return false }
+        id = UUID()
+        return true
+    }
+}
+
 @MainActor
 final class ServerManager: ObservableObject {
     @Published private(set) var state: ConnectionState = .stopped
@@ -605,7 +620,7 @@ final class ServerManager: ObservableObject {
         fileprivate let id: UUID
     }
 
-    private var operationID = UUID()
+    private var operationAuthority = ConnectionOperationAuthority()
     private var launchedBundledInstance: LaunchedBundledInstance?
     private let keychain: any PackagedSidecarSecretProvider
 
@@ -614,15 +629,14 @@ final class ServerManager: ObservableObject {
         ConfigurationStore.removeLegacyPlaintextSecret()
     }
 
-    var currentOperationToken: ConnectionOperationToken { ConnectionOperationToken(id: operationID) }
+    var currentOperationToken: ConnectionOperationToken { ConnectionOperationToken(id: operationAuthority.id) }
 
     func connect() {
         guard !terminationInProgress else { return }
         resetBrowserOwnedStateForOperationTransition()
         bundledReconnectQueue.cancel()
         readinessTask?.cancel()
-        operationID = UUID()
-        let operation = operationID
+        let operation = operationAuthority.replace()
         do {
             let selected = try ConfigurationStore.load()
             mode = selected
@@ -684,7 +698,7 @@ final class ServerManager: ObservableObject {
     }
 
     fileprivate func publishRecentLogLines(_ lines: [String], operation: UUID) {
-        guard logSnapshotBelongsToCurrentOperation(current: operationID, source: operation) else { return }
+        guard logSnapshotBelongsToCurrentOperation(current: operationAuthority.id, source: operation) else { return }
         recentLogLines = lines
     }
 
@@ -694,7 +708,7 @@ final class ServerManager: ObservableObject {
     }
 
     func deploymentReceived(_ deployment: DeploymentInfo, operation: ConnectionOperationToken? = nil) {
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         guard let selected = mode else { return }
         guard let version = currentVersion else { return }
         let nextState: ConnectionState
@@ -703,25 +717,25 @@ final class ServerManager: ObservableObject {
         } else {
             nextState = .ready(version, deployment)
         }
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         state = .verifyingDeployment(version)
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         state = nextState
     }
 
     func deploymentRequiresAuthentication(operation: ConnectionOperationToken? = nil) {
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         guard let version = currentVersion else { return }
         let nextState = ConnectionState.authenticationRequired(version)
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         state = nextState
     }
 
     func deploymentVerificationFailed(_ message: String, operation: ConnectionOperationToken? = nil) {
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         guard state.canDisplayWebView else { return }
         let nextState = ConnectionState.unavailable(FailureState(version: currentVersion, message: message))
-        guard operation.map({ $0.id == operationID }) ?? true else { return }
+        guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         state = nextState
     }
 
@@ -886,15 +900,15 @@ final class ServerManager: ObservableObject {
     private func verifyIdentity(for selected: ServerMode, operation: UUID, allowIntermediateFailureState: Bool) async {
         do {
             let version: VersionInfo = try await requestJSON(selected.origin.url(path: "/api/version"), expectedOrigin: selected.origin)
-            guard operation == operationID else { return }
+            guard operation == operationAuthority.id else { return }
             state = .identityVerified(version)
             if case .bundled = selected {
                 let deployment: DeploymentInfo = try await requestJSON(selected.origin.url(path: "/api/deployment"), expectedOrigin: selected.origin)
-                guard operation == operationID else { return }
+                guard operation == operationAuthority.id else { return }
                 deploymentReceived(deployment, operation: ConnectionOperationToken(id: operation))
             }
         } catch {
-            guard operation == operationID else { return }
+            guard operation == operationAuthority.id else { return }
             if allowIntermediateFailureState {
                 applyIdentityFailure(classifyServerIdentityError(error), version: currentVersion)
             }
@@ -926,11 +940,11 @@ final class ServerManager: ObservableObject {
                deployment.instanceID == launchedBundledInstance.instanceID.uuidString {
                 return
             }
-            guard operation == operationID else { return }
+            guard operation == operationAuthority.id else { return }
             guard process?.isRunning == true else { return }
             try? await Task.sleep(for: .milliseconds(300))
         }
-        guard operation == operationID, process?.isRunning == true else { return }
+        guard operation == operationAuthority.id, process?.isRunning == true else { return }
         let failure = FailureState(version: currentVersion, message: "Bundled Phoenix did not become ready. Open Connection Status to locate the app-owned log.")
         state = .failed(failure)
         stopPreservingFailureState(failure)
@@ -996,6 +1010,11 @@ final class ServerManager: ObservableObject {
         guard process === terminated else { return }
         let priorState = state
         let version = currentVersion
+        let exitedCurrentOperation = operationAuthority.invalidate(operation)
+        if exitedCurrentOperation {
+            readinessTask?.cancel()
+            readinessTask = nil
+        }
         stopDeadline?.cancel()
         stopDeadline = nil
         releaseOwnerLock()
@@ -1005,11 +1024,11 @@ final class ServerManager: ObservableObject {
         switch priorState {
         case .stopping, .restarting:
             finishStop(finalState: .stopped)
-        case .failed(let failure) where operation == operationID:
+        case .failed(let failure) where exitedCurrentOperation:
             finishStop(finalState: .failed(failure))
         default:
             let finalState: ConnectionState
-            if operation == operationID {
+            if exitedCurrentOperation {
                 finalState = .failed(FailureState(version: version, message: "Bundled Phoenix exited with code \(terminated.terminationStatus). Open Connection Status to locate the app-owned log."))
             } else {
                 finalState = .stopped

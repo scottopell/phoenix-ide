@@ -2,8 +2,31 @@ import SwiftUI
 import WebKit
 import UserNotifications
 
+enum WebKitStoragePartition: Equatable {
+    case attached
+    case bundled
+
+    init(serverMode: ServerModeKind) {
+        switch serverMode {
+        case .attached: self = .attached
+        case .bundled: self = .bundled
+        }
+    }
+
+    static let bundledPersistentIdentifier = UUID(uuidString: "DB535D27-91C2-42A0-9DF7-DC959C80D4D4")!
+
+    @MainActor
+    var dataStore: WKWebsiteDataStore {
+        switch self {
+        case .attached: WKWebsiteDataStore.default()
+        case .bundled: WKWebsiteDataStore(forIdentifier: Self.bundledPersistentIdentifier)
+        }
+    }
+}
+
 struct WebViewWrapper: NSViewRepresentable {
     let origin: PhoenixOrigin
+    let storagePartition: WebKitStoragePartition
     let operation: ServerManager.ConnectionOperationToken
     let browserEnvironment: BrowserEnvironment
     let onWebViewReady: (WKWebView, ServerManager.ConnectionOperationToken) -> Void
@@ -36,6 +59,7 @@ struct WebViewWrapper: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = storagePartition.dataStore
         configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.userContentController.add(context.coordinator, name: "phoenixDeployment")

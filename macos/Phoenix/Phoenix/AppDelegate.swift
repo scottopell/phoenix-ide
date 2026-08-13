@@ -131,7 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let window else { return }
         let currentOperation = serverManager.currentOperationToken
         let staleBrowserOperation = browserOperation != nil && browserOperation != currentOperation
-        if state.canDisplayWebView, let origin = serverManager.webOrigin {
+        if state.canDisplayWebView, let origin = serverManager.webOrigin, let mode = serverManager.mode {
             let operation = currentOperation
             if staleBrowserOperation, let browserOperation {
                 browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
@@ -144,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             browserOperation = operation
             let wrapper = WebViewWrapper(
                 origin: origin,
+                storagePartition: WebKitStoragePartition(serverMode: mode.kind),
                 operation: operation,
                 browserEnvironment: browserEnvironment,
                 onWebViewReady: { [weak self] value, operation in
