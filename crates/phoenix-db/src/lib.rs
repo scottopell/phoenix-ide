@@ -2294,7 +2294,9 @@ impl Database {
         let scopes = sqlx::query_as::<_, (String, String)>(
             "SELECT id, worktree_path
              FROM work_scopes
-             WHERE environment_kind = 'allocated_worktree' AND worktree_path IS NOT NULL
+             WHERE lifecycle = 'active'
+               AND environment_kind = 'allocated_worktree'
+               AND worktree_path IS NOT NULL
              ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -10756,6 +10758,40 @@ mod tests {
             identities[1].2.as_deref(),
             Some(replacement_fingerprint.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn worktree_reconciliation_preserves_retired_identity_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("retired-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, lifecycle, environment_kind, cwd, worktree_path,
+                 created_at, updated_at, retired_at, worktree_id, worktree_fingerprint
+             ) VALUES ('retired-scope', 'work', 'retired', 'allocated_worktree',
+                       ?1, ?1, ?2, ?2, ?2, 'retired-id', 'retired-fingerprint')",
+        )
+        .bind(worktree.to_str().unwrap())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.reconcile_worktree_identities().await.unwrap();
+
+        let identity = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT worktree_id, worktree_fingerprint
+             FROM work_scopes WHERE id = 'retired-scope'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(identity.0.as_deref(), Some("retired-id"));
+        assert_eq!(identity.1.as_deref(), Some("retired-fingerprint"));
     }
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {

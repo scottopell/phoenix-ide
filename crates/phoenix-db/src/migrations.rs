@@ -2081,7 +2081,12 @@ CREATE TABLE close_retirement_resource_history (
     inspection_fingerprint TEXT NOT NULL,
     resource_kind TEXT NOT NULL,
     identity_kind TEXT NOT NULL,
-    identity_codec TEXT NOT NULL,
+    identity_codec TEXT NOT NULL CHECK (
+        (identity_kind = 'git_path' AND identity_codec = 'git_path_bytes_hex_v1')
+        OR (identity_kind = 'git_oid' AND identity_codec = 'hex')
+        OR (identity_kind = 'opaque' AND identity_codec = 'opaque_string_v1')
+        OR (identity_kind = 'worktree' AND identity_codec = 'worktree_id_v1')
+    ),
     identity_value TEXT NOT NULL,
     proof_kind TEXT NOT NULL,
     absence_basis TEXT,

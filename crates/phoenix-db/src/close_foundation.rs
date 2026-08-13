@@ -5207,6 +5207,26 @@ mod tests {
         assert!(invalid_history_timestamp
             .to_string()
             .contains("must be valid RFC 3339"));
+        let invalid_history_codec = sqlx::query(
+            "INSERT INTO close_retirement_resource_history (
+                 attempt_id, scope, inspection_generation, inspection_fingerprint,
+                 resource_kind, identity_kind, identity_codec, identity_value,
+                 proof_kind, absence_basis, residual_reason, detail, recorded_at
+             )
+             SELECT attempt_id, scope, inspection_generation, inspection_fingerprint,
+                    resource_kind, identity_kind, 'opaque_string_v1', identity_value,
+                    proof_kind, absence_basis, residual_reason, 'invalid codec replay',
+                    recorded_at
+             FROM close_retirement_resource_history
+             WHERE attempt_id = 'attempt-1' AND identity_kind = 'worktree'
+             LIMIT 1",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(invalid_history_codec
+            .to_string()
+            .contains("CHECK constraint"));
 
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
