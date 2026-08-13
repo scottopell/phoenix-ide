@@ -555,9 +555,12 @@ async fn run_run(
     // not here — see `crate::bash_check`, which the seam invokes. No second
     // check at the tool boundary keeps enforcement single-homed.
 
-    if !matches!(spawn_context.lifecycle_scope, ResourceScopeKey::Work(_)) {
+    if !matches!(
+        spawn_context.lifecycle_scope,
+        ResourceScopeKey::Work(_) | ResourceScopeKey::Unattached(_)
+    ) {
         return BashError::SpawnFailed {
-            error_message: "bash processes require a WorkScope owner".to_string(),
+            error_message: "bash processes require a conversation-scoped owner".to_string(),
         }
         .into_tool_output();
     }
@@ -2390,7 +2393,7 @@ mod tests {
         assert!(!output.is_success());
         assert!(output
             .output()
-            .contains("bash processes require a WorkScope owner"));
+            .contains("bash processes require a conversation-scoped owner"));
         assert_eq!(registrar.register_calls(), 0);
     }
 
