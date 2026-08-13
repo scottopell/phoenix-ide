@@ -1,0 +1,229 @@
+# R2 — Atomic repository authority cutover
+
+## Problem and single goal
+
+Phoenix's live repository authority is still the legacy `Project` representation: canonical path is treated as identity, `projects.main_ref` supplies canonical-default/fork behavior, `conversations.project_id` drives creation and cleanup, and Project rows feed API, startup, task, fork, and lifecycle paths. R1 will add the hidden `GitRepository` substrate, deterministic legacy backfill, dormant `WorkScope.repository`, and read-only shadow validation, but R1 data is not live authority.
+
+R2 has one goal: perform one atomic reader/writer cutover so every correctness-sensitive repository decision flows through `ProductConversation → WorkScope.repository → hidden GitRepository`, while any temporarily surviving Project-shaped output is a typed read-only projection from that authority. This is an authority transition, not a rename and not a product-surface redesign.
+
+## Status and dependency checkpoint
+
+**BLOCKED on R1 merge and a clean exact-head R1 query-only shadow-validation result.** The final R1 planning authority is:
+
+- Task: [`tasks/55006-p1-blocked--gitrepository-additive-substrate.md`](https://github.com/scottopell/phoenix-ide/blob/task-r1-gitrepository-delivery-authority-brief-2831d6a0/tasks/55006-p1-blocked--gitrepository-additive-substrate.md)
+- Authority commit: [`01ba1aac56f0c0c3adf82823c974d53030a9c1e8`](https://github.com/scottopell/phoenix-ide/commit/01ba1aac56f0c0c3adf82823c974d53030a9c1e8)
+- Branch: `task-r1-gitrepository-delivery-authority-brief-2831d6a0`
+- Transitive prerequisite: PR #633, dormant truthful Close foundation and stable worktree identity
+
+Task 55006—not this task—freezes additive schema, migration-only backfill, query-only shadow validation, and dormant attachment semantics. R2 implementation must consume its merged authority rather than pre-freezing Rust module, table, function, or type names here.
+
+## Normative and decision authority
+
+- Accepted ADR-032: `specs/adrs/032_gitrepository-is-hidden-infrastructure-project-is-retired.md`
+- `specs/git-repository/requirements.md`, especially REQ-GITREP-001 through REQ-GITREP-008 and REQ-PROJ-015/020/021/024/025
+- `specs/git-repository/git-repository.allium`, especially `RepositoryAuthorityCutoverMovesReadersAndWritersTogether`
+- `specs/conversation-creation/requirements.md`, especially REQ-PROJ-001, REQ-PROJ-017, REQ-PROJ-022, REQ-PROJ-028, and REQ-CCR-005
+- `specs/work-lifecycle/requirements.md`, especially REQ-PROJ-028a and REQ-PROJ-WS-001
+- R1 task authority commit: `01ba1aac56f0c0c3adf82823c974d53030a9c1e8`
+- PR #633 evidence ref used for this census: `122a2d494bcc999eb4835ba80e06561f0f3750d7`
+- Main evidence ref used for this census: `80005c44636f0637d24f3d433d9c5034f42dcd77`
+
+If merged requirements, Allium, ADR-032, #633, or final R1 authority differ from this planning snapshot, reconcile this task before implementation. Normative authority wins.
+
+## Requires
+
+- PR #633 merged: dormant truthful Close foundation and stable worktree identity.
+- R1 task 55006 merged at or after authority commit `01ba1aac56f0c0c3adf82823c974d53030a9c1e8`, with its query-only shadow validator clean: additive hidden `GitRepository` substrate, deterministic replay-stable Project-ID-partitioned backfill, and dormant singular nullable `WorkScope.repository` attachment.
+- Accepted ADR-032 and merged GitRepository normative specs.
+- A complete repository-sensitive reader/writer/observer/lock/reconciler census, maintained through the implementation diff.
+- One deploy mechanism that structurally excludes every old binary, stale worker, background poller, one-shot runtime, or compatibility writer before new authority activation.
+
+## Provides
+
+- One atomic reader/writer authority cutover from Project to `ProductConversation → WorkScope.repository → hidden GitRepository`.
+- Steady-state hidden-authority writers and observations for identity, locators, default branch with provenance/freshness, scope attachment, creation/provisioning, worktree registry, locking, reconciliation, branch/PR observation, and compatibility projection.
+- Old/stale writer exclusion before deployment.
+- Compatibility direction reversal: any temporarily surviving Project-shaped value is produced read-only from hidden authority and cannot write, select identity, or feed correctness back into it.
+- Removal of correctness-sensitive Project, path-identity, current-branch-as-canonical, and fabricated `main` reads/fallbacks.
+- Creation, approved-task flow, continuation/follow-up, fork resolution, restart repair, startup reconciliation, cleanup inputs, repository mutation locking, and observation all resolve the same hidden repository authority.
+- Deployment, rollback, and acceptance gates proving production never has mixed repository authority.
+
+## Forbids
+
+- Production dual writes, read fallback between Project and GitRepository, mirrored mutable facts, shadow-write promotion, or per-call-site gradual production cutover.
+- Enabling any hidden-authority writer while a running old binary, worker, route, startup path, repair path, or compatibility adapter can still mutate or recreate Project authority.
+- Treating equal backfilled Project/GitRepository bytes as runtime substitutability.
+- Deriving repository identity from path, remote, slug, title, branch, or guessed continuity.
+- Fabricating `main`, treating a checked-out branch as canonical proof, or retaining `projects.main_ref` as a correctness fallback.
+- A visible Repository product, Repository collection, grouping/tabs/lifecycle/workflow, hidden GitRepository ID exposure, or Projects 2.0.
+- Physical Project storage/type/endpoint deletion; C1/task 92016 owns physical legacy deletion and final conceptual QA.
+- Web Project-surface retirement; P1/task 92013 owns presentation retirement. R2 may only make surviving Project-shaped surfaces non-authoritative read-only projections.
+- Close settlement or WorkScope retirement orchestration; L1/task 92033 owns it.
+- History/live Close/permanent Delete; L2/task 92032 owns it.
+- Reinterpreting R1's Project-ID partition as final runtime sameness: distinct R1 seeded identities remain distinct during R1 even for linked worktrees, and R2 may unify them only from complete retained/local Git-common-directory evidence during the fenced cutover.
+- Treating absent R1 locator/default observations as migration defects: task 55006 intentionally creates no observation unless exactly one complete retained source row supplies persisted value/status or branch/provenance plus generation/time.
+- Freezing R1 SQL or Rust API names before task 55006's implementation authority is merged.
+
+## Authority transition
+
+### Before R2
+
+`Project` is the sole live repository authority. R1 hidden repository rows and `WorkScope.repository` attachments are migration-seeded strictly by Project ID and remain dormant read-only shadow data. Distinct Project IDs therefore remain distinct in R1 even when later local evidence may prove linked worktrees share one Git common directory. Locator/default observations may be absent because R1 copies them only from exactly one complete retained source row with persisted generation/time and performs no live probes. Production behavior continues to consult/write Project; no R1 shadow mismatch or absence may be repaired by writing both models.
+
+### After R2
+
+`WorkScope.repository → hidden GitRepository` is the sole live repository authority. A ProductConversation obtains repository context only through its attached WorkScope. Typed pre-scope provisioning evidence may name a hidden repository before a WorkScope exists as allowed by the normative specs. During the fenced transition, R2 resolves the R1 Project-ID partition into steady-state identity: linked worktrees converge only when complete Git-common-directory evidence proves sameness; separate clones remain distinct; absent or contradictory evidence stays typed and cannot trigger path/remote/title guessing. Any retained `project`-named DTO, field, route, or report is a typed read-only compatibility projection/sink from hidden authority and cannot be written or consulted for correctness.
+
+### Merged-main invariant
+
+No running binary, worker, route, startup path, repair path, compatibility path, one-shot driver, background poller, or fallback can make a correctness-sensitive repository decision from Project, canonical path identity, current checkout as canonical proof, or a fabricated/default `main`. No semantic fact is written to both Project and GitRepository representations. Rollback cannot reactivate a binary or stale Project writer against state written after cutover.
+
+## Frozen implementation PR brief
+
+One PR owns the complete authority cutover. Separate commits are encouraged for reviewability—tests/gates, adapters, caller migration, compatibility reversal—but no intermediate commit may be deployed as a mixed-authority production state. If R1 and R2 cannot move all readers and writers together without a deploy window, combine R1 and R2 into one PR with distinct commits and one activation gate; do not weaken the single-authority rule.
+
+The implementation PR must keep the census below current. Every newly found repository-sensitive production caller must be added and classified before code changes are accepted. A caller may be deferred only when its current behavior is observational/presentational and the R2 implementation makes it structurally unable to write or flow back into correctness.
+
+## Atomic deployment sequence and gate matrix
+
+These are deploy gates for one coordinated cutover, not independently deployable production-authority phases.
+
+| Gate | Required state | Project authority | Hidden authority | Proof / abort condition |
+|---|---|---|---|---|
+| G0 — merged prerequisites | #633 and task 55006 are merged; the R1 query-only validator matches its exact Project-ID partition, per-row ownership, attachment, observation-copy/absence, and strict-dormancy rules on the production DB snapshot | sole live authority | dormant shadow only | Abort on any R1 validator mismatch, duplicate contradiction, partial source shape, live-reference leak, schema/version mismatch, or unmet R2 activation prerequisite. R1-valid absence is not itself a mismatch; R2 must resolve or type it without fallback before a consumer needs the fact. No repair dual writes or live R1 probes. |
+| G1 — quiesce and fence | Stop request admission and repository-mutating background work; drain/terminate creation workers, fork actors, direct-turn processes, startup reconcilers, PR pollers that can feed decisions, managed-worktree cleanup, and compatibility writers; fence all production deploy/restart backends and acquire the DB authority-generation claim | sole live authority, read-only during quiescence | disabled | Prove no old process/lease/claim can write. Abort if process identity, backend activation claim, generation, or drain cannot be proven. |
+| G2 — stage exact binary | Stage one exact build containing all R2 readers/writers and a minimum-schema/authority-generation startup check through the active launchd, systemd, or bare-supervisor transaction; do not admit requests or workers yet | disabled by code/schema fence | not yet activated | Startup/activation fails closed unless executable identity, schema, cutover generation, and writer exclusion match. Bare `prod restart` is fenced and may not reactivate a pre-R2 installed binary. There is no runtime feature flag that can switch back to Project. |
+| G3 — DB authority transaction | While service-manager admission remains fenced, validate R1 evidence and R2-required resolution again, record the irreversible authority generation, disable legacy Project mutations, and activate hidden-authority constraints in one DB transaction | retained read-only data/projection only | enabled | The DB transaction rolls back wholly on any mismatch. It does not pretend to atomically include binary files or service-manager handoff; durable backend deployment claims bracket G1–G4. No request/background admission until commit and exact-binary activation are both proven. |
+| G4 — post-cutover reconciliation | Run startup/worktree/restart/default/lock reconciliation only through hidden identity and typed observations; then resume admission and workers | not consulted | sole live authority | Fail closed/quarantine on missing or conflicting identity; never use Project/path/`main` fallback. |
+| G5 — acceptance and monitoring | Exercise creation, approved task, continuation/follow-up, fork, restart, cleanup-input, lock, branch/PR observation, API compatibility, and suggestion journeys; monitor forbidden-write counters and shadow-independent hidden reads | read-only compatibility output at most | sole live authority | Any legacy write/read-for-correctness, hidden-ID exposure, or authority mismatch blocks deployment completion and requires forward fix. |
+
+## Old-binary and stale-worker exclusion
+
+- Persist an authority/schema generation that every repository-sensitive writer checks structurally at DB open and before commit; pre-R2 binaries must be unable to satisfy it.
+- Deployment must quiesce request admission, background creation/fork/PR/reconciliation workers, managed-worktree cleanup, standalone `drive-turn` processes, and every `./dev.py prod deploy`/`prod restart` backend before G3. PID absence alone is insufficient when durable claims, service-manager activation helpers, or queued jobs can outlive a process.
+- In-flight creation claims, fork proposals, cleanup work, and background observation writes must either drain under old authority before G3 or be resumed only by the R2 binary from durable state under hidden authority. They must not straddle the authority transaction.
+- Compatibility routes and old clients may read projections after cutover, but no old client request may invoke a legacy Project writer. Route-level “read only by convention” is insufficient; the adapter type/API must have no write capability.
+- DB schema/trigger constraints must reject legacy Project authority mutations after G3 even if an old process reaches the database.
+- Every server startup path, file DB opener, one-shot runtime, and repair utility must enforce the same minimum authority generation. No alternate opener may bypass the fence.
+
+## Rollback and forward-fix posture
+
+After G3, rollback or bare-supervisor `prod restart` to a pre-R2 binary is prohibited: either could recreate stale Project authority or ignore post-cutover hidden writes. Launchd, systemd, and bare-supervisor rollback artifacts may restore executable files only before authority activation. Because filesystem/service activation and the SQLite authority transaction cannot be one transaction, durable backend claims must distinguish pre-G3 rollback-safe state from post-G3 roll-forward-only state. Once G3 commits, recovery is roll-forward with the same hidden authority.
+
+A post-G3 application failure may stop admission and deploy a fixed R2-compatible binary. It must not reverse the authority generation, copy hidden facts back into Project, re-enable Project triggers/writers, or consult retained Project data as fallback. Restoring a full pre-cutover database snapshot is an operator disaster-recovery action requiring proof that no post-snapshot external or filesystem mutation is being treated as retained authority; it is not ordinary deployment rollback.
+
+## Compatibility projection contract
+
+- Compatibility direction is hidden authority → typed projection/sink only.
+- A compatibility projection may expose only existing client-needed presentation values, never hidden `GitRepository` identity.
+- Existing branch-observation `repository_identity` strings are path/remote observations, not hidden identity. They may remain display-only only if structurally separated and renamed/typed so the backend can never populate them with, or accept them as, the hidden GitRepository ID.
+- It may not accept writes, select a repository, resolve a canonical default, authorize cleanup, key a mutation lock, infer sameness, seed reconciliation, or feed its output back into hidden persistence.
+- `project_id`-shaped filtering keys cannot be aliases of hidden IDs. If P1 still needs an old response shape, use an explicit compatibility-only token/value whose type cannot enter repository-domain APIs.
+- `/api/projects`, `Project` DTOs, nested SSE-init `conversation.project_id`, top-level SSE-init `project_name`, sidebar filters, usage grouping, task listings, and global-read reports are allowed to survive R2 only where P1/C1 owns removal and only after they are proven read-only projections. R2 must remove any use of those surfaces as creation, cleanup, lock, fork, or lookup inputs. Compatibility values must be structurally distinct from hidden repository identity and from authority-bearing domain inputs; raw-string convention is insufficient.
+- Recent location suggestions must follow REQ-API-001A: at most one present management-root locator per hidden repository, linked worktrees collapsed, separate clones distinct, ordered by surviving conversation/scope evidence, with no Repository collection or hidden ID.
+
+## Repository-authority call-site census
+
+Legend: **critical** means it must move in the atomic R2 cutover. “Projection allowed” means the named shape may remain temporarily only as a typed hidden→legacy read-only output; it does not permit fallback/backflow.
+
+| Symbol / path | Operation | Current authority or fallback | Required post-R2 authority | Critical | Projection allowed | Validation owner | Deferred owner |
+|---|---|---|---|---:|---:|---|---|
+| `Database::find_or_create_project` — `crates/phoenix-db/src/lib.rs` | read/write identity + default | canonical path lookup; creates Project; unresolved default becomes literal `main` | hidden repository resolver/creator from retained local identity evidence; typed locator/default observations; never path identity or fabricated default | yes | no for API; old rows may remain read-only | phoenix-db migration/repository tests | C1 removes legacy storage/API |
+| `Database::get_project`, `list_projects`, `update_project_main_ref` — `crates/phoenix-db/src/lib.rs` | read/write/reconcile | Project row supplies path/default; startup writes repaired `main_ref` | hidden repository/locator/default readers and writers; legacy query, if retained, is projection-only and has no update API | yes | read projection only | phoenix-db + startup tests | P1 removes UI use; C1 deletes APIs/storage |
+| `create_conversation_with_project`, conversation insert/update/continuation/handoff `project_id` threading — `crates/phoenix-db/src/lib.rs` | write/read attachment | conversation directly stores/inherits Project identity | ProductConversation derives through attached WorkScope; fresh scope gets singular repository attachment; pre-scope evidence is typed | yes | response field only if typed sink | phoenix-db creation/continuation/handoff tests | P1 wire removal; C1 column/type deletion |
+| `Database::has_active_work_conversation(project_id)` — `crates/phoenix-db/src/lib.rs` | correctness read | Project groups active work | query exact surviving WorkScope attachments by hidden repository, without repository-level product ownership | yes | no | phoenix-db work-scope tests | none |
+| `insert_work_scope_tx`, `update_work_scope_environment_tx` — `crates/phoenix-db/src/lib.rs` | write | scope environment is path/branch-shaped; no live repository relation | single R1-provided WorkScope repository attachment plus typed locator/worktree observations | yes | environment values remain observations | phoenix-db WorkScope tests | L1 owns retirement use |
+| `Database::reconcile_worktree_identities` and all DB-open callers — `crates/phoenix-db/src/lib.rs`, `crates/phoenix-ide/src/lib.rs`, `drive_turn.rs` | reconcile | path and `.git` marker repair worktree identity | exact WorkScope + hidden repository + worktree identity/fingerprint; conflict/inaccessible/missing typed and fail closed | yes | no | phoenix-db reconciliation + DB-open tests | L1 consumes retirement evidence |
+| `project_id_for_cwd`, `run` — `crates/phoenix-ide/src/drive_turn.rs` | write/create/startup | detects path, creates Project, runs Project `main_ref` reconciliation | attach Direct scope to hidden repository only when local identity resolves; same authority-generation startup fence as server | yes | no | drive-turn integration tests | none |
+| `provision_conversation` / creation metadata commit — `crates/phoenix-ide/src/runtime/creation_worker.rs` | read/write/provision | `find_or_create_project`; warns and continues without Project; requested/current branch fallbacks; persists `project_id` | typed pre-scope repository evidence; canonical provenanced default; atomically attach repository only after resolved provisioning; unresolved is typed, no guessed scope/default | yes | SSE compatibility output only | creation worker/retry/crash tests | none |
+| repository creation mutation lock (`RepositoryMutationLock::acquire` and every worktree/ref mutation path) — `creation_worker.rs` and git/worktree helpers | lock | filesystem common-dir lock derived from path | serialize by canonical hidden repository identity across live processes; locator used only to implement lock after identity is selected | yes | no | concurrent creation/worktree tests | none |
+| `approve_task` project gate — `crates/phoenix-ide/src/api/lifecycle_handlers.rs` | correctness read | `conv.project_id.is_some()` defines Git-backed task eligibility | derive Git-backed eligibility and attached write context through exact WorkScope.repository, not Project presence | yes | no | lifecycle/API approval tests | none |
+| `create_task_approval_handoff_conversation`, continuation/follow-up constructors — `crates/phoenix-db/src/lib.rs` | read/write | inherits Project and WorkScope fields together | continuation retains same scope/repository; fresh follow-up creates fresh scope that may attach same hidden repository; no Project inheritance authority | yes | wire projection only | phoenix-db handoff/continuation tests | none |
+| `fork_origin_repo_root`, `load_resolvable_proposal`, `prepare_spawn_blocking`, `prepare_promote_blocking`, child persistence — `crates/phoenix-ide/src/runtime/fork_resolve.rs` | read/resolve/write/reconcile | `conv.project_id → Project.canonical_path/main_ref`; falls back to stored path if repo detection fails | exact origin ProductConversation scope→hidden repository; present locator; admissible canonical-default evidence; no path or Project fallback | yes | breadcrumb only | fork resolve/restart/orphan tests | none |
+| `resolve_default_branch`, `resolve_remote_default_branch` — `crates/phoenix-core/src/git.rs` and callers | observe | remote HEAD else currently checked-out branch; some callers fabricate `main` | record optional branch+provenance+observed_at; canonical consumers require remote-head or separate corroboration; unresolved remains unresolved | yes | branch display observation | phoenix-core git + creation tests | none |
+| `reconcile_project_main_refs`, `local_branch_exists` — `crates/phoenix-ide/src/lib.rs` and `drive_turn.rs` | startup reconcile/write | scans Project; special-cases literal `main`; current-branch repair | retired from correctness; startup updates hidden default observations with provenance and does not fabricate/canonize current branch | yes | no | startup default-observation tests | C1 deletes old implementation |
+| `reclaim_unowned_worktrees`, `add_physical_project_worktrees`, `reclaim_unowned_worktree` — `crates/phoenix-ide/src/lib.rs` | startup observe/reconcile/cleanup | lists Project roots, scans `.phoenix/worktrees`, path ownership; may delete branch | inventory by hidden repository locator + exact WorkScope/worktree registry; quarantine uncertainty; repository refs remain user-owned | yes | no | startup orphan/dirty/inaccessible/submodule tests | L1 owns Close retirement, not startup orphan reconciliation |
+| `cleanup_managed_worktree`, `cleanup_managed_worktree_inner`, `/api/deployment/disk/managed-worktrees/cleanup` — `crates/phoenix-ide/src/api/deployment.rs`, `api/handlers.rs` | destructive cleanup/branch deletion | user-supplied worktree path + managed-conversation query + path-derived repository root authorizes forced removal/prune/branch delete | exact WorkScope→hidden repository + worktree registry/identity authorizes the target; locator only executes after authority selection; no path-only fallback | yes | no | deployment managed-worktree cleanup/foreign-path/branch tests | none |
+| startup `reconcile_worktrees` / missing worktree handling — `crates/phoenix-ide/src/lib.rs` | reconcile/repair | conversation mode/path and row-terminal legacy repair | keep ProductConversation Open; persist immutable missing/inaccessible evidence bound to ProductConversation, exact WorkScope, hidden repository, worktree identity/fingerprint, generation/time | yes | no | restart integration tests | L1 adopts evidence during exact Close attempt |
+| `cascade_project_target`, `cascade_projects_on_delete`, `run_resource_cleanup_cascade` — `crates/phoenix-ide/src/api/handlers.rs` | read/cleanup | mode/worktree path + Project root; Project lookup failure falls back to filesystem-only deletion | any surviving pre-L2 cleanup input derives repository/worktree through WorkScope.hidden authority and fails closed; no Project/path fallback | yes | no | cleanup/hard-delete regression tests | L1/L2 replace orchestration; C1 deletes legacy path |
+| legacy `abandon_task` / `mark_merged` Project-root reads — `crates/phoenix-ide/src/api/lifecycle_handlers.rs` | read/cleanup | Project path authorizes snapshot/cleanup | while compatibility verbs survive, they execute same Close contract and resolve only hidden authority; no independent cleanup path | yes | no | lifecycle compatibility tests | L1/L2 own live Close; C1 removes verbs |
+| `task_entries_for_cwd`, project task routes — `crates/phoenix-ide/src/api/handlers.rs` | read/join | maps cwd→Project→conversations; falls back to path equality | repository-context join from hidden repository/WorkScope or a presentation-only path query that cannot claim identity | yes where it joins conversations | read-only projection | API task-list tests | P1 presentation; C1 endpoint cleanup |
+| `search_project_files`, `list_project_skills`, `ResolutionRoot::for_create`, `GitStartPoint::for_inline_discovery` — `crates/phoenix-ide/src/api/handlers.rs`, `resolution_root.rs`, `git_start.rs` | pre-scope read/materialize | `/new` composer accepts cwd/mode/base branch and chooses working directory versus Git-tree materialization before a conversation/WorkScope exists | typed pre-scope repository evidence resolves hidden repository/locator/ref; explicit Direct non-repository directory remains typed as such; no Project/path/default-main authority fallback | yes | file/skill results only | composer file-search/skill-discovery/Git-tree cleanup tests | none |
+| `list_projects` HTTP route and router registration — `crates/phoenix-ide/src/api/handlers.rs` | API read | exposes Project collection directly | no Repository collection; if endpoint cannot be removed until P1, return explicit compatibility recent-location projection with no hidden ID and no authority input | yes for direction reversal | narrow read projection only | API contract + UI integration tests | P1 removes product surface; C1 removes endpoint/type |
+| SSE/init/list enrichment: nested `conversation.project_id`, top-level `project_name`, creation update — `api/handlers.rs`, `api/sse.rs`, `api/wire.rs`, `runtime/creation_worker.rs` | API/SSE projection | legacy Project ID/path name comes from Project lookup and is merged into the general conversation model | structurally separate compatibility projection from WorkScope.repository context; no hidden ID and no backflow into requests/domain APIs | yes for safety | yes | SSE parity/codegen/UI schema tests | P1 removes Project presentation; C1 removes fields |
+| `global_read::coordinator_snapshot` — `crates/phoenix-ide/src/api/global_read.rs` | global query/report | emits Project IDs beside scope/conversation | diagnostic projection may describe repository context without hidden ID; must never become an input or alternative aggregate | no if isolated | yes, diagnostic sink only | global-read snapshot tests | C1 removes legacy field |
+| usage aggregation `ProjectUsage` / `project_id` — `crates/phoenix-ide/src/api/usage.rs` | global query/API | groups semantics by Project ID | no repository product grouping; temporarily project-shaped grouping only if derived, non-identifying, and required by an existing client | no if isolated | yes | usage API/UI tests | P1/C1 |
+| sidebar `getProjects`, Project rail/filter/localStorage — `ui/src/components/Sidebar.tsx`, `ui/src/hooks/useCreateConversation.ts`, API client/cache | API/UI read | Project collection/ID filters and path suggestions | R2 can retain only read-only location/conversation projection with no hidden ID; cannot feed creation identity; REQ-API-001A suggestion semantics | yes for anti-backflow | yes | Sidebar/NewConversation/client cache tests | P1/task 92013 retires Project surface |
+| branch listing/search — `crates/phoenix-ide/src/api/git_handlers.rs` | observe/API | cwd chooses repository; remote search cache can be path/slug keyed | resolve observation context through WorkScope.repository; cache keyed internally by hidden identity; return branch facts without hidden ID | yes | yes, branch observations | git handler + cache tests | none |
+| PR status/diff/selection handlers — `api/git_handlers.rs`, `api/pr_monitoring.rs` | observe/read/write projection | worktree path + remote owner/name; active selection is WorkScope-based; some local path identity fallback | WorkScope.repository grounds local repository; remote identity remains observation; active PR stays WorkScope authority; no Project/path fallback | yes where repo matching/selection depends on identity | yes, PR summaries | PR association/diff tests | none |
+| `ObservedBranchSummaryResponse.repository_identity`, `ActivePrBranchContext.repository_identity`, StateBar branch display — `api/types.rs`, `phoenix-core/domain/active_pr_selection.rs`, `ui/src/api.ts`, `ui/src/components/StateBar.tsx` | API/UI observe/display | raw string contains local-path or remote repository observation and is rendered client-side | display-only typed path/remote label, structurally impossible to contain or accept hidden GitRepository ID; backend matching resolves through WorkScope.repository separately | yes for leak/backflow prevention | display projection only | API type/codegen/StateBar/PR selection tests | P1 may revise presentation |
+| `runtime::pr_status_poll::{collect_targets,poll_target}` and startup spawn — `runtime/pr_status_poll.rs`, `api.rs` | background observe/write | scope + worktree path + remote slug, with local-path fallback | resolve scope→hidden repository and locator; write only observations/selection under current authority generation; stop at quiesce | yes | yes, observation output | poller stale-generation/restart tests | none |
+| creation/fork/background command actors and durable claims — `runtime.rs`, `runtime/fork_resolve.rs`, `runtime/executor.rs` | worker/reconcile | can outlive request and resume Project-sensitive work | authority generation checked at claim/resume/commit; pre-G3 work drained or resumed only under R2; stale actor cannot commit | yes | no | crash/restart/concurrency tests | none |
+| production activation/restart paths: launchd/systemd/bare-supervisor deploy helpers and bare `prod_daemon_restart` — `dev.py`, `scripts/launchd_deploy_helper.py`, `scripts/systemd_deploy_helper.py`, `scripts/bare_supervisor.py` | deploy/restart/fence | service-manager and filesystem transactions can restore/reuse an installed binary independently of SQLite authority state | durable backend claim brackets DB generation flip; exact executable identity required; pre-G3 rollback only, post-G3 roll-forward only; restart cannot reactivate old authority | yes | no | disposable deployment-backend harness | none |
+| Project schema/migrations/legacy fixtures — `crates/phoenix-db/src/ddl.rs`, `migrations.rs`, DB tests | persistence/test | `projects.canonical_path`, `main_ref DEFAULT 'main'`, `conversations.project_id` encode authority | retained only as R1 backfill source and post-R2 read-only compatibility data until C1; new tests assert legacy writes rejected | yes | retained rows only | migration replay + schema guard tests | C1 physical deletion |
+| Project/main/path authority fixtures — Rust tests plus `ui/src/fixtures/**` | test/fixture | encode `project_id`, Project arrays, path identity, `main_ref: main` | convert R2-critical tests to hidden authority/unresolved/provenance cases; retain only explicit compatibility fixtures labeled projection-only | yes for critical tests | yes for P1 fixtures | owning Rust/UI test suites | P1/C1 remove legacy fixtures |
+
+## Explicit search closure and negative gates
+
+Implementation review must repeat a repository-wide production search (not only changed files) for at least:
+
+`find_or_create_project`, `get_project`, `list_projects`, `update_project_main_ref`, `project_id`, `Project`, `canonical_path`, `main_ref`, `resolve_default_branch`, `resolve_remote_default_branch`, literal/default `main`, `detect_git_repo_root`, `worktree_path`, `repo_root_from_phoenix_worktree`, repository mutation locks, creation claims, fork consumers, startup reconcilers, cleanup cascades including `/api/deployment/disk/managed-worktrees/cleanup`, pre-scope composer `search_project_files`/`list_project_skills`/`ResolutionRoot::for_create`/`GitStartPoint::for_inline_discovery`, branch/PR cache keys and `repository_identity` response fields, `/api/projects`, `getProjects`, Project filters, every DB opener, and every production deploy/restart helper.
+
+Classify literal `main` occurrences rather than mechanically banning test repository branch names. The forbidden class is a synthetic/default/correctness fallback; an explicit user branch, fixture branch under test, or observed branch value is not automatically wrong.
+
+Add compile/CI guards or architectural tests that fail when:
+
+- a production caller invokes legacy Project write APIs;
+- a correctness-sensitive module imports a Project compatibility DTO;
+- a hidden GitRepository ID enters API/SSE/UI generated types;
+- an old DB opener bypasses authority generation;
+- a canonical-default consumer accepts unresolved, `local_checked_out_branch`, or fabricated `main` as canonical;
+- a compatibility projection can be passed to repository-domain write/selection APIs;
+- a post-cutover SQL write mutates Project authority columns.
+
+## Acceptance evidence
+
+- [ ] Final R1 task path/commit is reconciled above; #633 and R1 are merged on the implementation base.
+- [ ] R1 query-only shadow validation is clean immediately before G3 on the exact target DB: Project-ID partition and cardinality, exact owned-field equality, WorkScope attachment equality, observation copy-or-absence rules, duplicate-contradiction failure, and strict dormancy all match task 55006. R1-valid absence remains absence until R2 resolves or types it without fallback.
+- [ ] R2 identity-resolution tests prove linked R1 Project partitions converge only from complete Git-common-directory evidence, separate clones stay distinct, contradictory evidence fails closed, and no path/remote/title heuristic guesses sameness.
+- [ ] The census is refreshed against implementation HEAD and every repository-sensitive production caller is migrated or structurally quarantined as a read-only sink.
+- [ ] Migration/schema tests prove one irreversible authority generation, hidden-authority constraints, legacy Project write rejection, deterministic old-row handling, and no dual writes.
+- [ ] Creation tests cover Git/non-Git, canonical remote default, stale cached canonical evidence, unresolved default, no fabricated scope/default, crash/retry, and concurrent same-repository creation.
+- [ ] Pre-scope composer tests prove file/skill discovery and Git-tree materialization use typed repository evidence without Project/path/default-main authority fallback, while explicit Direct non-repository directories remain supported.
+- [ ] Approved-task, continuation, and fresh follow-up tests prove repository attachment semantics through WorkScope and no Project inference.
+- [ ] Fork tests prove repository locator/default resolution from hidden authority, absent/inaccessible/conflicting evidence failure, restart/orphan recovery, and no Project/path fallback.
+- [ ] Startup/restart tests prove exact worktree reconciliation and immutable missing/inaccessible repair evidence through hidden authority; current branch/path reuse never proves continuity.
+- [ ] Cleanup-input tests prove no filesystem-only or Project-root fallback can authorize destructive work; Close/retirement behavior remains deferred to L1/L2.
+- [ ] Cross-process mutation tests prove canonical hidden-repository locking and stale writer/claim exclusion.
+- [ ] Branch/PR tests prove observation caches and local-repository matching use the hidden authority internally without exposing its ID or turning remote identity into local identity.
+- [ ] Public branch-observation tests prove path/remote display labels cannot serialize a hidden GitRepository ID or enter repository-domain selection/write APIs; active-PR matching uses WorkScope.repository internally.
+- [ ] API/SSE/UI tests prove any retained Project-shaped surface is read-only hidden→compatibility projection, cannot feed creation/cleanup/selection, and exposes no hidden ID.
+- [ ] REQ-API-001A recent-location tests prove linked-worktree collapse, separate-clone distinction, present management-root locators only, ordering by surviving evidence, and no Repository collection.
+- [ ] Disposable launchd/systemd/bare-supervisor deployment harness proves G0–G5, including quiesce, exact-binary identity, activation-claim/DB-generation ordering, old DB opener rejection, bare `prod restart` fencing, pre-G3 backend rollback, DB transaction rollback, and post-G3 roll-forward-only recovery.
+- [ ] A pre-R2 binary and stale worker are demonstrably unable to write after G3.
+- [ ] Focused crate/UI/spec/codegen checks and `./dev.py check --all` pass on exact implementation HEAD.
+- [ ] Adversarial exact-head review finds no omitted caller, dual-authority window, stale binary path, compatibility backflow, false API lock, Projects-2.0 leakage, or absorbed L1/L2/P1/C1 scope.
+
+## Non-goals and later owners
+
+- **L1 / task 92033:** live Close settlement, authority release, fresh loss inspection, resource-admission fencing, destructive WorkScope retirement, evidence recording, retry, and crash recovery through retirement.
+- **L2 / task 92032:** live Close finalization, durable outcome message, History transition/listing, exact replay, lifecycle-aware archive/Delete.
+- **P1 / task 92013:** web ProductConversation presentation and Project UI/surface retirement; R2 only reverses compatibility direction and blocks backflow.
+- **C1 / task 92016:** physical legacy Project table/column/type/endpoint deletion, obsolete compatibility removal, and conceptual 1.0 QA.
+- iOS vNext begins only after L2's stable client aggregate contract.
+- Task 98005 begins only after P1.
+- No new user-facing Repository domain, title, collection, grouping, lifecycle, task inventory, branch inventory, or PR workflow.
+
+## Feedback routing
+
+Classify every discovery before changing scope:
+
+- `FIX-NOW`: omitted R2 repository-authority reader/writer/observer/lock/reconciler, a mixed-authority deploy window, stale-writer escape, compatibility backflow, or hidden-ID leak.
+- `PREREQUISITE`: #633 or final R1 schema/backfill/shadow-validation defect. Return it to that owner; do not work around it in R2.
+- `DEFER:L1/92033`: Close settlement or WorkScope retirement orchestration.
+- `DEFER:L2/92032`: live Close, History finalization, or permanent Delete.
+- `DEFER:P1/92013`: web Project-surface/presentation retirement after compatibility is already read-only.
+- `DEFER:C1/92016`: physical Project storage/type/endpoint deletion and obsolete compatibility cleanup.
+- `UNRELATED:<workstream>`: anything outside this authority seam; record and route without absorbing it.
+
+Any uncertainty about whether a site can affect correctness is resolved conservatively: treat it as R2-critical until its type and dataflow prove it is a terminal read-only projection.
