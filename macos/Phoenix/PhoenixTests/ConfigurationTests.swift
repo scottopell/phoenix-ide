@@ -103,6 +103,20 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(built.absoluteString, "https://[::1]:8031")
     }
 
+    func testSecurityOriginURLBuilderTreatsWebKitZeroPortAsOmitted() throws {
+        let built = try XCTUnwrap(PhoenixWebViewPolicy.url(
+            for: SecurityOriginDescriptor(scheme: "https", host: "phoenix.example.test", port: 0)
+        ))
+        XCTAssertEqual(built.absoluteString, "https://phoenix.example.test")
+        XCTAssertEqual(
+            PhoenixWebViewPolicy.notificationDecision(
+                for: SecurityOriginDescriptor(scheme: "https", host: "phoenix.example.test", port: 0),
+                expectedOrigin: try PhoenixOrigin("https://phoenix.example.test")
+            ),
+            .grant
+        )
+    }
+
     func testMediaCapturePolicyAllowsOnlyExactOriginMicrophone() throws {
         let expected = try PhoenixOrigin("https://[::1]:8031")
         let descriptor = SecurityOriginDescriptor(scheme: "https", host: "::1", port: 8031)
@@ -1468,16 +1482,43 @@ final class ServerManagerHelpersTests: XCTestCase {
     func testDeepLinkValidationOutcomeRetainsQueuedConversationAcrossAuthenticationChallenge() {
         XCTAssertEqual(
             DeepLinkValidationOutcome.evaluate(.authenticationRequired),
-            DeepLinkValidationOutcome(shouldClearAuthenticationGate: true, shouldRetainPendingConversation: true)
+            DeepLinkValidationOutcome(
+                shouldClearAuthenticationGate: true,
+                shouldRetainPendingConversation: true,
+                shouldReenterAuthentication: true
+            )
         )
         XCTAssertEqual(
             DeepLinkValidationOutcome.evaluate(.invalidHTTPStatus(401)),
-            DeepLinkValidationOutcome(shouldClearAuthenticationGate: true, shouldRetainPendingConversation: true)
+            DeepLinkValidationOutcome(
+                shouldClearAuthenticationGate: true,
+                shouldRetainPendingConversation: true,
+                shouldReenterAuthentication: true
+            )
         )
         XCTAssertEqual(
             DeepLinkValidationOutcome.evaluate(.invalidHTTPStatus(500)),
-            DeepLinkValidationOutcome(shouldClearAuthenticationGate: false, shouldRetainPendingConversation: false)
+            DeepLinkValidationOutcome(
+                shouldClearAuthenticationGate: false,
+                shouldRetainPendingConversation: false,
+                shouldReenterAuthentication: false
+            )
         )
+    }
+
+    func testBrowserOwnedSurfacesCloseWheneverConnectionStopsDisplayingWebView() {
+        XCTAssertTrue(BrowserSurfaceOwnershipDecision.shouldCloseOwnedSurfaces(
+            hasBrowserOperation: true,
+            stateCanDisplayWebView: false
+        ))
+        XCTAssertFalse(BrowserSurfaceOwnershipDecision.shouldCloseOwnedSurfaces(
+            hasBrowserOperation: true,
+            stateCanDisplayWebView: true
+        ))
+        XCTAssertFalse(BrowserSurfaceOwnershipDecision.shouldCloseOwnedSurfaces(
+            hasBrowserOperation: false,
+            stateCanDisplayWebView: false
+        ))
     }
 
     func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {

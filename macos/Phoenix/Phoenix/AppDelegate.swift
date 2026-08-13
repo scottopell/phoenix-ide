@@ -172,7 +172,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if let browserOperation, browserOperation != currentOperation {
+        if let browserOperation,
+           BrowserSurfaceOwnershipDecision.shouldCloseOwnedSurfaces(
+               hasBrowserOperation: true,
+               stateCanDisplayWebView: state.canDisplayWebView
+           ) {
             pendingConversationValidationTask?.cancel()
             browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
             self.browserOperation = nil
@@ -271,6 +275,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 if decision.shouldClearAuthenticationGate {
                     self.isPrimaryWebViewAuthenticated = false
+                }
+                if decision.shouldReenterAuthentication {
+                    self.serverManager.deploymentRequiresAuthentication(operation: operation)
+                    validationWebView.load(URLRequest(url: validationOrigin.url(path: "/")))
                 }
                 if !decision.shouldRetainPendingConversation {
                     self.pendingConversationID = nil

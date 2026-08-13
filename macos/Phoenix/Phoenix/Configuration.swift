@@ -249,20 +249,32 @@ struct DeepLinkNavigationDecision {
 struct DeepLinkValidationOutcome: Equatable {
     let shouldClearAuthenticationGate: Bool
     let shouldRetainPendingConversation: Bool
+    let shouldReenterAuthentication: Bool
 
     static func evaluate(_ error: DeepLinkValidationError) -> DeepLinkValidationOutcome {
         switch error {
         case .authenticationRequired, .invalidHTTPStatus(401):
             return DeepLinkValidationOutcome(
                 shouldClearAuthenticationGate: true,
-                shouldRetainPendingConversation: true
+                shouldRetainPendingConversation: true,
+                shouldReenterAuthentication: true
             )
         default:
             return DeepLinkValidationOutcome(
                 shouldClearAuthenticationGate: false,
-                shouldRetainPendingConversation: false
+                shouldRetainPendingConversation: false,
+                shouldReenterAuthentication: false
             )
         }
+    }
+}
+
+struct BrowserSurfaceOwnershipDecision {
+    static func shouldCloseOwnedSurfaces(
+        hasBrowserOperation: Bool,
+        stateCanDisplayWebView: Bool
+    ) -> Bool {
+        hasBrowserOperation && !stateCanDisplayWebView
     }
 }
 
@@ -841,7 +853,7 @@ struct PhoenixWebViewPolicy {
             ? "[\(securityOrigin.host)]"
             : securityOrigin.host
         var value = "\(securityOrigin.scheme)://\(host)"
-        if securityOrigin.port >= 0 {
+        if securityOrigin.port > 0 {
             value += ":\(securityOrigin.port)"
         }
         return URL(string: value)
