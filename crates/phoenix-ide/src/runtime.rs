@@ -1827,7 +1827,9 @@ impl RuntimeManager {
             (ResourceScopeKey::Work(_), Some(BashTerminalEffect::InventoryAndBranchReconcile)) => {
                 BashLifecycleBridgeAction::Reconcile
             }
-            (ResourceScopeKey::Work(_), _) => BashLifecycleBridgeAction::Broadcast,
+            (ResourceScopeKey::Work(_) | ResourceScopeKey::Unattached(_), _) => {
+                BashLifecycleBridgeAction::Broadcast
+            }
             (ResourceScopeKey::Coordinator | ResourceScopeKey::GlobalTerminal, _) => {
                 BashLifecycleBridgeAction::Ignore
             }
@@ -2682,10 +2684,9 @@ impl RuntimeManager {
         conv_context.effective_effort = self
             .llm_registry
             .effective_effort(&spec.model_id, conv.effort);
-        conv_context.resource_scope = crate::work_scope::ResourceScopeKey::Work(
-            conv.attached_work_scope_id
-                .clone()
-                .expect("sub-agent conversations always have a work scope"),
+        conv_context.resource_scope = conv.attached_work_scope_id.clone().map_or_else(
+            || crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone()),
+            crate::work_scope::ResourceScopeKey::Work,
         );
         conv_context.resource_authority = match spec.mode {
             SubAgentMode::Explore => crate::work_scope::ResourceAuthority::Restricted,
@@ -3107,6 +3108,9 @@ impl RuntimeManager {
             Some(scope) => crate::work_scope::ResourceScopeKey::Work(scope),
             None if conv.runtime_role == crate::work_scope::RuntimeRole::Coordinator => {
                 crate::work_scope::ResourceScopeKey::Coordinator
+            }
+            None if is_sub_agent => {
+                crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
             }
             None => return Err("ordinary conversation is missing its work scope".to_string()),
         };

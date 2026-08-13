@@ -482,6 +482,9 @@ impl TmuxRegistry {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
             }
+            ResourceScopeKey::Unattached(conversation_id) => {
+                socket_path_for(&self.socket_dir, conversation_id)
+            }
             ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),
         };
@@ -769,6 +772,9 @@ impl TmuxRegistry {
         match work_scope {
             ResourceScopeKey::Work(id) => {
                 socket_path_for_worktree(&self.socket_dir, Path::new(id.as_str()))
+            }
+            ResourceScopeKey::Unattached(conversation_id) => {
+                socket_path_for(&self.socket_dir, conversation_id)
             }
             ResourceScopeKey::Coordinator => socket_path_for_coordinator(&self.socket_dir),
             ResourceScopeKey::GlobalTerminal => socket_path_for_global(&self.socket_dir),

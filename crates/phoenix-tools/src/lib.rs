@@ -180,6 +180,9 @@ pub trait WakeRegistrar: Send + Sync {
 pub fn work_scope_identity(scope: &ResourceScopeKey) -> Result<WorkScopeIdentity, String> {
     match scope {
         ResourceScopeKey::Work(id) => Ok(WorkScopeIdentity(id.as_str().to_string())),
+        ResourceScopeKey::Unattached(_) => {
+            Err("unattached scope cannot own a durable wake".to_string())
+        }
         ResourceScopeKey::Coordinator => {
             Err("coordinator scope cannot own a durable wake".to_string())
         }

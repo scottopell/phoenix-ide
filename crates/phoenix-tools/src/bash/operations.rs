@@ -2027,6 +2027,7 @@ mod tests {
         let worktree_path = None;
         let conversation_id = match work_scope {
             ResourceScopeKey::Work(id) => id.as_str().to_string(),
+            ResourceScopeKey::Unattached(conversation_id) => conversation_id.clone(),
             ResourceScopeKey::Coordinator => "coordinator".to_string(),
             ResourceScopeKey::GlobalTerminal => "conv-global".to_string(),
         };
