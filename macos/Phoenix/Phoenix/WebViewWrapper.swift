@@ -409,7 +409,7 @@ struct WebViewWrapper: NSViewRepresentable {
                 download.cancel { _ in }
                 return
             }
-            browserEnvironment.downloadManager.attach(download: download, operation: operation)
+            browserEnvironment.downloadManager.attach(download: download, operation: operation, origin: origin)
         }
     }
 }
@@ -553,10 +553,13 @@ final class DownloadManager {
     private var activeDownloads: [ObjectIdentifier: ActiveDownload] = [:]
     private var reservations = DownloadDestinationReservationState()
 
-    func attach(download: WKDownload, operation: ServerManager.ConnectionOperationToken) {
+    func attach(download: WKDownload, operation: ServerManager.ConnectionOperationToken, origin: PhoenixOrigin) {
         let delegate = DownloadDelegate(
             reserveDestination: { [weak self] download, response, suggestedFilename in
-                self?.reserveDestination(for: download, response: response, suggestedFilename: suggestedFilename)
+                guard let self,
+                      let responseURL = response.url,
+                      origin.exactlyMatches(responseURL) else { return nil }
+                return self.reserveDestination(for: download, response: response, suggestedFilename: suggestedFilename)
             },
             onFinish: { [weak self] finishedDownload in
                 self?.finishDownload(finishedDownload)

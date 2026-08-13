@@ -45,11 +45,12 @@ Debug builds may omit the sidecar and use attached mode. Release builds fail unl
 
 ```bash
 PHOENIX_SIDECAR_PATH=/absolute/path/to/phoenix_ide \
+PHOENIX_EXPECTED_BUILD_IDENTITY="$(/absolute/path/to/phoenix_ide --build-identity)" \
   xcodebuild -project macos/Phoenix/Phoenix.xcodeproj \
   -scheme Phoenix -configuration Release build
 ```
 
-The packaging phase copies the executable to `Contents/Helpers/phoenix_ide`, removes any stale helper during Debug no-sidecar builds, checks the packaged helper's architectures, and verifies nested signing when code signing is enabled. The app and sidecar form one release artifact; managed Phoenix's deployment updater does not own this sidecar.
+The packaging phase copies the executable to `Contents/Helpers/phoenix_ide`, removes any stale helper during Debug no-sidecar builds, checks the packaged helper's architectures and exact expected Phoenix build identity, and verifies nested signing when code signing is enabled. The app and sidecar form one release artifact; managed Phoenix's deployment updater does not own this sidecar.
 
 Signed hardened-runtime builds also require the `com.apple.security.device.audio-input` entitlement for WebKit microphone capture; Phoenix.app includes it and still denies camera-only or combined camera/microphone requests.
 
