@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from './StateBar';
@@ -465,8 +465,12 @@ describe('StateBar PR badge', () => {
     const trigger = screen.getByTestId('active-pr-selector-trigger');
     fireEvent.click(trigger);
     expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveAttribute('tabindex', '0');
+    expect(screen.getByTestId('active-pr-choice-34')).toHaveAttribute('tabindex', '-1');
     fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'ArrowDown' });
     expect(screen.getByTestId('active-pr-choice-34')).toHaveFocus();
+    expect(screen.getByTestId('active-pr-choice-12')).toHaveAttribute('tabindex', '-1');
+    expect(screen.getByTestId('active-pr-choice-34')).toHaveAttribute('tabindex', '0');
     fireEvent.keyDown(screen.getByTestId('active-pr-choice-34'), { key: 'Home' });
     expect(screen.getByTestId('active-pr-choice-12')).toHaveFocus();
     fireEvent.keyDown(screen.getByTestId('active-pr-choice-12'), { key: 'End' });
@@ -690,7 +694,7 @@ describe('StateBar model picker enablement (task 02713)', () => {
     setMobileViewport(true);
     renderWithState({ type: 'llm_requesting', attempt: 1 });
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
-    expect(screen.getByText(/Locked while the current operation is running/i)).toBeInTheDocument();
+    expect(screen.getByText(/locked until the current operation settles/i)).toBeInTheDocument();
     expect(screen.queryByRole('dialog', { name: /model, effort, and speed/i })).not.toBeInTheDocument();
   });
 
@@ -705,7 +709,19 @@ describe('StateBar model picker enablement (task 02713)', () => {
 
     fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
     expect(screen.getByText(/gpt-5.6-sol/i).closest('.conv-model')).toHaveTextContent('Fast');
-    expect(screen.getByText(/change model, effort, or speed/i)).toBeInTheDocument();
+    expect(screen.getByText(/locked until the current operation settles/i)).toBeInTheDocument();
+  });
+
+  it('does not show active-operation guidance in terminal states', () => {
+    setMobileViewport(true);
+    renderStateBar({
+      convState: { type: 'terminal' },
+      availableModels: pickerModels,
+      onUpgradeModel: vi.fn(),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+    expect(screen.queryByText(/locked until the current operation settles/i)).not.toBeInTheDocument();
   });
 
   it('discards staged model edits if the conversation starts work', () => {
@@ -1361,6 +1377,31 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByRole('radiogroup', { name: /select effort/i })).toBeInTheDocument();
   });
 
+  it('uses one tab stop per radio group and moves it with arrow selection', () => {
+    renderStateBar({
+      availableModels: pickerModels,
+      conversation: makeConversation({ model: 'gpt-5.6-sol' }),
+      onUpgradeModel: vi.fn(),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    const modelGroup = screen.getByRole('radiogroup', { name: /select model/i });
+    const modelRadios = within(modelGroup).getAllByRole('radio');
+    expect(modelRadios.filter((radio) => radio.tabIndex === 0)).toHaveLength(1);
+    const selectedModel = within(modelGroup).getByRole('radio', { name: /gpt-5.6-sol/i });
+    expect(selectedModel).toHaveAttribute('tabindex', '0');
+
+    for (const label of [/select effort/i, /select speed/i]) {
+      const group = screen.getByRole('radiogroup', { name: label });
+      expect(within(group).getAllByRole('radio').filter((radio) => radio.tabIndex === 0)).toHaveLength(1);
+    }
+
+    fireEvent.keyDown(selectedModel, { key: 'ArrowDown' });
+    expect(modelRadios.filter((radio) => radio.tabIndex === 0)).toHaveLength(1);
+    expect(modelRadios[modelRadios.indexOf(selectedModel) + 1]).toHaveAttribute('tabindex', '0');
+  });
+
   it('sends explicit effort changes from the state bar', () => {
     const onUpgradeModel = vi.fn();
     renderStateBar({
@@ -1430,6 +1471,29 @@ describe('StateBar mobile layout', () => {
 
     expect(onUpgradeModel).not.toHaveBeenCalled();
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('freezes staged controls while the atomic update is pending', async () => {
+    let resolveUpdate!: () => void;
+    const onUpgradeModel = vi.fn(() => new Promise<void>((resolve) => { resolveUpdate = resolve; }));
+    renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ model: 'gpt-5.6-sol' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    expect(screen.getByRole('dialog', { name: /model, effort, and speed/i })).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: /show all models/i })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /claude-opus-4-7/i })).toBeDisabled();
+
+    resolveUpdate();
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /model, effort, and speed/i })).not.toBeInTheDocument());
   });
 
   it('keeps a failed atomic update open with retryable error feedback', async () => {

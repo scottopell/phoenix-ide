@@ -93,7 +93,7 @@ describe('MobileMultiPrConversationFixture', () => {
     expect(screen.getByRole('dialog', { name: /choose active pull request/i })).toBeInTheDocument();
     expect(screen.getByRole('listbox', { name: /active pull request choices/i })).toBeInTheDocument();
     expect(screen.queryByTestId('mobile-pr-actions')).not.toBeInTheDocument();
-    expect(screen.getByText(/Locked while the current operation is running/i)).toBeInTheDocument();
+    expect(screen.getByText(/locked until the current operation settles/i)).toBeInTheDocument();
   });
 
   it('opens the idle model-and-effort dialog through its real StateBar trigger', async () => {

@@ -271,6 +271,7 @@ function handleChoiceGroupKeyDown(
 
 function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const [open, setOpen] = useState(false);
+  const [focusIndex, setFocusIndex] = useState(0);
   const [pendingAction, setPendingAction] = useState<'pin' | 'resume' | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -285,6 +286,11 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
   const auto = provenance === 'inferred';
   const canResume = provenance === 'pinned';
   const autoSummary = selection ? autoInferenceSummary(selection) : null;
+  const selectedActionableIndex = actionablePrs.findIndex((pr) =>
+    activePr?.repo_owner === pr.repo_owner
+    && activePr.repo_name === pr.repo_name
+    && activePr.pr_number === pr.pr_number
+  );
 
   const closeDialog = () => {
     setOpen(false);
@@ -296,7 +302,8 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
     if (source) restoreFocusRef.current = source;
     setMutationError(null);
     setOpen(true);
-  }, []);
+    setFocusIndex(selectedActionableIndex >= 0 ? selectedActionableIndex : 0);
+  }, [selectedActionableIndex]);
 
   useEffect(() => {
     const intent: ActivePrSelectorIntent = {
@@ -367,7 +374,7 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
           {autoSummary && auto && (
             <div className="active-pr-selector-auto-summary" data-testid="active-pr-auto-summary">{autoSummary}</div>
           )}
-          <div className="active-pr-selector-options" role="listbox" aria-label="Active pull request choices" onKeyDown={(event) => handleChoiceGroupKeyDown(event)}>
+          <div className="active-pr-selector-options" role="listbox" aria-label="Active pull request choices" onKeyDown={(event) => handleChoiceGroupKeyDown(event, setFocusIndex)}>
             {actionablePrs.map((pr, index) => {
               const isActive = activePr?.repo_owner === pr.repo_owner
                 && activePr.repo_name === pr.repo_name
@@ -380,7 +387,8 @@ function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
                   aria-selected={isActive}
                   className={`active-pr-selector-item${isActive ? ' active-pr-selector-item--active' : ''}`}
                   data-testid={`active-pr-choice-${pr.pr_number}`}
-                  data-selection-dialog-autofocus={index === 0 ? '' : undefined}
+                  data-selection-dialog-autofocus={index === focusIndex ? '' : undefined}
+                  tabIndex={index === focusIndex ? 0 : -1}
                   disabled={pendingAction !== null}
                   onClick={() => void runPin(index)}
                 >
@@ -1009,8 +1017,8 @@ export function StateBar({
             )}
             {currentServiceTier === 'fast' && <span className="conv-model-effort"> · Fast</span>}
           </span>
-          {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && (
-            <span className="conv-model-lock-reason">Locked while the current operation is running. Finish or cancel it to change model, effort, or speed.</span>
+          {variant === "mobile" && onUpgradeModel && availableModels && availableModels.length > 0 && isAgentWorking(convState) && (
+            <span className="conv-model-lock-reason">Model, effort, and speed are locked until the current operation settles.</span>
           )}
         </span>
       )}
@@ -1032,10 +1040,10 @@ export function StateBar({
             </>
           }
         >
-          <fieldset className="model-picker-section">
+          <fieldset className="model-picker-section" disabled={modelMutationPending}>
             <legend>Model</legend>
             <div className="model-picker-list" role="radiogroup" aria-label="Select model" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => { const model = pickerModels[index]; if (model) stageModel(model.id); })}>
-              {pickerModels.map((model, index) => {
+              {pickerModels.map((model) => {
                 const selected = model.id === stagedModel;
                 return (
                   <button
@@ -1046,7 +1054,8 @@ export function StateBar({
                     className={`model-picker-item${selected ? " model-picker-item--selected" : ""}`}
                     onClick={() => stageModel(model.id)}
                     title={model.description || model.id}
-                    data-selection-dialog-autofocus={index === 0 ? '' : undefined}
+                    data-selection-dialog-autofocus={selected ? '' : undefined}
+                    tabIndex={selected ? 0 : -1}
                   >
                     <span className="model-picker-item-check" aria-hidden="true">{selected ? <CheckIcon /> : null}</span>
                     <span className="model-picker-item-main">
@@ -1064,13 +1073,14 @@ export function StateBar({
             </label>
           </fieldset>
           {stagedEffortCapabilities?.support === 'supported' ? (
-            <fieldset className="model-picker-section">
+            <fieldset className="model-picker-section" disabled={modelMutationPending}>
               <legend>Effort</legend>
               <div className="model-picker-list model-picker-effort-list" role="radiogroup" aria-label="Select effort" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedEffort(index === 0 ? null : stagedEffortCapabilities.levels[index - 1] ?? null))}>
                 <button
                   type="button"
                   role="radio"
                   aria-checked={stagedEffort === null}
+                  tabIndex={stagedEffort === null ? 0 : -1}
                   className={`model-picker-item${stagedEffort === null ? ' model-picker-item--selected' : ''}`}
                   onClick={() => setStagedEffort(null)}
                 >
@@ -1085,6 +1095,7 @@ export function StateBar({
                       type="button"
                       role="radio"
                       aria-checked={selected}
+                      tabIndex={selected ? 0 : -1}
                       className={`model-picker-item${selected ? ' model-picker-item--selected' : ''}`}
                       onClick={() => setStagedEffort(level)}
                     >
@@ -1099,13 +1110,14 @@ export function StateBar({
             <div className="model-picker-capability-note">Effort controls are unavailable because this model's effort capabilities are unknown.</div>
           ) : null}
           {stagedSupportsFastMode && (
-            <fieldset className="model-picker-section">
+            <fieldset className="model-picker-section" disabled={modelMutationPending}>
               <legend>Speed</legend>
               <div className="model-picker-list model-picker-speed-list" role="radiogroup" aria-label="Select speed" onKeyDown={(event) => handleChoiceGroupKeyDown(event, (index) => setStagedServiceTier(index === 1 ? 'fast' : 'standard'))}>
                 <button
                   type="button"
                   role="radio"
                   aria-checked={stagedServiceTier === 'standard'}
+                  tabIndex={stagedServiceTier === 'standard' ? 0 : -1}
                   className={`model-picker-item${stagedServiceTier === 'standard' ? ' model-picker-item--selected' : ''}`}
                   onClick={() => setStagedServiceTier('standard')}
                 >
@@ -1119,6 +1131,7 @@ export function StateBar({
                   type="button"
                   role="radio"
                   aria-checked={stagedServiceTier === 'fast'}
+                  tabIndex={stagedServiceTier === 'fast' ? 0 : -1}
                   className={`model-picker-item${stagedServiceTier === 'fast' ? ' model-picker-item--selected' : ''}`}
                   onClick={() => setStagedServiceTier('fast')}
                 >

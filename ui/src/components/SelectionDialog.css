@@ -120,7 +120,7 @@
   color: white;
 }
 
-@media (width <= 768px) {
+@media (width <= 1024px) {
   .selection-dialog {
     display: flex;
     align-items: flex-end;
