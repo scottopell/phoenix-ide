@@ -225,6 +225,12 @@ interface PendingModelSelection {
   serviceTier: ServiceTier;
 }
 
+interface ModelSelectionBaseline {
+  model: string;
+  effort: ModelEffort | null;
+  serviceTier: ServiceTier;
+}
+
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   if (!pr.url) return null;
   const stopPropagation = (event: ReactMouseEvent<HTMLAnchorElement>) => {
@@ -514,6 +520,7 @@ export function StateBar({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerConversationId, setPickerConversationId] = useState<string>();
   const [pickerShowAll, setPickerShowAll] = useState(false);
+  const [modelSelectionBaseline, setModelSelectionBaseline] = useState<ModelSelectionBaseline | null>(null);
   const [stagedModel, setStagedModel] = useState('');
   const [stagedEffort, setStagedEffort] = useState<ModelEffort | null>(null);
   const [stagedServiceTier, setStagedServiceTier] = useState<ServiceTier>('standard');
@@ -537,6 +544,7 @@ export function StateBar({
     setPickerOpen(false);
     setPickerShowAll(false);
     setPickerConversationId(undefined);
+    setModelSelectionBaseline(null);
     setStagedModel('');
     setStagedEffort(null);
     setStagedServiceTier('standard');
@@ -917,11 +925,27 @@ export function StateBar({
   useEffect(() => {
     if (canPickModel || !pickerOpen || modelMutationPending) return;
     setPickerOpen(false);
+    setModelSelectionBaseline(null);
     setStagedModel('');
     setStagedEffort(null);
     setStagedServiceTier('standard');
     setModelMutationError(null);
   }, [canPickModel, modelMutationPending, pickerOpen]);
+
+  const modelSelectionBaselineMatchesPersisted = modelSelectionBaseline?.model === currentModel
+    && modelSelectionBaseline.effort === persistedEffort
+    && modelSelectionBaseline.serviceTier === currentServiceTier;
+
+  useLayoutEffect(() => {
+    if (!pickerOpen || modelMutationPending || modelSelectionBaselineMatchesPersisted) return;
+    setPickerOpen(false);
+    setPickerConversationId(undefined);
+    setModelSelectionBaseline(null);
+    setStagedModel('');
+    setStagedEffort(null);
+    setStagedServiceTier('standard');
+    setModelMutationError(null);
+  }, [modelMutationPending, modelSelectionBaselineMatchesPersisted, pickerOpen]);
 
   useLayoutEffect(() => {
     if (modelMutationPending || !pickerOpen || pickerConversationId !== conversation?.id || !availableModels?.length) return;
@@ -972,6 +996,11 @@ export function StateBar({
     setStagedModel(initialModel.id);
     setStagedEffort(effortCompatible(initialModel.effort_capabilities, persistedEffort) ? persistedEffort : null);
     setStagedServiceTier(initialModel.service_tier_capabilities === 'supported' ? currentServiceTier : 'standard');
+    setModelSelectionBaseline({
+      model: currentModel,
+      effort: persistedEffort,
+      serviceTier: currentServiceTier,
+    });
     setModelMutationError(null);
     setPickerOpen(true);
     setPickerConversationId(conversation?.id);
@@ -982,6 +1011,7 @@ export function StateBar({
     setPickerOpen(false);
     setModelMutationError(null);
     setPickerConversationId(undefined);
+    setModelSelectionBaseline(null);
   };
 
   const stageModel = (modelId: string) => {
@@ -993,7 +1023,13 @@ export function StateBar({
   };
 
   const applyModelSelection = async () => {
-    if (!onUpgradeModel || !stagedModelInfo || !modelSelectionChanged || modelMutationPending) return;
+    if (
+      !onUpgradeModel
+      || !stagedModelInfo
+      || !modelSelectionChanged
+      || modelMutationPending
+      || !modelSelectionBaselineMatchesPersisted
+    ) return;
     const submittedEffort = effortCompatible(stagedModelInfo.effort_capabilities, stagedEffort) ? stagedEffort : null;
     const submittedServiceTier = stagedModelInfo.service_tier_capabilities === 'supported'
       ? stagedServiceTier
@@ -1019,6 +1055,7 @@ export function StateBar({
       if (ownsMutation()) {
         setPickerOpen(false);
         setPickerConversationId(undefined);
+        setModelSelectionBaseline(null);
       }
     } catch (error) {
       if (ownsMutation()) {
@@ -1101,7 +1138,12 @@ export function StateBar({
         footer={
           <>
             <button type="button" className="selection-dialog__cancel" onClick={closeModelDialog} disabled={modelMutationPending}>Cancel</button>
-            <button type="button" className="selection-dialog__apply" onClick={() => void applyModelSelection()} disabled={!stagedModelInfo || !modelSelectionChanged || modelMutationPending}>
+            <button
+              type="button"
+              className="selection-dialog__apply"
+              onClick={() => void applyModelSelection()}
+              disabled={!stagedModelInfo || !modelSelectionChanged || modelMutationPending || !modelSelectionBaselineMatchesPersisted}
+            >
               {modelMutationPending ? 'Applying…' : 'Apply'}
             </button>
           </>

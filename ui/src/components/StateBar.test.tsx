@@ -1771,6 +1771,46 @@ describe('StateBar mobile layout', () => {
     expect(screen.queryByRole('radiogroup', { name: /select speed/i })).not.toBeInTheDocument();
   });
 
+  it('discards staged configuration when the persisted tuple changes for the same conversation', () => {
+    const onUpgradeModel = vi.fn();
+    const initialConversation = makeConversation({
+      id: 'same-conversation',
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      service_tier: 'standard',
+    });
+    const renderPicker = (conversation: Conversation) => (
+      <MemoryRouter>
+        <StateBar
+          conversation={conversation}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={272_000}
+          availableModels={pickerModels}
+          onUpgradeModel={onUpgradeModel}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderPicker(initialConversation));
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: gpt-5.6-sol/i));
+    fireEvent.click(screen.getByRole('radio', { name: /Fast Approximately 1.5x speed, increased usage/i }));
+
+    act(() => rerender(renderPicker({
+      ...initialConversation,
+      model: 'claude-sonnet-5',
+      effort: 'low',
+      service_tier: 'standard',
+    })));
+
+    expect(screen.queryByRole('dialog', { name: /model, effort, and speed/i })).not.toBeInTheDocument();
+    expect(onUpgradeModel).not.toHaveBeenCalled();
+  });
+
   it('discards staged configuration when the mounted conversation identity changes', () => {
     const onUpgradeModel = vi.fn();
     const { rerender } = renderStateBar({
