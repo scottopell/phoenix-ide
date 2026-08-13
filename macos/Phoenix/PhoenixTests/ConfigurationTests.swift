@@ -92,6 +92,9 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertFalse(origin.exactlyMatches(try XCTUnwrap(URL(string: "https://example.com.evil.test/"))))
         XCTAssertFalse(origin.exactlyMatches(try XCTUnwrap(URL(string: "http://example.com/"))))
         XCTAssertFalse(origin.exactlyMatches(try XCTUnwrap(URL(string: "https://example.com:8443/"))))
+        let ipv6 = try PhoenixOrigin("https://[::1]:8031")
+        XCTAssertTrue(ipv6.exactlyMatches(try XCTUnwrap(URL(string: "https://[0:0:0:0:0:0:0:1]:8031/"))))
+        XCTAssertEqual(ipv6.canonicalStorageKey, "https://::1:8031")
     }
 
     func testOriginRejectsValuesThatAreNotCanonicalOrigins() {

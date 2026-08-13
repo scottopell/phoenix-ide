@@ -1099,10 +1099,22 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         url = normalized
     }
 
+    private func canonicalHost(_ host: String) -> String {
+        let unbracketed = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        var address = in6_addr()
+        if inet_pton(AF_INET6, unbracketed, &address) == 1 {
+            var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            return withUnsafePointer(to: &address) { pointer in
+                inet_ntop(AF_INET6, pointer, &buffer, socklen_t(INET6_ADDRSTRLEN)).map(String.init(cString:))
+            } ?? unbracketed.lowercased()
+        }
+        return unbracketed.lowercased()
+    }
+
     var canonicalStorageKey: String {
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
         let scheme = components.scheme!.lowercased()
-        let host = components.host!.lowercased()
+        let host = canonicalHost(components.host!)
         let port = components.port ?? (scheme == "https" ? 443 : 80)
         return "\(scheme)://\(host):\(port)"
     }
@@ -1118,7 +1130,7 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         guard let lhs = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let rhs = URLComponents(url: candidate, resolvingAgainstBaseURL: false) else { return false }
         return lhs.scheme?.lowercased() == rhs.scheme?.lowercased()
-            && lhs.host?.lowercased() == rhs.host?.lowercased()
+            && lhs.host.map(canonicalHost) == rhs.host.map(canonicalHost)
             && effectivePort(lhs) == effectivePort(rhs)
     }
 
