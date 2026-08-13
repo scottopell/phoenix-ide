@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -2290,7 +2290,10 @@ impl Database {
     /// Inaccessible worktrees remain unresolved instead of receiving fabricated continuity.
     /// # Errors
     /// Returns a database error when an observed identity cannot be persisted.
+    #[allow(clippy::too_many_lines)]
     pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let scopes = sqlx::query_as::<_, (String, String)>(
             "SELECT id, worktree_path
              FROM work_scopes
@@ -2299,23 +2302,30 @@ impl Database {
                AND worktree_path IS NOT NULL
              ORDER BY id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let observations = scopes
             .into_iter()
-            .filter_map(|(scope_id, path)| {
-                Self::observe_worktree_fingerprint(&path)
-                    .map(|observed_fingerprint| (scope_id, observed_fingerprint))
+            .map(|(scope_id, path)| {
+                let observed_fingerprint = Self::observe_worktree_fingerprint(&path);
+                (scope_id, path, observed_fingerprint)
             })
             .collect::<Vec<_>>();
-        let mut tx = self.pool.begin().await?;
 
-        for (scope_id, observed_fingerprint) in &observations {
+        for (scope_id, path, observed_fingerprint) in &observations {
+            let revalidated = Self::observe_worktree_fingerprint(path);
+            let stable_fingerprint = match (observed_fingerprint, revalidated) {
+                (Some(observed), Some(revalidated)) if observed == &revalidated => Some(observed),
+                _ => None,
+            };
             sqlx::query(
                 "UPDATE work_scopes
                  SET worktree_id = NULL, worktree_fingerprint = NULL
                  WHERE id = ?1
-                   AND NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?2)
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?2
+                   AND (?3 IS NULL OR NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?3))
                    AND NOT EXISTS (
                        SELECT 1
                        FROM close_attempt_scopes captured
@@ -2327,16 +2337,29 @@ impl Database {
                    )",
             )
             .bind(scope_id)
-            .bind(observed_fingerprint)
+            .bind(path)
+            .bind(stable_fingerprint)
             .execute(&mut *tx)
             .await?;
         }
 
-        for (scope_id, observed_fingerprint) in observations {
+        for (scope_id, path, observed_fingerprint) in &observations {
+            let Some(observed_fingerprint) = observed_fingerprint else {
+                continue;
+            };
+            let Some(revalidated_fingerprint) = Self::observe_worktree_fingerprint(path) else {
+                continue;
+            };
+            if &revalidated_fingerprint != observed_fingerprint {
+                continue;
+            }
             let result = sqlx::query(
                 "UPDATE work_scopes
                  SET worktree_id = ?1, worktree_fingerprint = ?2
                  WHERE id = ?3
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?4
                    AND worktree_id IS NULL
                    AND worktree_fingerprint IS NULL
                    AND NOT EXISTS (
@@ -2354,8 +2377,9 @@ impl Database {
                    )",
             )
             .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&observed_fingerprint)
-            .bind(&scope_id)
+            .bind(observed_fingerprint)
+            .bind(scope_id)
+            .bind(path)
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 0 {
@@ -2364,6 +2388,33 @@ impl Database {
                     "worktree identity reconciliation deferred or unresolved"
                 );
             }
+        }
+
+        for (scope_id, path, observed_fingerprint) in &observations {
+            if Self::observe_worktree_fingerprint(path).as_ref() == observed_fingerprint.as_ref() {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE work_scopes
+                 SET worktree_id = NULL, worktree_fingerprint = NULL
+                 WHERE id = ?1
+                   AND lifecycle = 'active'
+                   AND environment_kind = 'allocated_worktree'
+                   AND worktree_path = ?2
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM close_attempt_scopes captured
+                       JOIN close_obligations obligation
+                         ON obligation.attempt_id = captured.attempt_id
+                       WHERE captured.scope = work_scopes.id
+                         AND obligation.phase <> 'completed'
+                         AND obligation.topology_sealed = 1
+                   )",
+            )
+            .bind(scope_id)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())

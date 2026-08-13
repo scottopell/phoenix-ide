@@ -910,6 +910,11 @@ FOR EACH ROW
 WHEN (
     OLD.inspection_generation IS NOT NEW.inspection_generation
     OR OLD.inspection_fingerprint IS NOT NEW.inspection_fingerprint
+) AND NOT (
+    NEW.phase = 'completed'
+    AND NEW.close_outcome = 'cancelled'
+    AND NEW.inspection_generation IS NULL
+    AND NEW.inspection_fingerprint IS NULL
 ) AND (
     OLD.phase <> 'awaiting_retirement_inspection'
     OR NEW.inspection_generation <> CASE
@@ -6870,6 +6875,28 @@ mod tests {
              ) VALUES (
                  'partial-cancel', 'scope-partial', 'g1', 'fp1', '2025-01-01T00:00:03Z'
              )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_retirement_losses (
+                 attempt_id, scope, generation, category,
+                 identity_kind, identity_codec, identity_value
+             ) VALUES (
+                 'partial-cancel', 'scope-partial', 'g1', 'untracked_non_ignored_paths',
+                 'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:70617468'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'awaiting_loss_confirmation',
+                 inspection_generation = 'v113:scope-partial2:g1',
+                 inspection_fingerprint = 'v113:scope-partial3:fp1'
+             WHERE attempt_id = 'partial-cancel'",
         )
         .execute(&pool)
         .await

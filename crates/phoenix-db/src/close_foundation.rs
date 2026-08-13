@@ -1287,7 +1287,8 @@ impl Database {
         &self,
         request: CaptureCloseRetirementInventoryRequest,
     ) -> DbResult<Vec<CloseExpectedRetirementResource>> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let attempt_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
         )
@@ -1452,10 +1453,11 @@ impl Database {
                     request.attempt_id
                 )));
             }
+            let resources =
+                list_close_expected_retirement_resources_tx(&mut tx, request.attempt_id.as_str())
+                    .await?;
             tx.commit().await?;
-            return self
-                .list_close_expected_retirement_resources(request.attempt_id.as_str())
-                .await;
+            return Ok(resources);
         }
 
         let root_id: String = sqlx::query_scalar(
@@ -1611,9 +1613,11 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        let resources =
+            list_close_expected_retirement_resources_tx(&mut tx, request.attempt_id.as_str())
+                .await?;
         tx.commit().await?;
-        self.list_close_expected_retirement_resources(request.attempt_id.as_str())
-            .await
+        Ok(resources)
     }
 
     /// Lists expected retirement resources for the current exact attempt snapshot.
@@ -1624,7 +1628,18 @@ impl Database {
         &self,
         attempt_id: &str,
     ) -> DbResult<Vec<CloseExpectedRetirementResource>> {
-        let status = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let resources = list_close_expected_retirement_resources_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(resources)
+    }
+}
+
+async fn list_close_expected_retirement_resources_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &str,
+) -> DbResult<Vec<CloseExpectedRetirementResource>> {
+    let status = sqlx::query(
             "SELECT
                  (SELECT COUNT(*) FROM close_attempt_scopes WHERE attempt_id = ?1) AS target_count,
                  (SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id = ?1) AS inventory_count,
@@ -1633,18 +1648,18 @@ impl Database {
              WHERE EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?1)",
         )
         .bind(attempt_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))?;
-        let target_count: i64 = status.try_get("target_count")?;
-        let inventory_count: i64 = status.try_get("inventory_count")?;
-        let unsealed_count: i64 = status.try_get("unsealed_count")?;
-        if target_count != inventory_count || unsealed_count != 0 {
-            return Err(close_precondition(format!(
-                "attempt {attempt_id} expected resources require a complete sealed inventory"
-            )));
-        }
-        sqlx::query(
+    let target_count: i64 = status.try_get("target_count")?;
+    let inventory_count: i64 = status.try_get("inventory_count")?;
+    let unsealed_count: i64 = status.try_get("unsealed_count")?;
+    if target_count != inventory_count || unsealed_count != 0 {
+        return Err(close_precondition(format!(
+            "attempt {attempt_id} expected resources require a complete sealed inventory"
+        )));
+    }
+    sqlx::query(
             "SELECT expected.attempt_id, expected.scope, expected.inspection_generation,
                     expected.inspection_fingerprint, expected.resource_kind,
                     expected.identity_kind, expected.identity_codec, expected.identity_value,
@@ -1660,7 +1675,7 @@ impl Database {
              ORDER BY expected.scope, expected.resource_kind, expected.identity_kind, expected.identity_value",
         )
         .bind(attempt_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?
         .into_iter()
         .map(|row| {
@@ -1692,8 +1707,13 @@ impl Database {
             })
         })
         .collect()
-    }
+}
 
+impl Database {
+    /// Records one exact resource-retirement outcome for an authorized Close snapshot.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when authority, replay, identity, or persistence validation fails.
     #[allow(clippy::too_many_lines)]
     pub async fn record_close_retirement_evidence(
         &self,
@@ -1943,6 +1963,10 @@ impl Database {
         Ok(())
     }
 
+    /// Lists retained retirement evidence for an attempt.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] when persistence or decoding fails.
     pub async fn list_close_retirement_evidence(
         &self,
         attempt_id: &str,
@@ -4281,6 +4305,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_retirement_inventory_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inventory-race.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        db.begin_close_foundation("root", "attempt-concurrent-inventory")
+            .await
+            .unwrap();
+        set_close_phase(
+            &db,
+            "attempt-concurrent-inventory",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        let worktree = current_test_worktree(&db, &scope).await;
+        let request = CaptureCloseRetirementInventoryRequest {
+            attempt_id: CloseAttemptId::parse("attempt-concurrent-inventory").unwrap(),
+            snapshot: current_test_snapshot(&db, "attempt-concurrent-inventory").await,
+            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                scope,
+                inventory: CloseOwnedResourceInventory {
+                    worktree: Some(worktree),
+                    bash_process_groups: std::collections::BTreeSet::default(),
+                    tmux_servers: std::collections::BTreeSet::default(),
+                    pty_sessions: std::collections::BTreeSet::default(),
+                    browser_sessions: std::collections::BTreeSet::default(),
+                    equivalent_live_resources: std::collections::BTreeSet::default(),
+                },
+            }],
+        };
+
+        let (first, second) = tokio::join!(
+            db.capture_close_retirement_inventory(request.clone()),
+            db.capture_close_retirement_inventory(request)
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
     }
 
     #[tokio::test]
