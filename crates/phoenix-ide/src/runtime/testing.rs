@@ -542,6 +542,7 @@ pub struct InMemoryStorage {
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
+    fail_message_add: Mutex<bool>,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
@@ -577,6 +578,7 @@ impl InMemoryStorage {
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
+            fail_message_add: Mutex::new(false),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
@@ -596,6 +598,10 @@ impl InMemoryStorage {
 
     pub fn set_fail_state_update(&self, fail: bool) {
         *self.fail_state_update.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_message_add(&self, fail: bool) {
+        *self.fail_message_add.lock().unwrap() = fail;
     }
 
     pub fn set_steering_drain_failures(&self, failures: usize) {
@@ -837,6 +843,9 @@ impl MessageStore for InMemoryStorage {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String> {
+        if *self.fail_message_add.lock().unwrap() {
+            return Err("injected message persistence failure".to_string());
+        }
         // Keep the monotonic id counter at least as high as the provided
         // seq so any subsequent `add_message` call produces a strictly
         // greater id. Mirrors DB.add_message_with_seq semantics.

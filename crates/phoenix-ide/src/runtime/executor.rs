@@ -3199,6 +3199,9 @@ where
             ))
             .await?;
         } else {
+            let terminal_subagent_transition = self.context.is_sub_agent
+                && matches!(self.state.step_result(), StepResult::Terminal(_));
+            let mut state_committed = false;
             for effect in result.effects {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
@@ -3206,8 +3209,15 @@ where
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let effect_result = Box::pin(self.execute_effect(effect)).await;
                 let effect_result = match effect_result {
-                    Ok(effect_result) => effect_result,
-                    Err(error) if is_state_persist || is_steering_drain => {
+                    Ok(effect_result) => {
+                        state_committed |= is_state_persist;
+                        effect_result
+                    }
+                    Err(error)
+                        if is_state_persist
+                            || is_steering_drain
+                            || (terminal_subagent_transition && !state_committed) =>
+                    {
                         let failed_state = std::mem::replace(&mut self.state, old_state.clone());
                         self.state_updated_at = old_state_updated_at;
                         self.manage_deadline(&failed_state);
@@ -12583,6 +12593,32 @@ mod steer_drain_detector_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn subagent_pre_state_persist_failure_restores_terminal_transition() {
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "terminal-persist-failure",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        rt.context.is_sub_agent = true;
+        storage.set_fail_message_add(true);
+        let result = TransitionResult::new(ConvState::Completed {
+            result: "done".to_string(),
+        })
+        .with_effect(Effect::PersistMessage {
+            content: MessageContent::agent(vec![ContentBlock::text("done")]),
+            display_data: None,
+            usage_data: None,
+            message_id: "terminal-message".to_string(),
+            idempotent: false,
+        })
+        .with_effect(Effect::PersistState);
+
+        assert!(rt.apply_transition_result(result).await.is_err());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+        assert_eq!(storage.get_current_state("terminal-persist-failure"), None);
     }
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
