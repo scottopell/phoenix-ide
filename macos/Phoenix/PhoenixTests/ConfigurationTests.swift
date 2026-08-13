@@ -890,6 +890,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertNil(configuration.publicEnvironment["HOME"])
         XCTAssertEqual(configuration.publicEnvironment["CODEX_HOME"], "/tmp/Phoenix Tests/.codex")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DATA_DIR"], "/tmp/Phoenix Tests/.phoenix-ide")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_STATE_DIR"], "/tmp/Phoenix Tests/.phoenix-ide")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TMP_DIR"], "/tmp/Phoenix Tests/tmp/phoenix-ide")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_PORT"], "8420")

@@ -47,6 +47,8 @@ pub struct PhoenixRuntimeEnvironment {
     codex_home: PathBuf,
     /// `$PHOENIX_DATA_DIR` if set, else `phoenix_home`.
     data_dir: PathBuf,
+    /// `$PHOENIX_STATE_DIR` if set, else the historical `home/.phoenix-ide` root.
+    state_dir: PathBuf,
     /// `$PHOENIX_DB_PATH` if set, else `phoenix_home/phoenix.db`.
     db_path: PathBuf,
     /// `temp_dir()/phoenix-ide` — root for Phoenix scratch namespaces.
@@ -88,6 +90,10 @@ impl PhoenixRuntimeEnvironment {
         let data_dir = std::env::var_os("PHOENIX_DATA_DIR")
             .filter(|v| !v.is_empty())
             .map_or_else(|| phoenix_home.clone(), PathBuf::from);
+        let state_dir = resolve_state_dir(
+            &phoenix_home,
+            std::env::var_os("PHOENIX_STATE_DIR").filter(|v| !v.is_empty()),
+        );
         let db_path = resolve_db_path(
             &phoenix_home,
             std::env::var_os("PHOENIX_DB_PATH").filter(|v| !v.is_empty()),
@@ -100,6 +106,7 @@ impl PhoenixRuntimeEnvironment {
             home,
             codex_home,
             data_dir,
+            state_dir,
             db_path,
             tmp_root,
         }
@@ -122,6 +129,7 @@ impl PhoenixRuntimeEnvironment {
         Self {
             codex_home: home.join(".codex"),
             data_dir: phoenix_home.clone(),
+            state_dir: phoenix_home.clone(),
             db_path: phoenix_home.join("phoenix.db"),
             tmp_root: home.join("tmp"),
             home,
@@ -134,10 +142,10 @@ impl PhoenixRuntimeEnvironment {
         &self.home
     }
 
-    /// `$PHOENIX_DATA_DIR` (or `home/.phoenix-ide`) — root of all Phoenix-owned on-disk state.
+    /// `$PHOENIX_STATE_DIR` (or `home/.phoenix-ide`) — root of Phoenix-owned on-disk state.
     #[must_use]
     pub fn phoenix_home(&self) -> PathBuf {
-        self.data_dir.clone()
+        self.state_dir.clone()
     }
 
     /// `$CODEX_HOME` (or `home/.codex`) — the Codex CLI's home directory.
@@ -288,6 +296,10 @@ impl PhoenixRuntimeEnvironment {
     }
 }
 
+fn resolve_state_dir(phoenix_home: &Path, override_path: Option<std::ffi::OsString>) -> PathBuf {
+    override_path.map_or_else(|| phoenix_home.to_path_buf(), PathBuf::from)
+}
+
 fn resolve_db_path(phoenix_home: &Path, override_path: Option<std::ffi::OsString>) -> PathBuf {
     override_path.map_or_else(|| phoenix_home.join("phoenix.db"), PathBuf::from)
 }
@@ -342,6 +354,22 @@ mod tests {
     }
 
     #[test]
+    fn custom_data_dir_does_not_change_historical_state_root() {
+        let phoenix_home = Path::new("/Users/example/.phoenix-ide");
+        assert_eq!(
+            resolve_state_dir(phoenix_home, None),
+            PathBuf::from("/Users/example/.phoenix-ide")
+        );
+        assert_eq!(
+            resolve_state_dir(
+                phoenix_home,
+                Some(std::ffi::OsString::from("/private/sidecar/.phoenix-ide"))
+            ),
+            PathBuf::from("/private/sidecar/.phoenix-ide")
+        );
+    }
+
+    #[test]
     fn custom_data_dir_does_not_change_historical_database_default() {
         let phoenix_home = Path::new("/Users/example/.phoenix-ide");
         assert_eq!(
@@ -363,6 +391,7 @@ mod tests {
             home: PathBuf::from("/Users/example"),
             codex_home: PathBuf::from("/private/sidecar/.codex"),
             data_dir: PathBuf::from("/private/sidecar/.phoenix-ide"),
+            state_dir: PathBuf::from("/private/sidecar/.phoenix-ide"),
             db_path: PathBuf::from("/private/sidecar/.phoenix-ide/phoenix.db"),
             tmp_root: PathBuf::from("/tmp/phoenix-ide"),
         };
@@ -441,6 +470,7 @@ mod tests {
             home: tmp.path().to_path_buf(),
             codex_home: tmp.path().join(".codex"),
             data_dir: tmp.path().join(".phoenix-ide"),
+            state_dir: tmp.path().join(".phoenix-ide"),
             db_path: tmp.path().join(".phoenix-ide/prod.db"),
             tmp_root: tmp.path().join("tmp"),
         };

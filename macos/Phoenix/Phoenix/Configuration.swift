@@ -1075,6 +1075,7 @@ struct BundledServerConfiguration: Equatable {
         [
             "CODEX_HOME": runtimeRootURL.appendingPathComponent(".codex", isDirectory: true).path,
             "PHOENIX_DATA_DIR": dataDirectoryURL.path,
+            "PHOENIX_STATE_DIR": dataDirectoryURL.path,
             "PHOENIX_TMP_DIR": runtimeRootURL.appendingPathComponent("tmp", isDirectory: true).appendingPathComponent("phoenix-ide", isDirectory: true).path,
             "PHOENIX_BIND_ADDR": "127.0.0.1",
             "PHOENIX_TLS": "off",

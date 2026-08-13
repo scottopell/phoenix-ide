@@ -22,7 +22,7 @@ Launches only `Phoenix.app/Contents/Helpers/phoenix_ide` (or a clearly marked De
 - `PHOENIX_TLS=off`
 - the real user `HOME` and working directory, so terminals, Git, SSH, skills, and `~` behave normally
 - a private runtime root under `~/Library/Application Support/Phoenix/sidecar-home` used only for Phoenix/Codex-owned mutable state
-- a private `PHOENIX_DATA_DIR`, `CODEX_HOME`, and database beneath that runtime root
+- private `PHOENIX_STATE_DIR`, `PHOENIX_DATA_DIR`, `CODEX_HOME`, and database paths beneath that runtime root
 - a fixed configured loopback port
 
 An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. This is state isolation, not a filesystem sandbox: the sidecar and its terminals retain ordinary access to the user's files. Phoenix.app creates the private runtime/data directories before taking that lock so the lock itself remains outside the managed data tree and cleanup still works after launch-preparation failures. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Any transition away from bundled mode first stops the exact child Phoenix.app launched, coalesces overlapping reconnect requests, and only then connects the latest candidate mode. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
