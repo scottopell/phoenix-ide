@@ -1,0 +1,172 @@
+.selection-dialog {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  margin: 0;
+  padding: 20px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+.selection-dialog::backdrop {
+  background: color-mix(in srgb, var(--bg-primary) 76%, transparent);
+  backdrop-filter: blur(3px);
+}
+
+.selection-dialog__surface {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, calc(100vw - 40px));
+  max-height: min(720px, calc(100dvh - 40px));
+  margin: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  background: var(--bg-secondary);
+  box-shadow: 0 24px 64px rgb(0 0 0 / 48%);
+  overflow: hidden;
+}
+
+.selection-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 20px 20px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.selection-dialog__heading {
+  min-width: 0;
+  flex: 1;
+}
+
+.selection-dialog__heading h2 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.3;
+  color: var(--text-primary);
+}
+
+.selection-dialog__description {
+  margin-top: 5px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.selection-dialog__close {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 25px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.selection-dialog__close:focus-visible,
+.selection-dialog__close:hover:not(:disabled) {
+  border-color: var(--border-color);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.selection-dialog__body {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 16px 20px;
+}
+
+.selection-dialog__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 20px max(14px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+}
+
+.selection-dialog__footer button {
+  min-height: 40px;
+  padding: 0 18px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.selection-dialog__footer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.selection-dialog__cancel {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.selection-dialog__apply {
+  border: 1px solid var(--accent-color);
+  background: var(--accent-color);
+  color: white;
+}
+
+@media (width <= 1024px) {
+  .selection-dialog {
+    display: flex;
+    align-items: flex-end;
+    padding: max(12px, env(safe-area-inset-top)) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  }
+
+  .selection-dialog__surface {
+    width: 100%;
+    max-height: calc(100dvh - max(12px, env(safe-area-inset-top)));
+    margin: auto 0 0;
+    border-width: 1px 0 0;
+    border-radius: 18px 18px 0 0;
+  }
+
+  .selection-dialog__header {
+    padding: 18px 18px 14px;
+  }
+
+  .selection-dialog__close {
+    width: 44px;
+    height: 44px;
+    margin: -8px -8px -8px 0;
+  }
+
+  .selection-dialog__body {
+    padding: 14px 16px;
+  }
+
+  .selection-dialog__footer {
+    padding: 12px 16px max(12px, env(safe-area-inset-bottom));
+  }
+
+  .selection-dialog__footer button {
+    min-height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .selection-dialog[open] .selection-dialog__surface {
+    animation: selection-dialog-enter 160ms ease-out;
+  }
+}
+
+@keyframes selection-dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+}

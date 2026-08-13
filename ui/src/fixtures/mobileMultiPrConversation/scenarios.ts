@@ -19,7 +19,7 @@ export function getMobileMultiPrConversationScenario(id: string): MobileMultiPrC
 export const mobileMultiPrConversation: Conversation = {
   id: 'fixture-mobile-multi-pr',
   slug: 'polish-mobile-multi-pr-conversation-ui',
-  model: 'claude-sonnet-4-6',
+  model: 'gpt-5.6-sol',
   cwd: '/Users/dev/phoenix-ide/.phoenix/worktrees/mobile-multi-pr-ui',
   created_at: '2026-07-15T14:00:00Z',
   updated_at: '2026-07-15T14:30:00Z',

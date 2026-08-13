@@ -7,7 +7,7 @@ import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
-import { useIsMobile } from '../hooks';
+import { useIsCompactLayout } from '../hooks';
 import './WorkActions.css';
 
 interface WorkControlBarProps {
@@ -126,7 +126,7 @@ export function WorkControlBar({
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
-  const isMobile = useIsMobile();
+  const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
@@ -152,7 +152,7 @@ export function WorkControlBar({
   );
   const { actionablePrs, canRepresentActiveSelection, shouldRender: shouldRenderPrRail } = derivePrRailAvailability(
     prStatusHandle,
-    isMobile,
+    usesCompactLayout,
   );
 
   const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
@@ -291,7 +291,7 @@ export function WorkControlBar({
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
 
-  if (isMobile && !canRepresentActiveSelection) {
+  if (usesCompactLayout && !canRepresentActiveSelection) {
       return (
         <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
@@ -387,7 +387,7 @@ export function WorkControlBar({
     ) : null;
 
     return (
-      <div className={`mobile-pr-dock${isMobile ? '' : ' desktop-pr-dock'}`} data-testid={isMobile ? 'mobile-work-controls' : 'desktop-work-controls'}>
+      <div className={`mobile-pr-dock${usesCompactLayout ? '' : ' desktop-pr-dock'}`} data-testid={usesCompactLayout ? 'mobile-work-controls' : 'desktop-work-controls'}>
         {expanded && (
           <div className="mobile-pr-actions" data-testid="mobile-pr-actions">
             {mobileHero && <div className="mobile-pr-actions-hero">{mobileHero}</div>}
@@ -471,9 +471,9 @@ export function WorkControlBar({
               >
                 <span className={`mobile-pr-status-dot mobile-pr-status-dot--${pr.display_state}`} aria-hidden="true" />
                 <span className="mobile-pr-chip-number">#{pr.pr_number}</span>
-                {!isMobile && <span className="desktop-pr-chip-title">{pr.title}</span>}
+                {!usesCompactLayout && <span className="desktop-pr-chip-title">{pr.title}</span>}
                 <span className="mobile-pr-chip-state">{savingPrIdentity === identity ? 'saving…' : pr.display_state}</span>
-                {!isMobile && <span className="desktop-pr-chip-branch">{pr.head}</span>}
+                {!usesCompactLayout && <span className="desktop-pr-chip-branch">{pr.head}</span>}
                 <PrReviewStateIndicator feedbackStatus={pr.feedback_status} />
                 {selected && freshnessLabel && (
                   <span className="mobile-pr-notification" aria-label={`${freshnessLabel} feedback`}>

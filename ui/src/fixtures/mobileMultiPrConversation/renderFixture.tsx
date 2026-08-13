@@ -4,6 +4,7 @@ import { StateBar } from '../../components/StateBar';
 import { WorkControlBar } from '../../components/WorkActions';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import type { ConversationPrStatusHandle } from '../../hooks/useConversationPrStatus';
+import type { ModelInfo } from '../../api';
 import '../../index.css';
 import './renderFixture.css';
 import {
@@ -42,9 +43,31 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
       activePrChip?.click();
       return;
     }
-
     if (scenario.chooserOpen && !document.querySelector('[data-testid="mobile-pr-actions"]')) return;
 
+    if (scenario.stateBarDialog === 'pr' && !document.querySelector('.active-pr-dialog[open]')) {
+      const trigger = document.querySelector<HTMLButtonElement>('[data-testid="active-pr-selector-trigger"]');
+      if (!trigger) return;
+      trigger.click();
+      return;
+    }
+    if (scenario.stateBarDialog === 'model' && !document.querySelector('.model-selection-dialog[open]')) {
+      const trigger = document.querySelector<HTMLButtonElement>('.conv-model--button');
+      if (!trigger) return;
+      trigger.click();
+      return;
+    }
+    if (scenario.stateBarDialog === 'model') {
+      const fastOption = document.querySelector<HTMLButtonElement>('.model-selection-dialog [aria-label="Select speed"] [role="radio"]:last-child');
+      if (!fastOption) return;
+      if (fastOption.getAttribute('aria-checked') !== 'true') {
+        fastOption.click();
+        return;
+      }
+    }
+
+    if (scenario.stateBarDialog && !document.querySelector('.selection-dialog[open]')) return;
+    if (scenario.id === 'model-locked' && !document.querySelector('.conv-model-lock-reason')) return;
     document.documentElement.dataset['mobileMultiPrConversationFixtureReady'] = scenario.id;
     observer?.disconnect();
   };
@@ -58,6 +81,27 @@ function markReadyWhenRendered(scenario: MobileMultiPrConversationScenario): () 
     observer?.disconnect();
   };
 }
+
+const fixtureModels: ModelInfo[] = [
+  {
+    id: 'gpt-5.6-sol',
+    provider: 'OpenAI',
+    description: 'GPT-5.6 Sol (frontier, 1M context)',
+    context_window: 272_000,
+    recommended: true,
+    effort_capabilities: { support: 'supported', levels: ['none', 'low', 'medium', 'high', 'xhigh'], native_default: { known: 'medium' } },
+    service_tier_capabilities: 'supported',
+  },
+  {
+    id: 'claude-opus-4-7',
+    provider: 'anthropic',
+    description: 'Most capable model for complex implementation work',
+    context_window: 200_000,
+    recommended: true,
+    effort_capabilities: { support: 'supported', levels: ['medium', 'high', 'max'], native_default: { known: 'high' } },
+    service_tier_capabilities: 'unsupported',
+  },
+];
 
 export function MobileMultiPrConversationFixture({ scenario }: Props) {
   const prStatusHandle = useMemo<ConversationPrStatusHandle>(() => {
@@ -74,7 +118,7 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
         resumeInference: async () => undefined,
       };
     }
-    const hasActivePr = scenario.id === 'active-pr-actions' || scenario.id === 'chooser-open';
+    const hasActivePr = scenario.id === 'active-pr-actions';
     const status = hasActivePr ? mobileMultiPrActiveStatus : mobileMultiPrStatus;
     return {
       state: { status: 'ready', prStatus: status },
@@ -119,7 +163,7 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
           <WorkControlBar
             conversationId={mobileMultiPrConversation.id}
             convModeLabel="Work"
-            phaseType="idle"
+            phaseType={scenario.inFlight ? 'llm_requesting' : 'idle'}
             continuedInConvId={null}
             onSendMessage={async () => undefined}
             prStatusHandle={prStatusHandle}
@@ -130,12 +174,14 @@ export function MobileMultiPrConversationFixture({ scenario }: Props) {
           </section>
           <StateBar
             conversation={mobileMultiPrConversation}
-            convState={{ type: 'idle' }}
+            convState={scenario.inFlight ? { type: 'llm_requesting', attempt: 1 } : { type: 'idle' }}
             connectionState="connected"
             connectionAttempt={0}
             nextRetryIn={null}
             contextWindowUsed={48_000}
-            modelContextWindow={200_000}
+            modelContextWindow={272_000}
+            availableModels={fixtureModels}
+            onUpgradeModel={async () => undefined}
             onOpenFiles={() => undefined}
             prStatusHandle={prStatusHandle}
           />

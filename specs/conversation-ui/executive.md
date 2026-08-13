@@ -47,7 +47,7 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-CONV-007:** Agent Activity Indicators | ✅ Complete | StateBar is the sole live-activity owner; discriminated union and exhaustive labels prevent ambiguous duplicate activity surfaces |
 | **REQ-CONV-008:** Cancellation | ✅ Complete | Cancel button during agent work |
 | **REQ-CONV-009:** New Conversation | ⚠️ Deprecated | Replaced by REQ-CONV-015, 017, 018 |
-| **REQ-CONV-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts; mobile terminal status/launcher lives in the expanded state drawer and opens the session-preserving terminal takeover instead of consuming persistent transcript height |
+| **REQ-CONV-010:** Responsive Layout | ✅ Complete | Viewport-specific layouts; mobile terminal status/launcher lives in the expanded state drawer; existing-conversation model, effort, and supported request speed are staged atomically in a top-layer selection dialog, with visible lock guidance while work is in flight (`StateBar`, `SelectionDialog`, `StateBar.test.tsx`, `mobileMultiPrConversation`) |
 | **REQ-CONV-011:** Local Storage Schema | ✅ Complete | Namespaced keys |
 | **REQ-CONV-012:** Conversation State Indicators | ✅ Complete | Part of task 561 |
 | **REQ-CONV-013:** Per-Conversation Scroll Position | ⚠️ Deprecated | Removed wholesale; returning lands pinned to bottom |

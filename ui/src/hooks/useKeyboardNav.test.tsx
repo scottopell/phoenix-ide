@@ -10,7 +10,6 @@ import { renderHook, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ReactNode } from 'react';
 
-// We need to spy on navigate to detect if navigation happened
 const mockNavigate = vi.fn();
 vi.mock('react-router-dom', async () => {
   const actual = await vi.importActual('react-router-dom');
@@ -27,36 +26,45 @@ function wrapper({ children }: { children: ReactNode }) {
   return <MemoryRouter initialEntries={['/c/test-conversation']}>{children}</MemoryRouter>;
 }
 
-describe('SIDE-03: Escape should not navigate when context menu is open', () => {
+describe('SIDE-03: global keyboard shortcut ownership', () => {
   beforeEach(() => {
     mockNavigate.mockClear();
   });
 
   it('does not navigate to / on Escape when a popover/menu is open', () => {
     renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
-
-    // Simulate a context menu being open by adding a DOM element
-    // that indicates an open menu (as ConversationList does with expandedId)
     const menuEl = document.createElement('div');
     menuEl.className = 'conv-item-actions';
     menuEl.setAttribute('role', 'menu');
     document.body.appendChild(menuEl);
 
-    // Fire Escape key
     act(() => {
-      const event = new KeyboardEvent('keydown', {
+      window.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Escape',
         bubbles: true,
         cancelable: true,
-      });
-      window.dispatchEvent(event);
+      }));
     });
 
-    // Navigation should NOT have happened because a menu was open.
-    // The handler should check for open menus/popovers before navigating.
     expect(mockNavigate).not.toHaveBeenCalled();
+    menuEl.remove();
+  });
 
-    // Cleanup
-    document.body.removeChild(menuEl);
+  it('suppresses global shortcuts while a native dialog is open', () => {
+    const dispatchSpy = vi.spyOn(window, 'dispatchEvent');
+    renderHook(() => useGlobalKeyboardShortcuts(), { wrapper });
+    const dialog = document.createElement('dialog');
+    dialog.setAttribute('open', '');
+    document.body.appendChild(dialog);
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '?', bubbles: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', bubbles: true }));
+    });
+
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(dispatchSpy.mock.calls.some(([event]) => event.type === 'toggle-shortcut-help')).toBe(false);
+    dialog.remove();
+    dispatchSpy.mockRestore();
   });
 });

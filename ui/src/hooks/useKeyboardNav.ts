@@ -13,6 +13,7 @@ export function useGlobalKeyboardShortcuts() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (document.querySelector('dialog[open]')) return;
       // Don't handle if user is typing in an input/textarea (except Escape)
       const target = e.target as HTMLElement;
       const isInput = target.tagName === 'INPUT' ||
