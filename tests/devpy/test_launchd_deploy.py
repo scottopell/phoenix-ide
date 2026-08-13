@@ -332,7 +332,7 @@ class PreparationTests(unittest.TestCase):
     def test_controller_release_revalidates_exact_tag_to_expected_commit(self):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
-             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456" + "0" * 28}), \
              mock.patch.object(self.dev.subprocess, "run") as run:
             staging = Path(td)
             asset = staging / "phoenix_ide-aarch64-apple-darwin"
@@ -465,6 +465,24 @@ class PreparationTests(unittest.TestCase):
             ]
             with self.assertRaisesRegex(SystemExit, "malformed git identity"):
                 self.dev._prepare_release_candidate("latest", staging)
+
+    def test_release_rejects_legacy_twelve_char_embedded_identity(self):
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "_release_asset_name", return_value="phoenix_ide-aarch64-apple-darwin"), \
+             mock.patch.object(self.dev, "_binary_identity", return_value={"version": "1.2.3", "git_sha": "abc123def456"}), \
+             mock.patch.object(self.dev.subprocess, "run") as run:
+            staging = Path(td)
+            asset = staging / "phoenix_ide-aarch64-apple-darwin"
+            asset.write_bytes(b"release")
+            (staging / "SHA256SUMS").write_text(f"{self.dev._file_sha256(asset)}  {asset.name}\n")
+            commit = "abc123def456" + "0" * 28
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, json.dumps({"tagName": "v1.2.3", "isPrerelease": False}), ""),
+                subprocess.CompletedProcess([], 0, commit + "\n", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with self.assertRaisesRegex(SystemExit, "modern published releases require 40"):
+                self.dev._prepare_release_candidate("v1.2.3", staging)
 
     def test_local_candidate_binds_exact_head_to_typed_identity(self):
         commit = "abc123def456" + "0" * 28

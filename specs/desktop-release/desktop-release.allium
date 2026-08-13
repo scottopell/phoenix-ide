@@ -106,7 +106,6 @@ entity DesktopArchiveBuild {
 entity ReleasePublication {
     identity: ReleaseIdentity
     state: PublishState
-    previous_assets_backed_up: Boolean
     failure_domain: FailureDomain
 
     transitions state {

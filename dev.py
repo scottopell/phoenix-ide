@@ -9064,18 +9064,13 @@ def _prepare_release_candidate(
         )
     if identity.git_sha.endswith("-dirty"):
         raise SystemExit(f"release {tag} asset embeds a dirty git identity")
-    if not _is_embedded_git_sha(identity.git_sha):
+    if not _is_full_git_sha(identity.git_sha):
         raise SystemExit(
-            f"release {tag} asset embeds malformed git identity {identity.git_sha!r}; expected 12 or 40 lowercase hex characters"
+            f"release {tag} asset embeds legacy or malformed git identity {identity.git_sha!r}; modern published releases require 40 lowercase hex characters"
         )
-    if _is_full_git_sha(identity.git_sha):
-        if release_commit != identity.git_sha:
-            raise SystemExit(
-                f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
-            )
-    elif not release_commit.startswith(identity.git_sha):
+    if release_commit != identity.git_sha:
         raise SystemExit(
-            f"release {tag} resolves to {release_commit}, but the asset embeds legacy prefix {identity.git_sha}"
+            f"release {tag} resolves to {release_commit}, but the asset embeds {identity.git_sha}"
         )
     return PreparedCandidate(
         binary=binary,
