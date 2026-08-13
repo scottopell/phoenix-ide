@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
+import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { StateBar } from './StateBar';
 import { api, type AssociatedPrStatusEnvelope, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 
