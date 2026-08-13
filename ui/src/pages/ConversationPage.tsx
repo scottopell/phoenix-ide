@@ -151,12 +151,6 @@ function prefersConversationIdRoute(routeSegment: string): boolean {
   return isUuidRouteSegment(routeSegment);
 }
 
-async function getCachedConversationForRoute(routeSegment: string): Promise<Conversation | null> {
-  return prefersConversationIdRoute(routeSegment)
-    ? await cacheDB.getConversation(routeSegment) ?? await cacheDB.getConversationBySlug(routeSegment)
-    : await cacheDB.getConversationBySlug(routeSegment) ?? await cacheDB.getConversation(routeSegment);
-}
-
 async function getConversationByResolvedId(route: ConversationRouteResponse) {
   return api.getConversation(route.id);
 }
@@ -808,8 +802,6 @@ function ConversationPageContent({
       hasEarlierHistory: false,
     });
 
-    const hadAtomData = !!atomRef.current.conversationId;
-
     let cancelled = false;
 
     const resolveAuthoritativeRoute = async () => {
@@ -826,45 +818,18 @@ function ConversationPageContent({
     };
 
     const loadConversation = async () => {
+      if (!navigator.onLine) {
+        if (!cancelled && !atomRef.current.conversation) {
+          setError('Conversation unavailable offline');
+        }
+        return;
+      }
       try {
-        let cached = atomRef.current.conversation;
-        let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
-        if (!hadAtomData) {
-          cached = await getCachedConversationForRoute(slug);
-          if (cached) {
-            cachedMessages = await cacheDB.getMessages(cached.id);
-            if (!cancelled) {
-              dispatch({
-                type: 'set_initial_data',
-                conversationId: cached.id,
-                conversation: cached,
-                messages: cachedMessages,
-                phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-                contextWindow: { used: 0 },
-                transcriptGeneration: cached.transcript_generation ?? 1,
-                transcriptCoverage: 'tail',
-                eventCursorFloor: eventCursorRef.current,
-              });
-            }
-          }
-        }
-
-        // Resolve the route before opening the stream. Cached data is provisional:
-        // it may paint immediately, but it never chooses the stream identity.
-        if (navigator.onLine && !cancelled) {
-          try {
-            await resolveAuthoritativeRoute();
-          } catch (routeError) {
-            if (!cached) throw routeError;
-            console.warn('Failed to resolve conversation route; keeping cached transcript provisional', routeError);
-          }
-        } else if (!cancelled && !cached) {
-          setError('Conversation not found in cache and offline');
-        }
+        await resolveAuthoritativeRoute();
       } catch (err) {
         if (!cancelled) {
-          console.error('Failed to load conversation:', err);
-          setError(err instanceof Error ? err.message : 'Failed to load conversation');
+          console.error('Failed to resolve conversation route:', err);
+          setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
         }
       }
     };

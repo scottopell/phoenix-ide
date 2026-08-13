@@ -1040,6 +1040,24 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
+  it('opens the authoritative stream without waiting for IndexedDB hydration', async () => {
+    vi.mocked(cacheDB.getConversationBySlug).mockReturnValue(new Promise(() => {}));
+    vi.mocked(cacheDB.getConversation).mockReturnValue(new Promise(() => {}));
+    vi.mocked(cacheDB.getMessages).mockReturnValue(new Promise(() => {}));
+    const conversation = makeConversation();
+
+    renderPage(conversation);
+
+    await waitFor(() => expect(api.getConversationRouteBySlug).toHaveBeenCalledWith(slug));
+    await waitFor(() => {
+      const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
+      expect(options.conversationId).toBe(conversation.id);
+    });
+    expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
+    expect(cacheDB.getConversation).not.toHaveBeenCalled();
+    expect(cacheDB.getMessages).not.toHaveBeenCalled();
+  });
+
   it('keeps a direct ID route when the authoritative conversation has no slug', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174001';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: uuidRoute });
@@ -1085,13 +1103,7 @@ describe('ConversationPage archived read-only rendering', () => {
   });
 
   it('uses the authoritative route owner when the cached slug owner changed', async () => {
-    const staleConversation = makeConversation({ id: 'stale-conv' });
     const authoritativeConversation = makeConversation({ id: 'authoritative-conv' });
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([{
-      ...historyMessage,
-      conversation_id: staleConversation.id,
-    }]);
     vi.mocked(api.getConversationRouteBySlug).mockResolvedValue({
       id: authoritativeConversation.id,
       slug: authoritativeConversation.slug,
@@ -1112,20 +1124,16 @@ describe('ConversationPage archived read-only rendering', () => {
       </ConversationContext.Provider>,
     );
 
-    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     await waitFor(() => {
       const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
       expect(options.conversationId).toBe(authoritativeConversation.id);
     });
-    expect(api.getConversationBySlug).not.toHaveBeenCalled();
+    expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
+    expect(cacheDB.getMessages).not.toHaveBeenCalled();
   });
 
-  it('keeps cached history visible and read-only when route resolution fails', async () => {
-    const conversation = makeConversation();
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(conversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
-    const routeFailure = deferred<{ id: string; slug: string | null }>();
-    vi.mocked(api.getConversationRouteBySlug).mockReturnValue(routeFailure.promise);
+  it('surfaces route failure without falling back to transcript IndexedDB', async () => {
+    vi.mocked(api.getConversationRouteBySlug).mockRejectedValue(new Error('temporary route failure'));
 
     render(
       <ConversationContext.Provider value={new ConversationStore()}>
@@ -1140,25 +1148,10 @@ describe('ConversationPage archived read-only rendering', () => {
         </DraftContext.Provider>
       </ConversationContext.Provider>,
     );
-    await waitFor(() => expect(cacheDB.getMessages).toHaveBeenCalledWith(conversation.id));
-    await act(async () => {
-      routeFailure.reject(new Error('temporary route failure'));
-      await routeFailure.promise.catch(() => undefined);
-    });
 
-    expect(screen.getByText('keep this history visible')).toBeInTheDocument();
-    expect(screen.queryByText('temporary route failure')).not.toBeInTheDocument();
-    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-
-    vi.mocked(api.getConversationRouteBySlug).mockResolvedValue({
-      id: conversation.id,
-      slug: conversation.slug,
-    });
-    act(() => window.dispatchEvent(new Event('online')));
-    await waitFor(() => {
-      const options = hooksMockState.useConnection.mock.calls.at(-1)?.[0] as ConnectionOptions;
-      expect(options.conversationId).toBe(conversation.id);
-    });
+    expect(await screen.findByText('temporary route failure')).toBeInTheDocument();
+    expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
+    expect(cacheDB.getMessages).not.toHaveBeenCalled();
   });
 
   it('does not send cached reconnect credentials to a different route owner', async () => {
