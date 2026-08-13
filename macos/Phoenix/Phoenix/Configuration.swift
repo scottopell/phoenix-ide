@@ -522,7 +522,7 @@ struct SettingsPersistence {
 
     func loadDraft() throws -> DraftLoadResult {
         let snapshot = try persistedSnapshot()
-        let hasSavedModeSelection = snapshot.preferences.serverMode != nil
+        let hasSavedModeSelection = snapshot.preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)) != nil
         return DraftLoadResult(draft: snapshot.draft(), hasSavedModeSelection: hasSavedModeSelection)
     }
 
@@ -531,7 +531,7 @@ struct SettingsPersistence {
         let snapshot = PersistedSettingsSnapshot(preferences: preferences, secrets: [:])
         return DraftLoadResult(
             draft: snapshot.nonsecretDraft(),
-            hasSavedModeSelection: preferences.serverMode != nil
+            hasSavedModeSelection: preferences.serverMode.flatMap(ServerModeKind.init(rawValue:)) != nil
         )
     }
 

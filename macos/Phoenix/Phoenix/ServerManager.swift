@@ -316,6 +316,12 @@ actor SidecarLogRecorder {
         pendingChunks.append(data)
     }
 
+    func noteDroppedChunks(_ count: Int, operation: UUID) {
+        guard self.operation == operation, count > 0 else { return }
+        droppedChunkCount += count
+        discardUntilRecordBoundary = true
+    }
+
     func drain(operation: UUID) async -> [Snapshot] {
         guard self.operation == operation else { return [] }
         var snapshots: [Snapshot] = []
@@ -490,6 +496,79 @@ struct RollingLogWriter {
     }
 }
 
+final class SidecarOutputPump: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chunks: [Data] = []
+    private var dropped = 0
+    private var draining = false
+    private var finished = false
+    private var prepared = false
+    private let maxChunks: Int
+    private let recorder: SidecarLogRecorder
+    private let operation: UUID
+
+    init(recorder: SidecarLogRecorder, operation: UUID, maxChunks: Int = 32) {
+        self.recorder = recorder
+        self.operation = operation
+        self.maxChunks = maxChunks
+    }
+
+    func offer(_ data: Data) {
+        lock.lock()
+        if chunks.count >= maxChunks {
+            chunks.removeFirst()
+            dropped += 1
+        }
+        chunks.append(data)
+        let shouldStart = !draining
+        draining = true
+        lock.unlock()
+        if shouldStart { Task { await drain() } }
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        let shouldStart = !draining
+        draining = true
+        lock.unlock()
+        if shouldStart { Task { await drain() } }
+    }
+
+    private func takeNext() -> (dropped: Int, chunk: Data?, shouldFinish: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        let droppedNow = dropped
+        dropped = 0
+        let chunk = chunks.isEmpty ? nil : chunks.removeFirst()
+        let shouldFinish = chunk == nil && finished
+        if chunk == nil { draining = false }
+        return (droppedNow, chunk, shouldFinish)
+    }
+
+    private func drain() async {
+        if !prepared {
+            await recorder.reset(operation: operation)
+            prepared = true
+        }
+        while true {
+            let next = takeNext()
+            let droppedNow = next.dropped
+            let chunk = next.chunk
+            let shouldFinish = next.shouldFinish
+
+            if droppedNow > 0 { await recorder.noteDroppedChunks(droppedNow, operation: operation) }
+            if let chunk {
+                await recorder.enqueue(chunk, operation: operation)
+                _ = await recorder.drain(operation: operation)
+                continue
+            }
+            if shouldFinish { _ = await recorder.finishPending(operation: operation) }
+            return
+        }
+    }
+}
+
 @MainActor
 private final class SidecarLogSnapshotSink {
     weak var manager: ServerManager?
@@ -534,7 +613,7 @@ final class ServerManager: ObservableObject {
     var currentOperationToken: ConnectionOperationToken { ConnectionOperationToken(id: operationID) }
 
     func connect() {
-        terminationInProgress = false
+        guard !terminationInProgress else { return }
         resetBrowserOwnedStateForOperationTransition()
         bundledReconnectQueue.cancel()
         readinessTask?.cancel()
@@ -738,8 +817,6 @@ final class ServerManager: ObservableObject {
                     await logSnapshotSink.publish(lines)
                 }
             )
-            Task { await logRecorder.reset(operation: operation) }
-
             let inherited = ProcessInfo.processInfo.environment
             guard let instanceID = launchedBundledInstance?.instanceID else {
                 throw ConfigurationError.bundledBinaryMissing
@@ -761,21 +838,14 @@ final class ServerManager: ObservableObject {
             let pipe = Pipe()
             launched.standardOutput = pipe
             launched.standardError = pipe
-            let outputQueue = DispatchQueue(label: "Phoenix.SidecarOutput")
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let outputPump = SidecarOutputPump(recorder: logRecorder, operation: operation)
+            pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard let self else { return }
-                outputQueue.async { [weak self] in
-                    guard let self else { return }
-                    if data.isEmpty {
-                        handle.readabilityHandler = nil
-                        Task { await self.handleSidecarEOF(logRecorder: logRecorder, operation: operation) }
-                        return
-                    }
-                    Task {
-                        await logRecorder.enqueue(data, operation: operation)
-                        await self.handleBufferedSidecarOutput(logRecorder: logRecorder, operation: operation)
-                    }
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    outputPump.finish()
+                } else {
+                    outputPump.offer(data)
                 }
             }
             launched.terminationHandler = { [weak self] terminated in
@@ -966,10 +1036,8 @@ final class ServerManager: ObservableObject {
     private func finishStopCallbacksOnly() {
         let callbacks = stopCompletions
         stopCompletions.removeAll()
-        if terminationInProgress {
-            terminationInProgress = false
-        }
         callbacks.forEach { $0() }
+        terminationInProgress = false
     }
 
     private func handleBufferedSidecarOutput(logRecorder: SidecarLogRecorder, operation: UUID) async {

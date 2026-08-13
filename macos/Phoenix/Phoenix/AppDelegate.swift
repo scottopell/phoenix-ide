@@ -197,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch action {
         case .status:
             showServerStatusWindow()
+            NSApp.activate(ignoringOtherApps: true)
         case .conversation(let id):
             showWindow()
             validateAndQueueConversationNavigation(id)

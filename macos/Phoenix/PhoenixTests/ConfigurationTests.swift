@@ -359,6 +359,16 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testSettingsPersistenceTreatsInvalidSavedModeAsUnselected() {
+        let suite = "SettingsPersistence.invalid-mode.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("removed-mode", forKey: PreferenceKey.serverMode)
+        let persistence = SettingsPersistence(defaults: defaults, keychain: ScriptedSecretStore(), bundle: .main)
+
+        XCTAssertFalse(persistence.loadConnectionDraft().hasSavedModeSelection)
+    }
+
     func testSettingsPersistenceLoadsUnselectedFirstRunWithoutPersistedMode() throws {
         let suite = "SettingsPersistence.load.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
