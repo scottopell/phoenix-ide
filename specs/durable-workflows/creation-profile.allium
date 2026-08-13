@@ -617,10 +617,30 @@ rule InitialTurnReadinessRequiresDispatchReceipt {
     ensures: conversation_projection_ready(binding) implies dispatch_receipt_present(binding)
 }
 
+rule InitialTurnReadinessPublishesReady {
+    when: ReadinessBarrierEvaluated(reducer, binding)
+    requires: binding.intent.start.variant = initial_turn
+    requires: all_required_effects_receipted(binding)
+    requires: conversation_projection_materialized(binding)
+    requires: dispatch_receipt_present(binding)
+    ensures: binding.outcome = ready
+    ensures: conversation_projection_ready(binding)
+}
+
 rule SeededEmptyReadinessOmitsDispatchRequirement {
     when: ReadinessBarrierEvaluated(reducer, binding)
     requires: binding.intent.start.variant = seeded_empty
     ensures: conversation_projection_ready(binding) implies not readiness_requires_dispatch(binding)
+}
+
+rule SeededEmptyReadinessPublishesReady {
+    when: ReadinessBarrierEvaluated(reducer, binding)
+    requires: binding.intent.start.variant = seeded_empty
+    requires: all_required_effects_receipted(binding)
+    requires: conversation_projection_materialized(binding)
+    ensures: binding.outcome = ready
+    ensures: conversation_projection_ready(binding)
+    ensures: not readiness_requires_dispatch(binding)
 }
 
 rule RuntimeBootstrapPrecedesFirstDispatch {
@@ -657,3 +677,5 @@ rule StaleCreationResultsCannotOverwriteLaterLifecycleOutcome {
 -- keyed by the hidden repository identity. Release is terminal for that lock row;
 -- retries acquire a new row only after no active lock remains.
 -- release_active_physical_repository_locks(workflow)
+-- all_required_effects_receipted(binding)
+-- conversation_projection_materialized(binding)
