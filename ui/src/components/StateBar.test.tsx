@@ -1486,6 +1486,26 @@ describe('StateBar mobile layout', () => {
     await waitFor(() => expect(trigger).toHaveFocus());
   });
 
+  it('stages an available model when the persisted model is no longer in the catalog', () => {
+    const onUpgradeModel = vi.fn();
+    renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      conversation: makeConversation({ model: 'removed-model', effort: 'max', service_tier: 'fast' }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+    fireEvent.click(screen.getByTitle(/Model: removed-model/i));
+
+    const modelGroup = screen.getByRole('radiogroup', { name: /select model/i });
+    const selected = within(modelGroup).getByRole('radio', { checked: true });
+    expect(selected).toHaveAccessibleName(/claude-sonnet-5/i);
+    expect(selected).toHaveAttribute('tabindex', '0');
+    expect(within(modelGroup).queryByText('removed-model')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(onUpgradeModel).toHaveBeenCalledWith('claude-sonnet-5', null, 'standard');
+  });
+
   it('discards staged configuration when the mounted conversation identity changes', () => {
     const onUpgradeModel = vi.fn();
     const { rerender } = renderStateBar({

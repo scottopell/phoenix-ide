@@ -882,7 +882,6 @@ export function StateBar({
     && !effortCompatible(currentEffortCapabilities, persistedEffort);
   const currentEffort = persistedEffort;
   const currentServiceTier = conversation?.service_tier ?? 'standard';
-  const supportsFastMode = currentModelInfo?.service_tier_capabilities === 'supported';
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -908,7 +907,7 @@ export function StateBar({
       const selected = availableModels.find((model) => model.id === selectedId);
       if (selected) return [selected, ...recommended];
     }
-    return recommended;
+    return recommended.length > 0 ? recommended : availableModels;
   })();
   const stagedModelInfo = availableModels?.find((model) => model.id === stagedModel);
   const stagedEffortCapabilities = stagedModelInfo?.effort_capabilities;
@@ -921,10 +920,14 @@ export function StateBar({
     : null;
 
   const openModelDialog = () => {
-    if (!canPickModel) return;
-    setStagedModel(currentModel);
-    setStagedEffort(effortCompatible(currentEffortCapabilities, persistedEffort) ? persistedEffort : null);
-    setStagedServiceTier(supportsFastMode ? currentServiceTier : 'standard');
+    if (!canPickModel || !availableModels) return;
+    const initialModel = availableModels.find((model) => model.id === currentModel)
+      ?? availableModels.find((model) => model.recommended)
+      ?? availableModels[0];
+    if (!initialModel) return;
+    setStagedModel(initialModel.id);
+    setStagedEffort(effortCompatible(initialModel.effort_capabilities, persistedEffort) ? persistedEffort : null);
+    setStagedServiceTier(initialModel.service_tier_capabilities === 'supported' ? currentServiceTier : 'standard');
     setModelMutationError(null);
     setPickerOpen(true);
     setPickerConversationId(conversation?.id);
