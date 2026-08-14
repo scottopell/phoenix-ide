@@ -1749,6 +1749,31 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: first, nextOrigin: first))
         XCTAssertFalse(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: first, nextOrigin: second))
         XCTAssertFalse(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: nil, nextOrigin: nil))
+        XCTAssertEqual(
+            QueuedDeepLinkAuthorityDecision.bindIfUnbound(pendingOrigin: nil, selectedOrigin: first),
+            first
+        )
+        XCTAssertEqual(
+            QueuedDeepLinkAuthorityDecision.bindIfUnbound(pendingOrigin: first, selectedOrigin: second),
+            first
+        )
+    }
+
+    func testDeploymentBridgeResponseRequiresExactFinalOrigin() throws {
+        let origin = try PhoenixOrigin("https://phoenix.example.test")
+        XCTAssertTrue(DeploymentBridgeResponseDecision.accepts(
+            responseURL: "https://phoenix.example.test/api/deployment",
+            expectedOrigin: origin
+        ))
+        XCTAssertTrue(DeploymentBridgeResponseDecision.accepts(
+            responseURL: "https://phoenix.example.test:443/api/deployment",
+            expectedOrigin: origin
+        ))
+        XCTAssertFalse(DeploymentBridgeResponseDecision.accepts(
+            responseURL: "https://evil.example.test/api/deployment",
+            expectedOrigin: origin
+        ))
+        XCTAssertFalse(DeploymentBridgeResponseDecision.accepts(responseURL: nil, expectedOrigin: origin))
     }
 
     func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {

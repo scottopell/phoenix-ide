@@ -56,9 +56,9 @@ struct WebViewWrapper: NSViewRepresentable {
         try {
           const response = await window.fetch('/api/deployment', { credentials: 'same-origin' });
           const body = response.ok ? await response.json() : null;
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, status: response.status, body });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, responseURL: response.url, status: response.status, body });
         } catch (_) {
-          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, status: 0, body: null });
+          window.webkit.messageHandlers.phoenixDeployment.postMessage({ generation: deploymentDocumentGeneration, sequence, responseURL: null, status: 0, body: null });
         }
       };
       window.__phoenixMacReportDeployment = reportDeployment;
@@ -384,6 +384,14 @@ struct WebViewWrapper: NSViewRepresentable {
                 latestDeploymentSequence = 0
             }
             latestDeploymentSequence = sequence
+            let responseURL = body["responseURL"] as? String
+            guard DeploymentBridgeResponseDecision.accepts(
+                responseURL: responseURL,
+                expectedOrigin: origin
+            ) else {
+                onDeployment(.failure(WebViewVerificationError.crossOriginResponse), operation)
+                return
+            }
             if status == 401 {
                 onAuthenticationRequired(operation)
                 return
@@ -686,10 +694,12 @@ final class DownloadManager {
 
 enum WebViewVerificationError: LocalizedError {
     case httpStatus(Int)
+    case crossOriginResponse
 
     var errorDescription: String? {
         switch self {
         case .httpStatus(let status): "Deployment verification failed with HTTP status \(status)."
+        case .crossOriginResponse: "Deployment verification was redirected to another origin."
         }
     }
 }

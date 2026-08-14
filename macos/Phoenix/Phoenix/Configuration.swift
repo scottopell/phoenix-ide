@@ -242,6 +242,17 @@ struct QueuedDeepLinkAuthorityDecision {
     static func shouldRetain(pendingOrigin: PhoenixOrigin?, nextOrigin: PhoenixOrigin?) -> Bool {
         nextOrigin != nil && (pendingOrigin == nil || pendingOrigin == nextOrigin)
     }
+
+    static func bindIfUnbound(pendingOrigin: PhoenixOrigin?, selectedOrigin: PhoenixOrigin?) -> PhoenixOrigin? {
+        pendingOrigin ?? selectedOrigin
+    }
+}
+
+struct DeploymentBridgeResponseDecision {
+    static func accepts(responseURL: String?, expectedOrigin: PhoenixOrigin) -> Bool {
+        guard let responseURL, let url = URL(string: responseURL) else { return false }
+        return expectedOrigin.exactlyMatches(url)
+    }
 }
 
 struct DeepLinkNavigationDecision {
