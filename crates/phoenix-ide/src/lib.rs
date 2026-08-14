@@ -74,7 +74,6 @@ use db::Database;
 use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_http::{
@@ -103,6 +102,7 @@ fn build_deployment_config(
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
     log: api::LogInfo,
+    instance_id: Option<api::LaunchInstanceId>,
 ) -> api::DeploymentConfig {
     use api::TlsInfo;
 
@@ -134,6 +134,7 @@ fn build_deployment_config(
         tls,
         log,
         locations,
+        instance_id,
     }
 }
 
@@ -425,7 +426,7 @@ fn build_disk_locations(
     locations.push(DiskLocation {
         category: DiskCategory::BrowserProfiles,
         label: "Browser profiles".to_string(),
-        path: PathBuf::from(tools::browser::session::user_data_dir_glob()),
+        path: tools::browser::session::user_data_dir_glob(runtime_env),
         mode: MeasureMode::Pattern,
     });
 
@@ -914,6 +915,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         tls_source.as_ref(),
         loaded_tls.as_ref(),
         log_config.to_log_info(),
+        std::env::var("PHOENIX_INSTANCE_ID")
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(api::LaunchInstanceId),
     ));
 
     let auth_enabled = password.is_some();

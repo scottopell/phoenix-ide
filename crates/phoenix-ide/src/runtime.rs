@@ -1489,6 +1489,26 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
+        Self::new_with_message_retriever_and_runtime_env(
+            db,
+            llm_registry,
+            message_retriever,
+            platform,
+            mcp_manager,
+            credential_helper,
+            &phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect(),
+        )
+    }
+
+    pub fn new_with_message_retriever_and_runtime_env(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        message_retriever: Arc<dyn crate::db::MessageRetriever>,
+        platform: PlatformCapability,
+        mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
+        runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
@@ -1525,9 +1545,10 @@ impl RuntimeManager {
             llm_registry,
             message_retriever,
             platform,
-            browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
-                browser_lifecycle_tx,
-            )),
+            browser_sessions: BrowserSessionManager::with_lifecycle_sink_and_runtime_env(
+                Some(browser_lifecycle_tx),
+                runtime_env,
+            ),
             bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
                 bash_lifecycle_tx,
             ))),

@@ -45,6 +45,8 @@ The page must let me confidently answer:
 4. Is it healthy on this machine right now? (process memory, CPU, system totals)
 5. Where are its bytes, and how many? (on-disk locations + sizes)
 6. Where do I go to read what it logged? (log file path)
+7. When a launcher owns one exact Phoenix child, can it prove which responding
+   deployment instance it actually launched? (optional typed instance identity)
 
 Each numbered question maps to one or more requirements below.
 
@@ -124,6 +126,21 @@ backend.
 
 THE SYSTEM SHALL keep runtime ownership independent from browser locality and
 release-update prerequisites.
+
+---
+
+### REQ-DEPLOY-002AA: Expose optional launch-instance identity
+
+THE SYSTEM SHALL allow `GET /api/deployment` to include one optional typed
+launch-instance identifier supplied by the running process environment.
+
+WHEN no launcher supplied such an identifier
+THE SYSTEM SHALL encode the field as absent/`null` rather than synthesizing one
+from PID, port, start time, or any other heuristic.
+
+WHEN a launcher does supply the identifier
+THE SYSTEM SHALL report exactly that value unchanged so a native host can prove
+that the responding Phoenix deployment is the exact child process it launched.
 
 ---
 

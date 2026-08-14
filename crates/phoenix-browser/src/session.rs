@@ -34,7 +34,7 @@ use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, Resou
 /// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
 /// stable across Rust/Phoenix releases — a toolchain upgrade must not
 /// orphan an existing on-disk Chrome profile by re-keying.
-fn user_data_dir_for_key(scope_key: &str) -> String {
+fn user_data_dir_for_key(tmp_root: &Path, scope_key: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(scope_key.as_bytes());
@@ -44,20 +44,43 @@ fn user_data_dir_for_key(scope_key: &str) -> String {
             .try_into()
             .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
     );
-    format!("{USER_DATA_DIR_PREFIX}{prefix:016x}")
+    tmp_root.join(format!("{USER_DATA_DIR_PREFIX}{prefix:016x}"))
+}
+
+fn legacy_user_data_dir_for_key(scope_key: &str) -> PathBuf {
+    user_data_dir_for_key(Path::new("/tmp"), scope_key)
+}
+
+fn legacy_profile_has_live_owner(profile: &Path) -> bool {
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(lock) else {
+        return false;
+    };
+    let Some(pid) = target
+        .to_string_lossy()
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return true;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.
-/// Profiles are created at `{USER_DATA_DIR_PREFIX}{16-hex}` by
-/// [`user_data_dir_for_key`].
-const USER_DATA_DIR_PREFIX: &str = "/tmp/phoenix-chrome-";
+const USER_DATA_DIR_PREFIX: &str = "phoenix-chrome-";
 
 /// Glob matching every per-scope Chrome user-data directory. Exposed so the
 /// About-this-deployment endpoint can report this (known-large, unsized)
 /// ephemeral location without enumerating individual profiles.
 #[must_use]
-pub fn user_data_dir_glob() -> String {
-    format!("{USER_DATA_DIR_PREFIX}*")
+pub fn user_data_dir_glob(runtime_env: &PhoenixRuntimeEnvironment) -> PathBuf {
+    runtime_env
+        .tmp_root()
+        .join(format!("{USER_DATA_DIR_PREFIX}*"))
 }
 
 /// Maximum console log entries to keep per session
@@ -402,14 +425,21 @@ impl BrowserSession {
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.
     /// The Chrome user data dir is derived from the browser session key.
     fn browser_config(
+        tmp_root: &Path,
         session_key: &str,
         executable: Option<&Path>,
     ) -> Result<BrowserConfig, BrowserError> {
-        let user_data_dir = user_data_dir_for_key(session_key);
+        let user_data_dir = user_data_dir_for_key(tmp_root, session_key);
 
         // Remove stale user data directory to avoid Chrome SingletonLock conflicts
         // (e.g. from a previous crash or test run that didn't clean up)
         let _ = std::fs::remove_dir_all(&user_data_dir);
+        let legacy_user_data_dir = legacy_user_data_dir_for_key(session_key);
+        if legacy_user_data_dir != user_data_dir
+            && !legacy_profile_has_live_owner(&legacy_user_data_dir)
+        {
+            let _ = std::fs::remove_dir_all(legacy_user_data_dir);
+        }
 
         let mut builder = BrowserConfig::builder()
             .new_headless_mode()
@@ -437,10 +467,11 @@ impl BrowserSession {
 
     /// Launch browser and create a session
     async fn launch_and_init(
+        tmp_root: &Path,
         scope_key: &str,
         executable: Option<&Path>,
     ) -> Result<Self, BrowserError> {
-        let config = Self::browser_config(scope_key, executable)?;
+        let config = Self::browser_config(tmp_root, scope_key, executable)?;
 
         // Browser::launch can hang on a wedged chromium subprocess. Bound it.
         // If launch itself times out there is no browser handle to clean up.
@@ -523,7 +554,7 @@ impl BrowserSession {
     ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
     ///      install paths).
     ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
-    async fn new(scope_key: &str) -> Result<Self, BrowserError> {
+    async fn new(tmp_root: &Path, scope_key: &str) -> Result<Self, BrowserError> {
         // 1. Explicit env-var override — used by the test harness in
         //    sandboxes where Chrome lives at a non-standard path that
         //    chromiumoxide's lookup doesn't probe.
@@ -534,7 +565,7 @@ impl BrowserSession {
                     "Using PHOENIX_CHROME_EXECUTABLE={}",
                     explicit_path.display()
                 );
-                match Self::launch_and_init(scope_key, Some(&explicit_path)).await {
+                match Self::launch_and_init(tmp_root, scope_key, Some(&explicit_path)).await {
                     Ok(session) => return Ok(session),
                     Err(e) => {
                         tracing::warn!(
@@ -551,7 +582,7 @@ impl BrowserSession {
         }
 
         // 2. System Chrome (no explicit executable — chromiumoxide finds it)
-        match Self::launch_and_init(scope_key, None).await {
+        match Self::launch_and_init(tmp_root, scope_key, None).await {
             Ok(session) => return Ok(session),
             Err(e) => {
                 tracing::info!("System Chrome not available ({e}), trying fetcher...");
@@ -583,7 +614,7 @@ impl BrowserSession {
 
         tracing::info!("Using Chrome at {:?}", info.executable_path);
 
-        Self::launch_and_init(scope_key, Some(&info.executable_path)).await
+        Self::launch_and_init(tmp_root, scope_key, Some(&info.executable_path)).await
     }
 
     /// Attach a new live-view viewer (REQ-BT-018).
@@ -1047,6 +1078,7 @@ pub struct BrowserSessionManager {
     /// reaps on age alone.
     scope_liveness_hook: std::sync::OnceLock<ScopeLivenessHook>,
     shutting_down: AtomicBool,
+    tmp_root: PathBuf,
 }
 
 impl BrowserSessionManager {
@@ -1062,11 +1094,22 @@ impl BrowserSessionManager {
     /// emits `SseEvent::BrowserSessionState`.
     #[must_use]
     pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
+        Self::with_lifecycle_sink_and_runtime_env(sink, &PhoenixRuntimeEnvironment::detect())
+    }
+
+    /// Construct a manager whose Chrome profiles use this process's resolved
+    /// Phoenix scratch root.
+    #[must_use]
+    pub fn with_lifecycle_sink_and_runtime_env(
+        sink: Option<BrowserSessionLifecycleSink>,
+        runtime_env: &PhoenixRuntimeEnvironment,
+    ) -> Arc<Self> {
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
+            tmp_root: runtime_env.tmp_root().to_path_buf(),
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -1335,7 +1378,7 @@ impl BrowserSessionManager {
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
         // BrowserSession::new bounds its own CDP launch (and may legitimately
         // run a multi-minute first-run chromium download, which is NOT bounded).
-        let session = BrowserSession::new(&key).await?;
+        let session = BrowserSession::new(&self.tmp_root, &key).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
         Self::setup_session_listeners(session_arc.clone()).await;
@@ -1383,7 +1426,9 @@ impl BrowserSessionManager {
         for (session, user_data_key) in sessions {
             identifiers.push(BrowserCleanupIdentifiers {
                 chrome_pid: session.read().await.chrome_pid,
-                profile_path: user_data_dir_for_key(&user_data_key),
+                profile_path: user_data_dir_for_key(&self.tmp_root, &user_data_key)
+                    .to_string_lossy()
+                    .into_owned(),
             });
         }
         identifiers
@@ -1528,7 +1573,7 @@ impl BrowserSessionManager {
         &self,
         key: &str,
         attempt: &Arc<KillAttempt>,
-        user_data_dir: &str,
+        user_data_dir: &Path,
     ) -> Result<(), BrowserError> {
         let failure = match tokio::time::timeout(
             SESSION_INIT_TIMEOUT,
@@ -1538,8 +1583,14 @@ impl BrowserSessionManager {
         {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Ok(Err(error)) => format!("failed to remove browser profile {user_data_dir}: {error}"),
-            Err(_) => format!("timed out removing browser profile {user_data_dir}"),
+            Ok(Err(error)) => format!(
+                "failed to remove browser profile {}: {error}",
+                user_data_dir.display()
+            ),
+            Err(_) => format!(
+                "timed out removing browser profile {}",
+                user_data_dir.display()
+            ),
         };
         self.complete_kill_failure(key, attempt, failure.clone())
             .await;
@@ -1647,7 +1698,7 @@ impl BrowserSessionManager {
                     return Ok(());
                 };
 
-                let user_data_dir = user_data_dir_for_key(&user_data_key);
+                let user_data_dir = user_data_dir_for_key(&manager.tmp_root, &user_data_key);
                 manager
                     .remove_profile_for_attempt(&key, &task_attempt, &user_data_dir)
                     .await?;
@@ -2069,6 +2120,7 @@ impl Default for BrowserSessionManager {
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
+            tmp_root: PhoenixRuntimeEnvironment::detect().tmp_root().to_path_buf(),
         }
     }
 }
@@ -2104,6 +2156,39 @@ mod lifecycle_hook_tests {
 
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(WorkScopeId::parse(id).unwrap())
+    }
+
+    #[test]
+    fn chrome_profiles_derive_from_the_resolved_phoenix_tmp_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let runtime_env =
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(root.path());
+        let scope_key = "work:test-scope";
+
+        let profile = super::user_data_dir_for_key(runtime_env.tmp_root(), scope_key);
+
+        assert_eq!(profile.parent(), Some(runtime_env.tmp_root()));
+        assert!(profile
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(super::USER_DATA_DIR_PREFIX)));
+        assert_eq!(
+            super::user_data_dir_glob(&runtime_env),
+            runtime_env.tmp_root().join("phoenix-chrome-*")
+        );
+        assert_eq!(
+            profile,
+            super::user_data_dir_for_key(runtime_env.tmp_root(), scope_key),
+            "same session identity must keep deterministic profile reuse within one runtime root"
+        );
+        let other_root = tempfile::tempdir().expect("other temp root");
+        let other_env =
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(other_root.path());
+        assert_ne!(
+            profile,
+            super::user_data_dir_for_key(other_env.tmp_root(), scope_key),
+            "matching scope IDs in isolated deployments must not share a Chrome profile"
+        );
     }
 
     #[test]
@@ -2168,7 +2253,7 @@ mod lifecycle_hook_tests {
 
         let manager = BrowserSessionManager::new();
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
-        let profile = super::user_data_dir_for_key(&scope.stable_key());
+        let profile = super::user_data_dir_for_key(&manager.tmp_root, &scope.stable_key());
         let session = manager.get_session(&scope).await.expect("launch browser");
 
         manager.shutdown_all().await.expect("browser shutdown");

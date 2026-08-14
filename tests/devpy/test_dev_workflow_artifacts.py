@@ -52,6 +52,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         with (
             mock.patch.object(self.dev, "get_default_ports", return_value=(8041, 8042)),
             mock.patch.object(self.dev, "get_pid", side_effect=pid_for),
+            mock.patch.object(self.dev, "PHOENIX_PORT_FILE", self.dev.ROOT / ".missing-test-port"),
             mock.patch.object(self.dev, "build_rust") as build,
             mock.patch.object(self.dev, "stop_process"),
             mock.patch.object(self.dev.time, "sleep"),

@@ -9,6 +9,12 @@ import type { NetworkInfo } from "./NetworkInfo";
  */
 export type DeploymentInfo = { build: BuildInfo, network: NetworkInfo, log: LogInfo, 
 /**
+ * Typed per-process launch identity supplied by the launcher when it needs
+ * to correlate readiness to one exact sidecar instance. `None` for normal
+ * Phoenix deployments that were not launched under such a contract.
+ */
+instance_id: string | null, 
+/**
  * Whether the requesting browser is on the server host, and so may use
  * host-local actions like revealing a path in the OS file manager. False
  * for any remote browser — the file-manager window opens on the server's

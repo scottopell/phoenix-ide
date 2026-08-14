@@ -29,7 +29,8 @@ pub(crate) mod usage;
 pub(crate) mod wire;
 
 pub use deployment::{
-    absolutize, DeploymentConfig, DiskCategory, DiskLocation, LogInfo, MeasureMode, TlsInfo,
+    absolutize, DeploymentConfig, DiskCategory, DiskLocation, LaunchInstanceId, LogInfo,
+    MeasureMode, TlsInfo,
 };
 pub(crate) use git_handlers::record_pr_auto_fix_context_baseline;
 pub use handlers::create_router;
@@ -147,13 +148,14 @@ impl AppState {
         // at startup (REQ-RET-003) off the request path.
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let message_retriever: Arc<dyn MessageRetriever> = retriever.clone();
-        let runtime = Arc::new(RuntimeManager::new_with_message_retriever(
+        let runtime = Arc::new(RuntimeManager::new_with_message_retriever_and_runtime_env(
             db.clone(),
             llm_registry.clone(),
             message_retriever.clone(),
             platform.clone(),
             mcp_manager.clone(),
             credential_helper.clone(),
+            &runtime_env,
         ));
         let retired_wakes = phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
             .retire_all_registrations(phoenix_workflow::Timestamp(

@@ -35,6 +35,11 @@ sha2 = "0.11"
 thiserror = "2"
 
 tracing = "0.1"
+libc = "0.2"
+
+[dev-dependencies]
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+tempfile = "3"
 
 [lints]
 workspace = true
