@@ -9,7 +9,10 @@ ignored private finalizer then catches up the dormant GitRepository shadows.
 
 The test-only artifact is `target/git_repository_r1_compat.artifact.json`. It is
 acceptance evidence, **not R2 authorization and not Phoenix product
-persistence**. It binds an independently recomputed length-framed integrity SHA
+persistence**. The artifact carries canonical serde `snake_case` typed readiness
+(every diagnostic category and bounded sample, valid absence, storage kind,
+applied migration ledger, and inspected R1 DDL) and the same canonical JSON is an
+integrity member verified exactly by Python. It binds an independently recomputed length-framed integrity SHA
 to the process-local run nonce, canonical target-database digest, candidate and
 historical identities, compiled schema, complete source snapshots, and four
 phase-specific shadow snapshot digests: before and after the initial historical
@@ -18,7 +21,22 @@ must be equal; the two phase digests may differ because candidate catch-up runs
 between them. The additive schema is retained; destructive down-migration is
 prohibited.
 
-On failure the runner retains drained historical-server output at
-`target/git_repository_r1_compat.failure.log`. It never uses sleeps or direct
-historical SQL writes. The historical process is started in a process group and
-is terminated/reaped with TERM then KILL escalation.
+Preparation produces a typed, private artifact before rollback, binding the exact
+candidate SHA/package/build schema, target database, complete source and initial
+shadow digest, fresh preparation root/nonce, typed readiness digest, and both
+catch-up statistics. Finalization re-derives and compares every binding before
+minting its run-bound preparation attestation.
+
+The authority census inventories explicit production Project readers, writers,
+and paths across conversation persistence/inheritance, active-work eligibility,
+WorkScope writes and cleanup, global read, usage, analytics, and direct SQL.
+Run `PHOENIX_R1_COMPAT_CENSUS_SELF_TEST=1 uv run tests/e2e/git_repository_r1_compat.py`
+to prove an injected occurrence changes the observed inventory.
+
+On failure the runner retains only its drained historical-server output at
+`target/git_repository_r1_compat.failure.log`; it removes stale failure output at
+run start and does not create it on success. It never uses sleeps or direct
+historical SQL writes. Startup is event-driven; only an early explicit bind race
+gets a bounded fresh-port retry, with the old process fully reaped. The historical
+process is started in a process group and is terminated/reaped with TERM then KILL
+escalation. Worktree cleanup is mandatory and is grouped with any body failure.

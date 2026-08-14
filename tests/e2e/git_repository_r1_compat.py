@@ -47,6 +47,7 @@ class Census:
 
 @dataclass(frozen=True)
 class Preparation:
+    value: dict[str, Any]
     initial_catchup: dict[str, int]
     replay_catchup: dict[str, int]
 
@@ -112,9 +113,13 @@ def exact_catchup(value: Any, name: str) -> dict[str, int]:
 
 def read_preparation(path: Path) -> Preparation:
     value = json.loads(path.read_text())
-    if set(value) != {"initial_catchup", "replay_catchup"}:
+    required = {"candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "source_digest", "initial_shadow_digest", "preparation_readiness_root", "preparation_run_nonce", "readiness", "readiness_summary_digest", "initial_catchup", "replay_catchup"}
+    if set(value) != required:
         raise RuntimeError("preparation artifact has unexpected fields")
+    if any(not isinstance(value[key], str) or not value[key] for key in required - {"readiness", "initial_catchup", "replay_catchup"}):
+        raise RuntimeError("preparation artifact lacks typed identity evidence")
     preparation = Preparation(
+        value,
         exact_catchup(value["initial_catchup"], "preparation initial catchup"),
         exact_catchup(value["replay_catchup"], "preparation replay catchup"),
     )
@@ -159,15 +164,25 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
     member_map = dict(members)
     if len(member_map) != len(members):
         raise RuntimeError("integrity members contain duplicate keys")
+    readiness = finalizer.get("readiness")
+    if not isinstance(readiness, dict) or not isinstance(finalizer.get("preparation_identity_digest"), str):
+        raise RuntimeError("artifact lacks typed readiness or preparation identity")
+    readiness_json = json.dumps(readiness, separators=(",", ":"))
+    if member_map.get("readiness") != readiness_json:
+        raise RuntimeError(
+            "typed readiness JSON differs from integrity member: "
+            f"artifact={readiness_json!r}, member={member_map.get('readiness')!r}"
+        )
     expected = {
-        key: str(finalizer[key]) for key in (
+        key: (json.dumps(finalizer[key], sort_keys=True, separators=(",", ":")) if key == "eligibility" else str(finalizer[key])) for key in (
             "candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "readiness_root", "run_nonce",
             "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
             "historical_sha", "old_source_digest_before", "old_source_digest_after",
             "shadow_before_initial_old", "shadow_after_initial_old", "shadow_before_rollback",
-            "shadow_after_rollback", "rollback_posture", "eligibility",
+            "shadow_after_rollback", "rollback_posture", "eligibility", "preparation_identity_digest",
         )
     }
+    expected["readiness"] = readiness_json
     for prefix, stats in (("preparation_initial_catchup", finalizer["preparation_initial_catchup"]), ("preparation_replay_catchup", finalizer["preparation_replay_catchup"]), ("final_catchup", finalizer["final_catchup"]), ("final_replay", finalizer["final_replay"])):
         expected.update({f"{prefix}.{key}": str(value) for key, value in stats.items()})
     expected.update({f"shadow_row_counts.{key}": str(value) for key, value in finalizer["shadow_row_counts"].items()})
@@ -179,20 +194,53 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         raise RuntimeError("Python integrity verification rejected Rust artifact")
 
 
+def census_observed(inventory: dict[str, Any], injected: dict[str, str] | None = None) -> dict[str, Any]:
+    sources = sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob("crates/**/*.rs") if "/tests/" not in path.as_posix() and not path.name.endswith("_test.rs"))
+    injected = injected or {}
+    def occurrences(symbol: str) -> dict[str, int]:
+        return {
+            path: count for path in sources
+            if (count := ((ROOT / path).read_text() + injected.get(path, "")).count(symbol))
+        }
+    return {
+        "shadow_table_occurrences": {table: occurrences(table) for table in inventory["shadow_tables"]},
+        "shadow_caller_occurrences": {symbol: occurrences(symbol) for symbol in inventory["shadow_caller_symbols"]},
+        "project_authority_occurrences": {
+            path["name"]: occurrences(path["pattern"])
+            for path in inventory["project_authority_paths"]
+        },
+    }
+
+
+def census_expected(inventory: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "shadow_table_occurrences": inventory["shadow_table_occurrences"],
+        "shadow_caller_occurrences": inventory["shadow_caller_occurrences"],
+        "project_authority_occurrences": {
+            path["name"]: path["occurrences"] for path in inventory["project_authority_paths"]
+        },
+    }
+
+
 def census() -> Census:
     inventory = json.loads((ROOT / "tests/e2e/git_repository_r1_census.json").read_text())
-    sources = sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob("crates/**/*.rs") if "/tests/" not in path.as_posix() and not path.name.endswith("_test.rs"))
-    def occurrences(symbol: str) -> dict[str, int]:
-        return {path: (ROOT / path).read_text().count(symbol) for path in sources if (ROOT / path).read_text().count(symbol)}
-    actual_tables = {table: occurrences(table) for table in inventory["shadow_tables"]}
-    actual_callers = {symbol: occurrences(symbol) for symbol in inventory["shadow_caller_symbols"]}
-    actual_projects = {symbol: occurrences(symbol) for symbol in inventory["project_authority_symbols"]}
-    observed = {"shadow_table_occurrences": actual_tables, "shadow_caller_occurrences": actual_callers, "project_authority_occurrences": actual_projects}
-    expected = {key: inventory[key] for key in observed}
+    observed, expected = census_observed(inventory), census_expected(inventory)
     if observed != expected:
         raise RuntimeError(f"authority census drift; expected={expected!r}, observed={observed!r}")
     digest = canonical_json_digest({"inventory": inventory, "observed": observed})
-    return Census(inventory["revision"], digest, sum(sum(files.values()) for files in actual_tables.values()), sum(sum(files.values()) for files in actual_projects.values()))
+    tables = observed["shadow_table_occurrences"]
+    projects = observed["project_authority_occurrences"]
+    return Census(inventory["revision"], digest, sum(sum(files.values()) for files in tables.values()), sum(sum(files.values()) for files in projects.values()))
+
+
+def census_self_test() -> None:
+    inventory = json.loads((ROOT / "tests/e2e/git_repository_r1_census.json").read_text())
+    path = inventory["project_authority_paths"][0]
+    file = next(iter(path["occurrences"]))
+    observed = census_observed(inventory, {file: path["pattern"]})
+    if observed == census_expected(inventory):
+        raise RuntimeError("census self-test could not prove injected source content changes observed inventory")
+    print("census self-test passed: injected authority occurrence changes observed inventory")
 
 
 def free_port() -> int:
@@ -212,14 +260,7 @@ def line_reader(stream: Any, lines: queue.Queue[object], retained: list[str]) ->
         lines.put(EOF)
 
 
-def preserved_logs(lines: list[str], failure_path: Path) -> str:
-    text = "".join(lines)
-    failure_path.parent.mkdir(parents=True, exist_ok=True)
-    failure_path.write_text(text)
-    return text
-
-
-def stop(process: subprocess.Popen[str], lines: queue.Queue[object], retained: list[str]) -> None:
+def stop(process: subprocess.Popen[str], lines: queue.Queue[object], retained: list[str]) -> str:
     if process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
         try:
@@ -238,36 +279,55 @@ def stop(process: subprocess.Popen[str], lines: queue.Queue[object], retained: l
             continue
         if value is EOF:
             break
-    logs = preserved_logs(retained, ROOT / "target/git_repository_r1_compat.failure.log")
+    logs = "".join(retained)
     if process.returncode not in (0, -signal.SIGTERM):
         raise RuntimeError(f"historical server stopped with unexpected exit {process.returncode}; logs:\n{logs}")
+    return logs
 
 
-def start_old(binary: Path, db_path: Path, root: Path, label: str) -> tuple[subprocess.Popen[str], str, queue.Queue[object], list[str]]:
-    port = free_port()  # Server API does not accept a pre-bound listener; diagnose bind races below.
+def stop_and_record(process: subprocess.Popen[str], lines: queue.Queue[object], retained: list[str], run_logs: list[str]) -> None:
+    try:
+        stop(process, lines, retained)
+    finally:
+        run_logs.extend(retained)
+
+
+def is_bind_race(logs: str) -> bool:
+    lower = logs.lower()
+    return "address already in use" in lower or "addrinuse" in lower or "failed to bind" in lower
+
+
+def start_old(binary: Path, db_path: Path, root: Path, label: str, run_logs: list[str]) -> tuple[subprocess.Popen[str], str, queue.Queue[object], list[str]]:
     home, config, data = root / "home", root / "config", root / "data"
     for directory in (home, config, data): directory.mkdir(exist_ok=True)
-    env = child_env(HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(config), PHOENIX_DATA_DIR=str(data), PHOENIX_DB_PATH=str(db_path), PHOENIX_PORT=str(port), PHOENIX_BIND_ADDR="127.0.0.1", PHOENIX_ENABLE_MOCK_MODEL="1", DEFAULT_MODEL="mock", PHOENIX_LOG_STDOUT="true", PHOENIX_LOG_FILE=str(root / f"historical-{label}.log"), PHOENIX_TRACE_EXPORTER="none", RUST_LOG="info")
-    process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
-    assert process.stdout is not None
-    lines: queue.Queue[object] = queue.Queue(); retained: list[str] = []
-    threading.Thread(target=line_reader, args=(process.stdout, lines, retained), daemon=True).start()
-    deadline = time.monotonic() + OUTER_TIMEOUT
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            stop(process, lines, retained)
-            logs = preserved_logs(retained, ROOT / "target/git_repository_r1_compat.failure.log")
-            raise RuntimeError(f"historical server did not emit {STARTUP_EVENT!r}; bind race or startup failure on port {port}; logs:\n{logs}")
-        try: event = lines.get(timeout=remaining)
-        except queue.Empty: continue
-        if event is EOF:
-            code = process.wait(timeout=1)
-            logs = preserved_logs(retained, ROOT / "target/git_repository_r1_compat.failure.log")
-            raise RuntimeError(f"historical server exited before startup ({code}); requested port={port}; logs:\n{logs}")
-        assert isinstance(event, str)
-        if STARTUP_EVENT in event:
-            return process, f"http://127.0.0.1:{port}", lines, retained
+    for attempt in range(3):
+        port = free_port()  # API accepts a port rather than a pre-bound listener.
+        env = child_env(HOME=str(home), USERPROFILE=str(home), XDG_CONFIG_HOME=str(config), PHOENIX_DATA_DIR=str(data), PHOENIX_DB_PATH=str(db_path), PHOENIX_PORT=str(port), PHOENIX_BIND_ADDR="127.0.0.1", PHOENIX_ENABLE_MOCK_MODEL="1", DEFAULT_MODEL="mock", PHOENIX_LOG_STDOUT="true", PHOENIX_LOG_FILE=str(root / f"historical-{label}-{attempt}.log"), PHOENIX_TRACE_EXPORTER="none", RUST_LOG="info")
+        process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+        assert process.stdout is not None
+        lines: queue.Queue[object] = queue.Queue(); retained: list[str] = []
+        run_logs.append(f"--- {label} startup attempt={attempt + 1} port={port} ---\n")
+        threading.Thread(target=line_reader, args=(process.stdout, lines, retained), daemon=True).start()
+        deadline = time.monotonic() + OUTER_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop_and_record(process, lines, retained, run_logs)
+                raise RuntimeError(f"historical server did not emit {STARTUP_EVENT!r}; startup timeout on port {port}; logs:\n{''.join(retained)}")
+            try: event = lines.get(timeout=remaining)
+            except queue.Empty: continue
+            if event is EOF:
+                code = process.wait(timeout=1)
+                logs = ''.join(retained)
+                run_logs.extend(retained)
+                if is_bind_race(logs) and attempt < 2:
+                    # EOF means the reader drained the already-reaped failed process.
+                    break
+                raise RuntimeError(f"historical server exited before startup ({code}); requested port={port}; logs:\n{logs}")
+            assert isinstance(event, str)
+            if STARTUP_EVENT in event:
+                return process, f"http://127.0.0.1:{port}", lines, retained
+    raise RuntimeError("historical server exhausted bounded address-in-use retries")
 
 
 def snapshot(db_path: Path, tables: tuple[str, ...]) -> dict[str, Any]:
@@ -316,23 +376,46 @@ async def create_seeded_empty(base_url: str, canonical_path: str) -> None:
     raise RuntimeError("SSE ended before init/state_change proved Idle")
 
 
+def registered_worktree(tree: Path) -> bool:
+    return f"worktree {tree.resolve()}" in run("git", "worktree", "list", "--porcelain").splitlines()
+
+
 @contextmanager
 def historical_worktree(work: Path) -> Iterator[Path]:
-    tree = work / "historical"; added = False
+    tree = work / "historical"
+    body_error: BaseException | None = None
     try:
-        run("git", "worktree", "add", "--detach", str(tree), HISTORICAL_SHA); added = True
+        run("git", "worktree", "add", "--detach", str(tree), HISTORICAL_SHA)
         yield tree
+    except BaseException as error:
+        body_error = error
     finally:
-        if added or tree.exists():
-            try: run("git", "worktree", "remove", "--force", str(tree))
-            except Exception as error: print(f"warning: worktree remove failed during cleanup: {error}")
-        try: run("git", "worktree", "prune")
-        except Exception as error: print(f"warning: worktree prune failed during cleanup: {error}")
+        cleanup_error: BaseException | None = None
+        try:
+            if registered_worktree(tree):
+                run("git", "worktree", "remove", "--force", str(tree))
+            run("git", "worktree", "prune")
+            if registered_worktree(tree):
+                raise RuntimeError(f"historical worktree remains registered after cleanup: {tree}")
+        except BaseException as error:
+            cleanup_error = error
+        if body_error and cleanup_error:
+            raise BaseExceptionGroup("historical worktree body and cleanup failed", [body_error, cleanup_error])
+        if cleanup_error:
+            raise cleanup_error
+        if body_error:
+            raise body_error
 
 
 def main() -> None:
+    if os.environ.get("PHOENIX_R1_COMPAT_CENSUS_SELF_TEST") == "1":
+        census_self_test()
+        print(census())
+        return
     candidate_sha = clean_head(); source_census = census()
     failure_log = ROOT / "target/git_repository_r1_compat.failure.log"
+    failure_log.unlink(missing_ok=True)
+    run_logs: list[str] = []
     with tempfile.TemporaryDirectory(prefix="phoenix-r1-compat-") as temporary:
         work = Path(temporary); old_target = work / "historical-target"; db_path = work / "candidate-expanded.db"; artifact = work / "finalizer.json"; preparation = work / "preparation.json"
         try:
@@ -350,12 +433,12 @@ def main() -> None:
                 repo = work / "canonical-repository"; repo.mkdir(); run("git", "init", cwd=repo); run("git", "config", "user.email", "compat@example.test", cwd=repo); run("git", "config", "user.name", "Compatibility", cwd=repo)
                 (repo / "README.md").write_text("compatibility\n"); run("git", "add", "README.md", cwd=repo); run("git", "commit", "-m", "initial", cwd=repo)
                 shadow_before_initial_old = snapshot(db_path, SHADOW_TABLES)
-                process, base_url, lines, retained = start_old(old_binary, db_path, work, "seed")
+                process, base_url, lines, retained = start_old(old_binary, db_path, work, "seed", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
                     if version != f"{HISTORICAL_SHA[:12]}-dirty": raise RuntimeError(f"historical version identity mismatch: {version!r}")
                     asyncio.run(asyncio.wait_for(create_seeded_empty(base_url, str(repo.resolve())), OUTER_TIMEOUT))
-                finally: stop(process, lines, retained)
+                finally: stop_and_record(process, lines, retained, run_logs)
                 source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES)
                 if shadow_after_initial_old != shadow_before_initial_old: raise RuntimeError("historical binary wrote additive shadow schema")
                 env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
@@ -366,12 +449,12 @@ def main() -> None:
                 if prepared.initial_catchup["inserted_git_repositories"] != 1 or prepared.initial_catchup["inserted_work_scope_attachments"] != expected_attachments:
                     raise RuntimeError(f"prepare catch-up did not derive exact repository/attachment equality: {prepared}")
                 source_before_rollback, shadow_before_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
-                process, base_url, lines, retained = start_old(old_binary, db_path, work, "rollback")
+                process, base_url, lines, retained = start_old(old_binary, db_path, work, "rollback", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
                     if version != f"{HISTORICAL_SHA[:12]}-dirty": raise RuntimeError("rollback binary identity drift")
                     asyncio.run(asyncio.wait_for(stream_existing_idle(base_url), OUTER_TIMEOUT))
-                finally: stop(process, lines, retained)
+                finally: stop_and_record(process, lines, retained, run_logs)
                 source_after_rollback, shadow_after_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
                 if source_after_rollback != source_before_rollback: raise RuntimeError("historical rollback binary mutated legacy source rows")
                 if shadow_after_rollback != shadow_before_rollback: raise RuntimeError("historical rollback binary mutated additive shadows")
@@ -384,9 +467,12 @@ def main() -> None:
                 output = ROOT / "target/git_repository_r1_compat.artifact.json"; output.write_text(json.dumps(finalizer, indent=2, sort_keys=True) + "\n")
                 print(json.dumps(finalizer, indent=2, sort_keys=True))
         except BaseException:
-            # Every started server drains into retained; preserve the shared diagnostic location on failure.
-            if not failure_log.exists(): failure_log.write_text("R1 compatibility failed before a server emitted logs\n")
+            failure_log.parent.mkdir(parents=True, exist_ok=True)
+            logs = "".join(run_logs) or f"R1 compatibility run head={candidate_sha} failed before a server emitted logs\n"
+            failure_log.write_text(f"run_head={candidate_sha}\n{logs}")
             raise
+        else:
+            failure_log.unlink(missing_ok=True)
 
 
 if __name__ == "__main__": main()
