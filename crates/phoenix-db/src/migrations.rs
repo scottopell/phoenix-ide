@@ -343,6 +343,84 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
+    MIGRATIONS
+        .iter()
+        .map(|migration| (i64::from(migration.version), migration.name))
+        .collect()
+}
+
+/// A length-delimited digest makes the exact compiled migration source part of
+/// readiness identity: adjacent values cannot be confused with a different
+/// version/name/body partition.
+pub(crate) fn compiled_migration_digest() -> String {
+    migration_digest_from_parts(MIGRATIONS.iter().map(|migration| {
+        (
+            migration.version,
+            migration.name.as_bytes(),
+            migration.sql.as_bytes(),
+        )
+    }))
+}
+
+fn migration_digest_from_parts<'a>(
+    parts: impl IntoIterator<Item = (u32, &'a [u8], &'a [u8])>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut digest = Sha256::new();
+    for (version, name, sql) in parts {
+        digest.update(b"phoenix-db-migration-v1\\0");
+        digest.update(version.to_be_bytes());
+        digest.update(
+            u64::try_from(name.len())
+                .expect("name length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(name);
+        digest.update(
+            u64::try_from(sql.len())
+                .expect("SQL length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(sql);
+    }
+    digest
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+            hex
+        })
+}
+
+pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'static str, String> {
+    const TABLES: [&str; 4] = [
+        "git_repositories",
+        "git_repository_locator_observations",
+        "git_repository_default_branch_observations",
+        "work_scope_git_repositories",
+    ];
+
+    MIGRATION_065
+        .split(';')
+        .filter_map(|statement| {
+            let canonical = normalize_sql(statement);
+            let table_name_match = canonical.to_ascii_lowercase();
+            TABLES.into_iter().find_map(|table| {
+                table_name_match
+                    .starts_with(&format!("create table {table} "))
+                    .then(|| (table, canonical.clone()))
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 const MIGRATION_065: &str = r"
 CREATE TABLE git_repositories (
     id TEXT PRIMARY KEY CHECK (id <> '')
@@ -5425,6 +5503,48 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    #[test]
+    fn compiled_migration_digest_binds_version_name_and_sql_body() {
+        let baseline =
+            migration_digest_from_parts([(1, b"name".as_slice(), b"SELECT 1".as_slice())]);
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(1, b"name".as_slice(), b"SELECT 2".as_slice())])
+        );
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(1, b"other".as_slice(), b"SELECT 1".as_slice())])
+        );
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(2, b"name".as_slice(), b"SELECT 1".as_slice())])
+        );
+    }
+
+    #[test]
+    fn r1_expected_table_definitions_cover_every_migration_65_table() {
+        assert_eq!(
+            r1_expected_table_definitions()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                "git_repositories",
+                "git_repository_default_branch_observations",
+                "git_repository_locator_observations",
+                "work_scope_git_repositories",
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_sql_preserves_quoted_literal_case() {
+        assert_ne!(
+            normalize_sql("CREATE TABLE examples (value TEXT CHECK (value = 'Present'))"),
+            normalize_sql("CREATE TABLE examples (value TEXT CHECK (value = 'present'))")
+        );
+    }
 
     async fn test_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")

@@ -173,6 +173,16 @@ pub enum DbError {
     DormantGitRepositoryCatchupPermitTargetMismatch,
     #[error("dormant git repository catch-up operation is stale")]
     DormantGitRepositoryCatchupStaleOperation,
+    #[error("dormant git repository catch-up cannot start while readiness has claimed a receipt")]
+    DormantGitRepositoryCatchupBlockedByReadinessClaim,
+    #[error(
+        "dormant git repository readiness cannot claim a receipt while catch-up is in progress"
+    )]
+    DormantGitRepositoryReadinessCatchupInProgress,
+    #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
+    DormantGitRepositoryReadinessReceiptTargetMismatch,
+    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -1214,11 +1224,25 @@ impl Database {
         &self.pool
     }
 
+    #[allow(
+        dead_code,
+        reason = "task 59004 consumes the existing dormant catch-up seam"
+    )]
     pub(crate) async fn catch_up_dormant_git_repositories(
         &self,
         permit: DormantGitRepositoryCatchupPermit,
     ) -> DbResult<DormantGitRepositoryCatchupOutcome> {
         git_repository_reconciliation::catch_up_dormant_git_repositories(self, permit).await
+    }
+
+    #[allow(dead_code, reason = "task 59004 consumes the dormant readiness facade")]
+    pub(crate) async fn validate_dormant_git_repository_readiness(
+        &self,
+        receipt: git_repository_reconciliation::DormantGitRepositoryCatchupReceipt,
+    ) -> DbResult<git_repository_reconciliation::DormantGitRepositoryCanonicalReadinessEvidence>
+    {
+        git_repository_reconciliation::validate_dormant_git_repository_readiness(self, receipt)
+            .await
     }
 
     pub(crate) fn dormant_git_repository_target_binding(
