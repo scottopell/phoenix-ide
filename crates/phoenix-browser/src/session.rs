@@ -64,7 +64,10 @@ fn legacy_profile_has_live_owner(profile: &Path) -> bool {
     else {
         return true;
     };
-    unsafe { libc::kill(pid, 0) == 0 || *libc::__error() == libc::EPERM }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Filesystem prefix shared by every per-scope Chrome user-data directory.
