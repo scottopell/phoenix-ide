@@ -17,6 +17,7 @@ mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
 mod project_opportunistic_build_warm;
+mod request_drain;
 mod resolution_root;
 mod runtime;
 mod send_chat_service;
@@ -975,6 +976,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Hold an Arc to the bash handle registry so the shutdown kill-tree
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
+    let request_drain = state.request_drain.clone();
 
     let app = create_router(state).layer(cors).layer(compression);
 
@@ -988,7 +990,14 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(listener, app, loaded_tls.server, socket_activated).await?;
+        tls::serve_https(
+            listener,
+            app,
+            loaded_tls.server,
+            socket_activated,
+            request_drain,
+        )
+        .await?;
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,
@@ -1024,8 +1033,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             // The server task ends on its own only via a fatal accept error.
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
+                let admitted_requests = request_drain.begin();
                 let _ = drain_tx.send(());
-                match tls::bounded_post_shutdown_drain(&mut server, "HTTP").await {
+                let drain = async {
+                    admitted_requests.wait().await;
+                    (&mut server).await
+                };
+                match tls::bounded_post_shutdown_drain(drain, "HTTP requests and connections").await {
                     Some(joined) => joined??,
                     None => server_abort.abort(),
                 }

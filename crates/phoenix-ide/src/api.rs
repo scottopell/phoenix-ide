@@ -97,6 +97,7 @@ pub struct AppState {
     pub discovery: Arc<DiscoveryRegistry>,
     /// Demand-driven shared process observation generation.
     pub resource_monitor: Arc<resource_monitor::ResourceMonitor>,
+    pub(crate) request_drain: crate::request_drain::RequestDrain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +240,7 @@ impl AppState {
             suggest_token,
             discovery,
             resource_monitor,
+            request_drain: crate::request_drain::RequestDrain::new(),
         })
     }
 }

@@ -103,6 +103,21 @@ const STREAMING_ROUTES: &[&str] = &[
     "/api/conversations/:id/browser-view",
 ];
 
+async fn request_drain_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let Some(_admission) = state.request_drain.admit() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "server is draining"})),
+        )
+            .into_response();
+    };
+    next.run(request).await
+}
+
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
@@ -526,6 +541,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             super::auth::auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_drain_middleware,
         ))
         // HTTP access log + Datadog tracing: applied via `route_layer` so it
         // runs AFTER routing, making axum's `MatchedPath` (the route template,
@@ -8711,6 +8730,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
     }
 
@@ -13796,6 +13816,7 @@ mod regenerate_conversation_name_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
     }
 
@@ -14004,6 +14025,7 @@ mod upgrade_model_state_guard_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
     }
 
@@ -14287,6 +14309,7 @@ mod file_read_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
     }
 
@@ -15051,6 +15074,7 @@ mod chat_authority_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
     }
 
@@ -15377,7 +15401,25 @@ mod wake_handler_tests {
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
             resource_monitor: crate::api::resource_monitor::ResourceMonitor::new(),
+            request_drain: crate::request_drain::RequestDrain::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn router_rejects_requests_after_drain_begins() {
+        let state = make_test_state().await;
+        state.request_drain.begin();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     async fn seed_conversation(state: &AppState, id: &str) {

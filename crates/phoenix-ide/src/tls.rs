@@ -184,6 +184,7 @@ pub async fn serve_https(
     app: Router,
     tls_config: ServerConfig,
     socket_activated: bool,
+    request_drain: crate::request_drain::RequestDrain,
 ) -> Result<(), Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
     tracing::info!(
@@ -199,12 +200,15 @@ pub async fn serve_https(
     let shutdown = crate::hot_restart::shutdown_signal();
     let mut shutdown = pin!(shutdown);
 
-    loop {
+    let admitted_requests = loop {
         tokio::select! {
+            biased;
+
             () = &mut shutdown => {
+                let admitted_requests = request_drain.begin();
                 drop(listener);
                 tracing::info!("HTTPS listener stopped accepting new connections");
-                break;
+                break admitted_requests;
             }
             accepted = listener.accept() => {
                 let (stream, peer_addr) = match accepted {
@@ -253,9 +257,12 @@ pub async fn serve_https(
                 });
             }
         }
-    }
+    };
 
-    let _ = bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS").await;
+    let drain = async {
+        tokio::join!(admitted_requests.wait(), graceful.shutdown());
+    };
+    let _ = bounded_post_shutdown_drain(drain, "HTTPS requests and connections").await;
 
     Ok(())
 }
