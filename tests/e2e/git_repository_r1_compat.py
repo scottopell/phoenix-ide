@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -153,15 +154,28 @@ def start_old(binary: Path, db_path: Path, root: Path) -> tuple[subprocess.Popen
     assert process.stdout is not None
     lines: queue.Queue[str] = queue.Queue()
     threading.Thread(target=line_reader, args=(process.stdout, lines), daemon=True).start()
-    async def await_startup() -> None:
-        while True:
-            if process.poll() is not None:
-                raise RuntimeError(f"historical server exited before startup: {process.returncode}")
-            line = await asyncio.to_thread(lines.get)
-            if STARTUP_EVENT in line:
-                return
-    asyncio.run(asyncio.wait_for(await_startup(), OUTER_TIMEOUT))
-    return process, f"http://127.0.0.1:{port}", lines
+    deadline = time.monotonic() + OUTER_TIMEOUT
+    startup_lines: list[str] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stop(process)
+            raise RuntimeError(
+                f"historical server did not emit {STARTUP_EVENT!r}; logs:\n"
+                + "".join(startup_lines)
+            )
+        try:
+            line = lines.get(timeout=remaining)
+        except queue.Empty:
+            continue
+        startup_lines.append(line)
+        if STARTUP_EVENT in line:
+            return process, f"http://127.0.0.1:{port}", lines
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"historical server exited before startup ({process.returncode}); logs:\n"
+                + "".join(startup_lines)
+            )
 
 
 def stop(process: subprocess.Popen[str]) -> None:
