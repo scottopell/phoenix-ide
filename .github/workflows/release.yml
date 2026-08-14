@@ -215,7 +215,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: macos-${{ matrix.target }}
-          path: sidecar
+          path: ${{ runner.temp }}/phoenix-sidecar
       - name: Import Developer ID certificate
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -240,9 +240,9 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          chmod +x "sidecar/${{ matrix.sidecar }}"
+          chmod +x "${{ runner.temp }}/phoenix-sidecar/${{ matrix.sidecar }}"
           macos/Phoenix/scripts/package-desktop-release.sh \
-            "sidecar/${{ matrix.sidecar }}" \
+            "${{ runner.temp }}/phoenix-sidecar/${{ matrix.sidecar }}" \
             "${{ matrix.target }}" \
             "${{ needs.gate.outputs.tag }}" \
             "${{ needs.gate.outputs.commit }}" \

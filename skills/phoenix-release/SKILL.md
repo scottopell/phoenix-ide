@@ -113,7 +113,3 @@ Print the URL back to the user. Done.
 
 - `phoenix-deployment` — deploying a built release to production (separate from publishing it on GitHub).
 - `phoenix-development` — `./dev.py up/check` etc., used during the optional pre-release sanity build.
-
-## Open follow-ups
-
-- No checksum file or macOS/aarch64 binary is produced. If multi-arch builds matter, that's a workflow expansion, not a process gap.
