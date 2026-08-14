@@ -963,6 +963,10 @@ enum PhoenixNavigationResponsePolicy {
         userActivated: Bool = false
     ) -> PhoenixNavigationResponseDecision {
         guard let responseURL else { return .cancel }
+        if responseURL.scheme?.lowercased() == "blob",
+           responseURL.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
+            return .allow
+        }
         guard expectedOrigin.exactlyMatches(responseURL) else {
             if (role == .authPopup || userActivated), PhoenixWebViewPolicy.safeToExternalize(responseURL) {
                 return .externalize(responseURL)
