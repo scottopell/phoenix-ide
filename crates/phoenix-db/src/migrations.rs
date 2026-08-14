@@ -476,7 +476,18 @@ CREATE TABLE git_repository_default_branch_observations (
 
 CREATE TABLE work_scope_git_repositories (
     work_scope_id TEXT NOT NULL PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE
-        CHECK (typeof(work_scope_id) = 'text'),
+        CONSTRAINT work_scope_git_repositories_work_scope_id_nonblank CHECK (
+            typeof(work_scope_id) = 'text'
+            AND length(trim(
+                work_scope_id,
+                char(9) || char(10) || char(11) || char(12) || char(13) || char(32)
+                || char(133) || char(160) || char(5760)
+                || char(8192) || char(8193) || char(8194) || char(8195) || char(8196)
+                || char(8197) || char(8198) || char(8199) || char(8200) || char(8201)
+                || char(8202) || char(8232) || char(8233) || char(8239) || char(8287)
+                || char(12288)
+            )) > 0
+        ),
     repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT
         CHECK (typeof(repository_id) = 'text')
 );
@@ -6109,6 +6120,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(applied_versions, vec![65]);
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_whitespace_only_work_scope_identity_transactionally() {
+        for (work_scope_id, conversation_id) in [
+            ("   ", "conv-ascii-whitespace-scope"),
+            ("\u{2003}", "conv-unicode-whitespace-scope"),
+        ] {
+            let pool = test_pool().await;
+            setup_pre_065_git_repository_schema(&pool).await;
+            sqlx::query(
+                "INSERT INTO projects (id, canonical_path, main_ref, created_at)
+                 VALUES ('project-a', '/repos/a', 'main', 1735689600000000)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO work_scopes (id) VALUES (?1)")
+                .bind(work_scope_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (id, work_scope_id, project_id)
+                 VALUES (?1, ?2, 'project-a')",
+            )
+            .bind(conversation_id)
+            .bind(work_scope_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            stamp_migrations_except(&pool, 65).await;
+
+            let error = run_pending_migrations(&pool).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("work_scope_git_repositories_work_scope_id_nonblank"),
+                "unexpected migration failure for {work_scope_id:?}: {error}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'work_scope_git_repositories'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0,
+                "invalid WorkScope identity must roll back additive DDL"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0,
+                "failed migration must not stamp version 65"
+            );
+        }
     }
 
     #[tokio::test]
