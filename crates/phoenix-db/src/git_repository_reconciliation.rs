@@ -66,7 +66,7 @@ pub(crate) enum DormantGitRepositoryR1Eligibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum DormantGitRepositoryReadinessDiagnosticCategory {
+pub(crate) enum DormantGitRepositoryReadinessDiagnosticCategory {
     MissingRepository,
     UnexpectedRepository,
     ConflictingScopeAttachment,
@@ -98,7 +98,7 @@ struct DormantGitRepositoryReadinessDiagnostics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum DormantGitRepositoryValidAbsence {
+pub(crate) enum DormantGitRepositoryValidAbsence {
     LocatorObservationRows,
     DefaultBranchObservationRows,
 }
@@ -124,30 +124,26 @@ impl DormantGitRepositoryReadinessDiagnostics {
         self.categories.is_empty()
     }
 
-    fn category_counts(&self) -> Vec<(String, usize)> {
+    fn typed_categories(&self) -> Vec<DormantGitRepositoryReadinessCategoryEvidence> {
         self.categories
             .iter()
-            .map(|(category, diagnostics)| (format!("{category:?}"), diagnostics.total_count))
+            .map(
+                |(category, diagnostics)| DormantGitRepositoryReadinessCategoryEvidence {
+                    category: *category,
+                    total_count: diagnostics.total_count,
+                    samples: diagnostics
+                        .samples
+                        .iter()
+                        .cloned()
+                        .map(|detail| DormantGitRepositoryReadinessDiagnosticSample { detail })
+                        .collect(),
+                },
+            )
             .collect()
     }
 
-    fn valid_absence_names(&self) -> Vec<String> {
-        self.valid_absences
-            .iter()
-            .map(|absence| format!("{absence:?}"))
-            .collect()
-    }
-
-    fn render_samples(&self) -> Vec<String> {
-        self.categories
-            .iter()
-            .flat_map(|(category, values)| {
-                values
-                    .samples
-                    .iter()
-                    .map(move |detail| format!("{category:?}: {detail}"))
-            })
-            .collect()
+    fn typed_valid_absences(&self) -> Vec<DormantGitRepositoryValidAbsence> {
+        self.valid_absences.iter().copied().collect()
     }
 }
 
@@ -209,6 +205,54 @@ struct DormantGitRepositoryReadinessSchemaSummary {
     inspected_r1_ddl: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct DormantGitRepositoryReadinessDiagnosticSample {
+    detail: String,
+}
+
+impl DormantGitRepositoryReadinessDiagnosticSample {
+    #[allow(
+        dead_code,
+        reason = "the dormant cutover consumer inspects bounded details"
+    )]
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DormantGitRepositoryReadinessCategoryEvidence {
+    category: DormantGitRepositoryReadinessDiagnosticCategory,
+    total_count: usize,
+    samples: Vec<DormantGitRepositoryReadinessDiagnosticSample>,
+}
+
+impl DormantGitRepositoryReadinessCategoryEvidence {
+    #[allow(
+        dead_code,
+        reason = "the dormant cutover consumer matches exhaustive categories"
+    )]
+    pub(crate) fn category(&self) -> DormantGitRepositoryReadinessDiagnosticCategory {
+        self.category
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the dormant cutover consumer inspects total mismatch counts"
+    )]
+    pub(crate) fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the dormant cutover consumer inspects bounded typed samples"
+    )]
+    pub(crate) fn samples(&self) -> &[DormantGitRepositoryReadinessDiagnosticSample] {
+        &self.samples
+    }
+}
+
 #[allow(
     dead_code,
     reason = "task 59004 consumes the aggregate readiness facade"
@@ -217,9 +261,8 @@ struct DormantGitRepositoryReadinessSchemaSummary {
 pub(crate) struct DormantGitRepositoryReadinessSummary {
     eligibility: DormantGitRepositoryR1Eligibility,
     storage_kind: DormantGitRepositoryReadinessStorageKind,
-    diagnostic_counts: Vec<(String, usize)>,
-    diagnostic_samples: Vec<String>,
-    valid_absences: Vec<String>,
+    diagnostic_categories: Vec<DormantGitRepositoryReadinessCategoryEvidence>,
+    valid_absences: Vec<DormantGitRepositoryValidAbsence>,
 }
 
 impl DormantGitRepositoryReadinessSummary {
@@ -229,17 +272,12 @@ impl DormantGitRepositoryReadinessSummary {
     }
 
     #[allow(dead_code, reason = "task 59004 consumes aggregate R1 diagnostics")]
-    pub(crate) fn diagnostic_counts(&self) -> &[(String, usize)] {
-        &self.diagnostic_counts
-    }
-
-    #[allow(dead_code, reason = "task 59004 consumes aggregate R1 diagnostics")]
-    pub(crate) fn diagnostic_samples(&self) -> &[String] {
-        &self.diagnostic_samples
+    pub(crate) fn diagnostic_categories(&self) -> &[DormantGitRepositoryReadinessCategoryEvidence] {
+        &self.diagnostic_categories
     }
 
     #[allow(dead_code, reason = "task 59004 consumes explicit R1 valid absences")]
-    pub(crate) fn valid_absences(&self) -> &[String] {
+    pub(crate) fn valid_absences(&self) -> &[DormantGitRepositoryValidAbsence] {
         &self.valid_absences
     }
 }
@@ -282,16 +320,25 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
         &self.summary.eligibility
     }
     #[cfg(test)]
-    fn diagnostic_categories(&self) -> Vec<String> {
+    fn diagnostic_categories(&self) -> Vec<DormantGitRepositoryReadinessDiagnosticCategory> {
         self.summary
-            .diagnostic_counts()
+            .diagnostic_categories()
             .iter()
-            .map(|(category, _)| category.clone())
+            .map(DormantGitRepositoryReadinessCategoryEvidence::category)
             .collect()
     }
     #[cfg(test)]
     fn diagnostics(&self) -> Vec<String> {
-        self.summary.diagnostic_samples().to_vec()
+        self.summary
+            .diagnostic_categories()
+            .iter()
+            .flat_map(|category| {
+                category
+                    .samples()
+                    .iter()
+                    .map(|sample| format!("{:?}: {}", category.category(), sample.detail()))
+            })
+            .collect()
     }
     #[cfg(test)]
     fn has_fresh_root_from(&self, other: &Self) -> bool {
@@ -300,16 +347,16 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
     #[cfg(test)]
     fn diagnostic_count(&self, category: DormantGitRepositoryReadinessDiagnosticCategory) -> usize {
         self.summary
-            .diagnostic_counts()
+            .diagnostic_categories()
             .iter()
-            .find_map(|(name, count)| (name == &format!("{category:?}")).then_some(*count))
+            .find_map(|evidence| {
+                (evidence.category() == category).then_some(evidence.total_count())
+            })
             .unwrap_or_default()
     }
     #[cfg(test)]
     fn has_valid_absence(&self, absence: DormantGitRepositoryValidAbsence) -> bool {
-        self.summary
-            .valid_absences()
-            .contains(&format!("{absence:?}"))
+        self.summary.valid_absences().contains(&absence)
     }
 }
 
@@ -422,9 +469,8 @@ pub(crate) async fn validate_dormant_git_repository_readiness(
             let summary = DormantGitRepositoryReadinessSummary {
                 eligibility,
                 storage_kind: readiness_storage_kind_for_path(&db.path),
-                diagnostic_counts: diagnostics.category_counts(),
-                diagnostic_samples: diagnostics.render_samples(),
-                valid_absences: diagnostics.valid_absence_names(),
+                diagnostic_categories: diagnostics.typed_categories(),
+                valid_absences: diagnostics.typed_valid_absences(),
             };
             let root = DormantGitRepositoryReadinessRunRoot {
                 database: claim.receipt.target.clone(),
@@ -1747,6 +1793,86 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadinessRowsSnapshot {
+        projects: Vec<(String, String, String)>,
+        source_attachments: Vec<(String, String, Option<String>)>,
+        repositories: Vec<String>,
+        attachments: Vec<(String, String)>,
+        locator_observations: Vec<(String, String, String, Option<String>, String)>,
+        default_branch_observations: Vec<(String, i64, String, Option<String>, String, String)>,
+    }
+
+    async fn readiness_rows_snapshot(db: &Database) -> ReadinessRowsSnapshot {
+        ReadinessRowsSnapshot {
+            projects: sqlx::query_as(
+                "SELECT id, canonical_path, main_ref FROM projects ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+            source_attachments: sqlx::query_as(
+                "SELECT attachment.work_scope_id, attachment.conversation_id, c.project_id
+                 FROM conversation_work_scope_attachments attachment
+                 JOIN conversations c ON c.id = attachment.conversation_id
+                 ORDER BY attachment.work_scope_id, attachment.conversation_id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+            repositories: repository_ids(db).await,
+            attachments: attachment_rows(db).await,
+            locator_observations: sqlx::query_as(
+                "SELECT repository_id, locator_kind, status, path, observed_at
+                 FROM git_repository_locator_observations
+                 ORDER BY repository_id, locator_kind",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+            default_branch_observations: sqlx::query_as(
+                "SELECT repository_id, generation, status, branch, provenance, observed_at
+                 FROM git_repository_default_branch_observations
+                 ORDER BY repository_id, generation",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+        }
+    }
+
+    async fn query_only_write_rejection_fixture(
+        db: &Database,
+    ) -> DormantGitRepositoryReadinessInspection {
+        let mut guard = QueryOnlyConnectionGuard::acquire(db).await.unwrap();
+        let original_query_only = read_query_only_flag(guard.connection()).await.unwrap();
+        guard.arm();
+        set_query_only_flag(guard.connection(), true).await.unwrap();
+        let mut tx = begin_query_only_transaction(guard.connection())
+            .await
+            .unwrap();
+
+        let write =
+            sqlx::query("INSERT INTO git_repositories (id) VALUES ('query-only-write-probe')")
+                .execute(&mut *tx)
+                .await;
+
+        let error = write.expect_err("query_only must reject writes inside readiness snapshot");
+        assert!(
+            error.to_string().contains("readonly"),
+            "unexpected query_only write error: {error}"
+        );
+        let inspection = validate_dormant_git_repository_readiness_tx(&mut tx)
+            .await
+            .expect("readiness inspection remains usable after the rejected write probe");
+        tx.rollback().await.unwrap();
+        set_query_only_flag(guard.connection(), original_query_only)
+            .await
+            .unwrap();
+        guard.disarm();
+        inspection
+    }
+
     async fn count_locator_rows(db: &Database) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM git_repository_locator_observations")
             .fetch_one(db.pool())
@@ -2043,7 +2169,7 @@ mod tests {
         );
         assert!(evidence
             .diagnostic_categories()
-            .contains(&"MigrationLedger".to_string()));
+            .contains(&DormantGitRepositoryReadinessDiagnosticCategory::MigrationLedger));
     }
 
     #[tokio::test]
@@ -2062,7 +2188,7 @@ mod tests {
             .unwrap();
         assert!(schema
             .diagnostic_categories()
-            .contains(&"Schema".to_string()));
+            .contains(&DormantGitRepositoryReadinessDiagnosticCategory::Schema));
 
         let db = Database::open_in_memory().await.unwrap();
         let ddl_outcome =
@@ -2080,7 +2206,7 @@ mod tests {
         let ddl_drift = validate_readiness(&db, ddl_outcome.receipt).await.unwrap();
         assert!(ddl_drift
             .diagnostic_categories()
-            .contains(&"Schema".to_string()));
+            .contains(&DormantGitRepositoryReadinessDiagnosticCategory::Schema));
 
         let db = Database::open_in_memory().await.unwrap();
         let fk_outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
@@ -2103,7 +2229,7 @@ mod tests {
         let foreign_key = validate_readiness(&db, fk_outcome.receipt).await.unwrap();
         assert!(foreign_key
             .diagnostic_categories()
-            .contains(&"ForeignKey".to_string()));
+            .contains(&DormantGitRepositoryReadinessDiagnosticCategory::ForeignKey));
     }
 
     #[tokio::test]
@@ -2122,8 +2248,54 @@ mod tests {
             .has_valid_absence(DormantGitRepositoryValidAbsence::DefaultBranchObservationRows));
         assert_eq!(
             evidence.summary().valid_absences(),
-            ["LocatorObservationRows", "DefaultBranchObservationRows"]
+            [
+                DormantGitRepositoryValidAbsence::LocatorObservationRows,
+                DormantGitRepositoryValidAbsence::DefaultBranchObservationRows,
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_query_only_rejects_writes_and_preserves_every_validated_row() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_project(&db, "repo-query-only").await;
+        let scope = insert_scope(&db, "scope-query-only").await;
+        insert_conversation_with_scope_and_project(
+            &db,
+            "conv-query-only",
+            &scope,
+            Some("repo-query-only"),
+        )
+        .await;
+        let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+        let before = readiness_rows_snapshot(&db).await;
+
+        let inspection = query_only_write_rejection_fixture(&db).await;
+        assert_eq!(
+            inspection.diagnostics.typed_valid_absences(),
+            [
+                DormantGitRepositoryValidAbsence::LocatorObservationRows,
+                DormantGitRepositoryValidAbsence::DefaultBranchObservationRows,
+            ]
+        );
+        assert!(inspection
+            .diagnostics
+            .categories
+            .keys()
+            .all(|category| matches!(
+                category,
+                DormantGitRepositoryReadinessDiagnosticCategory::CandidateBuildDirty
+                    | DormantGitRepositoryReadinessDiagnosticCategory::CandidateBuildUnavailable
+            )));
+        let evidence = validate_readiness(&db, outcome.receipt).await.unwrap();
+
+        assert_eq!(
+            evidence.summary().valid_absences(),
+            inspection.diagnostics.typed_valid_absences()
+        );
+        assert_eq!(readiness_rows_snapshot(&db).await, before);
     }
 
     #[tokio::test]
@@ -2182,13 +2354,20 @@ mod tests {
             ),
             1
         );
-        assert!(evidence
-            .diagnostic_categories()
-            .contains(&"UnexpectedLocatorObservation".to_string()));
-        assert!(evidence
+        assert!(evidence.diagnostic_categories().contains(
+            &DormantGitRepositoryReadinessDiagnosticCategory::UnexpectedLocatorObservation,
+        ));
+        let missing = evidence
             .summary()
-            .diagnostic_counts()
-            .contains(&("MissingRepository".to_string(), 12)));
+            .diagnostic_categories()
+            .iter()
+            .find(|category| {
+                category.category()
+                    == DormantGitRepositoryReadinessDiagnosticCategory::MissingRepository
+            })
+            .unwrap();
+        assert_eq!(missing.total_count(), 12);
+        assert_eq!(missing.samples().len(), READINESS_SAMPLE_LIMIT);
         assert_eq!(
             evidence.diagnostics().first().unwrap(),
             "MissingRepository: missing project-seeded repository repo-00"
