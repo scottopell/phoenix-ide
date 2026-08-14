@@ -123,7 +123,7 @@ asset=$(run_unsigned v1.2.3 0123456789abcdef0123456789abcdef01234567)
 [[ "$asset" == "$tmp/out/Phoenix-macos-aarch64-apple-darwin-v1.2.3.zip" ]]
 [[ -s "$asset" ]]
 grep -Fx "marketing=1.2.3" "$tmp/xcodebuild.log"
-grep -Fx "project_version=1002003" "$tmp/xcodebuild.log"
+grep -Fx "project_version=1.2.3" "$tmp/xcodebuild.log"
 case $(grep '^derived=' "$tmp/xcodebuild.log") in
   "derived=$tmp/tmpdir/phoenix-desktop-aarch64-apple-darwin."*) ;;
   *) echo "expected derived data to be created under TMPDIR fallback" >&2; exit 1 ;;

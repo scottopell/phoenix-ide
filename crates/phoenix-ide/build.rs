@@ -13,9 +13,7 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    // Embed the full git SHA into the binary so release artifacts can prove
-    // exact commit identity. Falls back to "unknown" when git isn't
-    // available (e.g. tarball builds, where .git/ is absent).
+    // Tarball builds without .git use "unknown".
     //
     // Rerun on every build: a rerun-if-changed path that never exists is
     // always considered out-of-date (documented cargo behavior). The git

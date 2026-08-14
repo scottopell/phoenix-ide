@@ -8294,6 +8294,7 @@ def prod_daemon_deploy(
         if protocol != "2":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
+        previous_running = _bare_child_running(layout)
         _start_bare_supervisor(
             layout,
             protocol,
@@ -8301,7 +8302,6 @@ def prod_daemon_deploy(
             reuse_compatible=controller.enabled,
         )
         _configure_bare_reboot_persistence(layout)
-        previous_running = _bare_child_running(layout)
         _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
 
     print("\n✓ Deployed through persistent bare Linux supervisor")

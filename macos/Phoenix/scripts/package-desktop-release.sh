@@ -33,10 +33,9 @@ match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
 if not match:
     raise SystemExit(f"invalid semantic version: {version}")
 major, minor, patch = (int(match.group(i)) for i in range(1, 4))
-if minor >= 1000 or patch >= 1000:
-    raise SystemExit("minor and patch components must be below 1000 for CFBundleVersion encoding")
-value = major * 1_000_000 + minor * 1_000 + patch
-print(value)
+if any(component >= 10_000 for component in (major, minor, patch)):
+    raise SystemExit("semantic version components must be below 10000 for CFBundleVersion encoding")
+print(f"{major}.{minor}.{patch}")
 PY
 }
 
