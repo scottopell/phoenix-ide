@@ -1,9 +1,11 @@
 use crate::{Database, DbError, DbResult};
 use phoenix_core::git_repository::GitRepositoryId;
 use phoenix_core::work_scope::WorkScopeId;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, Row, Sqlite, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -307,6 +309,7 @@ pub(crate) struct DormantGitRepositoryCanonicalReadinessEvidence {
 }
 
 impl DormantGitRepositoryCanonicalReadinessEvidence {
+    #[cfg(test)]
     fn unit4_binding(&self) -> DormantGitRepositoryUnit4RunBinding {
         DormantGitRepositoryUnit4RunBinding {
             database: self.root.database.clone(),
@@ -370,6 +373,7 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DormantGitRepositoryUnit4RunBinding {
     database: Arc<DormantGitRepositoryCatchupAuthorityState>,
@@ -377,6 +381,7 @@ struct DormantGitRepositoryUnit4RunBinding {
     run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
 }
 
+#[cfg(test)]
 impl DormantGitRepositoryUnit4RunBinding {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.database, &other.database)
@@ -385,6 +390,7 @@ impl DormantGitRepositoryUnit4RunBinding {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DormantGitRepositorySourceCensusAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
@@ -395,6 +401,7 @@ struct DormantGitRepositorySourceCensusAttestation {
     clean: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
@@ -407,17 +414,20 @@ struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
     passed: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DormantGitRepositoryRollbackPosture {
     AdditiveSchemaRetainedDestructiveDownMigrationProhibited,
 }
 
+#[cfg(test)]
 impl DormantGitRepositoryRollbackPosture {
     fn as_str(self) -> &'static str {
         "additive_schema_retained_destructive_down_migration_prohibited"
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DormantGitRepositoryRollbackAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
@@ -428,6 +438,7 @@ struct DormantGitRepositoryRollbackAttestation {
 
 /// An opaque, in-process acceptance aggregate. Its nonce is represented by an
 /// Arc identity and deliberately has no cross-process stability contract.
+#[cfg(test)]
 #[derive(Debug)]
 struct DormantGitRepositoryCompleteCompatibilityEvidence {
     readiness: DormantGitRepositoryCanonicalReadinessEvidence,
@@ -438,6 +449,7 @@ struct DormantGitRepositoryCompleteCompatibilityEvidence {
     eligible: bool,
 }
 
+#[cfg(test)]
 impl DormantGitRepositoryCompleteCompatibilityEvidence {
     fn new(
         readiness: DormantGitRepositoryCanonicalReadinessEvidence,
@@ -529,6 +541,7 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
     }
 }
 
+#[cfg(test)]
 fn length_framed_digest<'a>(parts: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
     let mut hasher = Sha256::new();
     for (name, value) in parts {
@@ -544,6 +557,7 @@ fn length_framed_digest<'a>(parts: impl IntoIterator<Item = (&'a str, &'a [u8])>
         .collect()
 }
 
+#[cfg(test)]
 fn assert_additive_shadow_schema(path: &str) -> DbResult<()> {
     if path.is_empty() || !Path::new(path).is_file() {
         return Err(DbError::Serialization(

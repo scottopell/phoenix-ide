@@ -540,7 +540,16 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
-        | crate::db::DbError::DirectTurnConflict(_)) => map_db_internal_error(&other),
+        | crate::db::DbError::DirectTurnConflict(_)
+        | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | crate::db::DbError::DormantGitRepositoryCatchupStaleOperation
+        | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+            map_db_internal_error(&other)
+        }
     }
 }
 
@@ -569,7 +578,16 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::CloseFoundationPrecondition(_)
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
-        | crate::db::DbError::ForkProposalConflict(_)) => map_db_internal_error(&other),
+        | crate::db::DbError::ForkProposalConflict(_)
+        | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | crate::db::DbError::DormantGitRepositoryCatchupStaleOperation
+        | crate::db::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | crate::db::DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | crate::db::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+            map_db_internal_error(&other)
+        }
     }
 }
 
