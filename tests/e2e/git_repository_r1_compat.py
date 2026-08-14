@@ -139,6 +139,18 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
     finalizer["final_catchup"] = exact_catchup(finalizer.get("final_catchup"), "final catchup")
     finalizer["final_replay"] = exact_catchup(finalizer.get("final_replay"), "final replay")
     finalizer["shadow_row_counts"] = canonical_shadow_counts(finalizer.get("shadow_row_counts"))
+    shadow_digests = (
+        "shadow_before_initial_old", "shadow_after_initial_old",
+        "shadow_before_rollback", "shadow_after_rollback",
+    )
+    if any(not isinstance(finalizer.get(name), str) or len(finalizer[name]) != 64 for name in shadow_digests):
+        raise RuntimeError("artifact must contain exact full shadow snapshot digests for both historical-binary exercises")
+    if finalizer["shadow_before_initial_old"] != finalizer["shadow_after_initial_old"]:
+        raise RuntimeError("initial historical-binary exercise mutated additive shadows")
+    if finalizer["shadow_before_rollback"] != finalizer["shadow_after_rollback"]:
+        raise RuntimeError("rollback historical-binary exercise mutated additive shadows")
+    if finalizer.get("old_source_digest_before") != finalizer.get("old_source_digest_after"):
+        raise RuntimeError("historical-binary exercises disagree on the complete legacy source snapshot")
     if any(finalizer["preparation_replay_catchup"].values()) or any(finalizer["final_catchup"].values()) or any(finalizer["final_replay"].values()):
         raise RuntimeError("artifact catch-up/replay proof was not exactly zero")
     members = finalizer.get("integrity_members")
@@ -151,8 +163,9 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         key: str(finalizer[key]) for key in (
             "candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "readiness_root", "run_nonce",
             "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
-            "historical_sha", "old_source_digest_before", "old_source_digest_after", "shadow_digest_before_old",
-            "shadow_digest_after_old", "rollback_posture", "eligibility",
+            "historical_sha", "old_source_digest_before", "old_source_digest_after",
+            "shadow_before_initial_old", "shadow_after_initial_old", "shadow_before_rollback",
+            "shadow_after_rollback", "rollback_posture", "eligibility",
         )
     }
     for prefix, stats in (("preparation_initial_catchup", finalizer["preparation_initial_catchup"]), ("preparation_replay_catchup", finalizer["preparation_replay_catchup"]), ("final_catchup", finalizer["final_catchup"]), ("final_replay", finalizer["final_replay"])):
@@ -336,16 +349,16 @@ def main() -> None:
                 run(str(candidate_binary), "--migrate-only", env=child_env(PHOENIX_DB_PATH=str(db_path)))
                 repo = work / "canonical-repository"; repo.mkdir(); run("git", "init", cwd=repo); run("git", "config", "user.email", "compat@example.test", cwd=repo); run("git", "config", "user.name", "Compatibility", cwd=repo)
                 (repo / "README.md").write_text("compatibility\n"); run("git", "add", "README.md", cwd=repo); run("git", "commit", "-m", "initial", cwd=repo)
-                shadow_before_old = snapshot(db_path, SHADOW_TABLES)
+                shadow_before_initial_old = snapshot(db_path, SHADOW_TABLES)
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "seed")
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
                     if version != f"{HISTORICAL_SHA[:12]}-dirty": raise RuntimeError(f"historical version identity mismatch: {version!r}")
                     asyncio.run(asyncio.wait_for(create_seeded_empty(base_url, str(repo.resolve())), OUTER_TIMEOUT))
                 finally: stop(process, lines, retained)
-                source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_old = snapshot(db_path, SHADOW_TABLES)
-                if shadow_after_old != shadow_before_old: raise RuntimeError("historical binary wrote additive shadow schema")
-                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_OLD_SHADOW_DIGEST=proof_digest(shadow_after_old))
+                source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES)
+                if shadow_after_initial_old != shadow_before_initial_old: raise RuntimeError("historical binary wrote additive shadow schema")
+                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
                 # First candidate pass only prepares typed catch-up proof before exercising the old binary again.
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=env | {"PHOENIX_R1_COMPAT_PHASE": "prepare"})
                 prepared = read_preparation(preparation)
@@ -363,7 +376,7 @@ def main() -> None:
                 if source_after_rollback != source_before_rollback: raise RuntimeError("historical rollback binary mutated legacy source rows")
                 if shadow_after_rollback != shadow_before_rollback: raise RuntimeError("historical rollback binary mutated additive shadows")
                 # Final candidate pass mints the artifact only after the binary rollback exercise.
-                final_env = env | {"PHOENIX_R1_COMPAT_PHASE": "finalize", "PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_ROLLBACK_SHADOW_DIGEST": proof_digest(shadow_after_rollback)}
+                final_env = env | {"PHOENIX_R1_COMPAT_PHASE": "finalize", "PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_SHADOW_BEFORE_ROLLBACK": proof_digest(shadow_before_rollback), "PHOENIX_R1_COMPAT_SHADOW_AFTER_ROLLBACK": proof_digest(shadow_after_rollback)}
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=final_env)
                 if snapshot(db_path, SOURCE_TABLES) != source_before_candidate: raise RuntimeError("candidate catch-up mutated complete legacy source tables")
                 finalizer = json.loads(artifact.read_text())

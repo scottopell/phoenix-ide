@@ -515,7 +515,8 @@ struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
     historical_sha: String,
     candidate_schema_digest: String,
     source_digest: String,
-    shadow_digest: String,
+    shadow_before_initial_old: String,
+    shadow_after_initial_old: String,
 }
 
 #[cfg(test)]
@@ -525,16 +526,23 @@ impl DormantGitRepositoryOldBinaryCompatibilityAttestation {
         historical_sha: String,
         candidate_schema_digest: String,
         source_digest: String,
-        shadow_digest: String,
+        shadow_before_initial_old: String,
+        shadow_after_initial_old: String,
     ) -> DbResult<Self> {
         if historical_sha.len() != 40
             || candidate_schema_digest.len() != 64
             || source_digest.len() != 64
-            || shadow_digest.len() != 64
+            || shadow_before_initial_old.len() != 64
+            || shadow_after_initial_old.len() != 64
         {
             return Err(DbError::Serialization(
                 "passed compatibility attestation requires exact SHA-256/SHA-1 evidence"
                     .to_string(),
+            ));
+        }
+        if shadow_before_initial_old != shadow_after_initial_old {
+            return Err(DbError::Serialization(
+                "initial historical-binary exercise mutated additive shadows".to_string(),
             ));
         }
         Ok(Self {
@@ -542,7 +550,8 @@ impl DormantGitRepositoryOldBinaryCompatibilityAttestation {
             historical_sha,
             candidate_schema_digest,
             source_digest,
-            shadow_digest,
+            shadow_before_initial_old,
+            shadow_after_initial_old,
         })
     }
 }
@@ -552,7 +561,8 @@ impl DormantGitRepositoryOldBinaryCompatibilityAttestation {
 struct DormantGitRepositoryRollbackAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
     source_digest: String,
-    shadow_digest: String,
+    shadow_before_rollback: String,
+    shadow_after_rollback: String,
 }
 
 #[cfg(test)]
@@ -560,17 +570,27 @@ impl DormantGitRepositoryRollbackAttestation {
     fn exercised(
         root: DormantGitRepositoryUnit4RunBinding,
         source_digest: String,
-        shadow_digest: String,
+        shadow_before_rollback: String,
+        shadow_after_rollback: String,
     ) -> DbResult<Self> {
-        if source_digest.len() != 64 || shadow_digest.len() != 64 {
+        if source_digest.len() != 64
+            || shadow_before_rollback.len() != 64
+            || shadow_after_rollback.len() != 64
+        {
             return Err(DbError::Serialization(
                 "rollback exercise requires full source and shadow digests".to_string(),
+            ));
+        }
+        if shadow_before_rollback != shadow_after_rollback {
+            return Err(DbError::Serialization(
+                "rollback historical-binary exercise mutated additive shadows".to_string(),
             ));
         }
         Ok(Self {
             root,
             source_digest,
-            shadow_digest,
+            shadow_before_rollback,
+            shadow_after_rollback,
         })
     }
 
@@ -680,6 +700,12 @@ fn validate_complete_compatibility_inputs(
             "compatibility schema is not the compiled readiness schema".to_string(),
         ));
     }
+    if compatibility.source_digest != rollback.source_digest {
+        return Err(DbError::Serialization(
+            "historical-binary exercises disagree on the complete legacy source snapshot"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -766,12 +792,20 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
                 rollback.source_digest.clone(),
             ),
             (
-                "shadow_digest_before_old".to_string(),
-                compatibility.shadow_digest.clone(),
+                "shadow_before_initial_old".to_string(),
+                compatibility.shadow_before_initial_old.clone(),
             ),
             (
-                "shadow_digest_after_old".to_string(),
-                rollback.shadow_digest.clone(),
+                "shadow_after_initial_old".to_string(),
+                compatibility.shadow_after_initial_old.clone(),
+            ),
+            (
+                "shadow_before_rollback".to_string(),
+                rollback.shadow_before_rollback.clone(),
+            ),
+            (
+                "shadow_after_rollback".to_string(),
+                rollback.shadow_after_rollback.clone(),
             ),
             (
                 "rollback_posture".to_string(),
@@ -2875,6 +2909,31 @@ mod tests {
     }
 
     #[test]
+    fn shadow_digest_attestations_reject_phase_mismatch() {
+        let root = DormantGitRepositoryUnit4RunBinding {
+            database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
+            operation: Arc::new(LegacyWriterExclusionMarker),
+            run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+        };
+        assert!(DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
+            root.clone(),
+            "d".repeat(40),
+            "e".repeat(64),
+            "f".repeat(64),
+            "0".repeat(64),
+            "1".repeat(64),
+        )
+        .is_err());
+        assert!(DormantGitRepositoryRollbackAttestation::exercised(
+            root,
+            "f".repeat(64),
+            "0".repeat(64),
+            "1".repeat(64),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn complete_compatibility_input_validation_rejects_cross_run_and_schema_mismatch() {
         let root = DormantGitRepositoryUnit4RunBinding {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
@@ -2896,7 +2955,8 @@ mod tests {
         .unwrap();
         let rollback = DormantGitRepositoryRollbackAttestation::exercised(
             root.clone(),
-            "b".repeat(64),
+            "f".repeat(64),
+            "c".repeat(64),
             "c".repeat(64),
         )
         .unwrap();
@@ -2905,6 +2965,7 @@ mod tests {
             "d".repeat(40),
             "e".repeat(64),
             "f".repeat(64),
+            "0".repeat(64),
             "0".repeat(64),
         )
         .unwrap();
@@ -2922,6 +2983,7 @@ mod tests {
             "e".repeat(64),
             "f".repeat(64),
             "0".repeat(64),
+            "0".repeat(64),
         )
         .unwrap();
         assert!(validate_complete_compatibility_inputs(
@@ -2932,6 +2994,14 @@ mod tests {
             &rollback
         )
         .is_err());
+        assert!(validate_complete_compatibility_inputs(
+            &root,
+            &"e".repeat(64),
+            &census,
+            &same_run,
+            &rollback
+        )
+        .is_ok());
     }
 
     #[derive(serde::Serialize)]
@@ -2949,8 +3019,10 @@ mod tests {
         target_database_digest: String,
         old_source_digest_before: String,
         old_source_digest_after: String,
-        shadow_digest_before_old: String,
-        shadow_digest_after_old: String,
+        shadow_before_initial_old: String,
+        shadow_after_initial_old: String,
+        shadow_before_rollback: String,
+        shadow_after_rollback: String,
         rollback_posture: String,
         eligibility: DormantGitRepositoryUnit4Eligibility,
         preparation_initial_catchup: DormantGitRepositoryCatchupStatsEvidence,
@@ -3066,9 +3138,11 @@ mod tests {
         let census_revision = required_env("PHOENIX_R1_COMPAT_CENSUS_REVISION");
         let census_content_digest = required_env("PHOENIX_R1_COMPAT_CENSUS_DIGEST");
         let old_source_digest = required_env("PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST");
-        let old_shadow_digest = required_env("PHOENIX_R1_COMPAT_OLD_SHADOW_DIGEST");
+        let shadow_before_initial_old = required_env("PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD");
+        let shadow_after_initial_old = required_env("PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD");
         let rollback_source_digest = required_env("PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST");
-        let rollback_shadow_digest = required_env("PHOENIX_R1_COMPAT_ROLLBACK_SHADOW_DIGEST");
+        let shadow_before_rollback = required_env("PHOENIX_R1_COMPAT_SHADOW_BEFORE_ROLLBACK");
+        let shadow_after_rollback = required_env("PHOENIX_R1_COMPAT_SHADOW_AFTER_ROLLBACK");
         let preparation_path = required_env("PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT");
         let preparation: DormantGitRepositoryPreparationArtifact =
             serde_json::from_slice(&fs::read(&preparation_path).unwrap()).unwrap();
@@ -3097,13 +3171,15 @@ mod tests {
             historical_sha,
             readiness.schema.compiled_migration_digest.clone(),
             old_source_digest,
-            old_shadow_digest,
+            shadow_before_initial_old,
+            shadow_after_initial_old,
         )
         .unwrap();
         let rollback = DormantGitRepositoryRollbackAttestation::exercised(
             root,
             rollback_source_digest,
-            rollback_shadow_digest,
+            shadow_before_rollback,
+            shadow_after_rollback,
         )
         .unwrap();
         let target = DormantGitRepositoryCompatibilityTargetIdentity::from_database(&db).unwrap();
@@ -3141,8 +3217,10 @@ mod tests {
             target_database_digest: evidence.target.0.clone(),
             old_source_digest_before: evidence.compatibility.source_digest.clone(),
             old_source_digest_after: evidence.rollback.source_digest.clone(),
-            shadow_digest_before_old: evidence.compatibility.shadow_digest.clone(),
-            shadow_digest_after_old: evidence.rollback.shadow_digest.clone(),
+            shadow_before_initial_old: evidence.compatibility.shadow_before_initial_old.clone(),
+            shadow_after_initial_old: evidence.compatibility.shadow_after_initial_old.clone(),
+            shadow_before_rollback: evidence.rollback.shadow_before_rollback.clone(),
+            shadow_after_rollback: evidence.rollback.shadow_after_rollback.clone(),
             rollback_posture: DormantGitRepositoryRollbackAttestation::posture().to_string(),
             eligibility: DormantGitRepositoryUnit4Eligibility::Passed,
             preparation_initial_catchup: evidence.preparation.0.initial_catchup.clone(),
