@@ -898,7 +898,7 @@ final class ServerManager: ObservableObject {
         timer.schedule(deadline: .now() + 35)
         timer.setEventHandler { [weak process] in
             guard let process, process.isRunning else { return }
-            kill(process.processIdentifier, SIGKILL)
+            kill(-process.processIdentifier, SIGKILL)
         }
         stopDeadline = timer
         timer.resume()
@@ -1012,6 +1012,10 @@ final class ServerManager: ObservableObject {
             }
             try launched.run()
             process = launched
+            guard setpgid(launched.processIdentifier, launched.processIdentifier) == 0 else {
+                launched.terminate()
+                throw ConfigurationError.bundledDataInUse
+            }
             launched.terminationHandler = { [weak self] terminated in
                 Task { @MainActor in self?.processExited(terminated, operation: operation) }
             }
@@ -1164,14 +1168,12 @@ final class ServerManager: ObservableObject {
             let readHandle = outputPipe?.fileHandleForReading
             outputPipe = nil
             readHandle?.readabilityHandler = nil
-            Task.detached { [weak self] in
-                let tail = readHandle?.readDataToEndOfFile() ?? Data()
-                if !tail.isEmpty { pump.offer(tail) }
-                pump.finish()
+            readHandle?.closeFile()
+            pump.offer(Data("[Phoenix stopped bounded sidecar output capture at process exit]\n".utf8))
+            pump.finish()
+            Task { @MainActor [weak self] in
                 await pump.waitUntilFinished()
-                await MainActor.run {
-                    self?.completeProcessExit(terminated, operation: operation)
-                }
+                self?.completeProcessExit(terminated, operation: operation)
             }
             return
         }

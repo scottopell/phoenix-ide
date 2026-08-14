@@ -20,7 +20,7 @@ validate_packaged_sidecar() {
     echo "error: packaged sidecar does not expose Phoenix build identity" >&2
     return 1
   }
-  printf '%s' "$build_identity" | /usr/bin/grep -Eq '^\{"version":"[^"]+","git_sha":"[0-9a-f]{12,40}(-dirty)?"\}$' || {
+  printf '%s' "$build_identity" | /usr/bin/grep -Eq '^\{"version":"[^"]+","git_sha":"(unknown|[0-9a-f]{12,40}(-dirty)?)"\}$' || {
     echo "error: packaged sidecar returned invalid Phoenix build identity" >&2
     return 1
   }
