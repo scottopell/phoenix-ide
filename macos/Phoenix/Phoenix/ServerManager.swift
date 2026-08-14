@@ -898,7 +898,7 @@ final class ServerManager: ObservableObject {
         timer.schedule(deadline: .now() + 35)
         timer.setEventHandler { [weak process] in
             guard let process, process.isRunning else { return }
-            kill(-process.processIdentifier, SIGKILL)
+            Self.killVerifiedProcessTree(rootPID: process.processIdentifier)
         }
         stopDeadline = timer
         timer.resume()
@@ -1012,10 +1012,6 @@ final class ServerManager: ObservableObject {
             }
             try launched.run()
             process = launched
-            guard setpgid(launched.processIdentifier, launched.processIdentifier) == 0 else {
-                launched.terminate()
-                throw ConfigurationError.bundledDataInUse
-            }
             launched.terminationHandler = { [weak self] terminated in
                 Task { @MainActor in self?.processExited(terminated, operation: operation) }
             }
@@ -1030,6 +1026,39 @@ final class ServerManager: ObservableObject {
             cleanupLaunchPreparationFailure()
             throw error
         }
+    }
+
+    private static func killVerifiedProcessTree(rootPID: Int32) {
+        let snapshot = Process()
+        snapshot.executableURL = URL(fileURLWithPath: "/bin/ps")
+        snapshot.arguments = ["-axo", "pid=,ppid="]
+        let pipe = Pipe()
+        snapshot.standardOutput = pipe
+        snapshot.standardError = FileHandle.nullDevice
+        guard (try? snapshot.run()) != nil else {
+            kill(rootPID, SIGKILL)
+            return
+        }
+        snapshot.waitUntilExit()
+        let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        var children: [Int32: [Int32]] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2,
+                  let pid = Int32(fields[0]),
+                  let parent = Int32(fields[1]) else { continue }
+            children[parent, default: []].append(pid)
+        }
+        var ordered: [Int32] = []
+        func appendDescendants(of pid: Int32) {
+            for child in children[pid, default: []] {
+                appendDescendants(of: child)
+                ordered.append(child)
+            }
+        }
+        appendDescendants(of: rootPID)
+        ordered.forEach { kill($0, SIGKILL) }
+        kill(rootPID, SIGKILL)
     }
 
     private func transitionFromBundled(to request: ServerReconnectRequest) {
