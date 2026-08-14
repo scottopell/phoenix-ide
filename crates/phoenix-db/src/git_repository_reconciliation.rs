@@ -1,4 +1,4 @@
-use crate::{Database, DbError, DbResult};
+use crate::{Database, DbError, DbResult, ProjectSeedId};
 use phoenix_core::git_repository::GitRepositoryId;
 use phoenix_core::work_scope::WorkScopeId;
 #[cfg(test)]
@@ -1564,15 +1564,17 @@ async fn validate_dormant_git_repository_readiness_tx(
     {
         return Ok(inspection);
     }
-    let expected_repository_ids = load_expected_repositories(&mut **tx).await?;
-    let expected_scope_attachments = load_expected_scope_attachments(&mut **tx).await?;
+    let project_ids = load_expected_repositories(&mut **tx).await?;
+    let project_attachments = load_expected_scope_attachments(&mut **tx).await?;
     let actual_repository_ids = load_actual_repository_ids(&mut **tx).await?;
     let actual_attachments = load_actual_attachments(&mut **tx).await?;
     let actual_locator_observations = load_actual_locator_observations(&mut **tx).await?;
     let actual_default_branch_observations =
         load_actual_default_branch_observations(&mut **tx).await?;
-    let (expected_attachments, conflicting_scopes) =
-        resolve_expected_scope_attachments_for_validation(expected_scope_attachments);
+    let (project_attachments, conflicting_scopes) =
+        resolve_expected_scope_attachments_for_validation(project_attachments);
+    let (expected_repository_ids, expected_attachments) =
+        seed_repository_snapshot(project_ids, project_attachments)?;
 
     for repository_id in expected_repository_ids.difference(&actual_repository_ids) {
         diagnostics.push(
@@ -1597,7 +1599,7 @@ async fn validate_dormant_git_repository_readiness_tx(
                 scope.as_str(),
                 repository_ids
                     .iter()
-                    .map(GitRepositoryId::as_str)
+                    .map(ProjectSeedId::as_str)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1714,11 +1716,21 @@ async fn migration_and_schema_diagnostics(
     }
     let database_instance_id = load_database_instance_id(connection).await?;
 
-    let foreign_key_violations: Vec<(String, i64, String, i64)> = sqlx::query_as("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check ORDER BY \"table\", rowid, parent, fkid").fetch_all(&mut *connection).await?;
+    let foreign_key_violations: Vec<(String, Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT \"table\", rowid, parent, fkid
+         FROM pragma_foreign_key_check
+         ORDER BY \"table\", rowid, parent, fkid",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
     for (table, rowid, parent, fkid) in foreign_key_violations {
+        let row = rowid.map_or_else(
+            || "row id unavailable (WITHOUT ROWID)".to_string(),
+            |rowid| format!("row {rowid}"),
+        );
         diagnostics.push(
             DormantGitRepositoryReadinessDiagnosticCategory::ForeignKey,
-            format!("{table} row {rowid} violates {parent} foreign key {fkid}"),
+            format!("{table} {row} violates {parent} foreign key {fkid}"),
         );
     }
     Ok(DormantGitRepositoryReadinessInspection {
@@ -1885,7 +1897,7 @@ pub(crate) struct DormantGitRepositoryCatchupStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedAttachment {
     work_scope_id: WorkScopeId,
-    repository_id: GitRepositoryId,
+    project_id: ProjectSeedId,
 }
 
 #[allow(
@@ -1952,11 +1964,13 @@ pub(crate) async fn catch_up_dormant_git_repositories(
 async fn catch_up_dormant_git_repositories_tx(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> DbResult<DormantGitRepositoryCatchupStats> {
-    let expected_repository_ids = load_expected_repositories(&mut **tx).await?;
-    let expected_scope_attachments = load_expected_scope_attachments(&mut **tx).await?;
+    let project_ids = load_expected_repositories(&mut **tx).await?;
+    let project_attachments = load_expected_scope_attachments(&mut **tx).await?;
     let actual_repository_ids = load_actual_repository_ids(&mut **tx).await?;
     let actual_attachments = load_actual_attachments(&mut **tx).await?;
-    let expected_attachments = resolve_expected_scope_attachments(expected_scope_attachments)?;
+    let project_attachments = resolve_expected_scope_attachments(project_attachments)?;
+    let (expected_repository_ids, expected_attachments) =
+        seed_repository_snapshot(project_ids, project_attachments)?;
 
     let mut stats = DormantGitRepositoryCatchupStats::default();
     delete_all_repository_observations_tx(tx, &mut stats).await?;
@@ -2034,7 +2048,7 @@ struct DormantGitRepositoryDefaultBranchObservationSample {
     repository_id: GitRepositoryId,
 }
 
-async fn load_expected_repositories<'e, E>(executor: E) -> DbResult<BTreeSet<GitRepositoryId>>
+async fn load_expected_repositories<'e, E>(executor: E) -> DbResult<BTreeSet<ProjectSeedId>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -2042,7 +2056,7 @@ where
         .fetch_all(executor)
         .await?
         .into_iter()
-        .map(|row| parse_git_repository_id(row.get::<String, _>("id")))
+        .map(|row| parse_project_seed_id(row.get::<String, _>("id")))
         .collect()
 }
 
@@ -2094,7 +2108,7 @@ where
             .map(|project_id| {
                 Ok(ExpectedAttachment {
                     work_scope_id: parse_work_scope_id(row.get::<String, _>("work_scope_id"))?,
-                    repository_id: parse_git_repository_id(project_id)?,
+                    project_id: parse_project_seed_id(project_id)?,
                 })
             })
     })
@@ -2107,39 +2121,39 @@ where
 )]
 fn resolve_expected_scope_attachments(
     attachments: Vec<ExpectedAttachment>,
-) -> DbResult<BTreeMap<WorkScopeId, GitRepositoryId>> {
+) -> DbResult<BTreeMap<WorkScopeId, ProjectSeedId>> {
     let (expected, conflicts) = resolve_expected_scope_attachments_for_validation(attachments);
-    if let Some((work_scope_id, repository_ids)) = conflicts.into_iter().next() {
+    if let Some((work_scope_id, project_ids)) = conflicts.into_iter().next() {
         return Err(DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
-            repository_ids: [repository_ids[0].clone(), repository_ids[1].clone()],
+            project_ids: [project_ids[0].clone(), project_ids[1].clone()],
         });
     }
     Ok(expected)
 }
 
-type ExpectedScopeAttachments = BTreeMap<WorkScopeId, GitRepositoryId>;
-type ConflictingScopeAttachments = Vec<(WorkScopeId, Vec<GitRepositoryId>)>;
+type ExpectedScopeAttachments = BTreeMap<WorkScopeId, ProjectSeedId>;
+type ConflictingScopeAttachments = Vec<(WorkScopeId, Vec<ProjectSeedId>)>;
 
 fn resolve_expected_scope_attachments_for_validation(
     attachments: Vec<ExpectedAttachment>,
 ) -> (ExpectedScopeAttachments, ConflictingScopeAttachments) {
-    let mut grouped: BTreeMap<WorkScopeId, Vec<GitRepositoryId>> = BTreeMap::new();
+    let mut grouped: BTreeMap<WorkScopeId, Vec<ProjectSeedId>> = BTreeMap::new();
     for attachment in attachments {
         grouped
             .entry(attachment.work_scope_id)
             .or_default()
-            .push(attachment.repository_id);
+            .push(attachment.project_id);
     }
     let mut expected = BTreeMap::new();
     let mut conflicts = Vec::new();
-    for (work_scope_id, mut repository_ids) in grouped {
-        repository_ids.sort();
-        repository_ids.dedup();
-        if repository_ids.len() > 1 {
-            conflicts.push((work_scope_id, repository_ids));
-        } else if let Some(repository_id) = repository_ids.into_iter().next() {
-            expected.insert(work_scope_id, repository_id);
+    for (work_scope_id, mut project_ids) in grouped {
+        project_ids.sort();
+        project_ids.dedup();
+        if project_ids.len() > 1 {
+            conflicts.push((work_scope_id, project_ids));
+        } else if let Some(project_id) = project_ids.into_iter().next() {
+            expected.insert(work_scope_id, project_id);
         }
     }
     (expected, conflicts)
@@ -2242,6 +2256,33 @@ async fn delete_all_repository_observations_tx(
 
 fn parse_work_scope_id(value: String) -> DbResult<WorkScopeId> {
     WorkScopeId::parse(value).map_err(|error| DbError::Serialization(error.to_string()))
+}
+
+fn seed_repository_snapshot(
+    project_ids: BTreeSet<ProjectSeedId>,
+    attachments: BTreeMap<WorkScopeId, ProjectSeedId>,
+) -> DbResult<(
+    BTreeSet<GitRepositoryId>,
+    BTreeMap<WorkScopeId, GitRepositoryId>,
+)> {
+    let repository_ids = project_ids
+        .into_iter()
+        .map(|project_id| GitRepositoryId::parse(project_id.as_str()))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let attachments = attachments
+        .into_iter()
+        .map(|(work_scope_id, project_id)| {
+            GitRepositoryId::parse(project_id.as_str())
+                .map(|repository_id| (work_scope_id, repository_id))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok((repository_ids, attachments))
+}
+
+fn parse_project_seed_id(value: String) -> DbResult<ProjectSeedId> {
+    ProjectSeedId::parse(value).map_err(|error| DbError::Serialization(error.to_string()))
 }
 
 fn parse_git_repository_id(value: String) -> DbResult<GitRepositoryId> {
@@ -2365,14 +2406,14 @@ mod tests {
 
         let DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
-            repository_ids: conflicting_repository_ids,
+            project_ids: conflicting_project_ids,
         } = err
         else {
             panic!("expected work-scope project conflict");
         };
         assert_eq!(work_scope_id, scope);
         assert_eq!(
-            conflicting_repository_ids
+            conflicting_project_ids
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
@@ -2405,14 +2446,14 @@ mod tests {
 
         let DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
-            repository_ids: conflicting_repository_ids,
+            project_ids: conflicting_project_ids,
         } = err
         else {
             panic!("expected work-scope project conflict");
         };
         assert_eq!(work_scope_id, scope);
         assert_eq!(
-            conflicting_repository_ids
+            conflicting_project_ids
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
@@ -2440,14 +2481,14 @@ mod tests {
 
         let DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
-            repository_ids,
+            project_ids,
         } = run_catchup(&db).await.unwrap_err()
         else {
             panic!("expected work-scope project conflict");
         };
         assert_eq!(work_scope_id, scope_a);
         assert_eq!(
-            repository_ids.map(|id| id.as_str().to_string()),
+            project_ids.map(|id| id.as_str().to_string()),
             ["  repo-a  ".to_string(), "repo,z".to_string()]
         );
     }
@@ -2458,9 +2499,9 @@ mod tests {
         let scope = WorkScopeId::parse("scope-full-conflict").unwrap();
         let attachments = ["repo,z", "  repo-a  ", "repo-m"]
             .into_iter()
-            .map(|repository_id| ExpectedAttachment {
+            .map(|project_id| ExpectedAttachment {
                 work_scope_id: scope.clone(),
-                repository_id: GitRepositoryId::parse(repository_id).unwrap(),
+                project_id: ProjectSeedId::parse(project_id).unwrap(),
             })
             .collect();
         let (_, conflicts) = resolve_expected_scope_attachments_for_validation(attachments);
@@ -2471,7 +2512,7 @@ mod tests {
             conflicts[0]
                 .1
                 .iter()
-                .map(GitRepositoryId::as_str)
+                .map(ProjectSeedId::as_str)
                 .collect::<Vec<_>>(),
             vec!["  repo-a  ", "repo,z", "repo-m"]
         );
@@ -2789,7 +2830,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO git_repository_default_branch_observations (
                 repository_id, generation, status, branch, provenance, observed_at
-             ) VALUES (?1, 0, 'resolved', 'main', 'user_selected', ?2)",
+             ) VALUES (?1, 1, 'resolved', 'main', 'user_selected', ?2)",
         )
         .bind(repository_id)
         .bind(Utc::now().to_rfc3339())
@@ -3372,6 +3413,48 @@ mod tests {
         assert!(foreign_key
             .diagnostic_categories()
             .contains(&DormantGitRepositoryReadinessDiagnosticCategory::ForeignKey));
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_without_rowid_foreign_key_violation_with_unavailable_row_id() {
+        let db = Database::open_in_memory().await.unwrap();
+        let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workflow_supported_codecs (workflow_id, codec_family, codec_version)
+             VALUES (9223372036854775807, 'missing-workflow', 1)",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let evidence = validate_readiness(&db, outcome.receipt).await.unwrap();
+        let foreign_key = evidence
+            .summary()
+            .diagnostic_categories()
+            .iter()
+            .find(|category| {
+                category.category() == DormantGitRepositoryReadinessDiagnosticCategory::ForeignKey
+            })
+            .expect("WITHOUT ROWID violation remains typed ForeignKey evidence");
+        assert_eq!(foreign_key.total_count(), 1);
+        assert!(foreign_key.samples().iter().any(|sample| {
+            sample.detail().contains("workflow_supported_codecs")
+                && sample
+                    .detail()
+                    .contains("row id unavailable (WITHOUT ROWID)")
+        }));
     }
 
     #[tokio::test]
@@ -4135,12 +4218,25 @@ mod tests {
     }
 
     #[test]
-    fn expected_attachment_type_uses_typed_ids() {
+    fn expected_attachment_preserves_typed_project_identity_until_seed_conversion() {
         let attachment = ExpectedAttachment {
             work_scope_id: WorkScopeId::parse("scope-typed").unwrap(),
-            repository_id: GitRepositoryId::parse("repo-typed").unwrap(),
+            project_id: ProjectSeedId::parse("  project,typed  ").unwrap(),
         };
         assert_eq!(attachment.work_scope_id.as_str(), "scope-typed");
-        assert_eq!(attachment.repository_id.as_str(), "repo-typed");
+        assert_eq!(attachment.project_id.as_str(), "  project,typed  ");
+        assert_eq!(
+            seed_repository_snapshot(
+                BTreeSet::from([attachment.project_id.clone()]),
+                BTreeMap::new()
+            )
+            .unwrap()
+            .0
+            .into_iter()
+            .next()
+            .unwrap()
+            .as_str(),
+            attachment.project_id.as_str()
+        );
     }
 }

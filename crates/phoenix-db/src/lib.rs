@@ -135,6 +135,48 @@ pub enum CloseFoundationRepair {
     },
 }
 
+/// Project identity carried only to the repository seed boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProjectSeedId(String);
+
+impl ProjectSeedId {
+    /// # Errors
+    /// Returns [`ProjectSeedIdError`] when the supplied identifier is empty.
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, ProjectSeedIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProjectSeedIdError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProjectSeedId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectSeedIdError {
+    Empty,
+}
+
+impl std::fmt::Display for ProjectSeedIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Project seed id must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectSeedIdError {}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
@@ -164,10 +206,10 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
-    #[error("git repository work-scope project conflict for {work_scope_id}: {repository_ids:?}")]
+    #[error("git repository work-scope project conflict for {work_scope_id}: {project_ids:?}")]
     GitRepositoryWorkScopeProjectConflict {
         work_scope_id: WorkScopeId,
-        repository_ids: [phoenix_core::git_repository::GitRepositoryId; 2],
+        project_ids: [ProjectSeedId; 2],
     },
     #[error("dormant git repository catch-up permit targeted a different database")]
     DormantGitRepositoryCatchupPermitTargetMismatch,
