@@ -45,6 +45,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [031](031_productconversation-persistence-uses-staged-single-authority.md) | ProductConversation persistence uses staged single authority | Accepted | REQ-BED-029, REQ-BED-030, REQ-BED-030A, REQ-BED-031B, REQ-CHN-002/003/005/007/008/009/010, REQ-GR-001/002/005/009/011, REQ-PROJ-014/015/019, REQ-PROJ-WS-001, REQ-WL-001/002; `ProductConversation`, `Conversation`, `CloseObligation`, `CloseAttemptMember`, `AttachedWorkScope` |
 | [032](032_gitrepository-is-hidden-infrastructure-project-is-retired.md) | GitRepository is hidden infrastructure; Project is retired | Accepted | REQ-GITREP-001–008, REQ-PROJ-015/020/021/024/025/028a, REQ-WL-002b; `GitRepository`, `WorkScope.repository`, `RestartRepairEvidence`, `RetirementAbsenceEvidence` |
 | [033](033_offline-database-rollback-and-foundation-storage.md) | Database rollback is offline and Foundation observations use relational scalar storage | Accepted | REQ-GITREP-001–004; `RepositoryLocatorObservation`, `DefaultBranchObservation` |
+| [034](034_compatibility-guarantees-are-explicit-and-data-aware.md) | Compatibility guarantees are explicit and data-aware | Accepted | REQ-COMP-001–005 |
 
 ## For agents: which decisions bind your task
 
@@ -73,6 +74,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
+| Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
 | Specifying in-app published release discovery, approval-bound self-update, or post-reconnect release-update status hydration | 018, 017 |
 | Specifying the Coordinator surface, current-activity orientation, or database read boundary | 027 for tool eligibility, then 022 and 021 for Coordinator-specific evidence and UI history |
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
@@ -93,6 +95,7 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-007 (Conversation creation uses fenced reconciliation)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
+      ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   └── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │       └── ADR-018 (release updates use published release previews and approval-bound installations)
@@ -105,7 +108,7 @@ ADR-000 (adopt spEARS v2 for new work)
           ├── ADR-019 (Runtime ownership requires positive evidence)
           └── ADR-020 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
-      └── ADR-025 (Continuation compaction is an idempotent durable operation)
+      ├── ADR-025 (Continuation compaction is an idempotent durable operation)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
