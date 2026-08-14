@@ -363,6 +363,7 @@ rule MixedReleaseStateIsObservableAfterPartialCommit {
     requires: publication.state = committing or publication.state = interrupted
     requires: release_is_temporarily_mixed(publication)
     ensures: publication.state = mixed
+    ensures: publication.failure_domain = publish
 }
 
 rule RetryFromInterruptedOrMixedStateMustRestageExactSet {

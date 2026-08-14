@@ -51,6 +51,14 @@ class BareSupervisorUnitTests(unittest.TestCase):
             self.assertTrue(owner.running)
             owner.stop_child.assert_called_once()
 
+    def test_legacy_protocol_one_is_read_only_status_compatible(self):
+        with tempfile.TemporaryDirectory() as td:
+            owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
+            response = owner.dispatch({"protocol_version": 1, "action": "status"})
+            self.assertTrue(response["ok"])
+            with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):
+                owner.dispatch({"protocol_version": 1, "action": "stop"})
+
     def test_protocol_mismatch_is_rejected(self):
         owner = supervisor.Supervisor(supervisor.Layout(Path("unused")))
         with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):

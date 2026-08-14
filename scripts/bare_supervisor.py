@@ -469,9 +469,12 @@ class Supervisor:
         return self.child_identity
 
     def dispatch(self, request: dict[str, object]) -> dict[str, object]:
-        if request.get("protocol_version") != PROTOCOL_VERSION:
-            raise SupervisorError("unsupported supervisor protocol")
         action = request.get("action")
+        protocol_version = request.get("protocol_version")
+        if protocol_version != PROTOCOL_VERSION and not (
+            action == "status" and protocol_version == 1
+        ):
+            raise SupervisorError("unsupported supervisor protocol")
         if action == "status":
             return {"ok": True, **self.status()}
         if action == "stop":
