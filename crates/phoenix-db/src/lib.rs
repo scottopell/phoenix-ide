@@ -2602,7 +2602,7 @@ impl Database {
         Ok(())
     }
 
-    /// Open or create database at the given path
+    /// Open or create a fully migrated database at the given path.
     ///
     /// # Errors
     ///
@@ -2627,10 +2627,9 @@ impl Database {
         restrict_db_permissions(path);
         let db = Self::new_with_generated_target_binding(pool, path.to_string());
         db.run_migrations().await?;
-        // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
-        // early chmod above could not see. Re-tighten now they exist. The prod
-        // path runs numbered migrations after `open` returns, so it must call
-        // `restrict_file_permissions` again afterward.
+        migrations::run_pending_migrations(&db.pool).await?;
+        // Migrations may have created the `-wal`/`-shm` sidecars that the early
+        // chmod above could not see. Re-tighten now they exist.
         db.restrict_file_permissions();
         Ok(db)
     }
@@ -2654,8 +2653,8 @@ impl Database {
     /// Open an in-memory database (for testing).
     ///
     /// Runs both the legacy idempotent ALTER TABLEs (`run_migrations`) and the
-    /// numbered migrations (`run_pending_migrations`), mirroring the production
-    /// startup sequence in `main.rs`. Without this, tests that exercise columns
+    /// numbered migrations (`run_pending_migrations`), mirroring the full
+    /// bootstrap contract of [`Database::open`]. Without this, tests that exercise columns
     /// added by numbered migrations would fail against a half-initialized DB.
     ///
     /// # Errors

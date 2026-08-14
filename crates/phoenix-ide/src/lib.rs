@@ -577,7 +577,6 @@ async fn open_database_with_migrations(
         std::fs::create_dir_all(parent)?;
     }
     let db = Database::open(&db_path.to_string_lossy()).await?;
-    db::run_pending_migrations(db.pool()).await?;
     db.reconcile_worktree_identities().await?;
     db.restrict_file_permissions();
     Ok(db)

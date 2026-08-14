@@ -408,9 +408,6 @@ async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult),
     let db = Database::open(path.to_string_lossy().as_ref())
         .await
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
-    phoenix_db::run_pending_migrations(db.pool())
-        .await
-        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     db.reconcile_worktree_identities()
         .await
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
