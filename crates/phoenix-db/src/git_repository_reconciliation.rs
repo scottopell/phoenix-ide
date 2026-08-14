@@ -1,8 +1,10 @@
 use crate::{Database, DbError, DbResult};
 use phoenix_core::git_repository::GitRepositoryId;
 use phoenix_core::work_scope::WorkScopeId;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, Row, Sqlite, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const READINESS_SAMPLE_LIMIT: usize = 10;
@@ -305,6 +307,14 @@ pub(crate) struct DormantGitRepositoryCanonicalReadinessEvidence {
 }
 
 impl DormantGitRepositoryCanonicalReadinessEvidence {
+    fn unit4_binding(&self) -> DormantGitRepositoryUnit4RunBinding {
+        DormantGitRepositoryUnit4RunBinding {
+            database: self.root.database.clone(),
+            operation: self.root.operation.clone(),
+            run_marker: self.root.run_marker.clone(),
+        }
+    }
+
     #[allow(dead_code, reason = "task 59004 binds the dormant readiness facade")]
     pub(crate) fn summary(&self) -> &DormantGitRepositoryReadinessSummary {
         &self.summary
@@ -358,6 +368,189 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
     fn has_valid_absence(&self, absence: DormantGitRepositoryValidAbsence) -> bool {
         self.summary.valid_absences().contains(&absence)
     }
+}
+
+#[derive(Debug, Clone)]
+struct DormantGitRepositoryUnit4RunBinding {
+    database: Arc<DormantGitRepositoryCatchupAuthorityState>,
+    operation: Arc<LegacyWriterExclusionMarker>,
+    run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
+}
+
+impl DormantGitRepositoryUnit4RunBinding {
+    fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.database, &other.database)
+            && Arc::ptr_eq(&self.operation, &other.operation)
+            && Arc::ptr_eq(&self.run_marker, &other.run_marker)
+    }
+}
+
+#[derive(Debug)]
+struct DormantGitRepositorySourceCensusAttestation {
+    root: DormantGitRepositoryUnit4RunBinding,
+    revision: String,
+    content_digest: String,
+    shadow_reference_count: usize,
+    project_authority_path_count: usize,
+    clean: bool,
+}
+
+#[derive(Debug)]
+struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
+    root: DormantGitRepositoryUnit4RunBinding,
+    historical_sha: String,
+    candidate_schema_digest: String,
+    old_source_unchanged: bool,
+    catchup_exact: bool,
+    replay_idempotent: bool,
+    fresh_readiness_root: bool,
+    passed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DormantGitRepositoryRollbackPosture {
+    AdditiveSchemaRetainedDestructiveDownMigrationProhibited,
+}
+
+impl DormantGitRepositoryRollbackPosture {
+    fn as_str(self) -> &'static str {
+        "additive_schema_retained_destructive_down_migration_prohibited"
+    }
+}
+
+#[derive(Debug)]
+struct DormantGitRepositoryRollbackAttestation {
+    root: DormantGitRepositoryUnit4RunBinding,
+    posture: DormantGitRepositoryRollbackPosture,
+    additive_schema_retained: bool,
+    old_source_unchanged: bool,
+}
+
+/// An opaque, in-process acceptance aggregate. Its nonce is represented by an
+/// Arc identity and deliberately has no cross-process stability contract.
+#[derive(Debug)]
+struct DormantGitRepositoryCompleteCompatibilityEvidence {
+    readiness: DormantGitRepositoryCanonicalReadinessEvidence,
+    census: DormantGitRepositorySourceCensusAttestation,
+    compatibility: DormantGitRepositoryOldBinaryCompatibilityAttestation,
+    rollback: DormantGitRepositoryRollbackAttestation,
+    integrity_digest: String,
+    eligible: bool,
+}
+
+impl DormantGitRepositoryCompleteCompatibilityEvidence {
+    fn new(
+        readiness: DormantGitRepositoryCanonicalReadinessEvidence,
+        census: DormantGitRepositorySourceCensusAttestation,
+        compatibility: DormantGitRepositoryOldBinaryCompatibilityAttestation,
+        rollback: DormantGitRepositoryRollbackAttestation,
+        target_identity: &str,
+    ) -> DbResult<Self> {
+        let root = readiness.unit4_binding();
+        if !root.matches(&census.root)
+            || !root.matches(&compatibility.root)
+            || !root.matches(&rollback.root)
+        {
+            return Err(DbError::Serialization(
+                "compatibility evidence members were assembled from different runs".to_string(),
+            ));
+        }
+        let build = compiled_build_identity();
+        let DormantGitRepositoryBuildIdentity::ExactClean { sha, .. } = &build else {
+            return Err(DbError::Serialization(
+                "candidate build must be an exact clean commit; commit the candidate before running the compatibility finalizer"
+                    .to_string(),
+            ));
+        };
+        let eligibility = readiness.summary.eligibility == DormantGitRepositoryR1Eligibility::Eligible
+            && census.clean
+            && compatibility.passed
+            && compatibility.old_source_unchanged
+            && compatibility.catchup_exact
+            && compatibility.replay_idempotent
+            && compatibility.fresh_readiness_root
+            && rollback.additive_schema_retained
+            && rollback.old_source_unchanged
+            && rollback.posture
+                == DormantGitRepositoryRollbackPosture::AdditiveSchemaRetainedDestructiveDownMigrationProhibited;
+        let integrity_digest = length_framed_digest([
+            ("candidate_build", sha.as_bytes()),
+            (
+                "candidate_schema",
+                readiness.schema.compiled_migration_digest.as_bytes(),
+            ),
+            ("target_identity", target_identity.as_bytes()),
+            ("census_revision", census.revision.as_bytes()),
+            ("census_digest", census.content_digest.as_bytes()),
+            ("historical_build", compatibility.historical_sha.as_bytes()),
+            (
+                "compatibility_schema",
+                compatibility.candidate_schema_digest.as_bytes(),
+            ),
+            ("rollback_posture", rollback.posture.as_str().as_bytes()),
+            ("eligible", if eligibility { b"true" } else { b"false" }),
+        ]);
+        Ok(Self {
+            readiness,
+            census,
+            compatibility,
+            rollback,
+            integrity_digest,
+            eligible: eligibility,
+        })
+    }
+
+    #[cfg(test)]
+    fn artifact_fields(&self) -> (&str, &str, &str, &str, usize, usize, bool, &str) {
+        let DormantGitRepositoryBuildIdentity::ExactClean { sha, .. } = &self.readiness.build
+        else {
+            unreachable!("complete evidence requires an exact clean candidate build");
+        };
+        (
+            sha,
+            &self.readiness.schema.compiled_migration_digest,
+            &self.compatibility.historical_sha,
+            &self.census.revision,
+            self.census.shadow_reference_count,
+            self.census.project_authority_path_count,
+            self.eligible,
+            &self.integrity_digest,
+        )
+    }
+
+    #[cfg(test)]
+    fn rollback_posture(&self) -> &'static str {
+        self.rollback.posture.as_str()
+    }
+
+    #[cfg(test)]
+    fn census_digest(&self) -> &str {
+        &self.census.content_digest
+    }
+}
+
+fn length_framed_digest<'a>(parts: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut hasher = Sha256::new();
+    for (name, value) in parts {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn assert_additive_shadow_schema(path: &str) -> DbResult<()> {
+    if path.is_empty() || !Path::new(path).is_file() {
+        return Err(DbError::Serialization(
+            "compatibility finalizer requires a file-backed database".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 struct DormantGitRepositoryCatchupInProgressGuard {
@@ -1291,6 +1484,8 @@ mod tests {
     use chrono::Utc;
     use phoenix_core::llm_language::LlmLanguage;
     use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext};
+    use std::env;
+    use std::fs;
 
     #[tokio::test]
     async fn catchup_inserts_missing_git_repository() {
@@ -2376,6 +2571,226 @@ mod tests {
             evidence.diagnostics().get(9).unwrap(),
             "MissingRepository: missing project-seeded repository repo-09"
         );
+    }
+
+    #[derive(serde::Serialize)]
+    struct CompatibilityFinalizerArtifact {
+        candidate_sha: String,
+        candidate_schema_digest: String,
+        historical_sha: String,
+        census_revision: String,
+        census_content_digest: String,
+        shadow_reference_count: usize,
+        project_authority_path_count: usize,
+        rollback_posture: String,
+        complete_eligibility: bool,
+        integrity_digest: String,
+        catchup_inserted_repositories: usize,
+        catchup_inserted_attachments: usize,
+    }
+
+    fn required_env(name: &str) -> String {
+        env::var(name)
+            .unwrap_or_else(|_| panic!("{name} is required for the compatibility finalizer"))
+    }
+
+    async fn shadow_counts(db: &Database) -> Vec<(String, i64)> {
+        vec![
+            (
+                "git_repositories".to_string(),
+                sqlx::query_scalar("SELECT COUNT(*) FROM git_repositories")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "work_scope_git_repositories".to_string(),
+                sqlx::query_scalar("SELECT COUNT(*) FROM work_scope_git_repositories")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "git_repository_locator_observations".to_string(),
+                sqlx::query_scalar("SELECT COUNT(*) FROM git_repository_locator_observations")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "git_repository_default_branch_observations".to_string(),
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM git_repository_default_branch_observations",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            ),
+        ]
+    }
+
+    async fn source_snapshot(
+        db: &Database,
+        canonical_path: &str,
+        conversation_id: &str,
+    ) -> (i64, Option<String>, Option<String>, Option<String>) {
+        let project_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects WHERE canonical_path = ?1")
+                .bind(canonical_path)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let project_id =
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        let state_kind =
+            sqlx::query_scalar::<_, String>("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(db.pool())
+                .await
+                .unwrap();
+        let job_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM conversation_creation_jobs WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        (project_count, project_id, state_kind, job_status)
+    }
+
+    #[tokio::test]
+    #[ignore = "historical binary acceptance runner supplies a migrated file database"]
+    async fn finalizes_historical_r1_compatibility_handoff() {
+        let db_path = required_env("PHOENIX_R1_COMPAT_DB_PATH");
+        let canonical_path = required_env("PHOENIX_R1_COMPAT_CANONICAL_PATH");
+        let project_id = required_env("PHOENIX_R1_COMPAT_PROJECT_ID");
+        let conversation_id = required_env("PHOENIX_R1_COMPAT_CONVERSATION_ID");
+        let artifact_path = required_env("PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT");
+        let historical_sha = required_env("PHOENIX_R1_COMPAT_HISTORICAL_SHA");
+        let census_revision = required_env("PHOENIX_R1_COMPAT_CENSUS_REVISION");
+        let census_content_digest = required_env("PHOENIX_R1_COMPAT_CENSUS_DIGEST");
+        let shadow_reference_count = required_env("PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT")
+            .parse::<usize>()
+            .unwrap();
+        let project_authority_path_count =
+            required_env("PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT")
+                .parse::<usize>()
+                .unwrap();
+        assert_eq!(
+            historical_sha, "799ea4d63c3d451f3f47859fa21df46fe3072923",
+            "the compatibility finalizer must be tied to the frozen historical binary"
+        );
+        assert_additive_shadow_schema(&db_path).unwrap();
+        let db = Database::open(&db_path).await.unwrap();
+        let before_source = source_snapshot(&db, &canonical_path, &conversation_id).await;
+        assert_eq!(
+            before_source.0, 1,
+            "historical process created one canonical project"
+        );
+        assert_eq!(before_source.1.as_deref(), Some(project_id.as_str()));
+        assert_eq!(before_source.2.as_deref(), Some("idle"));
+        assert_eq!(before_source.3.as_deref(), Some("ready"));
+        let before_shadow = shadow_counts(&db).await;
+        assert!(
+            before_shadow.iter().all(|(_, count)| *count == 0),
+            "the historical process must not write R1 shadow tables: {before_shadow:?}"
+        );
+
+        let first = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+        assert_eq!(first.stats.inserted_git_repositories, 1);
+        assert_eq!(first.stats.inserted_work_scope_attachments, 1);
+        assert_eq!(first.stats.deleted_git_repositories, 0);
+        assert_eq!(first.stats.deleted_work_scope_attachments, 0);
+        let first_readiness = validate_readiness(&db, first.receipt).await.unwrap();
+        assert_eq!(
+            first_readiness.eligibility(),
+            &DormantGitRepositoryR1Eligibility::Eligible
+        );
+
+        let replay = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+            .await
+            .unwrap();
+        assert_eq!(replay.stats, DormantGitRepositoryCatchupStats::default());
+        let replay_readiness = validate_readiness(&db, replay.receipt).await.unwrap();
+        assert_eq!(
+            replay_readiness.eligibility(),
+            &DormantGitRepositoryR1Eligibility::Eligible
+        );
+        assert!(replay_readiness.has_fresh_root_from(&first_readiness));
+        assert_eq!(
+            source_snapshot(&db, &canonical_path, &conversation_id).await,
+            before_source,
+            "candidate catch-up may derive shadows but must not mutate historical sources"
+        );
+
+        let root = replay_readiness.unit4_binding();
+        let census = DormantGitRepositorySourceCensusAttestation {
+            root: root.clone(),
+            revision: census_revision,
+            content_digest: census_content_digest,
+            shadow_reference_count,
+            project_authority_path_count,
+            clean: true,
+        };
+        let compatibility = DormantGitRepositoryOldBinaryCompatibilityAttestation {
+            root: root.clone(),
+            historical_sha: historical_sha.clone(),
+            candidate_schema_digest: replay_readiness.schema.compiled_migration_digest.clone(),
+            old_source_unchanged: true,
+            catchup_exact: true,
+            replay_idempotent: true,
+            fresh_readiness_root: true,
+            passed: true,
+        };
+        let rollback = DormantGitRepositoryRollbackAttestation {
+            root,
+            posture: DormantGitRepositoryRollbackPosture::AdditiveSchemaRetainedDestructiveDownMigrationProhibited,
+            additive_schema_retained: shadow_counts(&db).await.len() == 4,
+            old_source_unchanged: true,
+        };
+        let evidence = DormantGitRepositoryCompleteCompatibilityEvidence::new(
+            replay_readiness,
+            census,
+            compatibility,
+            rollback,
+            &format!("{canonical_path}:{conversation_id}"),
+        )
+        .unwrap();
+        let (
+            candidate_sha,
+            candidate_schema_digest,
+            evidence_historical_sha,
+            evidence_census_revision,
+            evidence_shadow_reference_count,
+            evidence_project_authority_path_count,
+            complete_eligibility,
+            integrity_digest,
+        ) = evidence.artifact_fields();
+        let artifact = CompatibilityFinalizerArtifact {
+            candidate_sha: candidate_sha.to_string(),
+            candidate_schema_digest: candidate_schema_digest.to_string(),
+            historical_sha: evidence_historical_sha.to_string(),
+            census_revision: evidence_census_revision.to_string(),
+            census_content_digest: evidence.census_digest().to_string(),
+            shadow_reference_count: evidence_shadow_reference_count,
+            project_authority_path_count: evidence_project_authority_path_count,
+            rollback_posture: evidence.rollback_posture().to_string(),
+            complete_eligibility,
+            integrity_digest: integrity_digest.to_string(),
+            catchup_inserted_repositories: first.stats.inserted_git_repositories,
+            catchup_inserted_attachments: first.stats.inserted_work_scope_attachments,
+        };
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
