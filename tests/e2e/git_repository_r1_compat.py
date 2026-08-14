@@ -178,7 +178,7 @@ def canonical_shadow_counts(value: Any) -> dict[str, int]:
 
 
 FINALIZER_KEYS = {
-    "candidate_sha", "candidate_package_version", "candidate_schema_digest", "historical_sha",
+    "candidate_sha", "candidate_package_version", "candidate_schema_digest", "historical_sha", "historical_runtime_identity",
     "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
     "readiness_root", "run_nonce", "target_database_digest", "old_source_digest_before",
     "old_source_digest_after", "shadow_before_initial_old", "shadow_after_initial_old",
@@ -194,6 +194,8 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         raise RuntimeError("finalizer top-level keys are not exact")
     if finalizer.get("candidate_sha") != candidate_sha or finalizer.get("eligibility") != "passed":
         raise RuntimeError(f"finalizer did not produce exact eligible evidence: {finalizer}")
+    if finalizer.get("historical_runtime_identity") != finalizer.get("historical_sha", "")[:12] or "dirty" in finalizer["historical_runtime_identity"]:
+        raise RuntimeError("historical runtime identity is not the exact clean pinned build")
     finalizer["preparation_initial_catchup"] = exact_catchup(finalizer.get("preparation_initial_catchup"), "preparation initial catchup")
     finalizer["preparation_replay_catchup"] = exact_catchup(finalizer.get("preparation_replay_catchup"), "preparation replay catchup")
     finalizer["final_catchup"] = exact_catchup(finalizer.get("final_catchup"), "final catchup")
@@ -234,7 +236,7 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         key: (json.dumps(finalizer[key], sort_keys=True, separators=(",", ":")) if key == "eligibility" else str(finalizer[key])) for key in (
             "candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "readiness_root", "run_nonce",
             "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
-            "historical_sha", "old_source_digest_before", "old_source_digest_after",
+            "historical_sha", "historical_runtime_identity", "old_source_digest_before", "old_source_digest_after",
             "shadow_before_initial_old", "shadow_after_initial_old", "shadow_before_rollback",
             "shadow_after_rollback", "rollback_posture", "eligibility", "preparation_identity_digest",
             "preparation_readiness_root", "preparation_run_nonce", "preparation_file_digest", "preparation_integrity_digest",
@@ -252,9 +254,34 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         raise RuntimeError("Python integrity verification rejected Rust artifact")
 
 
+def verify_finalizer_rejects_mutations(finalizer: dict[str, Any], candidate_sha: str) -> None:
+    mutations = []
+    extra = dict(finalizer)
+    extra["unexpected"] = True
+    mutations.append(extra)
+    for field, value in (("readiness_root", ""), ("candidate_sha", "0" * 40)):
+        mutation = dict(finalizer)
+        mutation[field] = value
+        mutations.append(mutation)
+    member_edit = dict(finalizer)
+    member_edit["integrity_members"] = [list(item) for item in finalizer["integrity_members"]]
+    member_edit["integrity_members"][0][1] = "0" * 40
+    mutations.append(member_edit)
+    digest_edit = dict(finalizer)
+    digest_edit["integrity_digest"] = "0" * 64
+    mutations.append(digest_edit)
+    for mutation in mutations:
+        try:
+            verify_finalizer(mutation, candidate_sha)
+        except RuntimeError:
+            continue
+        raise RuntimeError("adversarial final artifact mutation unexpectedly verified")
+
+
 def publish_verified_finalizer(output: Path, raw: bytes, candidate_sha: str) -> None:
     parsed = json.loads(raw)
     verify_finalizer(parsed, candidate_sha)
+    verify_finalizer_rejects_mutations(parsed, candidate_sha)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
     try:
@@ -302,15 +329,32 @@ def census_expected(inventory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_census_aggregate_counts(
+    inventory: dict[str, Any], observed: dict[str, Any]
+) -> tuple[int, int]:
+    shadow_count = sum(
+        sum(files.values())
+        for category in ("shadow_table_occurrences", "shadow_caller_occurrences")
+        for files in observed[category].values()
+    )
+    project_count = sum(
+        sum(files.values()) for files in observed["project_authority_occurrences"].values()
+    )
+    if inventory.get("shadow_reference_count") != shadow_count:
+        raise RuntimeError("stored shadow_reference_count disagrees with the exact inventory")
+    if inventory.get("project_authority_path_count") != project_count:
+        raise RuntimeError("stored project_authority_path_count disagrees with the exact inventory")
+    return shadow_count, project_count
+
+
 def census() -> Census:
     inventory = json.loads((ROOT / "tests/e2e/git_repository_r1_census.json").read_text())
     observed, expected = census_observed(inventory), census_expected(inventory)
     if observed != expected:
         raise RuntimeError(f"authority census drift; expected={expected!r}, observed={observed!r}")
     digest = canonical_json_digest({"inventory": inventory, "observed": observed})
-    tables = observed["shadow_table_occurrences"]
-    projects = observed["project_authority_occurrences"]
-    return Census(inventory["revision"], digest, sum(sum(files.values()) for files in tables.values()), sum(sum(files.values()) for files in projects.values()))
+    shadow_count, project_count = validate_census_aggregate_counts(inventory, observed)
+    return Census(inventory["revision"], digest, shadow_count, project_count)
 
 
 def census_self_test() -> None:
@@ -324,6 +368,17 @@ def census_self_test() -> None:
                 observed = census_observed(inventory, {injected_file: token})
                 if observed[category] == expected[category]:
                     raise RuntimeError(f"census self-test did not observe {category} token {token!r} injected into {injected_file}")
+    observed = census_observed(inventory)
+    for count_field in ("shadow_reference_count", "project_authority_path_count"):
+        contradictory = dict(inventory)
+        contradictory[count_field] += 1
+        try:
+            validate_census_aggregate_counts(contradictory, observed)
+        except RuntimeError:
+            continue
+        raise RuntimeError(
+            f"production census aggregate validation accepted contradictory {count_field}"
+        )
     print("census self-test passed: every closure token category observes Rust and Python/offline drift")
 
 
@@ -514,6 +569,7 @@ def main() -> None:
                 assert_clean_checkout(old_tree)
                 old_binary = old_target / "debug/phoenix_ide"
                 if run("git", "rev-parse", "HEAD", cwd=old_tree) != HISTORICAL_SHA: raise RuntimeError("historical build revision drift")
+                expected_historical_identity = HISTORICAL_SHA[:12]
                 candidate_target = ROOT / "target"; candidate_binary = candidate_target / "debug/phoenix_ide"
                 run("cargo", "build", "--offline", "--locked", "-p", "phoenix_ide", env=child_env(CARGO_TARGET_DIR=str(candidate_target)))
                 if not candidate_binary.is_file(): raise RuntimeError("candidate exact binary missing from ROOT/target")
@@ -530,7 +586,7 @@ def main() -> None:
                 finally: stop_and_record(process, lines, retained, run_logs)
                 source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES)
                 if shadow_after_initial_old != shadow_before_initial_old: raise RuntimeError("historical binary wrote additive shadow schema")
-                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
+                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_HISTORICAL_RUNTIME_IDENTITY=expected_historical_identity, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
                 # First candidate pass only prepares typed catch-up proof before exercising the old binary again.
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=env | {"PHOENIX_R1_COMPAT_PHASE": "prepare"})
                 preparation_bytes = preparation.read_bytes()

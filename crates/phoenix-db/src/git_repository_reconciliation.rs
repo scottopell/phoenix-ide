@@ -848,6 +848,7 @@ impl DormantGitRepositorySourceCensusAttestation {
 struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
     historical_sha: String,
+    historical_runtime_identity: String,
     candidate_schema_digest: String,
     source_digest: String,
     shadow_before_initial_old: String,
@@ -859,12 +860,15 @@ impl DormantGitRepositoryOldBinaryCompatibilityAttestation {
     fn passed_after_replay_and_fresh_readiness(
         root: DormantGitRepositoryUnit4RunBinding,
         historical_sha: String,
+        historical_runtime_identity: String,
         candidate_schema_digest: String,
         source_digest: String,
         shadow_before_initial_old: String,
         shadow_after_initial_old: String,
     ) -> DbResult<Self> {
         if historical_sha.len() != 40
+            || historical_sha.get(..12) != Some(historical_runtime_identity.as_str())
+            || historical_runtime_identity.contains("dirty")
             || candidate_schema_digest.len() != 64
             || source_digest.len() != 64
             || shadow_before_initial_old.len() != 64
@@ -883,6 +887,7 @@ impl DormantGitRepositoryOldBinaryCompatibilityAttestation {
         Ok(Self {
             root,
             historical_sha,
+            historical_runtime_identity,
             candidate_schema_digest,
             source_digest,
             shadow_before_initial_old,
@@ -1120,6 +1125,10 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
             (
                 "historical_sha".to_string(),
                 compatibility.historical_sha.clone(),
+            ),
+            (
+                "historical_runtime_identity".to_string(),
+                compatibility.historical_runtime_identity.clone(),
             ),
             (
                 "old_source_digest_before".to_string(),
@@ -3284,6 +3293,7 @@ mod tests {
         assert!(DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             root.clone(),
             "d".repeat(40),
+            "d".repeat(12),
             "e".repeat(64),
             "f".repeat(64),
             "0".repeat(64),
@@ -3507,6 +3517,7 @@ mod tests {
         let cross_run = DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             other_root,
             "d".repeat(40),
+            "d".repeat(12),
             "e".repeat(64),
             "f".repeat(64),
             "0".repeat(64),
@@ -3525,6 +3536,7 @@ mod tests {
         let same_run = DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             root.clone(),
             "d".repeat(40),
+            "d".repeat(12),
             "e".repeat(64),
             "f".repeat(64),
             "0".repeat(64),
@@ -3557,6 +3569,7 @@ mod tests {
         candidate_package_version: String,
         candidate_schema_digest: String,
         historical_sha: String,
+        historical_runtime_identity: String,
         census_revision: String,
         census_content_digest: String,
         shadow_reference_count: usize,
@@ -3718,6 +3731,8 @@ mod tests {
 
         let artifact_path = required_env("PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT");
         let historical_sha = required_env("PHOENIX_R1_COMPAT_HISTORICAL_SHA");
+        let historical_runtime_identity =
+            required_env("PHOENIX_R1_COMPAT_HISTORICAL_RUNTIME_IDENTITY");
         let census_revision = required_env("PHOENIX_R1_COMPAT_CENSUS_REVISION");
         let census_content_digest = required_env("PHOENIX_R1_COMPAT_CENSUS_DIGEST");
         let old_source_digest = required_env("PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST");
@@ -3768,6 +3783,7 @@ mod tests {
         let compatibility = DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             root.clone(),
             historical_sha,
+            historical_runtime_identity,
             readiness.schema.compiled_migration_digest.clone(),
             old_source_digest,
             shadow_before_initial_old,
@@ -3806,6 +3822,7 @@ mod tests {
             candidate_package_version: package_version.clone(),
             candidate_schema_digest: evidence.readiness.schema.compiled_migration_digest.clone(),
             historical_sha: evidence.compatibility.historical_sha.clone(),
+            historical_runtime_identity: evidence.compatibility.historical_runtime_identity.clone(),
             census_revision: evidence.census.revision.clone(),
             census_content_digest: evidence.census.content_digest.clone(),
             shadow_reference_count: evidence.census.shadow_reference_count,
