@@ -905,6 +905,14 @@ struct PhoenixWebViewPolicy {
         return .grant
     }
 
+    static func trustedBlobURL(_ url: URL, expectedOrigin: PhoenixOrigin) -> Bool {
+        guard url.scheme?.lowercased() == "blob" else { return false }
+        let value = url.absoluteString
+        guard value.hasPrefix("blob:"),
+              let creator = URL(string: String(value.dropFirst(5))) else { return false }
+        return expectedOrigin.exactlyMatches(creator)
+    }
+
     static func popupDecision(
         requestURL: URL?,
         sourceURL: URL?,
@@ -914,8 +922,7 @@ struct PhoenixWebViewPolicy {
               let sourceURL,
               expectedOrigin.exactlyMatches(sourceURL) else { return .cancel }
         if requestURL.absoluteString == "about:blank" { return .allowManagedChild }
-        if requestURL.scheme?.lowercased() == "blob",
-           requestURL.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
+        if trustedBlobURL(requestURL, expectedOrigin: expectedOrigin) {
             return .allowManagedChild
         }
         if expectedOrigin.exactlyMatches(requestURL) { return .allowManagedChild }
@@ -935,8 +942,7 @@ struct PhoenixWebViewPolicy {
         if url.absoluteString == "about:blank" || expectedOrigin.exactlyMatches(url) {
             return .allowManagedChild
         }
-        if url.scheme?.lowercased() == "blob",
-           url.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
+        if trustedBlobURL(url, expectedOrigin: expectedOrigin) {
             return .allowManagedChild
         }
         guard let scheme = url.scheme?.lowercased() else { return .cancel }
@@ -963,8 +969,7 @@ enum PhoenixNavigationResponsePolicy {
         userActivated: Bool = false
     ) -> PhoenixNavigationResponseDecision {
         guard let responseURL else { return .cancel }
-        if responseURL.scheme?.lowercased() == "blob",
-           responseURL.absoluteString.hasPrefix("blob:\(expectedOrigin.url.absoluteString)") {
+        if PhoenixWebViewPolicy.trustedBlobURL(responseURL, expectedOrigin: expectedOrigin) {
             return .allow
         }
         guard expectedOrigin.exactlyMatches(responseURL) else {

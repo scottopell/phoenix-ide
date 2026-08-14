@@ -123,6 +123,7 @@ struct WebViewWrapper: NSViewRepresentable {
         private var latestDeploymentGeneration: String?
         private var retiredDeploymentGenerations = Set<String>()
         private var latestDeploymentSequence = 0
+        private var committedDocumentGeneration: String?
         private var userActivatedMainNavigation = false
 
         init(
@@ -231,6 +232,7 @@ struct WebViewWrapper: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard role == .primary else { return }
+            committedDocumentGeneration = nil
             onWebViewReady(webView, operation)
             verifyDeployment(webView)
         }
@@ -362,7 +364,11 @@ struct WebViewWrapper: NSViewRepresentable {
                   let generation = body["generation"] as? String,
                   let sequence = body["sequence"] as? Int,
                   let status = body["status"] as? Int else { return }
-            guard !retiredDeploymentGenerations.contains(generation) else { return }
+            if committedDocumentGeneration == nil {
+                committedDocumentGeneration = generation
+            }
+            guard generation == committedDocumentGeneration,
+                  !retiredDeploymentGenerations.contains(generation) else { return }
             if generation == latestDeploymentGeneration {
                 guard sequence > latestDeploymentSequence else { return }
             } else {

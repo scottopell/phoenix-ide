@@ -838,6 +838,13 @@ final class ServerManager: ObservableObject {
         guard operation.map({ $0.id == operationAuthority.id }) ?? true else { return }
         guard let selected = mode else { return }
         guard let version = currentVersion else { return }
+        if deployment.build.version != version.version || deployment.build.gitSHA != version.gitSHA {
+            state = .unavailable(FailureState(
+                version: version,
+                message: "Phoenix restarted while its deployment was being verified. Reconnect to verify the new build."
+            ))
+            return
+        }
         let nextState: ConnectionState
         if let violation = deploymentViolation(deployment, for: selected, version: version) {
             switch selected {
@@ -1157,12 +1164,14 @@ final class ServerManager: ObservableObject {
             let readHandle = outputPipe?.fileHandleForReading
             outputPipe = nil
             readHandle?.readabilityHandler = nil
-            let tail = readHandle?.readDataToEndOfFile() ?? Data()
-            if !tail.isEmpty { pump.offer(tail) }
-            pump.finish()
-            Task { @MainActor [weak self] in
+            Task.detached { [weak self] in
+                let tail = readHandle?.readDataToEndOfFile() ?? Data()
+                if !tail.isEmpty { pump.offer(tail) }
+                pump.finish()
                 await pump.waitUntilFinished()
-                self?.completeProcessExit(terminated, operation: operation)
+                await MainActor.run {
+                    self?.completeProcessExit(terminated, operation: operation)
+                }
             }
             return
         }
