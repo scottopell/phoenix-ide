@@ -587,13 +587,16 @@ def main() -> None:
 
                 source_digest = canonical_json_digest(source_snapshot)
                 artifact = {
-                    "candidate_sha": candidate_sha,
+                    "authority_census": {
+                        "conclusion": "passed",
+                        "candidate_sha": candidate_sha,
+                        "revision": source_census.revision,
+                        "content_digest": source_census.digest,
+                        "shadow_reference_count": source_census.shadow_reference_count,
+                        "project_authority_path_count": source_census.project_authority_path_count,
+                    },
                     "historical_sha": HISTORICAL_SHA,
                     "historical_runtime_identity": HISTORICAL_SHA[:12],
-                    "census_revision": source_census.revision,
-                    "census_content_digest": source_census.digest,
-                    "shadow_reference_count": source_census.shadow_reference_count,
-                    "project_authority_path_count": source_census.project_authority_path_count,
                     "source_digest": source_digest,
                     "backup_digest": canonical_json_digest(backup_snapshot),
                     "restored_before_digest": canonical_json_digest(restored_before),

@@ -8,6 +8,7 @@ mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
 mod repository_authority;
+mod repository_cutover;
 pub mod retrieval;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,

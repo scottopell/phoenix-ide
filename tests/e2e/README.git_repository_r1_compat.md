@@ -29,6 +29,8 @@ The runner:
 
 The runner writes `target/git_repository_r1_compat.artifact.json` only after every assertion passes. On failure it removes any artifact and writes bounded historical server evidence to `target/git_repository_r1_compat.failure.log`.
 
+The artifact includes a nested `authority_census` projection so acceptance tests can verify the independently produced census schema without conflating it with paired-restore fields. This combined acceptance artifact is not production cutover authority. A future cutover-only deployment preflight supplies dedicated census evidence to G0; normal runtime startup does not read this file.
+
 ## Run
 
 ```bash

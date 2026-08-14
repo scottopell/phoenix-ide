@@ -315,7 +315,67 @@ pub(crate) struct DormantGitRepositoryCanonicalReadinessEvidence {
     summary: DormantGitRepositoryReadinessSummary,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum TestReadinessBuild<'a> {
+    ExactClean(&'a str),
+    Dirty(&'a str),
+    Unavailable,
+}
+
+#[cfg(test)]
+pub(super) fn test_readiness_evidence(
+    build: TestReadinessBuild<'_>,
+    eligibility: DormantGitRepositoryR1Eligibility,
+) -> DormantGitRepositoryCanonicalReadinessEvidence {
+    let package_version = "test".to_string();
+    let build = match build {
+        TestReadinessBuild::ExactClean(sha) => DormantGitRepositoryBuildIdentity::ExactClean {
+            sha: sha.to_string(),
+            package_version,
+        },
+        TestReadinessBuild::Dirty(sha) => DormantGitRepositoryBuildIdentity::Dirty {
+            sha: sha.to_string(),
+            package_version,
+        },
+        TestReadinessBuild::Unavailable => {
+            DormantGitRepositoryBuildIdentity::Unavailable { package_version }
+        }
+    };
+    DormantGitRepositoryCanonicalReadinessEvidence {
+        root: DormantGitRepositoryReadinessRunRoot {
+            database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
+            operation: Arc::new(LegacyWriterExclusionMarker),
+            run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+            run_id: uuid::Uuid::new_v4(),
+        },
+        build,
+        schema: DormantGitRepositoryReadinessSchemaSummary {
+            compiled_migration_digest: String::new(),
+            compiled_migration_count: 0,
+            applied_ledger: Vec::new(),
+            inspected_r1_ddl: BTreeMap::new(),
+        },
+        summary: DormantGitRepositoryReadinessSummary {
+            eligibility,
+            storage_kind: DormantGitRepositoryReadinessStorageKind::FileBacked,
+            diagnostic_categories: Vec::new(),
+            valid_absences: Vec::new(),
+        },
+    }
+}
+
 impl DormantGitRepositoryCanonicalReadinessEvidence {
+    pub(super) fn eligible_clean_candidate_sha(&self) -> Option<&str> {
+        match (&self.summary.eligibility, &self.build) {
+            (
+                DormantGitRepositoryR1Eligibility::Eligible,
+                DormantGitRepositoryBuildIdentity::ExactClean { sha, .. },
+            ) => Some(sha),
+            _ => None,
+        }
+    }
+
     #[allow(dead_code, reason = "task 59004 binds the dormant readiness facade")]
     pub(crate) fn summary(&self) -> &DormantGitRepositoryReadinessSummary {
         &self.summary
