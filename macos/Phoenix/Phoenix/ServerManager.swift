@@ -259,8 +259,9 @@ private struct LaunchedBundledInstance {
 }
 
 func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID: UUID?) -> Bool {
-    guard let instanceID else { return false }
-    return deployment?.instanceID == instanceID.uuidString
+    guard let instanceID,
+          let reported = deployment?.instanceID.flatMap(UUID.init(uuidString:)) else { return false }
+    return reported == instanceID
 }
 
 func attachedDeploymentOwnershipViolation(_ ownership: InstallationOwnership) -> String? {
@@ -838,7 +839,12 @@ final class ServerManager: ObservableObject {
         guard let version = currentVersion else { return }
         let nextState: ConnectionState
         if let violation = deploymentViolation(deployment, for: selected, version: version) {
-            nextState = .unsupportedOwnership(version, deployment, violation)
+            switch selected {
+            case .attached:
+                nextState = .unsupportedOwnership(version, deployment, violation)
+            case .bundled:
+                nextState = .failed(FailureState(version: version, message: violation))
+            }
         } else {
             nextState = .ready(version, deployment)
         }
