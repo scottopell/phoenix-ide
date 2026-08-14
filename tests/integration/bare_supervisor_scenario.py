@@ -46,7 +46,7 @@ def wrapper(fixture, version, git_sha, port, *, wrong=False):
 
 
 def transaction(
-    layout, fixture, port, transaction_id, *, previous,
+    module, layout, fixture, port, transaction_id, *, previous,
     previous_version="1.0.0", previous_git_sha="a" * 40, wrong=False,
 ):
     directory = layout.transactions / transaction_id
@@ -124,9 +124,9 @@ def main():
         if parent_pid(supervisor_pid) == os.getpid():
             raise RuntimeError("supervisor remained attached to scenario initiator")
 
-        success_id, success_hash = transaction(layout, args.fixture, args.port, "b" * 32, previous=True)
+        success_id, success_hash = transaction(module, layout, args.fixture, args.port, "b" * 32, previous=True)
         success = module.request(layout.socket, {
-            "protocol_version": 1, "action": "activate",
+            "protocol_version": module.PROTOCOL_VERSION, "action": "activate",
             "transaction_id": success_id, "manifest_sha256": success_hash,
         })
         if success["state"] != "committed":
@@ -140,11 +140,11 @@ def main():
             raise RuntimeError("child proc start time is not stable")
 
         rollback_id, rollback_hash = transaction(
-            layout, args.fixture, args.port, "c" * 32, previous=True,
+            module, layout, args.fixture, args.port, "c" * 32, previous=True,
             previous_version="2.0.0", previous_git_sha="b" * 40, wrong=True,
         )
         rollback = module.request(layout.socket, {
-            "protocol_version": 1, "action": "activate",
+            "protocol_version": module.PROTOCOL_VERSION, "action": "activate",
             "transaction_id": rollback_id, "manifest_sha256": rollback_hash,
         })
         if rollback["state"] != "activation_failed_rolled_back":

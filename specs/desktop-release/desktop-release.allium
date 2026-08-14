@@ -61,6 +61,7 @@ entity StandaloneHelperBuild {
 
     transitions signature {
         unsigned -> signed_once
+        unsigned -> failed
         signed_once -> verified
         signed_once -> failed
         verified -> failed
@@ -120,6 +121,7 @@ entity ReleasePublication {
         committing -> failed
         mixed -> replacing
         mixed -> completed
+        mixed -> failed
         interrupted -> replacing
         interrupted -> mixed
         interrupted -> failed
@@ -240,6 +242,8 @@ rule StandaloneHelperVerificationPrecedesDesktopEmbedding {
 rule MissingCredentialsRejectSignedReleasePath {
     when: ReleaseCredentialsMissing(archive, publication)
     requires: archive.build = ready
+    requires: publication.state = idle
+    requires: archive.identity = publication.identity
     requires: not notarization_credentials_available(archive)
     ensures: archive.build = failed
     ensures: publication.state = failed
