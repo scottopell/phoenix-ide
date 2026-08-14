@@ -343,11 +343,6 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_git_repository_shadow_tables",
         sql: MIGRATION_065,
     },
-    Migration {
-        version: 66,
-        name: "create_git_repository_foundation_identity",
-        sql: MIGRATION_066,
-    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -424,18 +419,6 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
         .collect()
 }
 
-pub(crate) fn foundation_identity_expected_table_definition() -> String {
-    MIGRATION_066
-        .split(';')
-        .map(normalize_sql)
-        .find(|statement| {
-            statement
-                .to_ascii_lowercase()
-                .starts_with("create table git_repository_foundation_identity ")
-        })
-        .expect("migration 66 creates foundation identity table")
-}
-
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -456,31 +439,11 @@ CREATE TABLE git_repository_locator_observations (
         CHECK (typeof(status) = 'text')
         CHECK (status IN ('present', 'missing', 'inaccessible')),
     path TEXT NOT NULL
-        CHECK (typeof(path) = 'text' AND path <> ''),
-    observed_at TEXT NOT NULL
+        CHECK (typeof(path) = 'text' AND path <> '' AND instr(path, char(0)) = 0),
+    observed_at_unix_micros INTEGER NOT NULL
         CHECK (
-            typeof(observed_at) = 'text'
-            AND instr(observed_at, char(0)) = 0
-            AND (
-                observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 21, 3) <> '000'
-                )
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 24, 3) <> '000'
-                )
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 27, 3) <> '000'
-                )
-            )
-            AND date(substr(observed_at, 1, 10), '+0 days') = substr(observed_at, 1, 10)
-            AND CAST(substr(observed_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
-            AND CAST(substr(observed_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
-            AND CAST(substr(observed_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
-            AND julianday(observed_at) IS NOT NULL
+            typeof(observed_at_unix_micros) = 'integer'
+            AND observed_at_unix_micros >= 0
         ),
     PRIMARY KEY (repository_id, locator_kind)
 );
@@ -493,32 +456,14 @@ CREATE TABLE git_repository_default_branch_observations (
     status TEXT NOT NULL
         CHECK (typeof(status) = 'text')
         CHECK (status IN ('resolved', 'unresolved')),
-    branch TEXT CHECK (branch IS NULL OR typeof(branch) = 'text'),
+    branch TEXT CHECK (
+        branch IS NULL OR (typeof(branch) = 'text' AND instr(branch, char(0)) = 0)
+    ),
     provenance TEXT CHECK (provenance IS NULL OR typeof(provenance) = 'text'),
-    observed_at TEXT NOT NULL
+    observed_at_unix_micros INTEGER NOT NULL
         CHECK (
-            typeof(observed_at) = 'text'
-            AND instr(observed_at, char(0)) = 0
-            AND (
-                observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 21, 3) <> '000'
-                )
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 24, 3) <> '000'
-                )
-                OR (
-                    observed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]+00:00'
-                    AND substr(observed_at, 27, 3) <> '000'
-                )
-            )
-            AND date(substr(observed_at, 1, 10), '+0 days') = substr(observed_at, 1, 10)
-            AND CAST(substr(observed_at, 12, 2) AS INTEGER) BETWEEN 0 AND 23
-            AND CAST(substr(observed_at, 15, 2) AS INTEGER) BETWEEN 0 AND 59
-            AND CAST(substr(observed_at, 18, 2) AS INTEGER) BETWEEN 0 AND 59
-            AND julianday(observed_at) IS NOT NULL
+            typeof(observed_at_unix_micros) = 'integer'
+            AND observed_at_unix_micros >= 0
         ),
     CHECK (
         (status = 'resolved'
@@ -574,18 +519,6 @@ WHERE distinct_project_count = 1;
 
 DROP TABLE migration_065_scope_project_guard;
 DROP TABLE migration_065_scope_project_counts;
-";
-
-const MIGRATION_066: &str = r"
-CREATE TABLE git_repository_foundation_identity (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    instance_id TEXT NOT NULL UNIQUE
-        CHECK (typeof(instance_id) = 'text')
-        CHECK (length(CAST(instance_id AS BLOB)) = 32)
-        CHECK (instance_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]')
-);
-INSERT INTO git_repository_foundation_identity (singleton, instance_id)
-VALUES (1, lower(hex(randomblob(16))));
 ";
 
 const MIGRATION_063: &str = r"
@@ -5663,14 +5596,6 @@ mod tests {
     }
 
     #[test]
-    fn foundation_identity_definition_is_exact_migration_66_ddl() {
-        assert_eq!(
-            foundation_identity_expected_table_definition(),
-            "CREATE TABLE git_repository_foundation_identity ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), instance_id TEXT NOT NULL UNIQUE CHECK (typeof(instance_id) = 'text') CHECK (length(CAST(instance_id AS BLOB)) = 32) CHECK (instance_id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]') )"
-        );
-    }
-
-    #[test]
     fn r1_expected_table_definitions_cover_every_migration_65_table() {
         assert_eq!(
             r1_expected_table_definitions()
@@ -6054,8 +5979,8 @@ mod tests {
         setup_pre_065_git_repository_schema(&pool).await;
         sqlx::query(
             "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
-                 ('project-a', '/repos/a', 'main', '2025-01-01T00:00:00+00:00'),
-                 ('project-b', '/repos/b', 'trunk', '2025-01-01T00:00:00+00:00')",
+                 ('project-a', '/repos/a', 'main', 1735689600000000),
+                 ('project-b', '/repos/b', 'trunk', 1735689600000000)",
         )
         .execute(&pool)
         .await
@@ -6142,7 +6067,7 @@ mod tests {
         setup_pre_065_git_repository_schema(&pool).await;
         sqlx::query(
             "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
-                 ('project-a', '/repos/a', 'main', '2025-01-01T00:00:00+00:00')",
+                 ('project-a', '/repos/a', 'main', 1735689600000000)",
         )
         .execute(&pool)
         .await
@@ -6192,7 +6117,7 @@ mod tests {
         setup_pre_065_git_repository_schema(&pool).await;
         sqlx::query(
             "INSERT INTO projects (id, canonical_path, main_ref, created_at)
-             VALUES ('', '/repos/empty-id', 'main', '2025-01-01T00:00:00+00:00')",
+             VALUES ('', '/repos/empty-id', 'main', 1735689600000000)",
         )
         .execute(&pool)
         .await
@@ -6259,8 +6184,8 @@ mod tests {
         setup_pre_065_git_repository_schema(&pool).await;
         sqlx::query(
             "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
-                 ('project-a', '/repos/a', 'main', '2025-01-01T00:00:00+00:00'),
-                 ('project-b', '/repos/b', 'main', '2025-01-01T00:00:00+00:00')",
+                 ('project-a', '/repos/a', 'main', 1735689600000000),
+                 ('project-b', '/repos/b', 'main', 1735689600000000)",
         )
         .execute(&pool)
         .await
@@ -6398,99 +6323,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_066_seeds_one_valid_identity_and_preserves_migration_065_rows() {
-        let pool = test_pool().await;
-        setup_pre_065_git_repository_schema(&pool).await;
-        sqlx::query(
-            "INSERT INTO projects (id, canonical_path, main_ref, created_at)
-             VALUES ('repo-upgrade', '/repos/upgrade', 'main', '2025-01-01')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-upgrade')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO conversations (id, work_scope_id, project_id)
-             VALUES ('conversation-upgrade', 'scope-upgrade', 'repo-upgrade')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        stamp_migrations_except(&pool, 65).await;
-        sqlx::query("DELETE FROM _migrations WHERE version = 66")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT singleton, instance_id
-             FROM git_repository_foundation_identity ORDER BY singleton",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 1, "identity row is required exactly once");
-        assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[0].1.len(), 32);
-        assert!(rows[0]
-            .1
-            .bytes()
-            .all(|byte| byte.is_ascii_digit()
-                || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())));
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT id FROM git_repositories")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            "repo-upgrade"
-        );
-        assert_eq!(
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT work_scope_id, repository_id FROM work_scope_git_repositories",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            ("scope-upgrade".to_string(), "repo-upgrade".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn migration_066_identity_constraints_reject_wrong_storage_and_bytes() {
-        let pool = test_pool().await;
-        setup_pre_065_git_repository_schema(&pool).await;
-        stamp_migrations_except(&pool, 66).await;
-        run_pending_migrations(&pool).await.unwrap();
-
-        for invalid_update in [
-            "UPDATE git_repository_foundation_identity SET instance_id = zeroblob(32) WHERE singleton = 1",
-            "UPDATE git_repository_foundation_identity SET instance_id = CAST(X'6100626364656661626364656661626364656661626364656661626364656661' AS TEXT) WHERE singleton = 1",
-            "UPDATE git_repository_foundation_identity SET instance_id = 'ABCDEFABCDEFABCDEFABCDEFABCDEFAB' WHERE singleton = 1",
-            "UPDATE git_repository_foundation_identity SET instance_id = 'gggggggggggggggggggggggggggggggg' WHERE singleton = 1",
-        ] {
-            assert!(
-                sqlx::query(invalid_update).execute(&pool).await.is_err(),
-                "{invalid_update}"
-            );
-        }
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM git_repository_foundation_identity
-                 WHERE singleton = 1 AND typeof(instance_id) = 'text'"
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-            1
-        );
-    }
-
-    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn migration_065_text_primary_keys_are_explicitly_not_null_and_reject_nulls() {
         let pool = test_pool().await;
@@ -6538,10 +6370,10 @@ mod tests {
             .await
             .unwrap();
         for statement in [
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES (NULL, 1, 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES (NULL, 1, 'unresolved', NULL, NULL, 1735689600000000)",
             "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES (NULL, 'repo-1')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES (NULL, 'common_dir', 'present', '/repo', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-1', NULL, 'present', '/repo', '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES (NULL, 'common_dir', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-1', NULL, 'present', '/repo', 1735689600000000)",
         ] {
             assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
         }
@@ -6569,16 +6401,16 @@ mod tests {
             .unwrap();
         for statement in [
             "INSERT INTO git_repositories (id) VALUES (X'7265706f2d626c6f62')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES (X'7265706f2d74657874', 'common_dir', 'present', '/repo', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-locator-kind', X'636f6d6d6f6e5f646972', 'present', '/repo', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-locator-status', 'common_dir', X'70726573656e74', '/repo', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-locator-path', 'common_dir', 'present', X'2f7265706f', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-locator-time', 'common_dir', 'present', '/repo', X'323032352d30312d3031')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES (X'7265706f2d74657874', 1, 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-default-status', 1, X'7265736f6c766564', 'main', 'user_selected', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-default-branch', 1, 'resolved', X'6d61696e', 'user_selected', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-default-provenance', 1, 'resolved', 'main', X'757365725f73656c6563746564', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-default-time', 1, 'unresolved', NULL, NULL, X'323032352d30312d3031')",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES (X'7265706f2d74657874', 'common_dir', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-kind', X'636f6d6d6f6e5f646972', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-status', 'common_dir', X'70726573656e74', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-path', 'common_dir', 'present', X'2f7265706f', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-time', 'common_dir', 'present', '/repo', 'not-integer')",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES (X'7265706f2d74657874', 1, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-status', 1, X'7265736f6c766564', 'main', 'user_selected', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-branch', 1, 'resolved', X'6d61696e', 'user_selected', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-provenance', 1, 'resolved', 'main', X'757365725f73656c6563746564', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-time', 1, 'unresolved', NULL, NULL, 'not-integer')",
             "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES (X'73636f70652d74657874', 'repo-text')",
             "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES ('scope-text', X'7265706f2d74657874')",
         ] {
@@ -6589,131 +6421,195 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn migration_065_enforces_canonical_utc_observation_timestamps() {
+    async fn migration_065_rejects_nul_in_locator_paths_and_branch_names() {
         let pool = test_pool().await;
         setup_pre_065_git_repository_schema(&pool).await;
         stamp_migrations_except(&pool, 65).await;
         run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO git_repositories (id) VALUES
+             ('repo-nul-insert'), ('repo-nul-update')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let accepted = [
-            "2025-01-01T00:00:00+00:00",
-            "2025-01-01T00:00:00.100+00:00",
-            "2025-01-01T00:00:00.123+00:00",
-            "2025-01-01T00:00:00.123400+00:00",
-            "2025-01-01T00:00:00.123456+00:00",
-            "2025-01-01T00:00:00.123456700+00:00",
-            "2025-01-01T00:00:00.123456789+00:00",
-            "2024-02-29T23:59:59.999999999+00:00",
-        ];
-        for (index, observed_at) in accepted.into_iter().enumerate() {
-            let repository_id = format!("repo-time-valid-{index}");
-            sqlx::query("INSERT INTO git_repositories (id) VALUES (?1)")
-                .bind(&repository_id)
-                .execute(&pool)
-                .await
-                .unwrap();
+        let nul_path = "/repo\0nested";
+        assert!(
             sqlx::query(
                 "INSERT INTO git_repository_locator_observations (
-                     repository_id, locator_kind, status, path, observed_at
-                 ) VALUES (?1, 'common_dir', 'present', '/repo', ?2)",
+                     repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES ('repo-nul-insert', 'common_dir', 'present', ?1, 1735689600000000)",
             )
-            .bind(&repository_id)
-            .bind(observed_at)
+            .bind(nul_path)
             .execute(&pool)
             .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO git_repository_default_branch_observations (
-                     repository_id, generation, status, branch, provenance, observed_at
-                 ) VALUES (?1, 1, 'unresolved', NULL, NULL, ?2)",
-            )
-            .bind(&repository_id)
-            .bind(observed_at)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        let rejected = [
-            "unknown",
-            "2025-01-01",
-            "2025-01-01 00:00:00+00:00",
-            "2025-01-01T00:00+00:00",
-            "2025-01-01T24:00:00+00:00",
-            "2025-02-29T00:00:00+00:00",
-            "2025-01-01T00:00:00Z",
-            "2025-01-01T00:00:00+05:30",
-            "2025-01-01T00:00:00+0000",
-            "2025-01-01T00:00:00.000+00:00",
-            "2025-01-01T00:00:00.123000+00:00",
-            "2025-01-01T00:00:00.123456000+00:00",
-            "2025-01-01T00:00:00.1+00:00",
-            "2025-01-01T00:00:00.1234+00:00",
-            "2025-01-01T00:00:00.abc+00:00",
-            "+10000-01-01T00:00:00+00:00",
-            "-0001-01-01T00:00:00+00:00",
-            "2025-01-01T00:00:00+00:00 ",
-            "2025-01-01T00:00:00+00:00\0junk",
-        ];
-        for (index, observed_at) in rejected.into_iter().enumerate() {
-            let repository_id = format!("repo-time-invalid-{index}");
-            sqlx::query("INSERT INTO git_repositories (id) VALUES (?1)")
-                .bind(&repository_id)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert!(
-                sqlx::query(
-                    "INSERT INTO git_repository_locator_observations (
-                         repository_id, locator_kind, status, path, observed_at
-                     ) VALUES (?1, 'common_dir', 'present', '/repo', ?2)",
-                )
-                .bind(&repository_id)
-                .bind(observed_at)
-                .execute(&pool)
-                .await
-                .is_err(),
-                "locator observation accepted invalid timestamp: {observed_at:?}"
-            );
-            assert!(
-                sqlx::query(
-                    "INSERT INTO git_repository_default_branch_observations (
-                         repository_id, generation, status, branch, provenance, observed_at
-                     ) VALUES (?1, 1, 'unresolved', NULL, NULL, ?2)",
-                )
-                .bind(&repository_id)
-                .bind(observed_at)
-                .execute(&pool)
-                .await
-                .is_err(),
-                "default-branch observation accepted invalid timestamp: {observed_at:?}"
-            );
-        }
-
+            .is_err(),
+            "locator path accepted embedded NUL"
+        );
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-nul-update', 'common_dir', 'present', '/repo', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert!(
             sqlx::query(
                 "UPDATE git_repository_locator_observations
-                 SET observed_at = 'unknown'
-                 WHERE repository_id = 'repo-time-valid-0'",
+                 SET path = ?1 WHERE repository_id = 'repo-nul-update'",
             )
+            .bind(nul_path)
             .execute(&pool)
             .await
             .is_err(),
-            "timestamp constraint must also reject invalid updates"
+            "locator path update accepted embedded NUL"
         );
+
+        let nul_branch = "ma\0in";
+        assert!(
+            sqlx::query(
+                "INSERT INTO git_repository_default_branch_observations (
+                     repository_id, generation, status, branch, provenance, observed_at_unix_micros
+                 ) VALUES ('repo-nul-insert', 1, 'resolved', ?1, 'user_selected', 1735689600000000)",
+            )
+            .bind(nul_branch)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "branch name accepted embedded NUL"
+        );
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-nul-update', 1, 'resolved', 'main', 'user_selected', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert!(
             sqlx::query(
                 "UPDATE git_repository_default_branch_observations
-                 SET observed_at = 'unknown'
-                 WHERE repository_id = 'repo-time-valid-0'",
+                 SET branch = ?1 WHERE repository_id = 'repo-nul-update'",
             )
+            .bind(nul_branch)
             .execute(&pool)
             .await
             .is_err(),
-            "default-branch timestamp constraint must reject invalid updates"
+            "branch update accepted embedded NUL"
         );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_065_enforces_unix_microsecond_observation_times() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO git_repositories (id) VALUES
+             ('repo-time-zero'),
+             ('repo-time-later'),
+             ('repo-time-invalid-locator-negative'),
+             ('repo-time-invalid-locator-fraction'),
+             ('repo-time-invalid-locator-text'),
+             ('repo-time-invalid-branch-negative'),
+             ('repo-time-invalid-branch-fraction'),
+             ('repo-time-invalid-branch-text'),
+             ('repo-time-update')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-time-zero', 'common_dir', 'present', '/zero', 0),
+                      ('repo-time-later', 'common_dir', 'present', '/later', 1735689600000001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-time-zero', 1, 'unresolved', NULL, NULL, 0),
+                      ('repo-time-later', 1, 'unresolved', NULL, NULL, 1735689600000001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ordered: Vec<i64> = sqlx::query_scalar(
+            "SELECT observed_at_unix_micros
+             FROM git_repository_locator_observations
+             ORDER BY observed_at_unix_micros",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ordered, vec![0, 1_735_689_600_000_001]);
+
+        for (statement, failure_message) in [
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-negative', 'common_dir', 'present', '/invalid', -1)",
+                "locator observation accepted a negative timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-fraction', 'common_dir', 'present', '/invalid', 0.5)",
+                "locator observation accepted a fractional timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-text', 'common_dir', 'present', '/invalid', 'not-integer')",
+                "locator observation accepted a text timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-negative', 1, 'unresolved', NULL, NULL, -1)",
+                "default-branch observation accepted a negative timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-fraction', 1, 'unresolved', NULL, NULL, 0.5)",
+                "default-branch observation accepted a fractional timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-text', 1, 'unresolved', NULL, NULL, 'not-integer')",
+                "default-branch observation accepted a text timestamp",
+            ),
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&pool).await.is_err(),
+                "{failure_message}"
+            );
+        }
+
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-time-update', 'common_dir', 'present', '/update', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE git_repository_locator_observations
+                 SET observed_at_unix_micros = -1
+                 WHERE repository_id = 'repo-time-update'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE git_repository_default_branch_observations
+                 SET observed_at_unix_micros = 'not-integer'
+                 WHERE repository_id = 'repo-time-zero'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -6754,8 +6650,8 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO git_repository_locator_observations (
-                     repository_id, locator_kind, status, path, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, '2025-01-01T00:00:00+00:00')",
+                     repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES (?1, ?2, ?3, ?4, 1735689600000000)",
             )
             .bind(repository_id)
             .bind(locator_kind)
@@ -6797,33 +6693,33 @@ mod tests {
             ]
         );
         for statement in [
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-2', 'management_root', 'present', NULL, '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-2', 'management_root', 'present', '', '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at) VALUES ('repo-2', 'management_root', 'unknown', '/repo/unknown', '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'present', NULL, 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'present', '', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'unknown', '/repo/unknown', 1735689600000000)",
         ] {
             assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
         }
 
         sqlx::query(
             "INSERT INTO git_repository_default_branch_observations (
-                 repository_id, generation, status, branch, provenance, observed_at
-             ) VALUES ('repo-1', 3, 'resolved', 'main', 'remote_head_cache', '2025-01-01T00:00:00+00:00')",
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-1', 3, 'resolved', 'main', 'remote_head_cache', 1735689600000000)",
         )
         .execute(&pool)
         .await
         .unwrap();
         assert!(sqlx::query(
             "INSERT INTO git_repository_default_branch_observations (
-                 repository_id, generation, status, branch, provenance, observed_at
-             ) VALUES ('repo-generation-negative', -1, 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-generation-negative', -1, 'unresolved', NULL, NULL, 1735689600000000)",
         )
         .execute(&pool)
         .await
         .is_err());
         for statement in [
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-generation-zero', 0, 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-generation-fraction', 0.5, 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
-            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at) VALUES ('repo-generation-text', 'not-a-generation', 'unresolved', NULL, NULL, '2025-01-01T00:00:00+00:00')",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-zero', 0, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-fraction', 0.5, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-text', 'not-a-generation', 'unresolved', NULL, NULL, 1735689600000000)",
         ] {
             assert!(
                 sqlx::query(statement).execute(&pool).await.is_err(),
@@ -6832,16 +6728,16 @@ mod tests {
         }
         assert!(sqlx::query(
             "INSERT INTO git_repository_default_branch_observations (
-                 repository_id, generation, status, branch, provenance, observed_at
-             ) VALUES ('repo-shape-resolved', 1, 'resolved', 'main', NULL, '2025-01-01T00:00:00+00:00')",
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-shape-resolved', 1, 'resolved', 'main', NULL, 1735689600000000)",
         )
         .execute(&pool)
         .await
         .is_err());
         assert!(sqlx::query(
             "INSERT INTO git_repository_default_branch_observations (
-                 repository_id, generation, status, branch, provenance, observed_at
-             ) VALUES ('repo-shape-unresolved', 1, 'unresolved', 'main', 'remote_head_cache', '2025-01-01T00:00:00+00:00')",
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-shape-unresolved', 1, 'unresolved', 'main', 'remote_head_cache', 1735689600000000)",
         )
         .execute(&pool)
         .await

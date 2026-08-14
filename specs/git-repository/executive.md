@@ -28,7 +28,7 @@ The shipped implementation still largely reflects the legacy `project`-named mod
 
 ## Normative Authority
 
-Current normative authority is `requirements.md` and `git-repository.allium`. ADR-032 records the hidden-repository identity and staged migration decision. This executive describes implementation drift from that target instead of claiming the hidden repository model is already shipped.
+Current normative authority is `requirements.md` and `git-repository.allium`. ADR-032 records the hidden-repository identity and staged migration decision. ADR-033 records offline paired database rollback, stopped-process replacement, and integer Unix-microsecond Foundation observation storage. This executive describes implementation drift from that target instead of claiming the hidden repository model is already shipped.
 
 ## Implementation Status
 
@@ -56,6 +56,8 @@ This spec intentionally separates observable repository facts from SQL or row-sh
 2. keep one writable authority per repository fact;
 3. move references away from retired `projects.allium` and project-as-product vocabulary;
 4. let lifecycle, deletion, and Close consume repository evidence without turning repositories into user-facing owners.
+
+The additive Foundation uses relational INTEGER Unix-microsecond observation columns and rejects NUL in filesystem/Git text. Rollback acceptance restores a pre-upgrade database backup while Phoenix is stopped and boots the matching historical binary; an older binary opening a newer-migrated database and live same-path database replacement are not supported contracts.
 
 ## Cross-Spec Notes
 
