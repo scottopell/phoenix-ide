@@ -4,10 +4,10 @@
   "shadow_caller_symbols": ["catch_up_dormant_git_repositories", "validate_dormant_git_repository_readiness", "test_only_mint"],
   "project_authority_symbols": ["find_or_create_project(", "get_project(", "list_projects(", "update_project_main_ref("],
   "shadow_table_occurrences": {
-    "git_repositories": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 48, "crates/phoenix-db/src/lib.rs": 2, "crates/phoenix-db/src/migrations.rs": 25},
-    "work_scope_git_repositories": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 10, "crates/phoenix-db/src/migrations.rs": 9},
-    "git_repository_locator_observations": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 7, "crates/phoenix-db/src/migrations.rs": 7},
-    "git_repository_default_branch_observations": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 8, "crates/phoenix-db/src/migrations.rs": 8}
+    "git_repositories": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 63, "crates/phoenix-db/src/lib.rs": 2, "crates/phoenix-db/src/migrations.rs": 25},
+    "work_scope_git_repositories": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 13, "crates/phoenix-db/src/migrations.rs": 9},
+    "git_repository_locator_observations": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 10, "crates/phoenix-db/src/migrations.rs": 7},
+    "git_repository_default_branch_observations": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 11, "crates/phoenix-db/src/migrations.rs": 8}
   },
   "shadow_caller_occurrences": {
     "catch_up_dormant_git_repositories": {"crates/phoenix-db/src/git_repository_reconciliation.rs": 15, "crates/phoenix-db/src/lib.rs": 2},

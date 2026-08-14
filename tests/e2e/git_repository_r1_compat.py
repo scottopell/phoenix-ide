@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import queue
-import secrets
 import signal
 import sqlite3
 import subprocess
@@ -44,6 +43,12 @@ class Census:
     digest: str
     shadow_reference_count: int
     project_authority_path_count: int
+
+
+@dataclass(frozen=True)
+class Preparation:
+    initial_catchup: dict[str, int]
+    replay_catchup: dict[str, int]
 
 
 def child_env(**phoenix: str) -> dict[str, str]:
@@ -83,6 +88,82 @@ def length_framed_digest(parts: list[tuple[str, str]]) -> str:
         digest.update(len(encoded_name).to_bytes(8, "big")); digest.update(encoded_name)
         digest.update(len(encoded_value).to_bytes(8, "big")); digest.update(encoded_value)
     return digest.hexdigest()
+
+
+CATCHUP_KEYS = (
+    "inserted_git_repositories", "deleted_git_repositories",
+    "inserted_work_scope_attachments", "replaced_work_scope_attachments",
+    "deleted_work_scope_attachments", "deleted_locator_observations",
+    "deleted_default_branch_observations",
+)
+SHADOW_COUNT_KEYS = (
+    "git_repositories", "work_scope_git_repositories",
+    "git_repository_locator_observations", "git_repository_default_branch_observations",
+)
+
+
+def exact_catchup(value: Any, name: str) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(CATCHUP_KEYS):
+        raise RuntimeError(f"{name} must contain exactly the catch-up stat keys")
+    if any(type(value[key]) is not int or value[key] < 0 for key in CATCHUP_KEYS):
+        raise RuntimeError(f"{name} has invalid catch-up statistics")
+    return {key: value[key] for key in CATCHUP_KEYS}
+
+
+def read_preparation(path: Path) -> Preparation:
+    value = json.loads(path.read_text())
+    if set(value) != {"initial_catchup", "replay_catchup"}:
+        raise RuntimeError("preparation artifact has unexpected fields")
+    preparation = Preparation(
+        exact_catchup(value["initial_catchup"], "preparation initial catchup"),
+        exact_catchup(value["replay_catchup"], "preparation replay catchup"),
+    )
+    if any(preparation.replay_catchup.values()):
+        raise RuntimeError("preparation replay catch-up was not exactly zero")
+    return preparation
+
+
+def canonical_shadow_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != set(SHADOW_COUNT_KEYS):
+        raise RuntimeError("shadow row counts must have exactly the canonical shadow table keys")
+    if any(type(value[key]) is not int or value[key] < 0 for key in SHADOW_COUNT_KEYS):
+        raise RuntimeError("shadow row counts are invalid")
+    return {key: value[key] for key in SHADOW_COUNT_KEYS}
+
+
+def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
+    if finalizer.get("candidate_sha") != candidate_sha or finalizer.get("eligibility") != "passed":
+        raise RuntimeError(f"finalizer did not produce exact eligible evidence: {finalizer}")
+    finalizer["preparation_initial_catchup"] = exact_catchup(finalizer.get("preparation_initial_catchup"), "preparation initial catchup")
+    finalizer["preparation_replay_catchup"] = exact_catchup(finalizer.get("preparation_replay_catchup"), "preparation replay catchup")
+    finalizer["final_catchup"] = exact_catchup(finalizer.get("final_catchup"), "final catchup")
+    finalizer["final_replay"] = exact_catchup(finalizer.get("final_replay"), "final replay")
+    finalizer["shadow_row_counts"] = canonical_shadow_counts(finalizer.get("shadow_row_counts"))
+    if any(finalizer["preparation_replay_catchup"].values()) or any(finalizer["final_catchup"].values()) or any(finalizer["final_replay"].values()):
+        raise RuntimeError("artifact catch-up/replay proof was not exactly zero")
+    members = finalizer.get("integrity_members")
+    if not isinstance(members, list) or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(part, str) for part in item) for item in members):
+        raise RuntimeError("integrity members must be string pairs")
+    member_map = dict(members)
+    if len(member_map) != len(members):
+        raise RuntimeError("integrity members contain duplicate keys")
+    expected = {
+        key: str(finalizer[key]) for key in (
+            "candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "readiness_root", "run_nonce",
+            "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
+            "historical_sha", "old_source_digest_before", "old_source_digest_after", "shadow_digest_before_old",
+            "shadow_digest_after_old", "rollback_posture", "eligibility",
+        )
+    }
+    for prefix, stats in (("preparation_initial_catchup", finalizer["preparation_initial_catchup"]), ("preparation_replay_catchup", finalizer["preparation_replay_catchup"]), ("final_catchup", finalizer["final_catchup"]), ("final_replay", finalizer["final_replay"])):
+        expected.update({f"{prefix}.{key}": str(value) for key, value in stats.items()})
+    expected.update({f"shadow_row_counts.{key}": str(value) for key, value in finalizer["shadow_row_counts"].items()})
+    if set(member_map) != set(expected):
+        raise RuntimeError(f"integrity member keys are not exhaustive: expected={set(expected)!r}, got={set(member_map)!r}")
+    if member_map != expected:
+        raise RuntimeError("top-level artifact values do not match their integrity members")
+    if finalizer.get("integrity_digest") != length_framed_digest([(key, value) for key, value in members]):
+        raise RuntimeError("Python integrity verification rejected Rust artifact")
 
 
 def census() -> Census:
@@ -237,10 +318,10 @@ def historical_worktree(work: Path) -> Iterator[Path]:
 
 
 def main() -> None:
-    candidate_sha = clean_head(); source_census = census(); run_nonce = secrets.token_hex(32)
+    candidate_sha = clean_head(); source_census = census()
     failure_log = ROOT / "target/git_repository_r1_compat.failure.log"
     with tempfile.TemporaryDirectory(prefix="phoenix-r1-compat-") as temporary:
-        work = Path(temporary); old_target = work / "historical-target"; db_path = work / "candidate-expanded.db"; artifact = work / "finalizer.json"
+        work = Path(temporary); old_target = work / "historical-target"; db_path = work / "candidate-expanded.db"; artifact = work / "finalizer.json"; preparation = work / "preparation.json"
         try:
             with historical_worktree(work) as old_tree:
                 (old_tree / "ui/dist").mkdir(parents=True, exist_ok=True); (old_tree / "ui/dist/index.html").write_text("<!doctype html><title>compatibility placeholder</title>")
@@ -264,9 +345,13 @@ def main() -> None:
                 finally: stop(process, lines, retained)
                 source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_old = snapshot(db_path, SHADOW_TABLES)
                 if shadow_after_old != shadow_before_old: raise RuntimeError("historical binary wrote additive shadow schema")
-                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_CONVERSATION_ID=CONVERSATION_ID, PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_OLD_SHADOW_DIGEST=proof_digest(shadow_after_old), PHOENIX_R1_COMPAT_RUN_NONCE=run_nonce)
-                # First candidate pass materializes shadows before exercising the old binary again.
-                run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=env)
+                env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_OLD_SHADOW_DIGEST=proof_digest(shadow_after_old))
+                # First candidate pass only prepares typed catch-up proof before exercising the old binary again.
+                run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=env | {"PHOENIX_R1_COMPAT_PHASE": "prepare"})
+                prepared = read_preparation(preparation)
+                expected_attachments = len(source_before_candidate["conversation_work_scope_attachments"]["rows"])
+                if prepared.initial_catchup["inserted_git_repositories"] != 1 or prepared.initial_catchup["inserted_work_scope_attachments"] != expected_attachments:
+                    raise RuntimeError(f"prepare catch-up did not derive exact repository/attachment equality: {prepared}")
                 source_before_rollback, shadow_before_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "rollback")
                 try:
@@ -277,14 +362,12 @@ def main() -> None:
                 source_after_rollback, shadow_after_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
                 if source_after_rollback != source_before_rollback: raise RuntimeError("historical rollback binary mutated legacy source rows")
                 if shadow_after_rollback != shadow_before_rollback: raise RuntimeError("historical rollback binary mutated additive shadows")
-                # Final candidate pass mints the artifact after the binary rollback exercise.
-                final_env = env | {"PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_ROLLBACK_SHADOW_DIGEST": proof_digest(shadow_after_rollback)}
+                # Final candidate pass mints the artifact only after the binary rollback exercise.
+                final_env = env | {"PHOENIX_R1_COMPAT_PHASE": "finalize", "PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_ROLLBACK_SHADOW_DIGEST": proof_digest(shadow_after_rollback)}
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=final_env)
                 if snapshot(db_path, SOURCE_TABLES) != source_before_candidate: raise RuntimeError("candidate catch-up mutated complete legacy source tables")
                 finalizer = json.loads(artifact.read_text())
-                if finalizer["candidate_sha"] != candidate_sha or finalizer["eligibility"] != "passed": raise RuntimeError(f"finalizer did not produce exact eligible evidence: {finalizer}")
-                expected_integrity = length_framed_digest([(key, str(finalizer[key])) for key in finalizer["integrity_members"]])
-                if finalizer["integrity_digest"] != expected_integrity: raise RuntimeError("Python integrity verification rejected Rust artifact")
+                verify_finalizer(finalizer, candidate_sha)
                 output = ROOT / "target/git_repository_r1_compat.artifact.json"; output.write_text(json.dumps(finalizer, indent=2, sort_keys=True) + "\n")
                 print(json.dumps(finalizer, indent=2, sort_keys=True))
         except BaseException:
