@@ -15,6 +15,7 @@ import queue
 import signal
 import sqlite3
 import subprocess
+import uuid
 import tempfile
 import threading
 import time
@@ -72,14 +73,28 @@ def run(*args: str, cwd: Path = ROOT, env: dict[str, str] | None = None, timeout
     return completed.stdout.strip()
 
 
+def assert_clean_checkout(cwd: Path = ROOT) -> None:
+    status = run("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=cwd)
+    if status:
+        raise RuntimeError(f"checkout must be exactly clean; git status returned: {status!r}")
+
+
 def clean_head() -> str:
-    if run("git", "status", "--porcelain=v1", "--untracked-files=all"):
-        raise RuntimeError("candidate checkout is dirty; commit every change before R1 compatibility acceptance")
+    assert_clean_checkout()
     return run("git", "rev-parse", "HEAD")
 
 
 def canonical_json_digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def exact_uuid(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be a UUID string")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be a UUID string") from error
 
 
 def length_framed_digest(parts: list[tuple[str, str]]) -> str:
@@ -111,21 +126,47 @@ def exact_catchup(value: Any, name: str) -> dict[str, int]:
     return {key: value[key] for key in CATCHUP_KEYS}
 
 
+PREPARATION_SEMANTIC_KEYS = (
+    "candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest",
+    "source_digest", "initial_shadow_digest", "preparation_readiness_root", "preparation_run_nonce",
+    "readiness", "readiness_summary_digest", "initial_catchup", "replay_catchup",
+)
+PREPARATION_KEYS = set(PREPARATION_SEMANTIC_KEYS) | {"preparation_integrity_members", "preparation_integrity_digest"}
+
+
+def preparation_members(value: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (key, json.dumps(value[key], separators=(",", ":")) if key in {"readiness", "initial_catchup", "replay_catchup"} else value[key])
+        for key in PREPARATION_SEMANTIC_KEYS
+    ]
+
+
 def read_preparation(path: Path) -> Preparation:
     value = json.loads(path.read_text())
-    required = {"candidate_sha", "candidate_package_version", "candidate_schema_digest", "target_database_digest", "source_digest", "initial_shadow_digest", "preparation_readiness_root", "preparation_run_nonce", "readiness", "readiness_summary_digest", "initial_catchup", "replay_catchup"}
-    if set(value) != required:
-        raise RuntimeError("preparation artifact has unexpected fields")
-    if any(not isinstance(value[key], str) or not value[key] for key in required - {"readiness", "initial_catchup", "replay_catchup"}):
-        raise RuntimeError("preparation artifact lacks typed identity evidence")
-    preparation = Preparation(
-        value,
-        exact_catchup(value["initial_catchup"], "preparation initial catchup"),
-        exact_catchup(value["replay_catchup"], "preparation replay catchup"),
-    )
+    if not isinstance(value, dict) or set(value) != PREPARATION_KEYS:
+        raise RuntimeError("preparation artifact top-level keys are not exact")
+    for key in set(PREPARATION_SEMANTIC_KEYS) - {"readiness", "initial_catchup", "replay_catchup"}:
+        if not isinstance(value[key], str) or not value[key]:
+            raise RuntimeError("preparation artifact lacks typed identity evidence")
+    exact_uuid(value["preparation_readiness_root"], "preparation readiness root")
+    exact_uuid(value["preparation_run_nonce"], "preparation run nonce")
+    members = value["preparation_integrity_members"]
+    if not isinstance(members, list) or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(part, str) for part in item) for item in members):
+        raise RuntimeError("preparation integrity members must be string pairs")
+    expected_members = preparation_members(value)
+    if len({name for name, _ in members}) != len(members) or members != [list(member) for member in expected_members]:
+        raise RuntimeError("preparation integrity members are not an exact semantic manifest")
+    if value["preparation_integrity_digest"] != length_framed_digest(expected_members):
+        raise RuntimeError("preparation integrity digest does not match semantic manifest")
+    preparation = Preparation(value, exact_catchup(value["initial_catchup"], "preparation initial catchup"), exact_catchup(value["replay_catchup"], "preparation replay catchup"))
     if any(preparation.replay_catchup.values()):
         raise RuntimeError("preparation replay catch-up was not exactly zero")
     return preparation
+
+
+def verify_preparation_expected(preparation: Preparation, expected_initial: dict[str, int]) -> None:
+    if preparation.initial_catchup != expected_initial:
+        raise RuntimeError("preparation initial catch-up does not equal exact source-derived values")
 
 
 def canonical_shadow_counts(value: Any) -> dict[str, int]:
@@ -136,7 +177,21 @@ def canonical_shadow_counts(value: Any) -> dict[str, int]:
     return {key: value[key] for key in SHADOW_COUNT_KEYS}
 
 
+FINALIZER_KEYS = {
+    "candidate_sha", "candidate_package_version", "candidate_schema_digest", "historical_sha",
+    "census_revision", "census_content_digest", "shadow_reference_count", "project_authority_path_count",
+    "readiness_root", "run_nonce", "target_database_digest", "old_source_digest_before",
+    "old_source_digest_after", "shadow_before_initial_old", "shadow_after_initial_old",
+    "shadow_before_rollback", "shadow_after_rollback", "rollback_posture", "eligibility",
+    "preparation_initial_catchup", "preparation_replay_catchup", "final_catchup", "final_replay",
+    "shadow_row_counts", "readiness", "preparation_identity_digest", "preparation_file_digest", "preparation_readiness_root",
+    "preparation_run_nonce", "preparation_integrity_digest", "integrity_members", "integrity_digest",
+}
+
+
 def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
+    if not isinstance(finalizer, dict) or set(finalizer) != FINALIZER_KEYS:
+        raise RuntimeError("finalizer top-level keys are not exact")
     if finalizer.get("candidate_sha") != candidate_sha or finalizer.get("eligibility") != "passed":
         raise RuntimeError(f"finalizer did not produce exact eligible evidence: {finalizer}")
     finalizer["preparation_initial_catchup"] = exact_catchup(finalizer.get("preparation_initial_catchup"), "preparation initial catchup")
@@ -165,8 +220,10 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
     if len(member_map) != len(members):
         raise RuntimeError("integrity members contain duplicate keys")
     readiness = finalizer.get("readiness")
-    if not isinstance(readiness, dict) or not isinstance(finalizer.get("preparation_identity_digest"), str):
-        raise RuntimeError("artifact lacks typed readiness or preparation identity")
+    for name in ("readiness_root", "run_nonce", "preparation_readiness_root", "preparation_run_nonce"):
+        exact_uuid(finalizer[name], name)
+    if not isinstance(readiness, dict) or any(not isinstance(finalizer[name], str) or len(finalizer[name]) != 64 for name in ("preparation_identity_digest", "preparation_file_digest", "preparation_integrity_digest")):
+        raise RuntimeError("artifact lacks typed readiness or exact preparation identity")
     readiness_json = json.dumps(readiness, separators=(",", ":"))
     if member_map.get("readiness") != readiness_json:
         raise RuntimeError(
@@ -180,6 +237,7 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
             "historical_sha", "old_source_digest_before", "old_source_digest_after",
             "shadow_before_initial_old", "shadow_after_initial_old", "shadow_before_rollback",
             "shadow_after_rollback", "rollback_posture", "eligibility", "preparation_identity_digest",
+            "preparation_readiness_root", "preparation_run_nonce", "preparation_file_digest", "preparation_integrity_digest",
         )
     }
     expected["readiness"] = readiness_json
@@ -194,8 +252,30 @@ def verify_finalizer(finalizer: dict[str, Any], candidate_sha: str) -> None:
         raise RuntimeError("Python integrity verification rejected Rust artifact")
 
 
+def publish_verified_finalizer(output: Path, raw: bytes, candidate_sha: str) -> None:
+    parsed = json.loads(raw)
+    verify_finalizer(parsed, candidate_sha)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        verify_finalizer(json.loads(temporary.read_bytes()), candidate_sha)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def census_sources() -> list[str]:
+    rust = ROOT.glob("crates/**/*.rs")
+    python = [ROOT / "dev.py", ROOT / "phoenix-client.py", *ROOT.glob("scripts/**/*.py")]
+    return sorted(path.relative_to(ROOT).as_posix() for path in [*rust, *python] if path.is_file() and "/target/" not in path.as_posix() and "/generated/" not in path.as_posix() and "__pycache__" not in path.as_posix())
+
+
 def census_observed(inventory: dict[str, Any], injected: dict[str, str] | None = None) -> dict[str, Any]:
-    sources = sorted(path.relative_to(ROOT).as_posix() for path in ROOT.glob("crates/**/*.rs") if "/tests/" not in path.as_posix() and not path.name.endswith("_test.rs"))
+    sources = census_sources()
     injected = injected or {}
     def occurrences(symbol: str) -> dict[str, int]:
         return {
@@ -235,12 +315,16 @@ def census() -> Census:
 
 def census_self_test() -> None:
     inventory = json.loads((ROOT / "tests/e2e/git_repository_r1_census.json").read_text())
-    path = inventory["project_authority_paths"][0]
-    file = next(iter(path["occurrences"]))
-    observed = census_observed(inventory, {file: path["pattern"]})
-    if observed == census_expected(inventory):
-        raise RuntimeError("census self-test could not prove injected source content changes observed inventory")
-    print("census self-test passed: injected authority occurrence changes observed inventory")
+    expected = census_expected(inventory)
+    rust_file = next(path for path in census_sources() if path.endswith(".rs"))
+    python_file = "dev.py"
+    for category, entries in (("shadow_table_occurrences", inventory["shadow_tables"]), ("shadow_caller_occurrences", inventory["shadow_caller_symbols"]), ("project_authority_occurrences", [path["pattern"] for path in inventory["project_authority_paths"]])):
+        for token in entries:
+            for injected_file in (rust_file, python_file):
+                observed = census_observed(inventory, {injected_file: token})
+                if observed[category] == expected[category]:
+                    raise RuntimeError(f"census self-test did not observe {category} token {token!r} injected into {injected_file}")
+    print("census self-test passed: every closure token category observes Rust and Python/offline drift")
 
 
 def free_port() -> int:
@@ -414,15 +498,20 @@ def main() -> None:
         return
     candidate_sha = clean_head(); source_census = census()
     failure_log = ROOT / "target/git_repository_r1_compat.failure.log"
+    output = ROOT / "target/git_repository_r1_compat.artifact.json"
     failure_log.unlink(missing_ok=True)
+    output.unlink(missing_ok=True)
     run_logs: list[str] = []
     with tempfile.TemporaryDirectory(prefix="phoenix-r1-compat-") as temporary:
         work = Path(temporary); old_target = work / "historical-target"; db_path = work / "candidate-expanded.db"; artifact = work / "finalizer.json"; preparation = work / "preparation.json"
         try:
             with historical_worktree(work) as old_tree:
-                (old_tree / "ui/dist").mkdir(parents=True, exist_ok=True); (old_tree / "ui/dist/index.html").write_text("<!doctype html><title>compatibility placeholder</title>")
-                run("git", "add", "-f", "ui/dist/index.html", cwd=old_tree)
+                assert_clean_checkout(old_tree)
+                ignored_index = old_tree / "ui/dist/index.html"
+                ignored_index.parent.mkdir(parents=True, exist_ok=True)
+                ignored_index.write_text("<!doctype html><title>compatibility placeholder</title>")
                 run("cargo", "build", "--offline", "--locked", "-p", "phoenix_ide", cwd=old_tree, env=child_env(CARGO_TARGET_DIR=str(old_target)))
+                assert_clean_checkout(old_tree)
                 old_binary = old_target / "debug/phoenix_ide"
                 if run("git", "rev-parse", "HEAD", cwd=old_tree) != HISTORICAL_SHA: raise RuntimeError("historical build revision drift")
                 candidate_target = ROOT / "target"; candidate_binary = candidate_target / "debug/phoenix_ide"
@@ -436,7 +525,7 @@ def main() -> None:
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "seed", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
-                    if version != f"{HISTORICAL_SHA[:12]}-dirty": raise RuntimeError(f"historical version identity mismatch: {version!r}")
+                    if version != HISTORICAL_SHA[:12]: raise RuntimeError(f"historical version identity mismatch: {version!r}")
                     asyncio.run(asyncio.wait_for(create_seeded_empty(base_url, str(repo.resolve())), OUTER_TIMEOUT))
                 finally: stop_and_record(process, lines, retained, run_logs)
                 source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES)
@@ -444,29 +533,36 @@ def main() -> None:
                 env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
                 # First candidate pass only prepares typed catch-up proof before exercising the old binary again.
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=env | {"PHOENIX_R1_COMPAT_PHASE": "prepare"})
+                preparation_bytes = preparation.read_bytes()
+                preparation_file_digest = hashlib.sha256(preparation_bytes).hexdigest()
                 prepared = read_preparation(preparation)
                 expected_attachments = len(source_before_candidate["conversation_work_scope_attachments"]["rows"])
-                if prepared.initial_catchup["inserted_git_repositories"] != 1 or prepared.initial_catchup["inserted_work_scope_attachments"] != expected_attachments:
-                    raise RuntimeError(f"prepare catch-up did not derive exact repository/attachment equality: {prepared}")
+                expected_initial = {key: 0 for key in CATCHUP_KEYS} | {
+                    "inserted_git_repositories": len(source_before_candidate["projects"]["rows"]),
+                    "inserted_work_scope_attachments": expected_attachments,
+                }
+                verify_preparation_expected(prepared, expected_initial)
                 source_before_rollback, shadow_before_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "rollback", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
-                    if version != f"{HISTORICAL_SHA[:12]}-dirty": raise RuntimeError("rollback binary identity drift")
+                    if version != HISTORICAL_SHA[:12]: raise RuntimeError("rollback binary identity drift")
                     asyncio.run(asyncio.wait_for(stream_existing_idle(base_url), OUTER_TIMEOUT))
                 finally: stop_and_record(process, lines, retained, run_logs)
                 source_after_rollback, shadow_after_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
                 if source_after_rollback != source_before_rollback: raise RuntimeError("historical rollback binary mutated legacy source rows")
                 if shadow_after_rollback != shadow_before_rollback: raise RuntimeError("historical rollback binary mutated additive shadows")
                 # Final candidate pass mints the artifact only after the binary rollback exercise.
-                final_env = env | {"PHOENIX_R1_COMPAT_PHASE": "finalize", "PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_SHADOW_BEFORE_ROLLBACK": proof_digest(shadow_before_rollback), "PHOENIX_R1_COMPAT_SHADOW_AFTER_ROLLBACK": proof_digest(shadow_after_rollback)}
+                final_env = env | {"PHOENIX_R1_COMPAT_PHASE": "finalize", "PHOENIX_R1_COMPAT_PREPARATION_FILE_DIGEST": preparation_file_digest, "PHOENIX_R1_COMPAT_ROLLBACK_SOURCE_DIGEST": proof_digest(source_after_rollback), "PHOENIX_R1_COMPAT_SHADOW_BEFORE_ROLLBACK": proof_digest(shadow_before_rollback), "PHOENIX_R1_COMPAT_SHADOW_AFTER_ROLLBACK": proof_digest(shadow_after_rollback)}
                 run("cargo", "test", "--offline", "-p", "phoenix-db", "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=final_env)
                 if snapshot(db_path, SOURCE_TABLES) != source_before_candidate: raise RuntimeError("candidate catch-up mutated complete legacy source tables")
-                finalizer = json.loads(artifact.read_text())
+                finalizer_raw = artifact.read_bytes()
+                finalizer = json.loads(finalizer_raw)
                 verify_finalizer(finalizer, candidate_sha)
-                output = ROOT / "target/git_repository_r1_compat.artifact.json"; output.write_text(json.dumps(finalizer, indent=2, sort_keys=True) + "\n")
-                print(json.dumps(finalizer, indent=2, sort_keys=True))
+                publish_verified_finalizer(output, finalizer_raw, candidate_sha)
+                print(finalizer_raw.decode())
         except BaseException:
+            output.unlink(missing_ok=True)
             failure_log.parent.mkdir(parents=True, exist_ok=True)
             logs = "".join(run_logs) or f"R1 compatibility run head={candidate_sha} failed before a server emitted logs\n"
             failure_log.write_text(f"run_head={candidate_sha}\n{logs}")

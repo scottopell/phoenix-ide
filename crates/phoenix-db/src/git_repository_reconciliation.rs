@@ -203,6 +203,9 @@ pub(crate) struct DormantGitRepositoryReadinessRunRoot {
     database: Arc<DormantGitRepositoryCatchupAuthorityState>,
     operation: Arc<LegacyWriterExclusionMarker>,
     run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
+    // Generated only when validation completes; this opaque value is the durable
+    // identity of this particular readiness observation, not a caller claim.
+    run_id: uuid::Uuid,
 }
 
 #[allow(
@@ -323,6 +326,7 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
             database: self.root.database.clone(),
             operation: self.root.operation.clone(),
             run_marker: self.root.run_marker.clone(),
+            readiness_run_id: self.root.run_id,
         }
     }
 
@@ -387,6 +391,7 @@ struct DormantGitRepositoryUnit4RunBinding {
     database: Arc<DormantGitRepositoryCatchupAuthorityState>,
     operation: Arc<LegacyWriterExclusionMarker>,
     run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
+    readiness_run_id: uuid::Uuid,
 }
 
 #[cfg(test)]
@@ -395,6 +400,11 @@ impl DormantGitRepositoryUnit4RunBinding {
         Arc::ptr_eq(&self.database, &other.database)
             && Arc::ptr_eq(&self.operation, &other.operation)
             && Arc::ptr_eq(&self.run_marker, &other.run_marker)
+            && self.readiness_run_id == other.readiness_run_id
+    }
+
+    fn readiness_run_id(&self) -> uuid::Uuid {
+        self.readiness_run_id
     }
 }
 
@@ -569,7 +579,20 @@ fn canonical_json_digest(value: &impl serde::Serialize) -> String {
 }
 
 #[cfg(test)]
+fn byte_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct DormantGitRepositoryPreparationArtifact {
     candidate_sha: String,
     candidate_package_version: String,
@@ -583,10 +606,89 @@ struct DormantGitRepositoryPreparationArtifact {
     readiness_summary_digest: String,
     initial_catchup: DormantGitRepositoryCatchupStatsEvidence,
     replay_catchup: DormantGitRepositoryCatchupStatsEvidence,
+    preparation_integrity_members: Vec<(String, String)>,
+    preparation_integrity_digest: String,
 }
 
 #[cfg(test)]
 impl DormantGitRepositoryPreparationArtifact {
+    fn semantic_members(&self) -> Vec<(String, String)> {
+        vec![
+            ("candidate_sha".to_string(), self.candidate_sha.clone()),
+            (
+                "candidate_package_version".to_string(),
+                self.candidate_package_version.clone(),
+            ),
+            (
+                "candidate_schema_digest".to_string(),
+                self.candidate_schema_digest.clone(),
+            ),
+            (
+                "target_database_digest".to_string(),
+                self.target_database_digest.clone(),
+            ),
+            ("source_digest".to_string(), self.source_digest.clone()),
+            (
+                "initial_shadow_digest".to_string(),
+                self.initial_shadow_digest.clone(),
+            ),
+            (
+                "preparation_readiness_root".to_string(),
+                self.preparation_readiness_root.clone(),
+            ),
+            (
+                "preparation_run_nonce".to_string(),
+                self.preparation_run_nonce.clone(),
+            ),
+            ("readiness".to_string(), self.readiness.canonical_json()),
+            (
+                "readiness_summary_digest".to_string(),
+                self.readiness_summary_digest.clone(),
+            ),
+            (
+                "initial_catchup".to_string(),
+                serde_json::to_string(&self.initial_catchup).expect("stats serialize"),
+            ),
+            (
+                "replay_catchup".to_string(),
+                serde_json::to_string(&self.replay_catchup).expect("stats serialize"),
+            ),
+        ]
+    }
+
+    fn seal(mut self) -> Self {
+        self.preparation_integrity_members = self.semantic_members();
+        self.preparation_integrity_digest = length_framed_digest(
+            self.preparation_integrity_members
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        self
+    }
+
+    fn verify_integrity(&self) -> DbResult<()> {
+        let expected = self.semantic_members();
+        let actual = &self.preparation_integrity_members;
+        let unique = actual.iter().map(|(name, _)| name).collect::<BTreeSet<_>>();
+        if actual != &expected || unique.len() != actual.len() {
+            return Err(DbError::Serialization(
+                "preparation artifact integrity members are not an exact semantic manifest"
+                    .to_string(),
+            ));
+        }
+        let digest = length_framed_digest(
+            actual
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        );
+        if self.preparation_integrity_digest != digest {
+            return Err(DbError::Serialization(
+                "preparation artifact integrity digest does not match its manifest".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn identity_digest(&self) -> String {
         canonical_json_digest(self)
     }
@@ -601,22 +703,42 @@ struct DormantGitRepositoryPreparationExpected<'a> {
     source_digest: &'a str,
     initial_shadow_digest: &'a str,
     readiness: &'a DormantGitRepositoryArtifactReadiness,
+    preparation_readiness_root: uuid::Uuid,
+    initial_catchup: &'a DormantGitRepositoryCatchupStatsEvidence,
 }
 
 #[cfg(test)]
 impl DormantGitRepositoryPreparationArtifact {
-    fn matches_expected(&self, expected: &DormantGitRepositoryPreparationExpected<'_>) -> bool {
-        self.replay_catchup.is_exactly_zero()
-            && self.candidate_sha == expected.candidate_sha
-            && self.candidate_package_version == expected.candidate_package_version
-            && self.candidate_schema_digest == expected.candidate_schema_digest
-            && self.target_database_digest == expected.target_database_digest
-            && self.source_digest == expected.source_digest
-            && self.initial_shadow_digest == expected.initial_shadow_digest
-            && self.readiness == *expected.readiness
-            && self.readiness_summary_digest == expected.readiness.digest()
-            && !self.preparation_readiness_root.is_empty()
-            && !self.preparation_run_nonce.is_empty()
+    fn verify_expected(
+        &self,
+        expected: &DormantGitRepositoryPreparationExpected<'_>,
+    ) -> DbResult<()> {
+        self.verify_integrity()?;
+        let preparation_root =
+            uuid::Uuid::parse_str(&self.preparation_readiness_root).map_err(|_| {
+                DbError::Serialization("preparation readiness root is not a UUID".to_string())
+            })?;
+        uuid::Uuid::parse_str(&self.preparation_run_nonce).map_err(|_| {
+            DbError::Serialization("preparation run nonce is not a UUID".to_string())
+        })?;
+        let matches = [
+            self.candidate_sha == expected.candidate_sha,
+            self.candidate_package_version == expected.candidate_package_version,
+            self.candidate_schema_digest == expected.candidate_schema_digest,
+            self.target_database_digest == expected.target_database_digest,
+            self.source_digest == expected.source_digest,
+            self.initial_shadow_digest == expected.initial_shadow_digest,
+            self.readiness == *expected.readiness,
+            self.readiness_summary_digest == expected.readiness.digest(),
+            self.initial_catchup == *expected.initial_catchup,
+            self.replay_catchup.is_exactly_zero(),
+            preparation_root == expected.preparation_readiness_root,
+        ];
+        if matches.into_iter().all(std::convert::identity) {
+            Ok(())
+        } else {
+            Err(DbError::Serialization("preparation artifact does not exactly bind preparation readiness and derived catch-up evidence".to_string()))
+        }
     }
 }
 
@@ -625,7 +747,11 @@ impl DormantGitRepositoryPreparationArtifact {
 struct DormantGitRepositoryPreparationAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
     artifact: DormantGitRepositoryPreparationArtifact,
+    file_digest: String,
     identity_digest: String,
+    preparation_readiness_root: uuid::Uuid,
+    preparation_run_nonce: uuid::Uuid,
+    preparation_integrity_digest: String,
 }
 
 #[cfg(test)]
@@ -637,6 +763,7 @@ impl DormantGitRepositoryPreparationAttestation {
         target: &DormantGitRepositoryCompatibilityTargetIdentity,
         source_digest: &str,
         initial_shadow_digest: &str,
+        file_digest: String,
     ) -> DbResult<Self> {
         let DormantGitRepositoryBuildIdentity::ExactClean {
             sha,
@@ -656,17 +783,28 @@ impl DormantGitRepositoryPreparationAttestation {
             source_digest,
             initial_shadow_digest,
             readiness: &readiness_artifact,
+            preparation_readiness_root: uuid::Uuid::parse_str(&artifact.preparation_readiness_root)
+                .map_err(|_| {
+                    DbError::Serialization("preparation readiness root is not a UUID".to_string())
+                })?,
+            initial_catchup: &artifact.initial_catchup,
         };
-        if !artifact.matches_expected(&expected) {
-            return Err(DbError::Serialization(
-                "preparation artifact does not bind the final candidate, schema, target, source, shadow, and typed readiness evidence".to_string(),
-            ));
-        }
+        artifact.verify_expected(&expected)?;
+        let preparation_readiness_root = expected.preparation_readiness_root;
+        let preparation_run_nonce = uuid::Uuid::parse_str(&artifact.preparation_run_nonce)
+            .map_err(|_| {
+                DbError::Serialization("preparation run nonce is not a UUID".to_string())
+            })?;
+        let preparation_integrity_digest = artifact.preparation_integrity_digest.clone();
         let identity_digest = artifact.identity_digest();
         Ok(Self {
             root,
             artifact,
+            file_digest,
             identity_digest,
+            preparation_readiness_root,
+            preparation_run_nonce,
+            preparation_integrity_digest,
         })
     }
 }
@@ -1023,6 +1161,22 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
                 "preparation_identity_digest".to_string(),
                 preparation.identity_digest.clone(),
             ),
+            (
+                "preparation_file_digest".to_string(),
+                preparation.file_digest.clone(),
+            ),
+            (
+                "preparation_readiness_root".to_string(),
+                preparation.preparation_readiness_root.to_string(),
+            ),
+            (
+                "preparation_run_nonce".to_string(),
+                preparation.preparation_run_nonce.to_string(),
+            ),
+            (
+                "preparation_integrity_digest".to_string(),
+                preparation.preparation_integrity_digest.clone(),
+            ),
         ];
         integrity_members.extend(
             preparation
@@ -1209,6 +1363,7 @@ pub(crate) async fn validate_dormant_git_repository_readiness(
                 database: claim.receipt.target.clone(),
                 operation: claim.receipt.marker.clone(),
                 run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+                run_id: uuid::Uuid::new_v4(),
             };
             claim.finalize();
             Ok(DormantGitRepositoryCanonicalReadinessEvidence {
@@ -2700,6 +2855,11 @@ mod tests {
             DormantGitRepositoryBuildIdentity::Unavailable { .. } => {}
         }
         assert!(second_evidence.has_fresh_root_from(&first_evidence));
+        assert_ne!(
+            second_evidence.unit4_binding().readiness_run_id(),
+            first_evidence.unit4_binding().readiness_run_id(),
+            "identical readiness observations receive distinct actual run identities"
+        );
     }
 
     #[test]
@@ -3119,6 +3279,7 @@ mod tests {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+            readiness_run_id: uuid::Uuid::new_v4(),
         };
         assert!(DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             root.clone(),
@@ -3158,8 +3319,8 @@ mod tests {
             target_database_digest: "d".repeat(64),
             source_digest: "e".repeat(64),
             initial_shadow_digest: "f".repeat(64),
-            preparation_readiness_root: "root".to_string(),
-            preparation_run_nonce: "nonce".to_string(),
+            preparation_readiness_root: uuid::Uuid::new_v4().to_string(),
+            preparation_run_nonce: uuid::Uuid::new_v4().to_string(),
             readiness_summary_digest: readiness.digest(),
             readiness: readiness.clone(),
             initial_catchup: DormantGitRepositoryCatchupStatsEvidence::observed(
@@ -3168,7 +3329,10 @@ mod tests {
             replay_catchup: DormantGitRepositoryCatchupStatsEvidence::observed(
                 &DormantGitRepositoryCatchupStats::default(),
             ),
-        };
+            preparation_integrity_members: vec![],
+            preparation_integrity_digest: String::new(),
+        }
+        .seal();
         let expected = DormantGitRepositoryPreparationExpected {
             candidate_sha: &artifact.candidate_sha,
             candidate_package_version: &artifact.candidate_package_version,
@@ -3177,8 +3341,11 @@ mod tests {
             source_digest: &artifact.source_digest,
             initial_shadow_digest: &artifact.initial_shadow_digest,
             readiness: &readiness,
+            preparation_readiness_root: uuid::Uuid::parse_str(&artifact.preparation_readiness_root)
+                .unwrap(),
+            initial_catchup: &artifact.initial_catchup,
         };
-        assert!(artifact.matches_expected(&expected));
+        assert!(artifact.verify_expected(&expected).is_ok());
 
         for field in [
             "candidate_sha",
@@ -3198,8 +3365,74 @@ mod tests {
                 "readiness" => mismatched.readiness.compiled_migration_count += 1,
                 _ => unreachable!(),
             }
-            assert!(!mismatched.matches_expected(&expected), "{field}");
+            assert!(mismatched.verify_expected(&expected).is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn preparation_artifact_integrity_rejects_root_nonce_stats_members_and_extra_fields() {
+        let readiness = DormantGitRepositoryArtifactReadiness {
+            eligibility: DormantGitRepositoryR1Eligibility::Eligible,
+            storage_kind: DormantGitRepositoryReadinessStorageKind::FileBacked,
+            diagnostic_categories: vec![],
+            valid_absences: vec![],
+            compiled_migration_digest: "c".repeat(64),
+            compiled_migration_count: 1,
+            applied_migration_ledger: vec![],
+            inspected_r1_ddl: BTreeMap::new(),
+            schema_status: DormantGitRepositoryArtifactSchemaStatus::Exact,
+        };
+        let artifact = DormantGitRepositoryPreparationArtifact {
+            candidate_sha: "a".repeat(40),
+            candidate_package_version: "1.0.0".to_string(),
+            candidate_schema_digest: "c".repeat(64),
+            target_database_digest: "d".repeat(64),
+            source_digest: "e".repeat(64),
+            initial_shadow_digest: "f".repeat(64),
+            preparation_readiness_root: uuid::Uuid::new_v4().to_string(),
+            preparation_run_nonce: uuid::Uuid::new_v4().to_string(),
+            readiness_summary_digest: readiness.digest(),
+            readiness,
+            initial_catchup: DormantGitRepositoryCatchupStatsEvidence::observed(
+                &DormantGitRepositoryCatchupStats::default(),
+            ),
+            replay_catchup: DormantGitRepositoryCatchupStatsEvidence::observed(
+                &DormantGitRepositoryCatchupStats::default(),
+            ),
+            preparation_integrity_members: vec![],
+            preparation_integrity_digest: String::new(),
+        }
+        .seal();
+        for mutation in [
+            |value: &mut DormantGitRepositoryPreparationArtifact| {
+                value.initial_catchup.inserted_git_repositories += 1;
+            },
+            |value: &mut DormantGitRepositoryPreparationArtifact| {
+                value.preparation_readiness_root = uuid::Uuid::new_v4().to_string();
+            },
+            |value: &mut DormantGitRepositoryPreparationArtifact| {
+                value.preparation_run_nonce = uuid::Uuid::new_v4().to_string();
+            },
+            |value: &mut DormantGitRepositoryPreparationArtifact| {
+                value
+                    .preparation_integrity_members
+                    .push(("extra".to_string(), "value".to_string()));
+            },
+        ] {
+            let mut mutated = artifact.clone();
+            mutation(&mut mutated);
+            assert!(mutated.verify_integrity().is_err());
+        }
+        let mut encoded = serde_json::to_value(&artifact).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_string(), serde_json::Value::Null);
+        let decoded = serde_json::from_value::<DormantGitRepositoryPreparationArtifact>(encoded);
+        assert!(
+            decoded.is_err(),
+            "serde rejects preparation artifacts with extra top-level fields"
+        );
     }
 
     #[test]
@@ -3209,11 +3442,13 @@ mod tests {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+            readiness_run_id: uuid::Uuid::new_v4(),
         };
         let other_root = DormantGitRepositoryUnit4RunBinding {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
+            readiness_run_id: uuid::Uuid::new_v4(),
         };
         let census = DormantGitRepositorySourceCensusAttestation::verified(
             root.clone(),
@@ -3232,6 +3467,7 @@ mod tests {
         .unwrap();
         let preparation = DormantGitRepositoryPreparationAttestation {
             root: root.clone(),
+            file_digest: "f".repeat(64),
             artifact: DormantGitRepositoryPreparationArtifact {
                 candidate_sha: "d".repeat(40),
                 candidate_package_version: "1.0.0".to_string(),
@@ -3239,8 +3475,8 @@ mod tests {
                 target_database_digest: "a".repeat(64),
                 source_digest: "f".repeat(64),
                 initial_shadow_digest: "0".repeat(64),
-                preparation_readiness_root: "root".to_string(),
-                preparation_run_nonce: "nonce".to_string(),
+                preparation_readiness_root: root.readiness_run_id().to_string(),
+                preparation_run_nonce: uuid::Uuid::new_v4().to_string(),
                 readiness: DormantGitRepositoryArtifactReadiness {
                     eligibility: DormantGitRepositoryR1Eligibility::Eligible,
                     storage_kind: DormantGitRepositoryReadinessStorageKind::FileBacked,
@@ -3259,8 +3495,14 @@ mod tests {
                 replay_catchup: DormantGitRepositoryCatchupStatsEvidence::observed(
                     &DormantGitRepositoryCatchupStats::default(),
                 ),
-            },
+                preparation_integrity_members: vec![],
+                preparation_integrity_digest: String::new(),
+            }
+            .seal(),
             identity_digest: "c".repeat(64),
+            preparation_readiness_root: root.readiness_run_id(),
+            preparation_run_nonce: uuid::Uuid::new_v4(),
+            preparation_integrity_digest: "c".repeat(64),
         };
         let cross_run = DormantGitRepositoryOldBinaryCompatibilityAttestation::passed_after_replay_and_fresh_readiness(
             other_root,
@@ -3337,6 +3579,10 @@ mod tests {
         shadow_row_counts: DormantGitRepositoryShadowRowCounts,
         readiness: DormantGitRepositoryArtifactReadiness,
         preparation_identity_digest: String,
+        preparation_file_digest: String,
+        preparation_readiness_root: String,
+        preparation_run_nonce: String,
+        preparation_integrity_digest: String,
         integrity_members: Vec<(String, String)>,
         integrity_digest: String,
     }
@@ -3447,13 +3693,19 @@ mod tests {
                     initial_shadow_digest: required_env(
                         "PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD",
                     ),
-                    preparation_readiness_root: uuid::Uuid::new_v4().to_string(),
+                    preparation_readiness_root: readiness
+                        .unit4_binding()
+                        .readiness_run_id()
+                        .to_string(),
                     preparation_run_nonce: uuid::Uuid::new_v4().to_string(),
                     readiness_summary_digest: readiness_artifact.digest(),
                     readiness: readiness_artifact,
                     initial_catchup,
                     replay_catchup: replay_stats,
-                };
+                    preparation_integrity_members: vec![],
+                    preparation_integrity_digest: String::new(),
+                }
+                .seal();
                 fs::write(
                     &preparation_path,
                     serde_json::to_vec_pretty(&preparation).unwrap(),
@@ -3475,8 +3727,15 @@ mod tests {
         let shadow_before_rollback = required_env("PHOENIX_R1_COMPAT_SHADOW_BEFORE_ROLLBACK");
         let shadow_after_rollback = required_env("PHOENIX_R1_COMPAT_SHADOW_AFTER_ROLLBACK");
         let preparation_path = required_env("PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT");
+        let preparation_bytes = fs::read(&preparation_path).unwrap();
+        let preparation_file_digest = byte_digest(&preparation_bytes);
+        assert_eq!(
+            preparation_file_digest,
+            required_env("PHOENIX_R1_COMPAT_PREPARATION_FILE_DIGEST"),
+            "preparation artifact bytes changed after the runner pinned them"
+        );
         let preparation: DormantGitRepositoryPreparationArtifact =
-            serde_json::from_slice(&fs::read(&preparation_path).unwrap()).unwrap();
+            serde_json::from_slice(&preparation_bytes).unwrap();
         let target = DormantGitRepositoryCompatibilityTargetIdentity::from_database(&db).unwrap();
         let preparation = DormantGitRepositoryPreparationAttestation::bind_after_verification(
             readiness.unit4_binding(),
@@ -3485,6 +3744,7 @@ mod tests {
             &target,
             &old_source_digest,
             &shadow_before_initial_old,
+            preparation_file_digest,
         )
         .unwrap();
         let shadow_reference_count = required_env("PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT")
@@ -3568,6 +3828,10 @@ mod tests {
             shadow_row_counts: evidence.shadow_row_counts.clone(),
             readiness: DormantGitRepositoryArtifactReadiness::from_evidence(&evidence.readiness),
             preparation_identity_digest: evidence.preparation.identity_digest.clone(),
+            preparation_file_digest: evidence.preparation.file_digest.clone(),
+            preparation_readiness_root: evidence.preparation.preparation_readiness_root.to_string(),
+            preparation_run_nonce: evidence.preparation.preparation_run_nonce.to_string(),
+            preparation_integrity_digest: evidence.preparation.preparation_integrity_digest.clone(),
             integrity_members: evidence.integrity_members.clone(),
             integrity_digest: evidence.integrity_digest.clone(),
         };

@@ -2,9 +2,11 @@
 
 Run `uv run tests/e2e/git_repository_r1_compat.py` only from an exact clean
 candidate commit. This explicit, heavyweight acceptance runner builds the frozen
-historical server in a detached temporary worktree, migrates an empty database
-with the exact candidate binary from `ROOT/target`, and lets the historical
-binary create a seeded-empty conversation through HTTP and SSE. The candidate's
+historical server in a detached temporary worktree without staging its ignored
+UI placeholder, requires the exact clean 12-character historical identity,
+migrates an empty database with the exact candidate binary from `ROOT/target`,
+and lets the historical binary create a seeded-empty conversation through HTTP
+and SSE. The candidate's
 ignored private finalizer then catches up the dormant GitRepository shadows.
 
 The test-only artifact is `target/git_repository_r1_compat.artifact.json`. It is
@@ -26,6 +28,14 @@ candidate SHA/package/build schema, target database, complete source and initial
 shadow digest, fresh preparation root/nonce, typed readiness digest, and both
 catch-up statistics. Finalization re-derives and compares every binding before
 minting its run-bound preparation attestation.
+The runner also pins the exact preparation-file bytes before rollback;
+finalization requires that independent SHA-256 pin, so no preparation root,
+nonce, statistic, member, or top-level field can change between phases.
+
+Published success evidence is removed at run start, verified against an exact
+top-level shape and exhaustive member digest, then atomically installed without
+reordering the verified Rust serialization. A failed run leaves no stale success
+artifact and records only that run's server logs.
 
 The authority census inventories explicit production Project readers, writers,
 and paths across conversation persistence/inheritance, active-work eligibility,
