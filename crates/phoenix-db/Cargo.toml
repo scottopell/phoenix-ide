@@ -17,6 +17,9 @@ path = "src/lib.rs"
 # Off in production builds.
 test-support = []
 
+[build-dependencies]
+phoenix-core = { path = "../phoenix-core" }
+
 [dependencies]
 # Shared domain vocabulary (persisted schema types, ConvState, ContentBlock,
 # LlmLanguage, Priority, the task-approval handoff parcel, …).

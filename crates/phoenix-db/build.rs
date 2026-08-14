@@ -1,7 +1,5 @@
-use std::process::Command;
-
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    let output = phoenix_core::git::command().args(args).output().ok()?;
     output.status.success().then(|| {
         String::from_utf8(output.stdout)
             .ok()
