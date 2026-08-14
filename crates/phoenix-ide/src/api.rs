@@ -100,6 +100,11 @@ pub struct AppState {
     pub(crate) request_drain: crate::request_drain::RequestDrain,
 }
 
+pub struct AppStartup {
+    pub state: AppState,
+    pub(crate) pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AgentFacingWakeRegistrationAvailable(bool);
 
@@ -133,7 +138,7 @@ impl AppState {
     // bundling them into a struct would only move the same fields behind one
     // more name.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub async fn start(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
@@ -143,7 +148,7 @@ impl AppState {
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<AppStartup, Box<dyn std::error::Error>> {
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path.
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
@@ -180,7 +185,8 @@ impl AppState {
                 .await
                 .map_err(std::io::Error::other)?;
         }
-        tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
+        let pr_status_poller =
+            crate::runtime::pr_status_poll::PrStatusPoller::start(runtime.clone());
         runtime.start_creation_worker().await;
         reconcile_startup_continuations(&runtime).await?;
         handlers::start_attachment_cleanup_task(db.clone());
@@ -221,26 +227,29 @@ impl AppState {
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
         let resource_monitor = resource_monitor::ResourceMonitor::new();
-        Ok(Self {
-            runtime,
-            llm_registry,
-            db,
-            platform,
-            mcp_manager,
-            credential_helper,
-            password,
-            sessions,
-            login_throttle: auth::LoginThrottle::new(),
-            terminals,
-            chain_qa,
-            message_retriever,
-            codex_login,
-            deployment,
-            runtime_env,
-            suggest_token,
-            discovery,
-            resource_monitor,
-            request_drain: crate::request_drain::RequestDrain::new(),
+        Ok(AppStartup {
+            state: Self {
+                runtime,
+                llm_registry,
+                db,
+                platform,
+                mcp_manager,
+                credential_helper,
+                password,
+                sessions,
+                login_throttle: auth::LoginThrottle::new(),
+                terminals,
+                chain_qa,
+                message_retriever,
+                codex_login,
+                deployment,
+                runtime_env,
+                suggest_token,
+                discovery,
+                resource_monitor,
+                request_drain: crate::request_drain::RequestDrain::new(),
+            },
+            pr_status_poller,
         })
     }
 }

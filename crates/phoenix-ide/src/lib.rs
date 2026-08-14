@@ -13,6 +13,7 @@ mod discovery;
 pub mod drive_turn;
 pub(crate) mod git_ops;
 pub(crate) mod git_start;
+mod managed_task;
 mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
@@ -931,7 +932,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create application state
-    let state = AppState::new(
+    let startup = AppState::start(
         db,
         llm_registry,
         platform,
@@ -943,6 +944,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         suggest_token,
     )
     .await?;
+    let state = startup.state;
+    let pr_status_poller = startup.pr_status_poller;
 
     // Create router
     //
@@ -996,6 +999,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             loaded_tls.server,
             socket_activated,
             request_drain,
+            pr_status_poller,
         )
         .await?;
     } else {
@@ -1034,10 +1038,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
                 let admitted_requests = request_drain.begin();
+                let pr_status_poller = pr_status_poller.begin_shutdown();
                 let _ = drain_tx.send(());
                 let drain = async {
-                    admitted_requests.wait().await;
-                    (&mut server).await
+                    let ((), (), joined) = tokio::join!(
+                        admitted_requests.wait(),
+                        pr_status_poller.wait(),
+                        &mut server,
+                    );
+                    joined
                 };
                 match tls::bounded_post_shutdown_drain(drain, "HTTP requests and connections").await {
                     Some(joined) => joined??,

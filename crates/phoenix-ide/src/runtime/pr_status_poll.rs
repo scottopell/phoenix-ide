@@ -133,21 +133,92 @@ fn next_poll_delay() -> Duration {
     interval_with_jitter(POLL_BASE_INTERVAL, POLL_JITTER, jitter_offset)
 }
 
-pub(crate) async fn run(manager: Arc<RuntimeManager>) {
-    loop {
-        tokio::time::sleep(next_poll_delay()).await;
-        if let Err(err) = poll_once(&manager).await {
-            tracing::debug!(error = %err, "background PR status poll failed");
-        }
+pub(crate) struct PrStatusPoller {
+    stop: tokio::sync::watch::Sender<bool>,
+    completion: crate::managed_task::ManagedTaskShutdown,
+}
+
+impl PrStatusPoller {
+    pub(crate) fn start(manager: Arc<RuntimeManager>) -> Self {
+        let (stop, completion) =
+            crate::managed_task::spawn("PR status poller", move |stop| run(manager, stop));
+        Self { stop, completion }
+    }
+
+    pub(crate) fn begin_shutdown(self) -> crate::managed_task::ManagedTaskShutdown {
+        self.stop.send_replace(true);
+        self.completion
     }
 }
 
-async fn poll_once(manager: &Arc<RuntimeManager>) -> Result<(), String> {
-    let targets = collect_targets(manager.db()).await?;
-    for target in targets {
-        poll_target(manager, target).await;
+pub(crate) async fn run(
+    manager: Arc<RuntimeManager>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let target_stop = stop.clone();
+    run_cycles(
+        &mut stop,
+        || tokio::time::sleep(next_poll_delay()),
+        || poll_once(&manager, &target_stop),
+    )
+    .await;
+}
+
+async fn run_cycles<W, WFut, C, CFut>(
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    mut wait: W,
+    mut cycle: C,
+) where
+    W: FnMut() -> WFut,
+    WFut: std::future::Future<Output = ()>,
+    C: FnMut() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            () = wait() => {}
+        }
+        if *stop.borrow() {
+            return;
+        }
+        cycle().await;
     }
-    Ok(())
+}
+
+async fn poll_once(manager: &Arc<RuntimeManager>, stop: &tokio::sync::watch::Receiver<bool>) {
+    let targets = match collect_targets(manager.db()).await {
+        Ok(targets) => targets,
+        Err(err) => {
+            tracing::debug!(error = %err, "background PR status poll failed");
+            return;
+        }
+    };
+    poll_targets(stop, targets, |target| poll_target(manager, target)).await;
+}
+
+async fn poll_targets<T, F, Fut>(
+    stop: &tokio::sync::watch::Receiver<bool>,
+    targets: Vec<T>,
+    mut poll: F,
+) where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for target in targets {
+        if *stop.borrow() {
+            return;
+        }
+        poll(target).await;
+    }
 }
 
 async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
@@ -308,6 +379,70 @@ async fn poll_target(manager: &Arc<RuntimeManager>, target: PollTarget) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_suppresses_a_new_poll_cycle() {
+        let (_stop_tx, mut stop_rx) = tokio::sync::watch::channel(true);
+        let cycles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        run_cycles(&mut stop_rx, std::future::pending, {
+            let cycles = cycles.clone();
+            move || {
+                cycles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(())
+            }
+        })
+        .await;
+        assert_eq!(cycles.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_an_owned_poll_cycle_before_join_returns() {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn({
+            let barrier = barrier.clone();
+            async move {
+                run_cycles(
+                    &mut stop_rx,
+                    || std::future::ready(()),
+                    move || {
+                        let barrier = barrier.clone();
+                        async move {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                    },
+                )
+                .await;
+            }
+        });
+        barrier.wait().await;
+
+        stop_tx.send_replace(true);
+        assert!(!run.is_finished());
+        barrier.wait().await;
+        run.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_during_target_poll_suppresses_later_targets() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let polled = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        poll_targets(&stop_rx, vec![1, 2], {
+            let polled = polled.clone();
+            move |target| {
+                let polled = polled.clone();
+                let stop_tx = stop_tx.clone();
+                async move {
+                    polled.lock().unwrap().push(target);
+                    stop_tx.send_replace(true);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(*polled.lock().unwrap(), vec![1]);
+    }
 
     #[test]
     fn jitter_interval_stays_within_bounds() {
