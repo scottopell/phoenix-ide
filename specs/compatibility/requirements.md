@@ -85,7 +85,8 @@ THE SYSTEM SHALL NOT guarantee detection, fencing, or recovery when an open data
 
 ### REQ-COMP-005 — Internal SQLite Timestamps Use Integer Unix Microseconds
 
-WHEN Phoenix stores a timestamp in a Phoenix-owned SQLite schema
+WHEN Phoenix introduces a new internal SQLite timestamp column
+OR structurally changes an existing internal SQLite timestamp column
 AND no more specific normative requirement identifies an external system or wire format that reads that stored value directly and requires another representation
 THE SYSTEM SHALL store the timestamp in an explicitly unit-named `INTEGER` column as microseconds since the Unix epoch
 AND SHALL reject non-integer values
@@ -95,4 +96,4 @@ THE SYSTEM SHALL reject negative values
 
 THE SYSTEM SHALL format that integer as a human-readable date and time only at an application or presentation boundary
 
-**Rationale:** SQLite has no native date-time storage class. One integer representation preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.
+**Rationale:** SQLite has no native date-time storage class. New or structurally changed columns use one integer representation without forcing a project-wide migration of unchanged historical timestamp storage. The integer preserves ordering and precision without embedding a duplicate date parser or formatter contract in the schema.

@@ -30,7 +30,7 @@ Phoenix does not build a general automatic database rollback subsystem. An opera
 
 One backend-managed Phoenix runtime version exclusively owns a production database. Database restore and replacement occur only while that runtime is stopped; mixed-version or independently launched Phoenix processes sharing the database are unsupported. Phoenix does not add live database-file replacement fencing.
 
-Phoenix-owned internal SQLite timestamps default to explicitly unit-named integer Unix microseconds. A different representation requires a more specific normative requirement that identifies the external reader and representation.
+New or structurally changed Phoenix-owned internal SQLite timestamp columns use explicitly unit-named integer Unix microseconds. Unchanged historical columns are not forced through a project-wide migration. A different representation for new or changed storage requires a more specific normative requirement that identifies the external reader and representation.
 
 ## Consequences
 
@@ -38,7 +38,7 @@ Phoenix-owned internal SQLite timestamps default to explicitly unit-named intege
 - **Positive:** Feature owners decide whether migrations preserve, transform, or retire their data.
 - **Positive:** Manual offline paired restore remains available without a general automatic rollback subsystem, and runtime-artifact rollback is not mistaken for database recovery.
 - **Positive:** Offline restore avoids a database-instance fencing protocol across connection pools and operations.
-- **Positive:** Integer timestamps preserve ordering with one representation and simple SQLite type checks.
+- **Positive:** New or structurally changed timestamp columns preserve ordering with one representation and simple SQLite type checks, without forcing unrelated historical migrations.
 - **Negative:** A feature that needs matching runtime/database recovery must explicitly justify and implement its own bounded mechanism.
 - **Negative:** Operators cannot replace or restore a database while Phoenix is running.
 - **Negative:** Rolling or mixed-version Phoenix processes cannot share one production SQLite database.
