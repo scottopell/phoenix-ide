@@ -733,6 +733,7 @@ final class ServerManager: ObservableObject {
     private var process: Process?
     private var outputPump: SidecarOutputPump?
     private var outputPipe: Pipe?
+    private var exitDrainInProgress = false
     private var readinessTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
@@ -1148,6 +1149,8 @@ final class ServerManager: ObservableObject {
 
     private func processExited(_ terminated: Process, operation: UUID) {
         guard process === terminated else { return }
+        guard !exitDrainInProgress else { return }
+        exitDrainInProgress = true
         let pump = outputPump
         outputPump = nil
         if let pump {
@@ -1168,6 +1171,7 @@ final class ServerManager: ObservableObject {
 
     private func completeProcessExit(_ terminated: Process, operation: UUID) {
         guard process === terminated else { return }
+        exitDrainInProgress = false
         let priorState = state
         let version = currentVersion
         let exitedCurrentOperation = operationAuthority.invalidate(operation)

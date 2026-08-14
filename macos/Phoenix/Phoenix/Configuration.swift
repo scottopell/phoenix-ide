@@ -1132,6 +1132,10 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         return "\(scheme)://\(host):\(port)"
     }
 
+    static func == (lhs: PhoenixOrigin, rhs: PhoenixOrigin) -> Bool {
+        lhs.canonicalStorageKey == rhs.canonicalStorageKey
+    }
+
     var description: String { url.absoluteString }
 
     func url(path: String) -> URL {
