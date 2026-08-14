@@ -5317,15 +5317,15 @@ where
 
             Effect::CompleteCreation { job_id, claim } => {
                 match self.storage.complete_creation_job(&job_id, &claim).await {
-                    Ok(crate::db::CreationCasOutcome::Applied) => {}
+                    Ok(crate::db::CreationCasOutcome::Applied) => Ok(None),
                     Ok(crate::db::CreationCasOutcome::ClaimLost) => {
                         tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
+                        Ok(None)
                     }
-                    Err(error) => {
-                        tracing::warn!(conv_id = %self.context.conversation_id, %job_id, %error, "failed to mark creation job complete after LLM dispatch");
-                    }
+                    Err(error) => Err(format!(
+                        "failed to mark creation job {job_id} complete after LLM dispatch: {error}"
+                    )),
                 }
-                Ok(None)
             }
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,

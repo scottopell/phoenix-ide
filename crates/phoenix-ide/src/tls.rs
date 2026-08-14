@@ -186,6 +186,7 @@ pub async fn serve_https(
     socket_activated: bool,
     request_drain: crate::request_drain::RequestDrain,
     pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
+    creation_worker: crate::runtime::creation_worker::CreationWorker,
 ) -> Result<(), Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
     tracing::info!(
@@ -261,10 +262,12 @@ pub async fn serve_https(
     };
 
     let pr_status_poller = pr_status_poller.begin_shutdown();
+    let creation_worker = creation_worker.begin_shutdown();
     let drain = async {
         tokio::join!(
             admitted_requests.wait(),
             pr_status_poller.wait(),
+            creation_worker.wait(),
             graceful.shutdown(),
         );
     };

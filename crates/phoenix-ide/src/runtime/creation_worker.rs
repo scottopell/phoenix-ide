@@ -17,6 +17,100 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+enum ClaimAdmission<T> {
+    Closed,
+    Open(T),
+}
+
+async fn begin_claim<F, Fut, T, E>(
+    stop: &tokio::sync::watch::Receiver<bool>,
+    claim_gate: &tokio::sync::Mutex<()>,
+    claim: F,
+) -> Result<ClaimAdmission<T>, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let _gate = claim_gate.lock().await;
+    if *stop.borrow() {
+        return Ok(ClaimAdmission::Closed);
+    }
+    claim().await.map(ClaimAdmission::Open)
+}
+
+pub(crate) struct CreationWorker {
+    stop: tokio::sync::watch::Sender<bool>,
+    completion: crate::managed_task::ManagedTaskShutdown,
+}
+
+impl CreationWorker {
+    pub(crate) fn start(
+        manager: Arc<RuntimeManager>,
+        mut kick: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        let claim_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let worker_claim_gate = claim_gate.clone();
+        let (stop, completion) = crate::managed_task::spawn(
+            "creation worker",
+            move |mut stop| async move {
+                loop {
+                    if *stop.borrow() {
+                        return;
+                    }
+                    if let Err(error) =
+                        drain_pending_jobs(&manager, &stop, &worker_claim_gate).await
+                    {
+                        tracing::error!(error = %error, "conversation creation worker drain failed");
+                    }
+                    if *stop.borrow() {
+                        return;
+                    }
+                    let next_deadline = match manager
+                        .db()
+                        .next_conversation_creation_deadline()
+                        .await
+                    {
+                        Ok(deadline) => deadline,
+                        Err(error) => {
+                            tracing::error!(error = %error, "failed to read conversation creation deadline");
+                            Some(chrono::Utc::now() + chrono::Duration::seconds(1))
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        changed = stop.changed() => {
+                            if changed.is_err() || *stop.borrow() {
+                                return;
+                            }
+                        }
+                        changed = kick.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = async {
+                            if let Some(deadline) = next_deadline {
+                                let delay = (deadline - chrono::Utc::now())
+                                    .to_std()
+                                    .unwrap_or(std::time::Duration::ZERO);
+                                tokio::time::sleep(delay).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {}
+                    }
+                }
+            },
+        );
+        Self { stop, completion }
+    }
+
+    pub(crate) fn begin_shutdown(self) -> crate::managed_task::ManagedTaskShutdown {
+        self.stop.send_replace(true);
+        self.completion
+    }
+}
+
 pub(crate) fn resolve_creation_model(
     registry: &ModelRegistry,
     explicit_model: Option<&str>,
@@ -35,19 +129,29 @@ pub(crate) fn resolve_creation_model(
     }
 }
 
-pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
+pub(crate) async fn drain_pending_jobs(
+    manager: &Arc<RuntimeManager>,
+    stop: &tokio::sync::watch::Receiver<bool>,
+    claim_gate: &tokio::sync::Mutex<()>,
+) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
-    while let Some(cleanup) = manager
-        .db()
-        .claim_next_conversation_creation_cleanup(
-            &worker_id.0,
-            &uuid::Uuid::new_v4().to_string(),
-            chrono::Utc::now(),
-            chrono::Duration::seconds(30),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-    {
+    loop {
+        let cleanup = begin_claim(stop, claim_gate, || async {
+            manager
+                .db()
+                .claim_next_conversation_creation_cleanup(
+                    &worker_id.0,
+                    &uuid::Uuid::new_v4().to_string(),
+                    chrono::Utc::now(),
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        let ClaimAdmission::Open(Some(cleanup)) = cleanup else {
+            break;
+        };
         if let Err(error) = reconcile_creation_cleanup(manager, &cleanup).await {
             tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
             manager
@@ -62,17 +166,20 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     }
     loop {
         let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
-        let outcome = manager
-            .db()
-            .claim_next_conversation_creation_job(
-                &worker_id,
-                &token,
-                chrono::Utc::now(),
-                chrono::Duration::seconds(30),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let CreationClaimOutcome::Claimed(job) = outcome else {
+        let outcome = begin_claim(stop, claim_gate, || async {
+            manager
+                .db()
+                .claim_next_conversation_creation_job(
+                    &worker_id,
+                    &token,
+                    chrono::Utc::now(),
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        let ClaimAdmission::Open(CreationClaimOutcome::Claimed(job)) = outcome else {
             return Ok(());
         };
         if let Err(error) = process_claimed_job(manager, *job).await {
@@ -181,7 +288,8 @@ async fn process_claimed_job(
                         tracing::debug!(job_id = %job_id, generation = claim.generation, "creation heartbeat observed terminal commit");
                         return processing.await;
                     }
-                    tracing::debug!(job_id = %job_id, generation = claim.generation, "stopping creation worker after lease authority was lost");
+                    tracing::debug!(job_id = %job_id, generation = claim.generation, "waiting for creation processing after lease authority was lost");
+                    let _ = processing.await;
                     return Ok(());
                 }
             }
@@ -833,10 +941,6 @@ async fn provision_conversation(
     manager
         .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
         .await;
-    let handle = manager
-        .get_or_create(&job.conversation_id)
-        .await
-        .map_err(|e| (e, ErrorKind::ServerError))?;
     let authority = manager
         .db()
         .renew_conversation_creation_claim(
@@ -853,11 +957,6 @@ async fn provision_conversation(
             ErrorKind::Cancelled,
         ));
     }
-    handle
-        .event_tx
-        .send(event)
-        .await
-        .map_err(|e| (format!("Failed to send event: {e}"), ErrorKind::ServerError))?;
     checkpoint_creation_stage(
         manager,
         job,
@@ -865,6 +964,15 @@ async fn provision_conversation(
         phoenix_core::domain::creation_protocol::CreationStage::Finalize,
     )
     .await?;
+    manager
+        .send_event(&job.conversation_id, event)
+        .await
+        .map_err(|e| {
+            (
+                format!("Failed to settle creation event: {e}"),
+                ErrorKind::ServerError,
+            )
+        })?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
 }
 
@@ -1573,5 +1681,66 @@ mod model_resolution_tests {
             resolve_creation_model(&registry, Some("gpt-5.4"), "managed", true),
             "gpt-5.4"
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_gate_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn closed_claim_admission_never_invokes_claim() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(true);
+        let gate = tokio::sync::Mutex::new(());
+        let calls = AtomicUsize::new(0);
+
+        let result: Result<ClaimAdmission<()>, ()> = begin_claim(&stop_rx, &gate, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result.unwrap(), ClaimAdmission::Closed));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(stop_tx);
+    }
+
+    #[tokio::test]
+    async fn shutdown_intent_closes_next_claim_while_started_claim_finishes() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let claim_started = Arc::new(tokio::sync::Barrier::new(2));
+        let claim_release = Arc::new(tokio::sync::Barrier::new(2));
+        let claim = tokio::spawn({
+            let gate = gate.clone();
+            let claim_started = claim_started.clone();
+            let claim_release = claim_release.clone();
+            let stop_rx = stop_rx.clone();
+            async move {
+                begin_claim(&stop_rx, &gate, || async {
+                    claim_started.wait().await;
+                    claim_release.wait().await;
+                    Ok::<_, ()>(())
+                })
+                .await
+                .unwrap()
+            }
+        });
+        claim_started.wait().await;
+
+        stop_tx.send_replace(true);
+
+        claim_release.wait().await;
+        assert!(matches!(claim.await.unwrap(), ClaimAdmission::Open(())));
+
+        let calls = AtomicUsize::new(0);
+        let next: Result<ClaimAdmission<()>, ()> = begin_claim(&stop_rx, &gate, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(next.unwrap(), ClaimAdmission::Closed));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -2362,46 +2362,17 @@ impl RuntimeManager {
         Ok(reconciled)
     }
 
-    pub async fn start_creation_worker(self: &Arc<Self>) {
-        let rx = self.creation_kick_rx.write().await.take();
-        let Some(mut rx) = rx else {
+    pub async fn start_creation_worker(
+        self: &Arc<Self>,
+    ) -> Option<crate::runtime::creation_worker::CreationWorker> {
+        let kick = self.creation_kick_rx.write().await.take();
+        let Some(kick) = kick else {
             tracing::debug!("creation worker already started; skipping");
-            return;
+            return None;
         };
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                if let Err(error) =
-                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
-                {
-                    tracing::error!(error = %error, "conversation creation worker drain failed");
-                }
-                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
-                    Ok(deadline) => deadline,
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to read conversation creation deadline");
-                        Some(chrono::Utc::now() + chrono::Duration::seconds(1))
-                    }
-                };
-                if let Some(deadline) = next_deadline {
-                    let delay = (deadline - chrono::Utc::now())
-                        .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    tokio::select! {
-                        changed = rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                        }
-                        () = tokio::time::sleep(delay) => {}
-                    }
-                } else if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-            tracing::info!("Conversation creation worker stopped");
-        });
+        let worker = crate::runtime::creation_worker::CreationWorker::start(Arc::clone(self), kick);
         self.kick_creation_worker();
+        Some(worker)
     }
 
     pub fn kick_creation_worker(&self) {

@@ -103,6 +103,7 @@ pub struct AppState {
 pub struct AppStartup {
     pub state: AppState,
     pub(crate) pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
+    pub(crate) creation_worker: crate::runtime::creation_worker::CreationWorker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +188,10 @@ impl AppState {
         }
         let pr_status_poller =
             crate::runtime::pr_status_poll::PrStatusPoller::start(runtime.clone());
-        runtime.start_creation_worker().await;
+        let creation_worker = runtime
+            .start_creation_worker()
+            .await
+            .expect("creation worker starts exactly once");
         reconcile_startup_continuations(&runtime).await?;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
@@ -250,6 +254,7 @@ impl AppState {
                 request_drain: crate::request_drain::RequestDrain::new(),
             },
             pr_status_poller,
+            creation_worker,
         })
     }
 }
