@@ -343,6 +343,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_git_repository_shadow_tables",
         sql: MIGRATION_065,
     },
+    Migration {
+        version: 66,
+        name: "create_repository_authority_generation",
+        sql: MIGRATION_066,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -422,6 +427,39 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_066: &str = r"
+CREATE TABLE repository_authority_generation (
+    singleton INTEGER NOT NULL PRIMARY KEY
+        CHECK (typeof(singleton) = 'integer' AND singleton = 1),
+    generation INTEGER NOT NULL
+        CHECK (typeof(generation) = 'integer' AND generation IN (1, 2))
+);
+
+INSERT INTO repository_authority_generation (singleton, generation)
+VALUES (1, 1);
+
+CREATE TRIGGER repository_authority_generation_no_insert
+BEFORE INSERT ON repository_authority_generation
+BEGIN
+    SELECT RAISE(ABORT, 'repository authority generation already exists');
+END;
+
+CREATE TRIGGER repository_authority_generation_no_delete
+BEFORE DELETE ON repository_authority_generation
+BEGIN
+    SELECT RAISE(ABORT, 'repository authority generation cannot be deleted');
+END;
+
+CREATE TRIGGER repository_authority_generation_monotonic_update
+BEFORE UPDATE ON repository_authority_generation
+WHEN NEW.singleton <> 1
+  OR OLD.generation <> 1
+  OR NEW.generation <> 2
+BEGIN
+    SELECT RAISE(ABORT, 'invalid repository authority generation transition');
+END;
+";
 
 const MIGRATION_065: &str = r"
 CREATE TABLE git_repositories (
@@ -5982,6 +6020,109 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_066_initializes_one_legacy_authority_generation() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 66).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let state: (i64, i64) =
+            sqlx::query_as("SELECT singleton, generation FROM repository_authority_generation")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, (1, 1));
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_066_authority_generation_is_singular_monotonic_and_irreversible() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 66).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        assert!(sqlx::query(
+            "INSERT INTO repository_authority_generation (singleton, generation)
+             VALUES (2, 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM repository_authority_generation WHERE singleton = 1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "UPDATE repository_authority_generation
+             SET generation = 3
+             WHERE singleton = 1",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE repository_authority_generation
+             SET generation = 1
+             WHERE singleton = 1",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query(
+            "UPDATE repository_authority_generation
+             SET generation = 2
+             WHERE singleton = 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for statement in [
+            "UPDATE repository_authority_generation SET generation = 2 WHERE singleton = 1",
+            "UPDATE repository_authority_generation SET generation = 1 WHERE singleton = 1",
+            "INSERT OR REPLACE INTO repository_authority_generation (singleton, generation) VALUES (1, 1)",
+            "INSERT OR REPLACE INTO repository_authority_generation (singleton, generation) VALUES (1, 2)",
+            "DELETE FROM repository_authority_generation WHERE singleton = 1",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err());
+        }
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM repository_authority_generation WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(generation, 2);
+    }
+
+    #[tokio::test]
+    async fn migration_066_does_not_block_legacy_writes_before_activation() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 66).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at)
+             VALUES ('still-authoritative', '/repo', 'main', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
