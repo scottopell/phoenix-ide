@@ -28,28 +28,38 @@ AND SHALL NOT introduce permanent compatibility machinery solely because the beh
 
 ### REQ-COMP-002 — Database Compatibility Moves Forward
 
-WHEN every migration version recorded by a Phoenix database is contained in the migration set embedded in the opening Phoenix binary
+WHEN an older Phoenix database has no migration ledger
+THE SYSTEM SHALL create the ledger and apply the opening binary's embedded migrations in version order
+
+WHEN a database migration ledger has been written only by supported Phoenix migration and seeding tools
+AND every recorded migration version is contained in the migration set embedded in the opening Phoenix binary
 THE SYSTEM SHALL determine pending migrations by individual version membership rather than by a continuous prefix or highest recorded version
 AND SHALL apply each unrecorded embedded migration in version order
-AND SHALL preserve persisted data unless a normative requirement and its decision record explicitly retire that data
+
+THE SYSTEM SHALL treat a migration ledger state that was not produced by supported Phoenix migration or seeding tools as unsupported
 
 THE SYSTEM SHALL NOT guarantee that an older Phoenix binary can open, read, or write a database after a newer binary has applied migrations that the older binary does not contain
 
-**Rationale:** Forward migration supports normal upgrades. Requiring historical binaries to understand future schemas would constrain every migration and create an unbounded cross-version protocol.
+THE SYSTEM SHALL NOT make a project-wide guarantee that migrations preserve all persisted data
+AND SHALL require each migration's owning feature requirements to define whether affected data is preserved, transformed, or retired
+
+**Rationale:** Forward migration supports normal upgrades without treating database damage as a supported sparse ledger. Data retention is a product decision owned by each feature. Requiring historical binaries to understand future schemas would create an unbounded cross-version protocol.
 
 ---
 
-### REQ-COMP-003 — Database-Compatible Rollback Restores a Matching Pair
+### REQ-COMP-003 — Database Recovery Is Feature-Scoped
+
+THE SYSTEM SHALL NOT provide a general automatic database rollback subsystem
 
 WHEN a deployment or recovery operation restores a previous Phoenix binary without restoring its matching previous database
 THE SYSTEM SHALL describe the outcome as runtime-artifact rollback
-AND SHALL NOT describe the outcome as database-compatible rollback
 AND SHALL NOT guarantee that the restored binary can use a database changed by the candidate
 
-WHEN the system reports database-compatible rollback
-THE SYSTEM SHALL have restored and verified the matching previous runtime, configuration, environment, service state, and database as one recovery unit
+WHEN a feature requires recovery of matching runtime and database state
+THE SYSTEM SHALL require that feature's normative requirements to define the recovery boundary and guarantees
+AND SHALL implement only the feature-scoped recovery mechanism required by that contract
 
-**Rationale:** Binary rollback without data rollback can pair an older binary with a schema it does not support. Explicit outcome names prevent the existing runtime-artifact recovery path from claiming a stronger compatibility guarantee than it provides.
+**Rationale:** A generic database rollback subsystem would impose permanent snapshot, restore, recovery, and verification complexity on every deployment. A feature with demonstrated recovery value can own a narrower mechanism and its costs explicitly.
 
 ---
 

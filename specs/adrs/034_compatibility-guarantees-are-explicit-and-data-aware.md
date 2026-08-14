@@ -15,7 +15,7 @@ Production rollback exposes a related gap. Restoring only the previous binary an
 ## Options considered
 
 1. **Preserve every behavior that defensive code can support** — maximizes best-effort compatibility, but turns implementation accidents into permanent guarantees and distributes their cost across migrations, deployment, persistence, and testing.
-2. **Make guarantees explicit and recover matching runtime/data pairs** — support forward migration, restore a matching database with a rolled-back runtime, require offline database replacement, and use one simple integer representation for Phoenix-owned SQLite timestamps.
+2. **Make guarantees explicit and keep database recovery feature-scoped** — support Phoenix-managed forward migration, keep runtime-artifact rollback distinct from database recovery, require offline database replacement, and use one simple integer representation for Phoenix-owned SQLite timestamps.
 3. **Remove rollback and compatibility behavior entirely** — minimizes machinery, but leaves routine upgrades without a safe recovery contract and provides too little operational support.
 
 ## Decision
@@ -24,9 +24,9 @@ Choose option 2.
 
 A compatibility, downgrade, rollback, recovery, or live-resource-replacement behavior is guaranteed only by a normative requirement. Missing guarantees are unsupported rather than best-effort obligations.
 
-Phoenix guarantees ordered forward migration when every recorded migration version exists in the binary's embedded migration set. Pending migrations are determined by individual version membership, allowing intentional ledger gaps; Phoenix does not guarantee backward access by an older binary to migrations it does not contain.
+Phoenix guarantees ordered forward migration for older databases with no ledger and for ledger states produced by supported Phoenix migration and seeding tools when every recorded version exists in the binary's embedded migration set. Pending migrations are determined by individual version membership, allowing intentional Phoenix-created gaps; Phoenix does not guarantee damaged or manually changed ledgers, or backward access by an older binary to migrations it does not contain. Data preservation, transformation, or retirement is a product decision owned by each migration's feature requirements rather than a project-wide guarantee.
 
-Restoring a previous binary without its matching database is runtime-artifact rollback, not database-compatible rollback. Phoenix reports database-compatible rollback only when the matching runtime and database are restored and verified as one recovery unit. This policy does not choose or prescribe a future snapshot mechanism.
+Restoring a previous binary without its matching database is runtime-artifact rollback. Phoenix does not build a general automatic database rollback subsystem. If a feature demonstrates a need to recover matching runtime and database state, that feature's normative requirements own a narrow recovery mechanism and its guarantees.
 
 One backend-managed Phoenix runtime version exclusively owns a production database. Database restore and replacement occur only while that runtime is stopped; mixed-version or independently launched Phoenix processes sharing the database are unsupported. Phoenix does not add live database-file replacement fencing.
 
@@ -35,10 +35,11 @@ Phoenix-owned internal SQLite timestamps default to explicitly unit-named intege
 ## Consequences
 
 - **Positive:** Migration design is not constrained by accidental historical-binary compatibility.
-- **Positive:** Runtime-artifact rollback cannot be mistaken for database-compatible rollback.
+- **Positive:** Feature owners decide whether migrations preserve, transform, or retire their data.
+- **Positive:** Runtime-artifact rollback is not mistaken for a general database recovery guarantee.
 - **Positive:** Offline restore avoids a database-instance fencing protocol across connection pools and operations.
 - **Positive:** Integer timestamps preserve ordering with one representation and simple SQLite type checks.
-- **Negative:** Database-compatible rollback requires a separate design and implementation for restoring and verifying matching data; this decision does not provide it.
+- **Negative:** A feature that needs matching runtime/database recovery must explicitly justify and implement its own bounded mechanism.
 - **Negative:** Operators cannot replace or restore a database while Phoenix is running.
 - **Negative:** Rolling or mixed-version Phoenix processes cannot share one production SQLite database.
 - **Negative:** Existing accidental compatibility and mixed timestamp representations require a separate inventory and deliberate cleanup.

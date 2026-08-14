@@ -6,7 +6,7 @@ Phoenix exposes a typed in-app published-release update surface on the About dep
 
 Approval is same-host only and binds the exact preview tag plus full commit. Backend eligibility derives from the same typed runtime-ownership snapshot shown by the deployment API; development, unmanaged, ambiguous, and unsupported processes cannot approve disruptive updates. The server downloads that commit's deployment controller into an owner-only transaction artifact and waits until the controller's transaction ID appears in backend-owned durable status. Launchd, systemd, and bare Linux continue to own disruption, exact runtime verification, commit, and rollback through the production-deployment stack; the running Phoenix process never replaces or restarts itself.
 
-After reconnect, the UI hydrates the authoritative native status file. In-progress, committed, precondition-failed, backend-reported rollback, rollback failure, concurrent rejection, unreadable, and stale outcomes remain distinct. The backend's rollback status covers runtime artifacts but is not a paired runtime/database rollback until `REQ-COMP-003` is implemented. `./dev.py` remains available for bootstrap, local HEAD deployment, offline repair, migration, and emergency recovery.
+After reconnect, the UI hydrates the authoritative native status file. In-progress, committed, precondition-failed, backend-reported rollback, rollback failure, concurrent rejection, unreadable, and stale outcomes remain distinct. The backend's rollback status covers runtime artifacts only; Phoenix does not provide a general automatic database rollback subsystem. `./dev.py` remains available for bootstrap, local HEAD deployment, offline repair, migration, and emergency recovery.
 
 ## Requirement coverage
 
@@ -20,7 +20,7 @@ After reconnect, the UI hydrates the authoritative native status file. In-progre
 | REQ-RU-005 | `release_updates::approve` launches the controller independently and returns only after durable backend handoff. |
 | REQ-RU-006 | `read_status` normalizes backend-owned status and the UI polls/restores it after reconnect. |
 | REQ-RU-007 | Committed status displays backend-verified expected identity and approved source commit. |
-| REQ-RU-008 | `TransactionStatus` renders backend-reported rollback distinctly, but the backend does not yet satisfy paired runtime/database rollback under `REQ-COMP-003`. |
+| REQ-RU-008 | `TransactionStatus` renders backend-reported runtime-artifact rollback distinctly; no general automatic database rollback is implied. |
 | REQ-RU-009 | Native status supplies transaction ID, approved source, expected runtime identity, timestamps, and failure evidence without a parallel SQLite copy. |
 | REQ-RU-010 | Normal `./dev.py prod deploy` behavior remains available; controller mode is additive and explicit. |
 
