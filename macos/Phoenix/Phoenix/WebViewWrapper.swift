@@ -49,6 +49,7 @@ struct WebViewWrapper: NSViewRepresentable {
     private static let authenticationBridgeScript = """
     (() => {
       const deploymentDocumentGeneration = crypto.randomUUID();
+      window.__phoenixMacDeploymentGeneration = deploymentDocumentGeneration;
       let deploymentRequestSequence = 0;
       const reportDeployment = async () => {
         const sequence = ++deploymentRequestSequence;
@@ -232,9 +233,16 @@ struct WebViewWrapper: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard role == .primary else { return }
-            committedDocumentGeneration = nil
             onWebViewReady(webView, operation)
-            verifyDeployment(webView)
+            webView.evaluateJavaScript("window.__phoenixMacDeploymentGeneration") { [weak self, weak webView] value, _ in
+                guard let self,
+                      let webView,
+                      let generation = value as? String else { return }
+                self.committedDocumentGeneration = generation
+                self.latestDeploymentGeneration = nil
+                self.latestDeploymentSequence = 0
+                self.verifyDeployment(webView)
+            }
         }
 
         func webView(
@@ -364,9 +372,6 @@ struct WebViewWrapper: NSViewRepresentable {
                   let generation = body["generation"] as? String,
                   let sequence = body["sequence"] as? Int,
                   let status = body["status"] as? Int else { return }
-            if committedDocumentGeneration == nil {
-                committedDocumentGeneration = generation
-            }
             guard generation == committedDocumentGeneration,
                   !retiredDeploymentGenerations.contains(generation) else { return }
             if generation == latestDeploymentGeneration {

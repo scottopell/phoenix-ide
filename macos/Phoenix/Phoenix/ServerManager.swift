@@ -1119,7 +1119,7 @@ final class ServerManager: ObservableObject {
             guard let launchedBundledInstance else { return }
             await verifyIdentity(for: .bundled(launchedBundledInstance.configuration), operation: operation, allowIntermediateFailureState: false)
             if case .ready(_, let deployment) = state,
-               deployment.instanceID == launchedBundledInstance.instanceID.uuidString {
+               deploymentMatchesBundledInstance(deployment, instanceID: launchedBundledInstance.instanceID) {
                 return
             }
             guard operation == operationAuthority.id else { return }
