@@ -143,7 +143,10 @@ def start_old(binary: Path, db_path: Path, root: Path) -> tuple[subprocess.Popen
         "HOME": str(home), "USERPROFILE": str(home), "XDG_CONFIG_HOME": str(config),
         "PHOENIX_DATA_DIR": str(data), "PHOENIX_DB_PATH": str(db_path), "PHOENIX_PORT": str(port),
         "PHOENIX_BIND_ADDR": "127.0.0.1", "PHOENIX_ENABLE_MOCK_MODEL": "1", "DEFAULT_MODEL": "mock",
-        "PHOENIX_LOG_STDOUT": "true", "PHOENIX_TRACE_EXPORTER": "none", "RUST_LOG": "info",
+        "PHOENIX_LOG_STDOUT": "true",
+        "PHOENIX_LOG_FILE": str(root / "historical.log"),
+        "PHOENIX_TRACE_EXPORTER": "none",
+        "RUST_LOG": "info",
     }
     for key in tuple(env):
         if key.startswith(("DD_", "OTEL_")):
