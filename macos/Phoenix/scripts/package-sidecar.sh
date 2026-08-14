@@ -21,7 +21,7 @@ expected_build_identity() {
   fi
   [ -n "$repository_root" ] || return 1
   version="$(/usr/bin/grep -m1 '^version' "$repository_root/crates/phoenix-ide/Cargo.toml" | /usr/bin/sed 's/version = "\(.*\)"/\1/')"
-  git_sha="$(git -C "$repository_root" rev-parse --short=12 HEAD 2>/dev/null || printf unknown)"
+  git_sha="$(git -C "$repository_root" rev-parse HEAD 2>/dev/null || printf unknown)"
   if [ "$git_sha" != unknown ] && [ -n "$(git -C "$repository_root" status --porcelain 2>/dev/null)" ]; then
     git_sha="$git_sha-dirty"
   fi

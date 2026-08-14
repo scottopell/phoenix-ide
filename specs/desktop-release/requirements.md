@@ -58,5 +58,5 @@ AND THE SYSTEM SHALL NOT promise local or durable rollback to the previously pub
 
 WHEN packaging a desktop release for tag `vX.Y.Z`,
 THE SYSTEM SHALL pass `MARKETING_VERSION=X.Y.Z` into `xcodebuild`
-AND SHALL pass a deterministic release-specific dotted `CURRENT_PROJECT_VERSION` whose major component has at most four digits and whose minor and patch components each have at most two digits
+AND SHALL pass a deterministic release-specific dotted `CURRENT_PROJECT_VERSION` whose positive major component equals `X+1` and has at most four digits, and whose minor and patch components equal `Y` and `Z` and each have at most two digits
 AND SHALL verify the built app's Info.plist carries those exact resolved values before publication.

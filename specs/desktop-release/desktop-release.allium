@@ -13,8 +13,6 @@ enum HelperSignatureState { unsigned | signed_once | verified | failed }
 enum AppSignatureState { unsigned | app_signed | app_verified | failed }
 enum NotaryState { pending | submitted | stapled | validated | failed }
 enum PublishState { idle | creating | replacing | committing | interrupted | mixed | completed | failed }
-enum AssetScope { standalone_helper | desktop_archive | checksum_set }
-
 enum FailureDomain {
     none | tag_gate | helper_build | app_build | helper_signing | notarization | publish | credentials
 }
@@ -24,9 +22,14 @@ value ReleaseIdentity {
     full_commit: String
 }
 
-value ReleaseAsset {
+value StandaloneHelperAsset {
     name: String
-    scope: AssetScope
+    target: String
+    identity: ReleaseIdentity
+}
+
+value DesktopArchiveAsset {
+    name: String
     target: String
     identity: ReleaseIdentity
 }
@@ -50,7 +53,7 @@ entity StandaloneHelperBuild {
     identity: ReleaseIdentity
     build: BuildState
     signature: HelperSignatureState
-    published_asset: ReleaseAsset?
+    published_asset: StandaloneHelperAsset?
 
     transitions build {
         pending -> ready
@@ -76,7 +79,7 @@ entity DesktopArchiveBuild {
     build: BuildState
     app_signature: AppSignatureState
     notarization: NotaryState
-    archive_asset: ReleaseAsset?
+    archive_asset: DesktopArchiveAsset?
 
     transitions build {
         pending -> ready
@@ -87,6 +90,7 @@ entity DesktopArchiveBuild {
     }
 
     transitions app_signature {
+        unsigned -> failed
         unsigned -> app_signed
         app_signed -> app_verified
         app_signed -> failed
