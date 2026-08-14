@@ -1,0 +1,1 @@
+# Establish the initial Phoenix compatibility policy: make guarantees explicit, define paired binary/database rollback and offline database replacement, choose integer Unix-microsecond repository observation timestamps, record rationale in an ADR, and add a short contributor guardrail. This PR is policy-only; implementation gaps remain explicit for follow-up.

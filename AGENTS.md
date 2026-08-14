@@ -281,6 +281,10 @@ Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `p
 
 These are constraints on the technical artifact, not process guidelines. They override existing code patterns and unreviewed plan decisions. When a plan says to do something that violates these, deviate from the plan and note why.
 
+#### Compatibility guarantees must be explicit
+
+Compatibility, downgrade, rollback, live-resource replacement, recovery, cross-version behavior, and internal SQLite timestamp guarantees are governed by `specs/compatibility/requirements.md` and more specific normative requirements. Do not add or expand one as defensive hardening without updating the normative contract and recording a policy or architecture change in an ADR; ADR-034 records the project-wide policy; ADR-033 records the Foundation-specific application.
+
 #### PR feedback is an actionable snapshot, not a GitHub mirror
 
 Phoenix stores a compact baseline of **agent-actionable PR feedback**. GitHub remains the source of truth for the PR model. Phoenix does not mirror GitHub; it only snapshots enough to prepare an autofix prompt and avoid misleading freshness badges.
