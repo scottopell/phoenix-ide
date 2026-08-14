@@ -1039,8 +1039,9 @@ final class ServerManager: ObservableObject {
             kill(rootPID, SIGKILL)
             return
         }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
         snapshot.waitUntilExit()
-        let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let text = String(decoding: output, as: UTF8.self)
         var children: [Int32: [Int32]] = [:]
         for line in text.split(separator: "\n") {
             let fields = line.split(whereSeparator: \.isWhitespace)

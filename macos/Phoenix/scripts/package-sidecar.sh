@@ -10,6 +10,21 @@ fi
 helpers="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
 destination="$helpers/phoenix_ide"
 
+expected_build_identity() {
+  if [ -n "${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" ]; then
+    printf '%s\n' "$PHOENIX_EXPECTED_BUILD_IDENTITY"
+    return 0
+  fi
+  repository_root="${PHOENIX_REPOSITORY_ROOT:-}"
+  if [ -z "$repository_root" ] && [ -n "${SRCROOT:-}" ]; then
+    repository_root="$(CDPATH= cd -- "$SRCROOT/../.." && pwd)"
+  fi
+  [ -n "$repository_root" ] || return 1
+  version="$(/usr/bin/grep -m1 '^version' "$repository_root/crates/phoenix-ide/Cargo.toml" | /usr/bin/sed 's/version = "\(.*\)"/\1/')"
+  git_sha="$(git -C "$repository_root" rev-parse HEAD 2>/dev/null || printf unknown)"
+  printf '{"version":"%s","git_sha":"%s"}\n' "$version" "$git_sha"
+}
+
 validate_packaged_sidecar() {
   helper="$1"
   required_archs="$2"
@@ -24,7 +39,7 @@ validate_packaged_sidecar() {
     echo "error: packaged sidecar returned invalid Phoenix build identity" >&2
     return 1
   }
-  if [ -n "${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" ] && [ "$build_identity" != "$PHOENIX_EXPECTED_BUILD_IDENTITY" ]; then
+  if [ -n "$expected_identity" ] && [ "$build_identity" != "$expected_identity" ]; then
     echo "error: packaged sidecar build identity does not match expected build" >&2
     return 1
   fi
@@ -82,9 +97,12 @@ if [ ! -f "$PHOENIX_SIDECAR_PATH" ] || [ ! -x "$PHOENIX_SIDECAR_PATH" ]; then
   exit 1
 fi
 
-if [ "${CONFIGURATION:-Debug}" = "Release" ] && [ -z "${PHOENIX_EXPECTED_BUILD_IDENTITY:-}" ]; then
-  echo "error: Release builds require PHOENIX_EXPECTED_BUILD_IDENTITY" >&2
-  exit 1
+expected_identity=""
+if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
+  expected_identity="$(expected_build_identity)" || {
+    echo "error: Release builds require repository-derived Phoenix build identity" >&2
+    exit 1
+  }
 fi
 
 mkdir -p "$helpers"
