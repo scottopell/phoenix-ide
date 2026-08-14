@@ -5,9 +5,11 @@
 
 use std::collections::HashSet;
 
-use sqlx::SqlitePool;
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use super::DbResult;
+use phoenix_core::work_scope::WorkScopeId;
+
+use super::{DbError, DbResult, ProjectSeedId};
 
 struct Migration {
     version: u32,
@@ -336,7 +338,199 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_close_retirement_tables",
         sql: MIGRATION_064,
     },
+    Migration {
+        version: 65,
+        name: "create_git_repository_shadow_tables",
+        sql: MIGRATION_065,
+    },
 ];
+
+pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
+    MIGRATIONS
+        .iter()
+        .map(|migration| (i64::from(migration.version), migration.name))
+        .collect()
+}
+
+/// A length-delimited digest makes the exact compiled migration source part of
+/// readiness identity: adjacent values cannot be confused with a different
+/// version/name/body partition.
+pub(crate) fn compiled_migration_digest() -> String {
+    migration_digest_from_parts(MIGRATIONS.iter().map(|migration| {
+        (
+            migration.version,
+            migration.name.as_bytes(),
+            migration.sql.as_bytes(),
+        )
+    }))
+}
+
+fn migration_digest_from_parts<'a>(
+    parts: impl IntoIterator<Item = (u32, &'a [u8], &'a [u8])>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut digest = Sha256::new();
+    for (version, name, sql) in parts {
+        digest.update(b"phoenix-db-migration-v1\\0");
+        digest.update(version.to_be_bytes());
+        digest.update(
+            u64::try_from(name.len())
+                .expect("name length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(name);
+        digest.update(
+            u64::try_from(sql.len())
+                .expect("SQL length fits u64")
+                .to_be_bytes(),
+        );
+        digest.update(sql);
+    }
+    digest
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to String cannot fail");
+            hex
+        })
+}
+
+pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'static str, String> {
+    const TABLES: [&str; 4] = [
+        "git_repositories",
+        "git_repository_locator_observations",
+        "git_repository_default_branch_observations",
+        "work_scope_git_repositories",
+    ];
+
+    MIGRATION_065
+        .split(';')
+        .filter_map(|statement| {
+            let canonical = normalize_sql(statement);
+            let table_name_match = canonical.to_ascii_lowercase();
+            TABLES.into_iter().find_map(|table| {
+                table_name_match
+                    .starts_with(&format!("create table {table} "))
+                    .then(|| (table, canonical.clone()))
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const MIGRATION_065: &str = r"
+CREATE TABLE git_repositories (
+    id TEXT NOT NULL PRIMARY KEY
+        CHECK (typeof(id) = 'text' AND id <> '')
+);
+
+CREATE TABLE git_repository_locator_observations (
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE CASCADE
+        CHECK (typeof(repository_id) = 'text'),
+    locator_kind TEXT NOT NULL
+        CHECK (typeof(locator_kind) = 'text')
+        CHECK (locator_kind IN ('common_dir', 'management_root')),
+    status TEXT NOT NULL
+        CHECK (typeof(status) = 'text')
+        CHECK (status IN ('present', 'missing', 'inaccessible')),
+    path TEXT NOT NULL
+        CHECK (typeof(path) = 'text' AND path <> '' AND instr(path, char(0)) = 0),
+    observed_at_unix_micros INTEGER NOT NULL
+        CHECK (
+            typeof(observed_at_unix_micros) = 'integer'
+            AND observed_at_unix_micros >= 0
+        ),
+    PRIMARY KEY (repository_id, locator_kind)
+);
+
+CREATE TABLE git_repository_default_branch_observations (
+    repository_id TEXT NOT NULL PRIMARY KEY REFERENCES git_repositories(id) ON DELETE CASCADE
+        CHECK (typeof(repository_id) = 'text'),
+    generation INTEGER NOT NULL
+        CHECK (typeof(generation) = 'integer' AND generation > 0),
+    status TEXT NOT NULL
+        CHECK (typeof(status) = 'text')
+        CHECK (status IN ('resolved', 'unresolved')),
+    branch TEXT CHECK (
+        branch IS NULL OR (typeof(branch) = 'text' AND instr(branch, char(0)) = 0)
+    ),
+    provenance TEXT CHECK (provenance IS NULL OR typeof(provenance) = 'text'),
+    observed_at_unix_micros INTEGER NOT NULL
+        CHECK (
+            typeof(observed_at_unix_micros) = 'integer'
+            AND observed_at_unix_micros >= 0
+        ),
+    CHECK (
+        (status = 'resolved'
+         AND branch IS NOT NULL AND branch <> ''
+         AND provenance IS NOT NULL
+         AND provenance IN ('remote_head_cache', 'local_checked_out_branch', 'user_selected'))
+        OR (status = 'unresolved' AND branch IS NULL AND provenance IS NULL)
+    )
+);
+
+CREATE TABLE work_scope_git_repositories (
+    work_scope_id TEXT NOT NULL PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE
+        CONSTRAINT work_scope_git_repositories_work_scope_id_nonblank CHECK (
+            typeof(work_scope_id) = 'text'
+            AND length(trim(
+                work_scope_id,
+                char(9) || char(10) || char(11) || char(12) || char(13) || char(32)
+                || char(133) || char(160) || char(5760)
+                || char(8192) || char(8193) || char(8194) || char(8195) || char(8196)
+                || char(8197) || char(8198) || char(8199) || char(8200) || char(8201)
+                || char(8202) || char(8232) || char(8233) || char(8239) || char(8287)
+                || char(12288)
+            )) > 0
+        ),
+    repository_id TEXT NOT NULL REFERENCES git_repositories(id) ON DELETE RESTRICT
+        CHECK (typeof(repository_id) = 'text')
+);
+
+INSERT INTO git_repositories (id)
+SELECT id
+FROM projects;
+
+CREATE TEMP TABLE migration_065_scope_project_counts (
+    work_scope_id TEXT NOT NULL PRIMARY KEY
+        CHECK (typeof(work_scope_id) = 'text'),
+    distinct_project_count INTEGER NOT NULL
+        CHECK (typeof(distinct_project_count) = 'integer'),
+    project_id TEXT CHECK (project_id IS NULL OR typeof(project_id) = 'text')
+);
+
+INSERT INTO migration_065_scope_project_counts (work_scope_id, distinct_project_count, project_id)
+SELECT c.work_scope_id,
+       COUNT(DISTINCT c.project_id) AS distinct_project_count,
+       MIN(c.project_id) AS project_id
+FROM conversations c
+WHERE c.work_scope_id IS NOT NULL
+  AND c.project_id IS NOT NULL
+GROUP BY c.work_scope_id;
+
+CREATE TEMP TABLE migration_065_scope_project_guard (
+    invalid_count INTEGER NOT NULL
+        CHECK (typeof(invalid_count) = 'integer' AND invalid_count = 0)
+);
+
+INSERT INTO migration_065_scope_project_guard (invalid_count)
+SELECT COUNT(*)
+FROM migration_065_scope_project_counts
+WHERE distinct_project_count > 1;
+
+INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+SELECT work_scope_id, project_id
+FROM migration_065_scope_project_counts
+WHERE distinct_project_count = 1;
+
+DROP TABLE migration_065_scope_project_guard;
+DROP TABLE migration_065_scope_project_counts;
+";
 
 const MIGRATION_063: &str = r"
 ALTER TABLE conversations ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'standard'
@@ -5210,6 +5404,51 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+async fn migration_065_preflight(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    let work_scope_id: Option<String> = sqlx::query_scalar(
+        "SELECT work_scope_id
+         FROM conversations
+         WHERE work_scope_id IS NOT NULL AND project_id IS NOT NULL
+         GROUP BY work_scope_id
+         HAVING COUNT(DISTINCT project_id) > 1
+         ORDER BY work_scope_id
+         LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(work_scope_id) = work_scope_id else {
+        return Ok(());
+    };
+    let project_ids: Vec<String> = sqlx::query(
+        "SELECT DISTINCT project_id
+         FROM conversations
+         WHERE work_scope_id = ?1 AND project_id IS NOT NULL
+         ORDER BY project_id
+         LIMIT 2",
+    )
+    .bind(&work_scope_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|row| row.get("project_id"))
+    .collect();
+    let [first, second] = project_ids.as_slice() else {
+        return Err(DbError::Serialization(
+            "migration 65 conflict preflight found fewer than two project ids".to_string(),
+        ));
+    };
+    Err(DbError::GitRepositoryWorkScopeProjectConflict {
+        work_scope_id: WorkScopeId::parse(work_scope_id)
+            .map_err(|error| DbError::Serialization(error.to_string()))?,
+        project_ids: [
+            ProjectSeedId::parse(first.clone())
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            ProjectSeedId::parse(second.clone())
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        ],
+    })
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -5259,6 +5498,10 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         // applied but unrecorded migration would fail to re-run (missing/duplicate
         // column) and abort startup.
         let mut tx = pool.begin().await?;
+
+        if migration.version == 65 {
+            migration_065_preflight(&mut tx).await?;
+        }
 
         if migration.version == 59 {
             let state_kind_exists: bool = sqlx::query_scalar(
@@ -5344,6 +5587,48 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use sqlx::Row;
     use std::str::FromStr;
+
+    #[test]
+    fn compiled_migration_digest_binds_version_name_and_sql_body() {
+        let baseline =
+            migration_digest_from_parts([(1, b"name".as_slice(), b"SELECT 1".as_slice())]);
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(1, b"name".as_slice(), b"SELECT 2".as_slice())])
+        );
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(1, b"other".as_slice(), b"SELECT 1".as_slice())])
+        );
+        assert_ne!(
+            baseline,
+            migration_digest_from_parts([(2, b"name".as_slice(), b"SELECT 1".as_slice())])
+        );
+    }
+
+    #[test]
+    fn r1_expected_table_definitions_cover_every_migration_65_table() {
+        assert_eq!(
+            r1_expected_table_definitions()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                "git_repositories",
+                "git_repository_default_branch_observations",
+                "git_repository_locator_observations",
+                "work_scope_git_repositories",
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_sql_preserves_quoted_literal_case() {
+        assert_ne!(
+            normalize_sql("CREATE TABLE examples (value TEXT CHECK (value = 'Present'))"),
+            normalize_sql("CREATE TABLE examples (value TEXT CHECK (value = 'present'))")
+        );
+    }
 
     async fn test_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -5434,6 +5719,28 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn setup_pre_065_git_repository_schema(pool: &SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TABLE projects (
+                 id TEXT PRIMARY KEY,
+                 canonical_path TEXT UNIQUE NOT NULL,
+                 main_ref TEXT NOT NULL DEFAULT 'main',
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE work_scopes (
+                 id TEXT PRIMARY KEY
+             );
+             CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 work_scope_id TEXT REFERENCES work_scopes(id),
+                 project_id TEXT REFERENCES projects(id)
+             );",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5675,6 +5982,865 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_065_creates_git_repository_shadow_tables_with_deterministic_seed() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
+                 ('project-a', '/repos/a', 'main', 1735689600000000),
+                 ('project-b', '/repos/b', 'trunk', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scopes (id) VALUES ('scope-a'), ('scope-b'), ('scope-c'), ('scope-empty')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, work_scope_id, project_id) VALUES
+                 ('conv-a1', 'scope-a', 'project-a'),
+                 ('conv-a2', 'scope-a', 'project-a'),
+                 ('conv-b1', 'scope-b', 'project-b'),
+                 ('conv-c1', 'scope-c', NULL),
+                 ('conv-c2', 'scope-c', 'project-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 65).await;
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let repositories: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM git_repositories ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            repositories,
+            vec!["project-a".to_string(), "project-b".to_string()]
+        );
+
+        let attachments: Vec<(String, String)> = sqlx::query_as(
+            "SELECT work_scope_id, repository_id
+             FROM work_scope_git_repositories
+             ORDER BY work_scope_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attachments,
+            vec![
+                ("scope-a".to_string(), "project-a".to_string()),
+                ("scope-b".to_string(), "project-b".to_string()),
+                ("scope-c".to_string(), "project-a".to_string()),
+            ]
+        );
+
+        let unattached_scope_empty: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scope_git_repositories WHERE work_scope_id = 'scope-empty'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unattached_scope_empty, 0);
+
+        let locator_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM git_repository_locator_observations")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let default_branch_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM git_repository_default_branch_observations")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            locator_count, 0,
+            "migration must not backfill locator observations"
+        );
+        assert_eq!(
+            default_branch_count, 0,
+            "migration must not backfill default-branch observations from projects.main_ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_065_leaves_zero_project_scopes_unattached_and_replays_cleanly() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
+                 ('project-a', '/repos/a', 'main', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-none'), ('scope-null-only')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, work_scope_id, project_id) VALUES
+                 ('conv-null', 'scope-null-only', NULL),
+                 ('conv-unscoped', NULL, 'project-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 65).await;
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+
+        let attachment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_scope_git_repositories")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attachment_count, 0);
+
+        let repositories: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM git_repositories ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(repositories, vec!["project-a".to_string()]);
+
+        let applied_versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _migrations WHERE version = 65")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied_versions, vec![65]);
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_whitespace_only_work_scope_identity_transactionally() {
+        for (work_scope_id, conversation_id) in [
+            ("   ", "conv-ascii-whitespace-scope"),
+            ("\u{2003}", "conv-unicode-whitespace-scope"),
+        ] {
+            let pool = test_pool().await;
+            setup_pre_065_git_repository_schema(&pool).await;
+            sqlx::query(
+                "INSERT INTO projects (id, canonical_path, main_ref, created_at)
+                 VALUES ('project-a', '/repos/a', 'main', 1735689600000000)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO work_scopes (id) VALUES (?1)")
+                .bind(work_scope_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (id, work_scope_id, project_id)
+                 VALUES (?1, ?2, 'project-a')",
+            )
+            .bind(conversation_id)
+            .bind(work_scope_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            stamp_migrations_except(&pool, 65).await;
+
+            let error = run_pending_migrations(&pool).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("work_scope_git_repositories_work_scope_id_nonblank"),
+                "unexpected migration failure for {work_scope_id:?}: {error}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'work_scope_git_repositories'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                0,
+                "invalid WorkScope identity must roll back additive DDL"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0,
+                "failed migration must not stamp version 65"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_empty_legacy_project_identity_transactionally() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at)
+             VALUES ('', '/repos/empty-id', 'main', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 65).await;
+
+        assert!(run_pending_migrations(&pool).await.is_err());
+
+        let shadow_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'git_repositories'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(shadow_table_count, 0, "failed migration must roll back DDL");
+
+        let applied_65: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied_65, 0, "failed migration must not stamp version 65");
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_blob_legacy_project_identity_transactionally() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at)
+             VALUES (X'70726f6a6563742d626c6f62', '/repos/blob-id', 'main', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 65).await;
+
+        assert!(run_pending_migrations(&pool).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'git_repositories'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "malformed legacy identity must roll back additive DDL"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "failed migration must not stamp version 65"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_065_fails_transactionally_when_one_scope_maps_to_multiple_projects() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        sqlx::query(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
+                 ('project-a', '/repos/a', 'main', 1735689600000000),
+                 ('project-b', '/repos/b', 'main', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-conflict')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (id, work_scope_id, project_id) VALUES
+                 ('conv-a', 'scope-conflict', 'project-a'),
+                 ('conv-b', 'scope-conflict', 'project-b')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        stamp_migrations_except(&pool, 65).await;
+
+        let error = run_pending_migrations(&pool).await.unwrap_err();
+        let DbError::GitRepositoryWorkScopeProjectConflict {
+            work_scope_id,
+            project_ids,
+        } = error
+        else {
+            panic!("migration 65 must return a typed project conflict");
+        };
+        assert_eq!(work_scope_id.as_str(), "scope-conflict");
+        assert_eq!(
+            project_ids.map(|id| id.as_str().to_string()),
+            ["project-a".to_string(), "project-b".to_string()]
+        );
+
+        let git_repositories_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'git_repositories'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            git_repositories_exists, 0,
+            "failed migration must roll back additive tables"
+        );
+
+        let applied_65: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(applied_65, 0, "failed migration must not stamp version 65");
+    }
+
+    #[tokio::test]
+    async fn migration_065_preflight_selects_the_exact_opaque_pair_independent_of_insert_order() {
+        let fixtures = [
+            [
+                ("z-1", "scope-z", "repo,z"),
+                ("z-2", "scope-z", "repo-m"),
+                ("a-1", "scope-a", "repo,z"),
+                ("a-2", "scope-a", "   "),
+                ("a-3", "scope-a", "repo-m"),
+            ],
+            [
+                ("a-3", "scope-a", "repo-m"),
+                ("a-2", "scope-a", "   "),
+                ("a-1", "scope-a", "repo,z"),
+                ("z-2", "scope-z", "repo-m"),
+                ("z-1", "scope-z", "repo,z"),
+            ],
+        ];
+
+        for conversations in fixtures {
+            let pool = test_pool().await;
+            setup_pre_065_git_repository_schema(&pool).await;
+            sqlx::query(
+                "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES
+                 ('repo,z', '/repos/z', 'main', '2025-01-01'),
+                 ('   ', '/repos/a', 'main', '2025-01-01'),
+                 ('repo-m', '/repos/m', 'main', '2025-01-01')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-z'), ('scope-a')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            for (id, scope_id, project_id) in conversations {
+                sqlx::query(
+                    "INSERT INTO conversations (id, work_scope_id, project_id) VALUES (?1, ?2, ?3)",
+                )
+                .bind(id)
+                .bind(scope_id)
+                .bind(project_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            stamp_migrations_except(&pool, 65).await;
+
+            let DbError::GitRepositoryWorkScopeProjectConflict {
+                work_scope_id,
+                project_ids,
+            } = run_pending_migrations(&pool).await.unwrap_err()
+            else {
+                panic!("expected typed migration conflict");
+            };
+            assert_eq!(work_scope_id.as_str(), "scope-a");
+            assert_eq!(
+                project_ids.map(|id| id.as_str().to_string()),
+                ["   ".to_string(), "repo,z".to_string()]
+            );
+            for table in [
+                "git_repositories",
+                "work_scope_git_repositories",
+                "git_repository_locator_observations",
+                "git_repository_default_branch_observations",
+            ] {
+                let exists: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(exists, 0, "preflight rollback must leave no {table}");
+            }
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 65")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_065_text_primary_keys_are_explicitly_not_null_and_reject_nulls() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        for (table, column) in [
+            ("git_repositories", "id"),
+            ("git_repository_locator_observations", "repository_id"),
+            ("git_repository_locator_observations", "locator_kind"),
+            (
+                "git_repository_default_branch_observations",
+                "repository_id",
+            ),
+            ("work_scope_git_repositories", "work_scope_id"),
+        ] {
+            let row = sqlx::query("SELECT name, \"notnull\", pk FROM pragma_table_info(?1)")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.get::<String, _>("name") == column)
+                .unwrap();
+            assert!(row.get::<i64, _>("pk") > 0, "{table}.{column} is a PK");
+            assert_eq!(row.get::<i64, _>("notnull"), 1, "{table}.{column}");
+        }
+        assert!(MIGRATION_065.contains(
+            "CREATE TEMP TABLE migration_065_scope_project_counts (\n    work_scope_id TEXT NOT NULL PRIMARY KEY"
+        ));
+
+        assert!(
+            sqlx::query("INSERT INTO git_repositories (id) VALUES (NULL)")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('repo-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for statement in [
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES (NULL, 1, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES (NULL, 'repo-1')",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES (NULL, 'common_dir', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-1', NULL, 'present', '/repo', 1735689600000000)",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_blob_storage_for_every_persisted_text_field() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('repo-text')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-text')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        for statement in [
+            "INSERT INTO git_repositories (id) VALUES (X'7265706f2d626c6f62')",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES (X'7265706f2d74657874', 'common_dir', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-kind', X'636f6d6d6f6e5f646972', 'present', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-status', 'common_dir', X'70726573656e74', '/repo', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-path', 'common_dir', 'present', X'2f7265706f', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-locator-time', 'common_dir', 'present', '/repo', 'not-integer')",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES (X'7265706f2d74657874', 1, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-status', 1, X'7265736f6c766564', 'main', 'user_selected', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-branch', 1, 'resolved', X'6d61696e', 'user_selected', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-provenance', 1, 'resolved', 'main', X'757365725f73656c6563746564', 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-default-time', 1, 'unresolved', NULL, NULL, 'not-integer')",
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES (X'73636f70652d74657874', 'repo-text')",
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id) VALUES ('scope-text', X'7265706f2d74657874')",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&mut *connection).await.is_err(),
+                "accepted non-text storage: {statement}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_065_rejects_nul_in_locator_paths_and_branch_names() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO git_repositories (id) VALUES
+             ('repo-nul-insert'), ('repo-nul-update')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let nul_path = "/repo\0nested";
+        assert!(
+            sqlx::query(
+                "INSERT INTO git_repository_locator_observations (
+                     repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES ('repo-nul-insert', 'common_dir', 'present', ?1, 1735689600000000)",
+            )
+            .bind(nul_path)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "locator path accepted embedded NUL"
+        );
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-nul-update', 'common_dir', 'present', '/repo', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "UPDATE git_repository_locator_observations
+                 SET path = ?1 WHERE repository_id = 'repo-nul-update'",
+            )
+            .bind(nul_path)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "locator path update accepted embedded NUL"
+        );
+
+        let nul_branch = "ma\0in";
+        assert!(
+            sqlx::query(
+                "INSERT INTO git_repository_default_branch_observations (
+                     repository_id, generation, status, branch, provenance, observed_at_unix_micros
+                 ) VALUES ('repo-nul-insert', 1, 'resolved', ?1, 'user_selected', 1735689600000000)",
+            )
+            .bind(nul_branch)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "branch name accepted embedded NUL"
+        );
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-nul-update', 1, 'resolved', 'main', 'user_selected', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "UPDATE git_repository_default_branch_observations
+                 SET branch = ?1 WHERE repository_id = 'repo-nul-update'",
+            )
+            .bind(nul_branch)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "branch update accepted embedded NUL"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn migration_065_enforces_unix_microsecond_observation_times() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        run_pending_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO git_repositories (id) VALUES
+             ('repo-time-zero'),
+             ('repo-time-later'),
+             ('repo-time-invalid-locator-negative'),
+             ('repo-time-invalid-locator-fraction'),
+             ('repo-time-invalid-locator-text'),
+             ('repo-time-invalid-branch-negative'),
+             ('repo-time-invalid-branch-fraction'),
+             ('repo-time-invalid-branch-text'),
+             ('repo-time-update')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-time-zero', 'common_dir', 'present', '/zero', 0),
+                      ('repo-time-later', 'common_dir', 'present', '/later', 1735689600000001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-time-zero', 1, 'unresolved', NULL, NULL, 0),
+                      ('repo-time-later', 1, 'unresolved', NULL, NULL, 1735689600000001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ordered: Vec<i64> = sqlx::query_scalar(
+            "SELECT observed_at_unix_micros
+             FROM git_repository_locator_observations
+             ORDER BY observed_at_unix_micros",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ordered, vec![0, 1_735_689_600_000_001]);
+
+        for (statement, failure_message) in [
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-negative', 'common_dir', 'present', '/invalid', -1)",
+                "locator observation accepted a negative timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-fraction', 'common_dir', 'present', '/invalid', 0.5)",
+                "locator observation accepted a fractional timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-time-invalid-locator-text', 'common_dir', 'present', '/invalid', 'not-integer')",
+                "locator observation accepted a text timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-negative', 1, 'unresolved', NULL, NULL, -1)",
+                "default-branch observation accepted a negative timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-fraction', 1, 'unresolved', NULL, NULL, 0.5)",
+                "default-branch observation accepted a fractional timestamp",
+            ),
+            (
+                "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-time-invalid-branch-text', 1, 'unresolved', NULL, NULL, 'not-integer')",
+                "default-branch observation accepted a text timestamp",
+            ),
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&pool).await.is_err(),
+                "{failure_message}"
+            );
+        }
+
+        sqlx::query(
+            "INSERT INTO git_repository_locator_observations (
+                 repository_id, locator_kind, status, path, observed_at_unix_micros
+             ) VALUES ('repo-time-update', 'common_dir', 'present', '/update', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE git_repository_locator_observations
+                 SET observed_at_unix_micros = -1
+                 WHERE repository_id = 'repo-time-update'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE git_repository_default_branch_observations
+                 SET observed_at_unix_micros = 'not-integer'
+                 WHERE repository_id = 'repo-time-zero'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_065_enforces_git_repository_shadow_constraints() {
+        let pool = test_pool().await;
+        setup_pre_065_git_repository_schema(&pool).await;
+        stamp_migrations_except(&pool, 65).await;
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        assert!(sqlx::query("INSERT INTO git_repositories (id) VALUES ('')")
+            .execute(&pool)
+            .await
+            .is_err());
+
+        sqlx::query("INSERT INTO git_repositories (id) VALUES ('repo-1'), ('repo-2')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO git_repositories (id) VALUES
+             ('repo-generation-negative'), ('repo-generation-zero'),
+             ('repo-generation-fraction'), ('repo-generation-text'),
+             ('repo-shape-resolved'), ('repo-shape-unresolved')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO work_scopes (id) VALUES ('scope-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for (repository_id, locator_kind, status, path) in [
+            ("repo-1", "common_dir", "present", "/repo/present"),
+            ("repo-1", "management_root", "missing", "/repo/missing"),
+            ("repo-2", "common_dir", "inaccessible", "/repo/inaccessible"),
+        ] {
+            sqlx::query(
+                "INSERT INTO git_repository_locator_observations (
+                     repository_id, locator_kind, status, path, observed_at_unix_micros
+                 ) VALUES (?1, ?2, ?3, ?4, 1735689600000000)",
+            )
+            .bind(repository_id)
+            .bind(locator_kind)
+            .bind(status)
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let locators: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT repository_id, locator_kind, status, path
+             FROM git_repository_locator_observations
+             ORDER BY repository_id, locator_kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            locators,
+            vec![
+                (
+                    "repo-1".to_string(),
+                    "common_dir".to_string(),
+                    "present".to_string(),
+                    "/repo/present".to_string()
+                ),
+                (
+                    "repo-1".to_string(),
+                    "management_root".to_string(),
+                    "missing".to_string(),
+                    "/repo/missing".to_string()
+                ),
+                (
+                    "repo-2".to_string(),
+                    "common_dir".to_string(),
+                    "inaccessible".to_string(),
+                    "/repo/inaccessible".to_string()
+                ),
+            ]
+        );
+        for statement in [
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'present', NULL, 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'present', '', 1735689600000000)",
+            "INSERT INTO git_repository_locator_observations (repository_id, locator_kind, status, path, observed_at_unix_micros) VALUES ('repo-2', 'management_root', 'unknown', '/repo/unknown', 1735689600000000)",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+        }
+
+        sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-1', 3, 'resolved', 'main', 'remote_head_cache', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-generation-negative', -1, 'unresolved', NULL, NULL, 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        for statement in [
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-zero', 0, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-fraction', 0.5, 'unresolved', NULL, NULL, 1735689600000000)",
+            "INSERT INTO git_repository_default_branch_observations (repository_id, generation, status, branch, provenance, observed_at_unix_micros) VALUES ('repo-generation-text', 'not-a-generation', 'unresolved', NULL, NULL, 1735689600000000)",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&pool).await.is_err(),
+                "accepted invalid generation: {statement}"
+            );
+        }
+        assert!(sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-shape-resolved', 1, 'resolved', 'main', NULL, 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO git_repository_default_branch_observations (
+                 repository_id, generation, status, branch, provenance, observed_at_unix_micros
+             ) VALUES ('repo-shape-unresolved', 1, 'unresolved', 'main', 'remote_head_cache', 1735689600000000)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query(
+            "INSERT INTO work_scope_git_repositories (work_scope_id, repository_id)
+             VALUES ('scope-1', 'repo-2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query("DELETE FROM git_repositories WHERE id = 'repo-2'")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        sqlx::query("DELETE FROM work_scopes WHERE id = 'scope-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let attachment_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scope_git_repositories WHERE work_scope_id = 'scope-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attachment_count, 0,
+            "scope delete must cascade attachment removal"
+        );
     }
 
     #[allow(clippy::too_many_lines)]

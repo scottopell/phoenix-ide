@@ -5,6 +5,7 @@
 mod close_foundation;
 mod coordinator_query;
 mod ddl;
+mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
 pub mod workflow;
@@ -26,6 +27,9 @@ use phoenix_core::work_scope::{
 pub use close_foundation::*;
 pub use coordinator_query::{
     execute_coordinator_query, CoordinatorQueryError, CoordinatorQueryResult,
+};
+pub(crate) use git_repository_reconciliation::{
+    DormantGitRepositoryCatchupOutcome, DormantGitRepositoryCatchupPermit,
 };
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
@@ -131,6 +135,48 @@ pub enum CloseFoundationRepair {
     },
 }
 
+/// Project identity carried only to the repository seed boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProjectSeedId(String);
+
+impl ProjectSeedId {
+    /// # Errors
+    /// Returns [`ProjectSeedIdError`] when the supplied identifier is empty.
+    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, ProjectSeedIdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProjectSeedIdError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProjectSeedId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectSeedIdError {
+    Empty,
+}
+
+impl std::fmt::Display for ProjectSeedIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Project seed id must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectSeedIdError {}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
@@ -160,6 +206,25 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
+    #[error("git repository work-scope project conflict for {work_scope_id}: {project_ids:?}")]
+    GitRepositoryWorkScopeProjectConflict {
+        work_scope_id: WorkScopeId,
+        project_ids: [ProjectSeedId; 2],
+    },
+    #[error("dormant git repository catch-up permit targeted a different database")]
+    DormantGitRepositoryCatchupPermitTargetMismatch,
+    #[error("dormant git repository catch-up operation is stale")]
+    DormantGitRepositoryCatchupStaleOperation,
+    #[error("dormant git repository catch-up cannot start while readiness has claimed a receipt")]
+    DormantGitRepositoryCatchupBlockedByReadinessClaim,
+    #[error(
+        "dormant git repository readiness cannot claim a receipt while catch-up is in progress"
+    )]
+    DormantGitRepositoryReadinessCatchupInProgress,
+    #[error("dormant git repository readiness receipt targeted a different database lifecycle")]
+    DormantGitRepositoryReadinessReceiptTargetMismatch,
+    #[error("dormant git repository readiness receipt did not match an exact completed catch-up operation")]
+    DormantGitRepositoryReadinessReceiptOperationMismatch,
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -1105,12 +1170,25 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
-#[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
+    dormant_git_repository_catchup_authority_state:
+        std::sync::Arc<git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState>,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            path: self.path.clone(),
+            dormant_git_repository_catchup_authority_state: self
+                .dormant_git_repository_catchup_authority_state
+                .clone(),
+        }
+    }
 }
 
 fn sqlite_constraint_code_is(code: Option<&str>, expected: &str) -> bool {
@@ -1186,6 +1264,50 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    #[allow(
+        dead_code,
+        reason = "task 59004 consumes the existing dormant catch-up seam"
+    )]
+    pub(crate) async fn catch_up_dormant_git_repositories(
+        &self,
+        permit: DormantGitRepositoryCatchupPermit,
+    ) -> DbResult<DormantGitRepositoryCatchupOutcome> {
+        git_repository_reconciliation::catch_up_dormant_git_repositories(self, permit).await
+    }
+
+    #[allow(dead_code, reason = "task 59004 consumes the dormant readiness facade")]
+    pub(crate) async fn validate_dormant_git_repository_readiness(
+        &self,
+        receipt: git_repository_reconciliation::DormantGitRepositoryCatchupReceipt,
+    ) -> DbResult<git_repository_reconciliation::DormantGitRepositoryCanonicalReadinessEvidence>
+    {
+        git_repository_reconciliation::validate_dormant_git_repository_readiness(self, receipt)
+            .await
+    }
+
+    pub(crate) fn dormant_git_repository_target_binding(
+        &self,
+    ) -> git_repository_reconciliation::DormantGitRepositoryTargetBinding {
+        git_repository_reconciliation::DormantGitRepositoryTargetBinding::for_state(
+            self.dormant_git_repository_catchup_authority_state.clone(),
+        )
+    }
+
+    fn new_with_generated_target_binding(pool: SqlitePool, path: String) -> Self {
+        Self {
+            pool,
+            path,
+            dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
+                git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pool_for_tests(pool: SqlitePool, path: String) -> Self {
+        Self::new_with_generated_target_binding(pool, path)
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
@@ -2503,10 +2625,7 @@ impl Database {
         // can leave it world-readable, so tighten to owner-only. Best-effort:
         // a chmod failure is logged, never fatal to startup.
         restrict_db_permissions(path);
-        let db = Self {
-            pool,
-            path: path.to_string(),
-        };
+        let db = Self::new_with_generated_target_binding(pool, path.to_string());
         db.run_migrations().await?;
         // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
         // early chmod above could not see. Re-tighten now they exist. The prod
@@ -2554,10 +2673,7 @@ impl Database {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        let db = Self {
-            pool,
-            path: String::new(),
-        };
+        let db = Self::new_with_generated_target_binding(pool, String::new());
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)
@@ -19451,10 +19567,7 @@ mod tests {
         .await
         .unwrap();
 
-        let db = Database {
-            pool,
-            path: String::new(),
-        };
+        let db = Database::from_pool_for_tests(pool, String::new());
         db.run_migrations().await.unwrap();
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

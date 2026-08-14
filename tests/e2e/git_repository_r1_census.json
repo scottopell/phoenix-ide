@@ -1,0 +1,444 @@
+{
+  "project_authority_path_count": 909,
+  "project_authority_paths": [
+    {
+      "classification": "authority_writer",
+      "name": "project_find_or_create",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 5,
+        "crates/phoenix-ide/src/drive_turn.rs": 1,
+        "crates/phoenix-ide/src/lib.rs": 25,
+        "crates/phoenix-ide/src/runtime/creation_worker.rs": 1,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 1,
+        "dev.py": 3
+      },
+      "pattern": "find_or_create_project("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "project_get",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 3,
+        "crates/phoenix-ide/src/api/lifecycle_handlers.rs": 2,
+        "crates/phoenix-ide/src/lib.rs": 7,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 2
+      },
+      "pattern": "get_project("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "project_list",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 3,
+        "crates/phoenix-ide/src/lib.rs": 2
+      },
+      "pattern": "list_projects("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "project_main_ref",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-ide/src/lib.rs": 2
+      },
+      "pattern": "update_project_main_ref("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_project_persistence",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 7,
+        "crates/phoenix-ide/src/api/handlers.rs": 11,
+        "crates/phoenix-ide/src/drive_turn.rs": 2,
+        "crates/phoenix-ide/src/lib.rs": 1,
+        "crates/phoenix-ide/src/runtime.rs": 1,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 1
+      },
+      "pattern": "create_conversation_with_project("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_project_inheritance",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 16,
+        "crates/phoenix-ide/src/api/handlers.rs": 1
+      },
+      "pattern": "continue_conversation("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "subagent_work_scope_inheritance",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 2,
+        "crates/phoenix-ide/src/runtime.rs": 3
+      },
+      "pattern": "create_subagent_conversation("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "active_work_eligibility",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1
+      },
+      "pattern": "has_active_work_conversation("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "work_scope_creation",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 5
+      },
+      "pattern": "insert_work_scope_tx("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "work_scope_environment",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 4
+      },
+      "pattern": "update_work_scope_environment_tx("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "work_scope_lifecycle_cleanup",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 6,
+        "crates/phoenix-ide/src/api/handlers.rs": 1,
+        "crates/phoenix-ide/src/runtime.rs": 1
+      },
+      "pattern": "retire_work_scope("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_lifecycle_archive",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-db/src/retrieval.rs": 2,
+        "crates/phoenix-ide/src/api/handlers.rs": 4,
+        "crates/phoenix-ide/src/runtime.rs": 1,
+        "crates/phoenix-ide/src/send_chat_service.rs": 1
+      },
+      "pattern": "archive_conversation("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_lifecycle_delete",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 7,
+        "crates/phoenix-db/src/retrieval.rs": 2,
+        "crates/phoenix-ide/src/api/handlers.rs": 2
+      },
+      "pattern": "delete_conversation("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_workscope_metadata",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 3,
+        "crates/phoenix-ide/src/runtime/creation_worker.rs": 1
+      },
+      "pattern": "update_conversation_creation_metadata_and_mode("
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_insert",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 5
+      },
+      "pattern": "insert_conversation_tx("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "direct_project_authority_read",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1
+      },
+      "pattern": "SELECT id FROM projects ORDER BY id"
+    },
+    {
+      "classification": "authority_writer",
+      "name": "direct_project_authority_write",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-db/src/migrations.rs": 7,
+        "dev.py": 1
+      },
+      "pattern": "INSERT INTO projects (id, canonical_path, main_ref, created_at)"
+    },
+    {
+      "classification": "authority_writer",
+      "name": "direct_project_main_ref_write",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1
+      },
+      "pattern": "UPDATE projects SET main_ref = ?1 WHERE id = ?2"
+    },
+    {
+      "classification": "authority_reader",
+      "name": "direct_project_active_work",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1
+      },
+      "pattern": "WHERE project_id = ?1 AND archived = 0"
+    },
+    {
+      "classification": "authority_writer",
+      "name": "direct_project_assignment_write",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 2
+      },
+      "pattern": "project_id = CASE"
+    },
+    {
+      "classification": "authority_path",
+      "name": "global_read_projection",
+      "occurrences": {
+        "crates/phoenix-ide/src/api/global_read.rs": 1
+      },
+      "pattern": "const SNAPSHOT_SQL: &str = r\""
+    },
+    {
+      "classification": "authority_reader",
+      "name": "usage_projection",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-ide/src/api/usage.rs": 1
+      },
+      "pattern": "usage_by_conversation("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "analytics_projection",
+      "occurrences": {
+        "crates/phoenix-db/src/lib.rs": 2,
+        "crates/phoenix-ide/src/analytics.rs": 1
+      },
+      "pattern": "analytics_conversation_ids_for_root("
+    },
+    {
+      "classification": "authority_reader",
+      "name": "lifecycle_eligibility_projection",
+      "occurrences": {
+        "crates/phoenix-db/src/close_foundation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 11
+      },
+      "pattern": "c.project_id, c.desired_base_branch"
+    },
+    {
+      "classification": "authority_reader",
+      "name": "shadow_project_attachment_projection",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1
+      },
+      "pattern": "SELECT attachment.work_scope_id, c.project_id"
+    },
+    {
+      "classification": "offline_authority_writer",
+      "name": "offline_seeder_project_find_or_create",
+      "occurrences": {
+        "dev.py": 3
+      },
+      "pattern": "_find_or_create_project("
+    },
+    {
+      "classification": "offline_authority_writer",
+      "name": "offline_seeder_conversation_project_persistence",
+      "occurrences": {
+        "crates/phoenix-db/src/close_foundation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 6,
+        "crates/phoenix-db/src/migrations.rs": 32,
+        "dev.py": 1
+      },
+      "pattern": "INSERT INTO conversations ("
+    },
+    {
+      "classification": "authority_catchall",
+      "name": "project_id_token_catchall",
+      "occurrences": {
+        "crates/phoenix-core/src/domain/db_schema.rs": 3,
+        "crates/phoenix-core/src/git_repository.rs": 1,
+        "crates/phoenix-db/src/close_foundation.rs": 1,
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 49,
+        "crates/phoenix-db/src/lib.rs": 61,
+        "crates/phoenix-db/src/migrations.rs": 33,
+        "crates/phoenix-db/src/workflow/direct_turn.rs": 1,
+        "crates/phoenix-ide/src/analytics.rs": 4,
+        "crates/phoenix-ide/src/api/deployment.rs": 1,
+        "crates/phoenix-ide/src/api/git_handlers.rs": 1,
+        "crates/phoenix-ide/src/api/global_read.rs": 4,
+        "crates/phoenix-ide/src/api/handlers.rs": 18,
+        "crates/phoenix-ide/src/api/lifecycle_handlers.rs": 8,
+        "crates/phoenix-ide/src/api/sse.rs": 2,
+        "crates/phoenix-ide/src/api/usage.rs": 11,
+        "crates/phoenix-ide/src/drive_turn.rs": 4,
+        "crates/phoenix-ide/src/lib.rs": 7,
+        "crates/phoenix-ide/src/runtime.rs": 1,
+        "crates/phoenix-ide/src/runtime/creation_worker.rs": 6,
+        "crates/phoenix-ide/src/runtime/executor.rs": 2,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 16,
+        "crates/phoenix-tools/src/process_inspection.rs": 1,
+        "dev.py": 50
+      },
+      "pattern": "project_id"
+    },
+    {
+      "classification": "authority_catchall",
+      "name": "projects_token_catchall",
+      "occurrences": {
+        "crates/phoenix-agents/src/lib.rs": 4,
+        "crates/phoenix-core/src/llm_language.rs": 1,
+        "crates/phoenix-db/src/ddl.rs": 4,
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 11,
+        "crates/phoenix-db/src/lib.rs": 9,
+        "crates/phoenix-db/src/migrations.rs": 15,
+        "crates/phoenix-db/src/workflow/direct_turn.rs": 1,
+        "crates/phoenix-ide/src/api/chains.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 16,
+        "crates/phoenix-ide/src/lib.rs": 16,
+        "crates/phoenix-ide/src/resolution_root.rs": 3,
+        "crates/phoenix-ide/src/runtime/wake.rs": 1,
+        "crates/phoenix-skills/src/lib.rs": 1,
+        "crates/phoenix-tools/src/process_inspection.rs": 2,
+        "crates/phoenix-tools/src/work_scope_inventory.rs": 6,
+        "dev.py": 2,
+        "phoenix-client.py": 15
+      },
+      "pattern": "projects"
+    },
+    {
+      "classification": "authority_catchall",
+      "name": "project_type_token_catchall",
+      "occurrences": {
+        "crates/phoenix-core/src/domain/db_schema.rs": 3,
+        "crates/phoenix-core/src/domain/llm_error_kind.rs": 1,
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 19,
+        "crates/phoenix-db/src/lib.rs": 22,
+        "crates/phoenix-db/src/migrations.rs": 6,
+        "crates/phoenix-db/src/workflow/direct_turn.rs": 6,
+        "crates/phoenix-db/src/workflow/wake.rs": 11,
+        "crates/phoenix-ide/src/api/global_read.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 20,
+        "crates/phoenix-ide/src/api/types.rs": 3,
+        "crates/phoenix-ide/src/api/usage.rs": 4,
+        "crates/phoenix-ide/src/lib.rs": 2,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 2,
+        "crates/phoenix-ide/src/runtime/traits.rs": 1,
+        "crates/phoenix-ide/src/send_chat_service.rs": 2,
+        "crates/phoenix-ide/src/system_prompt.rs": 3,
+        "crates/phoenix-state-machine/src/transition.rs": 1,
+        "crates/phoenix-tools/src/process_inspection.rs": 1,
+        "crates/phoenix-tools/src/work_scope_inventory.rs": 2,
+        "crates/phoenix-workflow/src/tests.rs": 1,
+        "crates/phoenix-workflow/src/wake_profile.rs": 2,
+        "dev.py": 2
+      },
+      "pattern": "Project"
+    },
+    {
+      "classification": "authority_catchall",
+      "name": "canonical_path_token_catchall",
+      "occurrences": {
+        "crates/phoenix-core/src/domain/db_schema.rs": 1,
+        "crates/phoenix-db/src/ddl.rs": 2,
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 2,
+        "crates/phoenix-db/src/lib.rs": 13,
+        "crates/phoenix-db/src/migrations.rs": 8,
+        "crates/phoenix-db/src/workflow/direct_turn.rs": 1,
+        "crates/phoenix-ide/src/api/handlers.rs": 8,
+        "crates/phoenix-ide/src/api/lifecycle_handlers.rs": 2,
+        "crates/phoenix-ide/src/lib.rs": 5,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 4,
+        "dev.py": 5
+      },
+      "pattern": "canonical_path"
+    },
+    {
+      "classification": "authority_catchall",
+      "name": "main_ref_token_catchall",
+      "occurrences": {
+        "crates/phoenix-core/src/domain/db_schema.rs": 1,
+        "crates/phoenix-core/src/git.rs": 3,
+        "crates/phoenix-db/src/ddl.rs": 1,
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 2,
+        "crates/phoenix-db/src/lib.rs": 16,
+        "crates/phoenix-db/src/migrations.rs": 9,
+        "crates/phoenix-db/src/workflow/direct_turn.rs": 1,
+        "crates/phoenix-ide/src/drive_turn.rs": 1,
+        "crates/phoenix-ide/src/lib.rs": 65,
+        "crates/phoenix-ide/src/runtime/fork_resolve.rs": 7,
+        "dev.py": 1
+      },
+      "pattern": "main_ref"
+    },
+    {
+      "classification": "authority_writer",
+      "name": "direct_project_insert_sql",
+      "occurrences": {
+        "crates/phoenix-db/src/git_repository_reconciliation.rs": 1,
+        "crates/phoenix-db/src/lib.rs": 1,
+        "crates/phoenix-db/src/migrations.rs": 7,
+        "dev.py": 1
+      },
+      "pattern": "INSERT INTO projects"
+    },
+    {
+      "classification": "authority_writer",
+      "name": "conversation_project_id_persistence",
+      "occurrences": {
+        "dev.py": 1
+      },
+      "pattern": "model, project_id"
+    }
+  ],
+  "revision": "r1-authority-census-v4",
+  "shadow_caller_occurrences": {
+    "catch_up_dormant_git_repositories": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 15,
+      "crates/phoenix-db/src/lib.rs": 2
+    },
+    "validate_dormant_git_repository_readiness": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 5,
+      "crates/phoenix-db/src/lib.rs": 2
+    },
+    "test_only_mint": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 14
+    }
+  },
+  "shadow_caller_symbols": [
+    "catch_up_dormant_git_repositories",
+    "validate_dormant_git_repository_readiness",
+    "test_only_mint"
+  ],
+  "shadow_reference_count": 218,
+  "shadow_table_occurrences": {
+    "git_repositories": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 43,
+      "crates/phoenix-db/src/lib.rs": 2,
+      "crates/phoenix-db/src/migrations.rs": 43
+    },
+    "work_scope_git_repositories": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 8,
+      "crates/phoenix-db/src/migrations.rs": 17
+    },
+    "git_repository_locator_observations": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 5,
+      "crates/phoenix-db/src/migrations.rs": 29
+    },
+    "git_repository_default_branch_observations": {
+      "crates/phoenix-db/src/git_repository_reconciliation.rs": 6,
+      "crates/phoenix-db/src/migrations.rs": 27
+    }
+  },
+  "shadow_tables": [
+    "git_repositories",
+    "work_scope_git_repositories",
+    "git_repository_locator_observations",
+    "git_repository_default_branch_observations"
+  ]
+}

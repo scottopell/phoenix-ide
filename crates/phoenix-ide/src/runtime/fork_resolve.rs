@@ -1577,7 +1577,16 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ConversationAlreadyExists(_)
-        | DbError::DirectTurnConflict(_) => ForkResolveError::Internal(e.to_string()),
+        | DbError::DirectTurnConflict(_)
+        | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | DbError::DormantGitRepositoryCatchupStaleOperation
+        | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch => {
+            ForkResolveError::Internal(e.to_string())
+        }
     }
 }
 

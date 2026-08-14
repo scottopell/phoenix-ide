@@ -29,6 +29,10 @@ AND SHALL treat separate clones as distinct hidden `GitRepository` identities ev
 THE SYSTEM SHALL NOT derive hidden `GitRepository` identity from a canonical path string, remote URL, repository slug, host/name pair, or guessed continuity across restarts
 AND SHALL NOT infer that two observations are "the same repository" solely because a path reappeared, a slug matched, or a remote looked similar
 
+WHEN an operator restores or replaces the Phoenix database
+THE SYSTEM SHALL require Phoenix to be stopped before the database files change
+AND SHALL NOT claim support for replacing the database beneath a running Phoenix process
+
 **Rationale:** Phoenix needs durable local repository identity for provisioning and repair, but users do not need Phoenix to elevate that hidden identity into a user-facing repository object or to guess sameness from mutable environmental strings.
 
 ---
@@ -61,6 +65,8 @@ THE SYSTEM SHALL represent that observation as an optional value carrying:
 - the observed branch identity
 - the provenance, one of `remote_head_cache`, `local_checked_out_branch`, or `user_selected`
 - the exact `observed_at` time
+
+THE SYSTEM SHALL persist new locator and default-branch observation times as non-negative Unix microseconds
 
 WHEN Phoenix lacks authoritative evidence for a canonical default branch
 THE SYSTEM SHALL represent that state as unresolved rather than fabricating a branch name

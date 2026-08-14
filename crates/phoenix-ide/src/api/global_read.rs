@@ -1102,7 +1102,16 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ForkProposalConflict(_)
-        | DbError::DirectTurnConflict(_)) => AppError::Internal(other.to_string()),
+        | DbError::DirectTurnConflict(_)
+        | DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | DbError::DormantGitRepositoryCatchupStaleOperation
+        | DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | DbError::DormantGitRepositoryReadinessReceiptOperationMismatch) => {
+            AppError::Internal(other.to_string())
+        }
     }
 }
 

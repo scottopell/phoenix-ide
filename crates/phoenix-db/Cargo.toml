@@ -1,5 +1,6 @@
 [package]
 name = "phoenix-db"
+build = "build.rs"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
@@ -15,6 +16,9 @@ path = "src/lib.rs"
 # conversations in their own tests enable this feature via dev-dependencies.
 # Off in production builds.
 test-support = []
+
+[build-dependencies]
+phoenix-core = { path = "../phoenix-core" }
 
 [dependencies]
 # Shared domain vocabulary (persisted schema types, ConvState, ContentBlock,
@@ -44,6 +48,7 @@ thiserror = "2"
 
 tracing = "0.1"
 libc = "0.2"
+sha2 = "0.11"
 
 # Async trait objects for the MessageRetriever seam (Arc<dyn MessageRetriever>).
 async-trait = "0.1"
