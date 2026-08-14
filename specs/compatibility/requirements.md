@@ -47,19 +47,23 @@ AND SHALL require each migration's owning feature requirements to define whether
 
 ---
 
-### REQ-COMP-003 — Database Recovery Is Feature-Scoped
+### REQ-COMP-003 — Database Recovery Is Offline and Feature-Scoped
 
 THE SYSTEM SHALL NOT provide a general automatic database rollback subsystem
 
-WHEN a deployment or recovery operation restores a previous Phoenix binary without restoring its matching previous database
+WHEN an operator rolls Phoenix back to an older binary version
+THE SYSTEM SHALL require Phoenix to be stopped
+AND SHALL require the database backup paired with that binary version to be restored before the binary starts
+
+WHEN an automated deployment restores a previous binary without restoring its matching previous database
 THE SYSTEM SHALL describe the outcome as runtime-artifact rollback
 AND SHALL NOT guarantee that the restored binary can use a database changed by the candidate
 
-WHEN a feature requires recovery of matching runtime and database state
+WHEN a feature requires additional automated recovery of matching runtime and database state
 THE SYSTEM SHALL require that feature's normative requirements to define the recovery boundary and guarantees
 AND SHALL implement only the feature-scoped recovery mechanism required by that contract
 
-**Rationale:** A generic database rollback subsystem would impose permanent snapshot, restore, recovery, and verification complexity on every deployment. A feature with demonstrated recovery value can own a narrower mechanism and its costs explicitly.
+**Rationale:** Manual offline paired restore supports version rollback without a generic snapshot-management subsystem. Any additional automation would impose recovery and verification complexity and must be justified by the feature that needs it.
 
 ---
 

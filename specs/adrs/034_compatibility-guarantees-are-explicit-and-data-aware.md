@@ -26,7 +26,7 @@ A compatibility, downgrade, rollback, recovery, or live-resource-replacement beh
 
 Phoenix guarantees ordered forward migration for older databases with no ledger and for ledger states produced by supported Phoenix migration and seeding tools when every recorded version exists in the binary's embedded migration set. Pending migrations are determined by individual version membership, allowing intentional Phoenix-created gaps; Phoenix does not guarantee damaged or manually changed ledgers, or backward access by an older binary to migrations it does not contain. Data preservation, transformation, or retirement is a product decision owned by each migration's feature requirements rather than a project-wide guarantee.
 
-Restoring a previous binary without its matching database is runtime-artifact rollback. Phoenix does not build a general automatic database rollback subsystem. If a feature demonstrates a need to recover matching runtime and database state, that feature's normative requirements own a narrow recovery mechanism and its guarantees.
+Phoenix does not build a general automatic database rollback subsystem. An operator rolling back binary versions stops Phoenix, restores the database backup paired with the target binary, and then starts that binary. Existing automated deployment may restore runtime artifacts without the database; that outcome is runtime-artifact rollback and carries no guarantee that the restored binary can use a database changed by the candidate. If a feature demonstrates a need for additional automated matching-state recovery, that feature's normative requirements own a narrow mechanism and its guarantees.
 
 One backend-managed Phoenix runtime version exclusively owns a production database. Database restore and replacement occur only while that runtime is stopped; mixed-version or independently launched Phoenix processes sharing the database are unsupported. Phoenix does not add live database-file replacement fencing.
 
@@ -36,7 +36,7 @@ Phoenix-owned internal SQLite timestamps default to explicitly unit-named intege
 
 - **Positive:** Migration design is not constrained by accidental historical-binary compatibility.
 - **Positive:** Feature owners decide whether migrations preserve, transform, or retire their data.
-- **Positive:** Runtime-artifact rollback is not mistaken for a general database recovery guarantee.
+- **Positive:** Manual offline paired restore remains available without a general automatic rollback subsystem, and runtime-artifact rollback is not mistaken for database recovery.
 - **Positive:** Offline restore avoids a database-instance fencing protocol across connection pools and operations.
 - **Positive:** Integer timestamps preserve ordering with one representation and simple SQLite type checks.
 - **Negative:** A feature that needs matching runtime/database recovery must explicitly justify and implement its own bounded mechanism.
