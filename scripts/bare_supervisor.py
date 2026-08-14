@@ -476,7 +476,9 @@ class Supervisor:
         ):
             raise SupervisorError("unsupported supervisor protocol")
         if action == "status":
-            return {"ok": True, **self.status()}
+            response = {"ok": True, **self.status()}
+            response["protocol_version"] = protocol_version
+            return response
         if action == "stop":
             self.stop_child()
             return {"ok": True, **self.status()}

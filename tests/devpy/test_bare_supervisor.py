@@ -56,6 +56,7 @@ class BareSupervisorUnitTests(unittest.TestCase):
             owner = supervisor.Supervisor(supervisor.Layout(Path(td)))
             response = owner.dispatch({"protocol_version": 1, "action": "status"})
             self.assertTrue(response["ok"])
+            self.assertEqual(1, response["protocol_version"])
             with self.assertRaisesRegex(supervisor.SupervisorError, "unsupported supervisor protocol"):
                 owner.dispatch({"protocol_version": 1, "action": "stop"})
 

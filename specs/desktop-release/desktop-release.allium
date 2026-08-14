@@ -9,7 +9,8 @@
 
 enum TagGateState { unresolved | exact_tag_match | new_tag_created | different_commit_refused }
 enum BuildState { pending | ready | built | failed }
-enum SignatureState { unsigned | signed_once | verified | app_signed | app_verified | failed }
+enum HelperSignatureState { unsigned | signed_once | verified | failed }
+enum AppSignatureState { unsigned | app_signed | app_verified | failed }
 enum NotaryState { pending | submitted | stapled | validated | failed }
 enum PublishState { idle | creating | replacing | committing | interrupted | mixed | completed | failed }
 enum AssetScope { standalone_helper | desktop_archive | checksum_set }
@@ -48,7 +49,7 @@ entity StandaloneHelperBuild {
     target: String
     identity: ReleaseIdentity
     build: BuildState
-    signature: SignatureState
+    signature: HelperSignatureState
     published_asset: ReleaseAsset?
 
     transitions build {
@@ -73,7 +74,7 @@ entity DesktopArchiveBuild {
     target: String
     identity: ReleaseIdentity
     build: BuildState
-    app_signature: SignatureState
+    app_signature: AppSignatureState
     notarization: NotaryState
     archive_asset: ReleaseAsset?
 
