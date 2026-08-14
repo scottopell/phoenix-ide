@@ -415,12 +415,12 @@
     "validate_dormant_git_repository_readiness",
     "test_only_mint"
   ],
-  "shadow_reference_count": 233,
+  "shadow_reference_count": 241,
   "shadow_table_occurrences": {
     "git_repositories": {
       "crates/phoenix-db/src/git_repository_reconciliation.rs": 66,
       "crates/phoenix-db/src/lib.rs": 2,
-      "crates/phoenix-db/src/migrations.rs": 40
+      "crates/phoenix-db/src/migrations.rs": 42
     },
     "work_scope_git_repositories": {
       "crates/phoenix-db/src/git_repository_reconciliation.rs": 13,
@@ -428,11 +428,11 @@
     },
     "git_repository_locator_observations": {
       "crates/phoenix-db/src/git_repository_reconciliation.rs": 10,
-      "crates/phoenix-db/src/migrations.rs": 19
+      "crates/phoenix-db/src/migrations.rs": 22
     },
     "git_repository_default_branch_observations": {
       "crates/phoenix-db/src/git_repository_reconciliation.rs": 11,
-      "crates/phoenix-db/src/migrations.rs": 19
+      "crates/phoenix-db/src/migrations.rs": 22
     }
   },
   "shadow_tables": [
