@@ -1,0 +1,27 @@
+{
+  "revision": "r1-authority-census-v1",
+  "shadow_tables": [
+    "git_repositories",
+    "work_scope_git_repositories",
+    "git_repository_locator_observations",
+    "git_repository_default_branch_observations"
+  ],
+  "shadow_reference_files": [
+    "crates/phoenix-db/src/git_repository_reconciliation.rs",
+    "crates/phoenix-db/src/lib.rs",
+    "crates/phoenix-db/src/migrations.rs"
+  ],
+  "shadow_production_roles": {
+    "crates/phoenix-db/src/migrations.rs": "additive migration only",
+    "crates/phoenix-db/src/git_repository_reconciliation.rs": "dormant reconciliation only",
+    "crates/phoenix-db/src/lib.rs": "private dormant reconciliation seam only"
+  },
+  "project_authority_paths": [
+    "crates/phoenix-db/src/lib.rs",
+    "crates/phoenix-ide/src/api/handlers.rs",
+    "crates/phoenix-ide/src/drive_turn.rs",
+    "crates/phoenix-ide/src/lib.rs",
+    "crates/phoenix-ide/src/runtime/creation_worker.rs",
+    "crates/phoenix-ide/src/runtime/fork_resolve.rs"
+  ]
+}
