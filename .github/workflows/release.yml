@@ -123,6 +123,7 @@ jobs:
           path: phoenix_ide-${{ matrix.target }}*
 
   build-macos:
+    environment: macos-release-signing
     needs: gate
     if: needs.gate.outputs.release == 'true'
     strategy:
@@ -194,6 +195,7 @@ jobs:
           path: ${{ matrix.asset }}
 
   build-macos-desktop:
+    environment: macos-release-signing
     needs: [gate, build-macos]
     if: needs.gate.outputs.release == 'true'
     strategy:

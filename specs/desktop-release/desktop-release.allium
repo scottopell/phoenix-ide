@@ -146,6 +146,8 @@ surface DesktopReleaseWorkflow {
 --   the existing release tag resolves to gate.identity.full_commit exactly.
 -- tag_absent_for_identity(gate) -> Boolean
 --   no existing release tag with gate.identity.tag exists.
+-- release_absent_for_identity(identity) -> Boolean
+--   no GitHub Release exists for identity.tag.
 -- helper_bytes_equal_signed_asset(helper, archive) -> Boolean
 --   the helper embedded in archive is byte-identical to the signed standalone
 --   helper artifact published for the same target and identity both before and
@@ -325,6 +327,7 @@ rule PublishCreatesFreshReleaseFromCompleteAssetSet {
     requires: publication.state = creating
     requires: gate.state = new_tag_created or gate.state = exact_tag_match
     requires: gate.identity = publication.identity
+    requires: release_absent_for_identity(publication.identity)
     requires: release_builds_verified(publication)
     requires: required_release_assets_complete(publication)
     requires: checksum_membership_complete(publication)
