@@ -133,6 +133,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let currentOperation = serverManager.currentOperationToken
         let staleBrowserOperation = browserOperation != nil && browserOperation != currentOperation
         if state.canDisplayWebView, let origin = serverManager.webOrigin, let mode = serverManager.mode {
+            if !QueuedDeepLinkAuthorityDecision.shouldRetain(
+                pendingOrigin: pendingConversationOrigin,
+                nextOrigin: origin
+            ) {
+                pendingConversationValidationTask?.cancel()
+                pendingConversationID = nil
+                pendingConversationOrigin = nil
+            }
             let operation = currentOperation
             if staleBrowserOperation, let browserOperation {
                 browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)

@@ -8,6 +8,7 @@ on:
     paths:
       - "macos/Phoenix/**"
       - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
@@ -16,6 +17,7 @@ on:
     paths:
       - "macos/Phoenix/**"
       - "crates/phoenix-ide/src/api/deployment.rs"
+      - "crates/phoenix-ide/src/api/installation_ownership.rs"
       - "crates/phoenix-ide/src/lib.rs"
       - "ui/src/generated/DeploymentInfo.ts"
       - ".github/workflows/macos-app.yml"
