@@ -362,7 +362,7 @@ mod tests {
     }
 
     async fn fixture() -> (WorkflowRepository, Arc<RecordingDispatcher>) {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
             .await
             .unwrap();

@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     async fn seed() -> Database {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("c-a", "a", "/tmp/a", true, None, None)
             .await
             .unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_match_handles_partial_porter_stem() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("c1", "prefix-porter", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -1541,7 +1541,7 @@ mod tests {
 
     #[tokio::test]
     async fn literal_partial_term_does_not_disable_prefix_matches_elsewhere() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for (id, slug, content) in [
             ("c-literal", "literal", "runni diagnostics"),
             ("c-complete", "complete", "running diagnostics"),
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_porter_term_does_not_broaden_to_shorter_prefixes() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for (id, slug, content) in [
             ("c-optimization", "optimization", "optimization work"),
             ("c-option", "option", "option work"),
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[tokio::test]
     async fn retrieval_bounds_snippets_with_unbroken_tokens() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("c1", "bounded-snippet", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -1646,7 +1646,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_match_uses_unicode61_case_and_diacritic_rules() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for (id, slug, content) in [
             ("c-case", "case", "ÜBER diagnostics"),
             ("c-diacritic", "diacritic", "école diagnostics"),

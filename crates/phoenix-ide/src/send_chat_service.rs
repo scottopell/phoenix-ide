@@ -540,6 +540,10 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
+        | crate::db::DbError::RepositoryAuthorityGenerationMismatch { .. }
+        | crate::db::DbError::RepositoryAuthorityGenerationMissing { .. }
+        | crate::db::DbError::RepositoryAuthorityGenerationRowMissing
+        | crate::db::DbError::RepositoryAuthorityGenerationCorrupt { .. }
         | crate::db::DbError::DirectTurnConflict(_)
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
@@ -579,6 +583,10 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
         | crate::db::DbError::ForkProposalConflict(_)
+        | crate::db::DbError::RepositoryAuthorityGenerationMismatch { .. }
+        | crate::db::DbError::RepositoryAuthorityGenerationMissing { .. }
+        | crate::db::DbError::RepositoryAuthorityGenerationRowMissing
+        | crate::db::DbError::RepositoryAuthorityGenerationCorrupt { .. }
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
         | crate::db::DbError::DormantGitRepositoryCatchupStaleOperation
@@ -943,7 +951,9 @@ mod tests {
     }
 
     async fn db_with_conversation(conversation_id: &str) -> crate::db::Database {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
             .await
             .unwrap();

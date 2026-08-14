@@ -99,7 +99,7 @@ impl LlmService for CountingLlm {
 
 #[tokio::test]
 async fn compute_chain_snapshot_sums_message_counts_across_three_members() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["s-a", "s-b", "s-c"]).await;
     add_user_message(&db, "s-a", 0, "first").await;
     add_user_message(&db, "s-a", 1, "second").await;
@@ -136,7 +136,7 @@ fn test_retriever(db: &Database) -> Arc<dyn crate::db::MessageRetriever> {
 
 #[tokio::test]
 async fn submit_question_persists_and_completes() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["chq-a", "chq-b", "chq-c"]).await;
     add_continuation_summary(&db, "chq-a", "A summary").await;
     add_continuation_summary(&db, "chq-b", "B summary").await;
@@ -170,7 +170,7 @@ async fn submit_question_persists_and_completes() {
 
 #[tokio::test]
 async fn submit_question_rejects_single_member_root() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     db.create_conversation("solo-root", "slug-solo", "/tmp", true, None, None)
         .await
         .unwrap();
@@ -188,7 +188,7 @@ async fn submit_question_rejects_single_member_root() {
 
 #[tokio::test]
 async fn submit_question_rejects_non_root_member() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["nrr-root", "nrr-mid", "nrr-leaf"]).await;
     add_continuation_summary(&db, "nrr-root", "rs").await;
     add_continuation_summary(&db, "nrr-mid", "ms").await;
@@ -318,7 +318,7 @@ async fn drain_n(rx: &mut broadcast::Receiver<ChainSseEvent>, n: usize) -> Vec<C
 
 #[tokio::test]
 async fn submit_question_streams_tokens_and_persists_completed_row() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["st-a", "st-b"]).await;
     add_continuation_summary(&db, "st-a", "summary A").await;
     add_user_message(&db, "st-b", 0, "leaf").await;
@@ -370,7 +370,7 @@ async fn submit_question_streams_tokens_and_persists_completed_row() {
 
 #[tokio::test]
 async fn submit_question_streams_failure_event_and_persists_partial() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["sf-a", "sf-b"]).await;
     add_continuation_summary(&db, "sf-a", "summary A").await;
     add_user_message(&db, "sf-b", 0, "leaf").await;
@@ -416,7 +416,7 @@ async fn submit_question_returns_qa_id_before_stream_completes() {
     // Submission shape: submit_question returns ChainQaId immediately after
     // INSERT in_flight. The persisted row exists synchronously even though
     // the streaming model invocation happens in a spawned task.
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["sy-a", "sy-b"]).await;
     add_continuation_summary(&db, "sy-a", "summary").await;
     add_user_message(&db, "sy-b", 0, "leaf").await;
@@ -441,7 +441,7 @@ async fn tab_close_mid_stream_does_not_orphan_invocation() {
     // updated to Completed. A subscriber that connects late reads the
     // canonical answer from `list_chain_qa` even though it missed the
     // token events.
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["tc-a", "tc-b"]).await;
     add_continuation_summary(&db, "tc-a", "summary").await;
     add_user_message(&db, "tc-b", 0, "leaf").await;
@@ -471,7 +471,7 @@ async fn tab_close_mid_stream_does_not_orphan_invocation() {
 
 #[tokio::test]
 async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscribers() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["dr-a", "dr-b"]).await;
     add_continuation_summary(&db, "dr-a", "summary").await;
     add_user_message(&db, "dr-b", 0, "leaf").await;
@@ -554,7 +554,7 @@ impl LlmService for ScriptedToolLlm {
 
 #[tokio::test]
 async fn agent_loop_executes_tool_then_answers() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["ag-a", "ag-b"]).await;
     add_continuation_summary(&db, "ag-a", "set up the limiter").await;
     add_user_message(&db, "ag-b", 0, "the rate limiter uses a token bucket").await;
@@ -592,7 +592,7 @@ async fn agent_loop_executes_tool_then_answers() {
 /// `#`-prefixed id must be accepted, not rejected as out-of-chain.
 #[tokio::test]
 async fn read_conversation_accepts_hash_prefixed_id() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["rd-a", "rd-b"]).await;
     add_user_message(&db, "rd-b", 0, "hello from b").await;
 
@@ -768,7 +768,7 @@ impl LlmService for AlwaysSearchLlm {
 /// as `Completed`.
 #[tokio::test]
 async fn agent_loop_is_bounded_when_tools_never_stop() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["lp-a", "lp-b"]).await;
     add_user_message(&db, "lp-b", 0, "leaf content").await;
 
@@ -804,7 +804,7 @@ fn qa_for_tool_tests(db: &Database) -> ChainQa {
 
 #[tokio::test]
 async fn execute_tool_rejects_blank_search_query() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     let qa = qa_for_tool_tests(&db);
     // Blank query is refused before any retrieval, so no index setup is needed.
     let (out, is_error) = qa
@@ -820,7 +820,7 @@ async fn execute_tool_rejects_blank_search_query() {
 
 #[tokio::test]
 async fn execute_tool_read_conversation_requires_an_id() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     let qa = qa_for_tool_tests(&db);
     let (out, is_error) = qa
         .execute_tool(
@@ -835,7 +835,7 @@ async fn execute_tool_read_conversation_requires_an_id() {
 
 #[tokio::test]
 async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     let qa = qa_for_tool_tests(&db);
     // The agent is scope-bound to the chain: a read outside the member set is
     // refused (REQ-RET-008), even if that conversation exists elsewhere.
@@ -852,7 +852,7 @@ async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
 
 #[tokio::test]
 async fn execute_tool_read_conversation_clamps_oversized_cursor() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     build_linear_chain(&db, &["cc-a", "cc-b"]).await;
     add_user_message(&db, "cc-a", 0, "some content").await;
     let qa = qa_for_tool_tests(&db);
@@ -872,7 +872,7 @@ async fn execute_tool_read_conversation_clamps_oversized_cursor() {
 
 #[tokio::test]
 async fn execute_tool_rejects_unknown_tool_name() {
-    let db = Database::open_in_memory().await.unwrap();
+    let db = Database::open_in_memory_project_authority().await.unwrap();
     let qa = qa_for_tool_tests(&db);
     let (out, is_error) = qa
         .execute_tool("frobnicate", &serde_json::json!({}), &["m-a".to_string()])

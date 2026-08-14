@@ -2382,7 +2382,7 @@ mod tests {
     use std::str::FromStr;
 
     async fn repo() -> WorkflowRepository {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -3608,7 +3608,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_turn_and_wake_allocate_distinct_global_workflow_ids() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
             .await
             .unwrap();

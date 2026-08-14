@@ -2982,7 +2982,9 @@ mod tests {
 
     #[tokio::test]
     async fn selection_envelope_reports_active_pr_plural_and_latest_branch() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-envelope").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -3049,7 +3051,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_worktree_response_retains_full_selection_envelope() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-missing").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,
@@ -3119,7 +3123,9 @@ mod tests {
 
     #[tokio::test]
     async fn active_selection_target_uses_explicit_selection_not_ranked_primary() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let scope = crate::work_scope::WorkScopeId::parse("/tmp/ws-active-target").unwrap();
         db.upsert_work_scope_pr_observations(
             &scope,

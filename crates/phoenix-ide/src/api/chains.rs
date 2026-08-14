@@ -893,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_returns_members_in_chain_order_and_marks_latest() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["v-a", "v-b", "v-c"]).await;
         add_continuation_summary(&db, "v-a", "summary A").await;
         add_continuation_summary(&db, "v-b", "summary B").await;
@@ -927,7 +927,7 @@ mod tests {
     /// keyed by that member's id so the dock can fetch its PR health.
     #[tokio::test]
     async fn build_view_resolves_work_identity_from_work_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["wi-a", "wi-b"]).await;
         add_continuation_summary(&db, "wi-a", "approved").await;
         // The continuation member owns the worktree (managed Explore approved
@@ -966,7 +966,7 @@ mod tests {
     /// than a set of empty worktree/branch/PR fields.
     #[tokio::test]
     async fn build_view_omits_work_identity_without_managed_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["wd-a", "wd-b"]).await;
         add_continuation_summary(&db, "wd-a", "first").await;
 
@@ -982,7 +982,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_uses_chain_name_when_set() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["dn-a", "dn-b"]).await;
         add_continuation_summary(&db, "dn-a", "first").await;
         add_user_message(&db, "dn-b", 0, "leaf").await;
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_falls_back_to_title_when_chain_name_unset() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["fb-a", "fb-b"]).await;
         // create_conversation populates title from the slug in title-case.
         // No explicit chain_name set => display_name uses title.
@@ -1044,7 +1044,7 @@ mod tests {
     /// root conversation's slug leaves `display_name` pinned to the override.
     #[tokio::test]
     async fn chain_name_override_survives_root_conversation_rename() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["ro-a", "ro-b"]).await;
         add_continuation_summary(&db, "ro-a", "first").await;
         add_user_message(&db, "ro-b", 0, "leaf").await;
@@ -1085,7 +1085,7 @@ mod tests {
     async fn fallback_tracks_root_rename_when_title_absent() {
         use phoenix_core::domain::db_schema::title_from_slug;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["fr-a", "fr-b"]).await;
         add_continuation_summary(&db, "fr-a", "first").await;
         add_user_message(&db, "fr-b", 0, "leaf").await;
@@ -1125,7 +1125,7 @@ mod tests {
     /// a future change to either rung is a conscious decision.
     #[tokio::test]
     async fn root_rename_is_masked_by_stale_title() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["mt-a", "mt-b"]).await;
         add_continuation_summary(&db, "mt-a", "first").await;
         add_user_message(&db, "mt-b", 0, "leaf").await;
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_rejects_single_member_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("solo", "slug-solo", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_rejects_non_root_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["nr-a", "nr-b", "nr-c"]).await;
         add_continuation_summary(&db, "nr-a", "summary").await;
         add_continuation_summary(&db, "nr-b", "summary").await;
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_rejects_unknown_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_view_includes_qa_history_for_existing_chain() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["q-a", "q-b"]).await;
         add_continuation_summary(&db, "q-a", "first").await;
         add_user_message(&db, "q-b", 0, "leaf").await;
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn has_worktree_reflects_member_mode() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["hw-a", "hw-b", "hw-c", "hw-d"]).await;
         add_continuation_summary(&db, "hw-a", "summary").await;
         add_continuation_summary(&db, "hw-b", "summary").await;

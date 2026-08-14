@@ -8669,7 +8669,9 @@ pub(crate) mod hard_delete_cascade_tests {
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
     pub(crate) async fn make_test_state() -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(TestLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
@@ -13753,7 +13755,9 @@ mod regenerate_conversation_name_tests {
     }
 
     async fn make_test_state(llm_registry: Arc<ModelRegistry>) -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         let platform = PlatformCapability::None {
             details: "test".into(),
         };
@@ -13958,7 +13962,9 @@ mod upgrade_model_state_guard_tests {
     }
 
     async fn make_test_state() -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
         let platform = PlatformCapability::None {
             details: "test".into(),
@@ -14229,7 +14235,9 @@ mod file_read_tests {
     /// Minimal `AppState` whose `preview_roots()` contains `cwd`, so the
     /// containment check in `read_file`/`list_files` admits files under it.
     async fn state_with_root(cwd: &std::path::Path) -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         db.create_conversation(
             "c-read",
             "read-test",
@@ -14786,7 +14794,7 @@ mod attachment_storage_tests {
 
     #[tokio::test]
     async fn referenced_paths_include_creation_job_files() {
-        let db = crate::db::Database::open_in_memory()
+        let db = crate::db::Database::open_in_memory_project_authority()
             .await
             .expect("open db");
         db.create_conversation(
@@ -14849,7 +14857,7 @@ mod attachment_storage_tests {
             AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
         };
 
-        let db = crate::db::Database::open_in_memory()
+        let db = crate::db::Database::open_in_memory_project_authority()
             .await
             .expect("open db");
         db.create_conversation(
@@ -14997,7 +15005,9 @@ mod chat_authority_tests {
 
     /// Build a minimal `AppState` backed by an in-memory database.
     async fn make_state() -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
         let platform = PlatformCapability::None {
             details: "test".to_string(),
@@ -15325,7 +15335,9 @@ mod wake_handler_tests {
     use tower::ServiceExt;
 
     async fn make_test_state() -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
+        let db = Database::open_in_memory_project_authority()
+            .await
+            .expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
         let platform = PlatformCapability::None {
             details: "test".into(),

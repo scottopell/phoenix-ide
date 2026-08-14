@@ -1759,7 +1759,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let cwd = tmp.path().to_path_buf();
 
         let result =
@@ -1791,7 +1793,9 @@ mod tests {
         .unwrap();
         // Empty DB: no Phoenix conversation owns the branch, so a checkout that
         // exists on disk must classify as an external (non-Phoenix) checkout.
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let cwd = tmp.path().to_path_buf();
 
         let result =

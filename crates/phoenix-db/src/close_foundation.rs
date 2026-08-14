@@ -2718,7 +2718,9 @@ mod tests {
     async fn concurrent_begin_returns_domain_conflict_after_immediate_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close-race.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap();
@@ -2756,7 +2758,7 @@ mod tests {
 
     #[tokio::test]
     async fn three_unarchived_chain_latest_admits_and_reads_topology() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -2806,7 +2808,7 @@ mod tests {
 
     #[tokio::test]
     async fn topology_seal_rejects_scope_snapshot_that_differs_from_live_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_root(&db, "other").await;
         let wrong_scope = db
@@ -2870,7 +2872,7 @@ mod tests {
     }
     #[tokio::test]
     async fn topology_seal_rejects_captured_continuation_edge_that_differs_from_live_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         create_root(&db, "other").await;
@@ -2911,7 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn topology_seal_rejects_ordinal_zero_with_live_predecessor() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "predecessor").await;
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
@@ -2958,7 +2960,7 @@ mod tests {
 
     #[tokio::test]
     async fn topology_seal_rejects_non_root_with_multiple_live_predecessors() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         create_root(&db, "fork").await;
@@ -3003,7 +3005,7 @@ mod tests {
 
     #[tokio::test]
     async fn delimiter_bearing_ids_do_not_truncate_topology() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "a|b").await;
         create_child(&db, "b", "a|b").await;
 
@@ -3023,7 +3025,7 @@ mod tests {
 
     #[tokio::test]
     async fn singleton_root_is_root_latest_and_captures_one_snapshot() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
 
         let topology = db.close_foundation_topology("root").await.unwrap();
@@ -3042,7 +3044,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn unresolved_allocated_worktree_admits_close_and_routes_inventory_to_repair() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         sqlx::query(
@@ -3150,7 +3152,7 @@ mod tests {
 
     #[tokio::test]
     async fn predecessor_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
 
@@ -3163,7 +3165,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_state_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         set_state(&db, "root", approval_state()).await;
 
@@ -3176,7 +3178,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_latest_states_admit() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let assistant = AssistantMessage::new(
             "busy-asst".to_string(),
             vec![ContentBlock::tool_use(
@@ -3266,7 +3268,7 @@ mod tests {
 
     #[tokio::test]
     async fn handed_off_latest_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.update_conversation_state(
             "root",
@@ -3287,7 +3289,7 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_continuation_on_any_member_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -3302,7 +3304,7 @@ mod tests {
 
     #[tokio::test]
     async fn eligible_latest_states_admit() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let states = vec![
             ("idle", ConvState::Idle),
             (
@@ -3347,7 +3349,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_latest_state_blockers_reject() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         create_root(&db, "approval").await;
         set_state(&db, "approval", approval_state()).await;
@@ -3370,7 +3372,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_same_attempt_survives_latest_mutation_and_conflict_different_attempt() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
 
@@ -3446,7 +3448,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_begin_rejects_incomplete_unsealed_topology() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
         let now = Utc::now().to_rfc3339();
@@ -3489,7 +3491,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_close_returns_error_for_nul_worktree_path() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         let scope = WorkScopeId::parse("scope-nul").unwrap();
         sqlx::query(
@@ -3524,7 +3526,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshots_capture_roles_and_distinct_scopes() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -3577,7 +3579,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_close_seals_live_topology_and_preserves_snapshots() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         db.begin_close_foundation("leaf", "attempt-1")
@@ -3603,7 +3605,7 @@ mod tests {
 
     #[tokio::test]
     async fn archived_non_root_member_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
@@ -3616,7 +3618,7 @@ mod tests {
 
     #[tokio::test]
     async fn archived_root_non_user_and_non_user_initiated_are_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "archived").await;
         set_archived(&db, "archived", true).await;
         assert!(matches!(
@@ -3647,7 +3649,7 @@ mod tests {
 
     #[tokio::test]
     async fn topology_rejects_cycle_deterministically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -3662,7 +3664,7 @@ mod tests {
 
     #[tokio::test]
     async fn topology_rejects_two_predecessors_deterministically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -3688,7 +3690,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_returns_typed_not_found() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let error = db
             .replace_close_inspection(ReplaceCloseInspectionRequest {
                 attempt_id: CloseAttemptId::parse("missing-attempt").unwrap(),
@@ -3704,7 +3706,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_round_trips_exact_identities_and_aggregate_pair() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -3764,7 +3766,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_identical_inspection_replacements_are_idempotent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         db.begin_close_foundation("root", "attempt-concurrent-inspection")
@@ -3802,7 +3804,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_close_retirement_losses_rejects_invalid_category_identity_pairing() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         allocate_scope_worktree(&db, "root").await;
@@ -3841,7 +3843,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_reentry_invalidates_prior_snapshot_and_rows() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         db.begin_close_foundation("root", "attempt-reentry")
@@ -3949,7 +3951,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_clean_scopes_skip_loss_confirmation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -3986,7 +3988,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_no_scopes_skip_loss_confirmation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.begin_close_foundation("root", "attempt-empty")
             .await
@@ -4013,7 +4015,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_requires_only_allocated_worktree_scopes() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -4088,7 +4090,7 @@ mod tests {
     #[tokio::test]
     async fn replace_close_inspection_supports_multi_scope_fingerprints_and_replacement_clears_stale(
     ) {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
@@ -4227,7 +4229,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_rejects_incomplete_scope_set_without_mutation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let root_scope = allocate_scope_worktree(&db, "root").await;
@@ -4292,7 +4294,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_close_inspection_rejects_untargeted_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.begin_close_foundation("root", "attempt-1")
             .await
@@ -4331,7 +4333,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_inventory_rejects_terminal_unarchived_root_on_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
         let scope = db
@@ -4384,7 +4386,9 @@ mod tests {
     async fn concurrent_identical_retirement_inventory_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inventory-race.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         crate::migrations::run_pending_migrations(db.pool())
             .await
             .unwrap();
@@ -4425,7 +4429,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.begin_close_foundation("root", "attempt-zero")
             .await
@@ -4447,7 +4451,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn retirement_inventory_round_trips_exact_expected_resources() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
 
@@ -4545,7 +4549,7 @@ mod tests {
             )),
         )
         .unwrap();
-        let db2 = Database::open_in_memory().await.unwrap();
+        let db2 = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db2, "root-2").await;
         allocate_scope_worktree(&db2, "root-2").await;
         let scope2 = db2
@@ -4594,7 +4598,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_inventory_replay_rejects_partial_unsealed_capture() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
         let scope = db
@@ -4664,7 +4668,7 @@ mod tests {
 
     #[tokio::test]
     async fn expected_resources_reject_incomplete_inventory_read() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
         let scope = db
@@ -4705,7 +4709,7 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_capture_returns_typed_not_found() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let error = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("missing-attempt").unwrap(),
@@ -4722,7 +4726,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_inventory_rejects_distinct_open_aggregate_on_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
         let scope = db
@@ -4765,7 +4769,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_completion_round_trips_typed_outcome() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.begin_close_foundation("root", "attempt-cancelled")
             .await
@@ -4792,7 +4796,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retirement_evidence_round_trips_and_rejects_divergent_replay() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         allocate_scope_worktree(&db, "root").await;
@@ -4989,7 +4993,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_absence_requires_retained_exact_identity_evidence() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         allocate_scope_worktree(&db, "root").await;
 
@@ -5079,7 +5083,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_identical_retirement_evidence_is_idempotent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         db.begin_close_foundation("root", "attempt-concurrent-evidence")
@@ -5131,7 +5135,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_evidence_rejects_early_phase_and_allows_needs_repair() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         allocate_scope_worktree(&db, "root").await;
@@ -5200,7 +5204,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn retirement_evidence_is_monotonic_after_first_proof() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         allocate_scope_worktree(&db, "root").await;
@@ -5519,7 +5523,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn delayed_retirement_evidence_requires_retained_aggregate_snapshot() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let root_scope = allocate_scope_worktree(&db, "root").await;
@@ -5635,7 +5639,7 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_retirement_inspection_cannot_skip_loss_confirmation_when_losses_persist() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -5686,7 +5690,7 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_retirement_inspection_cannot_enter_loss_confirmation_without_losses() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
@@ -5725,7 +5729,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_close_obligation_uses_persisted_chronology_over_clock_time() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
             .execute(db.pool())
@@ -5760,7 +5764,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_close_obligation_breaks_equal_instant_ties_by_persisted_order() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
             .execute(db.pool())
@@ -5787,7 +5791,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_close_obligation_preserves_submillisecond_order() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         sqlx::query("DROP TRIGGER close_obligations_require_admission_phase_on_insert")
             .execute(db.pool())
@@ -5818,7 +5822,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_close_obligations_rank_created_at_by_instant() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for root in ["root-a", "root-b"] {
             create_root(&db, root).await;
         }
@@ -5857,7 +5861,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_evidence_rejects_untargeted_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         create_root(&db, "root").await;
         db.begin_close_foundation("root", "attempt-1")
             .await

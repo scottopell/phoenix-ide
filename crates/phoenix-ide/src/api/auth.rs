@@ -628,7 +628,7 @@ mod tests {
     }
 
     async fn test_store() -> SessionStore {
-        let db = crate::db::Database::open_in_memory()
+        let db = crate::db::Database::open_in_memory_project_authority()
             .await
             .expect("in-memory db");
         SessionStore::new(db, password_fingerprint("test-password"))
@@ -665,7 +665,7 @@ mod tests {
     /// survive a process restart (a redeploy no longer logs everyone out).
     #[tokio::test]
     async fn session_token_survives_a_fresh_store_over_the_same_db() {
-        let db = crate::db::Database::open_in_memory()
+        let db = crate::db::Database::open_in_memory_project_authority()
             .await
             .expect("in-memory db");
         let fp = password_fingerprint("pw");
@@ -684,7 +684,7 @@ mod tests {
     /// where a restart cleared the in-memory store.
     #[tokio::test]
     async fn session_token_is_rejected_after_password_rotation() {
-        let db = crate::db::Database::open_in_memory()
+        let db = crate::db::Database::open_in_memory_project_authority()
             .await
             .expect("in-memory db");
         let token = SessionStore::new(db.clone(), password_fingerprint("old"))

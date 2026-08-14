@@ -380,7 +380,7 @@ async fn open_database(
     runtime_env: &PhoenixRuntimeEnvironment,
 ) -> Result<(Database, DatabaseResult), DriveTurnError> {
     match mode {
-        DatabaseMode::Memory => Database::open_in_memory()
+        DatabaseMode::Memory => Database::open_in_memory_project_authority()
             .await
             .map(|db| (db, DatabaseResult::Memory))
             .map_err(|error| DriveTurnError::Database(error.to_string())),
@@ -405,7 +405,7 @@ async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult),
         std::fs::create_dir_all(parent)
             .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     }
-    let db = Database::open(path.to_string_lossy().as_ref())
+    let db = Database::open_project_authority(path.to_string_lossy().as_ref())
         .await
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     db.reconcile_worktree_identities()
@@ -584,7 +584,9 @@ mod tests {
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: /tmp/linked-worktree\n").unwrap();
-        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(db_path.to_str().unwrap())
+            .await
+            .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
@@ -623,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_cancel_waiter_requires_new_and_persisted_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let conversation_id = "cancel-barrier";
         db.create_conversation_with_project(
             conversation_id,

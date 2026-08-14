@@ -870,7 +870,7 @@ mod tests {
     }
 
     async fn open_repo() -> (Database, WakeRepository, WorkScopeIdentity) {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let conversation = db
             .create_conversation("conv", "conv", "/tmp", true, None, None)
             .await

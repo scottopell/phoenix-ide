@@ -7,6 +7,7 @@ mod coordinator_query;
 mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
+mod repository_authority;
 pub mod retrieval;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
@@ -32,6 +33,7 @@ pub(crate) use git_repository_reconciliation::{
     DormantGitRepositoryCatchupOutcome, DormantGitRepositoryCatchupPermit,
 };
 pub use migrations::run_pending_migrations;
+pub use repository_authority::RepositoryAuthorityGeneration;
 pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
@@ -206,6 +208,21 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
+    #[error(
+        "repository authority generation mismatch: this opener requires {expected}, database has {actual}"
+    )]
+    RepositoryAuthorityGenerationMismatch {
+        expected: RepositoryAuthorityGeneration,
+        actual: RepositoryAuthorityGeneration,
+    },
+    #[error("repository authority generation is absent; {expected} opener cannot bootstrap it")]
+    RepositoryAuthorityGenerationMissing {
+        expected: RepositoryAuthorityGeneration,
+    },
+    #[error("repository authority generation row is missing")]
+    RepositoryAuthorityGenerationRowMissing,
+    #[error("repository authority generation {value} is invalid")]
+    RepositoryAuthorityGenerationCorrupt { value: i64 },
     #[error("git repository work-scope project conflict for {work_scope_id}: {project_ids:?}")]
     GitRepositoryWorkScopeProjectConflict {
         work_scope_id: WorkScopeId,
@@ -1313,10 +1330,10 @@ impl Database {
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
     ///
     /// Idempotent and best-effort: a `chmod` failure is logged at debug and
-    /// never fails. Call after migrations have run, since the numbered
-    /// migrations are what create the WAL sidecars that an early chmod in
-    /// `open` cannot see. A no-op for in-memory DBs (empty path) and on
-    /// non-Unix platforms.
+    /// never fails. Call after migrations and the authority-checked connection
+    /// setup have run, since those operations can create WAL sidecars that the
+    /// earlier permission pass cannot see. A no-op for in-memory DBs (empty path)
+    /// and on non-Unix platforms.
     pub fn restrict_file_permissions(&self) {
         if self.path.is_empty() {
             return;
@@ -2602,34 +2619,102 @@ impl Database {
         Ok(())
     }
 
-    /// Open or create a fully migrated database at the given path.
+    /// Open or bootstrap a Project-authority database.
     ///
     /// # Errors
     ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn open(path: &str) -> DbResult<Self> {
+    /// Returns a [`DbError`] if the database is already under `GitRepository` authority
+    /// or if an underlying database operation fails.
+    pub async fn open_project_authority(path: &str) -> DbResult<Self> {
+        Self::open_with_authority(path, RepositoryAuthorityGeneration::Project).await
+    }
+
+    /// Open an existing GitRepository-authority database.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the authority generation is absent or still belongs
+    /// to Project, or if an underlying database operation fails.
+    pub async fn open_git_repository_authority(path: &str) -> DbResult<Self> {
+        Self::open_with_authority(path, RepositoryAuthorityGeneration::GitRepository).await
+    }
+
+    async fn open_with_authority(
+        path: &str,
+        expected: RepositoryAuthorityGeneration,
+    ) -> DbResult<Self> {
+        let observed = repository_authority::probe_existing_generation(path).await?;
+        match (observed, expected) {
+            (Some(actual), expected) if actual != expected => {
+                return Err(DbError::RepositoryAuthorityGenerationMismatch { expected, actual });
+            }
+            (None, RepositoryAuthorityGeneration::GitRepository) => {
+                return Err(DbError::RepositoryAuthorityGenerationMissing { expected });
+            }
+            _ => {}
+        }
+
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
-            .journal_mode(SqliteJournalMode::Wal)
-            // synchronous=NORMAL is safe under WAL: commits are durable across
-            // process crashes (the WAL append is what makes them durable),
-            // only a power-failure between WAL append and the next checkpoint
-            // fsync can lose the last commit. Default FULL fsyncs every
-            // commit, which under concurrent I/O load (e.g. ./dev.py check)
-            // can stretch single-row INSERTs to 1+s. See task 13042.
-            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
-        // The DB (and its WAL sidecars) holds conversation history — command
-        // output, secrets the agent saw. On a multi-user host the default umask
-        // can leave it world-readable, so tighten to owner-only. Best-effort:
-        // a chmod failure is logged, never fatal to startup.
+        let pool = SqlitePoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .after_connect(move |connection, _| {
+                Box::pin(async move {
+                    repository_authority::prepare_connection(connection, expected).await
+                })
+            })
+            .before_acquire(move |connection, _| {
+                Box::pin(async move {
+                    repository_authority::connection_generation_matches(connection, expected).await
+                })
+            })
+            .connect_lazy_with(opts);
         restrict_db_permissions(path);
+        if observed.is_none() {
+            let bootstrap_pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .after_connect(|connection, _| {
+                    Box::pin(async move {
+                        if repository_authority::project_bootstrap_connection_is_eligible(
+                            connection,
+                        )
+                        .await?
+                        {
+                            Ok(())
+                        } else {
+                            Err(sqlx::Error::Configuration(Box::new(
+                                DbError::RepositoryAuthorityGenerationMismatch {
+                                    expected: RepositoryAuthorityGeneration::Project,
+                                    actual: RepositoryAuthorityGeneration::GitRepository,
+                                },
+                            )))
+                        }
+                    })
+                })
+                .before_acquire(|connection, _| {
+                    Box::pin(async move {
+                        repository_authority::project_bootstrap_connection_is_eligible(connection)
+                            .await
+                    })
+                })
+                .connect_with(
+                    SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
+                        .busy_timeout(std::time::Duration::from_secs(5))
+                        .foreign_keys(true),
+                )
+                .await
+                .map_err(repository_authority::authority_db_error)?;
+            let bootstrap =
+                Self::new_with_generated_target_binding(bootstrap_pool, path.to_string());
+            bootstrap.run_migrations().await?;
+            migrations::run_pending_migrations(&bootstrap.pool).await?;
+            drop(bootstrap);
+        }
         let db = Self::new_with_generated_target_binding(pool, path.to_string());
+        repository_authority::require_generation(&db.pool, expected).await?;
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
-        // Migrations may have created the `-wal`/`-shm` sidecars that the early
-        // chmod above could not see. Re-tighten now they exist.
         db.restrict_file_permissions();
         Ok(db)
     }
@@ -2654,14 +2739,14 @@ impl Database {
     ///
     /// Runs both the legacy idempotent ALTER TABLEs (`run_migrations`) and the
     /// numbered migrations (`run_pending_migrations`), mirroring the full
-    /// bootstrap contract of [`Database::open`]. Without this, tests that exercise columns
+    /// Project-authority bootstrap contract. Without this, tests that exercise columns
     /// added by numbered migrations would fail against a half-initialized DB.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Used in tests
-    pub async fn open_in_memory() -> DbResult<Self> {
+    pub async fn open_in_memory_project_authority() -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
@@ -2675,6 +2760,8 @@ impl Database {
         let db = Self::new_with_generated_target_binding(pool, String::new());
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
+        repository_authority::require_generation(&db.pool, RepositoryAuthorityGeneration::Project)
+            .await?;
         Ok(db)
     }
 
@@ -11035,7 +11122,7 @@ mod tests {
 
     #[tokio::test]
     async fn worktree_reconciliation_releases_stale_owner_before_claim_arbitration() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let claimant = temp.path().join("claimant");
         let stale_owner = temp.path().join("stale-owner");
@@ -11092,7 +11179,7 @@ mod tests {
 
     #[tokio::test]
     async fn worktree_reconciliation_preserves_retired_identity_evidence() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("retired-worktree");
         std::fs::create_dir_all(&worktree).unwrap();
@@ -11168,7 +11255,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_messages_start_at_newest_user_or_skill_boundary() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("recovery-suffix", "slug", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -11206,7 +11293,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_messages_include_the_complete_adopted_wake_tail() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("recovery-wake-tail", "slug", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -11250,7 +11337,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_claim_has_one_winner_and_fences_late_results() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-claim", "conv-claim").await;
         let now = Utc::now();
         let first = db
@@ -11340,7 +11427,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_stage_checkpoint_rejects_stale_generation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-stage", "conv-stage").await;
         let now = Utc::now();
         let first = db
@@ -11414,7 +11501,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_creation_reconciles_resources_without_deleting_record() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-failed-cleanup", "conv-failed-cleanup").await;
         let now = Utc::now();
         let claimed = db
@@ -11513,7 +11600,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_cancel_and_delete_revoke_claim_before_cleanup() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-cancel", "conv-cancel").await;
         let now = Utc::now();
         let claimed = db
@@ -11595,7 +11682,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_delete_rejects_ready_job_without_archiving() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-ready-delete", "conv-ready-delete").await;
         sqlx::query(
             "UPDATE conversation_creation_jobs
@@ -11625,7 +11712,7 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_empty_completion_is_atomic_and_claim_fenced() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-seeded", "conv-seeded").await;
         let now = Utc::now();
         let claimed = db
@@ -11709,7 +11796,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_cancel_rejects_ready_job_without_mutating_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-ready-cancel", "conv-ready-cancel").await;
         sqlx::query(
             "UPDATE conversation_creation_jobs
@@ -11754,7 +11841,7 @@ mod tests {
 
     #[tokio::test]
     async fn deletion_pending_creation_is_hidden_from_archived_listing() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-hidden-delete", "conv-hidden-delete").await;
         db.request_conversation_creation_deletion("conv-hidden-delete", Utc::now())
             .await
@@ -11771,7 +11858,7 @@ mod tests {
 
     #[tokio::test]
     async fn deletion_pending_creation_is_hidden_from_search_metadata() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-hidden-search", "conv-hidden-search").await;
         db.request_conversation_creation_deletion("conv-hidden-search", Utc::now())
             .await
@@ -11787,7 +11874,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_metadata_mode_and_normalized_environment_commit_together() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-mode-environment", "conv-mode-environment").await;
         let claimed = db
             .claim_next_conversation_creation_job(
@@ -11856,7 +11943,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_claim_cannot_commit_creation_metadata() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
         let now = Utc::now();
         let claimed = db
@@ -11910,7 +11997,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_resource_reservation_is_fenced_by_generation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-resource", "conv-resource").await;
         let now = Utc::now();
         let first = db
@@ -12002,7 +12089,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_cleanup_retry_clears_lease_and_uses_retry_deadline() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
         let now = Utc::now();
         db.cancel_conversation_creation("conv-cleanup-retry", now)
@@ -12054,7 +12141,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_cleanup_deadline_waits_for_live_cleanup_lease() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
         let now = Utc::now();
         db.cancel_conversation_creation("conv-cleanup-deadline", now)
@@ -12101,7 +12188,7 @@ mod tests {
 
     #[tokio::test]
     async fn creation_retry_is_durable_and_due_without_a_kick() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-retry", "conv-retry").await;
         let now = Utc::now();
         let first = db
@@ -12174,7 +12261,7 @@ mod tests {
         let db_file = dir.join("reopen.db");
         let db_path = db_file.to_string_lossy().to_string();
 
-        let db = Database::open(&db_path).await.unwrap();
+        let db = Database::open_project_authority(&db_path).await.unwrap();
         run_pending_migrations(db.pool()).await.unwrap();
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
             .fetch_all(db.pool())
@@ -12187,7 +12274,7 @@ mod tests {
         assert!(!columns.iter().any(|column| column == "phase"));
         drop(db);
 
-        let reopened = Database::open(&db_path)
+        let reopened = Database::open_project_authority(&db_path)
             .await
             .expect("post-migration database must reopen");
         drop(reopened);
@@ -12215,8 +12302,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Regression: the `-wal` sidecar that migrations create after `open`'s
-    /// early chmod must still end up 0600 after `restrict_file_permissions`.
+    /// Regression: a `-wal` sidecar created after the early permission pass
+    /// must still end up 0600 after `restrict_file_permissions`.
     #[cfg(unix)]
     #[tokio::test]
     async fn restrict_file_permissions_tightens_wal_sidecar() {
@@ -12227,9 +12314,11 @@ mod tests {
         let db_path = dir.join("test.db");
         let db_path_str = db_path.to_string_lossy().to_string();
 
-        // `open` connects in WAL mode and runs `run_migrations`, which writes to
-        // the DB and so materializes the `-wal`/`-shm` sidecars.
-        let db = Database::open(&db_path_str).await.unwrap();
+        // The authority-checked opener enables WAL and runs migrations, which
+        // write to the DB and materialize the `-wal`/`-shm` sidecars.
+        let db = Database::open_project_authority(&db_path_str)
+            .await
+            .unwrap();
         let wal_path = dir.join("test.db-wal");
         assert!(
             wal_path.exists(),
@@ -12255,7 +12344,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_setting_roundtrips_through_db() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Missing key reads back as None.
         assert!(db.get_app_setting("never_set").await.unwrap().is_none());
@@ -12277,7 +12366,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_session_is_valid_after_insert_and_unknown_tokens_are_not() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.insert_auth_session("tok-a", "fp", chrono::Duration::hours(1))
             .await
             .unwrap();
@@ -12293,7 +12382,7 @@ mod tests {
         // A token minted under one password must not authenticate once the
         // configured password (and thus its fingerprint) changes — rotating
         // PHOENIX_PASSWORD invalidates every prior session.
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.insert_auth_session("tok", "old-password-fp", chrono::Duration::hours(1))
             .await
             .unwrap();
@@ -12309,7 +12398,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_session_expiry_is_enforced_and_swept() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         // Already-expired token (negative TTL): never authenticates.
         db.insert_auth_session("stale", "fp", chrono::Duration::seconds(-1))
             .await
@@ -12333,7 +12422,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_oauth_registration_roundtrips_keyed_by_auth_server() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         assert!(db
             .get_mcp_oauth_registration("https://as.example.com")
@@ -12377,7 +12466,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_oauth_token_roundtrips_and_deletes() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         assert!(db.get_mcp_oauth_token("linear").await.unwrap().is_none());
 
@@ -12416,7 +12505,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_llm_language_unset_returns_phoenix_native() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         assert_eq!(
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::PhoenixNative
@@ -12425,7 +12514,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_llm_language_set_persists_and_reads_back() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.set_default_llm_language(LlmLanguage::Caveman)
             .await
@@ -12447,7 +12536,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_llm_language_falls_back_when_value_unknown() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         // Forge a value this build doesn't recognize (forward-compat: an
         // older binary reading a DB written by a newer one). Should fall
         // back to the default rather than poison startup.
@@ -12514,11 +12603,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("active-pr-cas.sqlite");
         let db_path = db_path.to_string_lossy().into_owned();
-        let first = Database::open(&db_path).await.unwrap();
+        let first = Database::open_project_authority(&db_path).await.unwrap();
         migrations::run_pending_migrations(&first.pool)
             .await
             .unwrap();
-        let second = Database::open(&db_path).await.unwrap();
+        let second = Database::open_project_authority(&db_path).await.unwrap();
         migrations::run_pending_migrations(&second.pool)
             .await
             .unwrap();
@@ -12689,7 +12778,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_pinned_selection_survives_association_updates() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-pinned".to_string())
                 .unwrap();
@@ -12756,7 +12845,7 @@ mod tests {
     #[tokio::test]
     async fn active_pr_infers_unique_branch_match_from_local_repository_identity_when_scope_maps_to_one_repo(
     ) {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-local-map".to_string())
                 .unwrap();
@@ -12807,7 +12896,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_conflicting_slug_still_uses_sole_actionable_fallback() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-local-slug-conflict".to_string(),
         )
@@ -12853,7 +12942,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_does_not_map_local_repository_identity_when_scope_spans_multiple_repos() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-local-ambiguous".to_string(),
         )
@@ -12905,7 +12994,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_infers_unique_branch_match() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-branch".to_string())
                 .unwrap();
@@ -12952,7 +13041,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_only_actionable_ignores_merged_and_closed() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-actionable".to_string())
                 .unwrap();
@@ -13001,7 +13090,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_ambiguity_leaves_selection_unset() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-ambiguous".to_string())
                 .unwrap();
@@ -13043,7 +13132,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_unmatched_branch_falls_through_to_sole_actionable_pr() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-unmatched-sole".to_string(),
         )
@@ -13082,7 +13171,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_unmatched_branch_keeps_multiple_actionable_prs_ambiguous() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-unmatched-many".to_string(),
         )
@@ -13130,7 +13219,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_retains_prior_inferred_selection_when_still_valid() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-retain".to_string())
                 .unwrap();
@@ -13281,7 +13370,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_stale_generation_protection_returns_current_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-generation".to_string())
                 .unwrap();
@@ -13363,7 +13452,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_pin_requires_existing_scope_association() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-pin-membership".to_string(),
         )
@@ -13385,7 +13474,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_pin_returns_persisted_generation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-pin-generation".to_string(),
         )
@@ -13470,7 +13559,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_clear_pin_uses_latest_durable_branch_evidence_when_input_missing() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-clear-durable".to_string(),
         )
@@ -13528,7 +13617,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_clear_pin_respects_compatible_repository_mapping() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse(
             "/tmp/ws-active-clear-compatible".to_string(),
         )
@@ -13594,7 +13683,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_pr_clear_pin_resumes_inference() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-active-clear".to_string())
                 .unwrap();
@@ -13655,7 +13744,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_scope_pr_association_upsert_preserves_first_seen_and_updates_primary() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-pr".to_string()).unwrap();
         let closed = WorkScopePrObservation {
             repo_owner: "owner".to_string(),
@@ -13728,7 +13817,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_usage_first_byte_at_is_nullable_and_roundtrips() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-fb", "slug-fb", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -13773,7 +13862,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_conversations_preserves_effort_projection() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-effort", "slug-effort", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -13806,7 +13895,7 @@ mod tests {
 
     #[tokio::test]
     async fn compare_and_set_service_tier_preserves_concurrent_model_upgrade() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("tier-cas", "tier-cas", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -13835,7 +13924,7 @@ mod tests {
 
     #[tokio::test]
     async fn analytics_conversation_ids_include_root_without_usage() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-root-only", "slug-root-only", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -13865,7 +13954,7 @@ mod tests {
 
     #[tokio::test]
     async fn usage_anchor_messages_returns_non_agent_timestamps_without_content() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("root-anchor", "root-anchor", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -13929,7 +14018,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_scope_observed_branch_upsert_preserves_first_seen_and_updates_last_seen() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-observed".to_string()).unwrap();
 
@@ -14038,7 +14127,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_scope_pr_feedback_baseline_roundtrips_and_replaces() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-baseline".to_string()).unwrap();
 
@@ -14089,7 +14178,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_scope_pr_feedback_baselines_are_keyed_by_full_identity() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             phoenix_core::work_scope::WorkScopeId::parse("/tmp/ws-baseline-identities".to_string())
                 .unwrap();
@@ -14139,7 +14228,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_and_get_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let conv = db
             .create_conversation("test-id", "test-slug", "/tmp/test", true, None, None)
@@ -14157,7 +14246,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_continuation_atomically_persists_response_and_operation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("begin-continuation", "begin", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14235,7 +14324,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_start_recovery_retains_threshold_response() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("recover-start", "recover", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14311,7 +14400,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_commit_is_atomic_idempotent_and_rejects_stale_operations() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation(
             "continuation-commit",
             "continuation",
@@ -14412,7 +14501,7 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_relation_is_singleton_and_keeps_conversation_shape_ordinary() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let first = db
             .get_or_create_coordinator(
@@ -14450,7 +14539,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversations_schema_exposes_state_kind_discriminator() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let columns: Vec<String> =
             sqlx::query_scalar("SELECT name FROM pragma_table_info('conversations')")
@@ -14474,7 +14563,9 @@ mod tests {
             "phoenix-coordinator-race-{}.db",
             uuid::Uuid::new_v4()
         ));
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         migrations::run_pending_migrations(db.pool()).await.unwrap();
         db.create_conversation("ordinary", "coordinator", "/tmp", true, None, None)
             .await
@@ -14512,7 +14603,7 @@ mod tests {
     /// therefore cannot re-expose already-cleared results.
     #[tokio::test]
     async fn update_clear_watermark_never_regresses() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("wm-1", "wm-slug", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14539,7 +14630,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_kind_tracks_inserted_and_updated_conversation_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("kind-conv", "kind-slug", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14575,7 +14666,7 @@ mod tests {
     #[tokio::test]
     async fn list_usage_limit_errors_returns_only_due_candidate_rows() {
         use phoenix_core::domain::db_schema::ErrorKind;
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let reset = Utc::now();
 
         let usage_limit_err = |resets_at| ConvState::Error {
@@ -14658,7 +14749,7 @@ mod tests {
 
     #[tokio::test]
     async fn sub_agent_persona_roundtrips_and_upserts() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("sub-1", "sub-slug", "/tmp", false, None, None)
             .await
             .unwrap();
@@ -14686,7 +14777,7 @@ mod tests {
 
     #[tokio::test]
     async fn sub_agent_persona_cascade_deletes_with_conversation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("sub-2", "sub-slug-2", "/tmp", false, None, None)
             .await
             .unwrap();
@@ -14700,7 +14791,7 @@ mod tests {
     async fn test_add_and_get_messages() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .await
@@ -14754,7 +14845,7 @@ mod tests {
 
     #[tokio::test]
     async fn transcript_generation_does_not_change_on_append() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-append", "slug-append", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14777,7 +14868,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_message_display_data_increments_transcript_generation_once() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-display", "slug-display", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14807,7 +14898,7 @@ mod tests {
 
     #[tokio::test]
     async fn hiding_message_removes_retrieval_row_atomically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("hidden-index", "hidden-index", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14866,7 +14957,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_tool_message_content_increments_transcript_generation_once() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-tool", "slug-tool", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14896,7 +14987,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_message_edit_leaves_transcript_generation_unchanged() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-miss", "slug-miss", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -14921,7 +15012,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_slice_helpers_return_expected_windows() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation("conv-slices", "slug-slices", "/tmp", true, None, None)
             .await
@@ -14987,13 +15078,13 @@ mod tests {
     }
 
     /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path
-    /// `open_in_memory` exercises) ends with the normalized `cm_*` columns and
+    /// `open_in_memory_project_authority` exercises) ends with the normalized `cm_*` columns and
     /// no `conv_mode` blob. This locks the migration-029 end state and proves
     /// the `conv_mode`-referencing migrations resolve during fresh-DB replay
     /// (`conv_mode` lives in the base schema until 029 drops it).
     #[tokio::test]
     async fn conversations_schema_is_normalized_after_migrations() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
             .map(|r: SqliteRow| r.get::<String, _>("name"))
             .fetch_all(db.pool())
@@ -15035,7 +15126,7 @@ mod tests {
     /// stays attachment-free, and `get_messages` rehydrates them in order.
     #[tokio::test]
     async fn attachments_persist_in_child_tables_and_rehydrate() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-a", "slug-a", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15146,7 +15237,7 @@ mod tests {
         use phoenix_core::domain::skill_invocation::SkillInvocation;
         use phoenix_core::domain::sm_event::SteerEntry;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-s", "slug-s", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15258,7 +15349,7 @@ mod tests {
             }
         }
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-append", "append", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15302,7 +15393,7 @@ mod tests {
 
     #[tokio::test]
     async fn steering_append_rolls_back_receipt_when_queue_insert_fails() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("receipt-a", "receipt-a", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15328,7 +15419,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_queue_replace_records_unknown_receipt_without_overwriting_exact_receipt() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("receipt-legacy", "receipt-legacy", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15395,7 +15486,7 @@ mod tests {
 
     #[tokio::test]
     async fn steering_drain_commits_fifo_messages_state_and_exact_queue_ids() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("drain-ok", "drain-ok", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15472,7 +15563,7 @@ mod tests {
 
     #[tokio::test]
     async fn steering_drain_missing_supplied_queue_id_rolls_back_every_write() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("drain-rollback", "drain-rollback", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15506,7 +15597,7 @@ mod tests {
 
     #[tokio::test]
     async fn steering_drain_recovers_matching_legacy_materialized_message_once() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("drain-legacy", "drain-legacy", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15556,7 +15647,7 @@ mod tests {
     /// `PersistBeforeBroadcast` in `specs/sse_wire/sse_wire.allium`.
     #[tokio::test]
     async fn test_add_message_with_seq_writes_caller_seq() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-seq", "slug-seq", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15606,7 +15697,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_preserves_llm_requesting_for_unfinished_creation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_test_creation_job(&db, "job-bootstrap", "conv-bootstrap").await;
         let requesting = ConvState::LlmRequesting { attempt: 1 };
         db.update_conversation_state("conv-bootstrap", &requesting)
@@ -15623,7 +15714,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_preserves_creation_cancelled_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("cancelled", "slug", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -15646,7 +15737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_preserves_context_exhausted_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Create a conversation with context_exhausted state
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
@@ -15686,7 +15777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_preserves_awaiting_task_approval_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .await
@@ -15731,7 +15822,7 @@ mod tests {
             AssistantMessage, CommissionReviewApprovalScope, CommissionReviewInput,
         };
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation(
             "conv-commission",
@@ -15789,7 +15880,7 @@ mod tests {
     async fn test_reset_repairs_orphaned_tool_use() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Create a conversation
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
@@ -15864,7 +15955,7 @@ mod tests {
     async fn test_reset_does_not_duplicate_complete_exchanges() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .await
@@ -15921,7 +16012,7 @@ mod tests {
     async fn test_reset_repairs_multiple_orphaned_tools() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .await
@@ -16009,7 +16100,7 @@ mod tests {
             AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
         };
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -16145,7 +16236,7 @@ mod tests {
             AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
         };
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-c", "slug-c", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -16284,7 +16375,7 @@ mod tests {
             ToolInput,
         };
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-sa", "slug-sa", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -16452,7 +16543,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_all_to_idle_preserves_completed_and_failed_states() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("completed", "completed", "/tmp", false, None, None)
             .await
             .unwrap();
@@ -16491,7 +16582,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_preserves_continuation_auth_recovery_but_resets_ordinary_recovery() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for id in ["continuation-auth", "ordinary-auth"] {
             db.create_conversation(id, id, "/tmp", true, None, None)
                 .await
@@ -16557,7 +16648,7 @@ mod tests {
             ToolInput,
         };
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-p", "slug-p", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -16666,7 +16757,7 @@ mod tests {
         use phoenix_core::domain::llm_types::ContentBlock;
         use phoenix_core::domain::sm_state::ConvState;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         for (id, state) in [
             (
@@ -16716,7 +16807,7 @@ mod tests {
 
     #[tokio::test]
     async fn conversation_effort_round_trips_and_sub_agents_inherit_explicit_override() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation(
             "effort-parent",
             "effort-parent",
@@ -16755,7 +16846,7 @@ mod tests {
 
     #[tokio::test]
     async fn unattached_sub_agent_inherits_parent_effort_without_a_work_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent = db
             .get_or_create_coordinator(
                 Some("gpt-5.4"),
@@ -16795,7 +16886,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slug_collision_gets_suffix() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // First conversation gets the exact slug
         let first = db
@@ -16833,7 +16924,7 @@ mod tests {
     /// the public handoff API arrives in Phase 2) read back as `Some`.
     #[tokio::test]
     async fn test_continued_in_conv_id_db_round_trip() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Fresh conversation: the column is NULL, so the struct field is None.
         let fresh = db
@@ -16880,7 +16971,7 @@ mod tests {
     // addition to the machine-friendly `slug`.
     #[tokio::test]
     async fn test_ftux08_conversation_json_includes_title_field() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let conv = db
             .create_conversation(
@@ -16983,7 +17074,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_creation_persists_dispatch_intent_atomically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         setup_exhausted_parent(
             &db,
             "parent-intent",
@@ -17027,7 +17118,7 @@ mod tests {
 
     #[tokio::test]
     async fn continuation_retry_returns_original_pending_intent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         setup_exhausted_parent(
             &db,
             "parent-retry-intent",
@@ -17068,7 +17159,7 @@ mod tests {
     /// `continued_in_conv_id` points at the new conv.
     #[tokio::test]
     async fn test_continue_conversation_work_to_work() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent_mode = work_mode_fixture();
         let parent =
             setup_exhausted_parent(&db, "parent-work", "parent-work", "/tmp", &parent_mode).await;
@@ -17132,7 +17223,7 @@ mod tests {
     /// Branch -> Branch: `branch_name/worktree_path/base_branch` transfer; no `task_id`.
     #[tokio::test]
     async fn test_continue_conversation_branch_to_branch() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent_mode = branch_mode_fixture();
         let parent = setup_exhausted_parent(
             &db,
@@ -17184,7 +17275,7 @@ mod tests {
     /// encoded in `ConvMode::Explore`, so this is just cwd + mode inheritance).
     #[tokio::test]
     async fn test_continue_conversation_explore_to_explore() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent = setup_exhausted_parent(
             &db,
             "parent-explore",
@@ -17216,7 +17307,7 @@ mod tests {
     /// Direct -> Direct: no worktree, only cwd and model inheritance.
     #[tokio::test]
     async fn test_continue_conversation_direct_to_direct() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent = setup_exhausted_parent(
             &db,
             "parent-direct",
@@ -17247,7 +17338,7 @@ mod tests {
     /// The parent's `continued_in_conv_id` is unchanged by the second call.
     #[tokio::test]
     async fn test_continue_conversation_idempotent_double_continue() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         setup_exhausted_parent(
             &db,
             "parent-double",
@@ -17296,7 +17387,7 @@ mod tests {
     /// parent state is unchanged.
     #[tokio::test]
     async fn test_continue_conversation_rejects_idle_parent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         // Create a Work-mode parent but leave it in Idle.
         db.create_conversation_with_project(
             "parent-idle",
@@ -17339,7 +17430,7 @@ mod tests {
     /// HTTP handler can map to 404.
     #[tokio::test]
     async fn test_continue_conversation_parent_not_found() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let result = db.continue_conversation("no-such-conv").await;
         match result {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "no-such-conv"),
@@ -17349,7 +17440,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_continuation_gets_fresh_work_scope() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent =
             setup_exhausted_parent(&db, "direct-root", "direct", "/tmp", &ConvMode::Direct).await;
 
@@ -17369,7 +17460,7 @@ mod tests {
     /// use the root slug (not the parent slug) so names don't compound.
     #[tokio::test]
     async fn test_continue_conversation_sequential_slugs() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Root conversation: slug = "my-task"
         setup_exhausted_parent(&db, "root", "my-task", "/tmp", &ConvMode::Direct).await;
@@ -17413,7 +17504,7 @@ mod tests {
 
     #[tokio::test]
     async fn coordinator_relation_moves_to_continuation() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let coordinator = db
             .get_or_create_coordinator(
                 Some("test-model"),
@@ -17551,7 +17642,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_create_task_approval_handoff_links_parent_to_work_successor() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -17660,7 +17751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_handoff_conversation_name_disambiguates_on_slug_collision() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("collide-parent", "collide-parent", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -17697,7 +17788,7 @@ mod tests {
     /// INSERT (raw UPDATE) and SELECT, and the unset case stays NULL.
     #[tokio::test]
     async fn test_chain_name_round_trips() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let unset = db
             .create_conversation("conv-unset", "slug-unset", "/tmp", true, None, None)
@@ -17731,7 +17822,7 @@ mod tests {
     /// for a 3-member linear chain.
     #[tokio::test]
     async fn test_chain_members_forward_three_member_linear() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["a", "b", "c"]).await;
 
         let members = db.chain_members_forward("a").await.unwrap();
@@ -17747,7 +17838,7 @@ mod tests {
     /// `chain_members_forward`, so the two must not diverge.
     #[tokio::test]
     async fn test_chain_members_forward_full_matches_per_member_fetch() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["a", "b", "c"]).await;
 
         // Give members distinct message counts so the COUNT subquery is exercised.
@@ -17781,7 +17872,7 @@ mod tests {
     /// A non-existent root yields an empty vec, mirroring `chain_members_forward`.
     #[tokio::test]
     async fn test_chain_members_forward_full_nonexistent_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let members = db.chain_members_forward_full("ghost").await.unwrap();
         assert!(members.is_empty());
@@ -17790,7 +17881,7 @@ mod tests {
     /// REQ-CHN-002: a single conversation with no continuation returns just itself.
     #[tokio::test]
     async fn test_chain_members_forward_single_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("solo", "slug-solo", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -17804,7 +17895,7 @@ mod tests {
     /// has been hard-deleted.
     #[tokio::test]
     async fn test_chain_members_forward_nonexistent_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let members = db.chain_members_forward("ghost").await.unwrap();
         assert!(
@@ -17816,7 +17907,7 @@ mod tests {
     /// REQ-CHN-002: `chain_root_of` walks back from the leaf to the root.
     #[tokio::test]
     async fn test_chain_root_of_leaf_returns_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["root-x", "mid-x", "leaf-x"]).await;
 
         let root = db.chain_root_of("leaf-x").await.unwrap();
@@ -17830,7 +17921,7 @@ mod tests {
     /// REQ-CHN-002: `chain_root_of` on a root returns the same id.
     #[tokio::test]
     async fn test_chain_root_of_root_returns_self() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("only-root", "slug-only-root", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -17842,7 +17933,7 @@ mod tests {
     /// REQ-CHN-002: `chain_root_of` on a nonexistent id yields None.
     #[tokio::test]
     async fn test_chain_root_of_nonexistent_returns_none() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         let root = db.chain_root_of("ghost").await.unwrap();
         assert_eq!(root, None);
@@ -17852,7 +17943,7 @@ mod tests {
     /// (root, mid, leaf) and None for solo conversations.
     #[tokio::test]
     async fn test_chain_root_if_member() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["m-a", "m-b", "m-c"]).await;
         db.create_conversation("solo-x", "slug-solo-x", "/tmp", true, None, None)
             .await
@@ -17890,7 +17981,7 @@ mod tests {
     /// REQ-CHN-005: `insert_chain_qa` round-trips all columns and starts `in_flight`.
     #[tokio::test]
     async fn test_insert_chain_qa_round_trips() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["qa-a", "qa-b"]).await;
         db.insert_chain_qa(fresh_new_chain_qa("qa-1", "qa-a"))
             .await
@@ -17914,7 +18005,7 @@ mod tests {
     /// and rewrites the snapshot counters to the completion-time chain shape.
     #[tokio::test]
     async fn test_complete_chain_qa_transitions_row() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["qac-a", "qac-b"]).await;
         db.insert_chain_qa(fresh_new_chain_qa("qac-1", "qac-a"))
             .await
@@ -17938,7 +18029,7 @@ mod tests {
     /// REQ-CHN-005: `fail_chain_qa` preserves the question and an optional partial.
     #[tokio::test]
     async fn test_fail_chain_qa_preserves_question_and_partial() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["qaf-a", "qaf-b"]).await;
         db.insert_chain_qa(fresh_new_chain_qa("qaf-1", "qaf-a"))
             .await
@@ -17966,7 +18057,7 @@ mod tests {
     /// REQ-CHN-005: `list_chain_qa` returns rows in chronological order.
     #[tokio::test]
     async fn test_list_chain_qa_orders_chronologically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["qal-a", "qal-b"]).await;
 
         let mut row1 = fresh_new_chain_qa("qal-1", "qal-a");
@@ -17994,7 +18085,7 @@ mod tests {
     /// REQ-CHN-005: `sweep_in_flight_chain_qa` flips ONLY `in_flight` rows.
     #[tokio::test]
     async fn test_sweep_in_flight_chain_qa_targets_in_flight_only() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         build_linear_chain(&db, &["qas-a", "qas-b"]).await;
 
         // Three rows: completed, failed, and in_flight.
@@ -18027,7 +18118,7 @@ mod tests {
     /// REQ-CHN-007: `set_chain_name` round-trips (set, change, clear).
     #[tokio::test]
     async fn test_set_chain_name_round_trips() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("scn-root", "slug-scn", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18060,7 +18151,7 @@ mod tests {
     async fn test_first_opening_message_text() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("fum", "slug-fum", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18140,7 +18231,7 @@ mod tests {
     /// `rename_conversation` updates the slug and advances `updated_at`.
     #[tokio::test]
     async fn test_rename_conversation_success() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("rc", "slug-rc-old", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18164,7 +18255,7 @@ mod tests {
     /// `DbError::SlugExists` and leaves the original row untouched.
     #[tokio::test]
     async fn test_rename_conversation_duplicate_slug() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("rc-a", "slug-taken", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18187,7 +18278,7 @@ mod tests {
     /// caller re-applying the current slug is not spuriously rejected.
     #[tokio::test]
     async fn test_rename_conversation_same_slug_is_ok() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("rc-same", "slug-same", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18204,7 +18295,7 @@ mod tests {
     /// `DbError::ConversationNotFound`, not a silent no-op.
     #[tokio::test]
     async fn test_rename_conversation_not_found() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         match db.rename_conversation("ghost", "slug-anything").await {
             Err(DbError::ConversationNotFound(id)) => assert_eq!(id, "ghost"),
             other => panic!("expected ConversationNotFound, got {other:?}"),
@@ -18214,7 +18305,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_delete_conversation_removes_wake_owned_workflows_and_messages() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let conversation = db
             .create_conversation_with_project(
                 "conv-del",
@@ -18422,7 +18513,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_proposal_insert_get_roundtrip() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-1", "o1", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18444,7 +18535,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_fork_proposal_with_tool_round_commits_both() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-tr", "otr", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18507,7 +18598,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn usage_recent_llm_metrics_returns_all_window_rows() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-ttft", "slug-ttft", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18624,7 +18715,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_tool_round_commits_assistant_and_all_results() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18688,7 +18779,7 @@ mod tests {
         // INSERT trips the `messages.conversation_id` foreign key (FKs are on)
         // and the transaction rolls back — the assistant message must NOT be
         // left behind unpaired.
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18742,7 +18833,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_proposal_list_for_origin_ordered() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-2", "o2", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18767,7 +18858,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_proposal_dismiss_is_idempotent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-4", "o4", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18788,7 +18879,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_proposal_retire_pending_only() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-5", "o5", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18816,7 +18907,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_proposal_cascade_deletes_with_origin() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-6", "o6", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18830,7 +18921,7 @@ mod tests {
 
     #[tokio::test]
     async fn sub_agent_cwd_override_survives_hydration() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let parent = db
             .create_conversation(
                 "parent-override",
@@ -18896,7 +18987,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_spawned_happy_path_and_idempotent_retry() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-7", "o7", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18946,7 +19037,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_promoted_happy_path_and_idempotent_retry() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-8", "o8", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -18980,7 +19071,7 @@ mod tests {
     /// back into a permanently-stuck retry loop).
     #[tokio::test]
     async fn insert_conversation_tx_is_pk_only_idempotent_not_slug_swallowing() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // An existing distinct conversation owns a slug.
         db.create_conversation("conv-existing", "fork-collide", "/tmp", true, None, None)
@@ -19023,7 +19114,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_conflicts_on_divergent_prior_resolution() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-9", "o9", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19053,7 +19144,7 @@ mod tests {
 
     #[tokio::test]
     async fn dangling_breadcrumb_and_fork_id_tolerated() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-10", "o10", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19105,7 +19196,7 @@ mod tests {
     /// of `spawned`; this covers the `dismissed` source row.
     #[tokio::test]
     async fn resolve_out_of_dismissed_terminal_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-dt", "odt", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19145,7 +19236,7 @@ mod tests {
     /// `resolve_out_of_dismissed_terminal_is_rejected` (dismissed source).
     #[tokio::test]
     async fn resolve_out_of_promoted_terminal_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-pt", "opt", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19186,7 +19277,7 @@ mod tests {
     /// fork conversation id survives (the live, decoupled child).
     #[tokio::test]
     async fn dismiss_after_spawned_is_a_noop() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-sd", "osd", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19212,7 +19303,7 @@ mod tests {
     /// pins `refinement` absent while pending.
     #[tokio::test]
     async fn pending_proposal_has_no_resolution_fields() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-pp", "opp", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19232,7 +19323,7 @@ mod tests {
     /// field absence the entity's present-iff-terminal contract requires.
     #[tokio::test]
     async fn dismissed_proposal_has_no_resolution_fields() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("origin-df", "odf", "/tmp", true, None, None)
             .await
             .unwrap();
@@ -19288,7 +19379,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_blocks_current_user_owner() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = retirement_fixture(&db, "owner", RuntimeRole::User, &ConvState::Idle).await;
         assert_eq!(
             db.retire_work_scope(no_live_resource(scope), "cleanup")
@@ -19300,7 +19391,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_blocks_user_successor() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             retirement_fixture(&db, "predecessor", RuntimeRole::User, &ConvState::Terminal).await;
         retirement_fixture(&db, "successor", RuntimeRole::User, &ConvState::Terminal).await;
@@ -19325,7 +19416,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_blocks_active_subagent() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = retirement_fixture(
             &db,
             "terminal-user",
@@ -19349,7 +19440,7 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_blocks_pending_wake_workflow() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             retirement_fixture(&db, "wake-owner", RuntimeRole::User, &ConvState::Terminal).await;
         sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (900, 'wake', 1, 1, 0, 0, 0, 'Active', 'wake', 1, X'00', 1, 1)")
@@ -19368,7 +19459,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_retirement_preserves_conversation_and_scope_history() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope = retirement_fixture(
             &db,
             "history-owner",
@@ -19404,7 +19495,7 @@ mod tests {
 
     #[tokio::test]
     async fn normalized_environment_is_authoritative_for_reads_and_mode_updates() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let mode = ConvMode::Work {
             branch_name: NonEmptyString::new("topic").unwrap(),
             worktree_path: NonEmptyString::new("/tmp/normalized-worktree").unwrap(),
@@ -19429,7 +19520,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_projection_preserves_shared_scope_participants_without_owners() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let root = setup_exhausted_parent(
             &db,
             "work-root",
@@ -19477,7 +19568,7 @@ mod tests {
 
     #[tokio::test]
     async fn mode_and_cwd_promotion_updates_normalized_environment_atomically() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope =
             retirement_fixture(&db, "legacy-explore", RuntimeRole::User, &ConvState::Idle).await;
         let mode = ConvMode::Work {
@@ -19517,7 +19608,7 @@ mod tests {
     /// dead `state_data` column (SCHEMA no longer creates it).
     #[tokio::test]
     async fn fresh_db_has_no_state_data_column() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
             .fetch_all(db.pool())
             .await

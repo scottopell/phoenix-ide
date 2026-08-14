@@ -5208,7 +5208,9 @@ mod scope_liveness_tests {
     }
 
     async fn test_manager() -> RuntimeManager {
-        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .expect("db");
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::new_empty()),
@@ -5366,7 +5368,9 @@ mod scope_liveness_tests {
     }
 
     async fn test_manager_with_recording_llm(llm: Arc<RecordingLlm>) -> RuntimeManager {
-        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .expect("db");
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::for_test_with_sonnet(llm)),
@@ -5379,7 +5383,9 @@ mod scope_liveness_tests {
     }
 
     async fn test_manager_with_failing_llm() -> RuntimeManager {
-        let db = crate::db::Database::open_in_memory().await.expect("db");
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .expect("db");
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(FailingLlm))),

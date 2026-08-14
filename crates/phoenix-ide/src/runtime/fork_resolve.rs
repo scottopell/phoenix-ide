@@ -1577,6 +1577,10 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ConversationAlreadyExists(_)
+        | DbError::RepositoryAuthorityGenerationMismatch { .. }
+        | DbError::RepositoryAuthorityGenerationMissing { .. }
+        | DbError::RepositoryAuthorityGenerationRowMissing
+        | DbError::RepositoryAuthorityGenerationCorrupt { .. }
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
@@ -1704,7 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn approve_taskmd_proposal_spawns_work_fork_off_main() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Fix the thing\n\n## Plan\nDo it.\n";
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
@@ -1772,7 +1776,7 @@ mod tests {
     #[tokio::test]
     async fn fork_spawn_does_not_stage_or_modify_origin_gitignore() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         // Precondition: the origin checkout is clean and `.gitignore` (if any) does
         // not already list `.phoenix/`.
@@ -1819,7 +1823,7 @@ mod tests {
     #[tokio::test]
     async fn approve_plain_brief_branches_with_fork_id_prefix_no_status_promotion() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Plan\n\nplain brief body\n";
         let pid = insert_pending(&db, &origin, "docs/plan.md", body).await;
@@ -1851,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn second_approve_after_spawn_is_rejected() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -1882,7 +1886,7 @@ mod tests {
     #[tokio::test]
     async fn approve_adopts_orphaned_worktree_at_deterministic_path() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -1922,7 +1926,7 @@ mod tests {
     #[tokio::test]
     async fn approve_succeeds_despite_legacy_fork_prefix_slug_collision() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -1968,7 +1972,7 @@ mod tests {
     #[tokio::test]
     async fn approve_adopts_worktree_with_already_promoted_taskmd_no_duplicate() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Fix the thing\n\n## Plan\nDo it.\n";
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
@@ -2034,7 +2038,7 @@ mod tests {
     #[tokio::test]
     async fn approve_adopts_worktree_with_renamed_but_uncommitted_taskmd_commits_it() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Fix the thing\n\n## Plan\nDo it.\n";
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
@@ -2105,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn approve_non_pending_is_rejected() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -2128,7 +2132,7 @@ mod tests {
     #[tokio::test]
     async fn dismiss_resolves_without_spawning() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", "# x\n").await;
 
@@ -2149,7 +2153,7 @@ mod tests {
     #[tokio::test]
     async fn dismiss_cleans_deterministic_orphan_then_marks_dismissed() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         // Simulate a crashed approve: the deterministic spawn worktree + branch
@@ -2208,7 +2212,7 @@ mod tests {
     #[tokio::test]
     async fn dirless_deterministic_orphan_is_cleaned_and_approve_then_succeeds() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -2253,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn dismiss_cleans_dirless_deterministic_orphan() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         make_dirless_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-x");
@@ -2275,7 +2279,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_colliding_user_branch_is_not_deleted_by_cleanup() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", "# x\n").await;
 
@@ -2300,7 +2304,7 @@ mod tests {
     #[tokio::test]
     async fn genuine_deterministic_orphan_still_cleaned_by_dismiss() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", "# x\n").await;
         make_dirless_deterministic_orphan(
@@ -2323,7 +2327,7 @@ mod tests {
     #[tokio::test]
     async fn dismiss_is_noop_on_spawned_and_leaves_live_fork() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2345,7 +2349,7 @@ mod tests {
     #[tokio::test]
     async fn request_changes_promotes_to_explore_with_uncommitted_draft() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Plan\n\nbrief body\n";
         let pid = insert_pending(&db, &origin, "docs/plan.md", body).await;
@@ -2406,7 +2410,7 @@ mod tests {
             &["commit", "-q", "-m", "add gitignore without .phoenix"],
         );
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "docs/plan.md", "# Plan\n\nbody\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2461,7 +2465,7 @@ mod tests {
         // promote-after-approve and approve-after-promote both rejected (the
         // proposal becomes terminal on first resolution).
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_p, origin) = seed_project_and_origin(&db, &repo).await;
         let p1 = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2488,7 +2492,7 @@ mod tests {
     #[tokio::test]
     async fn second_request_changes_after_promote_is_rejected() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_p, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2521,7 +2525,7 @@ mod tests {
     #[tokio::test]
     async fn request_changes_on_dismissed_is_rejected() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_p, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         assert!(db.dismiss_fork_proposal(&pid).await.unwrap());
@@ -2541,7 +2545,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_rejected_when_origin_terminal() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_p, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         // Drive the origin terminal.
@@ -2555,7 +2559,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_unknown_proposal_is_not_found() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let rt = make_runtime(db.clone()).await;
         let err = rt.approve_fork_proposal("no-such-id").await.unwrap_err();
         assert!(matches!(err, ForkResolveError::NotFound(_)), "got {err:?}");
@@ -2592,7 +2596,7 @@ mod tests {
     #[tokio::test]
     async fn retire_on_terminal_dismisses_pending_and_cleans_orphan() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         // A crashed approve left a deterministic spawn orphan for this pending proposal.
@@ -2617,7 +2621,7 @@ mod tests {
     #[tokio::test]
     async fn retire_on_terminal_leaves_spawned_untouched() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let body = "# Fix the thing\n";
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
@@ -2647,7 +2651,7 @@ mod tests {
     #[tokio::test]
     async fn hard_delete_cleanup_removes_pending_orphan_only() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
 
         // Proposal A: still pending, with a crashed-approve deterministic orphan.
@@ -2703,7 +2707,7 @@ mod tests {
     #[tokio::test]
     async fn approve_after_hard_delete_cleanup_is_rejected() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2739,7 +2743,7 @@ mod tests {
     #[tokio::test]
     async fn approve_on_terminal_origin_retires_proposal_and_conflicts() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         // A crashed approve left a deterministic spawn orphan for this proposal.
@@ -2776,7 +2780,7 @@ mod tests {
     #[tokio::test]
     async fn startup_reconcile_retires_pending_against_terminal_origin_only() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
 
         // Origin A is terminal with a stranded pending proposal + crashed orphan.
         let (_pa, origin_a) = seed_project_and_origin(&db, &repo).await;
@@ -2827,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn during_git_terminal_aborts_resolve_and_cleans_orphan() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,
@@ -2891,7 +2895,7 @@ mod tests {
     #[tokio::test]
     async fn during_git_recheck_is_noop_when_origin_still_live() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
         let rt = make_runtime(db.clone()).await;
@@ -2919,7 +2923,7 @@ mod tests {
     #[tokio::test]
     async fn approve_prunes_and_recreates_prunable_deterministic_worktree() {
         let (_tmp, repo) = init_repo();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(
             &db,

@@ -576,7 +576,7 @@ async fn open_database_with_migrations(
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let db = Database::open(&db_path.to_string_lossy()).await?;
+    let db = Database::open_project_authority(&db_path.to_string_lossy()).await?;
     db.reconcile_worktree_identities().await?;
     db.restrict_file_permissions();
     Ok(db)
@@ -680,7 +680,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Configuration. db_path materializes the env's resolved PathBuf as a
-    // string for the `&str`-taking APIs below (TLS config, Database::open).
+    // string for the `&str`-taking APIs below (TLS config and database opening).
     let db_path = runtime_env.db_path().to_string_lossy().into_owned();
 
     let port: u16 = std::env::var("PHOENIX_PORT")
@@ -1601,7 +1601,9 @@ mod suggest_token_tests {
     /// changes — the two properties the persistence fix guarantees.
     #[tokio::test]
     async fn token_persists_across_restarts_and_rotates_on_password_change() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
 
         // First resolve mints + persists.
         let first = resolve_suggest_token(&db, None).await;
@@ -1686,12 +1688,14 @@ mod reconcile_worktrees_tests {
         (wt_path, mode)
     }
 
-    /// Create a fresh in-memory database. `open_in_memory` runs both the
+    /// Create a fresh in-memory database. `open_in_memory_project_authority` runs both the
     /// baseline schema and the numbered migrations, mirroring production
     /// startup so tests can rely on columns added by later migrations
     /// (e.g. `continued_in_conv_id` added in task 24696 Phase 1).
     async fn fresh_db() -> db::Database {
-        db::Database::open_in_memory().await.unwrap()
+        db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap()
     }
 
     /// Helper: insert a Work conversation with the given `ConvMode`, then
@@ -2667,7 +2671,7 @@ mod reconcile_main_ref_tests {
     async fn reconciles_literal_main_to_remote_default_master() {
         let (_tmp, repo) = init_repo_on("master");
         set_remote_default(&repo, "master");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await
@@ -2703,7 +2707,7 @@ mod reconcile_main_ref_tests {
         // Repo on `feature`, but a real `main` branch ALSO exists locally.
         let (_tmp, repo) = init_repo_on("feature");
         create_branch(&repo, "main");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await
@@ -2730,7 +2734,7 @@ mod reconcile_main_ref_tests {
         // Repo on `develop`; the project was created when `develop` was the
         // resolved default. The remote default ONLY moves to `main` afterwards.
         let (_tmp, repo) = init_repo_on("develop");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await
@@ -2759,7 +2763,7 @@ mod reconcile_main_ref_tests {
     async fn no_origin_broken_main_ref_is_repaired_to_current_branch() {
         // Repo's only branch is `master`; there is no `main`.
         let (_tmp, repo) = init_repo_on("master");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await
@@ -2780,7 +2784,7 @@ mod reconcile_main_ref_tests {
     async fn reconcile_is_idempotent() {
         let (_tmp, repo) = init_repo_on("master");
         set_remote_default(&repo, "master");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await
@@ -2800,7 +2804,7 @@ mod reconcile_main_ref_tests {
 
     #[tokio::test]
     async fn missing_repo_is_skipped_without_error() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         // Create a project against a real repo so creation succeeds, then point
         // its canonical_path at a now-gone directory.
         let (tmp, repo) = init_repo_on("master");
@@ -2824,7 +2828,7 @@ mod reconcile_main_ref_tests {
     #[tokio::test]
     async fn find_or_create_resolves_default_at_creation() {
         let (_tmp, repo) = init_repo_on("develop");
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
             .await

@@ -475,7 +475,9 @@ mod tests {
     }
 
     async fn application_tools() -> (WritingConversationTools, Vec<Arc<dyn Tool>>) {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let runtime = Arc::new(crate::runtime::RuntimeManager::new(
             db.clone(),
@@ -508,7 +510,7 @@ mod tests {
     async fn tool_and_context() -> (ExplicitCwdSandboxedBash, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("coordinator-bash.db");
-        let db = crate::db::Database::open(db_path.to_str().unwrap())
+        let db = crate::db::Database::open_project_authority(db_path.to_str().unwrap())
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
@@ -559,7 +561,9 @@ mod tests {
 
     #[tokio::test]
     async fn send_conversation_message_rejects_self_before_dispatch() {
-        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let db = crate::db::Database::open_in_memory_project_authority()
+            .await
+            .unwrap();
         db.create_conversation("origin", "origin", "/tmp", true, None, None)
             .await
             .unwrap();

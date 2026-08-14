@@ -1102,6 +1102,10 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
         | DbError::ForkProposalConflict(_)
+        | DbError::RepositoryAuthorityGenerationMismatch { .. }
+        | DbError::RepositoryAuthorityGenerationMissing { .. }
+        | DbError::RepositoryAuthorityGenerationRowMissing
+        | DbError::RepositoryAuthorityGenerationCorrupt { .. }
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
@@ -1188,7 +1192,7 @@ mod tests {
     async fn snapshot_exposes_active_leaf_even_when_task_metadata_looks_complete() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snapshot.db");
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_project_authority(path.to_str().unwrap())
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
@@ -1248,7 +1252,7 @@ mod tests {
         let work = dir.path().join("work");
         std::fs::create_dir(&work).unwrap();
         let canonical = work.canonicalize().unwrap();
-        let db = crate::db::Database::open(path.to_str().unwrap())
+        let db = crate::db::Database::open_project_authority(path.to_str().unwrap())
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();

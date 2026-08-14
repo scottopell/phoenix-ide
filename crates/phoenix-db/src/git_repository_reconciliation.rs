@@ -1350,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_inserts_missing_git_repository() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-a").await;
 
         let stats = run_catchup(&db).await.unwrap();
@@ -1363,7 +1363,9 @@ mod tests {
     async fn catchup_inserts_missing_git_repository_on_file_backed_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catchup.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         run_pending_migrations(db.pool()).await.unwrap();
         insert_project(&db, "repo-file").await;
 
@@ -1375,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_replaces_superseded_attachment() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-good").await;
         insert_git_repository(&db, "repo-good").await;
         insert_git_repository(&db, "repo-stale").await;
@@ -1395,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_removes_deleted_source_project_attachment_and_observations() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_git_repository(&db, "repo-gone").await;
         insert_locator_observation(&db, "repo-gone").await;
         insert_default_branch_observation(&db, "repo-gone").await;
@@ -1416,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_is_idempotent_for_exact_set() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-a").await;
         insert_project(&db, "repo-b").await;
         insert_git_repository(&db, "repo-a").await;
@@ -1440,7 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_rolls_back_transaction_on_multi_project_conflict() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-a").await;
         insert_project(&db, "repo-b").await;
         insert_git_repository(&db, "repo-stale").await;
@@ -1480,7 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_reports_conflict_for_opaque_repository_ids_with_commas_and_padding() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let repo_a = "repo,one";
         let repo_b = "  repo-two  ";
         insert_project(&db, repo_a).await;
@@ -1512,7 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_conflict_reports_only_the_first_two_of_all_internal_conflicts() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let scope_a = insert_scope(&db, "scope-a").await;
         let scope_z = insert_scope(&db, "scope-z").await;
         for repository_id in ["  repo-a  ", "repo-m", "repo,z"] {
@@ -1569,7 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_deletes_all_observations_even_for_retained_attached_repo() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-keep").await;
         insert_git_repository(&db, "repo-keep").await;
         let scope = insert_scope(&db, "scope-keep").await;
@@ -1594,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn catchup_deletes_attachment_when_scope_has_zero_projects() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_git_repository(&db, "repo-gone").await;
         let scope = insert_scope(&db, "scope-zero").await;
         insert_conversation_with_scope_and_project(&db, "conv-zero", &scope, None).await;
@@ -1609,7 +1611,7 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_database_handles_share_authority_identity() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let cloned = db.clone();
         insert_project(&db, "repo-shared").await;
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
@@ -1629,8 +1631,8 @@ mod tests {
     #[tokio::test]
     async fn catchup_rejects_different_in_memory_database_before_mutation_and_leaves_rows_unchanged(
     ) {
-        let db = Database::open_in_memory().await.unwrap();
-        let other_db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
+        let other_db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-a").await;
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
             &other_db,
@@ -1652,9 +1654,13 @@ mod tests {
     async fn catchup_rejects_independently_reopened_file_database_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reopened-catchup.db");
-        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         run_pending_migrations(db.pool()).await.unwrap();
-        let reopened = Database::open(path.to_str().unwrap()).await.unwrap();
+        let reopened = Database::open_project_authority(path.to_str().unwrap())
+            .await
+            .unwrap();
         run_pending_migrations(reopened.pool()).await.unwrap();
         insert_project(&db, "repo-a").await;
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
@@ -1675,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn newer_mint_supersedes_older_and_stale_rejection_leaves_newer_usable() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-b").await;
         let permit_a = DormantGitRepositoryCatchupPermit::test_only_mint(
             &db,
@@ -1703,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_operation_permits_produce_non_substitutable_receipts() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let first = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -1718,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_catchup_spends_operation_and_another_permit_for_same_marker_goes_stale() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-spent").await;
         let proof = TestDormantGitRepositoryExclusionProof::new();
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof.clone());
@@ -1736,7 +1742,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_failure_spends_operation_without_restoring_marker() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let proof = TestDormantGitRepositoryExclusionProof::new();
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof.clone());
         let stale_retry = DormantGitRepositoryCatchupPermit::test_only_mint(&db, proof);
@@ -1757,7 +1763,7 @@ mod tests {
 
     #[tokio::test]
     async fn permit_consumption_prevents_reuse_by_move() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let permit = DormantGitRepositoryCatchupPermit::test_only_mint(
             &db,
             TestDormantGitRepositoryExclusionProof::new(),
@@ -2051,7 +2057,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_derives_internal_build_identity_schema_and_fresh_root() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let first = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2107,8 +2113,8 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_receipt_rejects_target_mismatch_and_reuse() {
-        let db = Database::open_in_memory().await.unwrap();
-        let other = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
+        let other = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2134,7 +2140,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_receipt_claim_rejects_concurrency_but_releases_without_finalization() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2163,7 +2169,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_latest_successful_catchup_receipt_may_be_claimed() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let first = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2185,7 +2191,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_readiness_claim_blocks_catchup_without_spending_its_marker() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2212,7 +2218,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_claim_and_catchup_start_share_one_lifecycle_coordination_state() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2240,7 +2246,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_validation_error_restores_connection_and_releases_receipt_for_retry() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2270,7 +2276,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_reports_ordered_migration_ledger_mismatch() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2292,7 +2298,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_reports_r1_schema_and_foreign_key_integrity_categories() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let schema_outcome =
             run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
                 .await
@@ -2308,7 +2314,7 @@ mod tests {
             .diagnostic_categories()
             .contains(&DormantGitRepositoryReadinessDiagnosticCategory::Schema));
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let ddl_outcome =
             run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
                 .await
@@ -2326,7 +2332,7 @@ mod tests {
             .diagnostic_categories()
             .contains(&DormantGitRepositoryReadinessDiagnosticCategory::Schema));
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let fk_outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2352,7 +2358,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_reports_without_rowid_foreign_key_violation_with_unavailable_row_id() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2394,7 +2400,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_records_explicit_valid_absence_for_unretained_observations() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
             .unwrap();
@@ -2417,7 +2423,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_query_only_rejects_writes_and_preserves_every_validated_row() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-query-only").await;
         let scope = insert_scope(&db, "scope-query-only").await;
         insert_conversation_with_scope_and_project(
@@ -2460,7 +2466,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_query_only_restores_connection_and_keeps_in_memory_database_alive() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         insert_project(&db, "repo-a").await;
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
             .await
@@ -2479,7 +2485,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_diagnostics_are_deterministic_and_bounded() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory_project_authority().await.unwrap();
         for id in 0..12 {
             insert_project(&db, &format!("repo-{id:02}")).await;
         }
