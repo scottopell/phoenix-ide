@@ -240,7 +240,7 @@ struct DeepLinkConversationValidation {
 
 struct QueuedDeepLinkAuthorityDecision {
     static func shouldRetain(pendingOrigin: PhoenixOrigin?, nextOrigin: PhoenixOrigin?) -> Bool {
-        pendingOrigin != nil && pendingOrigin == nextOrigin
+        nextOrigin != nil && (pendingOrigin == nil || pendingOrigin == nextOrigin)
     }
 }
 

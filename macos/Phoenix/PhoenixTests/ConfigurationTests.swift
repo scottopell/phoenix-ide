@@ -1742,6 +1742,15 @@ final class ServerManagerHelpersTests: XCTestCase {
         ))
     }
 
+    func testQueuedDeepLinkAuthorityBindsFirstOriginAndRejectsLaterOriginChanges() throws {
+        let first = try PhoenixOrigin("https://first.example.test")
+        let second = try PhoenixOrigin("https://second.example.test")
+        XCTAssertTrue(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: nil, nextOrigin: first))
+        XCTAssertTrue(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: first, nextOrigin: first))
+        XCTAssertFalse(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: first, nextOrigin: second))
+        XCTAssertFalse(QueuedDeepLinkAuthorityDecision.shouldRetain(pendingOrigin: nil, nextOrigin: nil))
+    }
+
     func testDeepLinkNavigationQueueWaitsForAuthenticatedPrimaryWebView() {
 
         let first = UUID()

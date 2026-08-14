@@ -133,10 +133,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let currentOperation = serverManager.currentOperationToken
         let staleBrowserOperation = browserOperation != nil && browserOperation != currentOperation
         if state.canDisplayWebView, let origin = serverManager.webOrigin, let mode = serverManager.mode {
-            if !QueuedDeepLinkAuthorityDecision.shouldRetain(
+            if QueuedDeepLinkAuthorityDecision.shouldRetain(
                 pendingOrigin: pendingConversationOrigin,
                 nextOrigin: origin
             ) {
+                if pendingConversationID != nil && pendingConversationOrigin == nil {
+                    pendingConversationOrigin = origin
+                }
+            } else {
                 pendingConversationValidationTask?.cancel()
                 pendingConversationID = nil
                 pendingConversationOrigin = nil
