@@ -10,8 +10,8 @@ AND SHALL require the embedded binary's version and full Git commit to match the
 ## REQ-DESKTOP-REL-002 — Preserve standalone server artifacts
 
 THE SYSTEM SHALL publish desktop archives as additional release assets
-AND SHALL preserve these standalone server assets: `phoenix_ide-aarch64-apple-darwin`, `phoenix_ide-x86_64-apple-darwin`, `phoenix_ide-x86_64-unknown-linux-gnu`, and `phoenix_ide-aarch64-unknown-linux-gnu`,
-AND SHALL preserve these debug-symbol assets: `phoenix_ide-x86_64-unknown-linux-gnu.debug` and `phoenix_ide-aarch64-unknown-linux-gnu.debug`,
+AND SHALL preserve these standalone server assets: `phoenix_ide-aarch64-apple-darwin`, `phoenix_ide-x86_64-apple-darwin`, `phoenix_ide-x86_64-unknown-linux-musl`, and `phoenix_ide-aarch64-unknown-linux-musl`,
+AND SHALL preserve these debug-symbol assets: `phoenix_ide-x86_64-unknown-linux-musl-debug` and `phoenix_ide-aarch64-unknown-linux-musl-debug`,
 AND SHALL preserve each named asset's executable or debug-symbol content contract.
 
 ## REQ-DESKTOP-REL-003 — Sign and notarize distributable apps

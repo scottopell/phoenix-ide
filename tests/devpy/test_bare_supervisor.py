@@ -288,7 +288,7 @@ class BareTransactionTests(unittest.TestCase):
         manifest, *_ = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
         self.assertEqual("b" * 12, manifest.expected.git_sha)
 
-    def test_legacy_persisted_manifest_without_source_kind_reconciles_as_installed_restart(self):
+    def test_protocol_two_manifest_without_source_kind_is_rejected(self):
         path = self.manifest(expected_sha="b" * 12, source_kind="installed_restart")
         self.transaction.chmod(0o700)
         path.chmod(0o600)
@@ -298,11 +298,8 @@ class BareTransactionTests(unittest.TestCase):
         path.chmod(0o400)
         self.transaction.chmod(0o500)
 
-        manifest = supervisor.TransactionManifest.load(path)
-        self.assertEqual("installed_restart", manifest.source_kind)
-        owner = supervisor.Supervisor(self.layout)
-        validated, *_ = owner.validated_transaction(self.transaction_id, supervisor.sha256(path))
-        self.assertEqual("b" * 12, validated.expected.git_sha)
+        with self.assertRaisesRegex(ValueError, "requires source_kind"):
+            supervisor.TransactionManifest.load(path)
 
     def test_accepts_previous_manifest_identity_with_legacy_twelve_char_sha(self):
         path = self.manifest(previous=True)

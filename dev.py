@@ -8190,7 +8190,9 @@ def _commit_bare_transaction(
     env_snapshot: dict[str, str],
     transaction_id: str,
     previous_running: bool,
-) -> None:
+    *,
+    activate: bool = True,
+) -> str:
     """Stage an immutable transaction for `prepared` and activate it through the
     running supervisor. Shared by deploy (new binary) and restart (installed
     binary, refreshed env); on activation failure it discards the unclaimed
@@ -8240,6 +8242,13 @@ def _commit_bare_transaction(
         artifact.chmod(0o400)
     transaction.chmod(0o500)
 
+    if not activate:
+        return manifest_hash
+    _activate_bare_transaction(layout, transaction_id, manifest_hash)
+    return manifest_hash
+
+
+def _activate_bare_transaction(layout: dict[str, Path], transaction_id: str, manifest_hash: str) -> None:
     result = subprocess.run([
         sys.executable, str(layout["supervisor"]), "--root", str(layout["root"]),
         "activate", "--transaction-id", transaction_id, "--manifest-sha256", manifest_hash,
@@ -8295,6 +8304,9 @@ def prod_daemon_deploy(
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
         previous_running = _bare_child_running(layout)
+        manifest_hash = _commit_bare_transaction(
+            layout, prepared, env_snapshot, transaction_id, previous_running, activate=False
+        )
         _start_bare_supervisor(
             layout,
             protocol,
@@ -8302,7 +8314,7 @@ def prod_daemon_deploy(
             reuse_compatible=controller.enabled,
         )
         _configure_bare_reboot_persistence(layout)
-        _commit_bare_transaction(layout, prepared, env_snapshot, transaction_id, previous_running)
+        _activate_bare_transaction(layout, transaction_id, manifest_hash)
 
     print("\n✓ Deployed through persistent bare Linux supervisor")
     print(f"  Transaction: {transaction_id}")

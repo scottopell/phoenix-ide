@@ -85,8 +85,7 @@ class TransactionManifest:
         try:
             raw = json.loads(path.read_text())
             if "source_kind" not in raw:
-                legacy_expected = raw.get("expected", {}).get("git_sha", "")
-                raw["source_kind"] = "installed_restart" if LEGACY_EMBEDDED_SHA_RE.fullmatch(legacy_expected) else "local_head"
+                raise ValueError("protocol-2 transaction manifest requires source_kind")
             raw["expected"] = RuntimeIdentity(**raw["expected"])
             raw["previous"] = RuntimeIdentity(**raw["previous"]) if raw.get("previous") else None
             raw["candidate_binary"] = Artifact(**raw["candidate_binary"])
