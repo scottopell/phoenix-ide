@@ -402,16 +402,18 @@ struct DormantGitRepositorySourceCensusAttestation {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DormantGitRepositoryCompatibilityResult {
+    Passed,
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct DormantGitRepositoryOldBinaryCompatibilityAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
     historical_sha: String,
     candidate_schema_digest: String,
-    old_source_unchanged: bool,
-    catchup_exact: bool,
-    replay_idempotent: bool,
-    fresh_readiness_root: bool,
-    passed: bool,
+    result: DormantGitRepositoryCompatibilityResult,
 }
 
 #[cfg(test)]
@@ -422,8 +424,12 @@ enum DormantGitRepositoryRollbackPosture {
 
 #[cfg(test)]
 impl DormantGitRepositoryRollbackPosture {
-    fn as_str(self) -> &'static str {
-        "additive_schema_retained_destructive_down_migration_prohibited"
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdditiveSchemaRetainedDestructiveDownMigrationProhibited => {
+                "additive_schema_retained_destructive_down_migration_prohibited"
+            }
+        }
     }
 }
 
@@ -432,8 +438,6 @@ impl DormantGitRepositoryRollbackPosture {
 struct DormantGitRepositoryRollbackAttestation {
     root: DormantGitRepositoryUnit4RunBinding,
     posture: DormantGitRepositoryRollbackPosture,
-    additive_schema_retained: bool,
-    old_source_unchanged: bool,
 }
 
 /// An opaque, in-process acceptance aggregate. Its nonce is represented by an
@@ -476,13 +480,7 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
         };
         let eligibility = readiness.summary.eligibility == DormantGitRepositoryR1Eligibility::Eligible
             && census.clean
-            && compatibility.passed
-            && compatibility.old_source_unchanged
-            && compatibility.catchup_exact
-            && compatibility.replay_idempotent
-            && compatibility.fresh_readiness_root
-            && rollback.additive_schema_retained
-            && rollback.old_source_unchanged
+            && compatibility.result == DormantGitRepositoryCompatibilityResult::Passed
             && rollback.posture
                 == DormantGitRepositoryRollbackPosture::AdditiveSchemaRetainedDestructiveDownMigrationProhibited;
         let integrity_digest = length_framed_digest([
@@ -499,7 +497,12 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
                 "compatibility_schema",
                 compatibility.candidate_schema_digest.as_bytes(),
             ),
-            ("rollback_posture", rollback.posture.as_str().as_bytes()),
+            (
+                "rollback_posture",
+                DormantGitRepositoryRollbackPosture::AdditiveSchemaRetainedDestructiveDownMigrationProhibited
+                    .as_str()
+                    .as_bytes(),
+            ),
             ("eligible", if eligibility { b"true" } else { b"false" }),
         ]);
         Ok(Self {
@@ -543,6 +546,8 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
 
 #[cfg(test)]
 fn length_framed_digest<'a>(parts: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    use std::fmt::Write;
+
     let mut hasher = Sha256::new();
     for (name, value) in parts {
         hasher.update((name.len() as u64).to_be_bytes());
@@ -550,11 +555,14 @@ fn length_framed_digest<'a>(parts: impl IntoIterator<Item = (&'a str, &'a [u8])>
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
     }
+
     hasher
         .finalize()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 #[cfg(test)]
@@ -2678,6 +2686,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "historical binary acceptance runner supplies a migrated file database"]
+    #[allow(clippy::too_many_lines)]
     async fn finalizes_historical_r1_compatibility_handoff() {
         let db_path = required_env("PHOENIX_R1_COMPAT_DB_PATH");
         let canonical_path = required_env("PHOENIX_R1_COMPAT_CANONICAL_PATH");
@@ -2756,17 +2765,11 @@ mod tests {
             root: root.clone(),
             historical_sha: historical_sha.clone(),
             candidate_schema_digest: replay_readiness.schema.compiled_migration_digest.clone(),
-            old_source_unchanged: true,
-            catchup_exact: true,
-            replay_idempotent: true,
-            fresh_readiness_root: true,
-            passed: true,
+            result: DormantGitRepositoryCompatibilityResult::Passed,
         };
         let rollback = DormantGitRepositoryRollbackAttestation {
             root,
             posture: DormantGitRepositoryRollbackPosture::AdditiveSchemaRetainedDestructiveDownMigrationProhibited,
-            additive_schema_retained: shadow_counts(&db).await.len() == 4,
-            old_source_unchanged: true,
         };
         let evidence = DormantGitRepositoryCompleteCompatibilityEvidence::new(
             replay_readiness,

@@ -34,7 +34,6 @@ ROOT = Path(__file__).resolve().parents[2]
 HISTORICAL_SHA = "799ea4d63c3d451f3f47859fa21df46fe3072923"
 CONVERSATION_ID = "11111111-1111-4111-8111-111111111111"
 MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
-PROJECT_ID = "33333333-3333-4333-8333-333333333333"
 STARTUP_EVENT = "Phoenix IDE server listening"
 OUTER_TIMEOUT = 120.0
 
@@ -158,16 +157,30 @@ def table_counts(db_path: Path) -> dict[str, int]:
 def old_database_proof(db_path: Path, canonical_path: str, before_shadow: dict[str, int]) -> dict[str, Any]:
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        row = connection.execute("SELECT id FROM projects WHERE canonical_path = ?", (canonical_path,)).fetchall()
-        if row != [(PROJECT_ID,)]:
-            raise RuntimeError(f"historical project proof failed: {row!r}")
-        conversation = connection.execute("SELECT project_id, state_kind FROM conversations WHERE id = ?", (CONVERSATION_ID,)).fetchone()
-        if conversation != (PROJECT_ID, "idle"):
-            raise RuntimeError(f"historical conversation must be Idle and attached to canonical Project: {conversation!r}")
-        job = connection.execute("SELECT status FROM conversation_creation_jobs WHERE conversation_id = ?", (CONVERSATION_ID,)).fetchone()
-        if job != ("ready",):
-            raise RuntimeError(f"historical creation job must finalize ready: {job!r}")
-        migrations = connection.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall()
+        rows = connection.execute(
+            "SELECT id FROM projects WHERE canonical_path = ?", (canonical_path,)
+        ).fetchall()
+        if len(rows) != 1:
+            raise RuntimeError(f"historical project proof failed: {rows!r}")
+        project_id = rows[0][0]
+        conversation = connection.execute(
+            "SELECT project_id, state_kind FROM conversations WHERE id = ?",
+            (CONVERSATION_ID,),
+        ).fetchone()
+        if conversation != (project_id, "idle"):
+            raise RuntimeError(
+                "historical conversation must be Idle and attached to canonical "
+                f"Project: project={project_id!r}, conversation={conversation!r}"
+            )
+        job = connection.execute(
+            "SELECT status, stage FROM conversation_creation_jobs WHERE conversation_id = ?",
+            (CONVERSATION_ID,),
+        ).fetchone()
+        if job != ("ready", "finalize"):
+            raise RuntimeError(f"historical creation job must settle ready/finalize: {job!r}")
+        migrations = connection.execute(
+            "SELECT version, name FROM _migrations ORDER BY version"
+        ).fetchall()
         if not any(name == "create_git_repository_shadow_tables" for _, name in migrations):
             raise RuntimeError("candidate additive shadow migration was removed")
     finally:
@@ -175,25 +188,53 @@ def old_database_proof(db_path: Path, canonical_path: str, before_shadow: dict[s
     after_shadow = table_counts(db_path)
     if after_shadow != before_shadow:
         raise RuntimeError(f"historical server wrote shadow tables: before={before_shadow}, after={after_shadow}")
-    return {"projects_at_canonical_path": 1, "conversation_project_matches": True, "state": "Idle", "creation_job": "ready", "shadow_before": before_shadow, "shadow_after_old": after_shadow}
+    return {
+        "projects_at_canonical_path": 1,
+        "project_id": project_id,
+        "conversation_project_matches": True,
+        "state": "Idle",
+        "creation_job_status": "ready",
+        "creation_job_stage": "finalize",
+        "shadow_before": before_shadow,
+        "shadow_after_old": after_shadow,
+    }
 
 
 async def create_seeded_empty(base_url: str, canonical_path: str) -> None:
-    payload = {"conversation_id": CONVERSATION_ID, "cwd": canonical_path, "model": "mock", "text": "", "images": [], "files": [], "message_id": MESSAGE_ID, "mode": "direct", "seed_parent_id": "44444444-4444-4444-8444-444444444444", "seed_label": "R1 compatibility seed"}
+    payload = {
+        "conversation_id": CONVERSATION_ID,
+        "cwd": canonical_path,
+        "model": "mock",
+        "text": "",
+        "message_id": MESSAGE_ID,
+        "images": [],
+        "files": [],
+        "mode": "direct",
+        "base_branch": None,
+        "seed_parent_id": None,
+        "checkout_ref": None,
+        "seed_label": "r1-old-binary-compat",
+    }
     async with httpx.AsyncClient(timeout=httpx.Timeout(OUTER_TIMEOUT)) as client:
-        async with aconnect_sse(client, "GET", f"{base_url}/api/conversations/{CONVERSATION_ID}/stream") as source:
-            response = await client.post(f"{base_url}/api/conversations/new", json=payload)
-            response.raise_for_status()
+        response = await client.post(f"{base_url}/api/conversations/new", json=payload)
+        response.raise_for_status()
+        async with aconnect_sse(
+            client,
+            "GET",
+            f"{base_url}/api/conversations/{CONVERSATION_ID}/stream",
+        ) as source:
             async for event in source.aiter_sse():
-                if event.event != "init":
+                if event.event not in {"init", "state_change"}:
                     continue
                 value = json.loads(event.data)
-                state = value.get("conversation", {}).get("state")
+                if event.event == "init":
+                    state = value.get("conversation", {}).get("state")
+                else:
+                    state = value.get("state")
                 state_kind = state.get("type", state) if isinstance(state, dict) else state
                 if str(state_kind).lower() == "idle":
                     return
-                raise RuntimeError(f"seeded empty SSE init did not prove Idle: {state!r}")
-    raise RuntimeError("SSE ended before an Idle init")
+    raise RuntimeError("SSE ended before init/state_change proved Idle")
 
 
 def main() -> None:
@@ -242,20 +283,31 @@ def main() -> None:
             proof = old_database_proof(db_path, str(repo.resolve()), before_shadow)
             finalizer_env = os.environ | {
                 "PHOENIX_R1_COMPAT_DB_PATH": str(db_path), "PHOENIX_R1_COMPAT_CANONICAL_PATH": str(repo.resolve()),
-                "PHOENIX_R1_COMPAT_PROJECT_ID": PROJECT_ID, "PHOENIX_R1_COMPAT_CONVERSATION_ID": CONVERSATION_ID,
+                "PHOENIX_R1_COMPAT_PROJECT_ID": proof["project_id"], "PHOENIX_R1_COMPAT_CONVERSATION_ID": CONVERSATION_ID,
                 "PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT": str(artifact), "PHOENIX_R1_COMPAT_HISTORICAL_SHA": HISTORICAL_SHA,
                 "PHOENIX_R1_COMPAT_CENSUS_REVISION": source_census.revision, "PHOENIX_R1_COMPAT_CENSUS_DIGEST": source_census.digest,
                 "PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT": str(source_census.shadow_reference_count),
                 "PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT": str(source_census.project_authority_path_count),
             }
-            run("cargo", "test", "--offline", "-p", "phoenix-db", "finalizes_historical_r1_compatibility_handoff", "--", "--ignored", "--exact", env=finalizer_env)
+            run(
+                "cargo",
+                "test",
+                "--offline",
+                "-p",
+                "phoenix-db",
+                "git_repository_reconciliation::tests::finalizes_historical_r1_compatibility_handoff",
+                "--",
+                "--ignored",
+                "--exact",
+                env=finalizer_env,
+            )
             finalizer = json.loads(artifact.read_text())
             if finalizer["candidate_sha"] != candidate_sha or not finalizer["complete_eligibility"]:
                 raise RuntimeError(f"candidate finalizer did not produce complete exact evidence: {finalizer}")
             if table_counts(db_path)["git_repositories"] != 1:
                 raise RuntimeError("candidate catch-up did not retain the additive GitRepository schema")
             report = {"candidate_sha": candidate_sha, "candidate_schema_digest": finalizer["candidate_schema_digest"], "historical_sha": HISTORICAL_SHA, "historical_version_endpoint": version, "historical_placeholder_only_dirty": True, "database_proof": proof, "census_revision": source_census.revision, "census_content_digest": source_census.digest, "rollback_posture": finalizer["rollback_posture"], "complete_eligibility": finalizer["complete_eligibility"], "integrity_digest": finalizer["integrity_digest"]}
-            output = ROOT / "tests/e2e/git_repository_r1_compat.artifact.json"
+            output = ROOT / "target/git_repository_r1_compat.artifact.json"
             output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
             print(json.dumps(report, indent=2, sort_keys=True))
         finally:

@@ -6,6 +6,6 @@ migrates an empty database with the candidate, and lets the old server create a
 seeded-empty conversation through HTTP and SSE. The candidate's ignored private
 finalizer then catches up the dormant GitRepository shadows.
 
-The acceptance artifact is `tests/e2e/git_repository_r1_compat.artifact.json`.
+The acceptance artifact is `target/git_repository_r1_compat.artifact.json`.
 It is CI/acceptance evidence, never Phoenix product persistence. The acceptance
 posture is additive schema retained; destructive down-migration is prohibited.
