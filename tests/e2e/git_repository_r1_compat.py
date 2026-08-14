@@ -46,10 +46,35 @@ class Census:
     project_authority_path_count: int
 
 
-def run(*args: str, cwd: Path = ROOT, env: dict[str, str] | None = None) -> str:
-    completed = subprocess.run(
-        args, cwd=cwd, env=env, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
+def run(
+    *args: str,
+    cwd: Path = ROOT,
+    env: dict[str, str] | None = None,
+    timeout: float = 900.0,
+) -> str:
+    command = " ".join(args)
+    print(f"+ [{cwd}] {command}", flush=True)
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            env=env,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"command failed ({error.returncode}): {command}\n"
+            f"stdout:\n{error.stdout}\nstderr:\n{error.stderr}"
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"command exceeded {timeout}s liveness bound: {command}\n"
+            f"stdout:\n{error.stdout}\nstderr:\n{error.stderr}"
+        ) from error
     return completed.stdout.strip()
 
 
@@ -238,7 +263,9 @@ async def create_seeded_empty(base_url: str, canonical_path: str) -> None:
 
 
 def main() -> None:
+    print("phase: candidate identity", flush=True)
     candidate_sha = clean_head()
+    print("phase: authority census", flush=True)
     source_census = census()
     with tempfile.TemporaryDirectory(prefix="phoenix-r1-compat-") as temporary:
         work = Path(temporary)
@@ -247,18 +274,30 @@ def main() -> None:
         db_path = work / "candidate-expanded.db"
         old_binary = old_target / "debug" / "phoenix_ide"
         artifact = work / "finalizer.json"
+        print("phase: materialize historical source", flush=True)
         run("git", "worktree", "add", "--detach", str(old_tree), HISTORICAL_SHA)
         try:
             (old_tree / "ui/dist").mkdir(parents=True, exist_ok=True)
             (old_tree / "ui/dist/index.html").write_text("<!doctype html><title>compatibility placeholder</title>")
             run("git", "add", "-f", "ui/dist/index.html", cwd=old_tree)
             build_env = os.environ | {"CARGO_TARGET_DIR": str(old_target)}
-            run("cargo", "build", "--offline", "--locked", "-p", "phoenix_ide", cwd=old_tree, env=build_env)
+            print("phase: build historical binary", flush=True)
+            run(
+                "cargo",
+                "build",
+                "--offline",
+                "--locked",
+                "-p",
+                "phoenix_ide",
+                cwd=old_tree,
+                env=build_env,
+            )
             old_version = run("git", "rev-parse", "HEAD", cwd=old_tree)
             old_dirty = run("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=old_tree)
             if old_version != HISTORICAL_SHA or old_dirty != "A  ui/dist/index.html":
                 raise RuntimeError(f"historical build identity changed beyond its placeholder: head={old_version}, status={old_dirty!r}")
             candidate_binary = ROOT / "target/debug/phoenix_ide"
+            print("phase: build candidate binary", flush=True)
             run("cargo", "build", "--offline", "--locked", "-p", "phoenix_ide")
             migrate_env = os.environ | {"PHOENIX_DB_PATH": str(db_path)}
             run(str(candidate_binary), "--migrate-only", env=migrate_env)
@@ -271,6 +310,7 @@ def main() -> None:
             run("git", "add", "README.md", cwd=repo)
             run("git", "commit", "-m", "initial", cwd=repo)
             before_shadow = table_counts(db_path)
+            print("phase: run historical seeded-empty journey", flush=True)
             process, base_url, _ = start_old(old_binary, db_path, work)
             try:
                 version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
@@ -289,6 +329,7 @@ def main() -> None:
                 "PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT": str(source_census.shadow_reference_count),
                 "PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT": str(source_census.project_authority_path_count),
             }
+            print("phase: candidate catch-up and finalization", flush=True)
             run(
                 "cargo",
                 "test",
