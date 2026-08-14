@@ -29,7 +29,8 @@ pub(crate) mod usage;
 pub(crate) mod wire;
 
 pub use deployment::{
-    absolutize, DeploymentConfig, DiskCategory, DiskLocation, LogInfo, MeasureMode, TlsInfo,
+    absolutize, DeploymentConfig, DiskCategory, DiskLocation, LaunchInstanceId, LogInfo,
+    MeasureMode, TlsInfo,
 };
 pub(crate) use git_handlers::record_pr_auto_fix_context_baseline;
 pub use handlers::create_router;

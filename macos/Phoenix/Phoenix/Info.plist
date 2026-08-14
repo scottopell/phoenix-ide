@@ -38,6 +38,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Phoenix connects to Phoenix deployments on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Phoenix uses the microphone for voice input in conversations.</string>
 	<key>NSPrincipalClass</key>

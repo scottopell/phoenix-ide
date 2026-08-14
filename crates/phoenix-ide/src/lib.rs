@@ -102,7 +102,7 @@ fn build_deployment_config(
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
     log: api::LogInfo,
-    instance_id: Option<String>,
+    instance_id: Option<api::LaunchInstanceId>,
 ) -> api::DeploymentConfig {
     use api::TlsInfo;
 
@@ -917,7 +917,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         log_config.to_log_info(),
         std::env::var("PHOENIX_INSTANCE_ID")
             .ok()
-            .filter(|value| !value.is_empty()),
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(api::LaunchInstanceId),
     ));
 
     let auth_enabled = password.is_some();

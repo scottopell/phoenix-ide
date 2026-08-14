@@ -55,6 +55,10 @@ pub struct DiskLocation {
     pub mode: MeasureMode,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, TS)]
+#[ts(type = "string")]
+pub struct LaunchInstanceId(pub uuid::Uuid);
+
 /// Static deployment facts resolved once at startup and threaded through
 /// [`AppState`]. Sampled facts are computed per request in [`deployment_info`].
 #[derive(Clone, Debug)]
@@ -63,7 +67,7 @@ pub struct DeploymentConfig {
     pub tls: TlsInfo,
     pub log: LogInfo,
     pub locations: Vec<DiskLocation>,
-    pub instance_id: Option<String>,
+    pub instance_id: Option<LaunchInstanceId>,
 }
 
 // ============================================================
@@ -80,7 +84,7 @@ pub struct DeploymentInfo {
     /// Typed per-process launch identity supplied by the launcher when it needs
     /// to correlate readiness to one exact sidecar instance. `None` for normal
     /// Phoenix deployments that were not launched under such a contract.
-    pub instance_id: Option<String>,
+    pub instance_id: Option<LaunchInstanceId>,
     /// Whether the requesting browser is on the server host, and so may use
     /// host-local actions like revealing a path in the OS file manager. False
     /// for any remote browser — the file-manager window opens on the server's
@@ -345,7 +349,7 @@ pub async fn deployment_info(
         network,
         installation_ownership: installation_ownership::detect(&state.runtime_env).await,
         log: cfg.log.clone(),
-        instance_id: cfg.instance_id.clone(),
+        instance_id: cfg.instance_id,
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
     })

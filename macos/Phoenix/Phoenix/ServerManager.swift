@@ -731,6 +731,7 @@ final class ServerManager: ObservableObject {
 
     private var process: Process?
     private var outputPump: SidecarOutputPump?
+    private var outputPipe: Pipe?
     private var readinessTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
@@ -981,6 +982,7 @@ final class ServerManager: ObservableObject {
             launched.standardInput = childLease
 
             let pipe = Pipe()
+            outputPipe = pipe
             launched.standardOutput = pipe
             launched.standardError = pipe
             let outputPump = SidecarOutputPump(recorder: logRecorder, operation: operation)
@@ -1143,6 +1145,11 @@ final class ServerManager: ObservableObject {
         let pump = outputPump
         outputPump = nil
         if let pump {
+            let readHandle = outputPipe?.fileHandleForReading
+            outputPipe = nil
+            readHandle?.readabilityHandler = nil
+            let tail = readHandle?.readDataToEndOfFile() ?? Data()
+            if !tail.isEmpty { pump.offer(tail) }
             pump.finish()
             Task { @MainActor [weak self] in
                 await pump.waitUntilFinished()
