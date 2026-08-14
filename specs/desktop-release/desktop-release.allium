@@ -277,10 +277,13 @@ rule OuterAppSigningFailureStopsRelease {
 }
 
 rule OuterAppVerificationFollowsSigning {
-    when: OuterAppVerified(archive)
+    when: OuterAppVerified(archive, helper)
     requires: archive.app_signature = app_signed
+    requires: helper.target = archive.target
+    requires: helper.identity = archive.identity
+    requires: helper.signature = verified
     requires: app_signature_verified(archive)
-    requires: helper_bytes_equal_signed_asset(StandaloneHelperBuild, archive)
+    requires: helper_bytes_equal_signed_asset(helper, archive)
     ensures: archive.app_signature = app_verified
 }
 

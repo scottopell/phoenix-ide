@@ -8032,19 +8032,38 @@ def _start_bare_supervisor(
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise SystemExit("running bare supervisor did not report its protocol version") from exc
             if running_protocol != protocol:
-                raise SystemExit(
-                    "running bare supervisor uses an incompatible protocol; stop it from an external shell "
-                    "with `python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
+                shutdown = subprocess.run(
+                    [
+                        sys.executable,
+                        str(layout["supervisor"]),
+                        "--root",
+                        str(layout["root"]),
+                        "shutdown-supervisor",
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
-            if reuse_compatible:
-                return
-            if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
-                return
-            raise SystemExit(
-                "running bare supervisor differs from the selected deployment source; production was left running. "
-                "Stop the supervisor from an external shell with "
-                "`python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
-            )
+                if shutdown.returncode != 0:
+                    raise SystemExit(
+                        "running bare supervisor uses an incompatible protocol and could not be stopped safely: "
+                        f"{shutdown.stderr.strip() or shutdown.stdout.strip()}"
+                    )
+                for _ in range(100):
+                    if not layout["socket"].exists():
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise SystemExit("incompatible bare supervisor did not release its socket during upgrade")
+            else:
+                if reuse_compatible:
+                    return
+                if layout["supervisor"].is_file() and _file_sha256(layout["supervisor"]) == _file_sha256(selected_source):
+                    return
+                raise SystemExit(
+                    "running bare supervisor differs from the selected deployment source; production was left running. "
+                    "Stop the supervisor from an external shell with "
+                    "`python3 ~/.phoenix-ide/bin/phoenix-supervisor.py shutdown-supervisor`, then redeploy"
+                )
         layout["socket"].unlink(missing_ok=True)
     layout["supervisor"].parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected_source, layout["supervisor"])
