@@ -8303,7 +8303,7 @@ def prod_daemon_deploy(
         if protocol != "2":
             raise SystemExit(f"bare supervisor protocol mismatch: {protocol!r}")
 
-        previous_running = _bare_child_running(layout)
+        previous_running = _bare_child_running(layout) if layout["socket"].exists() else False
         manifest_hash = _commit_bare_transaction(
             layout, prepared, env_snapshot, transaction_id, previous_running, activate=False
         )

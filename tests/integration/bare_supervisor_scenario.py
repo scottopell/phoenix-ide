@@ -66,6 +66,7 @@ def transaction(
         rollback_environment.chmod(0o600)
     manifest = {
         "manifest_version": module.PROTOCOL_VERSION,
+        "source_kind": "published_release",
         "transaction_id": transaction_id,
         "expected": {"version": "2.0.0", "git_sha": "b" * 40},
         "previous": {"version": previous_version, "git_sha": previous_git_sha} if previous else None,
