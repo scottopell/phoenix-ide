@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let persistence = SettingsPersistence()
     private var cancellables = Set<AnyCancellable>()
     private var pendingConversationID: UUID?
+    private var pendingConversationOrigin: PhoenixOrigin?
     private var pendingConversationValidationTask: Task<Void, Never>?
     private var isPrimaryWebViewAuthenticated = false
     private var hotkeyError: HotkeyError?
@@ -138,7 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.browserOperation = nil
                 webView = nil
                 pendingConversationValidationTask?.cancel()
-                pendingConversationID = nil
+                if !QueuedDeepLinkAuthorityDecision.shouldRetain(
+                    pendingOrigin: pendingConversationOrigin,
+                    nextOrigin: origin
+                ) {
+                    pendingConversationID = nil
+                    pendingConversationOrigin = nil
+                }
                 isPrimaryWebViewAuthenticated = false
             }
             if webView != nil { return }
@@ -183,7 +190,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pendingConversationValidationTask?.cancel()
             browserEnvironment.closeOperationOwnedSurfaces(for: browserOperation)
             self.browserOperation = nil
-            pendingConversationID = nil
+            if !QueuedDeepLinkAuthorityDecision.shouldRetain(
+                pendingOrigin: pendingConversationOrigin,
+                nextOrigin: serverManager.webOrigin
+            ) {
+                pendingConversationID = nil
+                pendingConversationOrigin = nil
+            }
         }
         if let current = webView {
             current.navigationDelegate = nil
@@ -230,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func validateAndQueueConversationNavigation(_ id: UUID) {
         pendingConversationID = id
+        pendingConversationOrigin = serverManager.webOrigin
         validateQueuedConversationNavigationIfPossible()
     }
 

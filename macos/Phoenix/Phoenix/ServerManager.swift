@@ -872,15 +872,11 @@ final class ServerManager: ObservableObject {
             finishStop(finalState: preservedState ?? .stopped)
             return
         }
+        state = preservedState ?? .stopping
         guard process.isRunning else {
-
-            releaseOwnerLock()
-            self.process = nil
-            launchedBundledInstance = nil
-            finishStop(finalState: preservedState ?? .stopped)
+            processExited(process, operation: operationAuthority.id)
             return
         }
-        state = preservedState ?? .stopping
         process.terminate()
 
         let timer = DispatchSource.makeTimerSource(queue: .main)
