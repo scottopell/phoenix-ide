@@ -22,6 +22,12 @@ binary exercise, plus before and after its rollback exercise. Each phase pair
 must be equal; the two phase digests may differ because candidate catch-up runs
 between them. The additive schema is retained; destructive down-migration is
 prohibited.
+The additive proof includes the database-owned Foundation identity singleton.
+Independent opens of one database retain that identity; a newly initialized
+replacement at the same path gets a different identity. A byte-for-byte copy or
+restore retains the logical database identity. The identity grants no authority
+and is not an R2 generation or compare-and-swap token.
+
 
 Preparation produces a typed, private artifact before rollback, binding the exact
 candidate SHA/package/build schema, target database, complete source and initial

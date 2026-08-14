@@ -4,7 +4,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 /// Opaque durable identifier for a Git repository authority row.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct GitRepositoryId(String);
 
@@ -39,6 +39,16 @@ impl FromStr for GitRepositoryId {
     }
 }
 
+impl<'de> Deserialize<'de> for GitRepositoryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitRepositoryIdError {
     Empty,
@@ -59,14 +69,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_rejects_empty_text() {
+    fn parse_rejects_only_empty_text() {
         assert_eq!(GitRepositoryId::parse(""), Err(GitRepositoryIdError::Empty));
     }
 
     #[test]
     fn parse_preserves_whitespace_only_legacy_identity() {
-        let id = GitRepositoryId::parse("  \t").unwrap();
-        assert_eq!(id.as_str(), "  \t");
+        let value = "  \t";
+        let id = GitRepositoryId::parse(value).unwrap();
+        assert_eq!(id.as_str().as_bytes(), value.as_bytes());
     }
 
     #[test]
@@ -79,5 +90,29 @@ mod tests {
     fn parse_preserves_legacy_project_identity_bytes_exactly() {
         let id = GitRepositoryId::parse("  repo-opaque  ").unwrap();
         assert_eq!(id.as_str(), "  repo-opaque  ");
+    }
+
+    #[test]
+    fn deserialize_rejects_empty_json_string() {
+        let result: Result<GitRepositoryId, _> = serde_json::from_str(r#""""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_preserves_whitespace_only_json_string() {
+        let id: GitRepositoryId = serde_json::from_str(r#""  \t  ""#).unwrap();
+        assert_eq!(id.as_str().as_bytes(), b"  \t  ");
+    }
+
+    #[test]
+    fn serde_roundtrip_matches_string_bytes_exactly() {
+        let id = GitRepositoryId::parse("  repo-opaque  ").unwrap();
+
+        let id_bytes = serde_json::to_vec(&id).unwrap();
+        let string_bytes = serde_json::to_vec(id.as_str()).unwrap();
+        assert_eq!(id_bytes, string_bytes);
+
+        let decoded: GitRepositoryId = serde_json::from_slice(&id_bytes).unwrap();
+        assert_eq!(decoded, id);
     }
 }

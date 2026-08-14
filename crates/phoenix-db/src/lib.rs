@@ -167,7 +167,7 @@ pub enum DbError {
     #[error("git repository work-scope project conflict for {work_scope_id}: {repository_ids:?}")]
     GitRepositoryWorkScopeProjectConflict {
         work_scope_id: WorkScopeId,
-        repository_ids: Vec<phoenix_core::git_repository::GitRepositoryId>,
+        repository_ids: [phoenix_core::git_repository::GitRepositoryId; 2],
     },
     #[error("dormant git repository catch-up permit targeted a different database")]
     DormantGitRepositoryCatchupPermitTargetMismatch,

@@ -12,6 +12,31 @@ use std::sync::{Arc, Mutex};
 const READINESS_SAMPLE_LIMIT: usize = 10;
 const READINESS_SAMPLE_BYTE_LIMIT: usize = 512;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseInstanceId(String);
+
+impl DatabaseInstanceId {
+    fn parse(value: String) -> DbResult<Self> {
+        if value.len() == 32
+            && value.bytes().all(|byte| {
+                byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+            })
+        {
+            Ok(Self(value))
+        } else {
+            Err(DbError::Serialization(
+                "git repository foundation database identity must be exactly 32 lowercase hex bytes"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DormantGitRepositoryCatchupAuthorityState {
     lifecycle: Mutex<DormantGitRepositoryLifecycle>,
@@ -201,6 +226,7 @@ struct DormantGitRepositoryReadinessRunMarker;
 #[derive(Debug)]
 pub(crate) struct DormantGitRepositoryReadinessRunRoot {
     database: Arc<DormantGitRepositoryCatchupAuthorityState>,
+    database_instance_id: DatabaseInstanceId,
     operation: Arc<LegacyWriterExclusionMarker>,
     run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
     // Generated only when validation completes; this opaque value is the durable
@@ -324,6 +350,7 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
     fn unit4_binding(&self) -> DormantGitRepositoryUnit4RunBinding {
         DormantGitRepositoryUnit4RunBinding {
             database: self.root.database.clone(),
+            database_instance_id: self.root.database_instance_id.clone(),
             operation: self.root.operation.clone(),
             run_marker: self.root.run_marker.clone(),
             readiness_run_id: self.root.run_id,
@@ -389,6 +416,7 @@ impl DormantGitRepositoryCanonicalReadinessEvidence {
 #[derive(Debug, Clone)]
 struct DormantGitRepositoryUnit4RunBinding {
     database: Arc<DormantGitRepositoryCatchupAuthorityState>,
+    database_instance_id: DatabaseInstanceId,
     operation: Arc<LegacyWriterExclusionMarker>,
     run_marker: Arc<DormantGitRepositoryReadinessRunMarker>,
     readiness_run_id: uuid::Uuid,
@@ -398,6 +426,7 @@ struct DormantGitRepositoryUnit4RunBinding {
 impl DormantGitRepositoryUnit4RunBinding {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.database, &other.database)
+            && self.database_instance_id == other.database_instance_id
             && Arc::ptr_eq(&self.operation, &other.operation)
             && Arc::ptr_eq(&self.run_marker, &other.run_marker)
             && self.readiness_run_id == other.readiness_run_id
@@ -760,7 +789,6 @@ impl DormantGitRepositoryPreparationAttestation {
         root: DormantGitRepositoryUnit4RunBinding,
         artifact: DormantGitRepositoryPreparationArtifact,
         readiness: &DormantGitRepositoryCanonicalReadinessEvidence,
-        target: &DormantGitRepositoryCompatibilityTargetIdentity,
         source_digest: &str,
         initial_shadow_digest: &str,
         file_digest: String,
@@ -775,6 +803,7 @@ impl DormantGitRepositoryPreparationAttestation {
             ));
         };
         let readiness_artifact = DormantGitRepositoryArtifactReadiness::from_evidence(readiness);
+        let target = DormantGitRepositoryCompatibilityTargetIdentity::from_readiness(readiness);
         let expected = DormantGitRepositoryPreparationExpected {
             candidate_sha: sha,
             candidate_package_version: package_version,
@@ -940,21 +969,16 @@ impl DormantGitRepositoryRollbackAttestation {
 }
 
 #[cfg(test)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct DormantGitRepositoryCompatibilityTargetIdentity(String);
 
 #[cfg(test)]
 impl DormantGitRepositoryCompatibilityTargetIdentity {
-    fn from_database(database: &Database) -> DbResult<Self> {
-        let canonical = std::fs::canonicalize(&database.path).map_err(|error| {
-            DbError::Serialization(format!(
-                "compatibility target database must be canonicalizable: {error}"
-            ))
-        })?;
-        Ok(Self(length_framed_digest([(
-            "database_path",
-            canonical.as_os_str().as_encoded_bytes(),
-        )])))
+    fn from_readiness(readiness: &DormantGitRepositoryCanonicalReadinessEvidence) -> Self {
+        Self(length_framed_digest([(
+            "database_instance_id",
+            readiness.root.database_instance_id.as_str().as_bytes(),
+        )]))
     }
 }
 
@@ -1061,12 +1085,12 @@ impl DormantGitRepositoryCompleteCompatibilityEvidence {
         compatibility: DormantGitRepositoryOldBinaryCompatibilityAttestation,
         rollback: DormantGitRepositoryRollbackAttestation,
         preparation: DormantGitRepositoryPreparationAttestation,
-        target: DormantGitRepositoryCompatibilityTargetIdentity,
         final_catchup: DormantGitRepositoryCatchupStatsEvidence,
         final_replay: DormantGitRepositoryCatchupStatsEvidence,
         shadow_row_counts: DormantGitRepositoryShadowRowCounts,
     ) -> DbResult<Self> {
         let root = readiness.unit4_binding();
+        let target = DormantGitRepositoryCompatibilityTargetIdentity::from_readiness(&readiness);
         validate_complete_compatibility_inputs(
             &root,
             &readiness.schema.compiled_migration_digest,
@@ -1351,10 +1375,14 @@ pub(crate) async fn validate_dormant_git_repository_readiness(
     match (validation, rollback, restore) {
         (Ok(inspection), Ok(()), Ok(())) => {
             guard.disarm();
-            let diagnostics = inspection.diagnostics;
+            let DormantGitRepositoryReadinessInspection {
+                diagnostics,
+                database_instance_id,
+                applied_ledger,
+                inspected_r1_ddl,
+            } = inspection;
             let build = compiled_build_identity();
-            let schema =
-                compiled_schema_summary(inspection.applied_ledger, inspection.inspected_r1_ddl);
+            let schema = compiled_schema_summary(applied_ledger, inspected_r1_ddl);
             let eligibility = if diagnostics.is_empty()
                 && matches!(build, DormantGitRepositoryBuildIdentity::ExactClean { .. })
             {
@@ -1370,6 +1398,7 @@ pub(crate) async fn validate_dormant_git_repository_readiness(
             };
             let root = DormantGitRepositoryReadinessRunRoot {
                 database: claim.receipt.target.clone(),
+                database_instance_id,
                 operation: claim.receipt.marker.clone(),
                 run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
                 run_id: uuid::Uuid::new_v4(),
@@ -1504,6 +1533,7 @@ fn compiled_schema_summary(
 
 struct DormantGitRepositoryReadinessInspection {
     diagnostics: DormantGitRepositoryReadinessDiagnostics,
+    database_instance_id: DatabaseInstanceId,
     applied_ledger: Vec<(i64, String)>,
     inspected_r1_ddl: BTreeMap<String, String>,
 }
@@ -1682,6 +1712,8 @@ async fn migration_and_schema_diagnostics(
             ),
         }
     }
+    let database_instance_id = load_database_instance_id(connection).await?;
+
     let foreign_key_violations: Vec<(String, i64, String, i64)> = sqlx::query_as("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check ORDER BY \"table\", rowid, parent, fkid").fetch_all(&mut *connection).await?;
     for (table, rowid, parent, fkid) in foreign_key_violations {
         diagnostics.push(
@@ -1691,9 +1723,44 @@ async fn migration_and_schema_diagnostics(
     }
     Ok(DormantGitRepositoryReadinessInspection {
         diagnostics,
+        database_instance_id,
         applied_ledger: applied,
         inspected_r1_ddl,
     })
+}
+
+async fn load_database_instance_id(
+    connection: &mut sqlx::SqliteConnection,
+) -> DbResult<DatabaseInstanceId> {
+    let expected_ddl = crate::migrations::foundation_identity_expected_table_definition();
+    let actual_ddl: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'git_repository_foundation_identity'",
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
+    if actual_ddl
+        .as_deref()
+        .map(crate::migrations::normalize_sql)
+        .as_deref()
+        != Some(expected_ddl.as_str())
+    {
+        return Err(DbError::Serialization(
+            "git repository foundation identity DDL differs from migration 66".to_string(),
+        ));
+    }
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT singleton, instance_id
+         FROM git_repository_foundation_identity
+         ORDER BY singleton",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    match rows.as_slice() {
+        [(1, instance_id)] => DatabaseInstanceId::parse(instance_id.clone()),
+        _ => Err(DbError::Serialization(
+            "git repository foundation identity must contain exactly singleton row 1".to_string(),
+        )),
+    }
 }
 
 fn readiness_storage_kind_for_path(path: &str) -> DormantGitRepositoryReadinessStorageKind {
@@ -2045,7 +2112,7 @@ fn resolve_expected_scope_attachments(
     if let Some((work_scope_id, repository_ids)) = conflicts.into_iter().next() {
         return Err(DbError::GitRepositoryWorkScopeProjectConflict {
             work_scope_id,
-            repository_ids,
+            repository_ids: [repository_ids[0].clone(), repository_ids[1].clone()],
         });
     }
     Ok(expected)
@@ -2350,6 +2417,63 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             vec![repo_b.to_string(), repo_a.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn catchup_conflict_reports_only_the_first_two_of_all_internal_conflicts() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope_a = insert_scope(&db, "scope-a").await;
+        let scope_z = insert_scope(&db, "scope-z").await;
+        for repository_id in ["  repo-a  ", "repo-m", "repo,z"] {
+            insert_project(&db, repository_id).await;
+        }
+        for (id, scope, repository_id) in [
+            ("a-1", &scope_a, "repo,z"),
+            ("a-2", &scope_a, "  repo-a  "),
+            ("a-3", &scope_a, "repo-m"),
+            ("z-1", &scope_z, "repo,z"),
+            ("z-2", &scope_z, "repo-m"),
+        ] {
+            insert_conversation_with_scope_and_project(&db, id, scope, Some(repository_id)).await;
+        }
+
+        let DbError::GitRepositoryWorkScopeProjectConflict {
+            work_scope_id,
+            repository_ids,
+        } = run_catchup(&db).await.unwrap_err()
+        else {
+            panic!("expected work-scope project conflict");
+        };
+        assert_eq!(work_scope_id, scope_a);
+        assert_eq!(
+            repository_ids.map(|id| id.as_str().to_string()),
+            ["  repo-a  ".to_string(), "repo,z".to_string()]
+        );
+    }
+
+    #[test]
+    fn attachment_conflict_collection_retains_all_internal_ids_before_the_typed_error_selects_two()
+    {
+        let scope = WorkScopeId::parse("scope-full-conflict").unwrap();
+        let attachments = ["repo,z", "  repo-a  ", "repo-m"]
+            .into_iter()
+            .map(|repository_id| ExpectedAttachment {
+                work_scope_id: scope.clone(),
+                repository_id: GitRepositoryId::parse(repository_id).unwrap(),
+            })
+            .collect();
+        let (_, conflicts) = resolve_expected_scope_attachments_for_validation(attachments);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, scope);
+        assert_eq!(
+            conflicts[0]
+                .1
+                .iter()
+                .map(GitRepositoryId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["  repo-a  ", "repo,z", "repo-m"]
         );
     }
 
@@ -2698,7 +2822,7 @@ mod tests {
         source_attachments: Vec<(String, String, Option<String>)>,
         repositories: Vec<String>,
         attachments: Vec<(String, String)>,
-        locator_observations: Vec<(String, String, String, Option<String>, String)>,
+        locator_observations: Vec<(String, String, String, String, String)>,
         default_branch_observations: Vec<(String, i64, String, Option<String>, String, String)>,
     }
 
@@ -2833,6 +2957,120 @@ mod tests {
             error,
             DbError::DormantGitRepositoryReadinessCatchupInProgress
         ));
+    }
+
+    #[tokio::test]
+    async fn readiness_uses_one_durable_identity_across_independent_file_handles_with_fresh_run_ids(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-instance.db");
+        let first = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(first.pool()).await.unwrap();
+        let second = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(second.pool()).await.unwrap();
+        let first_outcome =
+            run_catchup_with_proof(&first, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        let first_readiness = validate_readiness(&first, first_outcome.receipt)
+            .await
+            .unwrap();
+        let second_outcome =
+            run_catchup_with_proof(&second, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        let second_readiness = validate_readiness(&second, second_outcome.receipt)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first_readiness.root.database_instance_id,
+            second_readiness.root.database_instance_id
+        );
+        assert_ne!(
+            first_readiness.unit4_binding().readiness_run_id(),
+            second_readiness.unit4_binding().readiness_run_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_at_the_same_path_has_a_new_identity_and_cannot_reuse_compatibility_target()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replacement.db");
+        let first = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(first.pool()).await.unwrap();
+        let first_outcome =
+            run_catchup_with_proof(&first, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        let first_readiness = validate_readiness(&first, first_outcome.receipt)
+            .await
+            .unwrap();
+        let first_target =
+            DormantGitRepositoryCompatibilityTargetIdentity::from_readiness(&first_readiness);
+        drop(first);
+        fs::remove_file(&path).unwrap();
+        let replacement = Database::open(path.to_str().unwrap()).await.unwrap();
+        run_pending_migrations(replacement.pool()).await.unwrap();
+        let replacement_outcome =
+            run_catchup_with_proof(&replacement, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        let replacement_readiness = validate_readiness(&replacement, replacement_outcome.receipt)
+            .await
+            .unwrap();
+        assert_ne!(
+            first_readiness.root.database_instance_id,
+            replacement_readiness.root.database_instance_id
+        );
+        assert_ne!(
+            first_target,
+            DormantGitRepositoryCompatibilityTargetIdentity::from_readiness(&replacement_readiness)
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_identity_is_not_repaired_when_absent_or_malformed_in_query_only_mode() {
+        for mutation in [
+            "DELETE FROM git_repository_foundation_identity",
+            "UPDATE git_repository_foundation_identity SET instance_id = 'malformed'",
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let outcome =
+                run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+                    .await
+                    .unwrap();
+            if mutation.starts_with("UPDATE") {
+                sqlx::query("PRAGMA ignore_check_constraints = ON")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            sqlx::query(mutation).execute(db.pool()).await.unwrap();
+            if mutation.starts_with("UPDATE") {
+                sqlx::query("PRAGMA ignore_check_constraints = OFF")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let before: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT singleton, instance_id FROM git_repository_foundation_identity ORDER BY singleton",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+
+            let error = validate_readiness(&db, outcome.receipt).await.unwrap_err();
+            assert!(error.to_string().contains("identity"));
+            let after: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT singleton, instance_id FROM git_repository_foundation_identity ORDER BY singleton",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(after, before, "readiness must never repair identity");
+        }
     }
 
     #[tokio::test]
@@ -3137,6 +3375,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_fails_closed_for_identity_corruption_but_schema_drift_is_typed_ineligible() {
+        let db = Database::open_in_memory().await.unwrap();
+        let schema_outcome =
+            run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        sqlx::query("DROP TABLE git_repositories")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE git_repositories (id TEXT PRIMARY KEY)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let schema = validate_readiness(&db, schema_outcome.receipt)
+            .await
+            .unwrap();
+        assert_eq!(
+            schema.eligibility(),
+            &DormantGitRepositoryR1Eligibility::Ineligible
+        );
+        assert!(schema
+            .diagnostic_categories()
+            .contains(&DormantGitRepositoryReadinessDiagnosticCategory::Schema));
+
+        let db = Database::open_in_memory().await.unwrap();
+        let identity_outcome =
+            run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
+                .await
+                .unwrap();
+        sqlx::query("DELETE FROM git_repository_foundation_identity")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let error = validate_readiness(&db, identity_outcome.receipt)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("identity must contain exactly singleton row 1"));
+    }
+
+    #[tokio::test]
     async fn readiness_records_explicit_valid_absence_for_unretained_observations() {
         let db = Database::open_in_memory().await.unwrap();
         let outcome = run_catchup_with_proof(&db, TestDormantGitRepositoryExclusionProof::new())
@@ -3210,12 +3491,7 @@ mod tests {
             .await
             .unwrap();
 
-        let evidence = validate_readiness(&db, outcome.receipt).await.unwrap();
-        assert!(matches!(
-            evidence.eligibility(),
-            DormantGitRepositoryR1Eligibility::Eligible
-                | DormantGitRepositoryR1Eligibility::Ineligible
-        ));
+        validate_readiness(&db, outcome.receipt).await.unwrap();
         let mut conn = db.pool().acquire().await.unwrap();
         assert!(!read_query_only_flag(&mut *conn).await.unwrap());
         sqlx::query("INSERT INTO git_repositories (id) VALUES ('repo-after')")
@@ -3286,6 +3562,7 @@ mod tests {
     fn shadow_digest_attestations_reject_phase_mismatch() {
         let root = DormantGitRepositoryUnit4RunBinding {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
+            database_instance_id: DatabaseInstanceId::parse("a".repeat(32)).unwrap(),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
             readiness_run_id: uuid::Uuid::new_v4(),
@@ -3450,12 +3727,14 @@ mod tests {
     fn complete_compatibility_input_validation_rejects_cross_run_and_schema_mismatch() {
         let root = DormantGitRepositoryUnit4RunBinding {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
+            database_instance_id: DatabaseInstanceId::parse("a".repeat(32)).unwrap(),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
             readiness_run_id: uuid::Uuid::new_v4(),
         };
         let other_root = DormantGitRepositoryUnit4RunBinding {
             database: Arc::new(DormantGitRepositoryCatchupAuthorityState::default()),
+            database_instance_id: DatabaseInstanceId::parse("b".repeat(32)).unwrap(),
             operation: Arc::new(LegacyWriterExclusionMarker),
             run_marker: Arc::new(DormantGitRepositoryReadinessRunMarker),
             readiness_run_id: uuid::Uuid::new_v4(),
@@ -3699,8 +3978,7 @@ mod tests {
                     candidate_package_version: package_version.clone(),
                     candidate_schema_digest: readiness.schema.compiled_migration_digest.clone(),
                     target_database_digest:
-                        DormantGitRepositoryCompatibilityTargetIdentity::from_database(&db)
-                            .unwrap()
+                        DormantGitRepositoryCompatibilityTargetIdentity::from_readiness(&readiness)
                             .0,
                     source_digest: required_env("PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST"),
                     initial_shadow_digest: required_env(
@@ -3751,12 +4029,10 @@ mod tests {
         );
         let preparation: DormantGitRepositoryPreparationArtifact =
             serde_json::from_slice(&preparation_bytes).unwrap();
-        let target = DormantGitRepositoryCompatibilityTargetIdentity::from_database(&db).unwrap();
         let preparation = DormantGitRepositoryPreparationAttestation::bind_after_verification(
             readiness.unit4_binding(),
             preparation,
             &readiness,
-            &target,
             &old_source_digest,
             &shadow_before_initial_old,
             preparation_file_digest,
@@ -3804,7 +4080,6 @@ mod tests {
             compatibility,
             rollback,
             preparation,
-            target,
             initial_catchup,
             replay_stats,
             counts,

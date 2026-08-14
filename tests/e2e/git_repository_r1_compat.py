@@ -35,6 +35,7 @@ STARTUP_EVENT = "Phoenix IDE server listening"
 OUTER_TIMEOUT = 120.0
 EOF = object()
 SHADOW_TABLES = ("git_repositories", "work_scope_git_repositories", "git_repository_locator_observations", "git_repository_default_branch_observations")
+FOUNDATION_IDENTITY_TABLES = ("git_repository_foundation_identity",)
 SOURCE_TABLES = ("projects", "conversations", "work_scopes", "conversation_work_scope_attachments", "conversation_creation_jobs")
 
 
@@ -577,14 +578,14 @@ def main() -> None:
                 run(str(candidate_binary), "--migrate-only", env=child_env(PHOENIX_DB_PATH=str(db_path)))
                 repo = work / "canonical-repository"; repo.mkdir(); run("git", "init", cwd=repo); run("git", "config", "user.email", "compat@example.test", cwd=repo); run("git", "config", "user.name", "Compatibility", cwd=repo)
                 (repo / "README.md").write_text("compatibility\n"); run("git", "add", "README.md", cwd=repo); run("git", "commit", "-m", "initial", cwd=repo)
-                shadow_before_initial_old = snapshot(db_path, SHADOW_TABLES)
+                shadow_before_initial_old = snapshot(db_path, SHADOW_TABLES + FOUNDATION_IDENTITY_TABLES)
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "seed", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
                     if version != HISTORICAL_SHA[:12]: raise RuntimeError(f"historical version identity mismatch: {version!r}")
                     asyncio.run(asyncio.wait_for(create_seeded_empty(base_url, str(repo.resolve())), OUTER_TIMEOUT))
                 finally: stop_and_record(process, lines, retained, run_logs)
-                source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES)
+                source_before_candidate = snapshot(db_path, SOURCE_TABLES); shadow_after_initial_old = snapshot(db_path, SHADOW_TABLES + FOUNDATION_IDENTITY_TABLES)
                 if shadow_after_initial_old != shadow_before_initial_old: raise RuntimeError("historical binary wrote additive shadow schema")
                 env = child_env(CARGO_TARGET_DIR=str(candidate_target), PHOENIX_R1_COMPAT_DB_PATH=str(db_path), PHOENIX_R1_COMPAT_CANONICAL_PATH=str(repo.resolve()), PHOENIX_R1_COMPAT_FINALIZER_ARTIFACT=str(artifact), PHOENIX_R1_COMPAT_PREPARATION_ARTIFACT=str(preparation), PHOENIX_R1_COMPAT_HISTORICAL_SHA=HISTORICAL_SHA, PHOENIX_R1_COMPAT_HISTORICAL_RUNTIME_IDENTITY=expected_historical_identity, PHOENIX_R1_COMPAT_CENSUS_REVISION=source_census.revision, PHOENIX_R1_COMPAT_CENSUS_DIGEST=source_census.digest, PHOENIX_R1_COMPAT_SHADOW_REFERENCE_COUNT=str(source_census.shadow_reference_count), PHOENIX_R1_COMPAT_PROJECT_AUTHORITY_PATH_COUNT=str(source_census.project_authority_path_count), PHOENIX_R1_COMPAT_OLD_SOURCE_DIGEST=proof_digest(source_before_candidate), PHOENIX_R1_COMPAT_SHADOW_BEFORE_INITIAL_OLD=proof_digest(shadow_before_initial_old), PHOENIX_R1_COMPAT_SHADOW_AFTER_INITIAL_OLD=proof_digest(shadow_after_initial_old))
                 # First candidate pass only prepares typed catch-up proof before exercising the old binary again.
@@ -598,14 +599,14 @@ def main() -> None:
                     "inserted_work_scope_attachments": expected_attachments,
                 }
                 verify_preparation_expected(prepared, expected_initial)
-                source_before_rollback, shadow_before_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
+                source_before_rollback, shadow_before_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES + FOUNDATION_IDENTITY_TABLES)
                 process, base_url, lines, retained = start_old(old_binary, db_path, work, "rollback", run_logs)
                 try:
                     version = httpx.get(f"{base_url}/api/version", timeout=OUTER_TIMEOUT).json()["git_sha"]
                     if version != HISTORICAL_SHA[:12]: raise RuntimeError("rollback binary identity drift")
                     asyncio.run(asyncio.wait_for(stream_existing_idle(base_url), OUTER_TIMEOUT))
                 finally: stop_and_record(process, lines, retained, run_logs)
-                source_after_rollback, shadow_after_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES)
+                source_after_rollback, shadow_after_rollback = snapshot(db_path, SOURCE_TABLES), snapshot(db_path, SHADOW_TABLES + FOUNDATION_IDENTITY_TABLES)
                 if source_after_rollback != source_before_rollback: raise RuntimeError("historical rollback binary mutated legacy source rows")
                 if shadow_after_rollback != shadow_before_rollback: raise RuntimeError("historical rollback binary mutated additive shadows")
                 # Final candidate pass mints the artifact only after the binary rollback exercise.
