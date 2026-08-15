@@ -161,6 +161,25 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
+    /// Atomically persist the initial message, complete its creation job, and
+    /// commit the dispatchable runtime state under one current claim.
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_creation_runtime(
+        &self,
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        _conversation_id: &str,
+        _sequence_id: i64,
+        _content: &MessageContent,
+        _display_data: Option<&Value>,
+        _usage_data: Option<&UsageData>,
+        _message_id: &str,
+        _state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationRuntimeMaterialization, String> {
+        Ok(crate::db::CreationRuntimeMaterialization::ClaimLost)
+    }
+
     /// Atomically complete an async creation job and commit its runtime state.
     async fn settle_creation_runtime(
         &self,
@@ -525,6 +544,35 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         (**self).message_exists(message_id).await
+    }
+
+    async fn materialize_creation_runtime(
+        &self,
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationRuntimeMaterialization, String> {
+        (**self)
+            .materialize_creation_runtime(
+                job_id,
+                claim,
+                conversation_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+                state,
+                state_updated_at,
+            )
+            .await
     }
 
     async fn settle_creation_runtime(
@@ -959,6 +1007,36 @@ impl MessageStore for DatabaseStorage {
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         self.db
             .message_exists(message_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn materialize_creation_runtime(
+        &self,
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationRuntimeMaterialization, String> {
+        self.db
+            .materialize_conversation_creation_runtime(
+                job_id,
+                claim,
+                conversation_id,
+                message_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                state,
+                state_updated_at,
+            )
             .await
             .map_err(|e| e.to_string())
     }

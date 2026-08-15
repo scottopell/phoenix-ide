@@ -145,6 +145,7 @@ pub(crate) enum SteeringWakeOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcknowledgedEventOutcome {
     Settled,
+    StaleAuthority,
     SteeringWake(SteeringWakeOutcome),
 }
 
@@ -3764,9 +3765,19 @@ impl RuntimeManager {
             .send((event, ack_tx))
             .await
             .map_err(|error| error.to_string())?;
-        ack_rx
+        let outcome = ack_rx
             .await
-            .map_err(|_| "runtime stopped before event settled".to_string())?
+            .map_err(|_| "runtime stopped before event settled".to_string())??;
+        if outcome == AcknowledgedEventOutcome::StaleAuthority {
+            let mut runtimes = self.runtimes.write().await;
+            if runtimes
+                .get(conversation_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.identity, &handle.identity))
+            {
+                runtimes.remove(conversation_id);
+            }
+        }
+        Ok(outcome)
     }
 
     pub(crate) async fn wake_deferred_steering(
@@ -5239,6 +5250,74 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn stale_creation_ack_evicts_runtime_before_authoritative_reload() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "stale-creation-runtime";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let provisioning = ConvState::Provisioning {
+            job_id: "missing-current-claim".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        };
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &provisioning)
+            .await
+            .unwrap();
+        let stale_handle = manager.get_or_create(conversation_id).await.unwrap();
+        let mut stale_state = stale_handle.state_rx.clone();
+        let stale_identity = Arc::clone(&stale_handle.identity);
+        let claim = phoenix_core::domain::creation_protocol::CreationClaim {
+            worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId("stale".into()),
+            generation: 1,
+            token: phoenix_core::domain::creation_protocol::CreationClaimToken("stale".into()),
+            lease_until: u64::MAX,
+        };
+
+        manager
+            .send_event(
+                conversation_id,
+                Event::CreationProvisioned {
+                    job_id: "missing-current-claim".to_string(),
+                    claim,
+                    initial_message: crate::state_machine::event::SteerEntry {
+                        text: "must not persist".to_string(),
+                        llm_text: None,
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        message_id: "stale-message".to_string(),
+                        user_agent: None,
+                        skill_invocation: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert!(manager
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(*stale_state.borrow(), provisioning);
+        assert!(stale_state.changed().await.is_err());
+
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let authoritative = manager.get_or_create(conversation_id).await.unwrap();
+        assert_eq!(*authoritative.state_rx.borrow(), ConvState::Idle);
+        assert!(!Arc::ptr_eq(&stale_identity, &authoritative.identity));
     }
 
     #[tokio::test]

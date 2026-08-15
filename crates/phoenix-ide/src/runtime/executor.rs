@@ -1696,6 +1696,12 @@ enum RuntimeRecoveryDisposition {
 }
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationSettlementDisposition {
+    Continue,
+    StaleAuthority,
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1719,6 +1725,7 @@ where
         String,
         phoenix_core::domain::creation_protocol::CreationClaim,
     )>,
+    creation_settlement_disposition: CreationSettlementDisposition,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -2004,6 +2011,7 @@ where
             state,
             state_updated_at: Utc::now(),
             startup_creation_completion: None,
+            creation_settlement_disposition: CreationSettlementDisposition::Continue,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -2240,6 +2248,10 @@ where
                     return RuntimeExitDisposition::Interrupted;
                 }
             }
+            if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority
+            {
+                return RuntimeExitDisposition::Interrupted;
+            }
         }
 
         let startup_drain = match self.commit_startup_steering_queue().await {
@@ -2366,6 +2378,9 @@ where
                         self.emit_terminal_lifecycle_event().await;
                     }
                     let _ = acknowledgement.send(result);
+                    if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
+                        return RuntimeExitDisposition::Interrupted;
+                    }
                     if terminal {
                         return RuntimeExitDisposition::Terminal;
                     }
@@ -2386,6 +2401,9 @@ where
                         // SseEvent::Error at the source if appropriate
                         // (task 24682). No double-broadcast here.
                         tracing::error!(error = %e, "Error handling event");
+                    }
+                    if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
+                        return RuntimeExitDisposition::Interrupted;
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2822,7 +2840,15 @@ where
     ) -> Result<AcknowledgedEventOutcome, String> {
         if !matches!(&event, Event::SteeringQueueChanged) {
             self.process_event(event).await?;
-            return Ok(AcknowledgedEventOutcome::Settled);
+            return Ok(
+                if self.creation_settlement_disposition
+                    == CreationSettlementDisposition::StaleAuthority
+                {
+                    AcknowledgedEventOutcome::StaleAuthority
+                } else {
+                    AcknowledgedEventOutcome::Settled
+                },
+            );
         }
 
         if self.context.is_sub_agent {
@@ -2853,6 +2879,7 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         if matches!(event, Event::UserCancel { .. } | Event::Shutdown) {
             self.terminal_transition_retry = None;
         }
@@ -3134,10 +3161,12 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::CommitSteeringDrain { .. }));
-            let will_settle_creation = result
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::CompleteCreation { .. }));
+            let will_settle_creation = result.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::CompleteCreation { .. } | Effect::MaterializeCreation { .. }
+                )
+            });
             if !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
@@ -3278,7 +3307,9 @@ where
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(
                     effect,
-                    Effect::PersistState | Effect::CompleteCreation { .. }
+                    Effect::PersistState
+                        | Effect::CompleteCreation { .. }
+                        | Effect::MaterializeCreation { .. }
                 );
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let effect_result = Box::pin(self.execute_effect(effect)).await;
@@ -3314,6 +3345,14 @@ where
                 };
                 if let Some(gen_event) = effect_result {
                     generated_events.push(gen_event);
+                }
+                if self.creation_settlement_disposition
+                    == CreationSettlementDisposition::StaleAuthority
+                {
+                    let failed_state = std::mem::replace(&mut self.state, old_state.clone());
+                    self.state_updated_at = old_state_updated_at;
+                    self.manage_deadline(&failed_state);
+                    return Ok(generated_events);
                 }
                 if (is_authoritative_persist && self.direct_turn_materialization_aborted)
                     || self.continuation_effect_disposition
@@ -5336,6 +5375,47 @@ where
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
+            Effect::MaterializeCreation {
+                job_id,
+                claim,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            } => {
+                let sequence_id = self.broadcast_tx.next_seq();
+                match self
+                    .storage
+                    .materialize_creation_runtime(
+                        &job_id,
+                        &claim,
+                        &self.context.conversation_id,
+                        sequence_id,
+                        &content,
+                        display_data.as_ref(),
+                        usage_data.as_ref(),
+                        &message_id,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await
+                {
+                    Ok(crate::db::CreationRuntimeMaterialization::Materialized(message)) => {
+                        let _ = self.broadcast_tx.send_message(*message);
+                    }
+                    Ok(crate::db::CreationRuntimeMaterialization::ClaimLost) => {
+                        self.creation_settlement_disposition =
+                            CreationSettlementDisposition::StaleAuthority;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to atomically materialize creation job {job_id}: {error}"
+                        ));
+                    }
+                }
+                Ok(None)
+            }
+
             Effect::CompleteCreation { job_id, claim } => {
                 match self
                     .storage
@@ -5350,7 +5430,8 @@ where
                 {
                     Ok(crate::db::CreationCasOutcome::Applied) => {}
                     Ok(crate::db::CreationCasOutcome::ClaimLost) => {
-                        tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
+                        self.creation_settlement_disposition =
+                            CreationSettlementDisposition::StaleAuthority;
                     }
                     Err(error) => {
                         return Err(format!(
@@ -10175,22 +10256,41 @@ mod creation_completion_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn completion_claim_loss_allows_one_provider_dispatch() {
-        let mut harness = runtime(ConvState::Provisioning {
+    async fn claim_loss_acknowledges_stale_and_retires_without_mutation_or_dispatch() {
+        let provisioning = ConvState::Provisioning {
             job_id: "job".to_string(),
             phase: crate::db::ConversationCreationPhase::Provisioning,
-        });
+        };
+        let mut harness = runtime(provisioning.clone());
         harness
             .storage
             .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::ClaimLost));
-        let mut request_count = harness.llm.subscribe_request_count();
-
-        harness
+        let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(provisioning.clone());
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+        harness.runtime = harness
             .runtime
-            .process_event(creation_event())
+            .with_state_watcher(watch_tx)
+            .with_acknowledged_event_receiver(acknowledged_event_rx);
+        let runtime_task = tokio::spawn(harness.runtime.run());
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        acknowledged_event_tx
+            .send((creation_event(), ack_tx))
             .await
             .unwrap();
-        wait_for_provider_dispatch(&mut request_count).await;
+
+        assert_eq!(
+            ack_rx.await.unwrap(),
+            Ok(AcknowledgedEventOutcome::StaleAuthority)
+        );
+        assert!(matches!(
+            runtime_task.await.unwrap(),
+            RuntimeExitDisposition::Interrupted
+        ));
+        assert!(harness.llm.recorded_requests().is_empty());
+        assert!(harness.storage.recorded_messages().is_empty());
+        assert_eq!(*watch_rx.borrow(), provisioning);
+        assert!(watch_rx.changed().await.is_err());
     }
 
     #[tokio::test]

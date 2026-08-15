@@ -144,6 +144,16 @@ pub enum Effect {
         job_id: String,
         claim: phoenix_core::domain::creation_protocol::CreationClaim,
     },
+    /// Atomically persist the initial message, complete the creation job, and
+    /// commit the dispatchable runtime state under one current claim.
+    MaterializeCreation {
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+        content: MessageContent,
+        display_data: Option<Value>,
+        usage_data: Option<UsageData>,
+        message_id: String,
+    },
 
     /// Execute a tool (spawns as background task)
     ExecuteTool { tool: ToolCall },

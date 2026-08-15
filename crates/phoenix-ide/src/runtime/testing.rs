@@ -719,6 +719,16 @@ impl InMemoryStorage {
         self.states.lock().unwrap().get(conv_id).cloned()
     }
 
+    pub fn recorded_messages(&self) -> Vec<Message> {
+        self.messages
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     pub fn queue_complete_creation_job_result(
         &self,
         result: Result<crate::db::CreationCasOutcome, String>,
@@ -979,6 +989,60 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn materialize_creation_runtime(
+        &self,
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&crate::db::UsageData>,
+        message_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationRuntimeMaterialization, String> {
+        if let Some(started) = self.complete_creation_job_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.complete_creation_job_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let outcome = self
+            .complete_creation_job_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(crate::db::CreationCasOutcome::ClaimLost))?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Ok(crate::db::CreationRuntimeMaterialization::ClaimLost);
+        }
+        let message = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: chrono::Utc::now(),
+        };
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push(message.clone());
+        self.states
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_string(), state.clone());
+        Ok(crate::db::CreationRuntimeMaterialization::Materialized(
+            Box::new(message),
+        ))
     }
 
     async fn settle_creation_runtime(
