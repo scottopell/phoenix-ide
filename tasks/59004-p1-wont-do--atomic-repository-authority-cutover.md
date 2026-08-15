@@ -1,3 +1,46 @@
+# R2 — Hot repository authority cutover (rejected)
+
+## Disposition
+
+This task is retained as the historical record of a rejected implementation direction. It must not be resumed or treated as authority for Repository Cutover.
+
+Repository Foundation shipped hidden Project-seeded `GitRepository` rows and dormant `WorkScope.repository` attachments while leaving `Project` as sole live authority. This task attempted to activate that authority inside a running Phoenix deployment. It expanded a private database transition into whole-runtime coordination: request and worker drain, terminal/tmux quiescence, browser and MCP teardown, durable deployment-backend exclusion, live Git observation, linked-worktree identity convergence, runtime binding of source-census evidence, and post-commit roll-forward recovery.
+
+Complexity-cliff and independent persona reviews found that cost disproportionate to the product goal. ProductConversation and destructive Close are not live consumers of hidden repository authority, so Foundation availability creates no present activation obligation.
+
+ADR-035 and REQ-GITREP-009 replace this task's hot activation contract. Repository authority activation is consumer-triggered and offline. A separate blocked task records that future contract.
+
+## Rejected behavior
+
+Do not implement from this task:
+
+- live in-process authority switching;
+- global request, worker, poller, terminal/tmux, browser, or MCP drain as a Cutover protocol;
+- a durable cross-backend Cutover claim;
+- production capability minting from Foundation readiness plus a static source census;
+- live Git or filesystem observation during activation;
+- linked-worktree identity convergence during activation;
+- automatic authority rollback or hot recovery;
+- a generation flip before a named ProductConversation or destructive Close consumer requires hidden authority.
+
+## Preserved evidence
+
+The paused implementation branch `task-59004-repository-authority-cutover` is preserved at `a3286a8c27ae3324c782e4dd4ad7bfc2083f49ee`. It is not a merge candidate and must not be opened as one PR.
+
+Individual commits may be extracted only when a feature owner proves current value independent of Repository Cutover. Candidate areas include creation-worker terminal persistence, direct-turn correctness, and PR-poller lifecycle ownership. Request admission, browser lifecycle, and MCP lifecycle require separate requirements and review. Cutover-only binders, drains, convergence, and activation work are dropped.
+
+## Current authority
+
+- `Project` remains the sole live repository authority.
+- Hidden `GitRepository` Foundation data remains dormant.
+- No authority generation changed.
+- No ProductConversation or Close capability became live.
+- Task 44016 continues to own project-wide offline downgrade enforcement and truthful rollback messaging.
+
+---
+
+## Original rejected brief
+
 # R2 — Atomic repository authority cutover
 
 ## Problem and single goal

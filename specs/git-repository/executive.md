@@ -6,7 +6,9 @@
 
 ## Current Reality
 
-The shipped implementation still largely reflects the legacy `project`-named model. Repository identity and worktree ownership are still inferred from existing row fields, paths, and continuation relationships; the hidden `GitRepository` shape described here is not yet fully implemented as an explicit first-class authority. Branch discovery and remote-search behavior exist in the product, but the staged migration to opaque hidden repository identity, mutable locator status, typed restart repair evidence, and singular repository attachment remains normative future work.
+The additive Repository Foundation is shipped: deterministic Project-seeded hidden `GitRepository` rows and singular nullable `WorkScope.repository` attachments exist as dormant relational data, with query-only readiness validation. Legacy `Project` remains the sole live repository authority, and Foundation locator/default-branch observations may truthfully remain empty because Foundation performs no live probes. No ProductConversation or Close capability has made hidden authority live.
+
+Authority activation is deferred until a named ProductConversation or destructive Close capability requires it. That activation is an offline maintenance operation: Phoenix is stopped, a paired backup is verified, exclusive SQLite access is acquired, seeded identities are preserved, and one transaction changes authority generation from Project generation `1` to GitRepository generation `2`. Live cutover, runtime-wide drain, linked-worktree convergence, and production authorization from a source census are not supported activation behavior.
 
 ## Requirements Summary
 
@@ -21,6 +23,7 @@ The shipped implementation still largely reflects the legacy `project`-named mod
 | REQ-PROJ-015 | GitRepository worktree registry |
 | REQ-GITREP-007 | Hidden repository identity may survive conversation deletion when Phoenix still needs repository truth |
 | REQ-GITREP-008 | Hidden GitRepository owns no user-facing lifecycle or workflow surface |
+| REQ-GITREP-009 | Repository authority activation is consumer-triggered and offline |
 | REQ-PROJ-020 | Local branch discovery uses only local data |
 | REQ-PROJ-021 | Remote branch search is on-demand and cached |
 | REQ-PROJ-024 | Existing-branch work is repository state, not creation mode |
@@ -28,21 +31,22 @@ The shipped implementation still largely reflects the legacy `project`-named mod
 
 ## Normative Authority
 
-Current normative authority is `requirements.md` and `git-repository.allium`. ADR-032 records the hidden-repository identity and staged migration decision. ADR-033 records offline paired database rollback, stopped-process replacement, and integer Unix-microsecond Foundation observation storage. This executive describes implementation drift from that target instead of claiming the hidden repository model is already shipped.
+Current normative authority is `requirements.md` and `git-repository.allium`. ADR-032 records the hidden-repository identity and staged single-authority decision. ADR-033 records offline paired database rollback, stopped-process replacement, and integer Unix-microsecond Foundation observation storage. ADR-035 records consumer-triggered offline authority activation and replaces ADR-032's coordinated live-reader/writer activation mechanism. This executive distinguishes the shipped dormant Foundation from the deferred authority transition.
 
 ## Implementation Status
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| REQ-GITREP-001 | Not implemented | Shipped code still uses legacy project/path-oriented identity surfaces instead of one explicit opaque hidden `GitRepository` authority |
-| REQ-GITREP-002 | Not implemented | Mutable locator observations with `present` / `missing` / `inaccessible` status are a normative target, not a shipped contract |
-| REQ-GITREP-003 | Partially implemented | Phoenix already observes default-branch facts for provisioning and branch UI, but the explicit optional-provenance contract is not yet the sole authority |
-| REQ-GITREP-004 | Not implemented | Singular nullable `WorkScope.repository` attachment and pre-scope repository evidence remain migration targets |
+| REQ-GITREP-001 | Foundation implemented; activation deferred | Opaque Project-seeded hidden identities exist dormantly; Project remains live authority |
+| REQ-GITREP-002 | Foundation schema implemented | Mutable locator rows have typed status, but Foundation performs no live observation and valid tables may be empty |
+| REQ-GITREP-003 | Partially implemented | Typed dormant observation storage exists and Phoenix observes branch facts through legacy paths, but the hidden model is not live authority |
+| REQ-GITREP-004 | Foundation attachment implemented; activation deferred | Singular nullable `WorkScope.repository` is backfilled dormantly; ProductConversation and pre-scope hidden-authority consumers are not live |
 | REQ-GITREP-005 | Partially implemented | Continuation already preserves one work context, and follow-up is specified as fresh work, but repository attachment is still carried through legacy surfaces |
 | REQ-GITREP-006 | Not implemented | Immutable restart repair evidence bound to ProductConversation, WorkScope, hidden GitRepository, and fingerprint is not yet the shipped persistence contract |
 | REQ-PROJ-015 | Partially implemented | Worktree reconciliation exists, but the explicit hidden-repository authority and typed repair evidence are still incomplete |
 | REQ-GITREP-007 | Not implemented | Repository survival beyond one deleted conversation remains normative future work |
 | REQ-GITREP-008 | Partially implemented | Phoenix does not ship a first-class repository management product surface, but many legacy `project` names still appear in code and docs |
+| REQ-GITREP-009 | Not implemented; consumer-blocked | Project remains sole authority; no named live ProductConversation or destructive Close consumer requires offline activation |
 | REQ-PROJ-020 | Complete (legacy current reality) | Branch listing is local-first and does not fetch on the no-query path |
 | REQ-PROJ-021 | Complete (legacy current reality) | Remote search is on-demand via `ls-remote` with caching |
 | REQ-PROJ-024 | Complete (legacy current reality) | Existing-branch work happens as repository operations inside the disposable worktree |
@@ -50,12 +54,9 @@ Current normative authority is `requirements.md` and `git-repository.allium`. AD
 
 ## Migration Notes
 
-This spec intentionally separates observable repository facts from SQL or row-shape claims. The staged migration target is:
+This spec intentionally separates observable repository facts from SQL or row-shape claims. The dormant Foundation preserves legacy behavior while introducing hidden repository identity and typed evidence. It incurs temporary duplicate storage without creating a second writable authority.
 
-1. preserve legacy behavior while introducing hidden repository identity and typed evidence;
-2. keep one writable authority per repository fact;
-3. move references away from retired `projects.allium` and project-as-product vocabulary;
-4. let lifecycle, deletion, and Close consume repository evidence without turning repositories into user-facing owners.
+Authority changes only when a named live consumer requires it. The offline operation preserves the Project-seeded identity partition; linked-worktree identity convergence is separate future work. A source census may remain CI/review evidence but is not production activation authority.
 
 The additive Foundation uses relational INTEGER Unix-microsecond observation columns and rejects NUL in filesystem/Git text. Rollback acceptance restores a pre-upgrade database backup while Phoenix is stopped and boots the matching historical binary; an older binary opening a newer-migrated database and live same-path database replacement are not supported contracts.
 

@@ -14,7 +14,7 @@
 --   - Close retirement orchestration (work-lifecycle).
 --   - User-facing repository management UI.
 --
--- Requirement traceability: REQ-GITREP-001 through REQ-GITREP-008,
+-- Requirement traceability: REQ-GITREP-001 through REQ-GITREP-009,
 -- REQ-PROJ-015, REQ-PROJ-020, REQ-PROJ-021, REQ-PROJ-024, REQ-PROJ-025.
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -62,6 +62,16 @@ enum RestartRepairObservationKind {
 enum ProvisioningEvidenceKind {
     canonical_default_resolved
     | canonical_default_unresolved
+}
+
+enum RepositoryAuthorityGeneration {
+    project_1
+    | git_repository_2
+}
+
+enum RepositoryAuthorityConsumerKind {
+    product_conversation
+    | destructive_close
 }
 
 ------------------------------------------------------------
@@ -130,19 +140,19 @@ external entity ProductConversationDeletion {
 -- Rules
 ------------------------------------------------------------
 
-rule LinkedWorktreesReuseOneHiddenRepositoryIdentity {
-    when: LinkedWorktreesObserved(left_worktree, right_worktree, shared_git_common_dir)
+rule ExplicitLinkedWorktreeConvergenceReusesOneHiddenRepositoryIdentity {
+    when: LinkedWorktreeIdentityConvergenceRequested(left_worktree, right_worktree, shared_git_common_dir)
     let left_repository = resolved_hidden_repository(left_worktree)
     let right_repository = resolved_hidden_repository(right_worktree)
-    requires: retained_git_common_dir(left_worktree) = shared_git_common_dir
-    requires: retained_git_common_dir(right_worktree) = shared_git_common_dir
+    requires: complete_authoritative_shared_git_common_dir_evidence(left_worktree, right_worktree, shared_git_common_dir)
     ensures: left_repository.opaque_id = right_repository.opaque_id
     ensures: GitRepository.created(opaque_id: left_repository.opaque_id)
 
     @guidance
-        -- Phoenix keys hidden repository sameness from retained local repository
-        -- identity evidence, not from worktree paths. Linked worktrees that share
-        -- one Git common directory reuse one hidden GitRepository identity.
+        -- An explicit convergence operation may unify linked worktrees only from
+        -- complete authoritative shared-common-directory evidence. Distinct
+        -- Project-seeded identities remain distinct before and through repository-
+        -- authority activation; activation never invokes this rule implicitly.
 }
 
 rule SeparateClonesRemainDistinctHiddenRepositories {
@@ -245,17 +255,38 @@ rule ConflictingLegacyProjectAssignmentsFailRepositoryMigration {
         -- assignments, migration fails rather than selecting one heuristically.
 }
 
-rule RepositoryAuthorityCutoverMovesReadersAndWritersTogether {
-    when: RepositoryAuthorityCutoverRequested(repository_fact)
-    requires: superseded_repository_writers_excluded(repository_fact)
-    ensures: RepositoryAuthorityCutoverCompleted(repository_fact)
+rule RepositoryAuthorityActivationIsConsumerTriggeredAndOffline {
+    when: RepositoryAuthorityActivationRequested(consumer_kind)
+    requires: live_consumer_requires_hidden_repository_authority(consumer_kind)
+    requires: phoenix_is_stopped()
+    requires: paired_project_authority_backup_verified()
+    requires: exclusive_repository_database_access_held()
+    requires: dormant_git_repository_foundation_is_valid()
+    requires: persisted_repository_authority_generation() = project_1
+    ensures: RepositoryAuthorityActivationCompleted(git_repository_2)
+    ensures: ProjectSeededRepositoryIdentitiesPreserved()
+    ensures: LinkedWorktreeConvergenceSkipped()
 
     @guidance
-        -- Each repository fact has exactly one writable authority at a time.
-        -- GitRepository and WorkScope.repository become authoritative only in a
-        -- coordinated cutover that moves every relevant reader and writer together.
-        -- Legacy Project-shaped carriers may remain read-only, but old binaries,
-        -- stale workers, and other superseded writers are excluded first.
+        -- With Phoenix stopped and exclusive SQLite access held, validate the
+        -- dormant Foundation and preserve every deterministic Project-seeded
+        -- GitRepository identity. In one transaction, update authority-bearing
+        -- references and change the persisted generation from Project generation 1
+        -- to GitRepository generation 2. A pre-commit failure rolls the transaction
+        -- back wholly. Activation performs no live Git observation, linked-worktree
+        -- convergence, runtime drain protocol, or source-census authorization.
+}
+
+rule RepositoryAuthorityDatabaseOpenRejectsWrongGeneration {
+    when: RepositoryAuthorityDatabaseOpenRequested(required_authority_generation)
+    requires: required_authority_generation != persisted_repository_authority_generation()
+    ensures: RepositoryAuthorityDatabaseOpenRejected(required_authority_generation)
+
+    @guidance
+        -- Normal operation starts only when the binary's required authority
+        -- generation matches the database. After offline activation commits
+        -- generation 2, a Project-authority binary requiring generation 1 fails
+        -- closed rather than opening or modifying the database.
 }
 
 rule PreScopeProvisioningEvidenceMayReferenceRepositoryDirectly {
@@ -327,6 +358,16 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
 --
+--   complete_authoritative_shared_git_common_dir_evidence(
+--       left_worktree: WorktreeIdentity,
+--       right_worktree: WorktreeIdentity,
+--       shared_git_common_dir: String
+--   ) -> Boolean
+--       True iff an explicit identity-convergence operation holds complete,
+--       authoritative evidence that both worktrees share the same exact Git common
+--       directory. Path, remote, slug, commit, or default-branch similarity is
+--       insufficient, and repository-authority activation never supplies this proof.
+--
 --   resolved_hidden_repository(clone_evidence) -> GitRepository
 --       The hidden identity resolved from retained local clone evidence. Separate
 --       local clones resolve independently even when remote, slug, or commit graph
@@ -349,7 +390,7 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --
 --   repository_locator_observation_is_not_stale(
 --       repository: GitRepository,
---       locator_kind: RepositoryLocatorKind,
+--       locator_kind: LocatorKind,
 --       observed_at: Timestamp
 --   ) -> Boolean
 --       True iff no retained observation exists for that exact repository and
@@ -386,10 +427,33 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       generations makes this false. local_checked_out_branch or user_selected
 --       alone is never admissible canonical evidence.
 --
---   superseded_repository_writers_excluded(repository_fact) -> Boolean
---       True iff every old binary, stale worker, or other superseded writer that
---       could recreate or mutate the retired Project authority for repository_fact
---       is unable to write before the GitRepository authority is enabled.
+--   live_consumer_requires_hidden_repository_authority(
+--       consumer_kind: RepositoryAuthorityConsumerKind
+--   ) -> Boolean
+--       True iff a named ProductConversation or destructive Close capability has a
+--       correctness contract that cannot be satisfied while Project remains the
+--       sole repository authority. Foundation availability alone makes this false.
+--
+--   phoenix_is_stopped() -> Boolean
+--       True iff no Phoenix server, one-shot runtime, worker, or other Phoenix
+--       process has the target database open or can admit work against it.
+--
+--   paired_project_authority_backup_verified() -> Boolean
+--       True iff a recoverable database backup paired with the Project-authority
+--       binary has been identified and verified before activation begins.
+--
+--   exclusive_repository_database_access_held() -> Boolean
+--       True iff the offline maintenance operation exclusively owns the target
+--       SQLite database for the full validation and authority transaction.
+--
+--   dormant_git_repository_foundation_is_valid() -> Boolean
+--       True iff the additive Foundation schema, deterministic Project-seeded
+--       GitRepository identities, and WorkScope attachments satisfy their complete
+--       query-only readiness contract without promoting them to authority.
+--
+--   persisted_repository_authority_generation() -> RepositoryAuthorityGeneration
+--       The one persisted repository-authority generation. project_1 denotes
+--       Project authority and git_repository_2 denotes GitRepository authority.
 --
 --   unique_complete_latest_restart_repair_evidence(
 --       product_conversation: bedrock/ProductConversation,
@@ -409,6 +473,14 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       WorkScope attachment, pre-scope provisioning/repair evidence, orphan
 --       resource, default-branch observation required by a consumer, or active
 --       repository-scoped mutation lock that references the same GitRepository.
+--
+--   UserFacingRepositoryCatalogEntry(repository: GitRepository) -> Boolean
+--       True iff a user-facing repository catalog, favorite, recent-location,
+--       grouping, or equivalent product entry is keyed by repository.
+--
+--   UserFacingRepositoryLifecycleOwned(repository: GitRepository) -> Boolean
+--       True iff repository owns a user-facing lifecycle, title, task inventory,
+--       branch inventory, pull-request workflow, Close, or Delete behavior.
 --
 --   hidden_repository_needed_for_operational_truth(
 --       repository: GitRepository
