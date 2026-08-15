@@ -161,11 +161,14 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
-    /// Complete an async creation job using the authority that enqueued the initial turn.
-    async fn complete_creation_job(
+    /// Atomically complete an async creation job and commit its runtime state.
+    async fn settle_creation_runtime(
         &self,
         _job_id: &str,
         _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        _conversation_id: &str,
+        _state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::CreationCasOutcome, String> {
         Ok(crate::db::CreationCasOutcome::ClaimLost)
     }
@@ -524,12 +527,17 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).message_exists(message_id).await
     }
 
-    async fn complete_creation_job(
+    async fn settle_creation_runtime(
         &self,
         job_id: &str,
         claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::CreationCasOutcome, String> {
-        (**self).complete_creation_job(job_id, claim).await
+        (**self)
+            .settle_creation_runtime(job_id, claim, conversation_id, state, state_updated_at)
+            .await
     }
 
     async fn preflight_authoritative_user_message(
@@ -955,13 +963,22 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn complete_creation_job(
+    async fn settle_creation_runtime(
         &self,
         job_id: &str,
         claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::CreationCasOutcome, String> {
         self.db
-            .complete_conversation_creation_job(job_id, claim, chrono::Utc::now())
+            .settle_conversation_creation_runtime(
+                job_id,
+                claim,
+                conversation_id,
+                state,
+                state_updated_at,
+            )
             .await
             .map_err(|e| e.to_string())
     }

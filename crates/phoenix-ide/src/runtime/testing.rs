@@ -981,10 +981,13 @@ impl MessageStore for InMemoryStorage {
         Err(format!("Message not found: {message_id}"))
     }
 
-    async fn complete_creation_job(
+    async fn settle_creation_runtime(
         &self,
         _job_id: &str,
         _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::db::CreationCasOutcome, String> {
         if let Some(started) = self.complete_creation_job_started.lock().unwrap().take() {
             let _ = started.send(());
@@ -993,11 +996,19 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
-        self.complete_creation_job_results
+        let outcome = self
+            .complete_creation_job_results
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Ok(crate::db::CreationCasOutcome::ClaimLost))
+            .unwrap_or(Ok(crate::db::CreationCasOutcome::ClaimLost));
+        if matches!(outcome, Ok(crate::db::CreationCasOutcome::Applied)) {
+            self.states
+                .lock()
+                .unwrap()
+                .insert(conversation_id.to_string(), state.clone());
+        }
+        outcome
     }
 
     async fn preflight_authoritative_user_message(

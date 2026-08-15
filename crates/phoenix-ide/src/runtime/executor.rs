@@ -3134,8 +3134,13 @@ where
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::CommitSteeringDrain { .. }));
+            let will_settle_creation = result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CompleteCreation { .. }));
             if !will_drain_from_idle
                 && !will_commit_steering_drain
+                && !will_settle_creation
                 && !will_settle_active_direct_turn
             {
                 if let Some(tx) = &self.state_watcher {
@@ -3271,7 +3276,10 @@ where
             for effect in result.effects {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
-                let is_state_persist = matches!(effect, Effect::PersistState);
+                let is_state_persist = matches!(
+                    effect,
+                    Effect::PersistState | Effect::CompleteCreation { .. }
+                );
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let effect_result = Box::pin(self.execute_effect(effect)).await;
                 let effect_result = match effect_result {
@@ -5329,7 +5337,17 @@ where
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
             Effect::CompleteCreation { job_id, claim } => {
-                match self.storage.complete_creation_job(&job_id, &claim).await {
+                match self
+                    .storage
+                    .settle_creation_runtime(
+                        &job_id,
+                        &claim,
+                        &self.context.conversation_id,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await
+                {
                     Ok(crate::db::CreationCasOutcome::Applied) => {}
                     Ok(crate::db::CreationCasOutcome::ClaimLost) => {
                         tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
@@ -10040,6 +10058,10 @@ mod creation_completion_lifecycle_tests {
     }
 
     fn runtime(state: ConvState) -> RuntimeHarness {
+        runtime_with_storage(state, Arc::new(InMemoryStorage::new()))
+    }
+
+    fn runtime_with_storage(state: ConvState, storage: Arc<InMemoryStorage>) -> RuntimeHarness {
         let context = ConvContext::new(
             "conv-creation",
             PathBuf::from("/tmp"),
@@ -10047,7 +10069,6 @@ mod creation_completion_lifecycle_tests {
             200_000,
         );
         let (event_tx, event_rx) = mpsc::channel(32);
-        let storage = Arc::new(InMemoryStorage::new());
         let llm = Arc::new(MockLlmClient::new("test-model"));
         let runtime = ConversationRuntime::new(
             context,
@@ -10108,23 +10129,49 @@ mod creation_completion_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn completion_storage_failure_prevents_provider_dispatch() {
-        let mut harness = runtime(ConvState::Provisioning {
+    async fn retry_scheduled_reconstruction_waits_for_reclaim_before_one_dispatch() {
+        let provisioning = ConvState::Provisioning {
             job_id: "job".to_string(),
             phase: crate::db::ConversationCreationPhase::Provisioning,
-        });
-        harness.storage.queue_complete_creation_job_result(Err(
-            "injected creation completion failure".to_string(),
+        };
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .update_state("conv-creation", &provisioning, chrono::Utc::now())
+            .await
+            .unwrap();
+        storage.queue_complete_creation_job_result(Err(
+            "injected creation completion failure".to_string()
         ));
+        let mut failed_attempt = runtime_with_storage(provisioning.clone(), Arc::clone(&storage));
 
-        let error = harness
+        let error = failed_attempt
             .runtime
             .process_event(creation_event())
             .await
             .expect_err("completion persistence failure must fail the transition");
 
         assert!(error.contains("injected creation completion failure"));
-        assert!(harness.llm.recorded_requests().is_empty());
+        assert!(failed_attempt.llm.recorded_requests().is_empty());
+        assert_eq!(failed_attempt.runtime.state, provisioning);
+        assert_eq!(
+            storage.get_current_state("conv-creation"),
+            Some(provisioning.clone())
+        );
+
+        let reconstruction = runtime_with_storage(provisioning.clone(), Arc::clone(&storage));
+        reconstruction.event_tx.send(Event::Shutdown).await.unwrap();
+        reconstruction.runtime.run().await;
+        assert!(reconstruction.llm.recorded_requests().is_empty());
+
+        storage.queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
+        let mut reclaimed = runtime_with_storage(provisioning, storage);
+        let mut request_count = reclaimed.llm.subscribe_request_count();
+        reclaimed
+            .runtime
+            .process_event(creation_event())
+            .await
+            .unwrap();
+        wait_for_provider_dispatch(&mut request_count).await;
     }
 
     #[tokio::test]

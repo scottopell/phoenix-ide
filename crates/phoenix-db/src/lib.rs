@@ -5504,6 +5504,87 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
+    /// Atomically complete a claimed creation job and commit its runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if either write cannot be committed.
+    pub async fn settle_conversation_creation_runtime(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        conversation_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let cleared_intent = serde_json::json!({
+            "cwd": "",
+            "model": null,
+            "text": "",
+            "expansion_preflighted": false,
+            "llm_text": null,
+            "skill_invocation": null,
+            "images": [],
+            "mode": null,
+            "base_branch": null,
+            "checkout_ref": null,
+            "seed_parent_id": null,
+            "seed_label": null
+        })
+        .to_string();
+        let now = Utc::now().to_rfc3339();
+        let state_updated_at = state_updated_at.to_rfc3339();
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let mut tx = self.pool.begin().await?;
+        let job_update = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?3 AND conversation_id = ?4 AND status = 'claimed' AND generation = ?5
+               AND claim_worker_id = ?6 AND claim_token = ?7 AND lease_until > ?2",
+        )
+        .bind(cleared_intent)
+        .bind(&now)
+        .bind(job_id)
+        .bind(conversation_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&mut *tx)
+        .await?;
+        if job_update.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        let conversation_update = sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(state_json)
+        .bind(conv_state_kind(state))
+        .bind(state_updated_at)
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if conversation_update.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        sqlx::query("DELETE FROM conversation_creation_job_files WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_creation_job_images WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
+    }
+
     async fn persist_continuation_start(
         &self,
         conversation_id: &str,
@@ -11337,6 +11418,155 @@ mod tests {
                 .status,
             CreationStatus::Ready
         ));
+    }
+
+    async fn setup_runtime_settlement_job(db: &Database) -> (CreationClaim, DateTime<Utc>) {
+        insert_test_creation_job(db, "job-runtime-settle", "conv-runtime-settle").await;
+        db.update_conversation_state(
+            "conv-runtime-settle",
+            &ConvState::Provisioning {
+                job_id: "job-runtime-settle".to_string(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                now,
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected creation claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        (claim, now)
+    }
+
+    #[tokio::test]
+    async fn creation_runtime_settlement_rolls_back_job_when_state_write_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        sqlx::query(
+            "CREATE TEMP TRIGGER fail_creation_runtime_state
+             BEFORE UPDATE OF state ON conversations
+             WHEN OLD.id = 'conv-runtime-settle'
+             BEGIN SELECT RAISE(ABORT, 'injected state failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.settle_conversation_creation_runtime(
+            "job-runtime-settle",
+            &claim,
+            "conv-runtime-settle",
+            &ConvState::LlmRequesting { attempt: 1 },
+            now,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            db.get_conversation_creation_job("job-runtime-settle")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Claimed(_)
+        ));
+        assert!(matches!(
+            db.get_conversation("conv-runtime-settle")
+                .await
+                .unwrap()
+                .state,
+            ConvState::Provisioning { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_runtime_retry_reclaims_before_committing_dispatchable_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let retry_at = now + chrono::Duration::seconds(1);
+        assert_eq!(
+            db.schedule_conversation_creation_retry(
+                "job-runtime-settle",
+                &claim,
+                "injected completion failure",
+                now,
+                retry_at,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert!(matches!(
+            db.get_conversation_creation_job("job-runtime-settle")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::RetryScheduled { .. }
+        ));
+        assert!(matches!(
+            db.get_conversation("conv-runtime-settle")
+                .await
+                .unwrap()
+                .state,
+            ConvState::Provisioning { .. }
+        ));
+
+        let reclaimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("replacement".into()),
+                &CreationClaimToken("replacement-token".into()),
+                retry_at,
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(reclaimed_job) = reclaimed else {
+            panic!("retry must be reclaimable");
+        };
+        let CreationStatus::Claimed(reclaimed_claim) = reclaimed_job.protocol.status else {
+            panic!("replacement must own current claim");
+        };
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        assert_eq!(
+            db.settle_conversation_creation_runtime(
+                "job-runtime-settle",
+                &reclaimed_claim,
+                "conv-runtime-settle",
+                &requesting,
+                retry_at,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert!(matches!(
+            db.get_conversation_creation_job("job-runtime-settle")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+        assert_eq!(
+            db.get_conversation("conv-runtime-settle")
+                .await
+                .unwrap()
+                .state,
+            requesting
+        );
     }
 
     #[tokio::test]
