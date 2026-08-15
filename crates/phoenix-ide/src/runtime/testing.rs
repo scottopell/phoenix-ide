@@ -527,9 +527,9 @@ pub struct InMemoryStorage {
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
     preflight_authoritative_user_message_results:
-        Mutex<VecDeque<DirectTurnMaterializationEligibility>>,
+        Mutex<VecDeque<Result<DirectTurnMaterializationEligibility, String>>>,
     materialize_authoritative_user_message_results:
-        Mutex<VecDeque<AuthoritativeUserMessageMaterialization>>,
+        Mutex<VecDeque<Result<AuthoritativeUserMessageMaterialization, String>>>,
     preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
@@ -712,7 +712,14 @@ impl InMemoryStorage {
         self.preflight_authoritative_user_message_results
             .lock()
             .unwrap()
-            .push_back(result);
+            .push_back(Ok(result));
+    }
+
+    pub fn fail_next_preflight_authoritative_user_message(&self, error: impl Into<String>) {
+        self.preflight_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .push_front(Err(error.into()));
     }
 
     pub fn queue_materialize_authoritative_user_message(
@@ -722,7 +729,14 @@ impl InMemoryStorage {
         self.materialize_authoritative_user_message_results
             .lock()
             .unwrap()
-            .push_back(result);
+            .push_back(Ok(result));
+    }
+
+    pub fn fail_next_materialize_authoritative_user_message(&self, error: impl Into<String>) {
+        self.materialize_authoritative_user_message_results
+            .lock()
+            .unwrap()
+            .push_front(Err(error.into()));
     }
 
     pub fn recorded_preflight_authoritative_user_message_calls(
@@ -958,12 +972,11 @@ impl MessageStore for InMemoryStorage {
                 payload: payload.clone(),
                 now,
             });
-        Ok(self
-            .preflight_authoritative_user_message_results
+        self.preflight_authoritative_user_message_results
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(DirectTurnMaterializationEligibility::StaleAuthority))
+            .unwrap_or(Ok(DirectTurnMaterializationEligibility::StaleAuthority))
     }
 
     async fn materialize_authoritative_user_message(
@@ -982,12 +995,11 @@ impl MessageStore for InMemoryStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             });
-        Ok(self
-            .materialize_authoritative_user_message_results
+        self.materialize_authoritative_user_message_results
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(AuthoritativeUserMessageMaterialization::StaleAuthority))
+            .unwrap_or(Ok(AuthoritativeUserMessageMaterialization::StaleAuthority))
     }
 
     async fn load_active_direct_turn(

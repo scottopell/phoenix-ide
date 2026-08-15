@@ -100,10 +100,41 @@ pub struct AppState {
     pub(crate) request_drain: crate::request_drain::RequestDrain,
 }
 
+pub(crate) struct BackgroundWorkers {
+    pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
+    creation_worker: crate::runtime::creation_worker::CreationWorker,
+    direct_turn_worker: crate::runtime::direct_turn_worker::DirectTurnWorkerHandle,
+}
+
+pub(crate) struct BackgroundWorkerShutdown {
+    pr_status_poller: crate::managed_task::ManagedTaskShutdown,
+    creation_worker: crate::managed_task::ManagedTaskShutdown,
+    direct_turn_worker: crate::managed_task::ManagedTaskShutdown,
+}
+
+impl BackgroundWorkers {
+    pub(crate) fn begin_shutdown(self) -> BackgroundWorkerShutdown {
+        BackgroundWorkerShutdown {
+            pr_status_poller: self.pr_status_poller.begin_shutdown(),
+            creation_worker: self.creation_worker.begin_shutdown(),
+            direct_turn_worker: self.direct_turn_worker.begin_shutdown(),
+        }
+    }
+}
+
+impl BackgroundWorkerShutdown {
+    pub(crate) async fn wait(self) {
+        tokio::join!(
+            self.pr_status_poller.wait(),
+            self.creation_worker.wait(),
+            self.direct_turn_worker.wait(),
+        );
+    }
+}
+
 pub struct AppStartup {
     pub state: AppState,
-    pub(crate) pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
-    pub(crate) creation_worker: crate::runtime::creation_worker::CreationWorker,
+    pub(crate) background_workers: BackgroundWorkers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,10 +207,11 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
-        runtime
+        let direct_turn_worker = runtime
             .start_direct_turn_worker()
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(std::io::Error::other)?
+            .expect("direct-turn worker starts exactly once");
         if AGENT_FACING_WAKE_REGISTRATION.0 {
             runtime
                 .start_wake_worker()
@@ -253,8 +285,11 @@ impl AppState {
                 resource_monitor,
                 request_drain: crate::request_drain::RequestDrain::new(),
             },
-            pr_status_poller,
-            creation_worker,
+            background_workers: BackgroundWorkers {
+                pr_status_poller,
+                creation_worker,
+                direct_turn_worker,
+            },
         })
     }
 }

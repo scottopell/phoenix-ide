@@ -945,8 +945,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let state = startup.state;
-    let pr_status_poller = startup.pr_status_poller;
-    let creation_worker = startup.creation_worker;
+    let background_workers = startup.background_workers;
 
     // Create router
     //
@@ -1000,8 +999,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             loaded_tls.server,
             socket_activated,
             request_drain,
-            pr_status_poller,
-            creation_worker,
+            background_workers,
         )
         .await?;
     } else {
@@ -1040,14 +1038,12 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
                 let admitted_requests = request_drain.begin();
-                let pr_status_poller = pr_status_poller.begin_shutdown();
-                let creation_worker = creation_worker.begin_shutdown();
+                let background_workers = background_workers.begin_shutdown();
                 let _ = drain_tx.send(());
                 let drain = async {
-                    let ((), (), (), joined) = tokio::join!(
+                    let ((), (), joined) = tokio::join!(
                         admitted_requests.wait(),
-                        pr_status_poller.wait(),
-                        creation_worker.wait(),
+                        background_workers.wait(),
                         &mut server,
                     );
                     joined

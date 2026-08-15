@@ -13,8 +13,53 @@ use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
 
-use crate::runtime::RuntimeManager;
+use crate::runtime::{DirectTurnDispatchError, RuntimeManager};
 use crate::state_machine::Event;
+
+enum Admission<T> {
+    Closed,
+    Open(T),
+}
+
+async fn admit<F, Fut, T, E>(
+    stop: &watch::Receiver<bool>,
+    gate: &tokio::sync::Mutex<()>,
+    operation: F,
+) -> Result<Admission<T>, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let _gate = gate.lock().await;
+    if *stop.borrow() {
+        return Ok(Admission::Closed);
+    }
+    operation().await.map(Admission::Open)
+}
+
+pub(crate) struct DirectTurnWorkerHandle {
+    stop: watch::Sender<bool>,
+    completion: crate::managed_task::ManagedTaskShutdown,
+}
+
+impl DirectTurnWorkerHandle {
+    pub(crate) fn start(
+        manager: Arc<RuntimeManager>,
+        kick_rx: watch::Receiver<u64>,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (stop, completion) = crate::managed_task::spawn("direct-turn worker", move |stop| {
+            run(manager, kick_rx, ready_tx, stop, gate)
+        });
+        Self { stop, completion }
+    }
+
+    pub(crate) fn begin_shutdown(self) -> crate::managed_task::ManagedTaskShutdown {
+        self.stop.send_replace(true);
+        self.completion
+    }
+}
 
 const DISCOVERY_BATCH_LIMIT: usize = 64;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
@@ -28,10 +73,12 @@ fn fresh_process_incarnation() -> ProcessIncarnation {
     ProcessIncarnation(u64::from_le_bytes(bytes))
 }
 
-pub(crate) async fn run(
+async fn run(
     manager: Arc<RuntimeManager>,
     kick_rx: watch::Receiver<u64>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    stop: watch::Receiver<bool>,
+    gate: Arc<tokio::sync::Mutex<()>>,
 ) {
     let worker = DirectTurnWorker::new(
         WorkflowRepository::new(manager.db().pool().clone()),
@@ -39,7 +86,10 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
+    if let Err(error) = worker
+        .run_loop_admitted(kick_rx, ready_tx, stop, gate)
+        .await
+    {
         tracing::warn!(error = %error, "direct-turn worker stopped");
     }
 }
@@ -81,15 +131,36 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         self
     }
 
+    #[cfg(test)]
     async fn run_loop(
+        &self,
+        kick_rx: watch::Receiver<u64>,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), String> {
+        let (_stop_tx, stop) = watch::channel(false);
+        self.run_loop_admitted(
+            kick_rx,
+            ready_tx,
+            stop,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .await
+    }
+
+    async fn run_loop_admitted(
         &self,
         mut kick_rx: watch::Receiver<u64>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
+        mut stop: watch::Receiver<bool>,
+        gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Result<(), String> {
-        self.run_once().await?;
+        self.run_once_admitted(&stop, &gate).await?;
         let _ = ready_tx.send(());
         loop {
-            let wait = match self.run_once().await {
+            if *stop.borrow() {
+                return Ok(());
+            }
+            let wait = match self.run_once_admitted(&stop, &gate).await {
                 Ok(wait) => wait,
                 Err(error) => {
                     tracing::warn!(error = %error, "direct-turn worker pass failed; retrying");
@@ -99,6 +170,12 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
             tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        return Ok(());
+                    }
+                }
                 () = &mut sleep => {}
                 changed = kick_rx.changed() => {
                     if changed.is_err() {
@@ -109,18 +186,39 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_once(&self) -> Result<Duration, String> {
+        let (_stop_tx, stop) = watch::channel(false);
+        let gate = tokio::sync::Mutex::new(());
+        self.run_once_admitted(&stop, &gate).await
+    }
+
+    async fn run_once_admitted(
+        &self,
+        stop: &watch::Receiver<bool>,
+        gate: &tokio::sync::Mutex<()>,
+    ) -> Result<Duration, String> {
         let mut cursor = None;
         loop {
-            let page = self
-                .repo
-                .list_discoverable_accepted_runtime_direct_turns(cursor, DISCOVERY_BATCH_LIMIT)
-                .await
-                .map_err(|error| error.to_string())?;
+            let page = admit(stop, gate, || async {
+                self.repo
+                    .list_discoverable_accepted_runtime_direct_turns(cursor, DISCOVERY_BATCH_LIMIT)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await?;
+            let Admission::Open(page) = page else {
+                return Ok(EMPTY_RESCAN_INTERVAL);
+            };
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
             for candidate in page.candidates {
-                self.dispatch_candidate(candidate, self.clock.now()).await?;
+                if !self
+                    .dispatch_candidate_admitted(candidate, self.clock.now(), stop, gate)
+                    .await?
+                {
+                    return Ok(EMPTY_RESCAN_INTERVAL);
+                }
             }
             if exhausted {
                 break;
@@ -129,28 +227,35 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
         Ok(EMPTY_RESCAN_INTERVAL)
     }
 
-    async fn dispatch_candidate(
+    async fn dispatch_candidate_admitted(
         &self,
         candidate: DiscoverableAcceptedTurn,
         now: Timestamp,
-    ) -> Result<(), String> {
+        stop: &watch::Receiver<bool>,
+        gate: &tokio::sync::Mutex<()>,
+    ) -> Result<bool, String> {
         let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
-        let claim = self
-            .repo
-            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
-                turn_id: candidate.turn_id,
-                workflow_id: candidate.workflow_id,
-                process_incarnation: self.process_incarnation,
-                now,
-                lease_until,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+        let claim = admit(stop, gate, || async {
+            self.repo
+                .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                    turn_id: candidate.turn_id,
+                    workflow_id: candidate.workflow_id,
+                    process_incarnation: self.process_incarnation,
+                    now,
+                    lease_until,
+                })
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await?;
+        let Admission::Open(claim) = claim else {
+            return Ok(false);
+        };
         if claim.outcome != ClaimOutcome::Started {
-            return Ok(());
+            return Ok(true);
         }
         let Some(authority) = claim.authority else {
-            return Ok(());
+            return Ok(true);
         };
         let prepared = match PreparedDirectTurnPayload::from_exact_bytes(
             candidate.prepared.payload(),
@@ -167,7 +272,7 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
                     tracing::error!(turn_id = candidate.turn_id.0, error = %terminal_error, "failed to quarantine corrupt direct-turn payload");
                 }
                 tracing::warn!(turn_id = candidate.turn_id.0, error = %error, "direct-turn payload decode failed; terminally quarantined turn");
-                return Ok(());
+                return Ok(true);
             }
         };
         #[cfg(test)]
@@ -197,27 +302,56 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
                     turn_id = candidate.turn_id.0,
                     "direct-turn already materialized before dispatch; skipping"
                 );
-                return Ok(());
+                return Ok(true);
             }
             DirectTurnMaterializationEligibility::StaleAuthority => {
                 tracing::debug!(
                     turn_id = candidate.turn_id.0,
                     "direct-turn authority stale before dispatch; skipping"
                 );
-                return Ok(());
+                return Ok(true);
             }
         }
         let event = Event::AuthoritativeUserMessage {
             payload: prepared,
             authority: authority_to_event(&authority, candidate.turn_id),
         };
-        if let Err(error) = self
+        let dispatch_result = self
             .dispatcher
             .dispatch(&candidate.conversation.0, event)
-            .await
-        {
-            self.release(authority, now).await?;
-            tracing::warn!(conversation_id = %candidate.conversation.0, turn_id = candidate.turn_id.0, error = %error, "direct-turn dispatch failed; released claim");
+            .await;
+        self.settle_dispatch_result(
+            &candidate.conversation.0,
+            candidate.turn_id,
+            authority,
+            now,
+            dispatch_result,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn settle_dispatch_result(
+        &self,
+        conversation_id: &str,
+        turn_id: phoenix_workflow::TurnAuthorityId,
+        authority: LocalAttemptAuthority,
+        now: Timestamp,
+        result: Result<(), DirectTurnDispatchError>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(()) => {}
+            Err(DirectTurnDispatchError::ClaimLost) => {
+                tracing::debug!(%conversation_id, turn_id = turn_id.0, "direct-turn claim lost during acknowledged materialization");
+            }
+            Err(error @ DirectTurnDispatchError::PostMaterializationFailed(_)) => {
+                tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn effect failed after acknowledged authoritative materialization");
+                return Err(error.to_string());
+            }
+            Err(error @ DirectTurnDispatchError::Failed(_)) => {
+                self.release(authority, now).await?;
+                tracing::warn!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn dispatch failed; released claim");
+            }
         }
         Ok(())
     }
@@ -262,7 +396,11 @@ fn authority_to_event(
 
 #[async_trait]
 pub(crate) trait DirectTurnDispatcher: Send + Sync + 'static {
-    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String>;
+    async fn dispatch(
+        &self,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), DirectTurnDispatchError>;
 }
 
 struct ProductionDirectTurnDispatcher {
@@ -271,20 +409,14 @@ struct ProductionDirectTurnDispatcher {
 
 #[async_trait]
 impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
-    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
-        let handle = self.manager.get_or_create(conversation_id).await?;
-        if !matches!(
-            *handle.state_rx.borrow(),
-            phoenix_core::domain::sm_state::ConvState::Idle
-                | phoenix_core::domain::sm_state::ConvState::Error { .. }
-        ) {
-            return Err("direct-turn reducer cannot accept a new user turn".to_string());
-        }
-        handle
-            .event_tx
-            .send(event)
+    async fn dispatch(
+        &self,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), DirectTurnDispatchError> {
+        self.manager
+            .send_direct_turn_event(conversation_id, event)
             .await
-            .map_err(|error| format!("Failed to send direct-turn event: {error}"))
     }
 }
 
@@ -337,7 +469,7 @@ mod tests {
     }
 
     struct RecordingDispatcher {
-        result: Mutex<Result<(), String>>,
+        result: Mutex<Result<(), DirectTurnDispatchError>>,
         events: Mutex<Vec<(String, Event)>>,
     }
 
@@ -352,18 +484,59 @@ mod tests {
 
     #[async_trait]
     impl DirectTurnDispatcher for RecordingDispatcher {
-        async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        async fn dispatch(
+            &self,
+            conversation_id: &str,
+            event: Event,
+        ) -> Result<(), DirectTurnDispatchError> {
             self.events
                 .lock()
                 .unwrap()
                 .push((conversation_id.to_string(), event));
-            self.result.lock().unwrap().clone()
+            match &*self.result.lock().unwrap() {
+                Ok(()) => Ok(()),
+                Err(DirectTurnDispatchError::ClaimLost) => Err(DirectTurnDispatchError::ClaimLost),
+                Err(DirectTurnDispatchError::Failed(error)) => {
+                    Err(DirectTurnDispatchError::Failed(error.clone()))
+                }
+                Err(DirectTurnDispatchError::PostMaterializationFailed(error)) => Err(
+                    DirectTurnDispatchError::PostMaterializationFailed(error.clone()),
+                ),
+            }
+        }
+    }
+
+    struct GatedFailingDispatcher {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+        events: Mutex<Vec<(String, Event)>>,
+    }
+
+    #[async_trait]
+    impl DirectTurnDispatcher for GatedFailingDispatcher {
+        async fn dispatch(
+            &self,
+            conversation_id: &str,
+            event: Event,
+        ) -> Result<(), DirectTurnDispatchError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((conversation_id.to_string(), event));
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            self.release.notified().await;
+            Err(DirectTurnDispatchError::Failed("closed".to_string()))
         }
     }
 
     async fn fixture() -> (WorkflowRepository, Arc<RecordingDispatcher>) {
         let db = Database::open_in_memory_project_authority().await.unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-b", "B", "/tmp", true, None, None)
             .await
             .unwrap();
         let repo = WorkflowRepository::new(db.pool().clone());
@@ -392,18 +565,22 @@ mod tests {
         )
     }
 
-    fn prepared_turn(message_id: &str) -> PreparedTurn {
+    fn prepared_turn(conversation_id: &str, message_id: &str) -> PreparedTurn {
         PreparedTurn::from_exact_payload(
-            &ConversationAuthority("conv-a".to_string()),
+            &ConversationAuthority(conversation_id.to_string()),
             prepared_payload(message_id).to_exact_bytes().unwrap(),
         )
     }
 
-    async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
+    async fn accept_for(
+        repo: &WorkflowRepository,
+        conversation_id: &str,
+        key: &str,
+    ) -> phoenix_workflow::TurnAuthorityId {
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 client_key: ClientTurnKey::new(key).unwrap(),
-                prepared: prepared_turn(&format!("message-{key}")),
+                prepared: prepared_turn(conversation_id, &format!("message-{key}")),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
@@ -413,6 +590,10 @@ mod tests {
             panic!("expected created turn")
         };
         turn_id
+    }
+
+    async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
+        accept_for(repo, "conv-a", key).await
     }
 
     async fn latest_authority(
@@ -449,6 +630,123 @@ mod tests {
             }),
             ProcessIncarnation(process_incarnation),
         )
+    }
+
+    #[tokio::test]
+    async fn closed_admission_never_invokes_page_or_claim_operation() {
+        let (_stop_tx, stop) = watch::channel(true);
+        let gate = tokio::sync::Mutex::new(());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result: Result<Admission<()>, ()> = admit(&stop, &gate, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result.unwrap(), Admission::Closed));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_intent_allows_started_operation_then_suppresses_next() {
+        let (stop_tx, stop) = watch::channel(false);
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let operation = tokio::spawn({
+            let stop = stop.clone();
+            let gate = gate.clone();
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                admit(&stop, &gate, || async {
+                    started.wait().await;
+                    release.wait().await;
+                    Ok::<_, ()>(())
+                })
+                .await
+                .unwrap()
+            }
+        });
+        started.wait().await;
+
+        stop_tx.send_replace(true);
+        release.wait().await;
+        assert!(matches!(operation.await.unwrap(), Admission::Open(())));
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let next: Result<Admission<()>, ()> = admit(&stop, &gate, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(next.unwrap(), Admission::Closed));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_claimed_dispatch_release_and_suppresses_next_claim() {
+        let (repo, _dispatcher) = fixture().await;
+        let first_turn = accept(&repo, "draining-first").await;
+        let second_turn = accept_for(&repo, "conv-b", "draining-second").await;
+        let first_workflow = repo
+            .workflow_id_for_turn(first_turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_workflow = repo
+            .workflow_id_for_turn(second_turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dispatcher = Arc::new(GatedFailingDispatcher {
+            started: Mutex::new(Some(started_tx)),
+            release: tokio::sync::Notify::new(),
+            events: Mutex::new(Vec::new()),
+        });
+        let worker = DirectTurnWorker::new(
+            repo.clone(),
+            dispatcher.clone(),
+            Arc::new(TestClock { now: Timestamp(10) }),
+            ProcessIncarnation(1),
+        );
+        let (_kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop) = watch::channel(false);
+        let completion = tokio::spawn(async move {
+            worker
+                .run_loop_admitted(
+                    kick_rx,
+                    ready_tx,
+                    stop,
+                    Arc::new(tokio::sync::Mutex::new(())),
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+
+        stop_tx.send_replace(true);
+        assert!(!completion.is_finished());
+        dispatcher.release.notify_one();
+        completion.await.unwrap().unwrap();
+
+        let first_attempts = repo
+            .list_attempts(first_workflow, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(first_attempts.len(), 1);
+        assert_eq!(
+            first_attempts[0].status,
+            phoenix_workflow::AttemptStatus::AuthorityLost
+        );
+        assert!(repo
+            .list_attempts(second_workflow, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -625,7 +923,8 @@ mod tests {
     #[tokio::test]
     async fn unavailable_runtime_or_closed_channel_releases_claim() {
         let (repo, dispatcher) = fixture().await;
-        *dispatcher.result.lock().unwrap() = Err("closed".to_string());
+        *dispatcher.result.lock().unwrap() =
+            Err(DirectTurnDispatchError::Failed("closed".to_string()));
         let turn_id = accept(&repo, "release").await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         worker(repo.clone(), dispatcher.clone(), 10, 1)
@@ -656,12 +955,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_materialization_failure_does_not_release_materialized_claim() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(
+            DirectTurnDispatchError::PostMaterializationFailed("llm dispatch failed".to_string()),
+        );
+        let turn_id = accept(&repo, "post-materialization-failure").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        let error = worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.contains("after authoritative materialization"));
+
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_claim_loss_does_not_attempt_stale_release() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(DirectTurnDispatchError::ClaimLost);
+        let turn_id = accept(&repo, "claim-lost").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+
+        worker(repo, dispatcher.clone(), 11, 2)
+            .run_once()
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn malformed_payload_is_skipped_without_dispatch() {
         let (repo, dispatcher) = fixture().await;
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 client_key: ClientTurnKey::new("bad").unwrap(),
-                prepared: prepared_turn("bad"),
+                prepared: prepared_turn("conv-a", "bad"),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })

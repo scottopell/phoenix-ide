@@ -142,9 +142,21 @@ pub(crate) enum SteeringWakeOutcome {
     DispatchFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DirectTurnDispatchError {
+    #[error("direct-turn claim lost before authoritative materialization")]
+    ClaimLost,
+    #[error("direct-turn dispatch failed before authoritative materialization: {0}")]
+    Failed(String),
+    #[error("direct-turn effect failed after authoritative materialization: {0}")]
+    PostMaterializationFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AcknowledgedEventOutcome {
     Settled,
+    DirectTurnClaimLost,
+    DirectTurnPostMaterializationFailed(String),
     SteeringWake(SteeringWakeOutcome),
 }
 
@@ -2390,22 +2402,25 @@ impl RuntimeManager {
         let _ = self.direct_turn_kick_tx.send(next);
     }
 
-    pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
+    pub async fn start_direct_turn_worker(
+        self: &Arc<Self>,
+    ) -> Result<Option<crate::runtime::direct_turn_worker::DirectTurnWorkerHandle>, String> {
         let rx = self.direct_turn_kick_rx.write().await.take();
         let Some(rx) = rx else {
             tracing::debug!("direct-turn worker already started; skipping");
-            return Ok(());
+            return Ok(None);
         };
-        let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            crate::runtime::direct_turn_worker::run(manager, rx, ready_tx).await;
-        });
+        let worker = crate::runtime::direct_turn_worker::DirectTurnWorkerHandle::start(
+            Arc::clone(self),
+            rx,
+            ready_tx,
+        );
         ready_rx
             .await
             .map_err(|_| "direct-turn worker stopped before startup pass completed".to_string())?;
         self.kick_direct_turn_worker();
-        Ok(())
+        Ok(Some(worker))
     }
 
     pub async fn start_wake_worker(self: &Arc<Self>) -> Result<(), String> {
@@ -3699,6 +3714,26 @@ impl RuntimeManager {
         self.send_acknowledged_event(conversation_id, event)
             .await
             .map(|_| ())
+    }
+
+    pub(crate) async fn send_direct_turn_event(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), DirectTurnDispatchError> {
+        match self.send_acknowledged_event(conversation_id, event).await {
+            Ok(AcknowledgedEventOutcome::Settled) => Ok(()),
+            Ok(AcknowledgedEventOutcome::DirectTurnClaimLost) => {
+                Err(DirectTurnDispatchError::ClaimLost)
+            }
+            Ok(AcknowledgedEventOutcome::DirectTurnPostMaterializationFailed(error)) => {
+                Err(DirectTurnDispatchError::PostMaterializationFailed(error))
+            }
+            Ok(AcknowledgedEventOutcome::SteeringWake(_)) => Err(DirectTurnDispatchError::Failed(
+                "unexpected steering outcome".to_string(),
+            )),
+            Err(error) => Err(DirectTurnDispatchError::Failed(error)),
+        }
     }
 
     async fn send_acknowledged_event(
