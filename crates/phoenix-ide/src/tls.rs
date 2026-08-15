@@ -186,7 +186,7 @@ pub async fn serve_https(
     socket_activated: bool,
     request_drain: crate::request_drain::RequestDrain,
     background_workers: crate::api::BackgroundWorkers,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<String>, Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
     tracing::info!(
         addr = %local_addr,
@@ -262,15 +262,19 @@ pub async fn serve_https(
 
     let background_workers = background_workers.begin_shutdown();
     let drain = async {
-        tokio::join!(
-            admitted_requests.wait(),
-            background_workers.wait(),
+        let (background_workers, ()) = tokio::join!(
+            background_workers.wait_after_requests(admitted_requests),
             graceful.shutdown(),
         );
+        background_workers
     };
-    let _ = bounded_post_shutdown_drain(drain, "HTTPS requests and connections").await;
-
-    Ok(())
+    match bounded_post_shutdown_drain(drain, "HTTPS requests and connections").await {
+        Some(Ok(())) => Ok(None),
+        Some(Err(error)) => Ok(Some(error)),
+        None => Ok(Some(
+            "HTTPS requests and connections did not drain before the shutdown deadline".to_string(),
+        )),
+    }
 }
 
 fn log_alpn(

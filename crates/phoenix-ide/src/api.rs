@@ -101,20 +101,37 @@ pub struct AppState {
 }
 
 pub(crate) struct BackgroundWorkers {
+    browser_sessions: Arc<crate::tools::browser::BrowserSessionManager>,
     pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
     creation_worker: crate::runtime::creation_worker::CreationWorker,
     direct_turn_worker: crate::runtime::direct_turn_worker::DirectTurnWorkerHandle,
 }
 
 pub(crate) struct BackgroundWorkerShutdown {
+    browser_sessions: crate::tools::browser::BrowserSessionShutdown,
     pr_status_poller: crate::managed_task::ManagedTaskShutdown,
     creation_worker: crate::managed_task::ManagedTaskShutdown,
     direct_turn_worker: crate::managed_task::ManagedTaskShutdown,
 }
 
 impl BackgroundWorkers {
+    fn new(
+        runtime: &Arc<RuntimeManager>,
+        pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
+        creation_worker: crate::runtime::creation_worker::CreationWorker,
+        direct_turn_worker: crate::runtime::direct_turn_worker::DirectTurnWorkerHandle,
+    ) -> Self {
+        Self {
+            browser_sessions: runtime.browser_sessions().clone(),
+            pr_status_poller,
+            creation_worker,
+            direct_turn_worker,
+        }
+    }
+
     pub(crate) fn begin_shutdown(self) -> BackgroundWorkerShutdown {
         BackgroundWorkerShutdown {
+            browser_sessions: self.browser_sessions.begin_shutdown(),
             pr_status_poller: self.pr_status_poller.begin_shutdown(),
             creation_worker: self.creation_worker.begin_shutdown(),
             direct_turn_worker: self.direct_turn_worker.begin_shutdown(),
@@ -123,12 +140,20 @@ impl BackgroundWorkers {
 }
 
 impl BackgroundWorkerShutdown {
-    pub(crate) async fn wait(self) {
+    pub(crate) async fn wait_after_requests(
+        self,
+        admitted_requests: crate::request_drain::RequestDrainStarted,
+    ) -> Result<(), String> {
         tokio::join!(
+            admitted_requests.wait(),
             self.pr_status_poller.wait(),
             self.creation_worker.wait(),
             self.direct_turn_worker.wait(),
         );
+        self.browser_sessions
+            .wait()
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -181,8 +206,6 @@ impl AppState {
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
     ) -> Result<AppStartup, Box<dyn std::error::Error>> {
-        // Conversation-retrieval index: bring it in line with `messages` once
-        // at startup (REQ-RET-003) off the request path.
         let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
         let message_retriever: Arc<dyn MessageRetriever> = retriever.clone();
         let runtime = Arc::new(RuntimeManager::new_with_message_retriever(
@@ -226,7 +249,6 @@ impl AppState {
             .expect("creation worker starts exactly once");
         reconcile_startup_continuations(&runtime).await?;
         handlers::start_attachment_cleanup_task(db.clone());
-        let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and
         // reports `index_reconciled()` when complete.
         {
@@ -262,9 +284,15 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
-        let resource_monitor = resource_monitor::ResourceMonitor::new();
+        let background_workers = BackgroundWorkers::new(
+            &runtime,
+            pr_status_poller,
+            creation_worker,
+            direct_turn_worker,
+        );
         Ok(AppStartup {
             state: Self {
+                terminals: runtime.terminals.clone(),
                 runtime,
                 llm_registry,
                 db,
@@ -274,7 +302,6 @@ impl AppState {
                 password,
                 sessions,
                 login_throttle: auth::LoginThrottle::new(),
-                terminals,
                 chain_qa,
                 message_retriever,
                 codex_login,
@@ -282,14 +309,10 @@ impl AppState {
                 runtime_env,
                 suggest_token,
                 discovery,
-                resource_monitor,
+                resource_monitor: resource_monitor::ResourceMonitor::new(),
                 request_drain: crate::request_drain::RequestDrain::new(),
             },
-            background_workers: BackgroundWorkers {
-                pr_status_poller,
-                creation_worker,
-                direct_turn_worker,
-            },
+            background_workers,
         })
     }
 }

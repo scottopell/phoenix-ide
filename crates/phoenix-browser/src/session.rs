@@ -1049,6 +1049,20 @@ pub struct BrowserSessionManager {
     shutting_down: AtomicBool,
 }
 
+pub struct BrowserSessionShutdown {
+    manager: Arc<BrowserSessionManager>,
+}
+
+impl BrowserSessionShutdown {
+    /// Wait for every tracked Chromium process and profile teardown.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError`] when any session cannot confirm authoritative teardown.
+    pub async fn wait(self) -> Result<(), BrowserError> {
+        self.manager.shutdown_all().await
+    }
+}
+
 impl BrowserSessionManager {
     /// Create a new session manager and start cleanup task
     #[must_use]
@@ -1269,6 +1283,33 @@ impl BrowserSessionManager {
         }
     }
 
+    async fn terminate_unadmitted_session(
+        session: Arc<RwLock<BrowserSession>>,
+        key: &str,
+    ) -> Result<(), BrowserError> {
+        let teardown = {
+            let mut session = session.write().await;
+            session.terminate().await
+        };
+        let profile = user_data_dir_for_key(key);
+        let profile_removal =
+            tokio::time::timeout(SESSION_INIT_TIMEOUT, tokio::fs::remove_dir_all(&profile)).await;
+        teardown
+            .map_err(|teardown_error| BrowserError::OperationFailed(teardown_error.to_string()))?;
+        match profile_removal {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(profile_error)) if profile_error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Ok(Err(profile_error)) => Err(BrowserError::OperationFailed(format!(
+                "failed to remove browser profile {profile}: {profile_error}"
+            ))),
+            Err(_) => Err(BrowserError::OperationFailed(format!(
+                "timed out removing browser profile {profile}"
+            ))),
+        }
+    }
+
     async fn get_session_with_creator(
         &self,
         work_scope: &ResourceScopeKey,
@@ -1339,6 +1380,11 @@ impl BrowserSessionManager {
         let session_arc = Arc::new(RwLock::new(session));
 
         Self::setup_session_listeners(session_arc.clone()).await;
+
+        if let Err(error) = self.ensure_accepting_sessions() {
+            Self::terminate_unadmitted_session(session_arc, &key).await?;
+            return Err(error);
+        }
 
         sessions.insert(
             key.clone(),
@@ -1879,6 +1925,15 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Close browser-session admission synchronously and return the authoritative drain owner.
+    #[must_use]
+    pub fn begin_shutdown(self: &Arc<Self>) -> BrowserSessionShutdown {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        BrowserSessionShutdown {
+            manager: self.clone(),
+        }
+    }
+
     /// Kill all sessions and wait for their Chrome processes and profiles to be released.
     ///
     /// # Errors
@@ -2129,6 +2184,18 @@ mod lifecycle_hook_tests {
         assert!(!BrowserSessionLifecycleKind::TeardownRetryPending.viewer_active());
         assert!(!BrowserSessionLifecycleKind::TeardownFailed.viewer_active());
         assert!(!BrowserSessionLifecycleKind::Inactive.viewer_active());
+    }
+
+    #[tokio::test]
+    async fn begin_shutdown_closes_admission_before_wait() {
+        let manager = BrowserSessionManager::new();
+        let shutdown = manager.begin_shutdown();
+
+        let Err(error) = manager.get_session(&scope("after-begin-shutdown")).await else {
+            panic!("begin_shutdown must synchronously reject new sessions");
+        };
+        assert!(error.to_string().contains("shutting down"));
+        shutdown.wait().await.expect("empty shutdown");
     }
 
     #[tokio::test]

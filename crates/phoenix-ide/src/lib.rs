@@ -947,6 +947,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let state = startup.state;
     let background_workers = startup.background_workers;
 
+    let mut shutdown_error: Option<String> = None;
+
     // Create router
     //
     // CORS posture is tied to the auth posture. A password-protected deployment
@@ -993,7 +995,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(
+        shutdown_error = match tls::serve_https(
             listener,
             app,
             loaded_tls.server,
@@ -1001,7 +1003,11 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             request_drain,
             background_workers,
         )
-        .await?;
+        .await
+        {
+            Ok(browser_error) => browser_error,
+            Err(error) => Some(error.to_string()),
+        };
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,
@@ -1034,23 +1040,50 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         let server_abort = server.abort_handle();
 
         tokio::select! {
-            // The server task ends on its own only via a fatal accept error.
-            joined = &mut server => joined??,
+            joined = &mut server => {
+                shutdown_error = match joined {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+                let admitted_requests = request_drain.begin();
+                let background_workers = background_workers.begin_shutdown();
+                match tls::bounded_post_shutdown_drain(
+                    background_workers.wait_after_requests(admitted_requests),
+                    "HTTP background workers and browser sessions",
+                )
+                .await
+                {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => shutdown_error = Some(error),
+                    None => shutdown_error = Some("HTTP background workers and browser sessions did not drain before the shutdown deadline".to_string()),
+                }
+            }
             () = hot_restart::shutdown_signal() => {
                 let admitted_requests = request_drain.begin();
                 let background_workers = background_workers.begin_shutdown();
                 let _ = drain_tx.send(());
                 let drain = async {
-                    let ((), (), joined) = tokio::join!(
-                        admitted_requests.wait(),
-                        background_workers.wait(),
+                    let (background_workers, joined) = tokio::join!(
+                        background_workers.wait_after_requests(admitted_requests),
                         &mut server,
                     );
-                    joined
+                    (background_workers, joined)
                 };
-                match tls::bounded_post_shutdown_drain(drain, "HTTP requests and connections").await {
-                    Some(joined) => joined??,
-                    None => server_abort.abort(),
+                if let Some((background_workers, joined)) =
+                    tls::bounded_post_shutdown_drain(drain, "HTTP requests and connections").await
+                {
+                    if let Err(error) = background_workers {
+                        shutdown_error = Some(error);
+                    }
+                    match joined {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => shutdown_error = Some(error.to_string()),
+                        Err(error) => shutdown_error = Some(error.to_string()),
+                    }
+                } else {
+                    server_abort.abort();
+                    shutdown_error = Some("HTTP requests and connections did not drain before the shutdown deadline".to_string());
                 }
             }
         }
@@ -1071,7 +1104,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // (This does not return if hot restart is performed)
     hot_restart::maybe_perform_hot_restart();
 
-    Ok(())
+    match shutdown_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 /// Reconcile Work/Branch conversations whose worktree has been deleted.

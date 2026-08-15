@@ -22,7 +22,9 @@ mod tests;
 pub use phoenix_browser::{react, screencast, session};
 
 // Flat re-exports of the engine surface used through `browser::*`.
-pub use phoenix_browser::{BrowserError, BrowserSession, BrowserSessionManager};
+pub use phoenix_browser::{
+    BrowserError, BrowserSession, BrowserSessionManager, BrowserSessionShutdown,
+};
 
 pub use profile::BrowserProfileTool;
 pub use tools::{
