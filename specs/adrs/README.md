@@ -46,6 +46,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [032](032_gitrepository-is-hidden-infrastructure-project-is-retired.md) | GitRepository is hidden infrastructure; Project is retired | Accepted | REQ-GITREP-001–008, REQ-PROJ-015/020/021/024/025/028a, REQ-WL-002b; `GitRepository`, `WorkScope.repository`, `RestartRepairEvidence`, `RetirementAbsenceEvidence` |
 | [033](033_offline-database-rollback-and-foundation-storage.md) | Database rollback is offline and Foundation observations use relational scalar storage | Accepted | REQ-GITREP-001–004; `RepositoryLocatorObservation`, `DefaultBranchObservation` |
 | [034](034_compatibility-guarantees-are-explicit-and-data-aware.md) | Compatibility guarantees are explicit and data-aware | Accepted | REQ-COMP-001–005 |
+| [035](035_repository-authority-activation-is-consumer-triggered-and-offline.md) | Repository authority activation is consumer-triggered and offline | Accepted | REQ-GITREP-004/009; `GitRepository`, `WorkScope.repository`, repository authority generation |
 
 ## For agents: which decisions bind your task
 
@@ -70,7 +71,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
 | Specifying ProductConversation persistence identity, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031, then 026 |
-| Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, or repository survival beyond one deleted conversation | 033, then 032, 031, and 026 |
+| Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
@@ -120,7 +121,8 @@ ADR-000 (adopt spEARS v2 for new work)
           │       └── ADR-030 (iOS prose-review authority survives the composer handoff)
           └── ADR-031 (ProductConversation persistence uses staged single authority)
               └── ADR-032 (GitRepository is hidden infrastructure; Project is retired)
-                  └── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
+                  ├── ADR-033 (Database rollback is offline and Foundation observations use relational scalar storage)
+                  └── ADR-035 (Repository authority activation is consumer-triggered and offline)
 ```
 
 ## Conventions

@@ -59,5 +59,6 @@ Phoenix does **not** create a new user-facing repository product. Hidden reposit
 ## References
 
 - Related ADRs: ADR-026, ADR-031
+- ADR-035 replaces this ADR's coordinated live-reader/writer activation mechanism with consumer-triggered offline activation; the hidden-identity and single-authority decisions remain in force.
 - Specs: `specs/git-repository/requirements.md`, `specs/git-repository/git-repository.allium`, `specs/work-lifecycle/requirements.md`, `specs/work-lifecycle/work-lifecycle.allium`, `specs/conversation-creation/requirements.md`
 - Key symbols: `GitRepository`, `WorkScope.repository`, `RestartRepairEvidence`, `RetirementAbsenceEvidence`, `CloseObligation`
