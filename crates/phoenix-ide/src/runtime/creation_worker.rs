@@ -833,10 +833,6 @@ async fn provision_conversation(
     manager
         .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
         .await;
-    let handle = manager
-        .get_or_create(&job.conversation_id)
-        .await
-        .map_err(|e| (e, ErrorKind::ServerError))?;
     let authority = manager
         .db()
         .renew_conversation_creation_claim(
@@ -849,20 +845,21 @@ async fn provision_conversation(
         .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
     if matches!(authority, crate::db::CreationCasOutcome::ClaimLost) {
         return Err((
-            "creation claim was lost before runtime bootstrap enqueue".to_string(),
+            "creation claim was lost before runtime bootstrap settlement".to_string(),
             ErrorKind::Cancelled,
         ));
     }
-    handle
-        .event_tx
-        .send(event)
-        .await
-        .map_err(|e| (format!("Failed to send event: {e}"), ErrorKind::ServerError))?;
-    checkpoint_creation_stage(
-        manager,
-        job,
-        &claim,
-        phoenix_core::domain::creation_protocol::CreationStage::Finalize,
+    let conversation_id = job.conversation_id.clone();
+    checkpoint_then_deliver_creation(
+        || {
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::Finalize,
+            )
+        },
+        || manager.send_event(&conversation_id, event),
     )
     .await?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
@@ -922,6 +919,25 @@ fn creation_metadata_needs_commit(
     stage: phoenix_core::domain::creation_protocol::CreationStage,
 ) -> bool {
     stage < phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata
+}
+
+async fn checkpoint_then_deliver_creation<Checkpoint, CheckpointFuture, Deliver, DeliverFuture>(
+    checkpoint: Checkpoint,
+    deliver: Deliver,
+) -> Result<(), (String, ErrorKind)>
+where
+    Checkpoint: FnOnce() -> CheckpointFuture,
+    CheckpointFuture: std::future::Future<Output = Result<(), (String, ErrorKind)>>,
+    Deliver: FnOnce() -> DeliverFuture,
+    DeliverFuture: std::future::Future<Output = Result<(), String>>,
+{
+    checkpoint().await?;
+    deliver().await.map_err(|error| {
+        (
+            format!("creation runtime event did not settle: {error}"),
+            ErrorKind::ServerError,
+        )
+    })
 }
 
 async fn checkpoint_creation_stage(
@@ -1239,6 +1255,44 @@ mod bootstrap_stage_recovery_tests {
         assert!(creation_metadata_needs_commit(
             CreationStage::ExpandInitialMessage
         ));
+    }
+}
+
+#[cfg(test)]
+mod runtime_bootstrap_settlement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_delivery_waits_for_finalize_checkpoint() {
+        let (checkpoint_started_tx, checkpoint_started_rx) = tokio::sync::oneshot::channel();
+        let (release_checkpoint_tx, release_checkpoint_rx) = tokio::sync::oneshot::channel();
+        let (delivery_started_tx, mut delivery_started_rx) = tokio::sync::oneshot::channel();
+
+        let settlement = checkpoint_then_deliver_creation(
+            || async move {
+                checkpoint_started_tx.send(()).unwrap();
+                release_checkpoint_rx.await.unwrap();
+                Ok(())
+            },
+            || async move {
+                delivery_started_tx.send(()).unwrap();
+                Ok(())
+            },
+        );
+        tokio::pin!(settlement);
+
+        tokio::select! {
+            result = checkpoint_started_rx => result.unwrap(),
+            result = &mut settlement => panic!("settlement completed before checkpoint gate: {result:?}"),
+        }
+        assert!(matches!(
+            delivery_started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        release_checkpoint_tx.send(()).unwrap();
+        settlement.await.unwrap();
+        delivery_started_rx.await.unwrap();
     }
 }
 

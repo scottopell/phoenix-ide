@@ -2218,6 +2218,30 @@ where
     async fn run_inner(mut self) -> RuntimeExitDisposition {
         tracing::info!(conv_id = %self.context.conversation_id, "Starting conversation runtime");
 
+        if matches!(
+            self.state,
+            ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. }
+        ) {
+            if let Some((job_id, claim)) = self.startup_creation_completion.take() {
+                if let Err(error) = self
+                    .execute_effect(Effect::CompleteCreation { job_id, claim })
+                    .await
+                {
+                    tracing::error!(
+                        %error,
+                        "Failed to settle creation completion before resuming LLM dispatch"
+                    );
+                    let _ = self.broadcast_tx.send_seq(|sequence_id| SseEvent::Error {
+                        sequence_id,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "resume conversation creation",
+                        ),
+                    });
+                    return RuntimeExitDisposition::Interrupted;
+                }
+            }
+        }
+
         let startup_drain = match self.commit_startup_steering_queue().await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2248,31 +2272,20 @@ where
             } else {
                 tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
             }
-            let resume_failed = if startup_drain == StartupSteeringDrainOutcome::StartedLlm {
-                false
-            } else {
-                match Box::pin(self.resume_interrupted_llm_request()).await {
-                    Ok(failed) => failed,
-                    Err(settlement_error) => {
-                        tracing::error!(
-                            %settlement_error,
-                            "Failed to settle resumed LLM dispatch error; retiring runtime for reconstruction"
-                        );
-                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
-                            sequence_id: seq,
-                            error: crate::runtime::user_facing_error::UserFacingError::with_action(
-                                "resume the LLM request",
-                            ),
-                        });
-                        return RuntimeExitDisposition::Interrupted;
-                    }
-                }
-            };
-            if !resume_failed {
-                if let Some((job_id, claim)) = self.startup_creation_completion.take() {
-                    let _ = self
-                        .execute_effect(Effect::CompleteCreation { job_id, claim })
-                        .await;
+            if startup_drain != StartupSteeringDrainOutcome::StartedLlm {
+                if let Err(settlement_error) = Box::pin(self.resume_interrupted_llm_request()).await
+                {
+                    tracing::error!(
+                        %settlement_error,
+                        "Failed to settle resumed LLM dispatch error; retiring runtime for reconstruction"
+                    );
+                    let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                        sequence_id: seq,
+                        error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                            "resume the LLM request",
+                        ),
+                    });
+                    return RuntimeExitDisposition::Interrupted;
                 }
             }
         }
@@ -5322,7 +5335,9 @@ where
                         tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
                     }
                     Err(error) => {
-                        tracing::warn!(conv_id = %self.context.conversation_id, %job_id, %error, "failed to mark creation job complete after LLM dispatch");
+                        return Err(format!(
+                            "failed to mark creation job {job_id} complete after LLM dispatch: {error}"
+                        ));
                     }
                 }
                 Ok(None)
@@ -10004,6 +10019,222 @@ mod test_git_helpers {
 /// The effect is dispatched through the real `execute_effect` match arm
 /// (not a private helper) so the handler's full transition-time behaviour
 /// is exercised end-to-end.
+#[cfg(test)]
+mod creation_completion_lifecycle_tests {
+    use super::*;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    struct RuntimeHarness {
+        runtime: TestRuntime,
+        storage: Arc<InMemoryStorage>,
+        llm: Arc<MockLlmClient>,
+        event_tx: mpsc::Sender<Event>,
+    }
+
+    fn runtime(state: ConvState) -> RuntimeHarness {
+        let context = ConvContext::new(
+            "conv-creation",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+        );
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        let runtime = ConversationRuntime::new(
+            context,
+            state,
+            Arc::clone(&storage),
+            Arc::clone(&llm),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            mpsc::channel::<Event>(1).0,
+            crate::runtime::SseBroadcaster::new(128, 0),
+        );
+        RuntimeHarness {
+            runtime,
+            storage,
+            llm,
+            event_tx,
+        }
+    }
+
+    fn creation_claim() -> phoenix_core::domain::creation_protocol::CreationClaim {
+        phoenix_core::domain::creation_protocol::CreationClaim {
+            worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                "worker".to_string(),
+            ),
+            generation: 7,
+            token: phoenix_core::domain::creation_protocol::CreationClaimToken("token".to_string()),
+            lease_until: u64::MAX,
+        }
+    }
+
+    fn creation_event() -> Event {
+        Event::CreationProvisioned {
+            job_id: "job".to_string(),
+            claim: creation_claim(),
+            initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                text: "start".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        }
+    }
+
+    async fn wait_for_provider_dispatch(request_count: &mut tokio::sync::watch::Receiver<u64>) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), request_count.changed())
+            .await
+            .expect("provider dispatch signal must not hang")
+            .unwrap();
+        assert_eq!(*request_count.borrow(), 1);
+    }
+
+    #[tokio::test]
+    async fn completion_storage_failure_prevents_provider_dispatch() {
+        let mut harness = runtime(ConvState::Provisioning {
+            job_id: "job".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        });
+        harness.storage.queue_complete_creation_job_result(Err(
+            "injected creation completion failure".to_string(),
+        ));
+
+        let error = harness
+            .runtime
+            .process_event(creation_event())
+            .await
+            .expect_err("completion persistence failure must fail the transition");
+
+        assert!(error.contains("injected creation completion failure"));
+        assert!(harness.llm.recorded_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_claim_loss_allows_one_provider_dispatch() {
+        let mut harness = runtime(ConvState::Provisioning {
+            job_id: "job".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        });
+        harness
+            .storage
+            .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::ClaimLost));
+        let mut request_count = harness.llm.subscribe_request_count();
+
+        harness
+            .runtime
+            .process_event(creation_event())
+            .await
+            .unwrap();
+        wait_for_provider_dispatch(&mut request_count).await;
+    }
+
+    #[tokio::test]
+    async fn successful_completion_dispatches_provider_once_and_replay_does_not_redispatch() {
+        let mut harness = runtime(ConvState::Provisioning {
+            job_id: "job".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        });
+        harness
+            .storage
+            .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
+        let mut request_count = harness.llm.subscribe_request_count();
+
+        harness
+            .runtime
+            .process_event(creation_event())
+            .await
+            .unwrap();
+        wait_for_provider_dispatch(&mut request_count).await;
+
+        harness
+            .runtime
+            .process_event(creation_event())
+            .await
+            .expect_err("materialized creation event cannot be replayed");
+        assert_eq!(*request_count.borrow(), 1);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_creation_waits_through_completion_before_dispatch() {
+        let mut harness = runtime(ConvState::Provisioning {
+            job_id: "job".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        });
+        harness
+            .storage
+            .queue_complete_creation_job_result(Ok(crate::db::CreationCasOutcome::Applied));
+        let (completion_started, release_completion) = harness.storage.gate_complete_creation_job();
+        let mut request_count = harness.llm.subscribe_request_count();
+        let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
+        harness.runtime = harness
+            .runtime
+            .with_acknowledged_event_receiver(acknowledged_event_rx);
+        let runtime = harness.runtime.run();
+        let runtime_task = tokio::spawn(runtime);
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        acknowledged_event_tx
+            .send((creation_event(), ack_tx))
+            .await
+            .unwrap();
+
+        completion_started.await.unwrap();
+        assert!(matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(*request_count.borrow(), 0);
+
+        release_completion.send(()).unwrap();
+        ack_rx.await.unwrap().unwrap();
+        wait_for_provider_dispatch(&mut request_count).await;
+        harness.event_tx.send(Event::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_completion_failure_interrupts_before_provider_dispatch() {
+        let mut harness = runtime(ConvState::LlmRequesting { attempt: 1 });
+        harness.storage.queue_complete_creation_job_result(Err(
+            "injected startup completion failure".to_string(),
+        ));
+        harness.runtime = harness
+            .runtime
+            .with_startup_creation_completion("job".to_string(), creation_claim())
+            .with_steering_queue(vec![phoenix_core::domain::sm_event::SteerEntry {
+                text: "queued before restart".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "queued".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            }]);
+
+        let disposition = harness.runtime.run().await;
+
+        assert!(matches!(disposition, RuntimeExitDisposition::Interrupted));
+        assert!(harness.llm.recorded_requests().is_empty());
+    }
+}
+
 #[cfg(test)]
 mod authoritative_user_message_effect_tests {
     use super::*;

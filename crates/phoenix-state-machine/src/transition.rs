@@ -481,8 +481,8 @@ pub fn transition(
             });
         }
         return Ok(TransitionResult::new(state.clone())
-            .with_effect(Effect::RequestLlm)
-            .with_effect(Effect::CompleteCreation { job_id, claim }));
+            .with_effect(Effect::CompleteCreation { job_id, claim })
+            .with_effect(Effect::RequestLlm));
     }
 
     if let Event::CreationProvisioned {
@@ -1754,10 +1754,9 @@ fn creation_provisioned_transition(
             state: "Provisioning",
             event: "CreationProvisioned",
         })?;
-    result.effects.insert(
-        request_index + 1,
-        Effect::CompleteCreation { job_id, claim },
-    );
+    result
+        .effects
+        .insert(request_index, Effect::CompleteCreation { job_id, claim });
     Ok(result)
 }
 
@@ -4648,6 +4647,17 @@ mod tests {
                 claim: effect_claim,
             } if job_id == "creation-job" && effect_claim == &claim
         )));
+        let completion_index = from_provisioning
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::CompleteCreation { .. }))
+            .unwrap();
+        let request_index = from_provisioning
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::RequestLlm))
+            .unwrap();
+        assert!(completion_index < request_index);
     }
 
     fn creation_request_resume_event(generation: u64) -> Event {
@@ -4682,6 +4692,10 @@ mod tests {
             Effect::CompleteCreation { job_id, claim }
                 if job_id == "creation-job" && claim.generation == 3
         )));
+        assert!(matches!(
+            result.effects.as_slice(),
+            [Effect::CompleteCreation { .. }, Effect::RequestLlm]
+        ));
     }
 
     #[test]
