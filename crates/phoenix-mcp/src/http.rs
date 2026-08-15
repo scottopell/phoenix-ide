@@ -505,14 +505,16 @@ impl McpTransport for HttpTransport {
                     self.name
                 ))
             })?;
-            if !response.status().is_success() {
+            if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND
+            {
+                self.session_id.lock().unwrap().take();
+            } else {
                 return Err(TransportError::Disconnected(format!(
                     "MCP server '{}': session DELETE failed during shutdown with HTTP {}",
                     self.name,
                     response.status()
                 )));
             }
-            self.session_id.lock().unwrap().take();
         }
         match background_error {
             Some(error) => Err(TransportError::Disconnected(format!(
@@ -2186,6 +2188,32 @@ mod tests {
             ],
             "the failed DELETE retains the session ID and success clears it"
         );
+    }
+
+    #[tokio::test]
+    async fn http_shutdown_retry_accepts_session_already_gone() {
+        let server = TestServer::start(handshake_responses("sess-gone")).await;
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        server.push_responses(vec![status_response(503, &[]), status_response(404, &[])]);
+
+        mcp.terminate()
+            .await
+            .expect_err("ambiguous first DELETE remains retryable");
+        mcp.terminate()
+            .await
+            .expect("404 confirms the retained session is already gone");
+        mcp.terminate().await.expect("session ID was cleared");
+
+        let deletes = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .count();
+        assert_eq!(deletes, 2);
     }
 
     struct NullSink;
