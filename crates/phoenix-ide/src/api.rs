@@ -101,6 +101,7 @@ pub struct AppState {
 }
 
 pub(crate) struct BackgroundWorkers {
+    mcp: crate::tools::mcp::McpLifecycleOwner,
     browser_sessions: Arc<crate::tools::browser::BrowserSessionManager>,
     pr_status_poller: crate::runtime::pr_status_poll::PrStatusPoller,
     creation_worker: crate::runtime::creation_worker::CreationWorker,
@@ -108,6 +109,7 @@ pub(crate) struct BackgroundWorkers {
 }
 
 pub(crate) struct BackgroundWorkerShutdown {
+    mcp: crate::tools::mcp::McpLifecycleOwner,
     browser_sessions: crate::tools::browser::BrowserSessionShutdown,
     pr_status_poller: crate::managed_task::ManagedTaskShutdown,
     creation_worker: crate::managed_task::ManagedTaskShutdown,
@@ -122,6 +124,7 @@ impl BackgroundWorkers {
         direct_turn_worker: crate::runtime::direct_turn_worker::DirectTurnWorkerHandle,
     ) -> Self {
         Self {
+            mcp: runtime.mcp_manager().lifecycle_owner(),
             browser_sessions: runtime.browser_sessions().clone(),
             pr_status_poller,
             creation_worker,
@@ -131,6 +134,7 @@ impl BackgroundWorkers {
 
     pub(crate) fn begin_shutdown(self) -> BackgroundWorkerShutdown {
         BackgroundWorkerShutdown {
+            mcp: self.mcp,
             browser_sessions: self.browser_sessions.begin_shutdown(),
             pr_status_poller: self.pr_status_poller.begin_shutdown(),
             creation_worker: self.creation_worker.begin_shutdown(),
@@ -150,10 +154,10 @@ impl BackgroundWorkerShutdown {
             self.creation_worker.wait(),
             self.direct_turn_worker.wait(),
         );
-        self.browser_sessions
-            .wait()
-            .await
-            .map_err(|error| error.to_string())
+        let mcp = self.mcp.begin_shutdown();
+        let (mcp, browser_sessions) = tokio::join!(mcp.wait(), self.browser_sessions.wait());
+        mcp?;
+        browser_sessions.map_err(|error| error.to_string())
     }
 }
 

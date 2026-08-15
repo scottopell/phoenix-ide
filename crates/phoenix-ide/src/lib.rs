@@ -807,7 +807,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     if !disabled.is_empty() {
         tracing::info!(count = disabled.len(), servers = ?disabled, "Loaded disabled MCP servers from DB");
     }
-    mcp_manager.set_disabled_servers(disabled).await;
+    mcp_manager.set_disabled_servers(disabled).await?;
 
     // Read optional auth password (REQ-AUTH-001)
     let password = std::env::var("PHOENIX_PASSWORD")
@@ -905,7 +905,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
         mcp_manager.set_oauth_redirect_base(redirect_base);
     }
-    std::mem::drop(mcp_manager.start_background_discovery());
+    std::mem::drop(mcp_manager.start_background_discovery()?);
 
     // Static deployment facts served read-only by GET /api/deployment
     // (specs/deployment-info/).

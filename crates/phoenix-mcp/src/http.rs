@@ -466,12 +466,14 @@ impl McpTransport for HttpTransport {
         true
     }
 
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> Result<(), TransportError> {
         // Stop the server-initiated GET stream before ending the session: a
         // task still reconnecting would race the DELETE and re-open against a
         // session about to vanish (REQ-MCP-006).
-        if let Some(task) = self.stream_task.lock().unwrap().take() {
+        let stream_task = self.stream_task.lock().unwrap().take();
+        if let Some(task) = stream_task {
             task.abort();
+            let _ = task.await;
         }
         // End the server-side session explicitly so it does not linger until
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
@@ -492,11 +494,18 @@ impl McpTransport for HttpTransport {
             if let Some(version) = self.protocol_version.lock().unwrap().clone() {
                 builder = builder.header(MCP_PROTOCOL_VERSION, version);
             }
-            let result = builder.send().await;
-            if let Err(e) = result {
-                tracing::debug!(server = %self.name, "MCP session DELETE failed: {e}");
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| TransportError::Disconnected(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(TransportError::Protocol(format!(
+                    "MCP HTTP shutdown returned {}",
+                    response.status()
+                )));
             }
         }
+        Ok(())
     }
 }
 
@@ -2118,7 +2127,7 @@ mod tests {
             .expect("connect");
 
         server.push_responses(vec![status_response(200, &[])]);
-        mcp.terminate().await;
+        mcp.terminate().await.expect("HTTP shutdown");
 
         let requests = server.requests.lock().unwrap();
         let last = requests.last().expect("requests recorded");

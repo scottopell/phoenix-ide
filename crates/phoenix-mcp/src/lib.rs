@@ -148,8 +148,8 @@ pub trait McpTransport: Send + Sync {
         false
     }
 
-    /// Tear down the transport (stdio: kill the child process).
-    async fn shutdown(&self);
+    /// Tear down the transport and confirm owned resources have exited.
+    async fn shutdown(&self) -> Result<(), TransportError>;
 }
 
 /// Build a transport for `config`: stdio spawns the child process, HTTP
@@ -642,8 +642,8 @@ impl McpServer {
         self.config.clone()
     }
 
-    async fn terminate(&self) {
-        self.transport.shutdown().await;
+    async fn terminate(&self) -> Result<(), TransportError> {
+        self.transport.shutdown().await
     }
 
     /// Check whether the underlying transport is still usable.
@@ -662,7 +662,7 @@ impl McpServer {
         };
         let recoverable = self.should_reestablish(&error);
         let failure = HandshakeFailure::classify(error, &self.name);
-        self.terminate().await;
+        let _ = self.terminate().await;
         if !recoverable {
             return Err(failure);
         }
@@ -687,7 +687,7 @@ impl McpServer {
             Ok(()) => Ok(()),
             Err(error) => {
                 let failure = HandshakeFailure::classify(error, &self.name);
-                self.terminate().await;
+                let _ = self.terminate().await;
                 Err(failure)
             }
         }
@@ -704,7 +704,7 @@ impl McpServer {
         let config = self.config.clone();
         let pending_oauth_urls = Arc::clone(&self.pending_oauth_urls);
         let oauth_bearer = Arc::clone(&self.oauth_bearer);
-        self.terminate().await;
+        let _ = self.terminate().await;
         let mut replacement = Self::connect(&name, config, pending_oauth_urls, oauth_bearer)
             .await
             .map_err(HandshakeFailure::Other)?;
@@ -1570,9 +1570,91 @@ enum RefreshServerOutcome {
 // McpClientManager
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagerLifecycle {
+    Running,
+    Stopping,
+    Drained,
+}
+
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct ManagerAdmission {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    settled: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ManagerAdmission {
+    fn drop(&mut self) {
+        if self
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
+pub struct McpConfigurationChange<'a> {
+    manager: &'a McpClientManager,
+    _admission: ManagerAdmission,
+}
+
+impl McpConfigurationChange<'_> {
+    pub async fn set_disabled(&self, name: &str, disabled: bool) {
+        if disabled {
+            self.manager
+                .disabled_servers
+                .write()
+                .await
+                .insert(name.to_string());
+        } else {
+            self.manager.disabled_servers.write().await.remove(name);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct McpLifecycleOwner {
+    manager: Arc<McpClientManager>,
+}
+
+impl McpLifecycleOwner {
+    #[must_use]
+    pub fn begin_shutdown(self) -> McpShutdown {
+        self.manager.begin_shutdown()
+    }
+}
+
+pub struct McpShutdown {
+    manager: Arc<McpClientManager>,
+}
+
+impl McpShutdown {
+    /// Wait for admitted MCP work, supervisor tasks, and transports to terminate.
+    ///
+    /// # Errors
+    /// Returns the combined supervisor, transport, or OAuth-listener teardown failures.
+    pub async fn wait(self) -> Result<(), String> {
+        self.manager.wait_for_shutdown().await
+    }
+}
+
 /// Owns all MCP server connections.
-///
 pub struct McpClientManager {
+    lifecycle: std::sync::Mutex<ManagerLifecycle>,
+    active_admissions: Arc<std::sync::atomic::AtomicUsize>,
+    admissions_settled: Arc<tokio::sync::Notify>,
+    tasks: tokio_util::task::TaskTracker,
+    shutdown_cancel: CancellationToken,
+    shutdown_result: tokio::sync::OnceCell<Result<(), String>>,
     servers: Arc<RwLock<ServerMap>>,
     /// Server names whose tools should be excluded from conversations.
     /// The servers remain connected for instant re-enable.
@@ -1588,8 +1670,6 @@ pub struct McpClientManager {
     /// cleared when the server connects or its flow is cancelled. This is the
     /// structured `pending_auth_url` the status API serves (REQ-MCP-013).
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
-    #[cfg(test)]
-    background_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// OAuth lifecycle state: the token/registration store, the local
     /// callback's base URL, and the pending authorization flows
     /// (REQ-MCP-009..012).
@@ -1608,52 +1688,92 @@ impl McpClientManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            lifecycle: std::sync::Mutex::new(ManagerLifecycle::Running),
+            active_admissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            admissions_settled: Arc::new(tokio::sync::Notify::new()),
+            tasks: tokio_util::task::TaskTracker::new(),
+            shutdown_cancel: CancellationToken::new(),
+            shutdown_result: tokio::sync::OnceCell::new(),
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
             reload_serial: tokio::sync::Mutex::new(()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(test)]
-            background_tasks: std::sync::Mutex::new(Vec::new()),
             oauth: Arc::new(OAuthRuntime::default()),
         }
     }
 
-    #[cfg(test)]
-    fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.background_tasks
-            .lock()
-            .unwrap()
-            .push(tokio::spawn(future));
+    fn admit(&self) -> Result<ManagerAdmission, String> {
+        let lifecycle = self.lifecycle.lock().unwrap();
+        if *lifecycle != ManagerLifecycle::Running {
+            return Err("MCP manager is shutting down".to_string());
+        }
+        self.active_admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(ManagerAdmission {
+            active: Arc::clone(&self.active_admissions),
+            settled: Arc::clone(&self.admissions_settled),
+        })
     }
 
-    #[allow(clippy::unused_self)]
-    #[cfg(not(test))]
+    fn child_admission(&self) -> ManagerAdmission {
+        self.active_admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ManagerAdmission {
+            active: Arc::clone(&self.active_admissions),
+            settled: Arc::clone(&self.admissions_settled),
+        }
+    }
+
     fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        std::mem::drop(tokio::spawn(future));
+        let admission = self.child_admission();
+        self.tasks.spawn(async move {
+            let _admission = admission;
+            future.await;
+        });
+    }
+
+    fn track_background_task(&self, mut task: tokio::task::JoinHandle<()>) {
+        let admission = self.child_admission();
+        let shutdown_cancel = self.shutdown_cancel.clone();
+        self.tasks.spawn(async move {
+            let _admission = admission;
+            tokio::select! {
+                () = shutdown_cancel.cancelled() => {
+                    task.abort();
+                    let _ = task.await;
+                }
+                _ = &mut task => {}
+            }
+        });
     }
 
     #[cfg(test)]
     async fn await_background_tasks(&self) {
-        loop {
-            let tasks = std::mem::take(&mut *self.background_tasks.lock().unwrap());
-            if tasks.is_empty() {
-                return;
-            }
-            for task in tasks {
-                task.await.expect("background MCP task");
-            }
+        while self
+            .active_admissions
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            self.admissions_settled.notified().await;
         }
     }
 
-    #[cfg(test)]
-    fn track_background_task(&self, task: tokio::task::JoinHandle<()>) {
-        self.background_tasks.lock().unwrap().push(task);
+    #[must_use]
+    pub fn lifecycle_owner(self: &Arc<Self>) -> McpLifecycleOwner {
+        McpLifecycleOwner {
+            manager: Arc::clone(self),
+        }
     }
 
-    #[cfg(not(test))]
-    #[allow(clippy::unused_self)]
-    fn track_background_task(&self, task: tokio::task::JoinHandle<()>) {
-        drop(task);
+    fn begin_shutdown(self: &Arc<Self>) -> McpShutdown {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if *lifecycle == ManagerLifecycle::Running {
+            *lifecycle = ManagerLifecycle::Stopping;
+            self.shutdown_cancel.cancel();
+        }
+        McpShutdown {
+            manager: Arc::clone(self),
+        }
     }
 
     /// Swap in the persistent OAuth store (the default is in-memory). Called
@@ -1762,6 +1882,7 @@ impl McpClientManager {
         code: &str,
         iss: Option<&str>,
     ) -> Result<String, String> {
+        let _admission = self.admit()?;
         // The state nonce binds the callback to exactly one pending flow
         // (callback_state_matches): a code injected by another tab, server,
         // or a cancelled flow matches nothing and is rejected before any
@@ -1927,6 +2048,7 @@ impl McpClientManager {
     /// # Panics
     /// Panics if the internal lock is poisoned (a prior panic is already fatal).
     pub async fn fail_oauth_authorization(&self, state_nonce: &str, error: &str) -> Option<String> {
+        let _admission = self.admit().ok()?;
         let name = {
             let pending = self.oauth.pending.lock().unwrap();
             pending
@@ -2108,8 +2230,16 @@ impl McpClientManager {
     }
 
     /// Replace the disabled server set (called at startup with persisted state).
-    pub async fn set_disabled_servers(&self, disabled: std::collections::HashSet<String>) {
+    ///
+    /// # Errors
+    /// Returns an error after MCP lifecycle admission closes.
+    pub async fn set_disabled_servers(
+        &self,
+        disabled: std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let _admission = self.admit()?;
         *self.disabled_servers.write().await = disabled;
+        Ok(())
     }
 
     /// Check whether a server is currently disabled.
@@ -2118,14 +2248,35 @@ impl McpClientManager {
         self.disabled_servers.read().await.contains(name)
     }
 
+    /// Admit one configuration mutation that may span durable persistence and rollback.
+    ///
+    /// # Errors
+    /// Returns an error after MCP lifecycle admission closes.
+    pub fn admit_configuration_change(&self) -> Result<McpConfigurationChange<'_>, String> {
+        Ok(McpConfigurationChange {
+            manager: self,
+            _admission: self.admit()?,
+        })
+    }
+
     /// Add a server to the disabled set.
-    pub async fn disable_server(&self, name: &str) {
+    ///
+    /// # Errors
+    /// Returns an error after MCP lifecycle admission closes.
+    pub async fn disable_server(&self, name: &str) -> Result<(), String> {
+        let _admission = self.admit()?;
         self.disabled_servers.write().await.insert(name.to_string());
+        Ok(())
     }
 
     /// Remove a server from the disabled set.
-    pub async fn enable_server(&self, name: &str) {
+    ///
+    /// # Errors
+    /// Returns an error after MCP lifecycle admission closes.
+    pub async fn enable_server(&self, name: &str) -> Result<(), String> {
+        let _admission = self.admit()?;
         self.disabled_servers.write().await.remove(name);
+        Ok(())
     }
 
     fn begin_actor_connect_at_epoch(
@@ -2193,19 +2344,30 @@ impl McpClientManager {
         }
     }
 
+    /// Start one manager-owned config discovery and supervisor settlement task.
+    ///
+    /// # Errors
+    /// Returns an error after MCP lifecycle admission closes.
     #[must_use = "await the handle when MCP tools must be ready before continuing"]
-    pub fn start_background_discovery(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn start_background_discovery(
+        self: &Arc<Self>,
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let admission = self.admit()?;
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
+        Ok(self.tasks.spawn(async move {
+            let _admission = admission;
             let _ = manager
-                .reload_from_actor_configs(Self::read_all_configs())
+                .reload_from_actor_configs_admitted(Self::read_all_configs())
                 .await;
             let handles: Vec<SupervisorHandle> =
                 manager.servers.read().await.values().cloned().collect();
             let settles =
                 futures::future::join_all(handles.iter().map(SupervisorHandle::wait_for_settled));
-            let _ = tokio::time::timeout(CONNECT_TIMEOUT, settles).await;
-        })
+            tokio::select! {
+                () = manager.shutdown_cancel.cancelled() => {}
+                _ = tokio::time::timeout(CONNECT_TIMEOUT, settles) => {}
+            }
+        }))
     }
 
     pub async fn status(&self) -> Vec<McpServerStatus> {
@@ -2276,6 +2438,9 @@ impl McpClientManager {
     }
 
     pub async fn tool_definitions(&self) -> Vec<(String, McpToolDef)> {
+        let Ok(_admission) = self.admit() else {
+            return Vec::new();
+        };
         let handles: Vec<(String, SupervisorHandle)> = self
             .servers
             .read()
@@ -2300,7 +2465,7 @@ impl McpClientManager {
             if outcome.result.is_err()
                 && outcome.recoverable
                 && self
-                    .recover_actor(&name, &handle, outcome.epoch, None)
+                    .recover_actor(&name, &handle, outcome.epoch, &self.shutdown_cancel)
                     .await
                     .is_ok()
             {
@@ -2351,6 +2516,16 @@ impl McpClientManager {
         arguments: Value,
         cancel: CancellationToken,
     ) -> Result<String, McpToolCallError> {
+        let _admission = self.admit().map_err(McpToolCallError::Failed)?;
+        let effective_cancel = self.shutdown_cancel.child_token();
+        let _cancel_forwarder = AbortTaskOnDrop(self.tasks.spawn({
+            let effective_cancel = effective_cancel.clone();
+            async move {
+                cancel.cancelled().await;
+                effective_cancel.cancel();
+            }
+        }));
+        let cancel = effective_cancel;
         if self.disabled_servers.read().await.contains(server_name) {
             return Err(McpToolCallError::Failed(format!(
                 "MCP server '{server_name}' is disabled"
@@ -2383,7 +2558,12 @@ impl McpClientManager {
                 let recovery_handle = handle.clone();
                 self.spawn_background(async move {
                     let _ = manager
-                        .recover_actor(&name, &recovery_handle, first.epoch, None)
+                        .recover_actor(
+                            &name,
+                            &recovery_handle,
+                            first.epoch,
+                            &manager.shutdown_cancel,
+                        )
                         .await;
                 });
                 return Err(McpToolCallError::Cancelled);
@@ -2414,7 +2594,7 @@ impl McpClientManager {
                 }
                 CallRecovery::Transport | CallRecovery::CancelledTransport => {
                     if let Err(error) = self
-                        .recover_actor(server_name, &handle, first.epoch, Some(&cancel))
+                        .recover_actor(server_name, &handle, first.epoch, &cancel)
                         .await
                     {
                         return Err(if cancel.is_cancelled() {
@@ -2444,9 +2624,14 @@ impl McpClientManager {
             Ok(value) => Ok(value),
             Err(McpRequestError::Cancelled) => {
                 if matches!(retry_recovery, CallRecovery::CancelledTransport) {
-                    self.recover_actor(server_name, &retry_handle, retry.epoch, None)
-                        .await
-                        .map_err(McpToolCallError::Failed)?;
+                    self.recover_actor(
+                        server_name,
+                        &retry_handle,
+                        retry.epoch,
+                        &self.shutdown_cancel,
+                    )
+                    .await
+                    .map_err(McpToolCallError::Failed)?;
                 }
                 Err(McpToolCallError::Cancelled)
             }
@@ -2457,7 +2642,12 @@ impl McpClientManager {
                     let recovery_handle = retry_handle.clone();
                     self.spawn_background(async move {
                         let _ = manager
-                            .recover_actor(&name, &recovery_handle, retry.epoch, None)
+                            .recover_actor(
+                                &name,
+                                &recovery_handle,
+                                retry.epoch,
+                                &manager.shutdown_cancel,
+                            )
                             .await;
                     });
                 }
@@ -2515,7 +2705,7 @@ impl McpClientManager {
         server_name: &str,
         handle: &SupervisorHandle,
         observed_epoch: u64,
-        cancel: Option<&CancellationToken>,
+        cancel: &CancellationToken,
     ) -> Result<(), String> {
         if self
             .servers
@@ -2550,19 +2740,14 @@ impl McpClientManager {
                         }
                     }
                 });
-                if let Some(cancel) = cancel {
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => {
-                            self.track_background_task(task);
-                            Err(format!("MCP server '{server_name}': tool call cancelled"))
-                        }
-                        result = &mut task => result
-                            .map_err(|error| format!("MCP recovery task failed: {error}")),
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        self.track_background_task(task);
+                        Err(format!("MCP server '{server_name}': tool call cancelled"))
                     }
-                } else {
-                    task.await
-                        .map_err(|error| format!("MCP recovery task failed: {error}"))
+                    result = &mut task => result
+                        .map_err(|error| format!("MCP recovery task failed: {error}")),
                 }
             }
             RecoveryClaim::Follow(mut snapshots) => loop {
@@ -2579,21 +2764,14 @@ impl McpClientManager {
                             .unwrap_or_else(|| "MCP recovery failed".to_string()))
                     };
                 }
-                if let Some(cancel) = cancel {
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Err(
-                            format!("MCP server '{server_name}': tool call cancelled")
-                        ),
-                        changed = snapshots.changed() => {
-                            changed.map_err(|_| "MCP supervisor stopped".to_string())?;
-                        }
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(
+                        format!("MCP server '{server_name}': tool call cancelled")
+                    ),
+                    changed = snapshots.changed() => {
+                        changed.map_err(|_| "MCP supervisor stopped".to_string())?;
                     }
-                } else {
-                    snapshots
-                        .changed()
-                        .await
-                        .map_err(|_| "MCP supervisor stopped".to_string())?;
                 }
             },
             RecoveryClaim::Stale => Ok(()),
@@ -2612,7 +2790,7 @@ impl McpClientManager {
         let permit = match handle.claim_recovery(observed_epoch).await {
             RecoveryClaim::Leader(permit) => permit,
             RecoveryClaim::Follow(_) => {
-                return self.wait_for_ready(handle, &CancellationToken::new()).await;
+                return self.wait_for_ready(handle, &self.shutdown_cancel).await;
             }
             RecoveryClaim::Stale => return Ok(()),
             RecoveryClaim::Unavailable(error) => return Err(McpToolCallError::Failed(error)),
@@ -2661,6 +2839,7 @@ impl McpClientManager {
                         let name = server_name.to_string();
                         let config = permit.config.clone();
                         let retry_handle = handle.clone();
+                        let shutdown_cancel = self.shutdown_cancel.clone();
                         self.spawn_background(async move {
                             loop {
                                 if retry_handle.snapshot().epoch != reconnect_epoch {
@@ -2678,7 +2857,12 @@ impl McpClientManager {
                                         retry_handle.publish(reconnect_epoch, server).await;
                                         return;
                                     }
-                                    Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                                    Err(_) => {
+                                        tokio::select! {
+                                            () = shutdown_cancel.cancelled() => return,
+                                            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -2723,7 +2907,7 @@ impl McpClientManager {
                         "additional OAuth scopes required".to_string(),
                     )
                     .await;
-                self.wait_for_ready(handle, &CancellationToken::new()).await
+                self.wait_for_ready(handle, &self.shutdown_cancel).await
             }
         }
     }
@@ -2760,12 +2944,25 @@ impl McpClientManager {
     }
 
     pub async fn reload(&self) -> McpReloadResult {
-        self.reload_from_actor_configs(Self::read_all_configs())
+        let Ok(_admission) = self.admit() else {
+            return McpReloadResult {
+                added: Vec::new(),
+                removed: Vec::new(),
+                restarted: Vec::new(),
+                unchanged: Vec::new(),
+                failed: vec![McpReloadFailure {
+                    server: "*".to_string(),
+                    action: "reload".to_string(),
+                    error: "MCP manager is shutting down".to_string(),
+                }],
+            };
+        };
+        self.reload_from_actor_configs_admitted(Self::read_all_configs())
             .await
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn reload_from_actor_configs(
+    async fn reload_from_actor_configs_admitted(
         &self,
         configs: Vec<(String, McpServerConfig)>,
     ) -> McpReloadResult {
@@ -2786,14 +2983,22 @@ impl McpClientManager {
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
                 match self.oauth.store().delete_token(&name).await {
                     Ok(()) => {
-                        handle.remove().await;
+                        let remove_result = handle.remove().await;
                         if let Some(listener) =
                             self.oauth.loopback_listeners.lock().unwrap().remove(&name)
                         {
                             listener.abort();
                         }
                         self.pending_oauth_urls.write().await.remove(&name);
-                        removed.push(name);
+                        if let Err(error) = remove_result {
+                            failed.push(McpReloadFailure {
+                                server: name,
+                                action: "remove".to_string(),
+                                error,
+                            });
+                        } else {
+                            removed.push(name);
+                        }
                     }
                     Err(error) => {
                         self.servers.write().await.insert(name.clone(), handle);
@@ -2871,6 +3076,7 @@ impl McpClientManager {
                             RELOAD_RESTART_TIMEOUT.as_secs()
                         );
                         handle.fail(handle.snapshot().epoch, error.clone()).await;
+                        self.track_background_task(task);
                         failed.push(McpReloadFailure {
                             server: name,
                             action: "restart".to_string(),
@@ -2911,14 +3117,72 @@ impl McpClientManager {
         &self,
         configs: Vec<(String, McpServerConfig)>,
     ) -> McpReloadResult {
-        self.reload_from_actor_configs(configs).await
+        let _admission = self.admit().expect("test reload admission");
+        self.reload_from_actor_configs_admitted(configs).await
     }
 
-    pub async fn shutdown(&self) {
-        let handles = std::mem::take(&mut *self.servers.write().await);
-        for (_, handle) in handles {
-            handle.shutdown().await;
-        }
+    /// Close MCP admission and wait for authoritative manager teardown.
+    ///
+    /// # Errors
+    /// Returns the combined supervisor, transport, or OAuth-listener teardown failures.
+    pub async fn shutdown(self: &Arc<Self>) -> Result<(), String> {
+        self.lifecycle_owner().begin_shutdown().wait().await
+    }
+
+    async fn wait_for_shutdown(&self) -> Result<(), String> {
+        self.shutdown_result
+            .get_or_init(|| async {
+                loop {
+                    let notified = self.admissions_settled.notified();
+                    if self
+                        .active_admissions
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                self.tasks.close();
+                self.tasks.wait().await;
+                let _reload = self.reload_serial.lock().await;
+                let handles = std::mem::take(&mut *self.servers.write().await);
+                let mut errors: Vec<String> = futures::future::join_all(
+                    handles
+                        .into_values()
+                        .map(|handle| async move { handle.shutdown().await }),
+                )
+                .await
+                .into_iter()
+                .filter_map(Result::err)
+                .collect();
+                let listeners: Vec<_> = self
+                    .oauth
+                    .loopback_listeners
+                    .lock()
+                    .unwrap()
+                    .drain()
+                    .map(|(_, listener)| listener)
+                    .collect();
+                for listener in listeners {
+                    listener.abort();
+                    if let Err(error) = listener.await {
+                        if !error.is_cancelled() {
+                            errors.push(format!("MCP OAuth listener failed: {error}"));
+                        }
+                    }
+                }
+                self.oauth.pending.lock().unwrap().clear();
+                self.pending_oauth_urls.write().await.clear();
+                *self.lifecycle.lock().unwrap() = ManagerLifecycle::Drained;
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
+            })
+            .await
+            .clone()
     }
 }
 
@@ -3929,7 +4193,9 @@ mod tests {
             true
         }
 
-        async fn shutdown(&self) {}
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     type RequestLog = Arc<std::sync::Mutex<Vec<(String, Value, Duration)>>>;
@@ -4757,7 +5023,7 @@ for line in sys.stdin:
             1,
             "queued call never writes to the invalidated process"
         );
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -4805,7 +5071,7 @@ for line in sys.stdin:
             3,
             "initial crash recovery plus retry cancellation each respawn"
         );
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -4867,7 +5133,7 @@ for line in sys.stdin:
             .await
             .expect("next call uses a clean transport");
         assert_eq!(output, "label=v2;env=env2");
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -4893,7 +5159,7 @@ for line in sys.stdin:
                 .count(),
             1
         );
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -4925,7 +5191,7 @@ for line in sys.stdin:
             .await
             .expect("call report");
         assert_eq!(output, "label=v2;env=env1");
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -5008,7 +5274,7 @@ for line in sys.stdin:
             .await
             .expect("call report");
         assert_eq!(output, "label=v1;env=env2");
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -5031,6 +5297,110 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_admitted_readiness_wait_before_joining_admissions() {
+        let manager = Arc::new(McpClientManager::new());
+        let handle = SupervisorHandle::connecting(stdio_test_config("blocked"));
+        manager
+            .servers
+            .write()
+            .await
+            .insert("blocked".to_string(), handle.clone());
+        let admission = manager.admit().expect("readiness wait admitted");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                let _admission = admission;
+                let _ = started_tx.send(());
+                manager
+                    .wait_for_ready(&handle, &manager.shutdown_cancel)
+                    .await
+            }
+        });
+        started_rx.await.expect("readiness wait started");
+
+        manager.shutdown().await.expect("shutdown");
+
+        assert!(waiter.await.expect("waiter task").is_err());
+        assert!(manager.servers.read().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_shutdown_confirms_stdio_child_exit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = Arc::new(McpClientManager::new());
+        let config = fixture_config(&script, &marker, "exit", "owned");
+        connect_fixture(&manager, &config).await;
+        let start = marker_lines(&marker)
+            .into_iter()
+            .find(|line| line.starts_with("start|"))
+            .expect("child start marker");
+        let pid = start
+            .split('|')
+            .find_map(|part| part.strip_prefix("pid="))
+            .expect("child pid");
+
+        manager.shutdown().await.expect("manager shutdown");
+
+        let status = std::process::Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .expect("probe child pid");
+        assert!(!status.success(), "stdio child {pid} still exists");
+    }
+
+    #[tokio::test]
+    async fn begin_shutdown_closes_all_public_work_admission() {
+        let manager = Arc::new(McpClientManager::new());
+        let shutdown = manager.lifecycle_owner().begin_shutdown();
+
+        assert!(manager.start_background_discovery().is_err());
+        assert!(manager.disable_server("x").await.is_err());
+        assert!(manager.enable_server("x").await.is_err());
+        assert!(manager.tool_definitions().await.is_empty());
+        assert!(manager
+            .call_tool("missing", "tool", serde_json::json!({}))
+            .await
+            .expect_err("call admission closed")
+            .contains("shutting down"));
+        assert_eq!(manager.reload().await.failed.len(), 1);
+
+        shutdown.wait().await.expect("empty shutdown");
+        assert!(manager.servers.read().await.is_empty());
+        manager.shutdown().await.expect("idempotent shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_admitted_reload_before_final_supervisor_drain() {
+        let manager = Arc::new(McpClientManager::new());
+        let reload_guard = manager.reload_serial.lock().await;
+        let admitted = manager.admit().expect("reload admitted");
+        let reloader = Arc::clone(&manager);
+        let reload = tokio::spawn(async move {
+            let _admission = admitted;
+            reloader
+                .reload_from_actor_configs_admitted(vec![(
+                    "fixture".to_string(),
+                    stdio_test_config("reload-race"),
+                )])
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let shutdown = tokio::spawn(manager.lifecycle_owner().begin_shutdown().wait());
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        drop(reload_guard);
+
+        reload.await.expect("reload task");
+        shutdown.await.expect("shutdown task").expect("shutdown");
+        assert!(manager.servers.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn reload_added_server_reports_added_and_connects_in_background() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let script = write_fixture_server(&tmp);
@@ -5050,7 +5420,7 @@ for line in sys.stdin:
         .await
         .expect("fixture connected in background");
         assert_eq!(manager.status().await.len(), 1);
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -5087,7 +5457,7 @@ for line in sys.stdin:
                 .count(),
             3
         );
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 
     #[tokio::test]
@@ -5111,6 +5481,6 @@ for line in sys.stdin:
             .expect("ping must not be mistaken for the reply");
 
         assert_eq!(output, "label=v1;env=env1");
-        manager.shutdown().await;
+        manager.shutdown().await.expect("manager shutdown");
     }
 }

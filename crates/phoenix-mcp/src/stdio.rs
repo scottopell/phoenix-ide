@@ -12,6 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock};
 
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stdio transport: a child process exchanging JSON-RPC 2.0 over its
 /// stdin/stdout (REQ-MCP-003).
 pub struct StdioTransport {
@@ -293,10 +295,27 @@ impl McpTransport for StdioTransport {
         self.invalidated.store(true, Ordering::Release);
     }
 
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> Result<(), TransportError> {
         if let Some(handle) = self.stderr_task.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
-        let _ = self.child.lock().await.kill().await;
+        let mut child = self.child.lock().await;
+        if child
+            .try_wait()
+            .map_err(|error| TransportError::Disconnected(error.to_string()))?
+            .is_none()
+        {
+            child
+                .start_kill()
+                .map_err(|error| TransportError::Disconnected(error.to_string()))?;
+        }
+        tokio::time::timeout(CHILD_EXIT_TIMEOUT, child.wait())
+            .await
+            .map_err(|_| {
+                TransportError::Timeout("MCP stdio child did not exit after kill".to_string())
+            })?
+            .map_err(|error| TransportError::Disconnected(error.to_string()))?;
+        Ok(())
     }
 }

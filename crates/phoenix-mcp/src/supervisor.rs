@@ -70,6 +70,7 @@ pub(crate) struct DefinitionsOutcome {
 pub(crate) struct SupervisorHandle {
     mailbox: mpsc::Sender<Command>,
     snapshots: watch::Receiver<Snapshot>,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl SupervisorHandle {
@@ -97,7 +98,8 @@ impl SupervisorHandle {
         };
         let (mailbox, commands) = mpsc::channel(MAILBOX_CAPACITY);
         let (snapshots, snapshot) = watch::channel(initial.clone());
-        tokio::spawn(
+        let tasks = tokio_util::task::TaskTracker::new();
+        tasks.spawn(
             Actor {
                 mailbox: mailbox.downgrade(),
                 commands,
@@ -110,12 +112,14 @@ impl SupervisorHandle {
                 stdio_active: false,
                 stdio_queue: VecDeque::new(),
                 active_calls: HashMap::new(),
+                tasks: tasks.clone(),
             }
             .run(),
         );
         Self {
             mailbox,
             snapshots: snapshot,
+            tasks,
         }
     }
 
@@ -161,7 +165,7 @@ impl SupervisorHandle {
             .send(Command::Reconfigure { config, reply })
             .await
             .map_err(|_| stopped())?;
-        receive.await.map_err(|_| stopped())
+        receive.await.map_err(|_| stopped())?
     }
 
     pub(crate) async fn call(
@@ -241,7 +245,7 @@ impl SupervisorHandle {
             .await
         {
             if let Command::Publish { server, .. } = error.0 {
-                server.terminate().await;
+                let _ = server.terminate().await;
             }
             return false;
         }
@@ -283,18 +287,24 @@ impl SupervisorHandle {
         receive.await.unwrap_or(false)
     }
 
-    pub(crate) async fn remove(&self) {
+    pub(crate) async fn remove(&self) -> Result<(), String> {
         let (reply, receive) = oneshot::channel();
         if self.mailbox.send(Command::Remove { reply }).await.is_ok() {
-            let _ = receive.await;
+            receive.await.map_err(|_| stopped())??;
         }
+        self.tasks.close();
+        self.tasks.wait().await;
+        Ok(())
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
         let (reply, receive) = oneshot::channel();
         if self.mailbox.send(Command::Shutdown { reply }).await.is_ok() {
-            let _ = receive.await;
+            receive.await.map_err(|_| stopped())??;
         }
+        self.tasks.close();
+        self.tasks.wait().await;
+        Ok(())
     }
 }
 
@@ -332,7 +342,7 @@ enum Command {
     },
     Reconfigure {
         config: McpServerConfig,
-        reply: oneshot::Sender<u64>,
+        reply: oneshot::Sender<Result<u64, String>>,
     },
     Call {
         tool: String,
@@ -380,10 +390,10 @@ enum Command {
         reply: oneshot::Sender<bool>,
     },
     Remove {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -399,6 +409,7 @@ struct Actor {
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
     active_calls: HashMap<u64, CancellationToken>,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl Actor {
@@ -410,7 +421,9 @@ impl Actor {
                 return;
             }
         }
-        self.stop_server().await;
+        if let Err(error) = self.stop_server().await {
+            tracing::warn!(%error, "MCP supervisor transport teardown failed after mailbox close");
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -425,12 +438,18 @@ impl Actor {
                 }
                 self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
-                self.stop_server().await;
+                let teardown = self.stop_server().await;
                 self.recovery_from = None;
+                if let Err(error) = teardown {
+                    self.state = SupervisorState::Failed;
+                    self.publish_snapshot(Some(error.clone()), None);
+                    let _ = reply.send(Err(error));
+                    return;
+                }
                 self.snapshot.config = config;
                 self.state = SupervisorState::Connecting;
                 self.publish_snapshot(None, None);
-                let _ = reply.send(self.epoch);
+                let _ = reply.send(Ok(self.epoch));
             }
             Command::Call {
                 tool,
@@ -452,7 +471,7 @@ impl Actor {
                         let _ = reply.send(Err(stopped()));
                         return;
                     };
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         let result = context.call_tool(&tool, arguments, &cancel).await;
                         if let Err(error) = mailbox
                             .send(Command::CallCompleted {
@@ -475,7 +494,7 @@ impl Actor {
                         let _ = reply.send(Err(stopped()));
                         return;
                     };
-                    let cancellation_watch = tokio::spawn(async move {
+                    let cancellation_watch = self.tasks.spawn(async move {
                         cancellation.cancelled().await;
                         let _ = mailbox.send(Command::CancelQueued { call_id }).await;
                     });
@@ -549,7 +568,7 @@ impl Actor {
                     let _ = reply.send(Err(stopped()));
                     return;
                 };
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     let result = server.list_tools().await;
                     if result.is_err() {
                         server
@@ -595,7 +614,13 @@ impl Actor {
                 } else if matches!(self.state, SupervisorState::Ready(_)) {
                     self.recovery_from = Some(observed_epoch);
                     self.epoch = self.epoch.wrapping_add(1);
-                    self.stop_server().await;
+                    if let Err(error) = self.stop_server().await {
+                        self.recovery_from = None;
+                        self.state = SupervisorState::Failed;
+                        self.publish_snapshot(Some(error.clone()), None);
+                        let _ = reply.send(RecoveryClaim::Unavailable(error));
+                        return;
+                    }
                     self.state = SupervisorState::Recovering;
                     self.publish_snapshot(None, None);
                     let _ = reply.send(RecoveryClaim::Leader(RecoveryPermit {
@@ -624,7 +649,7 @@ impl Actor {
                     self.publish_snapshot(None, None);
                     let _ = reply.send(true);
                 } else {
-                    server.terminate().await;
+                    let _ = server.terminate().await;
                     let _ = reply.send(false);
                 }
             }
@@ -636,7 +661,12 @@ impl Actor {
                 let current = epoch == self.epoch;
                 if current {
                     self.recovery_from = None;
-                    self.stop_server().await;
+                    if let Err(teardown_error) = self.stop_server().await {
+                        self.state = SupervisorState::Failed;
+                        self.publish_snapshot(Some(teardown_error), None);
+                        let _ = reply.send(false);
+                        return;
+                    }
                     self.state = SupervisorState::Failed;
                     self.publish_snapshot(Some(error), None);
                 }
@@ -651,23 +681,40 @@ impl Actor {
                 let current = epoch == self.epoch;
                 if current {
                     self.recovery_from = None;
-                    self.stop_server().await;
+                    if let Err(teardown_error) = self.stop_server().await {
+                        self.state = SupervisorState::Failed;
+                        self.publish_snapshot(Some(teardown_error), None);
+                        let _ = reply.send(false);
+                        return;
+                    }
                     self.state = SupervisorState::Recovering;
                     self.publish_snapshot(Some(error), Some(url));
                 }
                 let _ = reply.send(current);
             }
-            Command::Remove { reply } | Command::Shutdown { reply } => {
+            Command::Remove { reply } => {
                 for cancellation in self.active_calls.values() {
                     cancellation.cancel();
                 }
                 self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
-                self.stop_server().await;
+                let result = self.stop_server().await;
+                self.recovery_from = None;
+                self.state = SupervisorState::Removed;
+                self.publish_snapshot(result.as_ref().err().cloned(), None);
+                let _ = reply.send(result);
+            }
+            Command::Shutdown { reply } => {
+                for cancellation in self.active_calls.values() {
+                    cancellation.cancel();
+                }
+                self.active_calls.clear();
+                self.epoch = self.epoch.wrapping_add(1);
+                let result = self.stop_server().await;
                 self.recovery_from = None;
                 self.state = SupervisorState::Removed;
                 self.publish_snapshot(None, None);
-                let _ = reply.send(());
+                let _ = reply.send(result);
             }
         }
     }
@@ -693,7 +740,7 @@ impl Actor {
                 self.stdio_active = false;
                 continue;
             };
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 let result = call
                     .context
                     .call_tool(&call.tool, call.arguments, &call.cancel)
@@ -735,12 +782,16 @@ impl Actor {
         })
     }
 
-    async fn stop_server(&mut self) {
+    async fn stop_server(&mut self) -> Result<(), String> {
         if let SupervisorState::Ready(server) =
             std::mem::replace(&mut self.state, SupervisorState::Removed)
         {
-            server.terminate().await;
+            server
+                .terminate()
+                .await
+                .map_err(|error| error.to_string())?;
         }
+        Ok(())
     }
 
     fn publish_snapshot(&mut self, error: Option<String>, auth_url: Option<String>) {
@@ -766,6 +817,7 @@ mod epoch_tests {
     struct GatedTransport {
         started: mpsc::UnboundedSender<()>,
         releases: Arc<Semaphore>,
+        shutdown_error: Option<String>,
     }
 
     #[async_trait]
@@ -800,7 +852,12 @@ mod epoch_tests {
             true
         }
 
-        async fn shutdown(&self) {}
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            match &self.shutdown_error {
+                Some(error) => Err(TransportError::Protocol(error.clone())),
+                None => Ok(()),
+            }
+        }
     }
 
     fn server(config: McpServerConfig) -> (McpServer, mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
@@ -812,6 +869,7 @@ mod epoch_tests {
                 transport: Arc::new(GatedTransport {
                     started,
                     releases: Arc::clone(&releases),
+                    shutdown_error: None,
                 }),
                 tools: std::sync::RwLock::new(Vec::new()),
                 config,
@@ -840,6 +898,80 @@ mod epoch_tests {
             env: HashMap::new(),
             tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
         }
+    }
+
+    fn failing_server(config: McpServerConfig) -> McpServer {
+        let (started, _) = mpsc::unbounded_channel();
+        McpServer {
+            name: "failing".to_string(),
+            transport: Arc::new(GatedTransport {
+                started,
+                releases: Arc::new(Semaphore::new(0)),
+                shutdown_error: Some("teardown failed".to_string()),
+            }),
+            tools: std::sync::RwLock::new(Vec::new()),
+            config,
+            tools_changed: Arc::new(AtomicBool::new(false)),
+            pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            oauth_bearer: SharedBearer::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_teardown_failures_propagate_from_terminal_transitions() {
+        let remove = SupervisorHandle::connected(failing_server(http_config()));
+        assert!(remove
+            .remove()
+            .await
+            .unwrap_err()
+            .contains("teardown failed"));
+
+        let shutdown = SupervisorHandle::connected(failing_server(http_config()));
+        assert!(shutdown
+            .shutdown()
+            .await
+            .unwrap_err()
+            .contains("teardown failed"));
+
+        let reconfigure = SupervisorHandle::connected(failing_server(http_config()));
+        assert!(reconfigure
+            .reconfigure(stdio_config())
+            .await
+            .unwrap_err()
+            .contains("teardown failed"));
+
+        let recovery = SupervisorHandle::connected(failing_server(http_config()));
+        assert!(matches!(
+            recovery.claim_recovery(0).await,
+            RecoveryClaim::Unavailable(error) if error.contains("teardown failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_owned_call_tasks() {
+        let (server, mut started, releases) = server(http_config());
+        let handle = SupervisorHandle::connected(server);
+        let call = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .call(
+                        "blocked".to_string(),
+                        serde_json::json!({}),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        started.recv().await.expect("call started");
+
+        let shutdown = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.shutdown().await }
+        });
+        shutdown.await.expect("shutdown task").expect("shutdown");
+        assert_eq!(releases.available_permits(), 0);
+        assert!(call.await.expect("call task").is_err());
     }
 
     #[tokio::test]
@@ -949,7 +1081,7 @@ mod epoch_tests {
             .reconfigure(stdio_config())
             .await
             .expect("connect epoch");
-        handle.remove().await;
+        handle.remove().await.expect("remove");
         let (late, _, _) = server(stdio_config());
         assert!(!handle.publish(epoch, late).await);
         assert!(matches!(handle.snapshot().state, SupervisorState::Removed));

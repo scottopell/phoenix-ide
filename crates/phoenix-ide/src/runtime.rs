@@ -1589,6 +1589,10 @@ impl RuntimeManager {
         self.platform.clone()
     }
 
+    pub(crate) fn mcp_manager(&self) -> &Arc<crate::tools::mcp::McpClientManager> {
+        &self.mcp_manager
+    }
+
     /// Get the browser session manager
     pub fn browser_sessions(&self) -> &Arc<BrowserSessionManager> {
         &self.browser_sessions

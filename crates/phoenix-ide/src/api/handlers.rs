@@ -7626,7 +7626,19 @@ async fn disable_mcp_server(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let change = match state.mcp_manager.admit_configuration_change() {
+        Ok(change) => change,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
+    change.set_disabled(&name, true).await;
     if let Err(e) = state.db.disable_mcp_server(&name).await {
+        change.set_disabled(&name, false).await;
         tracing::warn!(server = %name, error = %e, "Failed to persist MCP server disable");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7634,7 +7646,6 @@ async fn disable_mcp_server(
         )
             .into_response();
     }
-    state.mcp_manager.disable_server(&name).await;
     tracing::info!(server = %name, "MCP server disabled");
     Json(serde_json::json!({"ok": true})).into_response()
 }
@@ -7733,7 +7744,19 @@ async fn enable_mcp_server(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let change = match state.mcp_manager.admit_configuration_change() {
+        Ok(change) => change,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
+    change.set_disabled(&name, false).await;
     if let Err(e) = state.db.enable_mcp_server(&name).await {
+        change.set_disabled(&name, true).await;
         tracing::warn!(server = %name, error = %e, "Failed to persist MCP server enable");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7741,7 +7764,6 @@ async fn enable_mcp_server(
         )
             .into_response();
     }
-    state.mcp_manager.enable_server(&name).await;
     tracing::info!(server = %name, "MCP server enabled");
     Json(serde_json::json!({"ok": true})).into_response()
 }

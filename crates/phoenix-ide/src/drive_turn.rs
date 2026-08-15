@@ -136,11 +136,15 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
         db.clone(),
     )));
     match db.get_disabled_mcp_servers().await {
-        Ok(disabled) => manager.set_disabled_servers(disabled).await,
+        Ok(disabled) => {
+            if let Err(error) = manager.set_disabled_servers(disabled).await {
+                tracing::warn!(%error, "Failed to configure disabled MCP servers");
+            }
+        }
         Err(error) => tracing::warn!(error = %error, "Failed to load disabled MCP servers"),
     }
-    if let Err(error) = manager.start_background_discovery().await {
-        tracing::warn!(error = %error, "MCP discovery task terminated unexpectedly");
+    if let Err(error) = manager.start_background_discovery() {
+        tracing::warn!(%error, "MCP discovery admission closed");
     }
     manager
 }
@@ -153,6 +157,35 @@ async fn shutdown_browser_sessions(manager: &Arc<RuntimeManager>) -> Result<(), 
     .await
     .map_err(|_| DriveTurnError::Runtime("browser shutdown timed out".to_string()))?
     .map_err(|error| DriveTurnError::Runtime(format!("browser shutdown failed: {error}")))
+}
+
+async fn cleanup_tmux(manager: &RuntimeManager, conversation: &crate::db::Conversation) {
+    let work_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
+        conversation
+            .attached_work_scope_id
+            .clone()
+            .expect("persisted conversation has work scope"),
+    );
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        manager.tmux_registry(),
+        &work_scope,
+        None,
+        conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::Path::new),
+        matches!(conversation.conv_mode, crate::db::ConvMode::Direct)
+            .then_some(conversation.id.as_str()),
+    )
+    .await;
+    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
+        tracing::warn!(
+            socket_path = %tmux_report.socket_path.display(),
+            kill_server_error = ?tmux_report.kill_server_error,
+            unlink_error = ?tmux_report.unlink_error,
+            "drive-turn tmux cleanup partially failed"
+        );
+    }
 }
 
 /// Drive one user turn through the same runtime, provider adapters, and tool
@@ -213,6 +246,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     .map_err(|error| DriveTurnError::Database(error.to_string()))?;
 
     let mcp_manager = configure_mcp_manager(&db).await;
+    let mcp_manager_for_shutdown = Arc::clone(&mcp_manager);
     let manager = Arc::new(RuntimeManager::new(
         db.clone(),
         llm_registry,
@@ -235,34 +269,17 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     let conversation = db
         .get_conversation(&conversation_id)
         .await
-        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
-    let work_scope = phoenix_core::work_scope::ResourceScopeKey::Work(
-        conversation
-            .attached_work_scope_id
-            .expect("persisted conversation has work scope"),
-    );
-    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
-        manager.tmux_registry(),
-        &work_scope,
-        None,
-        conversation
-            .conv_mode
-            .worktree_path()
-            .map(std::path::Path::new),
-        matches!(conversation.conv_mode, crate::db::ConvMode::Direct)
-            .then_some(conversation.id.as_str()),
-    )
-    .await;
-    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
-        tracing::warn!(
-            socket_path = %tmux_report.socket_path.display(),
-            kill_server_error = ?tmux_report.kill_server_error,
-            unlink_error = ?tmux_report.unlink_error,
-            "drive-turn tmux cleanup partially failed"
-        );
+        .map_err(|error| DriveTurnError::Database(error.to_string()));
+    if let Ok(conversation) = &conversation {
+        cleanup_tmux(&manager, conversation).await;
     }
-    let browser_shutdown = shutdown_browser_sessions(&manager).await;
+    let (mcp_shutdown, browser_shutdown) = tokio::join!(
+        mcp_manager_for_shutdown.shutdown(),
+        shutdown_browser_sessions(&manager),
+    );
     crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
+    conversation?;
+    mcp_shutdown.map_err(DriveTurnError::Runtime)?;
     browser_shutdown?;
     result
 }
