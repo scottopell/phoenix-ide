@@ -19,7 +19,7 @@ resource reconciliation, and compensation.
 
 The normalized engine foundation and wake vertical slice are implemented. Workflow attempts, receipts, deliveries, schedules, wake bindings, terminal evidence, and message links have normalized persisted authorities; wake is restart-safe for Bash/tmux obligations and remains the only profile with full end-to-end production coverage.
 
-Direct-chat foundations have landed only partially. The pure aggregate/repository layer now contains accepted-turn identity, immutable prepared payload, runtime-acceptance, replay, and deterministic test foundations (see `crates/phoenix-db/src/workflow/direct_turn.rs` and the status row for REQ-DWF-CHAT-012–014), but Phoenix has not cut production chat submission/reconciliation over to that durable profile yet. Conversation creation is in a similar state: shell-first and protocol/model work exist, while production worker/orchestration cutover remains incomplete.
+The direct-chat vertical slice durably accepts direct turns and uses a production worker to claim, replay, authoritatively materialize, and settle them by exact accepted-turn generation. The runtime bridge acknowledges authoritative materialization before publishing working state, preserves SSE cursor continuity across replay/claim-loss/error paths, and distinguishes pre-materialization release from post-materialization failure recovery. Provider-response durability across a later local persistence failure remains incomplete. Conversation creation is in a similar state: shell-first and protocol/model work exist, while production worker/orchestration cutover remains incomplete.
 
 ## Normative Shape
 
@@ -58,9 +58,9 @@ These artifacts now state:
 | REQ-DWF-001–005 reducer authority, normalized ownership, atomic plans, DAGs, barriers | Implemented | The pure engine validates typed transition plans; SQLite persists normalized workflow, effect, dependency, barrier, receipt, delivery, and schedule state atomically. |
 | REQ-DWF-006–012 attempt fencing, optional leases, recovery policies, cancellation, manual resolution | Implemented | Persisted attempt/process authority fences every execution; only reclaimable observations receive renewable leases; cancellation and manual outcomes use typed transitions. |
 | REQ-DWF-013–018 capabilities, typed migration contract, deterministic verification | Implemented | Capability classes, supported codecs, profile/version compatibility, incompatible status, transactional failpoints, concurrency tests, and restart tests cover the implemented foundation. |
-| REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. Direct-turn profile behavior remains specified only. |
-| REQ-DWF-CHAT-001–011 direct-chat profile | Specified only | Target-bound direct-turn durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime arbitration, exact-ID reconciliation, capability-isolated target resolution, and independent per-target fan-out have no matching vertical-slice implementation. |
-| REQ-DWF-CHAT-012–014 direct-turn authority, refinement, and verification | Partially implemented | The pure aggregate and authoritative repository implement scoped replay, immutable prepared semantics, runtime ownership, canonical materialization identity, terminal generation, and deterministic transaction-cut tests. Production consumer cutover and the complete interleaving matrix are tracked separately. |
+| REQ-DWF-029–042 acceptance, parity/adoption boundaries, one scheduler, durable acknowledgement, canonical delivery, submit-observe, capability classes, direct turns, no-loss migration, CoalesceLatest, independent consumers, migration safety | Foundation implemented; profile coverage varies | The shared one-scheduler repository, durable acknowledgement, canonical delivery, submit-observe, capability, scheduling, and migration-safety mechanisms are implemented. The production direct-turn slice uses these boundaries through authoritative user-message materialization and exact-generation settlement. |
+| REQ-DWF-CHAT-001–011 direct-chat profile | Partially implemented | The production direct-chat slice implements target-bound durable acceptance, immutable prepared payloads, typed committed/replay outcomes, target-local runtime claiming, and authoritative materialization. Provider-response durability and the complete profile verification matrix remain incomplete. |
+| REQ-DWF-CHAT-012–015 direct-turn authority, refinement, verification, and exact-generation settlement | Partially implemented | The aggregate, repository, production worker, and runtime bridge implement the authoritative user-message materialization boundary: replay/claim-loss outcomes do not publish provisional working state or leave SSE cursor holes, pre-materialization failures release claims, and final settlement targets the exact accepted turn and generation. Durable provider-response child effects after provider dispatch remain incomplete. |
 | REQ-DWF-WAKE-001–005 wake profile | Implemented | Durable Bash/tmux registration, observation, expiry and cancellation arbitration, continuation transfer, canonical terminal delivery, exact-set adoption, restart recovery, and coalesced auto-resume use the normalized foundation. |
 | REQ-DWF-CREATE-001–005 creation profile | Specified only | Conversation creation has no matching vertical-slice implementation against the normalized foundation. |
 
@@ -80,10 +80,8 @@ code generation, specification shape, and Allium consistency.
 
 Remaining profile work is:
 
-- direct-chat acceptance, replay, conflict, exact-ID reconciliation, and
-  target-local runtime arbitration;
-- conversation-creation execution and compensation against the normalized
-  foundation.
+- direct-chat provider-response durability and the remaining profile verification matrix;
+- conversation-creation execution and compensation against the normalized foundation.
 
 ## Related Decisions
 

@@ -13,7 +13,7 @@ use phoenix_db::LocalAttemptAuthority;
 use phoenix_workflow::{ClaimOutcome, LeaseExpiry, ProcessIncarnation, Timestamp};
 use tokio::sync::watch;
 
-use crate::runtime::RuntimeManager;
+use crate::runtime::{DirectTurnDispatchError, RuntimeManager};
 use crate::state_machine::Event;
 
 const DISCOVERY_BATCH_LIMIT: usize = 64;
@@ -211,13 +211,44 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             payload: prepared,
             authority: authority_to_event(&authority, candidate.turn_id),
         };
-        if let Err(error) = self
+        let dispatch_result = self
             .dispatcher
             .dispatch(&candidate.conversation.0, event)
-            .await
-        {
-            self.release(authority, now).await?;
-            tracing::warn!(conversation_id = %candidate.conversation.0, turn_id = candidate.turn_id.0, error = %error, "direct-turn dispatch failed; released claim");
+            .await;
+        self.settle_dispatch_result(
+            &candidate.conversation.0,
+            candidate.turn_id,
+            authority,
+            now,
+            dispatch_result,
+        )
+        .await
+    }
+
+    async fn settle_dispatch_result(
+        &self,
+        conversation_id: &str,
+        turn_id: phoenix_workflow::TurnAuthorityId,
+        authority: LocalAttemptAuthority,
+        now: Timestamp,
+        result: Result<(), DirectTurnDispatchError>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(()) => {}
+            Err(DirectTurnDispatchError::ClaimLost) => {
+                tracing::debug!(%conversation_id, turn_id = turn_id.0, "direct-turn claim lost during acknowledged materialization");
+            }
+            Err(error @ DirectTurnDispatchError::PostMaterializationFailed(_)) => {
+                tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn effect failed after acknowledged authoritative materialization");
+                return Err(error.to_string());
+            }
+            Err(
+                error @ (DirectTurnDispatchError::TemporarilyInadmissible
+                | DirectTurnDispatchError::Failed(_)),
+            ) => {
+                self.release(authority, now).await?;
+                tracing::warn!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn dispatch failed before materialization; released claim for retry");
+            }
         }
         Ok(())
     }
@@ -262,7 +293,11 @@ fn authority_to_event(
 
 #[async_trait]
 pub(crate) trait DirectTurnDispatcher: Send + Sync + 'static {
-    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String>;
+    async fn dispatch(
+        &self,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), DirectTurnDispatchError>;
 }
 
 struct ProductionDirectTurnDispatcher {
@@ -271,20 +306,14 @@ struct ProductionDirectTurnDispatcher {
 
 #[async_trait]
 impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
-    async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
-        let handle = self.manager.get_or_create(conversation_id).await?;
-        if !matches!(
-            *handle.state_rx.borrow(),
-            phoenix_core::domain::sm_state::ConvState::Idle
-                | phoenix_core::domain::sm_state::ConvState::Error { .. }
-        ) {
-            return Err("direct-turn reducer cannot accept a new user turn".to_string());
-        }
-        handle
-            .event_tx
-            .send(event)
+    async fn dispatch(
+        &self,
+        conversation_id: &str,
+        event: Event,
+    ) -> Result<(), DirectTurnDispatchError> {
+        self.manager
+            .send_direct_turn_event(conversation_id, event)
             .await
-            .map_err(|error| format!("Failed to send direct-turn event: {error}"))
     }
 }
 
@@ -337,7 +366,7 @@ mod tests {
     }
 
     struct RecordingDispatcher {
-        result: Mutex<Result<(), String>>,
+        result: Mutex<Result<(), DirectTurnDispatchError>>,
         events: Mutex<Vec<(String, Event)>>,
     }
 
@@ -352,12 +381,28 @@ mod tests {
 
     #[async_trait]
     impl DirectTurnDispatcher for RecordingDispatcher {
-        async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+        async fn dispatch(
+            &self,
+            conversation_id: &str,
+            event: Event,
+        ) -> Result<(), DirectTurnDispatchError> {
             self.events
                 .lock()
                 .unwrap()
                 .push((conversation_id.to_string(), event));
-            self.result.lock().unwrap().clone()
+            match &*self.result.lock().unwrap() {
+                Ok(()) => Ok(()),
+                Err(DirectTurnDispatchError::ClaimLost) => Err(DirectTurnDispatchError::ClaimLost),
+                Err(DirectTurnDispatchError::TemporarilyInadmissible) => {
+                    Err(DirectTurnDispatchError::TemporarilyInadmissible)
+                }
+                Err(DirectTurnDispatchError::Failed(error)) => {
+                    Err(DirectTurnDispatchError::Failed(error.clone()))
+                }
+                Err(DirectTurnDispatchError::PostMaterializationFailed(error)) => Err(
+                    DirectTurnDispatchError::PostMaterializationFailed(error.clone()),
+                ),
+            }
         }
     }
 
@@ -625,7 +670,8 @@ mod tests {
     #[tokio::test]
     async fn unavailable_runtime_or_closed_channel_releases_claim() {
         let (repo, dispatcher) = fixture().await;
-        *dispatcher.result.lock().unwrap() = Err("closed".to_string());
+        *dispatcher.result.lock().unwrap() =
+            Err(DirectTurnDispatchError::Failed("closed".to_string()));
         let turn_id = accept(&repo, "release").await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         worker(repo.clone(), dispatcher.clone(), 10, 1)
@@ -653,6 +699,88 @@ mod tests {
             .unwrap()
             .authority
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn temporarily_inadmissible_runtime_releases_claim_for_retry() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(DirectTurnDispatchError::TemporarilyInadmissible);
+        let turn_id = accept(&repo, "busy-runtime").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts[0].status,
+            phoenix_workflow::AttemptStatus::AuthorityLost
+        );
+        assert!(repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(2),
+                now: Timestamp(11),
+                lease_until: LeaseExpiry(20),
+            })
+            .await
+            .unwrap()
+            .authority
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn post_materialization_failure_does_not_release_materialized_claim() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(
+            DirectTurnDispatchError::PostMaterializationFailed("llm dispatch failed".to_string()),
+        );
+        let turn_id = accept(&repo, "post-materialization-failure").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        let error = worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.contains("after authoritative materialization"));
+
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_claim_loss_does_not_attempt_stale_release() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(DirectTurnDispatchError::ClaimLost);
+        let turn_id = accept(&repo, "claim-lost").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+
+        worker(repo, dispatcher.clone(), 11, 2)
+            .run_once()
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
