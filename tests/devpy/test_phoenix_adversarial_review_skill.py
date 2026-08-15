@@ -30,7 +30,15 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
         self.assertLess(freeze, delta)
         self.assertLess(delta, independent)
         self.assertIn("external review `commit_id` are identical", self.text)
-        self.assertIn("label the evidence **unpaired**", self.text)
+        self.assertIn("Label that weaker evidence **near-match**", self.text)
+        self.assertIn("otherwise label it **unpaired**", self.text)
+
+    def test_near_match_requires_lineage_and_defect_continuity(self):
+        evidence = (SKILL_DIR / "references" / "evidence-method.md").read_text()
+        self.assertIn("the intervening diff `L..C` is inspected", evidence)
+        self.assertIn("faulty lines or semantic mechanism already existed at `L`", evidence)
+        self.assertIn("states the direction and commit distance", evidence)
+        self.assertIn("cannot reveal self-review misses", evidence)
 
     def test_finding_contract_requires_reachable_failure_and_counterevidence(self):
         for field in ("**Anchor:**", "**Trigger:**", "**Mechanism:**", "**Impact:**"):

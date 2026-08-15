@@ -2,24 +2,46 @@
 
 This skill was distilled from two empirical sources: internal Phoenix agent-review records and GitHub Codex review findings. The durable artifact contains only generalized review moves.
 
-## Unit of comparison
+## Evidence tiers
 
-The valid unit is a **same-HEAD pair**:
+Keep three tiers separate in analysis and reporting.
+
+### Tier 1: exact-HEAD review pair
+
+The strongest unit is:
 
 ```text
 (local independent review, repository, base SHA, head SHA)
 (Codex review, repository, commit_id = the same head SHA)
 ```
 
-A pair is invalid for reviewer-gap claims when:
+Use this tier to attribute a finding to a local or Codex review gap.
 
-- either SHA is missing or abbreviated ambiguously;
+### Tier 2: lineage-confirmed near match
+
+A local review at commit `L` and Codex review at descendant commit `C` may be compared only when the intervening diff `L..C` is inspected. A Codex finding can inform a local-review gap when all are true:
+
+- `L` and `C` are proven commits in the same PR lineage;
+- the locally reviewed snapshot was clean or captured exactly;
+- the finding's faulty lines or semantic mechanism already existed at `L`;
+- no intervening commit introduced, removed, or materially changed the trigger, guard, or consumer;
+- the record states the direction and commit distance.
+
+Label this **near-match**, never exact-HEAD. Compare individual findings, not whole-review counts. If ancestry or defect presence is uncertain, classify it as unpaired.
+
+### Tier 3: corpus trend
+
+Codex findings without a local counterpart can reveal candidate review moves but cannot reveal self-review misses. Derive trends from semantic findings, not raw comment totals. Deduplicate repeated review rounds and comments that share one root cause. Validate representative examples against their patch context before promoting a trend into a probe.
+
+A record is invalid for reviewer-gap claims when:
+
+- either reviewed target is missing or abbreviated ambiguously;
 - the local tree was dirty but the dirty patch was not captured;
-- Codex reviewed a later or earlier revision;
-- the evidence is only a review request, reaction, CI check, branch name, or summary;
-- review comments from several commits are counted together.
+- evidence is only a review request, reaction, CI check, branch name, or summary;
+- comments from several commits are counted together without lineage inspection;
+- a later finding is assumed to predate the intervening patch without checking it.
 
-Keep invalid cases as **unpaired** examples only.
+Keep these cases as **unpaired** examples only.
 
 ## Normalize and disposition findings
 
@@ -35,6 +57,7 @@ Use one record per semantic defect:
 | `severity` | Impact/reachability |
 | `confidence` | Evidence strength |
 | `disposition` | validated, disproved, unresolved, or superseded-by-drift |
+| `evidence_tier` | exact-HEAD, near-match with distance/direction, corpus trend, or unpaired |
 | `review_move` | Reusable action that would expose the defect |
 
 Two differently worded comments overlap when they identify the same trigger and violated postcondition. Several comments sharing one root cause count as one defect unless they require independent fixes.
@@ -51,7 +74,7 @@ Disposition is evidence, not a vote:
 Use prior findings in two phases:
 
 1. **Independent pass:** freeze target, read authorities/diff, generate and falsify candidates without Codex text.
-2. **Delta pass:** reveal same-HEAD Codex findings, normalize overlap, validate Codex-only candidates, and extract missing review moves.
+2. **Delta pass:** reveal exact-HEAD or lineage-confirmed Codex findings, normalize overlap, validate Codex-only candidates, and extract missing review moves.
 
 This separation tests review capability rather than prompt recall.
 
@@ -76,7 +99,7 @@ Keep raw query output outside the worktree and delete it when no longer needed.
 
 ## Held-out validation
 
-Do not validate only on cases used to write the probes. Reserve same-HEAD pairs and clean patches for later checks:
+Do not validate only on cases used to write the probes. Reserve exact-HEAD pairs, lineage-confirmed near matches, and clean patches for later checks:
 
 - recover known valid defects without revealing them first;
 - reject known false or superseded findings;

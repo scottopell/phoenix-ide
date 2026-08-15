@@ -19,7 +19,7 @@ Before reading conclusions from any prior review:
 3. If the tree is dirty, either review the dirty snapshot explicitly or stop and request a committed target. Never silently mix committed and uncommitted code.
 4. Fetch the complete diff and changed-file list. Detect truncation, generated files, renames, migrations, and changes outside the apparent feature directory.
 
-When comparing reviews, use the same frozen tree. If SHAs differ, label the evidence **unpaired** and do not infer reviewer blind spots from it.
+When comparing reviews, prefer the same frozen tree. If SHAs differ, do not infer a reviewer blind spot until ancestry and the intervening diff prove the specific defect already existed in the locally reviewed snapshot. Label that weaker evidence **near-match** with direction and commit distance; otherwise label it **unpaired**.
 
 ## 2. Build the authority and blast-radius map
 
@@ -82,13 +82,16 @@ Report confidence separately as high, medium, or low. Findings below medium conf
 
 Do not read Codex findings before the independent pass; they anchor the search and hide genuine local blind spots.
 
-For each same-HEAD pair, normalize findings by semantic defect rather than wording or line number and classify:
+For each comparison, normalize findings by semantic defect rather than wording or line number and classify:
 
 - **overlap:** both found the same violated postcondition;
 - **local-only:** local finding not raised by Codex;
 - **Codex-only:** Codex finding missed locally;
 - **disputed:** concrete counterevidence defeats one review;
-- **unpaired:** target identity is not proven equal.
+- **near-match:** different commits in one proven lineage, with the intervening diff showing the specific defect already existed locally;
+- **unpaired:** target identity, ancestry, or defect continuity is not proven.
+
+Use broader Codex review trends only to propose probes. Deduplicate repeated rounds and root causes, validate representative patch context, and never describe a corpus-only trend as a local-review miss.
 
 For every Codex-only valid finding, name the missing **review move**, not just the defect category—for example, “compare emitted and parsed marker literals” or “trace generation rotation on respawn.” Add that move to the current review and use it as held-out validation later. Do not claim that accepted comments are correct solely because they were fixed, or that rejected comments are false solely because they were closed.
 
@@ -122,7 +125,7 @@ Then include, only when useful:
 - Tests/reproductions run and material limitations.
 
 ## Review delta
-- overlap: N; local-only: N; Codex-only: N; disputed: N; unpaired: N
+- overlap: N; local-only: N; Codex-only: N; disputed: N; near-match: N; unpaired: N
 - Missing review moves learned from valid Codex-only findings.
 ```
 
@@ -135,6 +138,8 @@ If nothing survives falsification, say **“No actionable findings.”** Still r
 - Reading Codex first and merely rediscovering its comments.
 - Calling different commits an exact-HEAD comparison.
 - Reporting raw inline-comment count as defect count.
+- Calling a same-PR review a near-match without inspecting ancestry and the intervening diff.
+- Treating Codex-wide trends as evidence that local reviewers missed those defects.
 - Treating lint/style, speculative future needs, or alternative taste as defects.
 - Severity inflation without a reachable failure scenario.
 - Duplicating one root cause at every symptom.
