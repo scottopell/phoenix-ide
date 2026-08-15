@@ -8,7 +8,7 @@
 
 The additive Repository Foundation is shipped: deterministic Project-seeded hidden `GitRepository` rows and singular nullable `WorkScope.repository` attachments exist as dormant relational data, with query-only readiness validation. Legacy `Project` remains the sole live repository authority, and Foundation locator/default-branch observations may truthfully remain empty because Foundation performs no live probes. No ProductConversation or Close capability has made hidden authority live.
 
-Authority activation is deferred until a named ProductConversation or destructive Close capability requires it. That activation is an offline maintenance operation: Phoenix is stopped, a paired backup is verified, exclusive SQLite access is acquired, seeded identities are preserved, and one transaction changes authority generation from Project generation `1` to GitRepository generation `2`. Live cutover, runtime-wide drain, linked-worktree convergence, and production authorization from a source census are not supported activation behavior.
+Authority activation is deferred until an owning normative requirement for an exact ProductConversation or destructive Close capability requires generation `2`. The offline operation stops Phoenix, acquires exclusive SQLite access, captures and verifies the exact pre-activation snapshot with its paired Project-authority binary, preserves seeded identities, migrates or quarantines every repository-sensitive reader and writer, and changes authority transactionally. Live cutover, runtime-wide drain, identity convergence, and production authorization from a source census are not supported activation behavior.
 
 ## Requirements Summary
 
@@ -46,7 +46,7 @@ Current normative authority is `requirements.md` and `git-repository.allium`. AD
 | REQ-PROJ-015 | Partially implemented | Worktree reconciliation exists, but the explicit hidden-repository authority and typed repair evidence are still incomplete |
 | REQ-GITREP-007 | Not implemented | Repository survival beyond one deleted conversation remains normative future work |
 | REQ-GITREP-008 | Partially implemented | Phoenix does not ship a first-class repository management product surface, but many legacy `project` names still appear in code and docs |
-| REQ-GITREP-009 | Not implemented; consumer-blocked | Project remains sole authority; no named live ProductConversation or destructive Close consumer requires offline activation |
+| REQ-GITREP-009 | Not implemented; consumer-blocked | Project remains sole authority; no owning ProductConversation or destructive Close requirement explicitly mandates generation `2` |
 | REQ-PROJ-020 | Complete (legacy current reality) | Branch listing is local-first and does not fetch on the no-query path |
 | REQ-PROJ-021 | Complete (legacy current reality) | Remote search is on-demand via `ls-remote` with caching |
 | REQ-PROJ-024 | Complete (legacy current reality) | Existing-branch work happens as repository operations inside the disposable worktree |
@@ -56,7 +56,7 @@ Current normative authority is `requirements.md` and `git-repository.allium`. AD
 
 This spec intentionally separates observable repository facts from SQL or row-shape claims. The dormant Foundation preserves legacy behavior while introducing hidden repository identity and typed evidence. It incurs temporary duplicate storage without creating a second writable authority.
 
-Authority changes only when a named live consumer requires it. The offline operation preserves the Project-seeded identity partition; linked-worktree identity convergence is separate future work. A source census may remain CI/review evidence but is not production activation authority.
+Authority changes only when an exact owning consumer requirement explicitly mandates generation `2`. The offline operation preserves the Project-seeded identity partition; identity convergence has no contract in this feature and requires separate normative design. A source census proves reader/writer migration completeness in CI and review but is not production activation authority.
 
 The additive Foundation uses relational INTEGER Unix-microsecond observation columns and rejects NUL in filesystem/Git text. Rollback acceptance restores a pre-upgrade database backup while Phoenix is stopped and boots the matching historical binary; an older binary opening a newer-migrated database and live same-path database replacement are not supported contracts.
 

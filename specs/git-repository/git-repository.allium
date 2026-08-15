@@ -69,11 +69,6 @@ enum RepositoryAuthorityGeneration {
     | git_repository_2
 }
 
-enum RepositoryAuthorityConsumerKind {
-    product_conversation
-    | destructive_close
-}
-
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -81,6 +76,36 @@ enum RepositoryAuthorityConsumerKind {
 entity GitRepository {
     opaque_id: String
 }
+external entity DatabaseStateFingerprint {
+    digest: String
+}
+
+external entity ProductCapabilityContract {
+    capability_id: String
+}
+
+external entity NormativeRequirementContract {
+    requirement_id: String
+}
+
+external entity ProjectAuthorityBinaryArtifact {
+    artifact_id: String
+}
+
+external entity GitRepositoryAuthorityBinaryArtifact {
+    artifact_id: String
+}
+
+entity RepositoryAuthorityActivationMandate {
+    consumer_capability: ProductCapabilityContract
+    owning_requirement: NormativeRequirementContract
+}
+
+external entity PreActivationDatabaseSnapshot {
+    source_database_fingerprint: DatabaseStateFingerprint
+    project_authority_binary: ProjectAuthorityBinaryArtifact
+}
+
 
 entity RepositoryLocatorObservation {
     repository: GitRepository
@@ -139,21 +164,6 @@ external entity ProductConversationDeletion {
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
-
-rule ExplicitLinkedWorktreeConvergenceReusesOneHiddenRepositoryIdentity {
-    when: LinkedWorktreeIdentityConvergenceRequested(left_worktree, right_worktree, shared_git_common_dir)
-    let left_repository = resolved_hidden_repository(left_worktree)
-    let right_repository = resolved_hidden_repository(right_worktree)
-    requires: complete_authoritative_shared_git_common_dir_evidence(left_worktree, right_worktree, shared_git_common_dir)
-    ensures: left_repository.opaque_id = right_repository.opaque_id
-    ensures: GitRepository.created(opaque_id: left_repository.opaque_id)
-
-    @guidance
-        -- An explicit convergence operation may unify linked worktrees only from
-        -- complete authoritative shared-common-directory evidence. Distinct
-        -- Project-seeded identities remain distinct before and through repository-
-        -- authority activation; activation never invokes this rule implicitly.
-}
 
 rule SeparateClonesRemainDistinctHiddenRepositories {
     when: SeparateCloneObserved(left_clone_evidence, right_clone_evidence)
@@ -256,25 +266,60 @@ rule ConflictingLegacyProjectAssignmentsFailRepositoryMigration {
 }
 
 rule RepositoryAuthorityActivationIsConsumerTriggeredAndOffline {
-    when: RepositoryAuthorityActivationRequested(consumer_kind)
-    requires: live_consumer_requires_hidden_repository_authority(consumer_kind)
+    when: RepositoryAuthorityActivationRequested(consumer_capability, owning_requirement)
+    let mandate = RepositoryAuthorityActivationMandate{
+        consumer_capability: consumer_capability,
+        owning_requirement: owning_requirement
+    }
+    requires: mandate.consumer_capability.capability_id != ""
+    requires: mandate.owning_requirement.requirement_id != ""
+    requires: mandate_identifies_exact_authorizing_contract(mandate)
     requires: phoenix_is_stopped()
-    requires: paired_project_authority_backup_verified()
     requires: exclusive_repository_database_access_held()
+    let source_database_fingerprint = DatabaseStateFingerprint{
+        digest: exact_pre_activation_database_fingerprint_digest()
+    }
+    let project_authority_binary = ProjectAuthorityBinaryArtifact{
+        artifact_id: exact_project_authority_binary_artifact_id()
+    }
+    let pre_activation_snapshot = PreActivationDatabaseSnapshot{
+        source_database_fingerprint: source_database_fingerprint,
+        project_authority_binary: project_authority_binary
+    }
+    requires: exact_pre_activation_snapshot_verified(pre_activation_snapshot)
     requires: dormant_git_repository_foundation_is_valid()
+    requires: every_repository_sensitive_reader_and_writer_migrated_or_quarantined()
     requires: persisted_repository_authority_generation() = project_1
-    ensures: RepositoryAuthorityActivationCompleted(git_repository_2)
+    let activated_database_fingerprint = DatabaseStateFingerprint{
+        digest: committed_activation_database_fingerprint_digest()
+    }
+    let git_repository_authority_binary = GitRepositoryAuthorityBinaryArtifact{
+        artifact_id: exact_git_repository_authority_binary_artifact_id()
+    }
+    requires: activated_database_fingerprint.digest != ""
+    requires: git_repository_authority_binary.artifact_id != ""
+    requires: activated_database_fingerprint.digest != source_database_fingerprint.digest
+    ensures: RepositoryAuthorityGenerationChanged(project_1, git_repository_2)
+    ensures: RepositoryAuthorityActivationCompleted(
+        mandate,
+        pre_activation_snapshot,
+        activated_database_fingerprint,
+        git_repository_authority_binary,
+        git_repository_2
+    )
     ensures: ProjectSeededRepositoryIdentitiesPreserved()
-    ensures: LinkedWorktreeConvergenceSkipped()
+    ensures: SurvivingProjectRepresentationsCannotFeedCorrectnessDecisions()
 
     @guidance
-        -- With Phoenix stopped and exclusive SQLite access held, validate the
-        -- dormant Foundation and preserve every deterministic Project-seeded
-        -- GitRepository identity. In one transaction, update authority-bearing
-        -- references and change the persisted generation from Project generation 1
-        -- to GitRepository generation 2. A pre-commit failure rolls the transaction
-        -- back wholly. Activation performs no live Git observation, linked-worktree
-        -- convergence, runtime drain protocol, or source-census authorization.
+        -- With Phoenix stopped, acquire exclusive SQLite access before capturing
+        -- and verifying the exact database snapshot that will be activated. Validate
+        -- the dormant Foundation and preserve every deterministic Project-seeded
+        -- GitRepository identity. Before the global generation flip, migrate or
+        -- structurally quarantine every repository-sensitive reader and writer. In
+        -- one transaction, update authority-bearing references and change generation
+        -- 1 to generation 2. A pre-commit failure rolls back wholly. Activation
+        -- performs no live Git observation, identity convergence, runtime drain
+        -- protocol, or source-census authorization.
 }
 
 rule RepositoryAuthorityDatabaseOpenRejectsWrongGeneration {
@@ -358,16 +403,6 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 -- Allium has no formal helper-function declaration; this block defines the
 -- complete semantics of each bare helper used above.
 --
---   complete_authoritative_shared_git_common_dir_evidence(
---       left_worktree: WorktreeIdentity,
---       right_worktree: WorktreeIdentity,
---       shared_git_common_dir: String
---   ) -> Boolean
---       True iff an explicit identity-convergence operation holds complete,
---       authoritative evidence that both worktrees share the same exact Git common
---       directory. Path, remote, slug, commit, or default-branch similarity is
---       insufficient, and repository-authority activation never supplies this proof.
---
 --   resolved_hidden_repository(clone_evidence) -> GitRepository
 --       The hidden identity resolved from retained local clone evidence. Separate
 --       local clones resolve independently even when remote, slug, or commit graph
@@ -427,20 +462,41 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       generations makes this false. local_checked_out_branch or user_selected
 --       alone is never admissible canonical evidence.
 --
---   live_consumer_requires_hidden_repository_authority(
---       consumer_kind: RepositoryAuthorityConsumerKind
+--   exact_pre_activation_database_fingerprint_digest() -> String
+--       The stable digest of the exact database state captured while exclusive
+--       access is held and before any activation mutation.
+--
+--   exact_project_authority_binary_artifact_id() -> String
+--       The exact Project-authority Phoenix binary artifact verified to operate the
+--       captured pre-activation snapshot.
+--
+--   committed_activation_database_fingerprint_digest() -> String
+--       A stable digest of the exact committed generation-2 database state produced
+--       by the authority transaction. It differs from the pre-activation digest.
+--
+--   exact_git_repository_authority_binary_artifact_id() -> String
+--       The exact staged generation-2 Phoenix binary artifact whose complete
+--       repository-sensitive readers and writers were validated for this activation.
+--
+--   mandate_identifies_exact_authorizing_contract(
+--       mandate: RepositoryAuthorityActivationMandate
 --   ) -> Boolean
---       True iff a named ProductConversation or destructive Close capability has a
---       correctness contract that cannot be satisfied while Project remains the
---       sole repository authority. Foundation availability alone makes this false.
+--       True iff mandate names one exact ProductConversation or destructive Close
+--       capability and the exact owning normative requirement that explicitly
+--       requires GitRepository authority generation 2. A broad consumer category,
+--       generic domain reference, Foundation availability, or task alone makes this
+--       false.
 --
 --   phoenix_is_stopped() -> Boolean
 --       True iff no Phoenix server, one-shot runtime, worker, or other Phoenix
 --       process has the target database open or can admit work against it.
 --
---   paired_project_authority_backup_verified() -> Boolean
---       True iff a recoverable database backup paired with the Project-authority
---       binary has been identified and verified before activation begins.
+--   exact_pre_activation_snapshot_verified(
+--       snapshot: PreActivationDatabaseSnapshot
+--   ) -> Boolean
+--       True iff snapshot is recoverable, matches the exact exclusively held source
+--       database state before activation mutation, and is paired with a Project-
+--       authority binary verified to operate that snapshot.
 --
 --   exclusive_repository_database_access_held() -> Boolean
 --       True iff the offline maintenance operation exclusively owns the target
@@ -450,6 +506,14 @@ rule RepositoryMayOutliveConversationDeletionWhenOtherRepositoryTruthRemains {
 --       True iff the additive Foundation schema, deterministic Project-seeded
 --       GitRepository identities, and WorkScope attachments satisfy their complete
 --       query-only readiness contract without promoting them to authority.
+--
+--   every_repository_sensitive_reader_and_writer_migrated_or_quarantined() -> Boolean
+--       True iff every route, worker, one-shot runtime, creation/provisioning path,
+--       branch or PR observer, prompt-grounding path, reconciler, repair path, lock,
+--       and compatibility adapter that can make a repository-sensitive correctness
+--       decision either consumes GitRepository authority or is structurally unable
+--       to run or feed such a decision after generation 2. Merely freezing Project
+--       writes or migrating only the triggering consumer makes this false.
 --
 --   persisted_repository_authority_generation() -> RepositoryAuthorityGeneration
 --       The one persisted repository-authority generation. project_1 denotes

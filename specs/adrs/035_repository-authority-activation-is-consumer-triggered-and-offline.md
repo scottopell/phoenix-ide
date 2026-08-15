@@ -16,20 +16,22 @@ No live ProductConversation or destructive Close capability requires hidden GitR
 
 1. **Continue hot in-process activation.** Drain and fence the full runtime, bind source and database evidence, observe live Git state, converge linked identities, change authority, then resume admission. This minimizes planned downtime but imposes permanent cross-runtime coordination and recovery machinery before a product consumer exists.
 2. **Perform offline activation immediately.** Stop Phoenix, run a bounded exclusive SQLite operation, and restart the GitRepository-authority binary even though no live capability requires the new authority. This removes runtime-drain complexity but still pays migration and operational cost ahead of user value.
-3. **Activate offline only when a live consumer requires it.** Keep Foundation dormant and Project authoritative. When a named ProductConversation or destructive Close capability cannot satisfy its correctness contract without hidden authority, stop Phoenix, verify a paired backup, acquire exclusive SQLite access, preserve seeded identities, change authority transactionally, and start the matching binary.
+3. **Activate offline only when an exact consumer contract requires it.** Keep Foundation dormant and Project authoritative. When an owning ProductConversation or destructive Close requirement explicitly requires generation `2`, stop Phoenix, acquire exclusive SQLite access, capture the exact pre-activation snapshot, preserve seeded identities, change authority transactionally, and start the matching binary.
 4. **Abandon hidden GitRepository authority.** Leave Project authoritative permanently and reconsider the repository model if a consumer appears. This avoids migration cost but discards the accepted hidden-identity direction and the independently useful dormant Foundation.
 
 ## Decision
 
 Phoenix uses option 3.
 
-Repository authority activation is not an independent portfolio milestone. The dormant Foundation remains sufficient until a named live ProductConversation or destructive Close capability requires hidden GitRepository authority for correctness.
+Repository authority activation is not an independent portfolio milestone. The dormant Foundation remains sufficient until an owning normative requirement for an exact ProductConversation or destructive Close capability requires hidden GitRepository authority generation `2`. The activation operation accepts that exact capability and requirement as a typed mandate; a broad consumer category or generic domain reference cannot authorize the transition.
 
-Activation is offline-only. Phoenix is stopped before the operation begins. The operator verifies a recoverable database backup paired with the Project-authority binary, and the maintenance operation holds exclusive SQLite access while it validates Foundation state and changes authority.
+Activation is offline-only. Phoenix is stopped and the maintenance operation acquires exclusive SQLite access. While that access is held and before any activation mutation, it captures and verifies a recoverable snapshot of the exact database state to be activated and pairs that snapshot with a Project-authority binary verified to operate it. Foundation validation and authority changes use that same exclusively held source state.
 
-The operation preserves the deterministic Project-seeded GitRepository identity partition and existing WorkScope attachments. It does not observe live Git state or merge identities. Linked-worktree convergence, if a later consumer needs it, is a separate feature with its own evidence and requirements.
+The operation preserves the deterministic Project-seeded GitRepository identity partition and existing WorkScope attachments. It does not observe live Git state or merge identities. Identity convergence is outside this decision; any future convergence requires its own atomic survivor-selection, lossless reference-rewrite, and losing-identity-retirement contract.
 
-One SQLite transaction updates authority-bearing references and changes persisted repository authority generation from Project generation `1` to GitRepository generation `2`. A failure before commit rolls the transaction back wholly. After commit, normal operation requires a generation-2 GitRepository-authority binary; generation-1 Project-authority binaries fail closed. Recovery rolls forward with generation 2 or uses the project-wide offline paired-restore contract.
+Because repository authority generation is global, the generation-2 binary must migrate every repository-sensitive reader and writer to GitRepository authority or structurally quarantine it from generation-2 operation. Migrating only the triggering consumer is insufficient. Every surviving Project-shaped repository value is read-only compatibility output or retained data and cannot feed a correctness-sensitive decision.
+
+One SQLite transaction updates authority-bearing references and changes persisted repository authority generation from Project generation `1` to GitRepository generation `2`. The one offline operation binds the exact mandate and pre-activation snapshot to the exact committed database-state fingerprint and staged GitRepository-authority binary artifact without copying those external recovery artifacts into a second persisted representation inside the activated database. A failure before commit rolls the transaction back wholly. After commit, normal operation requires that generation-2 Phoenix binary; generation-1 Project-authority binaries fail closed. Recovery rolls forward with generation 2 or manually selects the exact pre-activation snapshot and paired Project-authority binary under the project-wide offline contract.
 
 The repository-authority generation is feature state: it selects which repository model is writable. It is not the database-instance identity, live replacement fence, compare-and-swap token, or general compatibility mechanism rejected by ADR-033.
 
@@ -41,7 +43,8 @@ This decision replaces ADR-032's coordinated live-reader/writer activation mecha
 
 - **Positive:** Authority activation is bounded by process shutdown and one exclusive database transaction instead of whole-runtime distributed coordination.
 - **Positive:** Migration work begins only when it unlocks a named user-facing capability.
-- **Positive:** Seeded identities remain replay-stable; activation no longer depends on a live filesystem or Git snapshot.
+- **Positive:** Seeded identities remain replay-stable; activation no longer depends on a live filesystem or Git observation.
+- **Positive:** The offline operation verifies exact snapshot-and-binary recovery evidence instead of relying on compatibility alone.
 - **Positive:** Wrong-generation binaries fail closed without requiring old processes and workers to participate in an in-process cutover protocol.
 - **Negative:** Activation requires planned downtime.
 - **Negative:** Dormant Foundation data remains temporary duplicate storage until a consumer justifies activation or the repository direction changes.

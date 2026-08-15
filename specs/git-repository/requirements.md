@@ -23,12 +23,10 @@ WHEN Phoenix recognizes local Git state that should participate in Git-backed pr
 THE SYSTEM SHALL model that repository as one hidden `GitRepository` with a Phoenix-local opaque identity
 AND SHALL keep that opaque identity distinct from every filesystem path, Git remote URL, branch name, slug, inferred display name, or user-facing label
 
-WHEN Phoenix performs an explicit repository-identity convergence operation from complete authoritative evidence that linked worktrees share one Git common directory
-THE SYSTEM SHALL treat those linked worktrees as the same hidden `GitRepository`
-AND SHALL treat separate clones as distinct hidden `GitRepository` identities even when they point at the same remotes, contain the same commit graph, or share a directory name
+THE SYSTEM SHALL treat separate clones as distinct hidden `GitRepository` identities even when they point at the same remotes, contain the same commit graph, or share a directory name
 
-THE SYSTEM SHALL allow distinct deterministic Project-seeded `GitRepository` identities to remain distinct before and through repository-authority activation
-AND SHALL NOT make linked-worktree identity convergence an implicit consequence of activation
+THE SYSTEM SHALL preserve distinct deterministic Project-seeded `GitRepository` identities before and through repository-authority activation
+AND SHALL NOT merge existing opaque identities unless an owning normative requirement defines one atomic operation that selects a surviving identity, rewrites every reference losslessly, and retires each losing identity
 
 THE SYSTEM SHALL NOT derive hidden `GitRepository` identity from a canonical path string, remote URL, repository slug, host/name pair, or guessed continuity across restarts
 AND SHALL NOT infer that two observations are "the same repository" solely because a path reappeared, a slug matched, or a remote looked similar
@@ -245,23 +243,32 @@ THE SYSTEM SHALL keep legacy `Project` as the sole writable repository authority
 AND SHALL NOT activate hidden `GitRepository` authority merely because its dormant Foundation data is available
 
 WHEN an owning normative requirement for a ProductConversation or destructive Close capability explicitly requires hidden `GitRepository` authority generation `2` for its correctness contract
+THE SYSTEM SHALL require an activation mandate that identifies that exact consumer capability and owning normative requirement
+AND SHALL make that mandate an exact input to the one activation operation
+AND SHALL NOT treat a generic reference to `GitRepository`, `WorkScope`, ProductConversation, Close, or a broad consumer category as activation authority
+
 THE SYSTEM SHALL perform repository-authority activation only as an offline maintenance operation
-AND SHALL NOT treat a generic reference to `GitRepository`, `WorkScope`, ProductConversation, or Close as activation authority
 AND SHALL require Phoenix to be stopped before the operation begins
-AND SHALL verify a recoverable database backup paired with the Project-authority binary
-AND SHALL acquire exclusive access to the target SQLite database
+AND SHALL acquire exclusive access to the target SQLite database before capturing activation recovery state
+AND SHALL capture and verify a recoverable snapshot of the exact database state to be activated while exclusive access is held and before any activation mutation
+AND SHALL pair that exact pre-activation snapshot with the Project-authority binary that can restore its operation
 AND SHALL validate the dormant GitRepository Foundation before changing authority
 
 THE SYSTEM SHALL preserve each deterministic Project-seeded `GitRepository` identity and its existing WorkScope attachments during activation
 AND SHALL NOT merge identities or perform linked-worktree convergence as part of activation
 
 THE SYSTEM SHALL change repository authority and its persisted authority generation from Project generation `1` to GitRepository generation `2` in one SQLite transaction
-AND SHALL roll back that transaction wholly if validation, reference updates, or authority activation fails before commit
+AND SHALL migrate or structurally quarantine every repository-sensitive reader and writer before generation `2` becomes authoritative
+AND SHALL leave every surviving Project-shaped repository value as read-only compatibility output or retained data that cannot feed a correctness-sensitive decision
+AND SHALL roll back that transaction wholly if validation, reference updates, reader/writer migration, or authority activation fails before commit
 
 AFTER the authority transaction commits
-THE SYSTEM SHALL allow only binaries that require GitRepository authority generation `2` to open the database for normal operation
+THE SYSTEM SHALL complete the one activation operation with the exact consumer mandate, exact pre-activation snapshot, exact committed generation-2 database state, and exact GitRepository-authority binary artifact as its bound inputs and outputs
+AND SHALL NOT require a second persisted representation of those external recovery artifacts inside the activated database
+AND SHALL persist repository authority generation `2` as part of that same transaction
+AND SHALL allow only Phoenix binaries that require GitRepository authority generation `2` to open the database for normal operation
 AND SHALL make binaries that require Project authority generation `1` fail closed
-AND SHALL require recovery to roll forward with generation `2` or use the offline paired-restore contract in `specs/compatibility/requirements.md`
+AND SHALL require recovery to roll forward with generation `2` or restore the exact pre-activation snapshot with its paired Project-authority binary under the offline contract in `specs/compatibility/requirements.md`
 
 THE SYSTEM SHALL NOT support live in-process repository-authority activation, runtime-wide drain as an activation protocol, live Git observation during activation, production authorization derived from a source census, or automatic authority rollback
 
