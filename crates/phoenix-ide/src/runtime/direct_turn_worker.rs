@@ -239,8 +239,7 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
                 tracing::debug!(%conversation_id, turn_id = turn_id.0, "direct-turn claim lost during acknowledged materialization");
             }
             Err(error @ DirectTurnDispatchError::PostMaterializationFailed(_)) => {
-                tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn effect failed after acknowledged authoritative materialization");
-                return Err(error.to_string());
+                tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn effect failed after acknowledged authoritative materialization; runtime recovery completed");
             }
             Err(
                 error @ (DirectTurnDispatchError::TemporarilyInadmissible
@@ -737,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_materialization_failure_does_not_release_materialized_claim() {
+    async fn recovered_post_materialization_failure_does_not_fail_pass_or_release_claim() {
         let (repo, dispatcher) = fixture().await;
         *dispatcher.result.lock().unwrap() = Err(
             DirectTurnDispatchError::PostMaterializationFailed("llm dispatch failed".to_string()),
@@ -745,11 +744,10 @@ mod tests {
         let turn_id = accept(&repo, "post-materialization-failure").await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
 
-        let error = worker(repo.clone(), dispatcher.clone(), 10, 1)
+        worker(repo.clone(), dispatcher.clone(), 10, 1)
             .run_once()
             .await
-            .unwrap_err();
-        assert!(error.contains("after authoritative materialization"));
+            .unwrap();
 
         let attempts = repo
             .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
@@ -757,6 +755,31 @@ mod tests {
             .unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+    }
+
+    #[tokio::test]
+    async fn recovered_post_materialization_failure_does_not_block_startup_readiness() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(
+            DirectTurnDispatchError::PostMaterializationFailed("llm dispatch failed".to_string()),
+        );
+        let turn_id = accept(&repo, "post-materialization-startup").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker = worker(repo.clone(), dispatcher.clone(), 10, 1);
+
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+        ready_rx.await.unwrap();
+
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
