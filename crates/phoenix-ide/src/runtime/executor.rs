@@ -1702,6 +1702,7 @@ enum DirectTurnMaterializationDisposition {
     Materialized,
     ExactReplay,
     ClaimLost,
+    RecoveryUnsettled,
 }
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
@@ -2830,16 +2831,29 @@ where
                     && self.direct_turn_materialization_disposition
                         == DirectTurnMaterializationDisposition::Materialized
                 {
-                    let recovery = self
+                    match self
                         .process_event(self.llm_dispatch_failure_event(error.clone()))
-                        .await;
-                    let error = match recovery {
-                        Ok(()) => error,
-                        Err(recovery_error) => format!(
-                            "{error}; direct-turn failure settlement failed: {recovery_error}"
+                        .await
+                    {
+                        Ok(()) => Ok(
+                            AcknowledgedEventOutcome::DirectTurnPostMaterializationFailed(error),
                         ),
-                    };
-                    Ok(AcknowledgedEventOutcome::DirectTurnPostMaterializationFailed(error))
+                        Err(recovery_error) => {
+                            self.recovery_disposition =
+                                RuntimeRecoveryDisposition::RecreateFromDatabase;
+                            Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(
+                                format!(
+                                    "{error}; direct-turn failure settlement failed: \
+                                     {recovery_error}"
+                                ),
+                            ))
+                        }
+                    }
+                } else if direct_turn
+                    && self.direct_turn_materialization_disposition
+                        == DirectTurnMaterializationDisposition::RecoveryUnsettled
+                {
+                    Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(error))
                 } else {
                     Err(error)
                 };
@@ -4820,36 +4834,39 @@ where
                 let sequence_id = reserved_seqs[0];
                 let (fallback_state, fallback_state_updated_at) = authoritative_fallback
                     .unwrap_or_else(|| (self.state.clone(), self.state_updated_at));
-                let materialization = self
+                let adoption = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
+                    authority,
+                    payload,
+                    sequence_id,
+                    created_at: phoenix_workflow::Timestamp(now),
+                    accepted_state: self.state.clone(),
+                    state_updated_at: self.state_updated_at,
+                    now: phoenix_workflow::Timestamp(now),
+                };
+                let (materialization, reconciled_after_error) = match self
                     .storage
-                    .materialize_authoritative_user_message(
-                        &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
-                            authority,
-                            payload,
-                            sequence_id,
-                            created_at: phoenix_workflow::Timestamp(now),
-                            accepted_state: self.state.clone(),
-                            state_updated_at: self.state_updated_at,
-                            now: phoenix_workflow::Timestamp(now),
-                        },
-                    )
-                    .await;
-                let materialization = match materialization {
-                    Ok(materialization) => materialization,
-                    Err(error) => {
-                        let _ = self
-                            .broadcast_tx
-                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
-                                sequence_id,
-                                presentation_mode: fallback_state.presentation_mode().to_string(),
-                                state: fallback_state,
-                                state_updated_at: fallback_state_updated_at,
-                            });
-                        drop(reserved_broadcast_range);
-                        return Err(format!(
-                            "direct-turn authoritative materialization failed: {error}"
-                        ));
-                    }
+                    .materialize_authoritative_user_message(&adoption)
+                    .await
+                {
+                    Ok(materialization) => (materialization, false),
+                    Err(primary_error) => match self
+                        .storage
+                        .reconcile_authoritative_user_message(&adoption)
+                        .await
+                    {
+                        Ok(materialization) => (materialization, true),
+                        Err(reconciliation_error) => {
+                            self.direct_turn_materialization_disposition =
+                                DirectTurnMaterializationDisposition::RecoveryUnsettled;
+                            self.recovery_disposition =
+                                RuntimeRecoveryDisposition::RecreateFromDatabase;
+                            drop(reserved_broadcast_range);
+                            return Err(format!(
+                                "direct-turn authoritative materialization failed ambiguously: \
+                                 {primary_error}; reconciliation failed: {reconciliation_error}"
+                            ));
+                        }
+                    },
                 };
                 match materialization {
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
@@ -4862,7 +4879,32 @@ where
                         let _ = self.broadcast_tx.send_message(*message);
                         Ok(None)
                     }
-                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay => {
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay {
+                        message,
+                        active,
+                    } if reconciled_after_error && message.sequence_id == sequence_id => {
+                        self.direct_turn_materialization_disposition =
+                            DirectTurnMaterializationDisposition::Materialized;
+                        self.active_direct_turn = Some(Box::new(active));
+                        let _ = self.broadcast_tx.send_message(*message);
+                        Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay {
+                        message,
+                        ..
+                    } => {
+                        if reconciled_after_error {
+                            self.direct_turn_materialization_disposition =
+                                DirectTurnMaterializationDisposition::RecoveryUnsettled;
+                            self.recovery_disposition =
+                                RuntimeRecoveryDisposition::RecreateFromDatabase;
+                            drop(reserved_broadcast_range);
+                            return Err(format!(
+                                "direct-turn reconciliation returned canonical sequence {} \
+                                 for reserved sequence {sequence_id}",
+                                message.sequence_id
+                            ));
+                        }
                         self.direct_turn_materialization_disposition =
                             DirectTurnMaterializationDisposition::ExactReplay;
                         let _ = self.broadcast_tx.send_reserved_seq(sequence_id, |sequence_id| {
@@ -10373,6 +10415,64 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn after_commit_ambiguity_replays_reserved_canonical_message_and_dispatches_once() {
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::ExactReplay {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        storage.fail_next_materialize_authoritative_user_message("after-commit ambiguity");
+        let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+
+        let outcome = rt
+            .process_acknowledged_event(authoritative_event())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AcknowledgedEventOutcome::Settled);
+        let first = rx.try_recv().expect("canonical message");
+        let SseEvent::Message { message } = first else {
+            panic!("expected canonical message")
+        };
+        assert_eq!(message.message_id, "msg-direct");
+        assert_eq!(message.sequence_id, 1);
+        let second = rx.try_recv().expect("state publication");
+        assert!(matches!(
+            second,
+            SseEvent::StateChange {
+                sequence_id: 2,
+                state: ConvState::LlmRequesting { attempt: 1 },
+                ..
+            }
+        ));
+        assert_no_broadcast(&mut rx);
+        assert_eq!(rt.broadcast_tx.current_seq(), 2);
+        assert!(watch_rx.has_changed().unwrap());
+        assert!(matches!(
+            *watch_rx.borrow_and_update(),
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        rt.llm_task_handle
+            .take()
+            .expect("provider task")
+            .await
+            .expect("provider task join");
+        assert_eq!(rt.llm_client.recorded_requests().len(), 1);
+        assert_eq!(
+            storage
+                .recorded_materialize_authoritative_user_message_calls()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn acknowledged_stale_authority_reports_claim_loss_without_publishing_state() {
         let (mut rt, _storage, _rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
@@ -10414,7 +10514,13 @@ mod authoritative_user_message_effect_tests {
     async fn acknowledged_late_replay_or_claim_loss_preserves_typed_outcome() {
         for (materialization, expected) in [
             (
-                AuthoritativeUserMessageMaterialization::ExactReplay,
+                AuthoritativeUserMessageMaterialization::ExactReplay {
+                    message: Box::new(message("msg-direct", 1)),
+                    active: crate::runtime::traits::ActiveDirectTurn {
+                        turn_id: phoenix_workflow::TurnAuthorityId(1),
+                        generation: 0,
+                    },
+                },
                 AcknowledgedEventOutcome::Settled,
             ),
             (
@@ -10505,6 +10611,50 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn failed_post_materialization_recovery_requires_reconstruction_and_retains_claim() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        storage
+            .update_state("conv-direct", &ConvState::Idle, chrono::Utc::now())
+            .await
+            .unwrap();
+        storage.set_active_direct_turn(Some(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(1),
+            generation: 0,
+        }));
+        storage.set_settle_active_direct_turn_error_once();
+
+        let outcome = rt
+            .process_acknowledged_event(authoritative_event())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(_)
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
+        assert!(rt.active_direct_turn.is_some());
+        assert!(rt.pending_direct_turn_terminal.is_some());
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
     async fn busy_authoritative_event_is_retryable_without_sse_or_state_publication() {
         let (mut rt, _storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
@@ -10577,36 +10727,33 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_materialization_error_propagates_without_publishing_state() {
+    async fn acknowledged_materialization_ambiguity_requires_reconstruction_without_publication() {
         let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
         storage.fail_next_materialize_authoritative_user_message("materialization unavailable");
+        storage.fail_next_materialize_authoritative_user_message("reconciliation unavailable");
         let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
         rt = rt.with_state_watcher(watch_tx);
 
-        let error = rt
+        let outcome = rt
             .process_acknowledged_event(authoritative_event())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(
-            error,
-            "direct-turn authoritative materialization failed: materialization unavailable"
-        );
-        let event = rx.try_recv().expect("reserved fallback event");
         assert!(matches!(
-            event,
-            SseEvent::StateChange {
-                ref state,
-                sequence_id: 1,
-                ..
-            } if matches!(*state, ConvState::Idle)
+            outcome,
+            AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(ref error)
+                if error.contains("materialization unavailable")
+                    && error.contains("reconciliation unavailable")
         ));
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::RecreateFromDatabase
+        );
         assert_no_broadcast(&mut rx);
         assert_eq!(rt.broadcast_tx.current_seq(), 1);
-        assert_eq!(rt.broadcast_tx.next_seq(), 2);
         assert!(!watch_rx.has_changed().unwrap());
         assert!(matches!(rt.state, ConvState::Idle));
     }
@@ -11594,7 +11741,13 @@ mod authoritative_user_message_effect_tests {
     async fn fresh_then_replay_or_stale_materialization_fills_reserved_sequence() {
         for (materialize, expected_disposition) in [
             (
-                AuthoritativeUserMessageMaterialization::ExactReplay,
+                AuthoritativeUserMessageMaterialization::ExactReplay {
+                    message: Box::new(message("msg-direct", 1)),
+                    active: crate::runtime::traits::ActiveDirectTurn {
+                        turn_id: phoenix_workflow::TurnAuthorityId(1),
+                        generation: 0,
+                    },
+                },
                 DirectTurnMaterializationDisposition::ExactReplay,
             ),
             (

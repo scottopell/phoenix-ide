@@ -241,6 +241,10 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             Err(error @ DirectTurnDispatchError::PostMaterializationFailed(_)) => {
                 tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn effect failed after acknowledged authoritative materialization; runtime recovery completed");
             }
+            Err(error @ DirectTurnDispatchError::RecoveryUnsettled(_)) => {
+                tracing::error!(%conversation_id, turn_id = turn_id.0, error = %error, "direct-turn post-materialization recovery remains unsettled; retaining claim for runtime reconstruction");
+                return Err(error.to_string());
+            }
             Err(
                 error @ (DirectTurnDispatchError::TemporarilyInadmissible
                 | DirectTurnDispatchError::Failed(_)),
@@ -401,6 +405,9 @@ mod tests {
                 Err(DirectTurnDispatchError::PostMaterializationFailed(error)) => Err(
                     DirectTurnDispatchError::PostMaterializationFailed(error.clone()),
                 ),
+                Err(DirectTurnDispatchError::RecoveryUnsettled(error)) => {
+                    Err(DirectTurnDispatchError::RecoveryUnsettled(error.clone()))
+                }
             }
         }
     }
@@ -749,6 +756,29 @@ mod tests {
             .await
             .unwrap();
 
+        let attempts = repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, phoenix_workflow::AttemptStatus::Begun);
+    }
+
+    #[tokio::test]
+    async fn unsettled_post_materialization_recovery_fails_pass_without_releasing_claim() {
+        let (repo, dispatcher) = fixture().await;
+        *dispatcher.result.lock().unwrap() = Err(DirectTurnDispatchError::RecoveryUnsettled(
+            "recovery settlement failed".to_string(),
+        ));
+        let turn_id = accept(&repo, "unsettled-post-materialization").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+
+        let error = worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("recovery settlement failed"));
         let attempts = repo
             .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
             .await

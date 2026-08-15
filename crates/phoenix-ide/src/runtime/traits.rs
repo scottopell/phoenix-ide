@@ -28,7 +28,10 @@ pub enum AuthoritativeUserMessageMaterialization {
         message: Box<Message>,
         active: ActiveDirectTurn,
     },
-    ExactReplay,
+    ExactReplay {
+        message: Box<Message>,
+        active: ActiveDirectTurn,
+    },
     StaleAuthority,
 }
 
@@ -184,6 +187,13 @@ pub trait MessageStore: Send + Sync {
         _input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
+    }
+
+    async fn reconcile_authoritative_user_message(
+        &self,
+        input: &AuthoritativeUserMessageAdoptionInput,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        self.materialize_authoritative_user_message(input).await
     }
 
     async fn load_active_direct_turn(
@@ -548,6 +558,13 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         (**self).materialize_authoritative_user_message(input).await
+    }
+
+    async fn reconcile_authoritative_user_message(
+        &self,
+        input: &AuthoritativeUserMessageAdoptionInput,
+    ) -> Result<AuthoritativeUserMessageMaterialization, String> {
+        (**self).reconcile_authoritative_user_message(input).await
     }
 
     async fn load_active_direct_turn(
@@ -1021,9 +1038,17 @@ impl MessageStore for DatabaseStorage {
                     },
                 })
             }
-            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
-                Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
-            }
+            (
+                AuthorityOutcome::Authorized,
+                TurnOutcome::MaterializationReplay { .. },
+                Some(message),
+            ) => Ok(AuthoritativeUserMessageMaterialization::ExactReplay {
+                message: Box::new(message),
+                active: ActiveDirectTurn {
+                    turn_id: materialized.canonical_turn.id,
+                    generation: materialized.canonical_turn.generation,
+                },
+            }),
             (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, None) => {
                 Err("direct-turn replay did not return canonical message".to_string())
             }

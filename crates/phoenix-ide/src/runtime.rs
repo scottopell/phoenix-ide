@@ -152,6 +152,8 @@ pub(crate) enum DirectTurnDispatchError {
     Failed(String),
     #[error("direct-turn effect failed after authoritative materialization: {0}")]
     PostMaterializationFailed(String),
+    #[error("direct-turn post-materialization recovery remains unsettled: {0}")]
+    RecoveryUnsettled(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +162,7 @@ pub(crate) enum AcknowledgedEventOutcome {
     DirectTurnClaimLost,
     DirectTurnTemporarilyInadmissible,
     DirectTurnPostMaterializationFailed(String),
+    DirectTurnRecoveryUnsettled(String),
     SteeringWake(SteeringWakeOutcome),
 }
 
@@ -3781,6 +3784,9 @@ impl RuntimeManager {
             }
             Ok(AcknowledgedEventOutcome::DirectTurnPostMaterializationFailed(error)) => {
                 Err(DirectTurnDispatchError::PostMaterializationFailed(error))
+            }
+            Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(error)) => {
+                Err(DirectTurnDispatchError::RecoveryUnsettled(error))
             }
             Ok(AcknowledgedEventOutcome::SteeringWake(_)) => Err(DirectTurnDispatchError::Failed(
                 "unexpected steering outcome".to_string(),
