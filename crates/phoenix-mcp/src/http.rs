@@ -466,23 +466,30 @@ impl McpTransport for HttpTransport {
         true
     }
 
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> Result<(), TransportError> {
         // Stop the server-initiated GET stream before ending the session: a
         // task still reconnecting would race the DELETE and re-open against a
         // session about to vanish (REQ-MCP-006).
-        if let Some(task) = self.stream_task.lock().unwrap().take() {
+        let mut background_error = None;
+        let stream_task = self.stream_task.lock().unwrap().take();
+        if let Some(task) = stream_task {
             task.abort();
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    background_error = Some(format!("stream task failed during shutdown: {error}"));
+                }
+            }
         }
         // End the server-side session explicitly so it does not linger until
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
-        let session_id = self.session_id.lock().unwrap().take();
+        let session_id = self.session_id.lock().unwrap().clone();
         if let Some(session_id) = session_id {
             let mut builder = self
                 .client
                 .delete(&self.url)
                 .timeout(Duration::from_secs(5))
                 .headers(self.base_headers.clone())
-                .header(MCP_SESSION_ID, session_id);
+                .header(MCP_SESSION_ID, &session_id);
             // The bearer rides the session DELETE too (REQ-MCP-012).
             if let Some(bearer) = self.bearer_header() {
                 builder = builder.header(AUTHORIZATION, bearer);
@@ -492,10 +499,27 @@ impl McpTransport for HttpTransport {
             if let Some(version) = self.protocol_version.lock().unwrap().clone() {
                 builder = builder.header(MCP_PROTOCOL_VERSION, version);
             }
-            let result = builder.send().await;
-            if let Err(e) = result {
-                tracing::debug!(server = %self.name, "MCP session DELETE failed: {e}");
+            let response = builder.send().await.map_err(|error| {
+                TransportError::Disconnected(format!(
+                    "MCP server '{}': session DELETE failed during shutdown: {error}",
+                    self.name
+                ))
+            })?;
+            if !response.status().is_success() {
+                return Err(TransportError::Disconnected(format!(
+                    "MCP server '{}': session DELETE failed during shutdown with HTTP {}",
+                    self.name,
+                    response.status()
+                )));
             }
+            self.session_id.lock().unwrap().take();
+        }
+        match background_error {
+            Some(error) => Err(TransportError::Disconnected(format!(
+                "MCP server '{}': {error}",
+                self.name
+            ))),
+            None => Ok(()),
         }
     }
 }
@@ -1334,6 +1358,7 @@ mod tests {
             Arc::default(),
         )
         .await
+        .map_err(|failure| failure.message)
     }
 
     #[tokio::test]
@@ -1535,8 +1560,7 @@ mod tests {
 
         let err = connect_http(&server, HttpAuth::None)
             .await
-            .err()
-            .expect("handshake must fail");
+            .expect_err("handshake must fail");
         assert!(err.contains("HTTP 500"), "got: {err}");
 
         let requests = server.requests.lock().unwrap();
@@ -1634,9 +1658,9 @@ mod tests {
             Arc::default(),
             discard_sink(),
         );
-        let err = smuggled
-            .err()
-            .expect("generic Authorization must be rejected");
+        let Err(err) = smuggled else {
+            panic!("generic Authorization must be rejected");
+        };
         assert!(err.contains("auth.bearer or auth.headers"), "got: {err}");
 
         let explicit = HttpTransport::connect(
@@ -2118,7 +2142,7 @@ mod tests {
             .expect("connect");
 
         server.push_responses(vec![status_response(200, &[])]);
-        mcp.terminate().await;
+        mcp.terminate().await.expect("shutdown succeeds");
 
         let requests = server.requests.lock().unwrap();
         let last = requests.last().expect("requests recorded");
@@ -2128,6 +2152,39 @@ mod tests {
             last.header("mcp-protocol-version"),
             Some("2025-03-26"),
             "the negotiated version rides the session DELETE too"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_shutdown_retains_session_for_retry_until_delete_succeeds() {
+        let server = TestServer::start(handshake_responses("sess-retry")).await;
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        server.push_responses(vec![status_response(503, &[]), status_response(200, &[])]);
+
+        let first = mcp.terminate().await.expect_err("DELETE failure surfaces");
+        assert!(first.to_string().contains("HTTP 503"), "{first}");
+        mcp.terminate().await.expect("same session retries");
+        mcp.terminate()
+            .await
+            .expect("successful shutdown is idempotent");
+
+        let deletes: Vec<_> = server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.http_method() == "DELETE")
+            .map(|request| request.header("mcp-session-id").map(str::to_string))
+            .collect();
+        assert_eq!(
+            deletes,
+            vec![
+                Some("sess-retry".to_string()),
+                Some("sess-retry".to_string())
+            ],
+            "the failed DELETE retains the session ID and success clears it"
         );
     }
 
@@ -2392,6 +2449,7 @@ mod tests {
             Arc::clone(&manager.oauth),
         )
         .await
+        .map_err(|failure| failure.message)
     }
 
     async fn pending_auth_url(manager: &McpClientManager) -> Option<String> {
@@ -2489,8 +2547,7 @@ mod tests {
         // The 401 starts discovery; the connect fails with the surfaced URL.
         let err = connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("unauthorized connect must not publish");
+            .expect_err("unauthorized connect must not publish");
         assert!(err.contains("requires OAuth authorization"), "got: {err}");
 
         // The authorization URL is structured state (REQ-MCP-013), carrying
@@ -2640,8 +2697,7 @@ mod tests {
 
         let err = connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("unauthorized connect must surface auth URL");
+            .expect_err("unauthorized connect must surface auth URL");
         assert!(err.contains("requires OAuth authorization"), "got: {err}");
 
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
@@ -2697,8 +2753,7 @@ mod tests {
 
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("unauthorized connect must not publish");
+            .expect_err("unauthorized connect must not publish");
 
         // Re-registration happened with the current redirect, and the flow
         // uses the freshly registered client.
@@ -2756,8 +2811,7 @@ mod tests {
 
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("unauthorized connect must not publish");
+            .expect_err("unauthorized connect must not publish");
 
         assert!(
             server.recorded_for_path("/register").is_empty(),
@@ -2785,8 +2839,7 @@ mod tests {
             HttpAuth::Static(StaticCred::Bearer("bad".to_string())),
         )
         .await
-        .err()
-        .expect("rejected static auth must fail");
+        .expect_err("rejected static auth must fail");
         assert!(err.contains("unauthorized (HTTP 401)"), "got: {err}");
 
         // StaticAuthRejected: no discovery, no pending flow (REQ-MCP-008).
@@ -3207,8 +3260,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
         let state = query_params(&auth_url).get("state").unwrap().clone();
 
@@ -3269,8 +3321,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         let err = connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("PKCE-less authorization server must be refused");
+            .expect_err("PKCE-less authorization server must be refused");
         assert!(
             err.contains("code_challenge_methods_supported"),
             "got: {err}"
@@ -3305,8 +3356,7 @@ mod tests {
         });
         connect_http_managed(&manager, &server, auth)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
 
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
         let params = query_params(&auth_url);
@@ -3369,8 +3419,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
 
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
         assert_eq!(
@@ -3430,8 +3479,7 @@ mod tests {
             .unwrap();
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
 
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
         let params = query_params(&auth_url);
@@ -3467,8 +3515,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
         let auth_url = pending_auth_url(&manager).await.expect("pending url");
         let state = query_params(&auth_url).get("state").unwrap().clone();
 
@@ -3783,8 +3830,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
         let old_url = pending_auth_url(&manager).await.expect("pending url");
         let old_state = query_params(&old_url).get("state").unwrap().clone();
 
@@ -3830,8 +3876,7 @@ mod tests {
         let config = http_config(&server.url, HttpAuth::None);
         connect_http_managed(&manager, &server, HttpAuth::None)
             .await
-            .err()
-            .expect("connect blocks on authorization");
+            .expect_err("connect blocks on authorization");
         let old_url = pending_auth_url(&manager).await.expect("pending url");
 
         // An unchanged reload must NOT rotate the nonce -- the operator may

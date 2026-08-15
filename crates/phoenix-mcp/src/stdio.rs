@@ -12,6 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock};
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stdio transport: a child process exchanging JSON-RPC 2.0 over its
 /// stdin/stdout (REQ-MCP-003).
 pub struct StdioTransport {
@@ -293,10 +295,93 @@ impl McpTransport for StdioTransport {
         self.invalidated.store(true, Ordering::Release);
     }
 
-    async fn shutdown(&self) {
-        if let Some(handle) = self.stderr_task.lock().await.take() {
-            handle.abort();
+    async fn shutdown(&self) -> Result<(), TransportError> {
+        let mut background_error = None;
+        if let Some(task) = self.stderr_task.lock().await.take() {
+            task.abort();
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    background_error =
+                        Some(format!("stderr drain task failed during shutdown: {error}"));
+                }
+            }
         }
-        let _ = self.child.lock().await.kill().await;
+
+        let mut child = self.child.lock().await;
+        if child
+            .try_wait()
+            .map_err(|error| {
+                TransportError::Disconnected(format!(
+                    "MCP server '{}': failed to inspect child during shutdown: {error}",
+                    self.name
+                ))
+            })?
+            .is_none()
+        {
+            child.start_kill().map_err(|error| {
+                TransportError::Disconnected(format!(
+                    "MCP server '{}': failed to terminate child during shutdown: {error}",
+                    self.name
+                ))
+            })?;
+        }
+
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait())
+            .await
+            .map_err(|_| {
+                TransportError::Timeout(format!(
+                    "MCP server '{}': child did not exit within {}s during shutdown",
+                    self.name,
+                    SHUTDOWN_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| {
+                TransportError::Disconnected(format!(
+                    "MCP server '{}': failed waiting for child exit during shutdown: {error}",
+                    self.name
+                ))
+            })?;
+        match background_error {
+            Some(error) => Err(TransportError::Disconnected(format!(
+                "MCP server '{}': {error}",
+                self.name
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_confirms_child_exit_and_settles_stderr_task() {
+        let transport = StdioTransport::spawn(
+            "sleeping",
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            &HashMap::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await
+        .expect("spawn child");
+
+        transport.shutdown().await.expect("shutdown child");
+
+        assert!(
+            transport
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("inspect child")
+                .is_some(),
+            "shutdown returns only after the child exits"
+        );
+        assert!(
+            transport.stderr_task.lock().await.is_none(),
+            "shutdown consumes stderr-drain ownership"
+        );
     }
 }

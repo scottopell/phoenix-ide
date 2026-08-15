@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -110,6 +111,7 @@ impl SupervisorHandle {
                 stdio_active: false,
                 stdio_queue: VecDeque::new(),
                 active_calls: HashMap::new(),
+                teardown_retry: Vec::new(),
             }
             .run(),
         );
@@ -161,7 +163,7 @@ impl SupervisorHandle {
             .send(Command::Reconfigure { config, reply })
             .await
             .map_err(|_| stopped())?;
-        receive.await.map_err(|_| stopped())
+        receive.await.map_err(|_| stopped())?
     }
 
     pub(crate) async fn call(
@@ -241,7 +243,9 @@ impl SupervisorHandle {
             .await
         {
             if let Command::Publish { server, .. } = error.0 {
-                server.terminate().await;
+                if let Err(error) = server.terminate().await {
+                    tracing::warn!(%error, "MCP transport teardown failed after supervisor stopped");
+                }
             }
             return false;
         }
@@ -249,12 +253,22 @@ impl SupervisorHandle {
     }
 
     pub(crate) async fn fail(&self, epoch: u64, error: String) -> bool {
+        self.fail_with_teardown_retry(epoch, error, None).await
+    }
+
+    pub(crate) async fn fail_with_teardown_retry(
+        &self,
+        epoch: u64,
+        error: String,
+        teardown_retry: Option<McpServer>,
+    ) -> bool {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
             .send(Command::Fail {
                 epoch,
                 error,
+                teardown_retry,
                 reply,
             })
             .await
@@ -266,6 +280,17 @@ impl SupervisorHandle {
     }
 
     pub(crate) async fn unauthorized(&self, epoch: u64, url: String, error: String) -> bool {
+        self.unauthorized_with_teardown_retry(epoch, url, error, None)
+            .await
+    }
+
+    pub(crate) async fn unauthorized_with_teardown_retry(
+        &self,
+        epoch: u64,
+        url: String,
+        error: String,
+        teardown_retry: Option<McpServer>,
+    ) -> bool {
         let (reply, receive) = oneshot::channel();
         if self
             .mailbox
@@ -273,6 +298,7 @@ impl SupervisorHandle {
                 epoch,
                 url,
                 error,
+                teardown_retry,
                 reply,
             })
             .await
@@ -283,18 +309,22 @@ impl SupervisorHandle {
         receive.await.unwrap_or(false)
     }
 
-    pub(crate) async fn remove(&self) {
+    pub(crate) async fn remove(&self) -> Result<(), String> {
         let (reply, receive) = oneshot::channel();
-        if self.mailbox.send(Command::Remove { reply }).await.is_ok() {
-            let _ = receive.await;
-        }
+        self.mailbox
+            .send(Command::Remove { reply })
+            .await
+            .map_err(|_| stopped())?;
+        receive.await.map_err(|_| stopped())?
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
         let (reply, receive) = oneshot::channel();
-        if self.mailbox.send(Command::Shutdown { reply }).await.is_ok() {
-            let _ = receive.await;
-        }
+        self.mailbox
+            .send(Command::Shutdown { reply })
+            .await
+            .map_err(|_| stopped())?;
+        receive.await.map_err(|_| stopped())?
     }
 }
 
@@ -332,7 +362,7 @@ enum Command {
     },
     Reconfigure {
         config: McpServerConfig,
-        reply: oneshot::Sender<u64>,
+        reply: oneshot::Sender<Result<u64, String>>,
     },
     Call {
         tool: String,
@@ -371,19 +401,21 @@ enum Command {
     Fail {
         epoch: u64,
         error: String,
+        teardown_retry: Option<McpServer>,
         reply: oneshot::Sender<bool>,
     },
     Unauthorized {
         epoch: u64,
         url: String,
         error: String,
+        teardown_retry: Option<McpServer>,
         reply: oneshot::Sender<bool>,
     },
     Remove {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -399,18 +431,23 @@ struct Actor {
     stdio_active: bool,
     stdio_queue: VecDeque<QueuedCall>,
     active_calls: HashMap<u64, CancellationToken>,
+    teardown_retry: Vec<Arc<McpServer>>,
 }
 
 impl Actor {
     async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
-            let stop = matches!(command, Command::Remove { .. } | Command::Shutdown { .. });
             self.handle(command).await;
-            if stop {
-                return;
+        }
+        loop {
+            match self.stop_server().await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "MCP supervisor transport teardown failed after mailbox close; retrying");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         }
-        self.stop_server().await;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -425,12 +462,20 @@ impl Actor {
                 }
                 self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
-                self.stop_server().await;
+                let teardown = self.stop_server().await;
                 self.recovery_from = None;
-                self.snapshot.config = config;
-                self.state = SupervisorState::Connecting;
-                self.publish_snapshot(None, None);
-                let _ = reply.send(self.epoch);
+                match teardown {
+                    Ok(()) => {
+                        self.snapshot.config = config;
+                        self.state = SupervisorState::Connecting;
+                        self.publish_snapshot(None, None);
+                        let _ = reply.send(Ok(self.epoch));
+                    }
+                    Err(error) => {
+                        self.publish_snapshot(Some(error.clone()), None);
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             Command::Call {
                 tool,
@@ -595,13 +640,21 @@ impl Actor {
                 } else if matches!(self.state, SupervisorState::Ready(_)) {
                     self.recovery_from = Some(observed_epoch);
                     self.epoch = self.epoch.wrapping_add(1);
-                    self.stop_server().await;
-                    self.state = SupervisorState::Recovering;
-                    self.publish_snapshot(None, None);
-                    let _ = reply.send(RecoveryClaim::Leader(RecoveryPermit {
-                        epoch: self.epoch,
-                        config: self.snapshot.config.clone(),
-                    }));
+                    match self.stop_server().await {
+                        Ok(()) => {
+                            self.state = SupervisorState::Recovering;
+                            self.publish_snapshot(None, None);
+                            let _ = reply.send(RecoveryClaim::Leader(RecoveryPermit {
+                                epoch: self.epoch,
+                                config: self.snapshot.config.clone(),
+                            }));
+                        }
+                        Err(error) => {
+                            self.recovery_from = None;
+                            self.publish_snapshot(Some(error.clone()), None);
+                            let _ = reply.send(RecoveryClaim::Unavailable(error));
+                        }
+                    }
                 } else {
                     let _ = reply.send(RecoveryClaim::Unavailable(self.not_ready_message()));
                 }
@@ -612,6 +665,7 @@ impl Actor {
                 reply,
             } => {
                 if epoch == self.epoch
+                    && self.teardown_retry.is_empty()
                     && matches!(
                         self.state,
                         SupervisorState::Connecting
@@ -624,21 +678,35 @@ impl Actor {
                     self.publish_snapshot(None, None);
                     let _ = reply.send(true);
                 } else {
-                    server.terminate().await;
+                    let server = Arc::new(server);
+                    if let Err(error) = server.terminate().await {
+                        self.retain_unresolved_stale_teardown(
+                            server,
+                            format!("stale replacement teardown failed: {error}"),
+                        )
+                        .await;
+                    }
                     let _ = reply.send(false);
                 }
             }
             Command::Fail {
                 epoch,
                 error,
+                teardown_retry,
                 reply,
             } => {
                 let current = epoch == self.epoch;
                 if current {
                     self.recovery_from = None;
-                    self.stop_server().await;
+                    if let Some(server) = teardown_retry {
+                        self.teardown_retry.push(Arc::new(server));
+                    }
+                    let error = compose_teardown_error(error, self.stop_server().await);
                     self.state = SupervisorState::Failed;
                     self.publish_snapshot(Some(error), None);
+                } else if let Some(server) = teardown_retry {
+                    self.retain_unresolved_stale_teardown(Arc::new(server), error)
+                        .await;
                 }
                 let _ = reply.send(current);
             }
@@ -646,14 +714,25 @@ impl Actor {
                 epoch,
                 url,
                 error,
+                teardown_retry,
                 reply,
             } => {
                 let current = epoch == self.epoch;
                 if current {
                     self.recovery_from = None;
-                    self.stop_server().await;
-                    self.state = SupervisorState::Recovering;
+                    if let Some(server) = teardown_retry {
+                        self.teardown_retry.push(Arc::new(server));
+                    }
+                    let error = compose_teardown_error(error, self.stop_server().await);
+                    if self.teardown_retry.is_empty() {
+                        self.state = SupervisorState::Recovering;
+                    } else {
+                        self.state = SupervisorState::Failed;
+                    }
                     self.publish_snapshot(Some(error), Some(url));
+                } else if let Some(server) = teardown_retry {
+                    self.retain_unresolved_stale_teardown(Arc::new(server), error)
+                        .await;
                 }
                 let _ = reply.send(current);
             }
@@ -663,11 +742,10 @@ impl Actor {
                 }
                 self.active_calls.clear();
                 self.epoch = self.epoch.wrapping_add(1);
-                self.stop_server().await;
+                let teardown = self.stop_server().await;
                 self.recovery_from = None;
-                self.state = SupervisorState::Removed;
-                self.publish_snapshot(None, None);
-                let _ = reply.send(());
+                self.publish_snapshot(teardown.as_ref().err().cloned(), None);
+                let _ = reply.send(teardown);
             }
         }
     }
@@ -735,11 +813,48 @@ impl Actor {
         })
     }
 
-    async fn stop_server(&mut self) {
+    async fn retain_unresolved_stale_teardown(&mut self, stale: Arc<McpServer>, primary: String) {
+        self.teardown_retry.push(stale);
+        let current = match std::mem::replace(&mut self.state, SupervisorState::Failed) {
+            SupervisorState::Ready(server) => Some(server),
+            SupervisorState::Connecting
+            | SupervisorState::Recovering
+            | SupervisorState::Failed
+            | SupervisorState::Removed => None,
+        };
+        let mut error = primary;
+        if let Some(current) = current {
+            if let Err(teardown) = current.terminate().await {
+                error = format!("{error}; current transport teardown also failed: {teardown}");
+                self.teardown_retry.push(current);
+            }
+        }
+        self.recovery_from = None;
+        self.publish_snapshot(Some(error), None);
+    }
+
+    async fn stop_server(&mut self) -> Result<(), String> {
         if let SupervisorState::Ready(server) =
             std::mem::replace(&mut self.state, SupervisorState::Removed)
         {
-            server.terminate().await;
+            self.teardown_retry.push(server);
+        }
+
+        let mut failed = Vec::new();
+        let mut errors = Vec::new();
+        for server in std::mem::take(&mut self.teardown_retry) {
+            if let Err(error) = server.terminate().await {
+                errors.push(error.to_string());
+                failed.push(server);
+            }
+        }
+        self.teardown_retry = failed;
+        if errors.is_empty() {
+            self.state = SupervisorState::Removed;
+            Ok(())
+        } else {
+            self.state = SupervisorState::Failed;
+            Err(errors.join("; "))
         }
     }
 
@@ -752,13 +867,20 @@ impl Actor {
     }
 }
 
+fn compose_teardown_error(primary: String, teardown: Result<(), String>) -> String {
+    match teardown {
+        Ok(()) => primary,
+        Err(teardown) => format!("{primary}; transport teardown also failed: {teardown}"),
+    }
+}
+
 #[cfg(test)]
 mod epoch_tests {
     use super::*;
     use crate::{HttpAuth, McpTransport, SharedBearer, TransportError, DEFAULT_TOOL_CALL_TIMEOUT};
     use async_trait::async_trait;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -766,6 +888,72 @@ mod epoch_tests {
     struct GatedTransport {
         started: mpsc::UnboundedSender<()>,
         releases: Arc<Semaphore>,
+    }
+
+    struct RetryShutdownTransport {
+        attempts: Arc<AtomicUsize>,
+        failures_remaining: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl McpTransport for RetryShutdownTransport {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            _timeout: Duration,
+            _sink: &dyn crate::ServerMessageSink,
+        ) -> Result<Value, TransportError> {
+            Ok(Value::Null)
+        }
+
+        async fn notify(&self, _notification: &Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn requested_protocol_version(&self) -> &'static str {
+            "2025-03-26"
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(TransportError::Disconnected(
+                    "injected teardown failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn retry_shutdown_server(failures: usize) -> (McpServer, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        (
+            McpServer {
+                name: "retry".to_string(),
+                transport: Arc::new(RetryShutdownTransport {
+                    attempts: Arc::clone(&attempts),
+                    failures_remaining: AtomicUsize::new(failures),
+                }),
+                tools: std::sync::RwLock::new(Vec::new()),
+                config: stdio_config(),
+                tools_changed: Arc::new(AtomicBool::new(false)),
+                pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+                oauth_bearer: SharedBearer::default(),
+            },
+            attempts,
+        )
     }
 
     #[async_trait]
@@ -800,7 +988,9 @@ mod epoch_tests {
             true
         }
 
-        async fn shutdown(&self) {}
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     fn server(config: McpServerConfig) -> (McpServer, mpsc::UnboundedReceiver<()>, Arc<Semaphore>) {
@@ -949,10 +1139,115 @@ mod epoch_tests {
             .reconfigure(stdio_config())
             .await
             .expect("connect epoch");
-        handle.remove().await;
+        handle.remove().await.expect("remove succeeds");
         let (late, _, _) = server(stdio_config());
         assert!(!handle.publish(epoch, late).await);
         assert!(matches!(handle.snapshot().state, SupervisorState::Removed));
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_is_private_and_blocks_replacement_until_retry_succeeds() {
+        let (serving, attempts) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+
+        let error = handle.remove().await.expect_err("first teardown fails");
+        assert!(error.contains("injected teardown failure"));
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(
+            handle.inspect().await.is_err(),
+            "retry-owned server is no longer callable"
+        );
+
+        let epoch = handle
+            .reconfigure(http_config())
+            .await
+            .expect("reconfigure retries terminal teardown");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            handle.snapshot().state,
+            SupervisorState::Connecting
+        ));
+        let (replacement, _, _) = server(http_config());
+        assert!(handle.publish(epoch, replacement).await);
+    }
+
+    #[tokio::test]
+    async fn stale_teardown_failure_makes_fresh_server_non_callable_and_retry_owned() {
+        let handle = SupervisorHandle::connecting(stdio_config());
+        let epoch = handle
+            .reconfigure(stdio_config())
+            .await
+            .expect("connect epoch");
+        let (fresh, fresh_attempts) = retry_shutdown_server(0);
+        assert!(handle.publish(epoch, fresh).await);
+        let (stale, stale_attempts) = retry_shutdown_server(1);
+
+        assert!(!handle.publish(epoch.wrapping_sub(1), stale).await);
+
+        assert_eq!(fresh_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(stale_attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+        assert!(handle.inspect().await.is_err());
+
+        handle
+            .reconfigure(http_config())
+            .await
+            .expect("reconfigure retries stale teardown");
+        assert_eq!(stale_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_issue_permit_when_teardown_fails() {
+        let (serving, attempts) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+
+        let claim = handle.claim_recovery(0).await;
+
+        assert!(
+            matches!(claim, RecoveryClaim::Unavailable(ref error) if error.contains("injected teardown failure"))
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(handle.snapshot().state, SupervisorState::Failed));
+    }
+
+    #[tokio::test]
+    async fn primary_and_teardown_failures_are_both_preserved() {
+        let (serving, _) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+
+        assert!(
+            handle
+                .fail(0, "primary handshake failure".to_string())
+                .await
+        );
+        let error = handle.snapshot().last_error.expect("failure reason");
+        assert!(error.contains("primary handshake failure"), "{error}");
+        assert!(error.contains("injected teardown failure"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_and_teardown_failures_are_both_preserved() {
+        let (serving, _) = retry_shutdown_server(1);
+        let handle = SupervisorHandle::connected(serving);
+
+        assert!(
+            handle
+                .unauthorized(
+                    0,
+                    "https://auth.example/authorize".to_string(),
+                    "primary unauthorized failure".to_string(),
+                )
+                .await
+        );
+        let snapshot = handle.snapshot();
+        let error = snapshot.last_error.expect("failure reason");
+        assert!(error.contains("primary unauthorized failure"), "{error}");
+        assert!(error.contains("injected teardown failure"), "{error}");
+        assert!(matches!(snapshot.state, SupervisorState::Failed));
+        assert_eq!(
+            snapshot.pending_oauth_url.as_deref(),
+            Some("https://auth.example/authorize")
+        );
     }
 
     #[tokio::test]

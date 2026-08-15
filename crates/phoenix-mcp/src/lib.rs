@@ -148,8 +148,8 @@ pub trait McpTransport: Send + Sync {
         false
     }
 
-    /// Tear down the transport (stdio: kill the child process).
-    async fn shutdown(&self);
+    /// Tear down the transport and confirm owned resources have exited.
+    async fn shutdown(&self) -> Result<(), TransportError>;
 }
 
 /// Build a transport for `config`: stdio spawns the child process, HTTP
@@ -322,7 +322,6 @@ impl From<String> for McpToolCallError {
 /// classification survives to the connect path, which dispatches on it:
 /// `StaticAuthRejected` for config credentials, the OAuth entry point
 /// otherwise (REQ-MCP-008, REQ-MCP-009).
-#[derive(Debug)]
 enum HandshakeFailure {
     /// The handshake was rejected with HTTP 401; carries the
     /// `WWW-Authenticate` challenge when present.
@@ -331,6 +330,33 @@ enum HandshakeFailure {
         message: String,
     },
     Other(String),
+    Teardown {
+        message: String,
+        retry: Option<Box<McpServer>>,
+    },
+}
+
+struct ConnectFailure {
+    message: String,
+    teardown_retry: Option<McpServer>,
+}
+
+impl std::fmt::Debug for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectFailure")
+            .field("message", &self.message)
+            .field("has_teardown_retry", &self.teardown_retry.is_some())
+            .finish()
+    }
+}
+
+impl From<String> for ConnectFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            teardown_retry: None,
+        }
+    }
 }
 
 impl HandshakeFailure {
@@ -349,10 +375,34 @@ impl HandshakeFailure {
     }
 }
 
+impl HandshakeFailure {
+    fn with_teardown(self, teardown: &TransportError) -> Self {
+        Self::Teardown {
+            message: format!("{self}; transport teardown also failed: {teardown}"),
+            retry: None,
+        }
+    }
+
+    fn into_connect_failure(self, caller: Option<McpServer>) -> ConnectFailure {
+        match self {
+            Self::Teardown { message, retry } => ConnectFailure {
+                message,
+                teardown_retry: retry.map(|server| *server).or(caller),
+            },
+            other @ (Self::Unauthorized { .. } | Self::Other(_)) => ConnectFailure {
+                message: other.to_string(),
+                teardown_retry: None,
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for HandshakeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unauthorized { message, .. } | Self::Other(message) => write!(f, "{message}"),
+            Self::Unauthorized { message, .. }
+            | Self::Other(message)
+            | Self::Teardown { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -411,6 +461,15 @@ fn notification_sink(name: &str, tools_changed: &Arc<AtomicBool>) -> Arc<dyn Ser
 
 /// One MCP server connection: the transport-agnostic JSON-RPC protocol layer
 /// (REQ-MCP-002) over a `McpTransport`.
+impl std::fmt::Debug for McpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServer")
+            .field("name", &self.name)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct McpServer {
     name: String,
     transport: Arc<dyn McpTransport>,
@@ -642,8 +701,8 @@ impl McpServer {
         self.config.clone()
     }
 
-    async fn terminate(&self) {
-        self.transport.shutdown().await;
+    async fn terminate(&self) -> Result<(), TransportError> {
+        self.transport.shutdown().await
     }
 
     /// Check whether the underlying transport is still usable.
@@ -662,7 +721,9 @@ impl McpServer {
         };
         let recoverable = self.should_reestablish(&error);
         let failure = HandshakeFailure::classify(error, &self.name);
-        self.terminate().await;
+        if let Err(teardown) = self.terminate().await {
+            return Err(failure.with_teardown(&teardown));
+        }
         if !recoverable {
             return Err(failure);
         }
@@ -687,8 +748,10 @@ impl McpServer {
             Ok(()) => Ok(()),
             Err(error) => {
                 let failure = HandshakeFailure::classify(error, &self.name);
-                self.terminate().await;
-                Err(failure)
+                match self.terminate().await {
+                    Ok(()) => Err(failure),
+                    Err(teardown) => Err(failure.with_teardown(&teardown)),
+                }
             }
         }
     }
@@ -704,12 +767,25 @@ impl McpServer {
         let config = self.config.clone();
         let pending_oauth_urls = Arc::clone(&self.pending_oauth_urls);
         let oauth_bearer = Arc::clone(&self.oauth_bearer);
-        self.terminate().await;
+        if let Err(teardown) = self.terminate().await {
+            return Err(HandshakeFailure::Teardown {
+                message: format!(
+                    "MCP server '{name}': transport teardown failed before recovery: {teardown}"
+                ),
+                retry: Some(Box::new(self)),
+            });
+        }
         let mut replacement = Self::connect(&name, config, pending_oauth_urls, oauth_bearer)
             .await
             .map_err(HandshakeFailure::Other)?;
-        replacement.handshake().await?;
-        Ok(replacement)
+        match replacement.handshake().await {
+            Ok(()) => Ok(replacement),
+            Err(HandshakeFailure::Teardown { message, .. }) => Err(HandshakeFailure::Teardown {
+                message,
+                retry: Some(Box::new(replacement)),
+            }),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1852,27 +1928,10 @@ impl McpClientManager {
             .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
 
         self.pending_oauth_urls.write().await.remove(&name);
-        let owner = if let Some((handle, epoch)) = resolved.owner.as_ref() {
-            if handle.snapshot().epoch == *epoch {
-                handle
-                    .reconfigure(resolved.config.clone())
-                    .await
-                    .ok()
-                    .map(|new_epoch| (handle.clone(), new_epoch))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        // The flow is resolved; stop its loopback listener (if any) so it does
-        // not hold the port for the rest of its window. On exchange failure the
-        // flow stays pending, so the listener keeps accepting (REQ-MCP-020).
-        if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
-            handle.abort();
-        }
         let config = resolved.config;
-        let owner = owner.or(resolved.owner);
+        let owner = self
+            .restart_oauth_owner(&name, &config, resolved.owner)
+            .await?;
 
         let manager = Arc::clone(self);
         let reconnect_name = name.clone();
@@ -1898,8 +1957,14 @@ impl McpClientManager {
                                 .remove(&reconnect_name);
                         }
                     }
-                    Err(error) => {
-                        handle.fail(epoch, error).await;
+                    Err(failure) => {
+                        handle
+                            .fail_with_teardown_retry(
+                                epoch,
+                                failure.message,
+                                failure.teardown_retry,
+                            )
+                            .await;
                     }
                 }
             } else {
@@ -1917,6 +1982,30 @@ impl McpClientManager {
         });
 
         Ok(name)
+    }
+
+    async fn restart_oauth_owner(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        owner: Option<(SupervisorHandle, u64)>,
+    ) -> Result<Option<(SupervisorHandle, u64)>, String> {
+        // The flow is resolved; stop its loopback listener (if any) so it does
+        // not hold the port for the rest of its window. On exchange failure the
+        // flow stays pending, so the listener keeps accepting (REQ-MCP-020).
+        if let Some(listener) = self.oauth.loopback_listeners.lock().unwrap().remove(name) {
+            listener.abort();
+        }
+        let Some((handle, epoch)) = owner else {
+            return Ok(None);
+        };
+        if handle.snapshot().epoch != epoch {
+            return Ok(None);
+        }
+        let new_epoch = handle.reconfigure(config.clone()).await.map_err(|error| {
+            format!("MCP server '{name}': failed to restart after authorization: {error}")
+        })?;
+        Ok(Some((handle, new_epoch)))
     }
 
     /// Handle an error redirect from the authorization server (the operator
@@ -2153,7 +2242,7 @@ impl McpClientManager {
                         pending.write().await.remove(&connect_name);
                     }
                 }
-                Err(error) => {
+                Err(failure) => {
                     if let Some(url) = pending.read().await.get(&name).cloned() {
                         {
                             let mut flows = oauth.pending.lock().unwrap();
@@ -2161,9 +2250,22 @@ impl McpClientManager {
                                 flow.owner = Some((handle.clone(), epoch));
                             }
                         }
-                        handle.unauthorized(epoch, url, error).await;
+                        handle
+                            .unauthorized_with_teardown_retry(
+                                epoch,
+                                url,
+                                failure.message,
+                                failure.teardown_retry,
+                            )
+                            .await;
                     } else {
-                        handle.fail(epoch, error).await;
+                        handle
+                            .fail_with_teardown_retry(
+                                epoch,
+                                failure.message,
+                                failure.teardown_retry,
+                            )
+                            .await;
                     }
                 }
             }
@@ -2175,9 +2277,9 @@ impl McpClientManager {
         name: String,
         config: McpServerConfig,
         handle: SupervisorHandle,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        let epoch = handle.reconfigure(config.clone()).await.ok()?;
-        Some(self.begin_actor_connect_at_epoch(name, &config, handle, epoch))
+    ) -> Result<tokio::task::JoinHandle<()>, String> {
+        let epoch = handle.reconfigure(config.clone()).await?;
+        Ok(self.begin_actor_connect_at_epoch(name, &config, handle, epoch))
     }
 
     async fn configure_actor(
@@ -2186,10 +2288,13 @@ impl McpClientManager {
         config: McpServerConfig,
         handle: SupervisorHandle,
     ) {
-        if let Some(task) = self.begin_actor_connect(name, config, handle).await {
-            if let Err(error) = task.await {
-                tracing::warn!(error = %error, "MCP connect task failed");
+        match self.begin_actor_connect(name, config, handle).await {
+            Ok(task) => {
+                if let Err(error) = task.await {
+                    tracing::warn!(error = %error, "MCP connect task failed");
+                }
             }
+            Err(error) => tracing::warn!(%error, "MCP server reconfiguration failed"),
         }
     }
 
@@ -2541,11 +2646,24 @@ impl McpClientManager {
                                 pending.write().await.remove(&name);
                             }
                         }
-                        Err(error) => {
+                        Err(failure) => {
                             if let Some(url) = pending.read().await.get(&name).cloned() {
-                                leader.unauthorized(permit.epoch, url, error).await;
+                                leader
+                                    .unauthorized_with_teardown_retry(
+                                        permit.epoch,
+                                        url,
+                                        failure.message,
+                                        failure.teardown_retry,
+                                    )
+                                    .await;
                             } else {
-                                leader.fail(permit.epoch, error).await;
+                                leader
+                                    .fail_with_teardown_retry(
+                                        permit.epoch,
+                                        failure.message,
+                                        failure.teardown_retry,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -2646,8 +2764,15 @@ impl McpClientManager {
                                     ))
                                 }
                             }
-                            Err(error) => {
-                                handle.fail(permit.epoch, error.clone()).await;
+                            Err(failure) => {
+                                let error = failure.message.clone();
+                                handle
+                                    .fail_with_teardown_retry(
+                                        permit.epoch,
+                                        failure.message,
+                                        failure.teardown_retry,
+                                    )
+                                    .await;
                                 Err(McpToolCallError::Failed(error))
                             }
                         }
@@ -2678,7 +2803,19 @@ impl McpClientManager {
                                         retry_handle.publish(reconnect_epoch, server).await;
                                         return;
                                     }
-                                    Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                                    Err(failure) => {
+                                        if failure.teardown_retry.is_some() {
+                                            retry_handle
+                                                .fail_with_teardown_retry(
+                                                    reconnect_epoch,
+                                                    failure.message,
+                                                    failure.teardown_retry,
+                                                )
+                                                .await;
+                                            return;
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                    }
                                 }
                             }
                         });
@@ -2782,11 +2919,16 @@ impl McpClientManager {
         let mut failed = Vec::new();
         let mut removed = Vec::new();
         for name in removed_names {
-            if let Some(handle) = self.servers.write().await.remove(&name) {
+            let handle = { self.servers.read().await.get(&name).cloned() };
+            if let Some(handle) = handle {
                 let pending_flow = self.oauth.pending.lock().unwrap().remove(&name);
-                match self.oauth.store().delete_token(&name).await {
+                let removal = match self.oauth.store().delete_token(&name).await {
+                    Ok(()) => handle.remove().await,
+                    Err(error) => Err(error),
+                };
+                match removal {
                     Ok(()) => {
-                        handle.remove().await;
+                        self.remove_current_handle(&name, &handle).await;
                         if let Some(listener) =
                             self.oauth.loopback_listeners.lock().unwrap().remove(&name)
                         {
@@ -2796,7 +2938,6 @@ impl McpClientManager {
                         removed.push(name);
                     }
                     Err(error) => {
-                        self.servers.write().await.insert(name.clone(), handle);
                         if let Some(flow) = pending_flow {
                             self.oauth
                                 .pending
@@ -2804,11 +2945,11 @@ impl McpClientManager {
                                 .unwrap()
                                 .insert(name.clone(), flow);
                         }
-                        tracing::warn!(server = %name, error = %error, "MCP token deletion failed; server removal aborted");
+                        tracing::warn!(server = %name, %error, "MCP server removal failed; handle retained for teardown retry");
                         failed.push(McpReloadFailure {
                             server: name,
                             action: "remove".to_string(),
-                            error: error.clone(),
+                            error,
                         });
                     }
                 }
@@ -2857,27 +2998,37 @@ impl McpClientManager {
                     (handle, false)
                 }
             };
-            let task = self
+            let task = match self
                 .begin_actor_connect(name.clone(), config, handle.clone())
-                .await;
+                .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    failed.push(McpReloadFailure {
+                        server: name,
+                        action: "restart".to_string(),
+                        error,
+                    });
+                    continue;
+                }
+            };
             if is_restart {
-                if let Some(mut task) = task {
-                    if tokio::time::timeout(RELOAD_RESTART_TIMEOUT, &mut task)
-                        .await
-                        .is_err()
-                    {
-                        let error = format!(
-                            "timed out after {}s restarting changed MCP server",
-                            RELOAD_RESTART_TIMEOUT.as_secs()
-                        );
-                        handle.fail(handle.snapshot().epoch, error.clone()).await;
-                        failed.push(McpReloadFailure {
-                            server: name,
-                            action: "restart".to_string(),
-                            error,
-                        });
-                        continue;
-                    }
+                let mut task = task;
+                if tokio::time::timeout(RELOAD_RESTART_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    let error = format!(
+                        "timed out after {}s restarting changed MCP server",
+                        RELOAD_RESTART_TIMEOUT.as_secs()
+                    );
+                    handle.fail(handle.snapshot().epoch, error.clone()).await;
+                    failed.push(McpReloadFailure {
+                        server: name,
+                        action: "restart".to_string(),
+                        error,
+                    });
+                    continue;
                 }
                 let snapshot = handle.snapshot();
                 match snapshot.state {
@@ -2893,7 +3044,7 @@ impl McpClientManager {
                             .unwrap_or_else(|| "restart did not reach ready".to_string()),
                     }),
                 }
-            } else if let Some(task) = task {
+            } else {
                 self.track_background_task(task);
             }
         }
@@ -2914,10 +3065,34 @@ impl McpClientManager {
         self.reload_from_actor_configs(configs).await
     }
 
+    async fn remove_current_handle(&self, name: &str, removed: &SupervisorHandle) {
+        let mut servers = self.servers.write().await;
+        if servers
+            .get(name)
+            .is_some_and(|current| current.same_actor(removed))
+        {
+            servers.remove(name);
+        }
+    }
+
     pub async fn shutdown(&self) {
-        let handles = std::mem::take(&mut *self.servers.write().await);
-        for (_, handle) in handles {
-            handle.shutdown().await;
+        let _serial = self.reload_serial.lock().await;
+        let handles: Vec<(String, SupervisorHandle)> = self
+            .servers
+            .read()
+            .await
+            .iter()
+            .map(|(name, handle)| (name.clone(), handle.clone()))
+            .collect();
+        for (name, handle) in handles {
+            match handle.shutdown().await {
+                Ok(()) => {
+                    self.remove_current_handle(&name, &handle).await;
+                }
+                Err(error) => {
+                    tracing::warn!(server = %name, %error, "MCP server shutdown failed; handle retained for teardown retry");
+                }
+            }
         }
     }
 }
@@ -2941,7 +3116,7 @@ impl McpClientManager {
         entry: &McpServerConfig,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
         oauth_rt: Arc<OAuthRuntime>,
-    ) -> Result<McpServer, String> {
+    ) -> Result<McpServer, ConnectFailure> {
         // A pre-configured client (Claude Code's `oauth` shape) is seeded only
         // once discovery resolves the authorization server's issuer, since the
         // config does not name it — see `acquire_client_registration`.
@@ -3009,17 +3184,20 @@ impl McpClientManager {
         let Err(failure) = server.handshake().await else {
             return Ok(server);
         };
+        if matches!(failure, HandshakeFailure::Teardown { .. }) {
+            return Err(failure.into_connect_failure(Some(server)));
+        }
         let HandshakeFailure::Unauthorized {
             www_authenticate,
             message,
         } = failure
         else {
-            return Err(failure.to_string());
+            return Err(failure.to_string().into());
         };
         // StaticAuthRejected: there is no interactive flow to recover a
         // rejected config credential into (REQ-MCP-008). Stdio cannot 401.
         let Some(url) = oauth_resource_url(entry) else {
-            return Err(message);
+            return Err(message.into());
         };
 
         // Silent refresh before any re-prompt: a restored token whose access
@@ -3038,13 +3216,14 @@ impl McpClientManager {
                                 // rejected; the grant chain is dead.
                                 let _ = oauth_rt.store().delete_token(name).await;
                             }
-                            Err(other) => return Err(other.to_string()),
+                            Err(other) => return Err(other.into_connect_failure(None)),
                         }
                     }
                     Err(RefreshFailure::Transient(e)) => {
                         return Err(format!(
                             "MCP server '{name}': OAuth token refresh failed: {e}"
-                        ));
+                        )
+                        .into());
                     }
                     Err(RefreshFailure::Rejected(e)) => {
                         tracing::warn!(
@@ -3073,10 +3252,12 @@ impl McpClientManager {
             Vec::new(),
         )
         .await
-        .map_err(|e| format!("MCP server '{name}': OAuth authorization failed: {e}"))?;
-        Err(format!(
-            "MCP server '{name}' requires OAuth authorization; open {auth_url}"
-        ))
+        .map_err(|e| {
+            ConnectFailure::from(format!(
+                "MCP server '{name}': OAuth authorization failed: {e}"
+            ))
+        })?;
+        Err(format!("MCP server '{name}' requires OAuth authorization; open {auth_url}").into())
     }
 
     /// Read all MCP config files in priority order, merging by server name
@@ -3881,6 +4062,77 @@ mod tests {
         notifications: Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
+    struct RetryShutdownTransport {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        failures_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl McpTransport for RetryShutdownTransport {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            _timeout: Duration,
+            _sink: &dyn ServerMessageSink,
+        ) -> Result<Value, TransportError> {
+            Ok(Value::Null)
+        }
+
+        async fn notify(&self, _notification: &Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn requested_protocol_version(&self) -> &'static str {
+            "2024-11-05"
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(TransportError::Disconnected(
+                    "injected manager teardown failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn retry_shutdown_server(failures: usize) -> (McpServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            McpServer {
+                name: "retry".to_string(),
+                transport: Arc::new(RetryShutdownTransport {
+                    attempts: Arc::clone(&attempts),
+                    failures_remaining: std::sync::atomic::AtomicUsize::new(failures),
+                }),
+                tools: std::sync::RwLock::new(Vec::new()),
+                config: McpServerConfig::Stdio {
+                    command: "unused".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    tool_call_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
+                },
+                tools_changed: Arc::new(AtomicBool::new(false)),
+                pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+                oauth_bearer: Arc::default(),
+            },
+            attempts,
+        )
+    }
+
     #[async_trait]
     impl McpTransport for FakeTransport {
         async fn request(
@@ -3929,7 +4181,9 @@ mod tests {
             true
         }
 
-        async fn shutdown(&self) {}
+        async fn shutdown(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     type RequestLog = Arc<std::sync::Mutex<Vec<(String, Value, Duration)>>>;
@@ -4090,6 +4344,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_listener_cleanup_survives_reconfigure_failure() {
+        let manager = McpClientManager::new();
+        let (server, _) = retry_shutdown_server(1);
+        let owner = server_handle(server);
+        let listener = tokio::spawn(std::future::pending::<()>());
+        manager
+            .oauth
+            .loopback_listeners
+            .lock()
+            .unwrap()
+            .insert("retry".to_string(), listener);
+
+        let result = manager
+            .restart_oauth_owner("retry", &owner.snapshot().config, Some((owner, 0)))
+            .await;
+        let Err(error) = result else {
+            panic!("reconfigure failure must propagate");
+        };
+
+        assert!(
+            error.contains("injected manager teardown failure"),
+            "{error}"
+        );
+        assert!(
+            !manager
+                .oauth
+                .loopback_listeners
+                .lock()
+                .unwrap()
+                .contains_key("retry"),
+            "resolved listener ownership is cleared before reconfigure"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_retains_failed_handle_for_retry() {
+        let manager = McpClientManager::new();
+        let (server, attempts) = retry_shutdown_server(1);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("retry".to_string(), server_handle(server));
+
+        manager.shutdown().await;
+        assert!(manager.servers.read().await.contains_key("retry"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        manager.shutdown().await;
+        assert!(!manager.servers.read().await.contains_key("retry"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_reports_failed_remove_and_retains_handle_for_retry() {
+        let manager = McpClientManager::new();
+        let (server, attempts) = retry_shutdown_server(1);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("retry".to_string(), server_handle(server));
+
+        let first = manager.reload_from_configs(Vec::new()).await;
+        assert!(first.removed.is_empty());
+        assert_eq!(first.failed.len(), 1);
+        assert!(manager.servers.read().await.contains_key("retry"));
+
+        let second = manager.reload_from_configs(Vec::new()).await;
+        assert_eq!(second.removed, vec!["retry"]);
+        assert!(second.failed.is_empty());
+        assert!(!manager.servers.read().await.contains_key("retry"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn long_tool_call_does_not_hold_global_server_map_lock() {
         let (exchange, started) =
             witnessed_delayed_exchange(Ok(serde_json::json!({"content": []})), 100);
@@ -4176,9 +4506,9 @@ mod tests {
         let call_result = call.await.expect("call task");
         assert!(
             call_result.is_ok()
-                || call_result
-                    .as_ref()
-                    .is_err_and(|error| error.contains("supervisor stopped")),
+                || call_result.as_ref().is_err_and(|error| {
+                    error.contains("supervisor stopped") || error.contains("cancelled")
+                }),
             "a removal may complete or supersede the already-started call: {call_result:?}"
         );
         let result = reload.await.expect("reload task");
