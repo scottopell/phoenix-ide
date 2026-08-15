@@ -996,7 +996,7 @@ impl MessageStore for InMemoryStorage {
         _job_id: &str,
         _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
         conversation_id: &str,
-        sequence_id: i64,
+        sequence_floor: i64,
         content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&crate::db::UsageData>,
@@ -1020,6 +1020,14 @@ impl MessageStore for InMemoryStorage {
         if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
             return Ok(crate::db::CreationRuntimeMaterialization::ClaimLost);
         }
+        let sequence_id = self.messages.lock().unwrap().get(conversation_id).map_or(
+            sequence_floor + 1,
+            |messages| {
+                sequence_floor
+                    .max(i64::try_from(messages.len()).expect("test message count fits i64"))
+                    + 1
+            },
+        );
         let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),

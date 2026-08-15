@@ -5523,7 +5523,7 @@ impl Database {
         claim: &CreationClaim,
         conversation_id: &str,
         message_id: &str,
-        sequence_id: i64,
+        sequence_floor: i64,
         content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
@@ -5560,6 +5560,14 @@ impl Database {
             tx.rollback().await?;
             return Ok(CreationRuntimeMaterialization::ClaimLost);
         }
+        let sequence_id: i64 = sqlx::query_scalar(
+            "SELECT MAX(COALESCE(MAX(sequence_id), 0), ?2) + 1
+             FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .bind(sequence_floor)
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -11625,7 +11633,7 @@ mod tests {
                 &claim,
                 "conv-runtime-settle",
                 "stale-message",
-                1,
+                0,
                 &MessageContent::user("stale"),
                 None,
                 None,
@@ -11656,6 +11664,53 @@ mod tests {
                 .state,
             ConvState::Provisioning { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn creation_runtime_materialization_allocates_above_sequence_floor() {
+        let db = Database::open_in_memory().await.unwrap();
+        let (claim, now) = setup_runtime_settlement_job(&db).await;
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+
+        let materialized = db
+            .materialize_conversation_creation_runtime(
+                "job-runtime-settle",
+                &claim,
+                "conv-runtime-settle",
+                "initial-message",
+                42,
+                &MessageContent::user("initial"),
+                None,
+                None,
+                &requesting,
+                now,
+            )
+            .await
+            .unwrap();
+        let CreationRuntimeMaterialization::Materialized(message) = materialized else {
+            panic!("current claim must materialize creation runtime");
+        };
+
+        assert_eq!(message.sequence_id, 43);
+        assert_eq!(
+            db.get_messages("conv-runtime-settle").await.unwrap()[0].sequence_id,
+            43
+        );
+        assert!(matches!(
+            db.get_conversation_creation_job("job-runtime-settle")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+        assert_eq!(
+            db.get_conversation("conv-runtime-settle")
+                .await
+                .unwrap()
+                .state,
+            requesting
+        );
     }
 
     #[tokio::test]

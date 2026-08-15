@@ -15,8 +15,9 @@
 
 use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
 use super::{
-    AcknowledgedEventOutcome, SseBroadcaster, SseEvent, SteeringWakeOutcome, SubAgentCancelRequest,
-    SubAgentSpawnRequest, TaskApprovalHandoffData, TaskApprovalHandoffRequest,
+    AcknowledgedEventOutcome, AcknowledgedEventRequest, SseBroadcaster, SseEvent,
+    SteeringWakeOutcome, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
+    TaskApprovalHandoffRequest,
 };
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
@@ -1753,10 +1754,7 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx: mpsc::Receiver<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )>,
+    acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -2158,10 +2156,7 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<(
-            Event,
-            tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-        )>,
+        receiver: mpsc::Receiver<AcknowledgedEventRequest>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
         self
@@ -2371,7 +2366,7 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
-                Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
+                Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
@@ -2379,6 +2374,7 @@ where
                     }
                     let _ = acknowledgement.send(result);
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
+                        let _ = retirement.await;
                         return RuntimeExitDisposition::Interrupted;
                     }
                     if terminal {
@@ -5383,14 +5379,13 @@ where
                 usage_data,
                 message_id,
             } => {
-                let sequence_id = self.broadcast_tx.next_seq();
                 match self
                     .storage
                     .materialize_creation_runtime(
                         &job_id,
                         &claim,
                         &self.context.conversation_id,
-                        sequence_id,
+                        self.broadcast_tx.current_seq(),
                         &content,
                         display_data.as_ref(),
                         usage_data.as_ref(),
@@ -10273,9 +10268,14 @@ mod creation_completion_lifecycle_tests {
             .with_acknowledged_event_receiver(acknowledged_event_rx);
         let runtime_task = tokio::spawn(harness.runtime.run());
         let (ack_tx, ack_rx) = oneshot::channel();
+        let (retirement_tx, retirement_rx) = oneshot::channel();
 
         acknowledged_event_tx
-            .send((creation_event(), ack_tx))
+            .send(AcknowledgedEventRequest {
+                event: creation_event(),
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .unwrap();
 
@@ -10283,6 +10283,7 @@ mod creation_completion_lifecycle_tests {
             ack_rx.await.unwrap(),
             Ok(AcknowledgedEventOutcome::StaleAuthority)
         );
+        retirement_tx.send(()).unwrap();
         assert!(matches!(
             runtime_task.await.unwrap(),
             RuntimeExitDisposition::Interrupted
@@ -10337,8 +10338,13 @@ mod creation_completion_lifecycle_tests {
         let runtime = harness.runtime.run();
         let runtime_task = tokio::spawn(runtime);
         let (ack_tx, mut ack_rx) = oneshot::channel();
+        let (_retirement_tx, retirement_rx) = oneshot::channel();
         acknowledged_event_tx
-            .send((creation_event(), ack_tx))
+            .send(AcknowledgedEventRequest {
+                event: creation_event(),
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .unwrap();
 
