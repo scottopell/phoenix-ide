@@ -596,6 +596,20 @@ impl WorkflowRepository {
         Ok(turn)
     }
 
+    pub async fn list_materialized_active_conversations(&self) -> DbResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT conversation_id FROM durable_turns
+             WHERE terminal_kind IS NULL AND canonical_message_id IS NOT NULL
+             ORDER BY conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("conversation_id"))
+            .collect())
+    }
+
     pub async fn list_discoverable_accepted_turns(
         &self,
         conversation: &ConversationAuthority,

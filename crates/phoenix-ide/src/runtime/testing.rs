@@ -759,6 +759,7 @@ impl InMemoryStorage {
             active.map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
                 active,
                 materialized: true,
+                canonical_message: None,
             });
     }
 
@@ -770,6 +771,7 @@ impl InMemoryStorage {
             Some(crate::runtime::traits::LoadedActiveDirectTurn {
                 active,
                 materialized: false,
+                canonical_message: None,
             });
     }
 

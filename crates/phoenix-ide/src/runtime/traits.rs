@@ -16,10 +16,11 @@ pub struct ActiveDirectTurn {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LoadedActiveDirectTurn {
     pub active: ActiveDirectTurn,
     pub materialized: bool,
+    pub canonical_message: Option<Message>,
 }
 
 #[derive(Debug, Clone)]
@@ -1061,23 +1062,32 @@ impl MessageStore for DatabaseStorage {
         conversation_id: &str,
     ) -> Result<Option<LoadedActiveDirectTurn>, String> {
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        repo.load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
-            conversation_id.to_string(),
-        ))
-        .await
-        .map(|turn| {
-            turn.map(|turn| LoadedActiveDirectTurn {
-                materialized: matches!(
-                    turn.materialization,
-                    phoenix_workflow::Materialization::Materialized { .. }
-                ),
-                active: ActiveDirectTurn {
-                    turn_id: turn.id,
-                    generation: turn.generation,
-                },
-            })
-        })
-        .map_err(|error| error.to_string())
+        let turn = repo
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let canonical_message = match turn.as_ref().map(|turn| &turn.materialization) {
+            Some(phoenix_workflow::Materialization::Materialized { message_id }) => Some(
+                self.db
+                    .get_message_by_id_in_conversation(conversation_id, &message_id.0)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+            _ => None,
+        };
+        Ok(turn.map(|turn| LoadedActiveDirectTurn {
+            materialized: matches!(
+                turn.materialization,
+                phoenix_workflow::Materialization::Materialized { .. }
+            ),
+            active: ActiveDirectTurn {
+                turn_id: turn.id,
+                generation: turn.generation,
+            },
+            canonical_message,
+        }))
     }
 
     async fn settle_active_direct_turn(

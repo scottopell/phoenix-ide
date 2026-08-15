@@ -59,6 +59,7 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum RuntimeExitDisposition {
     Terminal,
     Interrupted,
+    RecoveryRetirement,
 }
 
 struct TerminalTransitionRetry {
@@ -1756,10 +1757,7 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx: mpsc::Receiver<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )>,
+    acknowledged_event_rx: mpsc::Receiver<crate::runtime::AcknowledgedEventEnvelope>,
     broadcast_tx: SseBroadcaster,
     /// Token to cancel running tool execution
     tool_cancel_token: Option<CancellationToken>,
@@ -2160,10 +2158,7 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<(
-            Event,
-            tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-        )>,
+        receiver: mpsc::Receiver<crate::runtime::AcknowledgedEventEnvelope>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
         self
@@ -2356,7 +2351,11 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
-                Some((event, acknowledgement)) = self.acknowledged_event_rx.recv() => {
+                Some(crate::runtime::AcknowledgedEventEnvelope {
+                    event,
+                    acknowledgement,
+                    retirement,
+                }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
@@ -2371,7 +2370,8 @@ where
                         return RuntimeExitDisposition::Terminal;
                     }
                     if recreate {
-                        return RuntimeExitDisposition::Interrupted;
+                        let _ = retirement.await;
+                        return RuntimeExitDisposition::RecoveryRetirement;
                     }
                 }
                 Some(event) = self.event_rx.recv() => {
@@ -4867,7 +4867,7 @@ where
                                 DirectTurnMaterializationDisposition::RecoveryUnsettled;
                             self.recovery_disposition =
                                 RuntimeRecoveryDisposition::RecreateFromDatabase;
-                            drop(reserved_broadcast_range);
+                            reserved_broadcast_range.handoff();
                             return Err(format!(
                                 "direct-turn authoritative materialization failed ambiguously: \
                                  {primary_error}; reconciliation failed: {reconciliation_error}"
@@ -4905,7 +4905,7 @@ where
                                 DirectTurnMaterializationDisposition::RecoveryUnsettled;
                             self.recovery_disposition =
                                 RuntimeRecoveryDisposition::RecreateFromDatabase;
-                            drop(reserved_broadcast_range);
+                            reserved_broadcast_range.handoff();
                             return Err(format!(
                                 "direct-turn reconciliation returned canonical sequence {} \
                                  for reserved sequence {sequence_id}",

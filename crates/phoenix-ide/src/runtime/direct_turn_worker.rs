@@ -110,6 +110,17 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
     }
 
     pub(crate) async fn run_once(&self) -> Result<Duration, String> {
+        for conversation_id in self
+            .repo
+            .list_materialized_active_conversations()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.dispatcher
+                .reconstruct(&conversation_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let mut cursor = None;
         loop {
             let page = self
@@ -296,6 +307,8 @@ fn authority_to_event(
 
 #[async_trait]
 pub(crate) trait DirectTurnDispatcher: Send + Sync + 'static {
+    async fn reconstruct(&self, conversation_id: &str) -> Result<(), DirectTurnDispatchError>;
+
     async fn dispatch(
         &self,
         conversation_id: &str,
@@ -309,6 +322,14 @@ struct ProductionDirectTurnDispatcher {
 
 #[async_trait]
 impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
+    async fn reconstruct(&self, conversation_id: &str) -> Result<(), DirectTurnDispatchError> {
+        self.manager
+            .get_or_create(conversation_id)
+            .await
+            .map(|_| ())
+            .map_err(DirectTurnDispatchError::RecoveryUnsettled)
+    }
+
     async fn dispatch(
         &self,
         conversation_id: &str,
@@ -384,6 +405,10 @@ mod tests {
 
     #[async_trait]
     impl DirectTurnDispatcher for RecordingDispatcher {
+        async fn reconstruct(&self, _conversation_id: &str) -> Result<(), DirectTurnDispatchError> {
+            Ok(())
+        }
+
         async fn dispatch(
             &self,
             conversation_id: &str,

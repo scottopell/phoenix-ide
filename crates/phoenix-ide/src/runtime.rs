@@ -163,6 +163,7 @@ pub(crate) enum AcknowledgedEventOutcome {
     DirectTurnTemporarilyInadmissible,
     DirectTurnPostMaterializationFailed(String),
     DirectTurnRecoveryUnsettled(String),
+    DirectTurnRecovered,
     SteeringWake(SteeringWakeOutcome),
 }
 
@@ -366,13 +367,16 @@ enum BashLifecycleBridgeAction {
 }
 
 /// Handle to interact with a running conversation
+pub(crate) struct AcknowledgedEventEnvelope {
+    pub event: Event,
+    pub acknowledgement: tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    pub retirement: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub(crate) acknowledged_event_tx: mpsc::Sender<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventEnvelope>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -655,6 +659,12 @@ struct BroadcastGate {
 pub struct ReservedBroadcastRange {
     broadcaster: SseBroadcaster,
     active: bool,
+}
+
+impl ReservedBroadcastRange {
+    pub fn handoff(mut self) {
+        self.active = false;
+    }
 }
 
 impl Drop for ReservedBroadcastRange {
@@ -3423,6 +3433,12 @@ impl RuntimeManager {
         )
         .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
+            if let Some(message) = loaded.canonical_message.clone() {
+                broadcaster
+                    .send_persisted_message(message)
+                    .map_err(|()| "failed to replay canonical direct-turn message".to_string())?;
+                broadcaster.release_reserved_range();
+            }
             let recovered_terminal = if loaded.materialized {
                 match &initial_state {
                     ConvState::Idle | ConvState::HandedOff { .. } => {
@@ -3622,11 +3638,15 @@ impl RuntimeManager {
             // not evict that replacement.
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                let mut reservations = manager_for_cleanup.evicted_broadcasters.write().await;
                 if runtimes
                     .get(&conv_id)
                     .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
                 {
-                    runtimes.remove(&conv_id);
+                    let retired = runtimes.remove(&conv_id).expect("identity-checked runtime");
+                    if disposition == executor::RuntimeExitDisposition::RecoveryRetirement {
+                        reservations.insert(conv_id.clone(), retired.broadcast_tx);
+                    }
                     true
                 } else {
                     false
@@ -3775,7 +3795,9 @@ impl RuntimeManager {
         event: Event,
     ) -> Result<(), DirectTurnDispatchError> {
         match self.send_acknowledged_event(conversation_id, event).await {
-            Ok(AcknowledgedEventOutcome::Settled) => Ok(()),
+            Ok(
+                AcknowledgedEventOutcome::Settled | AcknowledgedEventOutcome::DirectTurnRecovered,
+            ) => Ok(()),
             Ok(AcknowledgedEventOutcome::DirectTurnClaimLost) => {
                 Err(DirectTurnDispatchError::ClaimLost)
             }
@@ -3821,22 +3843,45 @@ impl RuntimeManager {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((event, ack_tx))
+            .send(AcknowledgedEventEnvelope {
+                event,
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| error.to_string())?;
         let mut result = ack_rx
             .await
             .map_err(|_| "runtime stopped before event settled".to_string())?;
-        if let Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(error)) = &mut result {
+        if let Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(error)) = result {
             self.retire_acknowledged_runtime(conversation_id, &handle)
                 .await;
-            if let Err(reconstruction_error) = self.get_or_create(conversation_id).await {
-                error.push_str("; runtime reconstruction failed: ");
-                error.push_str(&reconstruction_error);
+            let mut reconstruction_error = None;
+            let mut reconstructed = false;
+            for _ in 0..3 {
+                match self.get_or_create(conversation_id).await {
+                    Ok(_) => {
+                        reconstructed = true;
+                        break;
+                    }
+                    Err(current_error) => reconstruction_error = Some(current_error),
+                }
             }
+            result = if reconstructed {
+                Ok(AcknowledgedEventOutcome::DirectTurnRecovered)
+            } else {
+                Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(
+                    format!(
+                        "{error}; runtime reconstruction failed: {}",
+                        reconstruction_error.unwrap_or_else(|| "unknown error".to_string())
+                    ),
+                ))
+            };
         }
+        let _ = retirement_tx.send(());
         result
     }
 
@@ -3876,15 +3921,22 @@ impl RuntimeManager {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((event, ack_tx))
+            .send(AcknowledgedEventEnvelope {
+                event,
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| error.to_string())?;
-        ack_rx
+        let result = ack_rx
             .await
             .map_err(|_| "runtime stopped before event settled".to_string())?
-            .map(|_| ())
+            .map(|_| ());
+        let _ = retirement_tx.send(());
+        result
     }
 
     pub async fn admit_continuation_retry(
@@ -3908,15 +3960,22 @@ impl RuntimeManager {
         }
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((Event::UserTriggerContinuation { operation_id }, ack_tx))
+            .send(AcknowledgedEventEnvelope {
+                event: Event::UserTriggerContinuation { operation_id },
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
-        ack_rx
+        let result = ack_rx
             .await
             .map_err(|_| "Continuation runtime stopped before admission settled".to_string())?
-            .map(|_| ())
+            .map(|_| ());
+        let _ = retirement_tx.send(());
+        result
     }
 
     /// Queue a steering message to be delivered when the conversation next
@@ -5486,10 +5545,7 @@ mod scope_liveness_tests {
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )> {
+    ) -> mpsc::Receiver<AcknowledgedEventEnvelope> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -5522,7 +5578,9 @@ mod scope_liveness_tests {
                     .await
             })
         };
-        let (_event, acknowledgement) = tokio::time::timeout(
+        let AcknowledgedEventEnvelope {
+            acknowledgement, ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acknowledged_event_rx.recv(),
         )
@@ -5646,27 +5704,36 @@ mod scope_liveness_tests {
         let cleanup_release = Arc::new(tokio::sync::Notify::new());
         let cleanup_release_for_actor = Arc::clone(&cleanup_release);
         tokio::spawn(async move {
-            let (_, acknowledgement) = acknowledged_event_rx
-                .recv()
-                .await
-                .expect("acknowledged event");
+            let AcknowledgedEventEnvelope {
+                acknowledgement,
+                retirement,
+                ..
+            } = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                acknowledged_event_rx.recv(),
+            )
+            .await
+            .expect("acknowledged event timeout")
+            .expect("acknowledged event");
             acknowledgement
                 .send(Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(
                     "settlement remains owed".to_string(),
                 )))
                 .expect("acknowledgement receiver");
-            cleanup_release_for_actor.notified().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retirement).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                cleanup_release_for_actor.notified(),
+            )
+            .await
+            .expect("cleanup release timeout");
         });
 
         let outcome = manager
             .send_direct_turn_event(conversation_id, Event::Shutdown)
             .await;
 
-        assert!(matches!(
-            outcome,
-            Err(DirectTurnDispatchError::RecoveryUnsettled(ref error))
-                if error == "settlement remains owed"
-        ));
+        assert!(outcome.is_ok(), "unexpected outcome: {outcome:?}");
         let replacement = manager
             .try_get_handle(conversation_id)
             .await

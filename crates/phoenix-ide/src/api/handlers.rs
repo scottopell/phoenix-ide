@@ -11818,10 +11818,11 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("persist steering queue");
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((
-                Event::SteerMessage {
+            .send(crate::runtime::AcknowledgedEventEnvelope {
+                event: Event::SteerMessage {
                     text: entry.text.clone(),
                     llm_text: entry.llm_text.clone(),
                     images: entry.images.clone(),
@@ -11830,14 +11831,16 @@ pub(crate) mod hard_delete_cascade_tests {
                     user_agent: entry.user_agent.clone(),
                     skill_invocation: entry.skill_invocation.clone(),
                 },
-                ack_tx,
-            ))
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .expect("notify runtime of queued steering");
         ack_rx
             .await
             .expect("runtime acknowledges steering notification")
             .expect("steering notification defers cleanly");
+        let _ = retirement_tx.send(());
         assert!(matches!(*handle.state_rx.borrow(), ConvState::Idle));
         assert_eq!(
             state
