@@ -2362,9 +2362,16 @@ where
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
                     }
+                    let recreate = matches!(
+                        result,
+                        Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(_))
+                    );
                     let _ = acknowledgement.send(result);
                     if terminal {
                         return RuntimeExitDisposition::Terminal;
+                    }
+                    if recreate {
+                        return RuntimeExitDisposition::Interrupted;
                     }
                 }
                 Some(event) = self.event_rx.recv() => {

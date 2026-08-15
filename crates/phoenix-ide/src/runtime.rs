@@ -3795,6 +3795,24 @@ impl RuntimeManager {
         }
     }
 
+    async fn retire_acknowledged_runtime(
+        &self,
+        conversation_id: &str,
+        handle: &ConversationHandle,
+    ) {
+        let mut runtimes = self.runtimes.write().await;
+        let mut reservations = self.evicted_broadcasters.write().await;
+        if runtimes
+            .get(conversation_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.identity, &handle.identity))
+        {
+            let retired = runtimes
+                .remove(conversation_id)
+                .expect("identity-checked runtime exists");
+            reservations.insert(conversation_id.to_string(), retired.broadcast_tx);
+        }
+    }
+
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -3808,9 +3826,18 @@ impl RuntimeManager {
             .send((event, ack_tx))
             .await
             .map_err(|error| error.to_string())?;
-        ack_rx
+        let mut result = ack_rx
             .await
-            .map_err(|_| "runtime stopped before event settled".to_string())?
+            .map_err(|_| "runtime stopped before event settled".to_string())?;
+        if let Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(error)) = &mut result {
+            self.retire_acknowledged_runtime(conversation_id, &handle)
+                .await;
+            if let Err(reconstruction_error) = self.get_or_create(conversation_id).await {
+                error.push_str("; runtime reconstruction failed: ");
+                error.push_str(&reconstruction_error);
+            }
+        }
+        result
     }
 
     pub(crate) async fn wake_deferred_steering(
@@ -5583,6 +5610,80 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Idle
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledged_recovery_reconstructs_before_return_despite_blocked_old_cleanup() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(llm).await);
+        let conversation_id = "direct-turn-recovery-retirement";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, mut acknowledged_event_rx) = mpsc::channel(1);
+        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let mut events = broadcaster.subscribe();
+        let (_state_tx, state_rx) = watch::channel(ConvState::LlmRequesting { attempt: 1 });
+        let retired = ConversationHandle {
+            event_tx,
+            acknowledged_event_tx,
+            turn_trigger: TurnTriggerSlot::default(),
+            broadcast_tx: broadcaster,
+            identity: Arc::new(()),
+            state_rx,
+        };
+        manager
+            .runtimes
+            .write()
+            .await
+            .insert(conversation_id.to_string(), retired.clone());
+        let cleanup_release = Arc::new(tokio::sync::Notify::new());
+        let cleanup_release_for_actor = Arc::clone(&cleanup_release);
+        tokio::spawn(async move {
+            let (_, acknowledgement) = acknowledged_event_rx
+                .recv()
+                .await
+                .expect("acknowledged event");
+            acknowledgement
+                .send(Ok(AcknowledgedEventOutcome::DirectTurnRecoveryUnsettled(
+                    "settlement remains owed".to_string(),
+                )))
+                .expect("acknowledgement receiver");
+            cleanup_release_for_actor.notified().await;
+        });
+
+        let outcome = manager
+            .send_direct_turn_event(conversation_id, Event::Shutdown)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(DirectTurnDispatchError::RecoveryUnsettled(ref error))
+                if error == "settlement remains owed"
+        ));
+        let replacement = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("replacement registered before acknowledgement returns");
+        assert!(!Arc::ptr_eq(&retired.identity, &replacement.identity));
+        assert!(retired.broadcast_tx.same_channel(&replacement.broadcast_tx));
+        assert!(events.try_recv().is_err());
+
+        manager
+            .retire_acknowledged_runtime(conversation_id, &retired)
+            .await;
+        let current = manager
+            .try_get_handle(conversation_id)
+            .await
+            .expect("late old cleanup preserves replacement");
+        assert!(Arc::ptr_eq(&current.identity, &replacement.identity));
+        cleanup_release.notify_one();
     }
 
     #[tokio::test]
