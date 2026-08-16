@@ -175,10 +175,8 @@ mod tests {
         Conversation {
             id: "owner".into(),
             product_conversation_id:
-                phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                    "owner".into().to_string(),
-                )
-                .expect("conversation id is non-empty"),
+                phoenix_core::domain::product_conversation::ProductConversationId::parse("owner")
+                    .expect("conversation id is non-empty"),
             slug: Some("owner".into()),
             title: Some("Owner".into()),
             cwd: "/tmp".into(),

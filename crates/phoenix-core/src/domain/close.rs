@@ -1187,7 +1187,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn transcript_conversation_id_is_distinct_and_round_trips() {
         let id = TranscriptConversationId::parse("leaf-1").unwrap();
         assert_eq!(id.as_str(), "leaf-1");

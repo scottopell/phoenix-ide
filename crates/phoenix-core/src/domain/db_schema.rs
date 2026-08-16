@@ -1982,10 +1982,7 @@ mod conversation_serde_tests {
     fn fixture(continued_in_conv_id: Option<String>) -> Conversation {
         Conversation {
             id: "conv-1".to_string(),
-            product_conversation_id:
-                phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                    "conv-1".to_string().to_string(),
-                )
+            product_conversation_id: ProductConversationId::parse("conv-1")
                 .expect("conversation id is non-empty"),
             slug: Some("test-conv".to_string()),
             title: Some("Test Conv".to_string()),

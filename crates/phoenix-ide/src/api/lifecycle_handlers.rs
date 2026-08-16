@@ -757,6 +757,9 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
+                    .unwrap(),
             slug: Some(format!("slug-{id}")),
             title: Some(format!("Title {id}")),
             cwd: "/tmp/work".to_string(),

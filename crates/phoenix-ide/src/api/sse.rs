@@ -499,6 +499,11 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-1".to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "product-conv-1",
+                )
+                .unwrap(),
             slug: Some("test-conv".to_string()),
             title: Some("Test Conversation".to_string()),
             cwd: "/tmp/work".to_string(),
