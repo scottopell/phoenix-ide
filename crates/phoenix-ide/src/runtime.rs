@@ -679,6 +679,13 @@ impl Drop for ReservedBroadcastRange {
     }
 }
 
+impl ReservedBroadcastRange {
+    fn abandon(mut self) {
+        self.broadcaster.abandon();
+        self.active = false;
+    }
+}
+
 /// Per-conversation SSE broadcaster with monotonic `sequence_id` allocation.
 ///
 /// Every [`SseEvent`] emitted for a conversation carries a `sequence_id` drawn

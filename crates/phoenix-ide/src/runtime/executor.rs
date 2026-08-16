@@ -4723,7 +4723,6 @@ where
                 }
                 let (reserved_broadcast_range, reserved_seqs) =
                     self.broadcast_tx.reserve_next_persisted_message_range(1);
-                let _reserved_broadcast_range = reserved_broadcast_range;
                 let materialization = self
                     .storage
                     .materialize_authoritative_user_message(
@@ -4744,6 +4743,7 @@ where
                         self.direct_turn_materialization_aborted = true;
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                        reserved_broadcast_range.abandon();
                         tracing::warn!(conversation_id = %self.context.conversation_id, %error, "direct-turn materialization adapter failed after sequence reservation; abandoning stream incarnation");
                         return Ok(None);
                     }
@@ -4755,6 +4755,7 @@ where
                     } => {
                         self.active_direct_turn = Some(Box::new(active));
                         let _ = self.broadcast_tx.send_message(*message);
+                        drop(reserved_broadcast_range);
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
@@ -4764,6 +4765,7 @@ where
                         self.direct_turn_materialization_aborted = true;
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                        reserved_broadcast_range.abandon();
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::Ambiguous { error } => {
@@ -4775,6 +4777,7 @@ where
                         self.direct_turn_materialization_aborted = true;
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                        reserved_broadcast_range.abandon();
                         Ok(None)
                     }
                 }
@@ -10597,25 +10600,36 @@ mod authoritative_user_message_effect_tests {
             },
         ];
         for outcome in outcomes {
-            let (mut rt, _storage, mut rx) =
+            let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, outcome);
             let broadcaster = rt.broadcast_tx.clone();
-            rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-                payload: payload("msg-direct"),
-                authority: authority(),
-                idempotent: true,
-            })
-            .await
-            .unwrap();
+            let (materialization_started, release_materialization) =
+                storage.gate_authoritative_user_message_materialization();
+            let (result, ()) = tokio::join!(
+                rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+                    payload: payload("msg-direct"),
+                    authority: authority(),
+                    idempotent: true,
+                }),
+                async {
+                    materialization_started.await.expect("reservation active");
+                    broadcaster
+                        .send_seq(|sequence_id| SseEvent::AgentDone { sequence_id })
+                        .expect("concurrent event queues above reservation");
+                    release_materialization
+                        .send(())
+                        .expect("release materialization");
+                }
+            );
+            result.unwrap();
 
-            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-            assert_eq!(broadcaster.current_seq(), 1);
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
+            assert_eq!(broadcaster.current_seq(), 2);
             assert!(broadcaster.snapshot_pending().3.is_empty());
             assert_eq!(
                 rt.run().await,
                 RuntimeExitDisposition::AbandonStreamIncarnation
             );
-            broadcaster.abandon();
             assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
         }
 
@@ -10625,21 +10639,32 @@ mod authoritative_user_message_effect_tests {
         );
         storage.queue_materialize_authoritative_user_message_error("adapter failure");
         let broadcaster = rt.broadcast_tx.clone();
-        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
-            authority: authority(),
-            idempotent: true,
-        })
-        .await
-        .unwrap();
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-        assert_eq!(broadcaster.current_seq(), 1);
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let (result, ()) = tokio::join!(
+            rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: true,
+            }),
+            async {
+                materialization_started.await.expect("reservation active");
+                broadcaster
+                    .send_seq(|sequence_id| SseEvent::AgentDone { sequence_id })
+                    .expect("concurrent event queues above reservation");
+                release_materialization
+                    .send(())
+                    .expect("release materialization");
+            }
+        );
+        result.unwrap();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
+        assert_eq!(broadcaster.current_seq(), 2);
         assert!(broadcaster.snapshot_pending().3.is_empty());
         assert_eq!(
             rt.run().await,
             RuntimeExitDisposition::AbandonStreamIncarnation
         );
-        broadcaster.abandon();
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
     }
 
@@ -11710,7 +11735,10 @@ mod authoritative_user_message_effect_tests {
             .await
             .unwrap();
 
-            assert_no_broadcast(&mut rx);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+            ));
             assert_eq!(
                 storage
                     .recorded_materialize_authoritative_user_message_calls()
