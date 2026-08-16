@@ -2,7 +2,7 @@
 // Simplified: Pure get/put storage, no TTL or staleness logic
 
 import { generateUUID } from './utils/uuid';
-import type { Conversation, ConversationReplicaMeta, FileAttachment, ImageData, Message } from './api';
+import type { Conversation, FileAttachment, ImageData } from './api';
 
 const DB_NAME = 'phoenix-ide-cache';
 const DB_VERSION = 2;
@@ -31,8 +31,6 @@ export interface PendingOperation {
   retryCount: number;
   status: 'pending' | 'processing' | 'failed';
 }
-
-export type ReplicaMeta = ConversationReplicaMeta;
 
 export class CacheDB {
   private db: IDBDatabase | null = null;
@@ -215,113 +213,8 @@ export class CacheDB {
 
   async deleteConversation(id: string): Promise<void> {
     await this.init();
-    const tx = this.db!.transaction(['conversations', 'messages', 'replicaMeta'], 'readwrite');
-    
-    // Delete conversation
+    const tx = this.db!.transaction(['conversations'], 'readwrite');
     tx.objectStore('conversations').delete(id);
-    
-    // Delete all messages for this conversation
-    const msgStore = tx.objectStore('messages');
-    const index = msgStore.index('by-conversation');
-    const range = IDBKeyRange.only(id);
-    const request = index.openCursor(range);
-    
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (cursor) {
-        cursor.delete();
-        cursor.continue();
-      }
-    };
-
-    tx.objectStore('replicaMeta').delete(id);
-  }
-
-  // Messages - simple get/put
-  async getMessages(conversationId: string): Promise<Message[]> {
-    await this.init();
-    const tx = this.db!.transaction(['messages'], 'readonly');
-    const store = tx.objectStore('messages');
-    const index = store.index('by-conversation');
-    const range = IDBKeyRange.only(conversationId);
-    
-    return new Promise((resolve) => {
-      const request = index.getAll(range);
-      
-      request.onsuccess = () => {
-        const messages: Message[] = request.result || [];
-        // Sort by sequence
-        resolve(messages.toSorted((a, b) => a.sequence_id - b.sequence_id));
-      };
-      
-      request.onerror = () => resolve([]);
-    });
-  }
-
-  async putMessage(message: Message): Promise<void> {
-    await this.init();
-    const tx = this.db!.transaction(['messages'], 'readwrite');
-    const store = tx.objectStore('messages');
-    store.put(message);
-  }
-
-  async putMessages(messages: Message[]): Promise<void> {
-    await this.init();
-    const tx = this.db!.transaction(['messages'], 'readwrite');
-    const store = tx.objectStore('messages');
-    for (const message of messages) {
-      store.put(message);
-    }
-  }
-
-  async replaceMessages(conversationId: string, messages: Message[]): Promise<void> {
-    await this.init();
-    const tx = this.db!.transaction(['messages'], 'readwrite');
-    const store = tx.objectStore('messages');
-    const index = store.index('by-conversation');
-    const request = index.openKeyCursor(IDBKeyRange.only(conversationId));
-    await new Promise<void>((resolve, reject) => {
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor) {
-          store.delete(cursor.primaryKey);
-          cursor.continue();
-          return;
-        }
-        for (const message of messages) store.put(message);
-      };
-      request.onerror = () => reject(request.error ?? new Error('Failed to replace cached messages'));
-      tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error ?? new Error('Failed to replace cached messages'));
-    });
-  }
-
-  async getLatestCachedMessages(conversationId: string, limit: number): Promise<Message[]> {
-    const messages = await this.getMessages(conversationId);
-    return messages.toSorted((a, b) => b.sequence_id - a.sequence_id).slice(0, limit);
-  }
-
-  async getMaxMessageSequenceId(conversationId: string): Promise<number | null> {
-    const messages = await this.getLatestCachedMessages(conversationId, 1);
-    return messages[0]?.sequence_id ?? null;
-  }
-
-  async getReplicaMeta(conversationId: string): Promise<ReplicaMeta | null> {
-    await this.init();
-    const tx = this.db!.transaction(['replicaMeta'], 'readonly');
-    const store = tx.objectStore('replicaMeta');
-    return new Promise((resolve) => {
-      const request = store.get(conversationId);
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => resolve(null);
-    });
-  }
-
-  async putReplicaMeta(meta: ReplicaMeta): Promise<void> {
-    await this.init();
-    const tx = this.db!.transaction(['replicaMeta'], 'readwrite');
-    const store = tx.objectStore('replicaMeta');
-    store.put(meta);
   }
 
   // Pending operations for offline support

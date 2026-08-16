@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -25,7 +25,6 @@ import {
 import { transcriptPositioningInputFromHistoryExpansion } from '../conversation/transcriptPositioning';
 import { transcriptCoverageAfterInit } from '../conversation/atom';
 import { resolveOwnedConversationTarget } from '../conversation/conversationNavigation';
-import { messageCacheWrite } from '../conversation/messageCachePersistence';
 import {
   buildHistoricalUnits,
   findHistoricalUnitIndexByMessageId,
@@ -222,10 +221,6 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
       </div>
     </div>
   );
-}
-
-function latestMessageSequenceId(messages: { sequence_id: number }[]): number | null {
-  return messages.length > 0 ? messages[messages.length - 1]?.sequence_id ?? null : null;
 }
 
 function ConversationPageContent({
@@ -466,15 +461,12 @@ function ConversationPageContent({
   // conversation. Honest UI: if the new conversation's data isn't ready, the
   // `if (!conversation)` early-return below paints a clean skeleton.
   //
-  // Refs (sendingMessagesRef, seedHydratedRef, cachedMessagesRef) are also
+  // Refs (sendingMessagesRef and seedHydratedRef) are also
   // reset here. Mutating .current during render is safe because refs don't
   // trigger re-renders. The refs live alongside this block (vs. their
   // original declaration sites further down the file) so the reset can see
   // them and the contract "these are per-slug state" is colocated.
   const seedHydratedRef = useRef<string | null>(null);
-  const cachedMessagesRef = useRef<readonly Message[]>([]);
-  const cachedRowsGenerationRef = useRef<number | null>(null);
-  const cacheWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [lastSlug, setLastSlug] = useState<string | undefined>(slug);
   if (lastSlug !== slug) {
     setLastSlug(slug);
@@ -494,9 +486,6 @@ function ConversationPageContent({
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
-    cachedMessagesRef.current = [];
-    cachedRowsGenerationRef.current = null;
-    cacheWriteQueueRef.current = Promise.resolve();
   }
   // Terminal split-pane height — collapses to a 32px header strip.
   // Default collapsed: most conversations don't use the terminal, and an
@@ -920,7 +909,6 @@ function ConversationPageContent({
           ) >= 0,
         commandToken: ++historyCommandTokenRef.current,
       });
-      await cacheDB.putMessages(result.messages);
     } catch (err) {
       console.warn('Failed to load earlier conversation history:', err);
       dispatchHistoryExpansion({
@@ -1078,39 +1066,6 @@ function ConversationPageContent({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [terminalPane]);
-
-  useEffect(() => {
-    if (!atom.conversationId || atom.transcriptGeneration === null) return;
-    const generationChanged = cachedRowsGenerationRef.current !== atom.transcriptGeneration;
-    const cacheWrite = messageCacheWrite(
-      atom.conversationId,
-      cachedMessagesRef.current,
-      atom.messages,
-      generationChanged,
-    );
-    cachedMessagesRef.current = atom.messages;
-    cachedRowsGenerationRef.current = atom.transcriptGeneration;
-    if (cacheWrite.kind === 'append' && cacheWrite.messages.length === 0) return;
-    const conversationId = atom.conversationId;
-    const transcriptGeneration = atom.transcriptGeneration;
-    const latestSequenceId = latestMessageSequenceId(atom.messages);
-    cacheWriteQueueRef.current = cacheWriteQueueRef.current
-      .catch(() => undefined)
-      .then(async () => {
-        if (cacheWrite.kind === 'replace') {
-          await cacheDB.replaceMessages(cacheWrite.conversationId, cacheWrite.messages);
-        } else {
-          await cacheDB.putMessages(cacheWrite.messages);
-        }
-        await cacheDB.putReplicaMeta({
-          conversationId,
-          latestMessageSequenceId: latestSequenceId,
-          latestEventSequenceId: null,
-          transcriptGeneration,
-          lastHydratedAt: new Date().toISOString(),
-        });
-      });
-  }, [atom.conversationId, atom.messages, atom.transcriptGeneration]);
 
   // Cache conversation metadata when it changes
   useEffect(() => {

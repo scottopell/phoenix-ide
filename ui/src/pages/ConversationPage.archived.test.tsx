@@ -50,15 +50,9 @@ vi.mock('../cache', () => ({
   cacheDB: {
     getConversation: vi.fn(() => Promise.resolve(null)),
     getConversationBySlug: vi.fn(() => Promise.resolve(null)),
-    getMessages: vi.fn(() => Promise.resolve([])),
-    getMaxMessageSequenceId: vi.fn(() => Promise.resolve(null)),
     getAllConversations: vi.fn(() => Promise.resolve([])),
-    getReplicaMeta: vi.fn(() => Promise.resolve(null)),
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
-    putMessages: vi.fn(() => Promise.resolve()),
-    replaceMessages: vi.fn(() => Promise.resolve()),
-    putReplicaMeta: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -1021,9 +1015,6 @@ describe('ConversationPage archived read-only rendering', () => {
   it('resolves a UUID route by id before opening its stream', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-archived', archived: true });
-    const uuidHistoryMessage = { ...historyMessage, conversation_id: uuidRoute } as Message;
-    vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([uuidHistoryMessage]);
     vi.mocked(api.getConversationRoute).mockResolvedValue({
       id: uuidConversation.id,
       slug: uuidConversation.slug,
@@ -1040,10 +1031,7 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
-  it('opens the authoritative stream without waiting for IndexedDB hydration', async () => {
-    vi.mocked(cacheDB.getConversationBySlug).mockReturnValue(new Promise(() => {}));
-    vi.mocked(cacheDB.getConversation).mockReturnValue(new Promise(() => {}));
-    vi.mocked(cacheDB.getMessages).mockReturnValue(new Promise(() => {}));
+  it('opens the authoritative stream without accessing transcript IndexedDB stores', async () => {
     const conversation = makeConversation();
 
     renderPage(conversation);
@@ -1055,7 +1043,6 @@ describe('ConversationPage archived read-only rendering', () => {
     });
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
     expect(cacheDB.getConversation).not.toHaveBeenCalled();
-    expect(cacheDB.getMessages).not.toHaveBeenCalled();
   });
 
   it('keeps a direct ID route when the authoritative conversation has no slug', async () => {
@@ -1129,10 +1116,9 @@ describe('ConversationPage archived read-only rendering', () => {
       expect(options.conversationId).toBe(authoritativeConversation.id);
     });
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
-    expect(cacheDB.getMessages).not.toHaveBeenCalled();
   });
 
-  it('surfaces route failure without falling back to transcript IndexedDB', async () => {
+  it('surfaces route failure without a transcript cache fallback', async () => {
     vi.mocked(api.getConversationRouteBySlug).mockRejectedValue(new Error('temporary route failure'));
 
     render(
@@ -1151,14 +1137,11 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('temporary route failure')).toBeInTheDocument();
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
-    expect(cacheDB.getMessages).not.toHaveBeenCalled();
   });
 
   it('does not send cached reconnect credentials to a different route owner', async () => {
     const staleConversation = makeConversation({ id: 'stale-owner', transcript_generation: 9 });
     const authoritativeConversation = makeConversation({ id: 'authoritative-owner' });
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([{ ...historyMessage, conversation_id: staleConversation.id }]);
     vi.mocked(api.getConversationRouteBySlug).mockResolvedValue({
       id: authoritativeConversation.id,
       slug: authoritativeConversation.slug,
@@ -1204,8 +1187,6 @@ describe('ConversationPage archived read-only rendering', () => {
   it('resolves an offline route when connectivity returns', async () => {
     const online = vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
     const conversation = makeConversation();
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(conversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
 
     renderPage(conversation);
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
@@ -1230,8 +1211,6 @@ describe('ConversationPage archived read-only rendering', () => {
       ...catchUpMessage,
       content: [{ type: 'text', text: 'authoritative SSE tail' }],
     } as Message;
-    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
 
     const { store } = renderPage(cachedConversation);
 

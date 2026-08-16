@@ -686,14 +686,6 @@ export interface ConversationMessagesAroundResponse {
   server_message_tail: number | null;
 }
 
-export interface ConversationReplicaMeta {
-  conversationId: string;
-  latestMessageSequenceId: number | null;
-  latestEventSequenceId: number | null;
-  transcriptGeneration: number | null;
-  lastHydratedAt: string;
-}
-
 export type MessageContent = 
   | { text: string; images?: ImageData[]; files?: FileAttachment[] }  // user message
   | ContentBlock[]  // agent message
