@@ -777,10 +777,33 @@ mod tests {
     /// Mirror of the `chain_qa` test helper — builds a linear chain and
     /// links `continued_in_conv_id` between successive members.
     async fn build_linear_chain(db: &Database, ids: &[&str]) {
-        for id in ids {
-            db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-                .await
-                .unwrap();
+        let root_id = ids[0];
+        let root = db
+            .create_conversation(
+                root_id,
+                &format!("slug-{root_id}"),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for id in &ids[1..] {
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, user_initiated, runtime_role,
+                     state_updated_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?4, ?4)",
+            )
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .bind(format!("slug-{id}"))
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .unwrap();
         }
         for pair in ids.windows(2) {
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
