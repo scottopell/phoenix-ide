@@ -73,7 +73,7 @@ AND automatically acquire the complete earlier history as the reader approaches 
 AND preserve the reader's viewport position, chronological order, and message identity without gaps or duplicates
 AND conceal transcript batching and acquisition progress while acquisition succeeds
 
-The initial conversation metadata and newest bounded transcript tail SHALL be authoritative only after a validated SSE init event. Route resolution SHALL select the conversation identity without duplicating conversation metadata or transcript content. Browser-cached transcript data MAY render provisionally but SHALL NOT authorize stream identity, archive status, runtime actions, or transcript coverage.
+The initial conversation metadata and newest bounded transcript tail SHALL be authoritative only after a validated SSE init event. Route resolution SHALL select the conversation identity without duplicating conversation metadata or transcript content. Conversation opening SHALL NOT read browser-persisted transcript data before route resolution or stream connection.
 
 Earlier transcript history SHALL remain server-owned and SHALL be requested lazily when reading or deep-link navigation requires it.
 
