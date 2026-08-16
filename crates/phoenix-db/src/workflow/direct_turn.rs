@@ -1055,38 +1055,50 @@ impl WorkflowRepository {
         conversation_id: &str,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<Option<String>> {
-        let mut tx = self.begin_tx().await?;
-        let summary = crate::reconcile_legacy_half_committed_continuation_tx(
-            &mut tx.tx,
-            conversation_id,
-            state_updated_at,
-        )
-        .await?;
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+            .await?;
+        let summary = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                let summary = crate::reconcile_legacy_half_committed_continuation_tx(
+                    &mut tx.tx,
+                    conversation_id,
+                    state_updated_at,
+                )
+                .await?;
+                let Some(summary) = summary else {
+                    return Ok(None);
+                };
+
+                let conversation = ConversationAuthority(conversation_id.to_string());
+                if let Some(turn) =
+                    load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
+                {
+                    self.terminalize_authoritative_turn_in_tx(
+                        &mut tx,
+                        &TerminalizeAuthoritativeTurnInput {
+                            command: TurnCommand::Fail {
+                                turn_id: turn.id,
+                                expected_generation: turn.generation,
+                                reason: "legacy continuation operation interrupted after summary persistence"
+                                    .to_string(),
+                            },
+                            projection: None,
+                        },
+                    )
+                    .await?;
+                }
+                Ok(Some(summary))
+            })
+            .await?;
         let Some(summary) = summary else {
             tx.rollback().await?;
             return Ok(None);
         };
-
-        let conversation = ConversationAuthority(conversation_id.to_string());
-        if let Some(turn) =
-            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
-        {
-            self.terminalize_authoritative_turn_in_tx(
-                &mut tx,
-                &TerminalizeAuthoritativeTurnInput {
-                    command: TurnCommand::Fail {
-                        turn_id: turn.id,
-                        expected_generation: turn.generation,
-                        reason:
-                            "legacy continuation operation interrupted after summary persistence"
-                                .to_string(),
-                    },
-                    projection: None,
-                },
-            )
+        telemetry
+            .observe_db(SqlitePhase::Commit, tx.commit())
             .await?;
-        }
-        tx.commit().await?;
         Ok(Some(summary))
     }
 
@@ -3165,6 +3177,79 @@ mod tests {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let error = contending_repo
             .settle_continuation_direct_turn_atomically(&settlement)
+            .await
+            .unwrap_err();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        assert!(matches!(error, DbError::Sqlx(_)));
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("direct_turn.terminal_settlement")
+        );
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("statement")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_continuation_reconciliation_records_statement_failure() {
+        let (directory, setup_repo, _) = open_workflow_repo_pair().await;
+        let awaiting = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID
+                    .to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&awaiting).unwrap())
+            .bind("awaiting_continuation")
+            .execute(&setup_repo.pool)
+            .await
+            .unwrap();
+        let content = crate::MessageContent::continuation("legacy durable summary");
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES ('legacy-continuation', 'conv-a', 1, 'continuation', ?1, ?2)",
+        )
+        .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&setup_repo.pool)
+        .await
+        .unwrap();
+
+        let path = directory.path().join("direct-turn.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let contending_repo = WorkflowRepository::new(pool);
+        let mut writer = setup_repo.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = contending_repo
+            .reconcile_legacy_continuation_atomically("conv-a", Utc::now())
             .await
             .unwrap_err();
         sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();

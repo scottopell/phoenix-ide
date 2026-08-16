@@ -648,7 +648,7 @@ pub async fn fts_upsert_conn(
     fts_upsert_conn_with_telemetry(conn, message, &telemetry).await
 }
 
-async fn fts_upsert_conn_with_telemetry(
+pub(crate) async fn fts_upsert_conn_with_telemetry(
     conn: &mut sqlx::SqliteConnection,
     message: &Message,
     telemetry: &SqliteTelemetry,
@@ -850,9 +850,9 @@ pub async fn fts_reconcile_upsert(
 pub(crate) async fn fts_index_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsIndexMessage);
-    delete_message_rows(tx, &message.message_id, &telemetry).await?;
+    delete_message_rows(tx, &message.message_id, telemetry).await?;
     let text = index_text(message);
     let inserted = telemetry
         .observe_sqlx(
@@ -867,7 +867,7 @@ pub(crate) async fn fts_index_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(&text),
-        &telemetry,
+        telemetry,
     )
     .await
 }
@@ -875,9 +875,9 @@ pub(crate) async fn fts_index_message_tx(
 pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsHideMessage);
-    delete_message_rows(tx, &message.message_id, &telemetry).await?;
+    delete_message_rows(tx, &message.message_id, telemetry).await?;
     let inserted = telemetry
         .observe_sqlx(
             SqlitePhase::FtsInsert,
@@ -889,7 +889,7 @@ pub(crate) async fn fts_hide_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(""),
-        &telemetry,
+        telemetry,
     )
     .await
 }
@@ -946,7 +946,7 @@ pub async fn fts_delete_conversation_conn(
     fts_delete_conversation_conn_with_telemetry(conn, conversation_id, &telemetry).await
 }
 
-async fn fts_delete_conversation_conn_with_telemetry(
+pub(crate) async fn fts_delete_conversation_conn_with_telemetry(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
     telemetry: &SqliteTelemetry,

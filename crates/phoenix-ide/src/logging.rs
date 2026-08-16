@@ -858,8 +858,6 @@ mod tests {
                 db.system = "sqlite",
                 db.operation = "direct_turn.terminal_settlement",
                 db.phase = "commit",
-                db.attempt = 1_u64,
-                db.retry_count = 0_u64,
                 db.elapsed_ms = 12_u64,
                 db.phase_elapsed_ms = 3_u64,
                 db.sqlite.primary_code = 5_i64,

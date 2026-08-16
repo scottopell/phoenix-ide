@@ -72,7 +72,6 @@ impl SqliteResultCodes {
 
 pub(crate) struct SqliteTelemetry {
     operation: SqliteOperation,
-    retry_count: u32,
     started_at: Instant,
 }
 
@@ -80,7 +79,6 @@ impl SqliteTelemetry {
     pub(crate) fn new(operation: SqliteOperation) -> Self {
         Self {
             operation,
-            retry_count: 0,
             started_at: Instant::now(),
         }
     }
@@ -114,7 +112,6 @@ impl SqliteTelemetry {
     fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
-        let attempt = self.retry_count.saturating_add(1);
         let codes = SqliteResultCodes::from_error(error);
         let parent = tracing::Span::current();
         let span = tracing::error_span!(
@@ -124,8 +121,6 @@ impl SqliteTelemetry {
             db.system = "sqlite",
             db.operation = self.operation.as_str(),
             db.phase = phase.as_str(),
-            db.attempt = attempt,
-            db.retry_count = self.retry_count,
             db.elapsed_ms = elapsed_ms,
             db.phase_elapsed_ms = phase_elapsed_ms,
             db.sqlite.primary_code = field::Empty,
@@ -144,8 +139,6 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
-                db_attempt = attempt,
-                db_retry_count = self.retry_count,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
                 db_sqlite_primary_code = codes.primary,
@@ -158,8 +151,6 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
-                db_attempt = attempt,
-                db_retry_count = self.retry_count,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
                 "SQLite operation failed without a database result code"
@@ -319,8 +310,6 @@ mod tests {
             event.get("db_phase").map(String::as_str),
             Some("locator_delete")
         );
-        assert_eq!(event.get("db_attempt").map(String::as_str), Some("1"));
-        assert_eq!(event.get("db_retry_count").map(String::as_str), Some("0"));
         assert_eq!(
             event.get("db_sqlite_primary_code").map(String::as_str),
             Some("5")
@@ -329,8 +318,54 @@ mod tests {
             event.get("db_sqlite_extended_code").map(String::as_str),
             Some(codes.extended.to_string()).as_deref()
         );
+        assert!(!event.contains_key("db_attempt"));
+        assert!(!event.contains_key("db_retry_count"));
         let rendered = format!("{event:?}");
         assert!(!rendered.contains("sensitive-message-id"));
         assert!(!rendered.contains("sensitive payload sentinel"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caller_owned_fts_transaction_records_acquisition_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caller-owned.db");
+        let setup = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(setup.pool())
+            .await
+            .unwrap();
+
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", path.to_string_lossy()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::ZERO)
+                .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = Database::from_pool_for_tests(pool.clone(), path.to_string_lossy().into_owned());
+        pool.close().await;
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = db.delete_conversation("unread-under-pool-contention").await;
+
+        assert!(matches!(
+            error,
+            Err(crate::DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("fts.delete_conversation")
+        );
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("transaction_acquisition")
+        );
     }
 }

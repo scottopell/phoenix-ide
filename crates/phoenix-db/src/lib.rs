@@ -46,6 +46,7 @@ use phoenix_core::domain::llm_types::{
     ProviderStreamTelemetry, ServiceTier, StreamTelemetryOutputKind,
 };
 use serde::{Deserialize, Serialize};
+use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -6643,7 +6644,10 @@ impl Database {
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
-        let mut tx = self.pool.begin().await?;
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
         sqlx::query(
             "UPDATE work_scopes SET authority_kind = 'work', updated_at = ?1 WHERE id = ?2",
         )
@@ -6787,10 +6791,12 @@ impl Database {
             usage_data: None,
             created_at: now,
         };
-        retrieval::fts_upsert_conn(&mut tx, &seed_msg).await?;
-        retrieval::fts_upsert_conn(&mut tx, &handoff_msg).await?;
+        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &seed_msg, &fts_telemetry).await?;
+        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &handoff_msg, &fts_telemetry).await?;
 
-        tx.commit().await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
 
         Ok(Conversation {
             id: new_id,
@@ -8197,7 +8203,10 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let mut tx = self.pool.begin().await?;
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
         sqlx::query(
             "DELETE FROM workflows
              WHERE workflow_id IN (
@@ -8215,8 +8224,10 @@ impl Database {
             // tx dropped without commit → rollback.
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        retrieval::fts_delete_conversation_conn(&mut tx, id).await?;
-        tx.commit().await?;
+        retrieval::fts_delete_conversation_conn_with_telemetry(&mut tx, id, &fts_telemetry).await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
         Ok(())
     }
 
@@ -9297,7 +9308,18 @@ impl Database {
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut message = self.get_message_by_id(message_id).await?;
         message.display_data = Some(display_data.clone());
-        let mut tx = self.pool.begin().await?;
+        let hidden = display_data
+            .get("hidden")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let fts_telemetry = SqliteTelemetry::new(if hidden {
+            SqliteOperation::FtsHideMessage
+        } else {
+            SqliteOperation::FtsIndexMessage
+        });
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
         let conversation_id: Option<String> = sqlx::query_scalar(
             "UPDATE messages
              SET display_data = ?1
@@ -9321,16 +9343,14 @@ impl Database {
         .bind(conversation_id)
         .fetch_one(&mut *tx)
         .await?;
-        let hidden = display_data
-            .get("hidden")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         if hidden {
-            retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+            retrieval::fts_hide_message_tx(&mut tx, &message, &fts_telemetry).await?;
         } else {
-            retrieval::fts_index_message_tx(&mut tx, &message).await?;
+            retrieval::fts_index_message_tx(&mut tx, &message, &fts_telemetry).await?;
         }
-        tx.commit().await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
         Ok(transcript_generation)
     }
 
