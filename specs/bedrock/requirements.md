@@ -363,13 +363,17 @@ fact needed to continue cannot be established
 THE SYSTEM SHALL stop admission and semantic publication
 AND SHALL NOT perform database-backed cleanup that depends on the suspect
 persistence path
-AND SHALL terminate the process nonzero.
+AND SHALL attempt only bounded best-effort shutdown work
+AND SHALL terminate the process nonzero, aborting when that bound expires.
 
-WHEN a task that owns this local SQLite authority boundary panics, exits
-unexpectedly, or is cancelled before delivering a typed result
+WHEN, while serving, a task that owns this local SQLite authority boundary panics,
+exits unexpectedly, or is cancelled before delivering a typed result
 THE SYSTEM SHALL apply the same fail-stop behavior unless the one exact authority
 query against the owning authoritative rows establishes the durable fact needed
 to continue.
+
+A task termination covered by a typed coordinated-shutdown disposition SHALL NOT
+select this fail-stop behavior.
 
 Failure of a task that does not own this local SQLite authority boundary SHALL
 remain governed by its feature's ordinary failure contract.
@@ -379,7 +383,10 @@ as conversation or workflow semantic state.
 
 WHEN the failed process has stopped and another Phoenix process opens the same
 authoritative SQLite database
-THE SYSTEM SHALL reconstruct conversation and workflow authority from SQLite
+THE SYSTEM SHALL reconstruct conversation and workflow authority and admit work
+only after that process successfully establishes the authoritative durable facts
+required for admission
+AND SHALL otherwise remain unavailable under this fail-stop requirement
 AND SHALL NOT require continuity of process-local runtime, SSE, replay-buffer,
 task, timer, or connection identity.
 

@@ -12,6 +12,7 @@ This task implements `REQ-DWF-043`, the strengthened `REQ-DWF-CHAT-013`, `REQ-BE
 
 ### 1. Commit-before-publication authority ordering
 
+- The direct-chat Allium invariant remains the executable normative model for committed materialization before observer/routing/admission-visible semantic state.
 - Proposed direct-turn transition state remains private and structurally distinct from committed observer/routing/admission authority until authoritative materialization commits.
 - No provisional semantic state is published or exposed as adopted committed state to observers, routing, or admission.
 - A failed, stale, replayed, or otherwise non-fresh materialization cannot publish the proposed state or make it authoritative; its exact command-scoped typed result governs behavior.
@@ -20,18 +21,22 @@ This task implements `REQ-DWF-043`, the strengthened `REQ-DWF-CHAT-013`, `REQ-BE
 
 ### 2. One top-level persistence fail-stop signal
 
-- An authoritative local SQLite command that returns no typed result permits at most one exact classification query against the rows owning the required fact.
+- The exact direct-turn authoritative command boundary returns a closed command-scoped result type that structurally distinguishes `DurableFactEstablished(typed domain result)` from `DurableFactUnclassified`; an ordinary database/library `Result` is insufficient.
+- `DurableFactUnclassified` permits at most one exact classification query against the rows owning the required fact.
 - Failure to establish that fact emits one top-level fail-stop signal consumed by the process boundary; it does not create conversation/workflow state or competing runtime-local recovery paths.
 - The process boundary stops admission and semantic publication, avoids database-backed cleanup through the suspect persistence path, and exits nonzero.
+- Fatal shutdown work is bounded and best-effort; expiry emits unconditional nonzero termination/abort through the same top-level fail-stop signal.
 - Deterministic tests distinguish a successfully classified command result from a failed or inconclusive classification.
 
 ### 3. Narrow critical-task supervision
 
 - Panic, unexpected exit, or cancellation escalates only for the task owning this exact local SQLite authority boundary and only when no typed result or exact authoritative-row classification was delivered.
+- A typed coordinated-shutdown disposition prevents ordinary shutdown cancellation from selecting fatal persistence handling.
 - Ordinary non-authoritative task failure and genuine external ambiguity retain their feature-owned behavior.
 - Deterministic tests cover boundary-owner disappearance without broadening supervision to general Tokio tasks.
 
 ### 4. Crash and restart verification
 
 - Crash/restart tests prove that another process reconstructs unfinished obligations and committed conversation/workflow authority from the same SQLite database without process-local runtime, observer, timer, queue, or connection identity.
-- Tests prove provisional semantic state is absent after restart and that an unavailable authority database does not permit continued processing.
+- Replacement-process admission remains closed until authoritative durable facts required for admission are successfully established.
+- Tests prove provisional semantic state is absent after restart and that an unavailable or unreadable authority database does not permit continued processing.

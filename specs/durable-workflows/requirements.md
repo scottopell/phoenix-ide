@@ -52,13 +52,18 @@ facts, but their identity and continuity SHALL be disposable. A profile adapter,
 runtime, SSE stream, or UI view SHALL NOT independently redefine the durable fact
 it projects.
 
-IF an authoritative local SQLite command does not return a typed result
+THE owning command boundary SHALL return a closed command-scoped sum type that
+structurally distinguishes `DurableFactEstablished`, carrying the typed domain
+result, from `DurableFactUnclassified`. An ordinary database or library error
+result SHALL NOT by itself establish either commit or non-commit.
+
+WHEN an authoritative local SQLite command returns `DurableFactUnclassified`
 THE owning boundary MAY perform one exact classification query against the rows
-that are authoritative for the fact needed to continue. WHEN that query
-establishes a command-scoped typed result, THE SYSTEM SHALL follow that result.
-IF the exact query is unavailable or cannot establish the durable fact needed to
-continue safely, THE owning execution boundary SHALL fail stop rather than create
-durable workflow or conversation state for epistemic uncertainty.
+that are authoritative for the fact needed to continue. WHEN that query returns
+`DurableFactEstablished`, THE SYSTEM SHALL follow its typed domain result. IF the
+exact query is unavailable or returns `DurableFactUnclassified`, THE owning
+execution boundary SHALL fail stop rather than create durable workflow or
+conversation state for epistemic uncertainty.
 
 This local classification boundary SHALL NOT replace the recovery policy for a
 genuine external outcome. Genuine external outcomes remain governed by their

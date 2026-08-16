@@ -48,18 +48,22 @@ implementation branches to continue.
 
 Choose option 4.
 
-After an authoritative local SQLite command fails without a typed result, its
-owning execution boundary may issue one exact query against the rows that own the
-fact needed to continue. Phoenix follows a command-scoped typed result established
-by that query. If the query is unavailable or cannot establish the required
-durable fact, Phoenix stops admission and semantic publication, avoids cleanup
-that depends on the suspect persistence path, and terminates nonzero.
+The owning command boundary returns a closed result that structurally separates an
+established durable fact carrying its typed domain result from an unclassified
+durable fact. An ordinary database or library error is not evidence of commit or
+non-commit. After an unclassified result, the owning execution boundary may issue
+one exact query against the rows that own the fact needed to continue. Phoenix
+follows an established typed domain result. If the query is unavailable or remains
+unclassified, Phoenix stops admission and semantic publication, avoids cleanup
+that depends on the suspect persistence path, attempts only bounded best-effort
+shutdown work, and terminates nonzero or aborts when the bound expires.
 
-A task that owns this local SQLite authority boundary cannot disappear without a
-typed result. Panic, unexpected exit, or cancellation at that boundary selects the
-same fail-stop outcome unless the one exact query against the owning authoritative
-rows establishes the durable fact. This is not a general task-supervision policy;
-ordinary task failures remain feature-owned.
+While Phoenix is serving, a task that owns this local SQLite authority boundary
+cannot disappear without a typed result. Panic, unexpected exit, or cancellation
+at that boundary selects the same fail-stop outcome unless the one exact query
+against the owning authoritative rows establishes the durable fact. A typed
+coordinated-shutdown disposition is not fatal. This is not a general
+task-supervision policy; ordinary task failures remain feature-owned.
 
 Inability to establish local persistence authority is not conversation or workflow
 semantic state. Runtime and observer identity and continuity are sacrificed across
@@ -86,7 +90,8 @@ without requiring one particular runtime representation.
 - **Positive:** External ambiguity retains the recovery policy selected by the
   feature that owns the external effect.
 - **Negative:** One unclassifiable local persistence result terminates the process
-  and interrupts every process-local runtime and observer connection.
+  within a bounded shutdown path and interrupts every process-local runtime and
+  observer connection.
 - **Negative:** Authority-boundary tasks and direct-turn publication ordering need
   structural implementation enforcement rather than call-site convention.
 - **Neutral:** This decision does not itself change SQLite write frequency or add
