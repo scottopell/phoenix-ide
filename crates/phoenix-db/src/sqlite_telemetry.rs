@@ -130,6 +130,7 @@ impl SqliteTelemetry {
             db.phase_elapsed_ms = phase_elapsed_ms,
             db.sqlite.primary_code = field::Empty,
             db.sqlite.extended_code = field::Empty,
+            otel.status_code = "ERROR",
         );
         if let Some(codes) = codes {
             span.record("db.sqlite.primary_code", i64::from(codes.primary));
@@ -172,22 +173,21 @@ fn elapsed_millis(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::retrieval::fts_upsert;
-    use crate::{Database, Message, MessageContent, MessageType};
-    use chrono::Utc;
-    use libsqlite3_sys as ffi;
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+pub(crate) mod test_support {
     use std::collections::BTreeMap;
-    use std::str::FromStr;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
-    use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+    use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
     #[derive(Clone, Default)]
-    struct EventCapture {
+    pub(crate) struct EventCapture {
         events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl EventCapture {
+        pub(crate) fn events(&self) -> Vec<BTreeMap<String, String>> {
+            self.events.lock().expect("event capture lock").clone()
+        }
     }
 
     impl<S> Layer<S> for EventCapture
@@ -223,6 +223,19 @@ mod tests {
             self.0.insert(field.name().to_owned(), format!("{value:?}"));
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::EventCapture;
+    use super::*;
+    use crate::retrieval::fts_upsert;
+    use crate::{Database, Message, MessageContent, MessageType};
+    use chrono::Utc;
+    use libsqlite3_sys as ffi;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::str::FromStr;
+    use tracing_subscriber::prelude::*;
 
     #[test]
     fn primary_code_is_derived_from_extended_code() {
@@ -295,7 +308,7 @@ mod tests {
         let codes = SqliteResultCodes::from_error(&error).expect("SQLite result codes");
         assert_eq!(codes.primary, ffi::SQLITE_BUSY);
 
-        let events = capture.events.lock().expect("event capture lock");
+        let events = capture.events();
         assert_eq!(events.len(), 1, "one failed database phase is recorded");
         let event = &events[0];
         assert_eq!(

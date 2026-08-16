@@ -35,6 +35,8 @@ mod rotation;
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+const DEFAULT_LOG_FILTER: &str =
+    "phoenix_ide=debug,tower_http=debug,phoenix_db::observability=error";
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
 
 pub(crate) fn process_log_config() -> &'static LogConfig {
@@ -723,8 +725,7 @@ fn invalid_input<T>(message: impl Into<String>) -> std::io::Result<T> {
 /// Create a fresh `EnvFilter` from the environment. Used per-sink because
 /// `EnvFilter` does not implement Clone.
 fn make_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into())
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -863,6 +864,7 @@ mod tests {
                 db.phase_elapsed_ms = 3_u64,
                 db.sqlite.primary_code = 5_i64,
                 db.sqlite.extended_code = 517_i64,
+                otel.status_code = "ERROR",
             );
             drop(db_failure);
             drop(turn);
@@ -969,6 +971,10 @@ mod tests {
             extended_code.value,
             opentelemetry::Value::I64(517)
         ));
+        assert!(matches!(
+            db_failure.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
         for required in [
             "gpt-test",
             "openai",
@@ -1024,6 +1030,15 @@ mod tests {
     #[test]
     fn stdout_defaults_on_when_unset() {
         assert!(stdout_enabled(None));
+    }
+
+    #[test]
+    fn default_log_filter_keeps_sqlite_failure_events() {
+        let filter = EnvFilter::try_new(DEFAULT_LOG_FILTER).unwrap();
+        assert!(filter
+            .to_string()
+            .split(',')
+            .any(|directive| directive == "phoenix_db::observability=error"));
     }
 
     #[test]
