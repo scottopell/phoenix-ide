@@ -227,16 +227,21 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 }
 
 /// Manager for all conversation runtimes
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum RuntimeMaterializationError {
     Ordinary(String),
-    AbandonIncarnation(String),
+    AbandonIncarnation {
+        error: String,
+        broadcaster: SseBroadcaster,
+    },
 }
 
 impl std::fmt::Display for RuntimeMaterializationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ordinary(error) | Self::AbandonIncarnation(error) => formatter.write_str(error),
+            Self::Ordinary(error) | Self::AbandonIncarnation { error, .. } => {
+                formatter.write_str(error)
+            }
         }
     }
 }
@@ -767,6 +772,18 @@ impl SseBroadcaster {
         gate.queued.clear();
         gate.reserved_until = None;
         self.tx.lock().expect("SSE sender mutex").take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandon_for_test(&self) {
+        self.abandon();
+    }
+
+    pub(crate) fn commit_first_init(&self, init: SseEvent) -> Option<SseEvent> {
+        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        let sender = self.tx.lock().expect("SSE sender mutex");
+        sender.as_ref()?;
+        Some(init)
     }
 
     /// Atomically allocate the next `sequence_id` and return it.
@@ -2605,76 +2622,28 @@ impl RuntimeManager {
         })
     }
 
-    async fn abandon_startup_broadcaster(
+    async fn abandon_incarnation_while_creations_locked(
         &self,
         conversation_id: &str,
-        broadcaster: SseBroadcaster,
-    ) {
-        let admission = self.conversation_admission(conversation_id).await;
-        let _admission_guard = admission.lock().await;
-        let _creations_guard = self.runtime_creations.lock().await;
-        let reserved = {
-            let mut reservations = self.evicted_broadcasters.write().await;
-            if reservations
-                .get(conversation_id)
-                .is_some_and(|reserved| reserved.same_channel(&broadcaster))
-            {
-                reservations.remove(conversation_id)
-            } else {
-                None
-            }
-        };
-        if reserved.is_some() {
-            self.evicted_model_upgrades
-                .write()
-                .await
-                .remove(conversation_id);
-        }
-        broadcaster.abandon();
-        if let Some(reserved) = reserved.as_ref() {
-            reserved.abandon();
-        }
-        drop(reserved);
-        drop(broadcaster);
-    }
-
-    #[cfg(test)]
-    async fn abandon_runtime_incarnation(
-        &self,
-        conversation_id: &str,
-        expected_identity: &Arc<()>,
-    ) -> bool {
-        let admission = self.conversation_admission(conversation_id).await;
-        let _admission_guard = admission.lock().await;
-        let _creations_guard = self.runtime_creations.lock().await;
-        self.abandon_runtime_incarnation_while_locked(conversation_id, expected_identity)
-            .await
-    }
-
-    async fn abandon_runtime_incarnation_while_locked(
-        &self,
-        conversation_id: &str,
-        expected_identity: &Arc<()>,
+        expected_identity: Option<&Arc<()>>,
+        expected_broadcaster: &SseBroadcaster,
     ) -> bool {
         let removed = {
             let mut runtimes = self.runtimes.write().await;
-            if runtimes
-                .get(conversation_id)
-                .is_some_and(|handle| Arc::ptr_eq(&handle.identity, expected_identity))
-            {
+            if runtimes.get(conversation_id).is_some_and(|handle| {
+                expected_identity.is_some_and(|identity| Arc::ptr_eq(&handle.identity, identity))
+                    || handle.broadcast_tx.same_channel(expected_broadcaster)
+            }) {
                 runtimes.remove(conversation_id)
             } else {
                 None
             }
         };
-        let Some(handle) = removed else {
-            return false;
-        };
         let reserved = {
             let mut reservations = self.evicted_broadcasters.write().await;
             if reservations
                 .get(conversation_id)
-                .is_some_and(|broadcaster| broadcaster.same_channel(&handle.broadcast_tx))
+                .is_some_and(|broadcaster| broadcaster.same_channel(expected_broadcaster))
             {
                 reservations.remove(conversation_id)
             } else {
@@ -2687,13 +2656,17 @@ impl RuntimeManager {
                 .await
                 .remove(conversation_id);
         }
-        handle.broadcast_tx.abandon();
+        expected_broadcaster.abandon();
+        if let Some(handle) = removed.as_ref() {
+            handle.broadcast_tx.abandon();
+        }
         if let Some(broadcaster) = reserved.as_ref() {
             broadcaster.abandon();
         }
-        drop(handle);
+        let removed_owned_incarnation = removed.is_some() || reserved.is_some();
+        drop(removed);
         drop(reserved);
-        true
+        removed_owned_incarnation
     }
 
     async fn handle_runtime_exit(
@@ -3027,6 +3000,7 @@ impl RuntimeManager {
         let task_text = spec.task.clone();
         let cleanup_conversation = conv.clone();
         let manager_for_cleanup = Arc::clone(self);
+        let cleanup_broadcaster = broadcaster.clone();
         tokio::spawn(async move {
             // Send initial UserMessage event to start the conversation
             // Sub-agents generate their own message_id since they don't have a client
@@ -3048,14 +3022,15 @@ impl RuntimeManager {
             timeout_task.abort();
 
             if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
-                let admission = manager_for_cleanup.conversation_admission(&conv_id).await;
-                let admission_guard = admission.lock().await;
                 let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
                 let removed = manager_for_cleanup
-                    .abandon_runtime_incarnation_while_locked(&conv_id, &sub_agent_identity)
+                    .abandon_incarnation_while_creations_locked(
+                        &conv_id,
+                        Some(&sub_agent_identity),
+                        &cleanup_broadcaster,
+                    )
                     .await;
                 drop(creations_guard);
-                drop(admission_guard);
                 tracing::warn!(
                     conv_id = %conv_id,
                     removed_exact_runtime = removed,
@@ -3131,6 +3106,7 @@ impl RuntimeManager {
     /// Materialization is single-flight per conversation. Unrelated conversations
     /// do not share a construction lock, while concurrent callers for one absent
     /// runtime receive the same typed result.
+    #[allow(clippy::too_many_lines)]
     pub async fn get_or_create(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -3186,43 +3162,51 @@ impl RuntimeManager {
                     )))
                 });
 
-                match &result {
-                    Err(RuntimeMaterializationError::AbandonIncarnation(error)) => {
-                        tracing::warn!(
-                            conv_id = %conversation_id,
-                            %error,
-                            "Runtime initialization abandoned its SSE incarnation"
-                        );
-                    }
-                    Err(RuntimeMaterializationError::Ordinary(error))
-                        if is_invalid_runtime_cwd_error(error) =>
-                    {
-                        tracing::warn!(conv_id = %conversation_id, error = %error, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
-                    }
-                    Err(RuntimeMaterializationError::Ordinary(error)) => {
-                        tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
+                if let Err(RuntimeMaterializationError::Ordinary(error)) = &result {
+                    if !is_invalid_runtime_cwd_error(error) {
+                        tracing::error!(conv_id = %conversation_id, %error, "Runtime materialization failed after conversation stream opened");
                         let broadcaster = manager.conversation_broadcaster(&conversation_id).await;
                         let _ = broadcaster.send_seq(|sequence_id| SseEvent::Error {
                             sequence_id,
                             error: user_facing_error::UserFacingError::internal(),
                         });
                     }
-                    Ok(_) => {}
                 }
-                let result = result.map_err(|error| error.to_string());
-
-                let result_tx = {
-                    let mut creations = manager.runtime_creations.lock().await;
-                    let result_tx = creations
-                        .get(&conversation_id)
-                        .expect("runtime materialization supervisor retains its single-flight slot")
-                        .clone();
-                    result_tx.send_replace(Some(result));
-                    creations
-                        .remove(&conversation_id)
-                        .expect("published runtime materialization slot remains owned")
+                let mut creations = manager.runtime_creations.lock().await;
+                let result_tx = creations
+                    .remove(&conversation_id)
+                    .expect("runtime materialization supervisor retains its single-flight slot");
+                let result = match result {
+                    Err(RuntimeMaterializationError::AbandonIncarnation { error, broadcaster }) => {
+                        manager
+                            .abandon_incarnation_while_creations_locked(
+                                &conversation_id,
+                                None,
+                                &broadcaster,
+                            )
+                            .await;
+                        tracing::warn!(
+                            conv_id = %conversation_id,
+                            %error,
+                            "Runtime initialization abandoned its SSE incarnation"
+                        );
+                        Err(error)
+                    }
+                    Err(RuntimeMaterializationError::Ordinary(error))
+                        if is_invalid_runtime_cwd_error(&error) =>
+                    {
+                        tracing::warn!(conv_id = %conversation_id, error = %error, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
+                        Err(error)
+                    }
+                    Err(RuntimeMaterializationError::Ordinary(error)) => {
+                        tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
+                        Err(error)
+                    }
+                    Ok(handle) => Ok(handle),
                 };
+                result_tx.send_replace(Some(result));
                 drop(result_tx);
+                drop(creations);
             });
         }
 
@@ -3619,11 +3603,10 @@ impl RuntimeManager {
                     .await
                     .remove(conversation_id)
                 {
-                    self.abandon_startup_broadcaster(conversation_id, broadcaster)
-                        .await;
-                    return Err(RuntimeMaterializationError::AbandonIncarnation(
-                        "injected startup direct-turn settlement ambiguity".to_string(),
-                    ));
+                    return Err(RuntimeMaterializationError::AbandonIncarnation {
+                        error: "injected startup direct-turn settlement ambiguity".to_string(),
+                        broadcaster,
+                    });
                 }
                 match crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
@@ -3646,9 +3629,10 @@ impl RuntimeManager {
                         let error = format!(
                             "startup direct-turn terminal settlement remained ambiguous: {error}"
                         );
-                        self.abandon_startup_broadcaster(conversation_id, broadcaster)
-                            .await;
-                        return Err(RuntimeMaterializationError::AbandonIncarnation(error));
+                        return Err(RuntimeMaterializationError::AbandonIncarnation {
+                            error,
+                            broadcaster,
+                        });
                     }
                 }
             } else {
@@ -3765,6 +3749,7 @@ impl RuntimeManager {
         // Start runtime in background
         let conv_id = conversation_id.to_string();
         let manager_for_cleanup = Arc::clone(self);
+        let cleanup_broadcaster = broadcaster.clone();
         // Shared with the executor: event senders deposit their ambient span
         // here so the turn it starts can link back to the triggering request.
         let turn_trigger = runtime.turn_trigger_slot();
@@ -3810,14 +3795,15 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let disposition = runtime.run().await;
             if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
-                let admission = manager_for_cleanup.conversation_admission(&conv_id).await;
-                let admission_guard = admission.lock().await;
                 let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
                 let removed = manager_for_cleanup
-                    .abandon_runtime_incarnation_while_locked(&conv_id, &cleanup_identity)
+                    .abandon_incarnation_while_creations_locked(
+                        &conv_id,
+                        Some(&cleanup_identity),
+                        &cleanup_broadcaster,
+                    )
                     .await;
                 drop(creations_guard);
-                drop(admission_guard);
                 tracing::warn!(
                     conv_id = %conv_id,
                     removed_exact_runtime = removed,
@@ -3918,6 +3904,16 @@ impl RuntimeManager {
     /// to the old runtime so it exits cleanly and releases its broadcaster
     /// clone, completing the hand-off.
     pub async fn evict_runtime(&self, conversation_id: &str, reason: EvictionReason) {
+        let _creations_guard = self.runtime_creations.lock().await;
+        self.evict_runtime_while_creations_locked(conversation_id, reason)
+            .await;
+    }
+
+    async fn evict_runtime_while_creations_locked(
+        &self,
+        conversation_id: &str,
+        reason: EvictionReason,
+    ) {
         let old = {
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
@@ -4867,6 +4863,20 @@ mod broadcaster_tests {
     }
 
     #[test]
+    fn first_init_commit_is_atomic_with_abandonment() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let init = token_event(0, "init-placeholder");
+        broadcaster.abandon();
+        assert!(broadcaster.commit_first_init(init).is_none());
+
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let init = token_event(0, "init-placeholder");
+        assert!(broadcaster.commit_first_init(init).is_some());
+        broadcaster.abandon();
+        assert_eq!(broadcaster.receiver_count(), 0);
+    }
+
+    #[test]
     fn normal_clone_send_and_replay_ring_behavior_is_unchanged() {
         let broadcaster = SseBroadcaster::new(16, 0);
         let clone = broadcaster.clone();
@@ -5597,6 +5607,7 @@ mod scope_liveness_tests {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "abandon-identity-mismatch";
         let expected_old_identity = Arc::new(());
+        let expected_old_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
         let newer_identity = Arc::new(());
         let newer_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
         let mut newer_receiver = newer_broadcaster.subscribe();
@@ -5610,9 +5621,14 @@ mod scope_liveness_tests {
             .await
             .insert(conversation_id.to_string(), newer_broadcaster.clone());
 
+        let _creations_guard = manager.runtime_creations.lock().await;
         assert!(
             !manager
-                .abandon_runtime_incarnation(conversation_id, &expected_old_identity)
+                .abandon_incarnation_while_creations_locked(
+                    conversation_id,
+                    Some(&expected_old_identity),
+                    &expected_old_broadcaster,
+                )
                 .await
         );
 
@@ -5642,6 +5658,110 @@ mod scope_liveness_tests {
                 .try_recv()
                 .expect("newer subscriber remains live"),
             SseEvent::StateChange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn abandonment_revokes_new_identity_sharing_doomed_broadcaster() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "abandon-shared-channel-replacement";
+        let doomed_identity = Arc::new(());
+        let replacement_identity = Arc::new(());
+        let doomed_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let mut receiver = doomed_broadcaster.subscribe();
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            idle_handle_with_broadcaster(
+                doomed_broadcaster.clone(),
+                Arc::clone(&replacement_identity),
+            ),
+        );
+
+        let _creations_guard = manager.runtime_creations.lock().await;
+        assert!(
+            manager
+                .abandon_incarnation_while_creations_locked(
+                    conversation_id,
+                    Some(&doomed_identity),
+                    &doomed_broadcaster,
+                )
+                .await
+        );
+
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn abandonment_revokes_evicted_broadcaster_and_preserves_distinct_newer_incarnation() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "evict-abandon-exact-broadcaster";
+        let doomed_identity = Arc::new(());
+        let doomed_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let mut doomed_receiver = doomed_broadcaster.subscribe();
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            idle_handle_with_broadcaster(doomed_broadcaster.clone(), Arc::clone(&doomed_identity)),
+        );
+
+        let _creations_guard = manager.runtime_creations.lock().await;
+        manager
+            .evict_runtime_while_creations_locked(conversation_id, EvictionReason::ModelUpgrade)
+            .await;
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert!(manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .is_some_and(|reserved| reserved.same_channel(&doomed_broadcaster)));
+
+        let newer_identity = Arc::new(());
+        let newer_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let mut newer_receiver = newer_broadcaster.subscribe();
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            idle_handle_with_broadcaster(newer_broadcaster.clone(), Arc::clone(&newer_identity)),
+        );
+
+        assert!(
+            manager
+                .abandon_incarnation_while_creations_locked(
+                    conversation_id,
+                    Some(&doomed_identity),
+                    &doomed_broadcaster,
+                )
+                .await
+        );
+
+        assert!(matches!(
+            doomed_receiver.try_recv(),
+            Err(TryRecvError::Closed)
+        ));
+        assert!(manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .is_none());
+        let current = manager
+            .runtimes
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+            .expect("distinct newer runtime survives exact cleanup");
+        assert!(Arc::ptr_eq(&current.identity, &newer_identity));
+        newer_broadcaster
+            .send_seq(|sequence_id| SseEvent::AgentDone { sequence_id })
+            .expect("distinct newer broadcaster remains live");
+        assert!(matches!(
+            newer_receiver.try_recv().expect("newer event"),
+            SseEvent::AgentDone { .. }
         ));
     }
 
@@ -5683,7 +5803,11 @@ mod scope_liveness_tests {
         assert!({
             let _creations_guard = manager.runtime_creations.lock().await;
             manager
-                .abandon_runtime_incarnation_while_locked(conversation_id, &old_identity)
+                .abandon_incarnation_while_creations_locked(
+                    conversation_id,
+                    Some(&old_identity),
+                    &old_broadcaster,
+                )
                 .await
         });
         assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
@@ -7176,10 +7300,58 @@ mod scope_liveness_tests {
             .await
             .insert(conversation_id.to_string());
 
-        let Err(error) = manager.get_or_create(conversation_id).await else {
-            panic!("startup ambiguity must fail this incarnation");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let (admission_held_tx, admission_held_rx) = tokio::sync::oneshot::channel();
+        let owner = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                let admission = manager.conversation_admission(conversation_id).await;
+                let admission_guard = admission.lock().await;
+                admission_held_tx.send(()).expect("signal held admission");
+                let result = manager.get_or_create(conversation_id).await;
+                drop(admission_guard);
+                result
+            })
         };
-        assert!(error.contains("startup direct-turn settlement ambiguity"));
+        admission_held_rx.await.expect("owner holds admission");
+        barrier.wait().await;
+
+        let mut waiter = Box::pin(manager.get_or_create(conversation_id));
+        assert!(matches!(
+            futures::poll!(&mut waiter),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            manager
+                .runtime_creations
+                .lock()
+                .await
+                .get(conversation_id)
+                .expect("doomed single-flight remains joinable before settlement")
+                .receiver_count(),
+            2,
+            "owner and waiter must share the doomed single-flight"
+        );
+        barrier.wait().await;
+
+        let Err(waiter_error) = waiter.await else {
+            panic!("joined waiter must receive startup ambiguity failure");
+        };
+        let Err(owner_error) = owner.await.expect("owner task joins") else {
+            panic!("admission-holding owner must receive startup ambiguity failure");
+        };
+        assert!(!manager
+            .runtime_creations
+            .lock()
+            .await
+            .contains_key(conversation_id));
+        assert!(owner_error.contains("startup direct-turn settlement ambiguity"));
+        assert_eq!(waiter_error, owner_error);
         assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
         assert!(old_broadcaster.snapshot_pending().3.is_empty());
         assert!(manager

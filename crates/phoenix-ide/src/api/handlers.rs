@@ -4019,6 +4019,7 @@ async fn stream_conversation(
     Ok(sse_stream(
         id,
         init_event,
+        broadcast_tx,
         broadcast_rx,
         Some(init_trace),
         crate::api::sse::SseStreamAudience::Authenticated,
@@ -8043,6 +8044,7 @@ async fn shared_sse_stream(
     Ok(sse_stream(
         conversation_id,
         init_event,
+        broadcast_tx,
         broadcast_rx,
         None,
         crate::api::sse::SseStreamAudience::SharedTranscript,

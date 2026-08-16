@@ -939,6 +939,30 @@ fn direct_turn_terminal_command(
     }
 }
 
+fn classify_active_direct_turn_settlement(
+    result: phoenix_db::DbResult<phoenix_workflow::TurnStep>,
+) -> ActiveDirectTurnSettlementOutcome {
+    match result {
+        Ok(step)
+            if matches!(
+                step.outcome,
+                phoenix_workflow::TurnOutcome::Terminal { .. }
+                    | phoenix_workflow::TurnOutcome::TerminalReplay { .. }
+            ) =>
+        {
+            ActiveDirectTurnSettlementOutcome::Settled
+        }
+        Ok(_)
+        | Err(phoenix_db::DbError::DirectTurnConflict(
+            phoenix_workflow::TurnConflict::StaleGeneration { .. }
+            | phoenix_workflow::TurnConflict::AlreadyTerminal,
+        )) => ActiveDirectTurnSettlementOutcome::StaleAuthority,
+        Err(error) => ActiveDirectTurnSettlementOutcome::Ambiguous {
+            error: error.to_string(),
+        },
+    }
+}
+
 #[async_trait]
 impl MessageStore for DatabaseStorage {
     async fn add_message(
@@ -1186,21 +1210,7 @@ impl MessageStore for DatabaseStorage {
                 },
             )
             .await;
-        match result {
-            Ok(step)
-                if matches!(
-                    step.outcome,
-                    phoenix_workflow::TurnOutcome::Terminal { .. }
-                        | phoenix_workflow::TurnOutcome::TerminalReplay { .. }
-                ) =>
-            {
-                ActiveDirectTurnSettlementOutcome::Settled
-            }
-            Ok(_) => ActiveDirectTurnSettlementOutcome::StaleAuthority,
-            Err(error) => ActiveDirectTurnSettlementOutcome::Ambiguous {
-                error: error.to_string(),
-            },
-        }
+        classify_active_direct_turn_settlement(result)
     }
 
     async fn settle_continuation_direct_turn(
@@ -1809,5 +1819,35 @@ mod tool_registry_executor_tests {
             .await
             .iter()
             .any(|definition| definition.name == "search_conversations"));
+    }
+}
+
+#[cfg(test)]
+mod direct_turn_settlement_tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_terminal_conflicts_are_stale_not_ambiguous() {
+        for conflict in [
+            phoenix_workflow::TurnConflict::StaleGeneration { actual: 2 },
+            phoenix_workflow::TurnConflict::AlreadyTerminal,
+        ] {
+            assert_eq!(
+                classify_active_direct_turn_settlement(Err(
+                    phoenix_db::DbError::DirectTurnConflict(conflict),
+                )),
+                ActiveDirectTurnSettlementOutcome::StaleAuthority
+            );
+        }
+    }
+
+    #[test]
+    fn repository_failure_remains_ambiguous() {
+        assert!(matches!(
+            classify_active_direct_turn_settlement(Err(phoenix_db::DbError::Serialization(
+                "probe failed".to_string()
+            ),)),
+            ActiveDirectTurnSettlementOutcome::Ambiguous { .. }
+        ));
     }
 }

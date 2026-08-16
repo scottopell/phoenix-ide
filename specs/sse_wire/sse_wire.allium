@@ -346,6 +346,8 @@ config {
 
 -- current_stream_incarnation(conversation_id)
 -- RuntimeIncarnationAbandonmentRequested(conversation_id, stream_incarnation)
+-- FirstInitCommitAttempted(conversation_id, stream_incarnation)
+-- FirstInitCommitRejected(conversation_id, stream_incarnation)
 -- ClientSubscribesAfterAbandonment(conversation_id, abandoned_incarnation, snapshot)
 -- SnapshotReplayBelongsToIncarnation(snapshot, stream_incarnation)
 -- no_fabricated_event_for_abandoned_incarnation(conversation_id, stream_incarnation)
@@ -499,6 +501,15 @@ rule AbandonedIncarnationEmitsNoRepairEvent {
 
     ensures: no_fabricated_event_for_abandoned_incarnation(conversation_id, stream_incarnation)
     ensures: no_reserved_cursor_transfer(conversation_id, stream_incarnation)
+}
+
+rule AbandonedIncarnationRejectsFirstInitCommit {
+    when: FirstInitCommitAttempted(conversation_id, stream_incarnation)
+
+    requires: BroadcasterIncarnation{conversation_id: conversation_id, stream_incarnation: stream_incarnation}.sender_owners = 0
+
+    ensures: FirstInitCommitRejected(conversation_id, stream_incarnation)
+    ensures: not exists SseStream{conversation_id: conversation_id, stream_incarnation: stream_incarnation}
 }
 
 rule ReplacementIncarnationStartsFromAuthoritativeInit {

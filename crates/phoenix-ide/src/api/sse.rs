@@ -148,11 +148,13 @@ fn conversation_keep_alive() -> KeepAlive {
 pub fn sse_stream(
     conv_id: String,
     init_event: SseEvent,
+    broadcaster: crate::runtime::SseBroadcaster,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
     init_trace: Option<SseInitTrace>,
     audience: SseStreamAudience,
 ) -> impl IntoResponse {
     let init = futures::stream::once(async move {
+        let init_event = broadcaster.commit_first_init(init_event)?;
         let serialization_started = std::time::Instant::now();
         let event = sse_event_to_axum(
             audience
@@ -164,8 +166,9 @@ pub fn sse_stream(
             trace.record_ms("stream.time_to_init_ms", trace.started.elapsed());
             drop(trace);
         }
-        Ok::<Event, Infallible>(event)
-    });
+        Some(Ok::<Event, Infallible>(event))
+    })
+    .filter_map(|event| event);
 
     let broadcasts = BroadcastStream::new(broadcast_rx)
         .take_while(move |result| match result {
@@ -548,6 +551,82 @@ mod tests {
             work_scope_key: "conversation:conv-1".to_string(),
             cached_pr: None,
         }
+    }
+
+    fn fixture_init(stream_incarnation: &str) -> SseEvent {
+        SseEvent::Init {
+            sequence_id: 0,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            transcript: crate::runtime::InitTranscript::Complete(Vec::new()),
+            steering_messages: Vec::new(),
+            agent_working: false,
+            presentation_mode: "idle".to_string(),
+            last_sequence_id: 0,
+            stream_incarnation: stream_incarnation.to_string(),
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 0,
+            pending_events: Vec::new(),
+            pending_truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_incarnation_cannot_emit_init_on_first_stream_poll() {
+        use crate::runtime::SseBroadcaster;
+
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let receiver = broadcaster.subscribe();
+        let response = sse_stream(
+            "conv-1".to_string(),
+            fixture_init(broadcaster.stream_incarnation()),
+            broadcaster.clone(),
+            receiver,
+            None,
+            SseStreamAudience::Authenticated,
+        )
+        .into_response();
+
+        broadcaster.abandon_for_test();
+
+        let mut body = response.into_body().into_data_stream();
+        assert!(
+            futures::StreamExt::next(&mut body).await.is_none(),
+            "abandonment before first body poll must close without Init"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_committed_by_first_stream_poll_is_emitted_once() {
+        use crate::runtime::SseBroadcaster;
+
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let receiver = broadcaster.subscribe();
+        let response = sse_stream(
+            "conv-1".to_string(),
+            fixture_init(broadcaster.stream_incarnation()),
+            broadcaster.clone(),
+            receiver,
+            None,
+            SseStreamAudience::Authenticated,
+        )
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+
+        let first = futures::StreamExt::next(&mut body)
+            .await
+            .expect("Init frame")
+            .expect("Init bytes");
+        let frame = std::str::from_utf8(&first).expect("UTF-8 SSE frame");
+        assert!(frame.starts_with("event: init\n"));
+        assert_eq!(frame.matches("event: init\n").count(), 1);
+
+        broadcaster.abandon_for_test();
+        assert!(
+            futures::StreamExt::next(&mut body).await.is_none(),
+            "abandonment after Init must close without another frame"
+        );
     }
 
     fn fixture_user_message() -> Message {

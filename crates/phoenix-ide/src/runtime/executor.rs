@@ -2377,11 +2377,16 @@ where
             tokio::select! {
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
+                    let abandon_stream_incarnation = self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
-                    if terminal {
+                    if terminal && !abandon_stream_incarnation {
                         self.emit_terminal_lifecycle_event().await;
                     }
                     let _ = acknowledgement.send(result);
+                    if abandon_stream_incarnation {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
                         return RuntimeExitDisposition::Interrupted;
@@ -2410,6 +2415,11 @@ where
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         return RuntimeExitDisposition::Interrupted;
                     }
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2424,6 +2434,11 @@ where
                 Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
                     self.process_generation_tagged_llm_outcome(generation, llm_outcome)
                         .await;
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2442,6 +2457,11 @@ where
                     }
                 }, if terminal_retry_at.is_some() => {
                     self.retry_terminal_transition().await;
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
@@ -2472,6 +2492,11 @@ where
                         self.process_outcome(EffectOutcome::Tool(tool_outcome)).await
                     {
                         tracing::warn!(error = %e, "Outcome rejected by state machine");
+                    }
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -2505,6 +2530,11 @@ where
                     {
                         tracing::warn!(error = %e, "Outcome rejected by state machine");
                     }
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2526,6 +2556,11 @@ where
                     }
                 }, if deadline.is_some() => {
                     self.handle_deadline_expiry().await;
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -2545,6 +2580,11 @@ where
                     }
                 }, if awaiting_recovery && self.credential_helper.is_some() => {
                     self.handle_credential_settlement().await;
+                    if self.recovery_disposition
+                        == RuntimeRecoveryDisposition::AbandonStreamIncarnation
+                    {
+                        return RuntimeExitDisposition::AbandonStreamIncarnation;
+                    }
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
@@ -11529,6 +11569,53 @@ mod authoritative_user_message_effect_tests {
         assert!(rt.active_direct_turn.is_some());
         assert!(rt.pending_direct_turn_terminal.is_some());
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn terminal_ambiguity_exit_precedes_terminal_lifecycle_event() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(71),
+            generation: 1,
+        }));
+        storage.set_active_direct_turn(rt.active_direct_turn.as_deref().cloned());
+        storage.set_settle_active_direct_turn_commit_error_once();
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "terminal ambiguity".to_string(),
+            },
+        ));
+        rt.state = ConvState::Error {
+            message: "terminal ambiguity".to_string(),
+            error_kind: crate::db::ErrorKind::ServerError,
+            resets_at: None,
+        };
+
+        rt.persist_state_effect(true).await.unwrap();
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::AbandonStreamIncarnation
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "ambiguous settlement must emit no state event"
+        );
+
+        let exit = rt.run().await;
+
+        assert_eq!(exit, RuntimeExitDisposition::AbandonStreamIncarnation);
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(TryRecvError::Empty | TryRecvError::Closed)
+            ),
+            "abandonment must emit no lifecycle or agent_done event"
+        );
     }
 
     #[tokio::test]
