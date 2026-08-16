@@ -1331,11 +1331,15 @@ enum TerminalEvidenceTransactionCut {
     AfterCommit,
 }
 
-fn parent_scope_and_effort(
+fn parent_creation_values(
     row: Option<SqliteRow>,
-) -> DbResult<(Option<WorkScopeId>, Option<ModelEffort>)> {
+) -> DbResult<(
+    Option<WorkScopeId>,
+    Option<ModelEffort>,
+    Option<phoenix_core::domain::product_conversation::ProductConversationId>,
+)> {
     let Some(row) = row else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
     let scope = row
         .try_get::<Option<String>, _>("work_scope_id")?
@@ -1347,7 +1351,11 @@ fn parent_scope_and_effort(
         .map(|value| ModelEffort::from_str(&value))
         .transpose()
         .map_err(DbError::Serialization)?;
-    Ok((scope, effort))
+    let product_conversation_id = row
+        .try_get::<String, _>("product_conversation_id")?
+        .parse::<phoenix_core::domain::product_conversation::ProductConversationId>()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    Ok((scope, effort, Some(product_conversation_id)))
 }
 
 impl Database {
@@ -3694,22 +3702,24 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
-        let unchecked_parent_values =
-            if matches!(expected_parent_scope, ExpectedParentScope::NotChecked) {
-                if let Some(parent_id) = parent_id {
-                    let row = sqlx::query(
-                        "SELECT work_scope_id, effort FROM conversations WHERE id = ?1",
+        let unchecked_parent_values = if matches!(
+            expected_parent_scope,
+            ExpectedParentScope::NotChecked
+        ) {
+            if let Some(parent_id) = parent_id {
+                let row = sqlx::query(
+                        "SELECT work_scope_id, effort, product_conversation_id FROM conversations WHERE id = ?1",
                     )
                     .bind(parent_id)
                     .fetch_optional(&self.pool)
                     .await?;
-                    Some(parent_scope_and_effort(row)?)
-                } else {
-                    Some((None, None))
-                }
+                Some(parent_creation_values(row)?)
             } else {
-                None
-            };
+                Some((None, None, None))
+            }
+        } else {
+            None
+        };
         let runtime_role = if parent_id.is_some() {
             RuntimeRole::SubAgent
         } else {
@@ -3721,45 +3731,64 @@ impl Database {
         let mut attempts = 0u8;
         let preserve_unattached_parent =
             matches!(expected_parent_scope, ExpectedParentScope::Snapshot(None));
-        let (created_work_scope_id, inherited_effort) = loop {
+        let (created_work_scope_id, inherited_effort, product_conversation_id) = loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let mut tx = match &expected_parent_scope {
                 ExpectedParentScope::NotChecked => self.pool.begin().await?,
                 ExpectedParentScope::Snapshot(_) => self.pool.begin_with("BEGIN IMMEDIATE").await?,
             };
-            let (inherited_scope, inherited_effort) = match &expected_parent_scope {
-                ExpectedParentScope::NotChecked => unchecked_parent_values
-                    .clone()
-                    .expect("unchecked parent values are loaded before the transaction"),
-                ExpectedParentScope::Snapshot(expected_scope) => {
-                    let parent_id = parent_id.expect("scope snapshots require a parent");
-                    let row = sqlx::query(
-                        "SELECT work_scope_id, effort FROM conversations WHERE id = ?1",
+            let (inherited_scope, inherited_effort, inherited_product_conversation_id) =
+                match &expected_parent_scope {
+                    ExpectedParentScope::NotChecked => unchecked_parent_values
+                        .clone()
+                        .expect("unchecked parent values are loaded before the transaction"),
+                    ExpectedParentScope::Snapshot(expected_scope) => {
+                        let parent_id = parent_id.expect("scope snapshots require a parent");
+                        let row = sqlx::query(
+                        "SELECT work_scope_id, effort, product_conversation_id FROM conversations WHERE id = ?1",
                     )
                     .bind(parent_id)
                     .fetch_optional(&mut *tx)
                     .await?;
-                    let Some(row) = row else {
-                        tx.rollback().await?;
-                        return Err(DbError::CloseFoundationConflict(format!(
-                            "parent conversation {parent_id} no longer exists"
-                        )));
-                    };
-                    let values = parent_scope_and_effort(Some(row))?;
-                    #[cfg(test)]
-                    if let Some(latch) = &self.sub_agent_creation_test_latch {
-                        latch.parent_read.notify_one();
-                        latch.competing_write_observed.notified().await;
-                    }
-                    if values.0.as_ref() != *expected_scope {
-                        tx.rollback().await?;
-                        return Err(DbError::CloseFoundationConflict(format!(
+                        let Some(row) = row else {
+                            tx.rollback().await?;
+                            return Err(DbError::CloseFoundationConflict(format!(
+                                "parent conversation {parent_id} no longer exists"
+                            )));
+                        };
+                        let values = parent_creation_values(Some(row))?;
+                        #[cfg(test)]
+                        if let Some(latch) = &self.sub_agent_creation_test_latch {
+                            latch.parent_read.notify_one();
+                            latch.competing_write_observed.notified().await;
+                        }
+                        if values.0.as_ref() != *expected_scope {
+                            tx.rollback().await?;
+                            return Err(DbError::CloseFoundationConflict(format!(
                             "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
                         )));
+                        }
+                        values
                     }
-                    values
-                }
-            };
+                };
+            let product_conversation_id =
+                if let Some(product_conversation_id) = inherited_product_conversation_id {
+                    product_conversation_id
+                } else {
+                    let product_conversation_id =
+                        phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                            uuid::Uuid::new_v4().to_string(),
+                        )
+                        .expect("UUID ProductConversation identity is non-empty");
+                    sqlx::query(
+                        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+                     VALUES (?1, 'ordinary', 'open')",
+                    )
+                    .bind(product_conversation_id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                    product_conversation_id
+                };
             let generated_scope =
                 (inherited_scope.is_none() && !preserve_unattached_parent).then(|| {
                     let (scope_id, authority_kind, environment) =
@@ -3782,8 +3811,8 @@ impl Database {
                 .await?;
             }
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                "INSERT INTO conversations (id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
+                 VALUES (?1, ?24, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -3808,13 +3837,14 @@ impl Database {
             .bind(work_scope_id.as_ref().map(WorkScopeId::as_str))
             .bind(parent_id.map(|_| cwd))
             .bind(ServiceTier::Standard.as_wire_name())
+            .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
             .await;
 
             match result {
                 Ok(_) => {
                     tx.commit().await?;
-                    break (work_scope_id, inherited_effort);
+                    break (work_scope_id, inherited_effort, product_conversation_id);
                 }
                 Err(sqlx::Error::Database(ref e))
                     if (is_sqlite_unique_constraint(e.as_ref())
@@ -3845,6 +3875,7 @@ impl Database {
         let title = schema::title_from_slug(&actual_slug);
         Ok(Conversation {
             id: id.to_string(),
+            product_conversation_id,
             slug: Some(actual_slug),
             title: Some(title),
             cwd: cwd.to_string(),
@@ -3899,12 +3930,24 @@ impl Database {
 
             let id = uuid::Uuid::new_v4().to_string();
             let slug = format!("coordinator-{}", id.get(..8).unwrap_or(&id));
+            let product_conversation_id =
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .expect("UUID ProductConversation identity is non-empty");
+            sqlx::query(
+                "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+                 VALUES (?1, 'coordinator', NULL)",
+            )
+            .bind(product_conversation_id.as_str())
+            .execute(&mut *conn)
+            .await?;
             let now = Utc::now().to_rfc3339();
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
+                "INSERT INTO conversations (id, product_conversation_id, slug, title, coordinator_head, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind, runtime_role, work_scope_id)
+                 VALUES (?1, ?8, ?2, 'Coordinator', 1, 0, ?3, ?4, ?5, ?5, ?5, 0, 1, ?6, ?7, 'explore', 'coordinator', NULL)",
             )
             .bind(&id)
             .bind(slug)
@@ -3913,6 +3956,7 @@ impl Database {
             .bind(now)
             .bind(model)
             .bind(llm_language.as_str())
+            .bind(product_conversation_id.as_str())
             .execute(&mut *conn)
             .await?;
             Ok(id)
@@ -3999,7 +4043,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4028,7 +4072,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4177,7 +4221,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4312,7 +4356,7 @@ impl Database {
         work_scope_id: &WorkScopeId,
     ) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, attachment.work_scope_id, c.transcript_generation,
@@ -4341,7 +4385,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4368,7 +4412,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_all_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4392,7 +4436,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -4488,6 +4532,18 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let (created_work_scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(cwd, &cm);
+        let product_conversation_id =
+            phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .expect("UUID ProductConversation identity is non-empty");
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES (?1, 'ordinary', 'open')",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
         Self::insert_work_scope_tx(
             &mut tx,
             &created_work_scope_id,
@@ -4502,8 +4558,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'user', ?18)",
+                "INSERT INTO conversations (id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id)
+                 VALUES (?1, ?19, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 'user', ?18)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -4523,6 +4579,7 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(created_work_scope_id.as_str())
+            .bind(product_conversation_id.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -4570,6 +4627,7 @@ impl Database {
         let title = schema::title_from_slug(&actual_slug);
         Ok(Conversation {
             id: id.to_string(),
+            product_conversation_id,
             slug: Some(actual_slug),
             title: Some(title),
             cwd: cwd.to_string(),
@@ -6625,7 +6683,7 @@ impl Database {
         worktree_path: &str,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -6655,7 +6713,7 @@ impl Database {
         work_scope_id: &phoenix_core::work_scope::WorkScopeId,
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -6866,8 +6924,8 @@ impl Database {
             let inserted = fts_telemetry
                 .observe_sqlx(SqlitePhase::Statement, async {
                     match sqlx::query(
-                        "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, service_tier)
-                 VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?15, 'user', ?16, ?17)",
+                        "INSERT INTO conversations (id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, service_tier)
+                 VALUES (?1, ?18, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?15, 'user', ?16, ?17)",
                     )
                     .bind(&new_id)
                     .bind(&candidate_slug)
@@ -6889,6 +6947,7 @@ impl Database {
                     .bind(cm.next_taskmd_id_hint)
                     .bind(work_scope_id.as_str())
                     .bind(parent.service_tier.as_wire_name())
+                    .bind(parent.product_conversation_id.as_str())
                     .execute(&mut *tx)
                     .await
                     {
@@ -7031,6 +7090,7 @@ impl Database {
 
         Ok(Conversation {
             id: new_id,
+            product_conversation_id: parent.product_conversation_id,
             slug: Some(actual_slug.clone()),
             title: Some(schema::title_from_slug(&actual_slug)),
             cwd: approval.worktree_path.clone(),
@@ -7209,8 +7269,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
-                 VALUES (?1, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21, ?22)",
+                "INSERT INTO conversations (id, product_conversation_id, slug, title, coordinator_head, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, sub_agent_cwd_override, service_tier)
+                 VALUES (?1, ?23, ?2, ?3, CASE WHEN ?19 = 'coordinator' THEN 1 ELSE 0 END, NULL, ?18, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, ?15, ?16, ?17, ?19, ?20, ?21, ?22)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -7242,6 +7302,7 @@ impl Database {
                 (parent.runtime_role == RuntimeRole::SubAgent).then_some(parent.cwd.as_str()),
             )
             .bind(parent.service_tier.as_wire_name())
+            .bind(parent.product_conversation_id.as_str())
             .execute(&mut *tx)
             .await;
 
@@ -7327,6 +7388,7 @@ impl Database {
         let title_str = schema::title_from_slug(&actual_slug);
         let new_conversation = Conversation {
             id: new_id,
+            product_conversation_id: parent.product_conversation_id,
             slug: Some(actual_slug),
             title: Some(title_str),
             cwd: parent.cwd,
@@ -7419,7 +7481,7 @@ impl Database {
                 FROM conversations c
                 JOIN chain ON c.id = chain.next_id
             )
-            SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                    c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -8546,7 +8608,7 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
-            "SELECT c.id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
+            "SELECT c.id, c.product_conversation_id, c.slug, c.title, COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model, c.effort, c.service_tier,
                     c.project_id, c.desired_base_branch,
                     c.runtime_role, c.work_scope_id,
@@ -11213,6 +11275,10 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let id: String = row.try_get("id")?;
+    let product_conversation_id = row
+        .try_get::<String, _>("product_conversation_id")?
+        .parse::<phoenix_core::domain::product_conversation::ProductConversationId>()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
 
     let state_json: String = row.try_get("state")?;
     let state: ConvState = match serde_json::from_str(&state_json) {
@@ -11271,6 +11337,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
 
     Ok(Conversation {
         id,
+        product_conversation_id,
         slug,
         title,
         cwd: row.try_get("cwd")?,
@@ -11593,6 +11660,14 @@ async fn insert_conversation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv: &Conversation,
 ) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+         VALUES (?1, 'ordinary', 'open')
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(conv.product_conversation_id.as_str())
+    .execute(&mut **tx)
+    .await?;
     let state_json =
         serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
     let cm = conv_mode_columns(&conv.conv_mode);
@@ -11630,14 +11705,14 @@ async fn insert_conversation_tx(
     // here. The legacy `steering_queue` column defaults to '[]'.
     sqlx::query(
         "INSERT INTO conversations (
-            id, slug, title, parent_conversation_id, user_initiated, state, state_kind,
+            id, product_conversation_id, slug, title, parent_conversation_id, user_initiated, state, state_kind,
             state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,
             runtime_role, work_scope_id, service_tier
-        ) VALUES (?1, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        ) VALUES (?1, ?31, ?2, ?3, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -11670,6 +11745,7 @@ async fn insert_conversation_tx(
     .bind(conv.runtime_role.as_str())
     .bind(work_scope_id.map(WorkScopeId::as_str))
     .bind(conv.service_tier.as_wire_name())
+    .bind(conv.product_conversation_id.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -1566,6 +1566,11 @@ fn build_child_conversation(
     let slug = format!("fork-{conv_id}");
     Conversation {
         id: conv_id.to_string(),
+        product_conversation_id:
+            phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                conv_id.to_string().to_string(),
+            )
+            .expect("conversation id is non-empty"),
         runtime_role: phoenix_core::work_scope::RuntimeRole::User,
         attached_work_scope_id: None,
         slug: Some(slug.clone()),

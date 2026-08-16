@@ -365,6 +365,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "settle_retired_tool_recovery",
         sql: MIGRATION_069,
     },
+    Migration {
+        version: 70,
+        name: "persist_product_conversation_identity",
+        sql: MIGRATION_070,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -444,6 +449,1239 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_070: &str = r"
+CREATE TABLE product_conversations (
+    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
+    kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator')),
+    ordinary_lifecycle TEXT CHECK (
+        (kind = 'ordinary' AND ordinary_lifecycle IN ('open', 'history'))
+        OR (kind = 'coordinator' AND ordinary_lifecycle IS NULL)
+    )
+);
+
+ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE;
+
+CREATE TEMP TABLE migration_070_membership (
+    conversation_id TEXT PRIMARY KEY,
+    product_conversation_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator'))
+);
+
+WITH RECURSIVE roots(conversation_id, product_conversation_id, kind) AS (
+    SELECT root.id, root.id,
+           CASE root.runtime_role WHEN 'coordinator' THEN 'coordinator' ELSE 'ordinary' END
+    FROM conversations root
+    WHERE root.parent_conversation_id IS NULL
+      AND root.runtime_role IN ('user', 'coordinator')
+      AND NOT EXISTS (
+          SELECT 1 FROM conversations predecessor
+          WHERE predecessor.continued_in_conv_id = root.id
+      )
+), members(conversation_id, product_conversation_id, kind) AS (
+    SELECT conversation_id, product_conversation_id, kind FROM roots
+    UNION
+    SELECT successor.id, members.product_conversation_id, members.kind
+    FROM members
+    JOIN conversations current ON current.id = members.conversation_id
+    JOIN conversations successor ON successor.id = current.continued_in_conv_id
+    WHERE successor.parent_conversation_id IS NULL
+      AND successor.runtime_role = current.runtime_role
+    UNION
+    SELECT participant.id, members.product_conversation_id, members.kind
+    FROM members
+    JOIN conversations participant ON participant.parent_conversation_id = members.conversation_id
+    WHERE participant.runtime_role = 'sub_agent'
+)
+INSERT INTO migration_070_membership
+SELECT conversation_id, product_conversation_id, kind FROM members;
+
+CREATE TEMP TABLE migration_070_membership_guard (
+    unresolved_count INTEGER NOT NULL CHECK (unresolved_count = 0)
+);
+INSERT INTO migration_070_membership_guard
+SELECT COUNT(*) FROM conversations c
+WHERE NOT EXISTS (
+    SELECT 1 FROM migration_070_membership m WHERE m.conversation_id = c.id
+);
+DROP TABLE migration_070_membership_guard;
+
+INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+SELECT DISTINCT m.product_conversation_id, m.kind,
+       CASE m.kind
+           WHEN 'ordinary' THEN CASE WHEN root.archived = 1 THEN 'history' ELSE 'open' END
+       END
+FROM migration_070_membership m
+JOIN conversations root ON root.id = m.product_conversation_id;
+
+UPDATE conversations
+SET product_conversation_id = (
+    SELECT m.product_conversation_id FROM migration_070_membership m
+    WHERE m.conversation_id = conversations.id
+);
+DROP TABLE migration_070_membership;
+
+CREATE TRIGGER conversations_require_product_membership_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW
+WHEN NEW.product_conversation_id IS NULL
+  OR NOT EXISTS (SELECT 1 FROM product_conversations p WHERE p.id = NEW.product_conversation_id)
+BEGIN
+    SELECT RAISE(ABORT, 'conversation requires ProductConversation membership');
+END;
+
+CREATE TRIGGER conversations_product_membership_is_immutable
+BEFORE UPDATE OF product_conversation_id ON conversations
+FOR EACH ROW WHEN OLD.product_conversation_id IS NOT NEW.product_conversation_id
+BEGIN
+    SELECT RAISE(ABORT, 'conversation ProductConversation membership is immutable');
+END;
+
+CREATE TRIGGER conversations_validate_product_kind_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM product_conversations p
+    WHERE p.id = NEW.product_conversation_id
+      AND ((NEW.runtime_role = 'coordinator' AND p.kind = 'coordinator')
+        OR (NEW.runtime_role = 'user' AND p.kind = 'ordinary')
+        OR NEW.runtime_role = 'sub_agent')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'conversation runtime role does not match ProductConversation kind');
+END;
+
+CREATE TRIGGER conversations_validate_product_kind_on_update
+BEFORE UPDATE OF runtime_role ON conversations
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM product_conversations p
+    WHERE p.id = NEW.product_conversation_id
+      AND ((NEW.runtime_role = 'coordinator' AND p.kind = 'coordinator')
+        OR (NEW.runtime_role = 'user' AND p.kind = 'ordinary')
+        OR NEW.runtime_role = 'sub_agent')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'conversation runtime role does not match ProductConversation kind');
+END;
+
+CREATE TRIGGER conversations_validate_product_parent_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW WHEN NEW.parent_conversation_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations parent
+    WHERE parent.id = NEW.parent_conversation_id
+      AND parent.product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'subordinate execution must share parent ProductConversation');
+END;
+
+CREATE TRIGGER conversations_validate_product_continuation_on_update
+BEFORE UPDATE OF continued_in_conv_id ON conversations
+FOR EACH ROW WHEN NEW.continued_in_conv_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations successor
+    WHERE successor.id = NEW.continued_in_conv_id
+      AND successor.product_conversation_id = OLD.product_conversation_id
+      AND successor.parent_conversation_id IS NULL
+      AND successor.runtime_role = OLD.runtime_role
+)
+BEGIN
+    SELECT RAISE(ABORT, 'continuation must connect parent transcripts in one ProductConversation');
+END;
+
+CREATE TRIGGER conversations_validate_product_continuation_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW WHEN NEW.continued_in_conv_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations successor
+    WHERE successor.id = NEW.continued_in_conv_id
+      AND successor.product_conversation_id = NEW.product_conversation_id
+      AND successor.parent_conversation_id IS NULL
+      AND successor.runtime_role = NEW.runtime_role
+)
+BEGIN
+    SELECT RAISE(ABORT, 'continuation must connect parent transcripts in one ProductConversation');
+END;
+
+DROP TRIGGER close_obligations_require_admission_phase_on_insert;
+
+DROP TRIGGER close_obligations_reject_invalid_timestamps_on_insert;
+
+DROP TRIGGER close_obligations_reject_invalid_timestamps_on_update;
+
+DROP TRIGGER close_obligations_reject_active_standalone_delete;
+
+DROP TRIGGER close_obligations_completed_outcome_is_immutable;
+
+DROP TRIGGER close_obligations_require_archived_members_for_completion;
+
+DROP TRIGGER close_obligations_require_open_members_for_cancelled_completion;
+
+DROP TRIGGER close_obligations_require_complete_retirement_proof;
+
+DROP TRIGGER close_obligations_require_topology_seal_before_phase_transition;
+
+DROP TRIGGER close_obligations_transition_graph;
+
+DROP TRIGGER close_obligations_root_is_immutable;
+
+DROP TRIGGER close_obligations_created_at_is_immutable;
+
+DROP TRIGGER close_obligations_chronology_ordinal_is_immutable;
+
+DROP TRIGGER close_obligations_chronology_must_be_database_allocated;
+
+DROP TRIGGER close_obligations_require_closed_timestamps;
+
+DROP TRIGGER close_obligations_reject_inspection_pair_mismatch_on_update;
+
+DROP TRIGGER close_obligations_reject_missing_inspection_on_update;
+
+DROP TRIGGER close_obligations_require_complete_inspection_scope_coverage;
+
+DROP TRIGGER close_obligations_require_loss_consistent_branch_from_inspection;
+
+DROP TRIGGER close_obligations_invalidate_inspection_on_reentry;
+
+DROP TRIGGER close_obligations_snapshot_matches_inspection_aggregate;
+
+DROP TRIGGER close_obligations_touch_updated_at;
+
+DROP TRIGGER close_obligations_validate_topology_before_seal;
+
+DROP TRIGGER close_obligations_topology_seal_is_monotonic;
+
+DROP TRIGGER close_obligations_require_member_cleanup_before_delete;
+
+DROP TRIGGER close_obligations_require_residual_before_needs_repair;
+
+DROP TRIGGER close_obligations_preserve_dependent_absence_on_delete;
+
+DROP TRIGGER close_obligations_preserve_dependent_absence_on_snapshot_update;
+
+DROP TRIGGER conversations_reject_close_root_identity_change;
+
+DROP TRIGGER close_attempt_members_reject_delete_after_topology_seal;
+
+DROP TRIGGER close_attempt_members_preserve_target_scope_on_delete;
+
+DROP TRIGGER close_attempt_scopes_preserve_captured_target_on_delete;
+
+DROP TRIGGER close_retirement_inspections_reject_sealed_delete;
+
+DROP TRIGGER close_retirement_losses_require_open_inspection_on_delete;
+
+DROP TRIGGER close_retirement_inventories_reject_distinct_owner_before_seal;
+
+DROP TRIGGER close_retirement_inventories_reject_standalone_delete;
+
+DROP TRIGGER close_expected_retirement_resources_reject_standalone_delete;
+
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_insert;
+
+DROP TRIGGER close_retirement_resources_require_absence_proof_on_update;
+
+DROP TRIGGER close_retirement_resources_reject_standalone_delete;
+
+DROP TRIGGER close_retirement_resources_preserve_dependent_absence_on_delete;
+
+DROP TRIGGER close_retirement_resources_preserve_dependent_absence_on_update;
+
+DROP INDEX close_obligations_one_active_per_root;
+ALTER TABLE close_obligations
+    ADD COLUMN product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE;
+UPDATE close_obligations
+SET product_conversation_id = root_conversation_id;
+ALTER TABLE close_obligations DROP COLUMN root_conversation_id;
+
+CREATE TRIGGER close_obligations_require_product_membership_on_insert
+BEFORE INSERT ON close_obligations
+FOR EACH ROW WHEN NEW.product_conversation_id IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation requires ProductConversation identity');
+END;
+
+CREATE TRIGGER close_obligations_require_admission_phase_on_insert
+BEFORE INSERT ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase <> 'awaiting_blocker_resolution'
+  OR NEW.topology_sealed <> 0
+  OR NEW.inspection_generation IS NOT NULL
+  OR NEW.inspection_fingerprint IS NOT NULL
+  OR NEW.completed_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation must begin at admission phase');
+END;
+
+CREATE TRIGGER close_obligations_reject_invalid_timestamps_on_insert
+BEFORE INSERT ON close_obligations
+FOR EACH ROW
+WHEN (
+      NEW.created_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.created_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.created_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.created_at, 21, LENGTH(NEW.created_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.created_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.created_at, 21, LENGTH(NEW.created_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR (
+      NEW.updated_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.updated_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR date(SUBSTR(NEW.created_at, 1, 10), '+0 days') <> SUBSTR(NEW.created_at, 1, 10)
+  OR CAST(SUBSTR(NEW.created_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.created_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.created_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.created_at) IS NULL
+  OR date(SUBSTR(NEW.updated_at, 1, 10), '+0 days') <> SUBSTR(NEW.updated_at, 1, 10)
+  OR CAST(SUBSTR(NEW.updated_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.updated_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.updated_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.updated_at) IS NULL
+  OR (
+      NEW.completed_at IS NOT NULL
+      AND (
+          (
+              NEW.completed_at NOT GLOB '????-??-??T??:??:??Z'
+              AND NEW.completed_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+              AND (NEW.completed_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.completed_at, 21, LENGTH(NEW.completed_at) - 21) GLOB '*[^0-9]*')
+              AND (NEW.completed_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.completed_at, 21, LENGTH(NEW.completed_at) - 26) GLOB '*[^0-9]*')
+          )
+          OR date(SUBSTR(NEW.completed_at, 1, 10), '+0 days') <> SUBSTR(NEW.completed_at, 1, 10)
+          OR CAST(SUBSTR(NEW.completed_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+          OR CAST(SUBSTR(NEW.completed_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+          OR CAST(SUBSTR(NEW.completed_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+          OR julianday(NEW.completed_at) IS NULL
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation timestamps must be valid RFC 3339');
+END;
+
+CREATE TRIGGER close_obligations_reject_invalid_timestamps_on_update
+BEFORE UPDATE OF created_at, updated_at, completed_at ON close_obligations
+FOR EACH ROW
+WHEN (
+      NEW.created_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.created_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.created_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.created_at, 21, LENGTH(NEW.created_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.created_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.created_at, 21, LENGTH(NEW.created_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR (
+      NEW.updated_at NOT GLOB '????-??-??T??:??:??Z'
+      AND NEW.updated_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 21) GLOB '*[^0-9]*')
+      AND (NEW.updated_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.updated_at, 21, LENGTH(NEW.updated_at) - 26) GLOB '*[^0-9]*')
+  )
+  OR date(SUBSTR(NEW.created_at, 1, 10), '+0 days') <> SUBSTR(NEW.created_at, 1, 10)
+  OR CAST(SUBSTR(NEW.created_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.created_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.created_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.created_at) IS NULL
+  OR date(SUBSTR(NEW.updated_at, 1, 10), '+0 days') <> SUBSTR(NEW.updated_at, 1, 10)
+  OR CAST(SUBSTR(NEW.updated_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+  OR CAST(SUBSTR(NEW.updated_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR CAST(SUBSTR(NEW.updated_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+  OR julianday(NEW.updated_at) IS NULL
+  OR (
+      NEW.completed_at IS NOT NULL
+      AND (
+          (
+              NEW.completed_at NOT GLOB '????-??-??T??:??:??Z'
+              AND NEW.completed_at NOT GLOB '????-??-??T??:??:??[+-]??:??'
+              AND (NEW.completed_at NOT GLOB '????-??-??T??:??:??.*Z' OR SUBSTR(NEW.completed_at, 21, LENGTH(NEW.completed_at) - 21) GLOB '*[^0-9]*')
+              AND (NEW.completed_at NOT GLOB '????-??-??T??:??:??.*[+-]??:??' OR SUBSTR(NEW.completed_at, 21, LENGTH(NEW.completed_at) - 26) GLOB '*[^0-9]*')
+          )
+          OR date(SUBSTR(NEW.completed_at, 1, 10), '+0 days') <> SUBSTR(NEW.completed_at, 1, 10)
+          OR CAST(SUBSTR(NEW.completed_at, 12, 2) AS INTEGER) NOT BETWEEN 0 AND 23
+          OR CAST(SUBSTR(NEW.completed_at, 15, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+          OR CAST(SUBSTR(NEW.completed_at, 18, 2) AS INTEGER) NOT BETWEEN 0 AND 59
+          OR julianday(NEW.completed_at) IS NULL
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation timestamps must be valid RFC 3339');
+END;
+
+CREATE TRIGGER close_obligations_reject_active_standalone_delete
+BEFORE DELETE ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase <> 'completed' AND EXISTS (
+    SELECT 1 FROM product_conversations WHERE id = OLD.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active close obligation can only be deleted with its root');
+END;
+
+CREATE TRIGGER close_obligations_completed_outcome_is_immutable
+BEFORE UPDATE OF phase, close_outcome, completed_at, updated_at ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'completed'
+  AND (
+      NEW.phase IS NOT OLD.phase
+      OR NEW.close_outcome IS NOT OLD.close_outcome
+      OR NEW.completed_at IS NOT OLD.completed_at
+      OR NEW.updated_at IS NOT OLD.updated_at
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'completed close outcome is immutable');
+END;
+
+CREATE TRIGGER close_obligations_require_archived_members_for_completion
+BEFORE UPDATE OF phase, close_outcome ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'completed'
+  AND NEW.close_outcome = 'archived'
+  AND EXISTS (
+      SELECT 1 FROM close_attempt_members member
+      JOIN conversations conversation ON conversation.id = member.conversation_id
+      WHERE member.attempt_id = OLD.attempt_id AND conversation.archived <> 1
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close completion requires archived captured members');
+END;
+
+CREATE TRIGGER close_obligations_require_open_members_for_cancelled_completion
+BEFORE UPDATE OF phase, close_outcome ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'completed'
+  AND NEW.close_outcome = 'cancelled'
+  AND EXISTS (
+      SELECT 1 FROM close_attempt_members member
+      JOIN conversations conversation ON conversation.id = member.conversation_id
+      WHERE member.attempt_id = OLD.attempt_id AND conversation.archived <> 0
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'cancelled close completion requires open captured members');
+END;
+
+CREATE TRIGGER close_obligations_require_complete_retirement_proof
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase IN ('retirement_requested', 'needs_repair')
+  AND NEW.phase = 'completed'
+  AND (
+      EXISTS (
+          SELECT 1 FROM close_attempt_scopes target
+          WHERE target.attempt_id = OLD.attempt_id
+            AND NOT EXISTS (
+                SELECT 1 FROM close_retirement_inventories inventory
+                WHERE inventory.attempt_id = target.attempt_id
+                  AND inventory.scope = target.scope
+                  AND inventory.inspection_generation = OLD.inspection_generation
+                  AND inventory.inspection_fingerprint = OLD.inspection_fingerprint
+                  AND inventory.sealed = 1
+            )
+      )
+      OR EXISTS (
+          SELECT 1
+          FROM close_attempt_scopes target
+          JOIN work_scopes scope ON scope.id = target.scope
+          WHERE target.attempt_id = OLD.attempt_id
+            AND scope.environment_kind = 'allocated_worktree'
+            AND NOT EXISTS (
+                SELECT 1 FROM close_expected_retirement_resources expected
+                WHERE expected.attempt_id = target.attempt_id
+                  AND expected.scope = target.scope
+                  AND expected.inspection_generation = OLD.inspection_generation
+                  AND expected.inspection_fingerprint = OLD.inspection_fingerprint
+                  AND expected.resource_kind = 'worktree'
+            )
+      )
+      OR EXISTS (
+          SELECT 1 FROM close_expected_retirement_resources expected
+          WHERE expected.attempt_id = OLD.attempt_id
+            AND expected.inspection_generation = OLD.inspection_generation
+            AND expected.inspection_fingerprint = OLD.inspection_fingerprint
+            AND NOT EXISTS (
+                SELECT 1 FROM close_retirement_resources proof
+                WHERE proof.attempt_id = expected.attempt_id
+                  AND proof.scope = expected.scope
+                  AND proof.inspection_generation = expected.inspection_generation
+                  AND proof.inspection_fingerprint = expected.inspection_fingerprint
+                  AND proof.resource_kind = expected.resource_kind
+                  AND proof.identity_kind = expected.identity_kind
+                  AND proof.identity_codec = expected.identity_codec
+                  AND proof.identity_value = expected.identity_value
+                  AND proof.proof_kind IN ('retired', 'absence_adopted')
+            )
+      )
+      OR EXISTS (
+          SELECT 1 FROM close_retirement_resources resource
+          WHERE resource.attempt_id = OLD.attempt_id
+            AND resource.inspection_generation = OLD.inspection_generation
+            AND resource.inspection_fingerprint = OLD.inspection_fingerprint
+            AND resource.proof_kind = 'residual'
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation lacks complete retirement proof');
+END;
+
+CREATE TRIGGER close_obligations_require_topology_seal_before_phase_transition
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase <> NEW.phase
+  AND OLD.topology_sealed <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation phase transition requires sealed topology');
+END;
+
+CREATE TRIGGER close_obligations_transition_graph
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NOT (
+    (OLD.phase = 'awaiting_blocker_resolution' AND NEW.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work', 'completed'))
+    OR (OLD.phase = 'awaiting_stop_work_confirmation' AND NEW.phase IN ('settling_active_work', 'completed'))
+    OR (OLD.phase = 'settling_active_work' AND NEW.phase IN ('cancel_requested_during_settlement', 'awaiting_retirement_inspection'))
+    OR (OLD.phase = 'cancel_requested_during_settlement' AND NEW.phase = 'completed')
+    OR (OLD.phase = 'awaiting_retirement_inspection' AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'awaiting_loss_confirmation' AND NEW.phase IN ('awaiting_retirement_inspection', 'retirement_requested', 'completed'))
+    OR (OLD.phase = 'retirement_requested' AND NEW.phase IN ('needs_repair', 'completed'))
+    OR (OLD.phase = 'needs_repair' AND NEW.phase IN ('retirement_requested', 'completed'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid close obligation phase transition');
+END;
+
+CREATE TRIGGER close_obligations_root_is_immutable
+BEFORE UPDATE OF product_conversation_id ON close_obligations
+FOR EACH ROW
+WHEN OLD.product_conversation_id <> NEW.product_conversation_id
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation root is immutable');
+END;
+
+CREATE TRIGGER close_obligations_created_at_is_immutable
+BEFORE UPDATE OF created_at ON close_obligations
+FOR EACH ROW
+WHEN OLD.created_at <> NEW.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation creation timestamp is immutable');
+END;
+
+CREATE TRIGGER close_obligations_chronology_ordinal_is_immutable
+BEFORE UPDATE OF chronology_ordinal ON close_obligations
+FOR EACH ROW
+WHEN OLD.chronology_ordinal <> NEW.chronology_ordinal
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation chronology ordinal is immutable');
+END;
+
+CREATE TRIGGER close_obligations_chronology_must_be_database_allocated
+BEFORE INSERT ON close_obligations
+FOR EACH ROW
+WHEN NEW.chronology_ordinal <> -1
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation chronology must be database allocated');
+END;
+
+CREATE TRIGGER close_obligations_require_closed_timestamps
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.phase = 'completed') <> (NEW.completed_at IS NOT NULL))
+  OR ((NEW.phase = 'completed') <> (NEW.close_outcome IS NOT NULL))
+  OR (OLD.phase <> 'completed' AND NEW.phase = 'completed'
+      AND NEW.close_outcome = 'cancelled'
+      AND OLD.phase IN ('retirement_requested', 'needs_repair'))
+  OR (OLD.phase <> 'completed' AND NEW.phase = 'completed'
+      AND NEW.close_outcome = 'archived'
+      AND OLD.phase NOT IN ('retirement_requested', 'needs_repair'))
+BEGIN
+    SELECT RAISE(ABORT, 'close_obligations completion outcome must match legal source phase');
+END;
+
+CREATE TRIGGER close_obligations_reject_inspection_pair_mismatch_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.inspection_generation IS NULL) <> (NEW.inspection_fingerprint IS NULL))
+BEGIN
+    SELECT RAISE(ABORT, 'close_obligations inspection_generation/fingerprint must both be null or both nonnull');
+END;
+
+CREATE TRIGGER close_obligations_reject_missing_inspection_on_update
+BEFORE UPDATE ON close_obligations
+FOR EACH ROW
+WHEN ((NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested', 'needs_repair')) AND NEW.inspection_generation IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'close_obligations inspection required for phase');
+END;
+
+CREATE TRIGGER close_obligations_require_complete_inspection_scope_coverage
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'awaiting_retirement_inspection'
+  AND NEW.phase IN ('awaiting_loss_confirmation', 'retirement_requested')
+  AND EXISTS (
+      SELECT 1
+      FROM close_attempt_scopes target
+      JOIN work_scopes scope ON scope.id = target.scope
+      WHERE target.attempt_id = NEW.attempt_id
+        AND scope.environment_kind = 'allocated_worktree'
+        AND NOT EXISTS (
+            SELECT 1 FROM close_retirement_inspections inspection
+            WHERE inspection.attempt_id = target.attempt_id
+              AND inspection.scope = target.scope
+        )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close inspection must cover every targeted allocated worktree scope');
+END;
+
+CREATE TRIGGER close_obligations_require_loss_consistent_branch_from_inspection
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'awaiting_retirement_inspection'
+  AND (
+      (
+          NEW.phase = 'retirement_requested'
+          AND EXISTS (
+              SELECT 1 FROM close_retirement_losses loss
+              WHERE loss.attempt_id = NEW.attempt_id
+          )
+      )
+      OR (
+          NEW.phase = 'awaiting_loss_confirmation'
+          AND NOT EXISTS (
+              SELECT 1 FROM close_retirement_losses loss
+              WHERE loss.attempt_id = NEW.attempt_id
+          )
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation phase must match persisted inspection losses');
+END;
+
+CREATE TRIGGER close_obligations_invalidate_inspection_on_reentry
+AFTER UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN NEW.phase = 'awaiting_retirement_inspection'
+  AND OLD.phase <> 'awaiting_retirement_inspection'
+BEGIN
+    DELETE FROM close_retirement_inspections WHERE attempt_id = NEW.attempt_id;
+    UPDATE close_obligations
+    SET inspection_generation = NULL, inspection_fingerprint = NULL
+    WHERE attempt_id = NEW.attempt_id;
+END;
+
+CREATE TRIGGER close_obligations_snapshot_matches_inspection_aggregate
+BEFORE UPDATE OF inspection_generation, inspection_fingerprint ON close_obligations
+FOR EACH ROW
+WHEN (
+    OLD.inspection_generation IS NOT NEW.inspection_generation
+    OR OLD.inspection_fingerprint IS NOT NEW.inspection_fingerprint
+) AND NOT (
+    NEW.phase = 'completed'
+    AND NEW.close_outcome = 'cancelled'
+    AND NEW.inspection_generation IS NULL
+    AND NEW.inspection_fingerprint IS NULL
+) AND (
+    OLD.phase <> 'awaiting_retirement_inspection'
+    OR NEW.inspection_generation <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT generation,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(generation AS BLOB)) || ':' || generation AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        ) ELSE 'no-worktree'
+    END
+    OR NEW.inspection_fingerprint <> CASE
+        WHEN EXISTS (
+            SELECT 1 FROM close_retirement_inspections
+            WHERE attempt_id = NEW.attempt_id
+        ) THEN (
+            SELECT 'v1' || COALESCE(GROUP_CONCAT(component, ''), '')
+            FROM (
+                SELECT fingerprint,
+                       LENGTH(CAST(scope AS BLOB)) || ':' || scope ||
+                       LENGTH(CAST(fingerprint AS BLOB)) || ':' || fingerprint AS component
+                FROM close_retirement_inspections
+                WHERE attempt_id = NEW.attempt_id
+                ORDER BY scope
+            )
+        ) ELSE 'no-worktree'
+    END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation snapshot must match atomic inspection replacement');
+END;
+
+CREATE TRIGGER close_obligations_touch_updated_at
+AFTER UPDATE ON close_obligations
+FOR EACH ROW
+WHEN NEW.updated_at = OLD.updated_at
+  AND NEW.phase <> 'completed'
+  AND julianday('now') > julianday(OLD.updated_at)
+BEGIN
+    UPDATE close_obligations
+    SET updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE attempt_id = NEW.attempt_id;
+END;
+
+CREATE TRIGGER close_obligations_validate_topology_before_seal
+BEFORE UPDATE OF topology_sealed ON close_obligations
+FOR EACH ROW
+WHEN OLD.topology_sealed = 0 AND NEW.topology_sealed = 1 AND (
+    NOT EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        WHERE member.attempt_id = OLD.attempt_id
+          AND member.continuation_ordinal = 0
+          AND EXISTS (SELECT 1 FROM conversations root_member WHERE root_member.id = member.conversation_id AND root_member.product_conversation_id = OLD.product_conversation_id)
+          AND member.member_role IN ('root', 'root_latest')
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM conversations root
+        WHERE root.id = OLD.product_conversation_id
+          AND root.runtime_role = 'user'
+          AND root.parent_conversation_id IS NULL
+          AND root.user_initiated = 1
+          AND root.archived = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM close_attempt_members latest
+        JOIN conversations live ON live.id = latest.conversation_id
+        WHERE latest.attempt_id = OLD.attempt_id
+          AND latest.member_role IN ('latest', 'root_latest')
+          AND live.state_kind = 'handed_off'
+          AND live.continued_in_conv_id IS NULL
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM close_attempt_members member
+        JOIN conversations live ON live.id = member.conversation_id
+        WHERE member.attempt_id = OLD.attempt_id
+          AND live.state_kind IN ('awaiting_task_approval', 'awaiting_continuation')
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        WHERE member.attempt_id = OLD.attempt_id
+          AND member.member_role IN ('latest', 'root_latest')
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members latest
+        WHERE latest.attempt_id = OLD.attempt_id
+          AND latest.member_role IN ('latest', 'root_latest')
+          AND (
+              latest.captured_continued_in_conv_id IS NOT NULL
+              OR EXISTS (
+                  SELECT 1 FROM close_attempt_members later
+                  WHERE later.attempt_id = latest.attempt_id
+                    AND later.continuation_ordinal > latest.continuation_ordinal
+              )
+          )
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        WHERE member.attempt_id = OLD.attempt_id
+          AND member.continuation_ordinal > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM close_attempt_members predecessor
+              WHERE predecessor.attempt_id = member.attempt_id
+                AND predecessor.continuation_ordinal = member.continuation_ordinal - 1
+                AND predecessor.captured_continued_in_conv_id = member.conversation_id
+          )
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        JOIN conversations live ON live.id = member.conversation_id
+        WHERE member.attempt_id = OLD.attempt_id
+          AND (
+              member.captured_continued_in_conv_id IS NOT live.continued_in_conv_id
+              OR member.captured_state_kind <> live.state_kind
+              OR member.captured_runtime_role <> live.runtime_role
+          )
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        JOIN conversations live ON live.id = member.conversation_id
+        WHERE member.attempt_id = OLD.attempt_id
+          AND live.archived <> 0
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        WHERE member.attempt_id = OLD.attempt_id
+          AND (
+              (
+                  member.continuation_ordinal = 0
+                  AND (
+                      SELECT COUNT(*) FROM conversations predecessor
+                      WHERE predecessor.continued_in_conv_id = member.conversation_id
+                  ) <> 0
+              )
+              OR (
+                  member.continuation_ordinal > 0
+                  AND (
+                      SELECT COUNT(*) FROM conversations predecessor
+                      WHERE predecessor.continued_in_conv_id = member.conversation_id
+                  ) <> 1
+              )
+          )
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        JOIN conversations live ON live.id = member.conversation_id
+        WHERE member.attempt_id = OLD.attempt_id
+          AND member.captured_work_scope_id IS NOT live.work_scope_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM close_attempt_members member
+        WHERE member.attempt_id = OLD.attempt_id
+          AND member.captured_work_scope_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM close_attempt_scopes scope
+              WHERE scope.attempt_id = member.attempt_id
+                AND scope.scope = member.captured_work_scope_id
+          )
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM close_attempt_scopes captured
+        JOIN work_scopes live ON live.id = captured.scope
+        WHERE captured.attempt_id = OLD.attempt_id
+          AND (
+              (live.environment_kind = 'allocated_worktree'
+               AND (captured.captured_worktree_identity IS NOT live.worktree_id
+                   OR captured.captured_worktree_fingerprint IS NOT live.worktree_fingerprint
+                   OR captured.captured_worktree_locator IS NOT
+                       'git_path_bytes_hex_v1:' || lower(hex(CAST(live.worktree_path AS BLOB)))))
+              OR (live.environment_kind <> 'allocated_worktree'
+                  AND (captured.captured_worktree_identity IS NOT NULL
+                      OR captured.captured_worktree_fingerprint IS NOT NULL
+                      OR captured.captured_worktree_locator IS NOT NULL))
+          )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured close topology is incomplete');
+END;
+
+CREATE TRIGGER close_obligations_topology_seal_is_monotonic
+BEFORE UPDATE OF topology_sealed ON close_obligations
+FOR EACH ROW
+WHEN OLD.topology_sealed = 1 AND NEW.topology_sealed <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'captured close topology seal is immutable');
+END;
+
+CREATE TRIGGER close_obligations_require_member_cleanup_before_delete
+BEFORE DELETE ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'completed'
+  AND (
+      EXISTS (
+          SELECT 1 FROM close_attempt_members member
+          WHERE member.attempt_id = OLD.attempt_id
+      )
+      OR EXISTS (
+          SELECT 1 FROM close_attempt_scopes scope
+          WHERE scope.attempt_id = OLD.attempt_id
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'completed Close history must remove member snapshots before obligation deletion');
+END;
+
+CREATE TRIGGER close_obligations_require_residual_before_needs_repair
+BEFORE UPDATE OF phase ON close_obligations
+FOR EACH ROW
+WHEN OLD.phase = 'retirement_requested'
+  AND NEW.phase = 'needs_repair'
+  AND NOT EXISTS (
+      SELECT 1 FROM close_retirement_resources resource
+      WHERE resource.attempt_id = OLD.attempt_id
+        AND resource.inspection_generation = OLD.inspection_generation
+        AND resource.inspection_fingerprint = OLD.inspection_fingerprint
+        AND resource.proof_kind = 'residual'
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM close_attempt_scopes captured
+      WHERE captured.attempt_id = OLD.attempt_id
+        AND captured.captured_worktree_identity IS NULL
+        AND captured.captured_worktree_fingerprint IS NULL
+        AND captured.captured_worktree_locator IS NOT NULL
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'needs_repair requires current-snapshot residual evidence');
+END;
+
+CREATE TRIGGER close_obligations_preserve_dependent_absence_on_delete
+BEFORE DELETE ON close_obligations
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM conversations root
+    JOIN close_retirement_resources proof ON proof.attempt_id = OLD.attempt_id
+    JOIN close_obligations dependent_obligation
+      ON dependent_obligation.product_conversation_id = OLD.product_conversation_id
+    JOIN close_retirement_resources dependent
+      ON dependent.attempt_id = dependent_obligation.attempt_id
+    WHERE root.id = OLD.product_conversation_id
+      AND proof.inspection_generation = OLD.inspection_generation
+      AND proof.inspection_fingerprint = OLD.inspection_fingerprint
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+      AND dependent.attempt_id <> OLD.attempt_id
+      AND dependent.scope = proof.scope
+      AND dependent.resource_kind = proof.resource_kind
+      AND dependent.identity_kind = proof.identity_kind
+      AND dependent.identity_codec = proof.identity_codec
+      AND dependent.identity_value = proof.identity_value
+      AND dependent.proof_kind = 'absence_adopted'
+      AND dependent.absence_basis = 'preexisting_exact_identity_evidence'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation retains proof for adopted absence');
+END;
+
+CREATE TRIGGER close_obligations_preserve_dependent_absence_on_snapshot_update
+BEFORE UPDATE OF inspection_generation, inspection_fingerprint ON close_obligations
+FOR EACH ROW
+WHEN (
+    OLD.inspection_generation IS NOT NEW.inspection_generation
+    OR OLD.inspection_fingerprint IS NOT NEW.inspection_fingerprint
+) AND EXISTS (
+    SELECT 1
+    FROM close_retirement_resources proof
+    JOIN close_obligations dependent_obligation
+      ON dependent_obligation.product_conversation_id = OLD.product_conversation_id
+    JOIN close_retirement_resources dependent
+      ON dependent.attempt_id = dependent_obligation.attempt_id
+    WHERE proof.attempt_id = OLD.attempt_id
+      AND proof.inspection_generation = OLD.inspection_generation
+      AND proof.inspection_fingerprint = OLD.inspection_fingerprint
+      AND proof.proof_kind IN ('retired', 'absence_adopted')
+      AND dependent.attempt_id <> OLD.attempt_id
+      AND dependent.scope = proof.scope
+      AND dependent.resource_kind = proof.resource_kind
+      AND dependent.identity_kind = proof.identity_kind
+      AND dependent.identity_codec = proof.identity_codec
+      AND dependent.identity_value = proof.identity_value
+      AND dependent.proof_kind = 'absence_adopted'
+      AND dependent.absence_basis = 'preexisting_exact_identity_evidence'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation retains proof for adopted absence');
+END;
+
+CREATE TRIGGER conversations_reject_close_product_membership_change
+BEFORE UPDATE OF product_conversation_id ON conversations
+FOR EACH ROW WHEN OLD.product_conversation_id IS NOT NEW.product_conversation_id
+ AND EXISTS (SELECT 1 FROM close_obligations o WHERE o.product_conversation_id = OLD.product_conversation_id AND o.phase <> 'completed')
+BEGIN
+    SELECT RAISE(ABORT, 'active Close preserves ProductConversation membership');
+END;
+
+CREATE TRIGGER close_attempt_members_reject_delete_after_topology_seal
+BEFORE DELETE ON close_attempt_members
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.topology_sealed = 1
+      AND obligation.phase <> 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured close topology is sealed');
+END;
+
+CREATE TRIGGER close_attempt_members_preserve_target_scope_on_delete
+BEFORE DELETE ON close_attempt_members
+FOR EACH ROW
+WHEN OLD.captured_work_scope_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'completed'
+) AND EXISTS (
+    SELECT 1 FROM close_attempt_scopes target
+    WHERE target.attempt_id = OLD.attempt_id AND target.scope = OLD.captured_work_scope_id
+) AND NOT EXISTS (
+    SELECT 1 FROM close_attempt_members member
+    WHERE member.attempt_id = OLD.attempt_id
+      AND member.captured_work_scope_id = OLD.captured_work_scope_id
+      AND member.conversation_id <> OLD.conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured member scope is targeted by close attempt');
+END;
+
+CREATE TRIGGER close_attempt_scopes_preserve_captured_target_on_delete
+BEFORE DELETE ON close_attempt_scopes
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'completed'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured close target is immutable');
+END;
+
+CREATE TRIGGER close_retirement_inspections_reject_sealed_delete
+BEFORE DELETE ON close_retirement_inspections
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'persisted close inspection snapshot is sealed');
+END;
+
+CREATE TRIGGER close_retirement_losses_require_open_inspection_on_delete
+BEFORE DELETE ON close_retirement_losses
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+      AND obligation.phase <> 'awaiting_retirement_inspection'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close loss inventory is sealed outside inspection replacement');
+END;
+
+CREATE TRIGGER close_retirement_inventories_reject_distinct_owner_before_seal
+BEFORE UPDATE OF sealed ON close_retirement_inventories
+FOR EACH ROW
+WHEN OLD.sealed = 0
+  AND NEW.sealed = 1
+  AND EXISTS (
+      WITH RECURSIVE open_candidates(id) AS (
+          SELECT id FROM conversations
+          WHERE work_scope_id = NEW.scope
+            AND runtime_role = 'user'
+            AND parent_conversation_id IS NULL
+            AND archived = 0
+      ), ancestry(candidate_id, id, path) AS (
+          SELECT id, id, json_array(id) FROM open_candidates
+          UNION ALL
+          SELECT ancestry.candidate_id, predecessor.id,
+                 json_insert(ancestry.path, '$[#]', predecessor.id)
+          FROM ancestry
+          JOIN conversations predecessor
+            ON predecessor.continued_in_conv_id = ancestry.id
+          WHERE NOT EXISTS (
+              SELECT 1 FROM json_each(ancestry.path) visited
+              WHERE visited.value = predecessor.id
+          )
+      ), resolved(candidate_id, root_id) AS (
+          SELECT ancestry.candidate_id, root.product_conversation_id
+          FROM ancestry
+          JOIN conversations root ON root.id = ancestry.id
+          WHERE NOT EXISTS (
+              SELECT 1 FROM conversations predecessor
+              WHERE predecessor.continued_in_conv_id = ancestry.id
+          )
+      ), captured_root(id) AS (
+          SELECT product_conversation_id FROM close_obligations
+          WHERE attempt_id = NEW.attempt_id
+      )
+      SELECT 1
+      FROM open_candidates candidate
+      LEFT JOIN resolved ON resolved.candidate_id = candidate.id
+      CROSS JOIN captured_root
+      GROUP BY candidate.id, captured_root.id
+      HAVING COUNT(resolved.root_id) <> 1
+          OR MAX(resolved.root_id) <> captured_root.id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'retirement inventory scope is retained by distinct open aggregate');
+END;
+
+CREATE TRIGGER close_retirement_inventories_reject_standalone_delete
+BEFORE DELETE ON close_retirement_inventories
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'captured retirement inventory can only be deleted with its root');
+END;
+
+CREATE TRIGGER close_expected_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_expected_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'expected retirement resource can only be deleted with its root');
+END;
+
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_insert
+BEFORE INSERT ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted' AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    JOIN close_obligations proof_obligation ON proof_obligation.attempt_id = proof.attempt_id
+    JOIN close_obligations current_obligation ON current_obligation.attempt_id = NEW.attempt_id
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND (
+          (NEW.absence_basis = 'same_attempt_prior_retirement'
+           AND proof.attempt_id = NEW.attempt_id
+           AND proof.inspection_generation = NEW.inspection_generation
+           AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+           AND proof.proof_kind = 'retired')
+          OR
+          (NEW.absence_basis = 'preexisting_exact_identity_evidence'
+           AND proof.attempt_id <> NEW.attempt_id
+           AND proof_obligation.product_conversation_id = current_obligation.product_conversation_id
+           AND proof.inspection_generation = proof_obligation.inspection_generation
+           AND proof.inspection_fingerprint = proof_obligation.inspection_fingerprint
+           AND proof.proof_kind IN ('retired', 'absence_adopted'))
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
+CREATE TRIGGER close_retirement_resources_require_absence_proof_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN NEW.proof_kind = 'absence_adopted'
+ AND (
+     OLD.proof_kind <> 'absence_adopted'
+     OR OLD.absence_basis IS NOT NEW.absence_basis
+     OR OLD.attempt_id <> NEW.attempt_id
+     OR OLD.scope <> NEW.scope
+     OR OLD.inspection_generation <> NEW.inspection_generation
+     OR OLD.inspection_fingerprint <> NEW.inspection_fingerprint
+     OR OLD.resource_kind <> NEW.resource_kind
+     OR OLD.identity_kind <> NEW.identity_kind
+     OR OLD.identity_codec <> NEW.identity_codec
+     OR OLD.identity_value <> NEW.identity_value
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM close_retirement_resources proof
+    JOIN close_obligations proof_obligation ON proof_obligation.attempt_id = proof.attempt_id
+    JOIN close_obligations current_obligation ON current_obligation.attempt_id = NEW.attempt_id
+    WHERE proof.scope = NEW.scope
+      AND proof.resource_kind = NEW.resource_kind
+      AND proof.identity_kind = NEW.identity_kind
+      AND proof.identity_codec = NEW.identity_codec
+      AND proof.identity_value = NEW.identity_value
+      AND (
+          (NEW.absence_basis = 'same_attempt_prior_retirement'
+           AND proof.attempt_id = NEW.attempt_id
+           AND proof.inspection_generation = NEW.inspection_generation
+           AND proof.inspection_fingerprint = NEW.inspection_fingerprint
+           AND proof.proof_kind = 'retired')
+          OR
+          (NEW.absence_basis = 'preexisting_exact_identity_evidence'
+           AND proof.attempt_id <> NEW.attempt_id
+           AND proof_obligation.product_conversation_id = current_obligation.product_conversation_id
+           AND proof.inspection_generation = proof_obligation.inspection_generation
+           AND proof.inspection_fingerprint = proof_obligation.inspection_fingerprint
+           AND proof.proof_kind IN ('retired', 'absence_adopted'))
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'adopted absence requires exact retained proof');
+END;
+
+CREATE TRIGGER close_retirement_resources_reject_standalone_delete
+BEFORE DELETE ON close_retirement_resources
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1
+    FROM close_obligations obligation
+    JOIN product_conversations root ON root.id = obligation.product_conversation_id
+    WHERE obligation.attempt_id = OLD.attempt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retirement evidence can only be deleted with its root');
+END;
+
+CREATE TRIGGER close_retirement_resources_preserve_dependent_absence_on_delete
+BEFORE DELETE ON close_retirement_resources
+FOR EACH ROW
+WHEN OLD.proof_kind IN ('retired', 'absence_adopted') AND EXISTS (
+    SELECT 1
+    FROM close_obligations proof_obligation
+    JOIN product_conversations root ON root.id = proof_obligation.product_conversation_id
+    JOIN close_obligations dependent_obligation
+      ON dependent_obligation.product_conversation_id = proof_obligation.product_conversation_id
+    JOIN close_retirement_resources dependent
+      ON dependent.attempt_id = dependent_obligation.attempt_id
+    WHERE proof_obligation.attempt_id = OLD.attempt_id
+      AND OLD.inspection_generation = proof_obligation.inspection_generation
+      AND OLD.inspection_fingerprint = proof_obligation.inspection_fingerprint
+      AND dependent.attempt_id <> OLD.attempt_id
+      AND dependent.scope = OLD.scope
+      AND dependent.resource_kind = OLD.resource_kind
+      AND dependent.identity_kind = OLD.identity_kind
+      AND dependent.identity_codec = OLD.identity_codec
+      AND dependent.identity_value = OLD.identity_value
+      AND dependent.proof_kind = 'absence_adopted'
+      AND dependent.absence_basis = 'preexisting_exact_identity_evidence'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retained proof has dependent adopted absence');
+END;
+
+CREATE TRIGGER close_retirement_resources_preserve_dependent_absence_on_update
+BEFORE UPDATE ON close_retirement_resources
+FOR EACH ROW
+WHEN OLD.proof_kind IN ('retired', 'absence_adopted')
+ AND (
+     NEW.proof_kind NOT IN ('retired', 'absence_adopted')
+     OR NEW.attempt_id <> OLD.attempt_id
+     OR NEW.scope <> OLD.scope
+     OR NEW.inspection_generation <> OLD.inspection_generation
+     OR NEW.inspection_fingerprint <> OLD.inspection_fingerprint
+     OR NEW.resource_kind <> OLD.resource_kind
+     OR NEW.identity_kind <> OLD.identity_kind
+     OR NEW.identity_codec <> OLD.identity_codec
+     OR NEW.identity_value <> OLD.identity_value
+ )
+ AND EXISTS (
+    SELECT 1
+    FROM close_obligations proof_obligation
+    JOIN product_conversations root ON root.id = proof_obligation.product_conversation_id
+    JOIN close_obligations dependent_obligation
+      ON dependent_obligation.product_conversation_id = proof_obligation.product_conversation_id
+    JOIN close_retirement_resources dependent
+      ON dependent.attempt_id = dependent_obligation.attempt_id
+    WHERE proof_obligation.attempt_id = OLD.attempt_id
+      AND OLD.inspection_generation = proof_obligation.inspection_generation
+      AND OLD.inspection_fingerprint = proof_obligation.inspection_fingerprint
+      AND dependent.attempt_id <> OLD.attempt_id
+      AND dependent.scope = OLD.scope
+      AND dependent.resource_kind = OLD.resource_kind
+      AND dependent.identity_kind = OLD.identity_kind
+      AND dependent.identity_codec = OLD.identity_codec
+      AND dependent.identity_value = OLD.identity_value
+      AND dependent.proof_kind = 'absence_adopted'
+      AND dependent.absence_basis = 'preexisting_exact_identity_evidence'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'retained proof has dependent adopted absence');
+END;
+
+CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
 
 const MIGRATION_069: &str = "";
 
@@ -11126,6 +12364,197 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(indexes.len(), 3, "dependent wake indexes must survive");
+    }
+
+    async fn setup_schema_before_migration_070(pool: &SqlitePool) {
+        setup_legacy_conversations_table(pool).await;
+        sqlx::query(
+            "CREATE TABLE _migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (70, 'temporarily_skip_product_conversation_migration')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        run_pending_migrations(pool).await.unwrap();
+        sqlx::query("DELETE FROM _migrations WHERE version = 70")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_070_backfills_first_class_product_conversations_and_reanchors_close() {
+        let pool = test_pool().await;
+        setup_schema_before_migration_070(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO work_scopes (id, authority_kind, environment_kind, cwd, created_at, updated_at) VALUES ('scope-open', 'work', 'unowned_cwd', '/tmp', '2025-01-01', '2025-01-01'), ('scope-archived', 'work', 'unowned_cwd', '/tmp', '2025-01-01', '2025-01-01');
+             INSERT INTO conversations (
+                 id, slug, user_initiated, state, state_kind, state_updated_at,
+                 created_at, updated_at, archived, runtime_role, parent_conversation_id,
+                 continued_in_conv_id, work_scope_id
+             ) VALUES
+                 ('open-root', 'open-root', 1, '{\"type\":\"idle\"}', 'idle',
+                  '2025-01-01', '2025-01-01', '2025-01-01', 0, 'user', NULL, 'open-latest', 'scope-open'),
+                 ('open-latest', 'open-latest', 1, '{\"type\":\"idle\"}', 'idle',
+                  '2025-01-01', '2025-01-01', '2025-01-01', 0, 'user', NULL, NULL, 'scope-open'),
+                 ('worker', 'worker', 0, '{\"type\":\"idle\"}', 'idle',
+                  '2025-01-01', '2025-01-01', '2025-01-01', 0, 'sub_agent', 'open-latest', NULL, 'scope-open'),
+                 ('archived', 'archived', 1, '{\"type\":\"idle\"}', 'idle',
+                  '2025-01-01', '2025-01-01', '2025-01-01', 1, 'user', NULL, NULL, 'scope-archived'),
+                 ('coordinator', 'coordinator', 0, '{\"type\":\"idle\"}', 'idle',
+                  '2025-01-01', '2025-01-01', '2025-01-01', 0, 'coordinator', NULL, NULL, NULL);
+             INSERT INTO close_obligations (
+                 attempt_id, root_conversation_id, phase, created_at, updated_at
+             ) VALUES ('attempt-open', 'open-root', 'awaiting_blocker_resolution',
+                       '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+             INSERT INTO close_attempt_members (
+                 attempt_id, conversation_id, member_role, continuation_ordinal,
+                 captured_continued_in_conv_id, captured_state_kind,
+                 captured_runtime_role, captured_at
+             ) VALUES
+                 ('attempt-open', 'open-root', 'root', 0, 'open-latest', 'idle', 'user',
+                  '2025-01-01T00:00:00Z'),
+                 ('attempt-open', 'open-latest', 'latest', 1, NULL, 'idle', 'user',
+                  '2025-01-01T00:00:00Z');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+
+        let memberships: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, product_conversation_id FROM conversations ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(memberships.contains(&("open-root".into(), "open-root".into())));
+        assert!(memberships.contains(&("open-latest".into(), "open-root".into())));
+        assert!(memberships.contains(&("worker".into(), "open-root".into())));
+        assert!(memberships.contains(&("archived".into(), "archived".into())));
+        assert!(memberships.contains(&("coordinator".into(), "coordinator".into())));
+
+        let aggregates: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, kind, ordinary_lifecycle FROM product_conversations ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(aggregates.contains(&("open-root".into(), "ordinary".into(), Some("open".into()))));
+        assert!(aggregates.contains(&(
+            "archived".into(),
+            "ordinary".into(),
+            Some("history".into())
+        )));
+        assert!(aggregates.contains(&("coordinator".into(), "coordinator".into(), None)));
+
+        let close_owner: String = sqlx::query_scalar(
+            "SELECT product_conversation_id FROM close_obligations WHERE attempt_id = 'attempt-open'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(close_owner, "open-root");
+        let member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_members WHERE attempt_id = 'attempt-open'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(member_count, 2);
+        let close_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('close_obligations') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(close_columns.contains(&"product_conversation_id".to_string()));
+        assert!(!close_columns.contains(&"root_conversation_id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn migration_070_rejects_invalid_membership_and_coordinator_lifecycle() {
+        let pool = test_pool().await;
+        setup_schema_before_migration_070(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        assert!(sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('bad-coordinator', 'coordinator', 'open')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('coordinator-only', 'coordinator', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role,
+                 state_updated_at, created_at, updated_at
+             ) VALUES (
+                 'ordinary-in-coordinator', 'coordinator-only', 'user',
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO conversations (id, runtime_role) VALUES ('missing-member', 'user')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle) VALUES
+                 ('ordinary-a', 'ordinary', 'open'),
+                 ('ordinary-b', 'ordinary', 'open');
+             INSERT INTO work_scopes (id, authority_kind, environment_kind, cwd, created_at, updated_at) VALUES ('scope-a', 'work', 'unowned_cwd', '/tmp/a', '2025-01-01', '2025-01-01'), ('scope-b', 'work', 'unowned_cwd', '/tmp/b', '2025-01-01', '2025-01-01');
+             INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role, user_initiated, work_scope_id,
+                 state_updated_at, created_at, updated_at
+             ) VALUES
+                 ('a', 'ordinary-a', 'user', 1, 'scope-a', '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('b', 'ordinary-b', 'user', 1, 'scope-b', '2025-01-01', '2025-01-01', '2025-01-01');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = 'b' WHERE id = 'a'",)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "UPDATE conversations SET runtime_role = 'coordinator' WHERE id = 'a'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role
+             ) VALUES ('child', 'ordinary-b', 'a', 'sub_agent')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
     }
 
     #[tokio::test]

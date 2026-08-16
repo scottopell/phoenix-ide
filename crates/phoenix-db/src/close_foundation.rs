@@ -131,8 +131,8 @@ fn parse_close_obligation_row(row: SqliteRow) -> DbResult<CloseObligation> {
     CloseObligation::parse(
         parse_close_attempt_id(row.try_get("attempt_id")?)?,
         parse_product_conversation_id(
-            row.try_get("root_conversation_id")?,
-            "root_conversation_id",
+            row.try_get("product_conversation_id")?,
+            "product_conversation_id",
         )?,
         phase,
         snapshot,
@@ -399,7 +399,7 @@ async fn validate_adopted_absence_evidence(
                      FROM close_retirement_resources evidence
                      JOIN close_obligations prior ON prior.attempt_id = evidence.attempt_id
                      JOIN close_obligations current ON current.attempt_id = ?1
-                     WHERE prior.root_conversation_id = current.root_conversation_id
+                     WHERE prior.product_conversation_id = current.product_conversation_id
                        AND prior.attempt_id <> current.attempt_id
                        AND evidence.scope = ?2 AND evidence.resource_kind = ?3
                        AND evidence.identity_kind = ?4 AND evidence.identity_codec = ?5
@@ -592,7 +592,7 @@ async fn read_topology_tx(
                  SELECT 1 FROM json_each(forward.path) visited WHERE visited.value = c.id
              )
          )
-         SELECT c.id, c.slug, c.title,
+         SELECT c.id, c.product_conversation_id, c.slug, c.title,
                 COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd,
                 c.parent_conversation_id, c.user_initiated, c.state,
                 c.state_updated_at, c.created_at, c.updated_at, c.archived,
@@ -821,7 +821,7 @@ impl Database {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) = sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
                     topology_sealed
              FROM close_obligations WHERE attempt_id = ?1",
@@ -865,10 +865,10 @@ impl Database {
         validate_begin_preconditions(&topology, addressed_id)?;
 
         if let Some(row) = sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations
-             WHERE root_conversation_id = ?1 AND phase <> 'completed'",
+             WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
         .bind(&topology.root.id)
         .fetch_optional(&mut *tx)
@@ -886,7 +886,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
              ) VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
         )
         .bind(attempt_id)
@@ -965,7 +965,7 @@ impl Database {
             .await?;
 
         let row = sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations WHERE attempt_id = ?1",
         )
@@ -979,7 +979,7 @@ impl Database {
 
     pub async fn get_close_obligation(&self, attempt_id: &str) -> DbResult<CloseObligation> {
         sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations WHERE attempt_id = ?1",
         )
@@ -993,15 +993,15 @@ impl Database {
 
     pub async fn get_active_close_obligation_for_root(
         &self,
-        root_conversation_id: &str,
+        product_conversation_id: &str,
     ) -> DbResult<Option<CloseObligation>> {
         sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations
-             WHERE root_conversation_id = ?1 AND phase <> 'completed'",
+             WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
-        .bind(root_conversation_id)
+        .bind(product_conversation_id)
         .fetch_optional(&self.pool)
         .await?
         .map(parse_close_obligation_row)
@@ -1010,7 +1010,7 @@ impl Database {
 
     pub async fn list_latest_close_obligations(&self) -> DbResult<Vec<CloseObligation>> {
         let rows = sqlx::query(
-            "SELECT chronology_ordinal, attempt_id, root_conversation_id, phase,
+            "SELECT chronology_ordinal, attempt_id, product_conversation_id, phase,
                     inspection_generation, inspection_fingerprint, created_at, updated_at,
                     completed_at, close_outcome
              FROM close_obligations",
@@ -1040,7 +1040,7 @@ impl Database {
 
     pub async fn list_pending_close_obligations(&self) -> DbResult<Vec<CloseObligation>> {
         let rows = sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations
              WHERE phase <> 'completed'",
@@ -1121,7 +1121,7 @@ impl Database {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = sqlx::query(
-            "SELECT attempt_id, root_conversation_id, phase, inspection_generation,
+            "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome
              FROM close_obligations WHERE attempt_id = ?1",
         )
@@ -1462,7 +1462,7 @@ impl Database {
         }
 
         let root_id: String = sqlx::query_scalar(
-            "SELECT root_conversation_id FROM close_obligations WHERE attempt_id = ?1",
+            "SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1",
         )
         .bind(request.attempt_id.as_str())
         .fetch_one(&mut *tx)
@@ -2216,16 +2216,65 @@ mod tests {
         ToolInput,
     };
 
+    fn product_id(id: &str) -> ProductConversationId {
+        ProductConversationId::parse(id.to_string()).unwrap()
+    }
+
     async fn create_root(db: &Database, id: &str) {
-        db.create_conversation(id, id, "/tmp", true, None, None)
+        let mut conversation = db
+            .create_conversation(id, id, "/tmp", true, None, None)
             .await
             .unwrap();
+        let allocated_product_id = conversation.product_conversation_id.clone();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+            .bind(allocated_product_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES (?1, 'ordinary', 'open')",
+        )
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        conversation.product_conversation_id = product_id(id);
+        let mut tx = db.pool().begin().await.unwrap();
+        crate::insert_conversation_tx(&mut tx, &conversation)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
     }
 
     async fn create_child(db: &Database, id: &str, parent_id: &str) {
-        db.create_conversation(id, id, "/tmp", false, Some(parent_id), None)
+        let parent = db.get_conversation(parent_id).await.unwrap();
+        let mut conversation = db
+            .create_conversation(id, id, "/tmp", true, None, None)
             .await
             .unwrap();
+        let allocated_product_id = conversation.product_conversation_id.clone();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+            .bind(allocated_product_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        conversation.product_conversation_id = parent.product_conversation_id;
+        let mut tx = db.pool().begin().await.unwrap();
+        crate::insert_conversation_tx(&mut tx, &conversation)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
             .bind(id)
             .bind(parent_id)
@@ -2733,7 +2782,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations
-             (attempt_id, root_conversation_id, phase, created_at, updated_at)
+             (attempt_id, product_conversation_id, phase, created_at, updated_at)
              VALUES ('winner', 'race-root', 'awaiting_blocker_resolution', ?1, ?1)",
         )
         .bind(&now)
@@ -2818,7 +2867,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
              ) VALUES (
                  'attempt-wrong-scope', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
              )",
@@ -2877,7 +2926,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
              ) VALUES (
                  'attempt-wrong-edge', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
              )",
@@ -2924,7 +2973,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
              ) VALUES (
                  'attempt-root-predecessor', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
              )",
@@ -2969,7 +3018,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at, completed_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
              ) VALUES (
                  'attempt-double-predecessor', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
              )",
@@ -3452,7 +3501,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO close_obligations (
-                 attempt_id, root_conversation_id, phase, created_at, updated_at
+                 attempt_id, product_conversation_id, phase, created_at, updated_at
              ) VALUES (
                  'attempt-partial', 'root', 'awaiting_blocker_resolution', ?1, ?1
              )",
@@ -5737,7 +5786,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO close_obligations (
-                     attempt_id, root_conversation_id, phase, created_at, updated_at,
+                     attempt_id, product_conversation_id, phase, created_at, updated_at,
                      completed_at, close_outcome, topology_sealed
                  ) VALUES (
                      ?1, 'root', 'completed', ?2, ?2, ?2, 'cancelled', 1
@@ -5769,7 +5818,7 @@ mod tests {
         for attempt_id in ["lexically-later", "lexically-earlier"] {
             sqlx::query(
                 "INSERT INTO close_obligations (
-                     attempt_id, root_conversation_id, phase, created_at, updated_at,
+                     attempt_id, product_conversation_id, phase, created_at, updated_at,
                      completed_at, close_outcome, topology_sealed
                  ) VALUES (
                      ?1, 'root', 'completed', '2025-01-01T00:00:00Z',
@@ -5799,7 +5848,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO close_obligations (
-                     attempt_id, root_conversation_id, phase, created_at, updated_at,
+                     attempt_id, product_conversation_id, phase, created_at, updated_at,
                      completed_at, close_outcome, topology_sealed
                  ) VALUES (?1, 'root', 'completed', ?2, ?2, ?2, 'cancelled', 1)",
             )
@@ -5832,7 +5881,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO close_obligations (
-                     attempt_id, root_conversation_id, phase, created_at, updated_at
+                     attempt_id, product_conversation_id, phase, created_at, updated_at
                  ) VALUES (?1, ?2, 'awaiting_blocker_resolution', ?3, ?3)",
             )
             .bind(attempt_id)

@@ -174,6 +174,11 @@ mod tests {
     fn owner_conversation(work_scope_id: phoenix_core::work_scope::WorkScopeId) -> Conversation {
         Conversation {
             id: "owner".into(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "owner".into().to_string(),
+                )
+                .expect("conversation id is non-empty"),
             slug: Some("owner".into()),
             title: Some("Owner".into()),
             cwd: "/tmp".into(),
