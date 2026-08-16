@@ -1139,6 +1139,38 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalled();
   });
 
+  it('keeps validated in-memory history visible when route resolution fails', async () => {
+    vi.mocked(api.getConversationRouteBySlug).mockRejectedValue(new Error('temporary route failure'));
+
+    renderPage(makeConversation());
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.queryByText('temporary route failure')).not.toBeInTheDocument();
+  });
+
+  it('rejects metadata-only offline snapshots as unavailable', async () => {
+    vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
+    const store = new ConversationStore();
+    const conversation = makeConversation();
+    store.upsertSnapshot(conversation.slug, conversation);
+
+    render(
+      <ConversationContext.Provider value={store}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('Conversation unavailable offline')).toBeInTheDocument();
+  });
+
   it('does not send cached reconnect credentials to a different route owner', async () => {
     const staleConversation = makeConversation({ id: 'stale-owner', transcript_generation: 9 });
     const authoritativeConversation = makeConversation({ id: 'authoritative-owner' });

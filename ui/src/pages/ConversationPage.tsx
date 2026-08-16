@@ -808,7 +808,7 @@ function ConversationPageContent({
 
     const loadConversation = async () => {
       if (!navigator.onLine) {
-        if (!cancelled && !atomRef.current.conversation) {
+        if (!cancelled && !atomRef.current.conversationId) {
           setError('Conversation unavailable offline');
         }
         return;
@@ -818,7 +818,9 @@ function ConversationPageContent({
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to resolve conversation route:', err);
-          setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
+          if (!atomRef.current.conversationId) {
+            setError(err instanceof Error ? err.message : 'Failed to resolve conversation route');
+          }
         }
       }
     };
