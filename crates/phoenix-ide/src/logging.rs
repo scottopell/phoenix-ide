@@ -35,9 +35,9 @@ mod rotation;
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
-const SQLITE_FAILURE_LOG_DIRECTIVE: &str = "phoenix_db::observability=error";
+const SQLITE_OBSERVABILITY_LOG_DIRECTIVE: &str = "phoenix_db::observability=warn";
 const DEFAULT_LOG_FILTER: &str =
-    "phoenix_ide=debug,tower_http=debug,phoenix_db::observability=error";
+    "phoenix_ide=debug,tower_http=debug,phoenix_db::observability=warn";
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
 
 pub(crate) fn process_log_config() -> &'static LogConfig {
@@ -427,6 +427,7 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
     ("phoenix_db::otel", "db.failure"),
+    ("phoenix_db::otel", "db.slow_operation"),
 ];
 
 pub(crate) fn conversation_cancel_span(conversation_id: &str) -> tracing::Span {
@@ -727,26 +728,26 @@ fn invalid_input<T>(message: impl Into<String>) -> std::io::Result<T> {
 /// `EnvFilter` does not implement Clone.
 fn make_env_filter() -> EnvFilter {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
-    ensure_sqlite_failure_events(filter)
+    ensure_sqlite_observability_events(filter)
 }
 
-fn ensure_sqlite_failure_events(filter: EnvFilter) -> EnvFilter {
+fn ensure_sqlite_observability_events(filter: EnvFilter) -> EnvFilter {
     if filter
         .to_string()
         .split(',')
-        .any(sqlite_failure_events_are_configured)
+        .any(sqlite_observability_events_are_configured)
     {
         filter
     } else {
         filter.add_directive(
-            SQLITE_FAILURE_LOG_DIRECTIVE
+            SQLITE_OBSERVABILITY_LOG_DIRECTIVE
                 .parse()
-                .expect("static SQLite failure log directive is valid"),
+                .expect("static SQLite observability log directive is valid"),
         )
     }
 }
 
-fn sqlite_failure_events_are_configured(directive: &str) -> bool {
+fn sqlite_observability_events_are_configured(directive: &str) -> bool {
     if directive
         .parse::<tracing::level_filters::LevelFilter>()
         .is_ok()
@@ -889,13 +890,25 @@ mod tests {
                 db.operation = "direct_turn.terminal_settlement",
                 db.phase = "commit",
                 db.error.kind = "database",
-                db.elapsed_ms = 12_u64,
-                db.phase_elapsed_ms = 3_u64,
+                db.elapsed_ms = 12_i64,
+                db.phase_elapsed_ms = 3_i64,
                 db.sqlite.primary_code = 5_i64,
                 db.sqlite.extended_code = 517_i64,
                 otel.status_code = "ERROR",
             );
             drop(db_failure);
+            let db_slow = tracing::warn_span!(
+                target: "phoenix_db::otel",
+                parent: &turn,
+                "db.slow_operation",
+                db.system = "sqlite",
+                db.operation = "direct_turn.terminal_settlement",
+                db.outcome = "committed",
+                db.slow_phase = "transaction",
+                db.pool_acquisition_ms = 12_i64,
+                db.transaction_ms = 300_i64,
+            );
+            drop(db_slow);
             drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
@@ -945,7 +958,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 11);
+        assert_eq!(spans.len(), 12);
         assert_eq!(
             spans
                 .iter()
@@ -961,6 +974,7 @@ mod tests {
                 "direct_turn.settle",
                 "direct_turn.settle",
                 "db.failure",
+                "db.slow_operation",
                 "conversation.turn",
                 "llm.request"
             ]
@@ -1000,7 +1014,16 @@ mod tests {
             .iter()
             .find(|attribute| attribute.key.as_str() == "db.error.kind")
             .expect("bounded database error kind exported");
+        let failure_elapsed_ms = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.elapsed_ms")
+            .expect("database failure elapsed time exported");
         assert!(matches!(primary_code.value, opentelemetry::Value::I64(5)));
+        assert!(matches!(
+            failure_elapsed_ms.value,
+            opentelemetry::Value::I64(12)
+        ));
         assert!(matches!(
             extended_code.value,
             opentelemetry::Value::I64(517)
@@ -1013,6 +1036,30 @@ mod tests {
             db_failure.status,
             opentelemetry::trace::Status::Error { .. }
         ));
+        let db_slow = spans
+            .iter()
+            .find(|span| span.name == "db.slow_operation")
+            .expect("slow database operation span exported");
+        let pool_acquisition_ms = db_slow
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.pool_acquisition_ms")
+            .expect("pool acquisition timing exported");
+        let transaction_ms = db_slow
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.transaction_ms")
+            .expect("transaction timing exported");
+        assert!(
+            matches!(pool_acquisition_ms.value, opentelemetry::Value::I64(12)),
+            "unexpected pool acquisition value: {:?}",
+            pool_acquisition_ms.value
+        );
+        assert!(
+            matches!(transaction_ms.value, opentelemetry::Value::I64(300)),
+            "unexpected transaction value: {:?}",
+            transaction_ms.value
+        );
         for required in [
             "gpt-test",
             "openai",
@@ -1071,23 +1118,24 @@ mod tests {
     }
 
     #[test]
-    fn default_log_filter_keeps_sqlite_failure_events() {
+    fn default_log_filter_keeps_sqlite_observability_events() {
         let filter = EnvFilter::try_new(DEFAULT_LOG_FILTER).unwrap();
         assert!(filter
             .to_string()
             .split(',')
-            .any(|directive| directive == "phoenix_db::observability=error"));
+            .any(|directive| directive == SQLITE_OBSERVABILITY_LOG_DIRECTIVE));
     }
 
     #[test]
-    fn supplied_log_filter_keeps_sqlite_failures_unless_explicitly_configured() {
-        let filter = ensure_sqlite_failure_events(EnvFilter::try_new("phoenix_ide=info").unwrap());
+    fn supplied_log_filter_keeps_sqlite_observability_unless_explicitly_configured() {
+        let filter =
+            ensure_sqlite_observability_events(EnvFilter::try_new("phoenix_ide=info").unwrap());
         assert!(filter
             .to_string()
             .split(',')
-            .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE));
+            .any(|directive| directive == SQLITE_OBSERVABILITY_LOG_DIRECTIVE));
 
-        let explicit = ensure_sqlite_failure_events(
+        let explicit = ensure_sqlite_observability_events(
             EnvFilter::try_new("phoenix_db::observability=off").unwrap(),
         );
         assert!(explicit
@@ -1096,13 +1144,13 @@ mod tests {
             .any(|directive| directive == "phoenix_db::observability=off"));
 
         for broad in ["off", "warn", "phoenix_db=off", "phoenix_db=info"] {
-            let filter = ensure_sqlite_failure_events(EnvFilter::try_new(broad).unwrap());
+            let filter = ensure_sqlite_observability_events(EnvFilter::try_new(broad).unwrap());
             assert!(
                 !filter
                     .to_string()
                     .split(',')
-                    .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE),
-                "{broad} already configures the SQLite failure target"
+                    .any(|directive| directive == SQLITE_OBSERVABILITY_LOG_DIRECTIVE),
+                "{broad} already configures the SQLite observability target"
             );
         }
     }
