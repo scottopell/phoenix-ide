@@ -791,6 +791,17 @@ mod tests {
             .unwrap();
         for id in &ids[1..] {
             let now = chrono::Utc::now().to_rfc3339();
+            let scope_id = format!("scope-{id}");
+            sqlx::query(
+                "INSERT INTO work_scopes (
+                     id, authority_kind, environment_kind, cwd, created_at, updated_at
+                 ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+            )
+            .bind(&scope_id)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
             sqlx::query(
                 "INSERT INTO conversations (
                      id, product_conversation_id, slug, user_initiated, runtime_role,
@@ -801,7 +812,7 @@ mod tests {
             .bind(root.product_conversation_id.as_str())
             .bind(format!("slug-{id}"))
             .bind(now)
-            .bind(root.attached_work_scope_id.as_ref().map(|id| id.as_str()))
+            .bind(scope_id)
             .execute(db.pool())
             .await
             .unwrap();
