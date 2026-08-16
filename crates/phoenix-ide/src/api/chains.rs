@@ -794,13 +794,14 @@ mod tests {
             sqlx::query(
                 "INSERT INTO conversations (
                      id, product_conversation_id, slug, user_initiated, runtime_role,
-                     state_updated_at, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?4, ?4)",
+                     state_updated_at, created_at, updated_at, work_scope_id
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?4, ?4, ?5)",
             )
             .bind(id)
             .bind(root.product_conversation_id.as_str())
             .bind(format!("slug-{id}"))
             .bind(now)
+            .bind(root.attached_work_scope_id.as_ref().map(|id| id.as_str()))
             .execute(db.pool())
             .await
             .unwrap();
