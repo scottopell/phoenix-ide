@@ -145,7 +145,14 @@ pub(crate) enum SteeringWakeOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcknowledgedEventOutcome {
     Settled,
+    StaleAuthority,
     SteeringWake(SteeringWakeOutcome),
+}
+
+pub(crate) struct AcknowledgedEventRequest {
+    pub event: Event,
+    pub acknowledgement: tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
+    pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
@@ -351,10 +358,7 @@ enum BashLifecycleBridgeAction {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
-    pub(crate) acknowledged_event_tx: mpsc::Sender<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )>,
+    pub(crate) acknowledged_event_tx: mpsc::Sender<AcknowledgedEventRequest>,
     /// Turn-trigger slot shared with this conversation's executor (see
     /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
     /// the turn the event starts can link back to it.
@@ -834,6 +838,26 @@ impl SseBroadcaster {
         &self,
         count: usize,
     ) -> (ReservedBroadcastRange, Vec<i64>) {
+        self.reserve_persisted_message_range_after(count, 0)
+    }
+
+    pub fn reserve_next_persisted_message_after(
+        &self,
+        sequence_floor: i64,
+    ) -> (ReservedBroadcastRange, i64) {
+        let (reserved, mut seqs) = self.reserve_persisted_message_range_after(1, sequence_floor);
+        (
+            reserved,
+            seqs.pop()
+                .expect("single persisted-message reservation has one sequence"),
+        )
+    }
+
+    fn reserve_persisted_message_range_after(
+        &self,
+        count: usize,
+        sequence_floor: i64,
+    ) -> (ReservedBroadcastRange, Vec<i64>) {
         assert!(
             count > 0,
             "persisted-message range must contain at least one row"
@@ -843,6 +867,7 @@ impl SseBroadcaster {
             gate.reserved_until.is_none(),
             "nested persisted-message broadcast ranges are not supported"
         );
+        self.last_seq.fetch_max(sequence_floor, Ordering::AcqRel);
         let mut seqs = Vec::with_capacity(count);
         for _ in 0..count {
             seqs.push(self.next_seq_unlocked());
@@ -3759,14 +3784,34 @@ impl RuntimeManager {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((event, ack_tx))
+            .send(AcknowledgedEventRequest {
+                event,
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| error.to_string())?;
-        ack_rx
+        let outcome = ack_rx
             .await
-            .map_err(|_| "runtime stopped before event settled".to_string())?
+            .map_err(|_| "runtime stopped before event settled".to_string())??;
+        if outcome == AcknowledgedEventOutcome::StaleAuthority {
+            let mut runtimes = self.runtimes.write().await;
+            let mut reservations = self.evicted_broadcasters.write().await;
+            if runtimes
+                .get(conversation_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.identity, &handle.identity))
+            {
+                let stale = runtimes
+                    .remove(conversation_id)
+                    .expect("identity-guarded stale runtime exists");
+                reservations.insert(conversation_id.to_string(), stale.broadcast_tx);
+                let _ = retirement_tx.send(());
+            }
+        }
+        Ok(outcome)
     }
 
     pub(crate) async fn wake_deferred_steering(
@@ -3805,9 +3850,14 @@ impl RuntimeManager {
         let handle = self.get_or_create(conversation_id).await?;
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((event, ack_tx))
+            .send(AcknowledgedEventRequest {
+                event,
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| error.to_string())?;
         ack_rx
@@ -3837,9 +3887,14 @@ impl RuntimeManager {
         }
         deposit_turn_trigger(&handle);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send((Event::UserTriggerContinuation { operation_id }, ack_tx))
+            .send(AcknowledgedEventRequest {
+                event: Event::UserTriggerContinuation { operation_id },
+                acknowledgement: ack_tx,
+                retirement: retirement_rx,
+            })
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
         ack_rx
@@ -4615,6 +4670,34 @@ mod broadcaster_tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    #[test]
+    fn persisted_message_reservation_queues_concurrent_event_above_db_floor() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let b = SseBroadcaster::new(16, 7);
+        let mut rx = b.subscribe();
+        let (guard, message_seq) = b.reserve_next_persisted_message_after(42);
+
+        let _ = b.send_seq(|seq| token_event(seq, "concurrent"));
+        assert_eq!(message_seq, 43);
+        assert_eq!(b.current_seq(), 44);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let _ = b.send_message(test_message(message_seq, "persisted"));
+        drop(guard);
+
+        assert!(matches!(
+            rx.try_recv().expect("reserved message arrives first"),
+            SseEvent::Message { ref message }
+                if message.message_id == "persisted" && message.sequence_id == 43
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("concurrent event follows message"),
+            SseEvent::Token { sequence_id: 44, ref text, .. } if text == "concurrent"
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
     /// `observe_seq` is idempotent when the broadcaster's counter is
     /// already past the supplied seq — this is the normal path once
     /// `send_message` runs with a pre-allocated seq (broadcaster counter
@@ -5241,6 +5324,115 @@ mod scope_liveness_tests {
         )
     }
 
+    fn stale_creation_event() -> Event {
+        Event::CreationProvisioned {
+            job_id: "missing-current-claim".to_string(),
+            claim: phoenix_core::domain::creation_protocol::CreationClaim {
+                worker_id: phoenix_core::domain::creation_protocol::CreationWorkerId(
+                    "stale".into(),
+                ),
+                generation: 1,
+                token: phoenix_core::domain::creation_protocol::CreationClaimToken("stale".into()),
+                lease_until: u64::MAX,
+            },
+            initial_message: crate::state_machine::event::SteerEntry {
+                text: "must not persist".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "stale-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_creation_ack_evicts_runtime_before_authoritative_reload() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "stale-creation-runtime";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let provisioning = ConvState::Provisioning {
+            job_id: "missing-current-claim".to_string(),
+            phase: crate::db::ConversationCreationPhase::Provisioning,
+        };
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &provisioning)
+            .await
+            .unwrap();
+        let stale_handle = manager.get_or_create(conversation_id).await.unwrap();
+        let stale_broadcaster = stale_handle.broadcast_tx.clone();
+        let stream_incarnation = stale_broadcaster.stream_incarnation().to_string();
+        let stale_cursor = stale_broadcaster.current_seq();
+        let mut existing_sse = stale_broadcaster.subscribe();
+        let mut stale_state = stale_handle.state_rx.clone();
+        let stale_identity = Arc::clone(&stale_handle.identity);
+        manager
+            .send_event(conversation_id, stale_creation_event())
+            .await
+            .unwrap();
+
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        let reserved = manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+            .expect("stale eviction preserves broadcaster");
+        assert_eq!(reserved.stream_incarnation(), stream_incarnation);
+        assert_eq!(reserved.current_seq(), stale_cursor);
+        assert!(matches!(
+            existing_sse.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(reserved.receiver_count(), 1);
+        assert!(manager
+            .db()
+            .get_messages(conversation_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(*stale_state.borrow(), provisioning);
+        assert!(stale_state.changed().await.is_err());
+
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::Idle)
+            .await
+            .unwrap();
+        let authoritative = manager.get_or_create(conversation_id).await.unwrap();
+        assert_eq!(*authoritative.state_rx.borrow(), ConvState::Idle);
+        assert!(!Arc::ptr_eq(&stale_identity, &authoritative.identity));
+        assert_eq!(
+            authoritative.broadcast_tx.stream_incarnation(),
+            stream_incarnation
+        );
+        assert_eq!(authoritative.broadcast_tx.current_seq(), stale_cursor);
+        assert_eq!(authoritative.broadcast_tx.receiver_count(), 1);
+        authoritative
+            .broadcast_tx
+            .send_seq(|sequence_id| SseEvent::StateChange {
+                sequence_id,
+                presentation_mode: ConvState::Idle.presentation_mode().to_string(),
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(matches!(
+            existing_sse.recv().await.unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn terminal_subagent_cleanup_is_gated_by_typed_exit_disposition() {
         let manager = test_manager().await;
@@ -5415,10 +5607,7 @@ mod scope_liveness_tests {
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<(
-        Event,
-        tokio::sync::oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
-    )> {
+    ) -> mpsc::Receiver<AcknowledgedEventRequest> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -5451,7 +5640,9 @@ mod scope_liveness_tests {
                     .await
             })
         };
-        let (_event, acknowledgement) = tokio::time::timeout(
+        let AcknowledgedEventRequest {
+            acknowledgement, ..
+        } = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acknowledged_event_rx.recv(),
         )

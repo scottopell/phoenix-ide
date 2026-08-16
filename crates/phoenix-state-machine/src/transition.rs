@@ -481,8 +481,8 @@ pub fn transition(
             });
         }
         return Ok(TransitionResult::new(state.clone())
-            .with_effect(Effect::RequestLlm)
-            .with_effect(Effect::CompleteCreation { job_id, claim }));
+            .with_effect(Effect::CompleteCreation { job_id, claim })
+            .with_effect(Effect::RequestLlm));
     }
 
     if let Event::CreationProvisioned {
@@ -1722,6 +1722,7 @@ fn creation_provisioned_transition(
             Effect::PersistState
             | Effect::RequestLlm
             | Effect::CompleteCreation { .. }
+            | Effect::MaterializeCreation { .. }
             | Effect::ExecuteTool { .. }
             | Effect::BroadcastAssistantMessage { .. }
             | Effect::AbortTool { .. }
@@ -1746,18 +1747,40 @@ fn creation_provisioned_transition(
             | Effect::CommitSteeringDrain { .. } => {}
         }
     }
-    let request_index = result
+    let message_index = result
         .effects
         .iter()
-        .position(|effect| matches!(effect, Effect::RequestLlm))
+        .position(|effect| matches!(effect, Effect::PersistMessage { .. }))
         .ok_or(TransitionError::InvalidTransition {
             state: "Provisioning",
             event: "CreationProvisioned",
         })?;
-    result.effects.insert(
-        request_index + 1,
-        Effect::CompleteCreation { job_id, claim },
-    );
+    let Effect::PersistMessage {
+        content,
+        display_data,
+        usage_data,
+        message_id,
+        ..
+    } = result.effects.remove(message_index)
+    else {
+        unreachable!("creation message index is structurally PersistMessage")
+    };
+    let persist_state_index = result
+        .effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::PersistState))
+        .ok_or(TransitionError::InvalidTransition {
+            state: "Provisioning",
+            event: "CreationProvisioned",
+        })?;
+    result.effects[persist_state_index] = Effect::MaterializeCreation {
+        job_id,
+        claim,
+        content,
+        display_data,
+        usage_data,
+        message_id,
+    };
     Ok(result)
 }
 
@@ -4559,6 +4582,21 @@ mod tests {
             .any(|effect| matches!(effect, Effect::PersistMessage { .. })));
     }
 
+    fn assert_creation_settles_before_request(effects: &[Effect]) {
+        let completion_index = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::MaterializeCreation { .. }))
+            .unwrap();
+        let request_index = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::RequestLlm))
+            .unwrap();
+        assert!(completion_index < request_index);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+    }
+
     #[test]
     fn creation_provisioned_reuses_normal_initial_turn_transition() {
         let claim = phoenix_core::domain::creation_protocol::CreationClaim {
@@ -4607,10 +4645,17 @@ mod tests {
         let normal_provisioning_effects: Vec<_> = from_provisioning
             .effects
             .iter()
-            .filter(|effect| !matches!(effect, Effect::CompleteCreation { .. }))
+            .filter(|effect| !matches!(effect, Effect::MaterializeCreation { .. }))
             .collect();
-        assert_eq!(normal_provisioning_effects.len(), from_idle.effects.len());
-        for (provisioning, idle) in normal_provisioning_effects.iter().zip(&from_idle.effects) {
+        let normal_idle_effects: Vec<_> = from_idle
+            .effects
+            .iter()
+            .filter(|effect| {
+                !matches!(effect, Effect::PersistMessage { .. } | Effect::PersistState)
+            })
+            .collect();
+        assert_eq!(normal_provisioning_effects.len(), normal_idle_effects.len());
+        for (provisioning, idle) in normal_provisioning_effects.iter().zip(normal_idle_effects) {
             match (provisioning, idle) {
                 (
                     Effect::PersistMessage {
@@ -4631,23 +4676,20 @@ mod tests {
                 _ => assert_eq!(format!("{provisioning:?}"), format!("{idle:?}")),
             }
         }
-        assert!(from_provisioning.effects.iter().any(|effect| matches!(
+        assert!(!from_provisioning.effects.iter().any(|effect| matches!(
             effect,
-            Effect::PersistMessage {
-                idempotent: true,
-                ..
-            } | Effect::PersistAuthoritativeUserMessage {
-                idempotent: true,
-                ..
-            }
+            Effect::PersistMessage { .. } | Effect::PersistAuthoritativeUserMessage { .. }
         )));
         assert!(from_provisioning.effects.iter().any(|effect| matches!(
             effect,
-            Effect::CompleteCreation {
+            Effect::MaterializeCreation {
                 job_id,
                 claim: effect_claim,
-            } if job_id == "creation-job" && effect_claim == &claim
+                message_id,
+                ..
+            } if job_id == "creation-job" && effect_claim == &claim && message_id == "creation-message-id"
         )));
+        assert_creation_settles_before_request(&from_provisioning.effects);
     }
 
     fn creation_request_resume_event(generation: u64) -> Event {
@@ -4682,6 +4724,10 @@ mod tests {
             Effect::CompleteCreation { job_id, claim }
                 if job_id == "creation-job" && claim.generation == 3
         )));
+        assert!(matches!(
+            result.effects.as_slice(),
+            [Effect::CompleteCreation { .. }, Effect::RequestLlm]
+        ));
     }
 
     #[test]
@@ -7155,6 +7201,7 @@ mod tests {
                 | Effect::PersistState
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
+                | Effect::MaterializeCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }
                 | Effect::AbortTool { .. }
                 | Effect::AbortLlm

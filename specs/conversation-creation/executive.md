@@ -17,7 +17,7 @@ The branch includes the shell-first API and UI flow. The durable protocol vocabu
 | REQ-CCR-003 Crash Reconciliation | Modelled | Expired-claim takeover emits reconciliation rather than blind replay |
 | REQ-CCR-004 Bounded Retry | Modelled | Pure four-attempt policy and generated operation schedules |
 | REQ-CCR-005 Repository Serialization | Not implemented | Real Git reservation/locking tests required |
-| REQ-CCR-006 Runtime Bootstrap | Not implemented | Temporary persisted Idle path remains |
+| REQ-CCR-006 Runtime Bootstrap | Partial | Initial-message creation checkpoints `Finalize`, then atomically commits its message, ready job status, and dispatchable runtime state under the current claim before provider dispatch. Stale authority mutates none of them, acknowledges a typed stale outcome, and retires the stale runtime before authoritative reconstruction. Retry-scheduled reconstruction remains non-dispatchable until current-claim settlement. Broader idempotent bootstrap and recovery remain incomplete |
 | REQ-CCR-007 Cancellation | Modelled | Claim revocation and visible cancelled-state test |
 | REQ-CCR-008 Deletion | Modelled | Hidden deletion-pending tombstone test |
 | REQ-CCR-009 Durable Scheduling | Not implemented | Deadline-aware production scheduler required |

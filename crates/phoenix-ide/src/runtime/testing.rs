@@ -28,15 +28,18 @@ pub struct MockLlmClient {
     model_id: String,
     /// Record of all requests made
     pub requests: Mutex<Vec<LlmRequest>>,
+    request_count_tx: tokio::sync::watch::Sender<u64>,
 }
 
 #[allow(dead_code)]
 impl MockLlmClient {
     pub fn new(model_id: impl Into<String>) -> Self {
+        let (request_count_tx, _) = tokio::sync::watch::channel(0);
         Self {
             responses: Mutex::new(VecDeque::new()),
             model_id: model_id.into(),
             requests: Mutex::new(Vec::new()),
+            request_count_tx,
         }
     }
 
@@ -54,12 +57,17 @@ impl MockLlmClient {
     pub fn recorded_requests(&self) -> Vec<LlmRequest> {
         self.requests.lock().unwrap().clone()
     }
+
+    pub fn subscribe_request_count(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.request_count_tx.subscribe()
+    }
 }
 
 #[async_trait]
 impl LlmClient for MockLlmClient {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         self.requests.lock().unwrap().push(request.clone());
+        self.request_count_tx.send_modify(|count| *count += 1);
         self.responses
             .lock()
             .unwrap()
@@ -522,6 +530,9 @@ pub struct InMemoryStorage {
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     cwds: Mutex<HashMap<String, String>>,
     next_msg_id: Mutex<u64>,
+    complete_creation_job_results: Mutex<VecDeque<Result<crate::db::CreationCasOutcome, String>>>,
+    complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    complete_creation_job_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
@@ -562,6 +573,9 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             cwds: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
+            complete_creation_job_results: Mutex::new(VecDeque::new()),
+            complete_creation_job_started: Mutex::new(None),
+            complete_creation_job_release: Mutex::new(None),
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
@@ -703,6 +717,39 @@ impl InMemoryStorage {
     /// Get current state for a conversation
     pub fn get_current_state(&self, conv_id: &str) -> Option<ConvState> {
         self.states.lock().unwrap().get(conv_id).cloned()
+    }
+
+    pub fn recorded_messages(&self) -> Vec<Message> {
+        self.messages
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    pub fn queue_complete_creation_job_result(
+        &self,
+        result: Result<crate::db::CreationCasOutcome, String>,
+    ) {
+        self.complete_creation_job_results
+            .lock()
+            .unwrap()
+            .push_back(result);
+    }
+
+    pub fn gate_complete_creation_job(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.complete_creation_job_started.lock().unwrap() = Some(started_tx);
+        *self.complete_creation_job_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn queue_preflight_authoritative_user_message(
@@ -942,6 +989,99 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn materialize_creation_runtime(
+        &self,
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        allocate_sequence: &mut (dyn FnMut(i64) -> i64 + Send),
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&crate::db::UsageData>,
+        message_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationRuntimeMaterialization, String> {
+        if let Some(started) = self.complete_creation_job_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.complete_creation_job_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let outcome = self
+            .complete_creation_job_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(crate::db::CreationCasOutcome::ClaimLost))?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Ok(crate::db::CreationRuntimeMaterialization::ClaimLost);
+        }
+        let persisted_sequence_max = self
+            .messages
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .map_or(0, |messages| {
+                i64::try_from(messages.len()).expect("test message count fits i64")
+            });
+        let sequence_id = allocate_sequence(persisted_sequence_max);
+        let message = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: chrono::Utc::now(),
+        };
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push(message.clone());
+        self.states
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_string(), state.clone());
+        Ok(crate::db::CreationRuntimeMaterialization::Materialized(
+            Box::new(message),
+        ))
+    }
+
+    async fn settle_creation_runtime(
+        &self,
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+        conversation_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        if let Some(started) = self.complete_creation_job_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.complete_creation_job_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        let outcome = self
+            .complete_creation_job_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(crate::db::CreationCasOutcome::ClaimLost));
+        if matches!(outcome, Ok(crate::db::CreationCasOutcome::Applied)) {
+            self.states
+                .lock()
+                .unwrap()
+                .insert(conversation_id.to_string(), state.clone());
+        }
+        outcome
     }
 
     async fn preflight_authoritative_user_message(
