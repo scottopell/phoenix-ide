@@ -838,6 +838,26 @@ impl SseBroadcaster {
         &self,
         count: usize,
     ) -> (ReservedBroadcastRange, Vec<i64>) {
+        self.reserve_persisted_message_range_after(count, 0)
+    }
+
+    pub fn reserve_next_persisted_message_after(
+        &self,
+        sequence_floor: i64,
+    ) -> (ReservedBroadcastRange, i64) {
+        let (reserved, mut seqs) = self.reserve_persisted_message_range_after(1, sequence_floor);
+        (
+            reserved,
+            seqs.pop()
+                .expect("single persisted-message reservation has one sequence"),
+        )
+    }
+
+    fn reserve_persisted_message_range_after(
+        &self,
+        count: usize,
+        sequence_floor: i64,
+    ) -> (ReservedBroadcastRange, Vec<i64>) {
         assert!(
             count > 0,
             "persisted-message range must contain at least one row"
@@ -847,6 +867,7 @@ impl SseBroadcaster {
             gate.reserved_until.is_none(),
             "nested persisted-message broadcast ranges are not supported"
         );
+        self.last_seq.fetch_max(sequence_floor, Ordering::AcqRel);
         let mut seqs = Vec::with_capacity(count);
         for _ in 0..count {
             seqs.push(self.next_seq_unlocked());
@@ -4645,6 +4666,34 @@ mod broadcaster_tests {
         assert!(matches!(
             queued,
             SseEvent::Token { sequence_id, ref text, .. } if sequence_id == second_seq + 1 && text == "queued"
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn persisted_message_reservation_queues_concurrent_event_above_db_floor() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let b = SseBroadcaster::new(16, 7);
+        let mut rx = b.subscribe();
+        let (guard, message_seq) = b.reserve_next_persisted_message_after(42);
+
+        let _ = b.send_seq(|seq| token_event(seq, "concurrent"));
+        assert_eq!(message_seq, 43);
+        assert_eq!(b.current_seq(), 44);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let _ = b.send_message(test_message(message_seq, "persisted"));
+        drop(guard);
+
+        assert!(matches!(
+            rx.try_recv().expect("reserved message arrives first"),
+            SseEvent::Message { ref message }
+                if message.message_id == "persisted" && message.sequence_id == 43
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("concurrent event follows message"),
+            SseEvent::Token { sequence_id: 44, ref text, .. } if text == "concurrent"
         ));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }

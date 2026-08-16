@@ -5379,30 +5379,57 @@ where
                 usage_data,
                 message_id,
             } => {
-                match self
-                    .storage
-                    .materialize_creation_runtime(
-                        &job_id,
-                        &claim,
-                        &self.context.conversation_id,
-                        self.broadcast_tx.current_seq(),
-                        &content,
-                        display_data.as_ref(),
-                        usage_data.as_ref(),
-                        &message_id,
-                        &self.state,
-                        self.state_updated_at,
-                    )
-                    .await
-                {
+                let broadcaster = self.broadcast_tx.clone();
+                let mut reserved_broadcast = None;
+                let materialization = {
+                    let mut allocate_sequence = |persisted_sequence_max| {
+                        let (reservation, sequence_id) = broadcaster
+                            .reserve_next_persisted_message_after(persisted_sequence_max);
+                        reserved_broadcast = Some((reservation, sequence_id));
+                        sequence_id
+                    };
+                    self.storage
+                        .materialize_creation_runtime(
+                            &job_id,
+                            &claim,
+                            &self.context.conversation_id,
+                            &mut allocate_sequence,
+                            &content,
+                            display_data.as_ref(),
+                            usage_data.as_ref(),
+                            &message_id,
+                            &self.state,
+                            self.state_updated_at,
+                        )
+                        .await
+                };
+                match materialization {
                     Ok(crate::db::CreationRuntimeMaterialization::Materialized(message)) => {
+                        let (reservation, sequence_id) = reserved_broadcast
+                            .take()
+                            .expect("materialized creation reserved an SSE sequence");
+                        debug_assert_eq!(sequence_id, message.sequence_id);
                         let _ = self.broadcast_tx.send_message(*message);
+                        drop(reservation);
                     }
                     Ok(crate::db::CreationRuntimeMaterialization::ClaimLost) => {
+                        debug_assert!(reserved_broadcast.is_none());
                         self.creation_settlement_disposition =
                             CreationSettlementDisposition::StaleAuthority;
                     }
                     Err(error) => {
+                        if let Some((reservation, sequence_id)) = reserved_broadcast.take() {
+                            let _ = self.broadcast_tx.send_reserved_seq(
+                                sequence_id,
+                                |sequence_id| SseEvent::Error {
+                                    sequence_id,
+                                    error: crate::runtime::user_facing_error::UserFacingError::with_action(
+                                        "initialize the conversation",
+                                    ),
+                                },
+                            );
+                            drop(reservation);
+                        }
                         return Err(format!(
                             "failed to atomically materialize creation job {job_id}: {error}"
                         ));

@@ -5523,7 +5523,7 @@ impl Database {
         claim: &CreationClaim,
         conversation_id: &str,
         message_id: &str,
-        sequence_floor: i64,
+        allocate_sequence: impl FnOnce(i64) -> i64,
         content: &MessageContent,
         display_data: Option<&serde_json::Value>,
         usage_data: Option<&UsageData>,
@@ -5560,14 +5560,19 @@ impl Database {
             tx.rollback().await?;
             return Ok(CreationRuntimeMaterialization::ClaimLost);
         }
-        let sequence_id: i64 = sqlx::query_scalar(
-            "SELECT MAX(COALESCE(MAX(sequence_id), 0), ?2) + 1
+        let persisted_sequence_max: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0)
              FROM messages WHERE conversation_id = ?1",
         )
         .bind(conversation_id)
-        .bind(sequence_floor)
         .fetch_one(&mut *tx)
         .await?;
+        let sequence_id = allocate_sequence(persisted_sequence_max);
+        if sequence_id <= persisted_sequence_max {
+            return Err(DbError::Sqlx(sqlx::Error::Protocol(format!(
+                "creation sequence allocator returned {sequence_id} at or below persisted maximum {persisted_sequence_max}"
+            ))));
+        }
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -11633,7 +11638,7 @@ mod tests {
                 &claim,
                 "conv-runtime-settle",
                 "stale-message",
-                0,
+                |_| panic!("stale claim must not allocate an SSE sequence"),
                 &MessageContent::user("stale"),
                 None,
                 None,
@@ -11678,7 +11683,7 @@ mod tests {
                 &claim,
                 "conv-runtime-settle",
                 "initial-message",
-                42,
+                |persisted_sequence_max| persisted_sequence_max.max(42) + 1,
                 &MessageContent::user("initial"),
                 None,
                 None,
