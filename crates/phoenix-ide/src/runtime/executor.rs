@@ -63,6 +63,8 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum RuntimeExitDisposition {
     FatalLocalAuthorityLoss,
     Terminal,
+    CoordinatedShutdown,
+    FatalLocalAuthorityLoss,
     Interrupted,
     RecreateFromDatabase,
 }
@@ -1732,6 +1734,12 @@ enum CreationSettlementDisposition {
     StaleAuthority,
 }
 
+#[derive(Debug)]
+struct ProposedDirectTurnState {
+    state: ConvState,
+    updated_at: DateTime<Utc>,
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1955,6 +1963,7 @@ where
     local_terminal_authority: LocalTerminalAuthority,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
+    proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2090,6 +2099,7 @@ where
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
+            proposed_direct_turn_state: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2426,9 +2436,13 @@ where
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; exiting executor loop"
                         );
-                        return RuntimeExitDisposition::Interrupted;
+                        return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                     if let Err(e) = self.process_event(event).await {
+                        if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
+                            tracing::error!(error = %e, "fatal local SQLite authority loss");
+                            return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                        }
                         // process_event already broadcast a typed
                         // SseEvent::Error at the source if appropriate
                         // (task 24682). No double-broadcast here.
@@ -3151,6 +3165,7 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
+        self.proposed_direct_turn_state = None;
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
         let terminal_subagent_transition = self.context.is_sub_agent
             && matches!(result.new_state.step_result(), StepResult::Terminal(_));
@@ -3176,7 +3191,19 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
-        let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        let is_direct_turn_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let old_state = self.state.clone();
+        if is_direct_turn_adoption {
+            self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+                state: result.new_state.clone(),
+                updated_at: Utc::now(),
+            });
+        } else {
+            self.state = result.new_state.clone();
+        }
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         // Only stamp a fresh entry time when the phase actually changes.
@@ -5009,8 +5036,22 @@ where
                             payload,
                             sequence_id: reserved_seqs[0],
                             created_at: phoenix_workflow::Timestamp(now),
-                            accepted_state: self.state.clone(),
-                            state_updated_at: self.state_updated_at,
+                            accepted_state: self
+                                .proposed_direct_turn_state
+                                .as_ref()
+                                .map(|proposed| proposed.state.clone())
+                                .ok_or_else(|| {
+                                    "authoritative materialization missing proposed state"
+                                        .to_string()
+                                })?,
+                            state_updated_at: self
+                                .proposed_direct_turn_state
+                                .as_ref()
+                                .map(|proposed| proposed.updated_at)
+                                .ok_or_else(|| {
+                                    "authoritative materialization missing proposed timestamp"
+                                        .to_string()
+                                })?,
                             now: phoenix_workflow::Timestamp(now),
                         },
                     )
@@ -5028,14 +5069,28 @@ where
                         message,
                         active,
                     } => {
+                        let proposed = self
+                            .proposed_direct_turn_state
+                            .take()
+                            .ok_or_else(|| "committed direct turn missing proposed state".to_string())?;
+                        self.state = proposed.state;
+                        self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
                         let _ = self.broadcast_tx.send_message(*message);
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
-                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::NotCommitted
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommandRejected => {
+                        self.proposed_direct_turn_state = None;
                         self.direct_turn_materialization_aborted = true;
                         Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified => {
+                        self.proposed_direct_turn_state = None;
+                        Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+                            .to_string())
                     }
                 }
             }
@@ -11111,6 +11166,10 @@ mod authoritative_user_message_effect_tests {
             },
         );
 
+        rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            state: ConvState::LlmRequesting { attempt: 1 },
+            updated_at: Utc::now(),
+        });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
             payload: payload("msg-direct"),
             authority: authority(),
@@ -12425,6 +12484,81 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn proposed_direct_turn_state_is_not_observable_before_materialization_returns() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let transition = rt.apply_transition_result(result);
+        tokio::pin!(transition);
+        tokio::select! {
+            started = materialization_started => started.expect("materialization started"),
+            result = &mut transition => panic!("transition returned before materialization release: {result:?}"),
+        }
+
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
+        release_materialization
+            .send(())
+            .expect("release materialization");
+        transition.await.unwrap();
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unclassified_direct_turn_result_is_fatal_without_adopting_state() {
+        let (mut rt, _storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::DurableFactUnclassified,
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
+    }
+
+    #[tokio::test]
     async fn stale_or_replay_materialization_aborts_without_request_llm_or_state_persist() {
         for preflight in [
             DirectTurnMaterializationEligibility::ExactReplay,
@@ -12471,6 +12605,10 @@ mod authoritative_user_message_effect_tests {
             let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
 
+            rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+                state: ConvState::LlmRequesting { attempt: 1 },
+                updated_at: Utc::now(),
+            });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
                 payload: payload("msg-direct"),
                 authority: authority(),

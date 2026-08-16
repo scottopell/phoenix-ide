@@ -1083,7 +1083,8 @@ mod tests {
             now: Timestamp(11),
         })
         .await
-        .unwrap();
+        .established()
+        .expect("classified direct-turn materialization");
         assert_eq!(
             lookup_durable_replay(&db, &req, &submitted_identity_from_request(&req))
                 .await

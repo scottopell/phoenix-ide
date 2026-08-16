@@ -2686,11 +2686,23 @@ impl RuntimeManager {
         })
     }
 
+    pub fn fatal_local_authority_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
+        self.fatal_local_authority_tx.subscribe()
+    }
+
     async fn handle_runtime_exit(
         &self,
         conv: &crate::db::Conversation,
         disposition: executor::RuntimeExitDisposition,
     ) {
+        if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+            let _ = self
+                .fatal_local_authority_tx
+                .send(Some("direct_turn_materialization"));
+            return;
+        }
         if disposition != executor::RuntimeExitDisposition::Terminal
             || conv.runtime_role != crate::work_scope::RuntimeRole::SubAgent
         {
@@ -7591,6 +7603,7 @@ mod scope_liveness_tests {
             now: Timestamp(3),
         })
         .await
+        .established()
         .expect("materialize direct turn");
 
         mgr.db()

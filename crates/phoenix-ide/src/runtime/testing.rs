@@ -544,6 +544,9 @@ pub struct InMemoryStorage {
     preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
+    materialize_authoritative_user_message_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    materialize_authoritative_user_message_release:
+        Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     active_direct_turn: Mutex<Option<crate::runtime::traits::LoadedActiveDirectTurn>>,
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -589,6 +592,8 @@ impl InMemoryStorage {
             materialize_authoritative_user_message_results: Mutex::new(VecDeque::new()),
             preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
             materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
+            materialize_authoritative_user_message_started: Mutex::new(None),
+            materialize_authoritative_user_message_release: Mutex::new(None),
             active_direct_turn: Mutex::new(None),
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
@@ -803,6 +808,25 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .push_back(result);
+    }
+
+    pub fn gate_authoritative_user_message_materialization(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .materialize_authoritative_user_message_started
+            .lock()
+            .unwrap() = Some(started_tx);
+        *self
+            .materialize_authoritative_user_message_release
+            .lock()
+            .unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn recorded_preflight_authoritative_user_message_calls(
@@ -1196,6 +1220,22 @@ impl MessageStore for InMemoryStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             });
+        if let Some(started) = self
+            .materialize_authoritative_user_message_started
+            .lock()
+            .unwrap()
+            .take()
+        {
+            let _ = started.send(());
+        }
+        let release = self
+            .materialize_authoritative_user_message_release
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         Ok(self
             .materialize_authoritative_user_message_results
             .lock()

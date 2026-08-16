@@ -48,7 +48,10 @@ pub enum AuthoritativeUserMessageMaterialization {
         active: ActiveDirectTurn,
     },
     ExactReplay,
+    NotCommitted,
     StaleAuthority,
+    CommandRejected,
+    DurableFactUnclassified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1309,8 +1312,11 @@ impl MessageStore for DatabaseStorage {
         &self,
         input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
-        use phoenix_db::workflow::{MaterializeAuthoritativeTurnInput, WorkflowRepository};
-        use phoenix_workflow::{AuthorityOutcome, TurnAuthorityId, TurnOutcome};
+        use phoenix_db::workflow::{
+            LocalAuthorityResult, MaterializeAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnOutcome, WorkflowRepository,
+        };
+        use phoenix_workflow::TurnAuthorityId;
         let repo = WorkflowRepository::new(self.db.pool().clone());
         let local_authority = direct_turn_local_authority(&input.authority);
         let materialized = repo
@@ -1324,30 +1330,36 @@ impl MessageStore for DatabaseStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             })
-            .await
-            .map_err(|error| error.to_string())?;
-        match (
-            materialized.authority_outcome,
-            materialized.outcome,
-            materialized.message,
-        ) {
-            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => {
-                Ok(AuthoritativeUserMessageMaterialization::Materialized {
-                    message: Box::new(message),
-                    active: ActiveDirectTurn {
-                        turn_id: materialized.canonical_turn.id,
-                        generation: materialized.canonical_turn.generation,
-                    },
-                })
+            .await;
+        Ok(match materialized {
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(materialization),
+            ) => AuthoritativeUserMessageMaterialization::Materialized {
+                message: materialization.message,
+                active: ActiveDirectTurn {
+                    turn_id: materialization.turn_id,
+                    generation: materialization.generation,
+                },
+            },
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::ExactReplay(_),
+            ) => AuthoritativeUserMessageMaterialization::ExactReplay,
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::NotCommitted,
+            ) => AuthoritativeUserMessageMaterialization::NotCommitted,
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::StaleAuthority,
+            ) => AuthoritativeUserMessageMaterialization::StaleAuthority,
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::CommandRejected(error),
+            ) => {
+                tracing::warn!(?error, "direct-turn materialization command rejected");
+                AuthoritativeUserMessageMaterialization::CommandRejected
             }
-            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
-                Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
+            LocalAuthorityResult::DurableFactUnclassified => {
+                AuthoritativeUserMessageMaterialization::DurableFactUnclassified
             }
-            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, None) => {
-                Err("direct-turn replay did not return canonical message".to_string())
-            }
-            _ => Ok(AuthoritativeUserMessageMaterialization::StaleAuthority),
-        }
+        })
     }
 
     async fn load_active_direct_turn(

@@ -1143,7 +1143,8 @@ mod tests {
                         },
                     )
                     .await
-                    .unwrap();
+                    .established()
+                    .expect("classified direct-turn materialization");
                 })
             }),
         );
