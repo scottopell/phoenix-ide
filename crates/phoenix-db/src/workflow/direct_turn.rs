@@ -4007,6 +4007,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_repository_reconstructs_only_committed_direct_turn_state() {
+        let (_dir, writer, replacement) = open_workflow_repo_pair().await;
+        let (turn_id, workflow_id) = created_turn(&writer, "replacement", 17).await;
+        let authority = writer
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        assert!(matches!(
+            writer
+                .materialize_authoritative_turn_at_cut(
+                    &materialize_input(turn_id, authority, 1, 1, "message-conv-a-replacement", 10,),
+                    TransactionCut::BeforeCommit,
+                )
+                .await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::NotCommitted
+            )
+        ));
+
+        let persisted_state: String =
+            sqlx::query_scalar("SELECT state FROM conversations WHERE id = 'conv-a'")
+                .fetch_one(replacement.pool())
+                .await
+                .unwrap();
+        let message_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-a'")
+                .fetch_one(replacement.pool())
+                .await
+                .unwrap();
+        let obligations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM durable_turns
+             WHERE conversation_id = 'conv-a' AND terminal_kind IS NULL",
+        )
+        .fetch_one(replacement.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<ConvState>(&persisted_state).unwrap(),
+            ConvState::Idle
+        );
+        assert_eq!(message_count, 0);
+        assert_eq!(obligations, 1);
+    }
+
+    #[tokio::test]
     async fn unavailable_authority_database_returns_unclassified() {
         let repo = repo().await;
         let (turn_id, workflow_id) = created_turn(&repo, "unclassified", 18).await;

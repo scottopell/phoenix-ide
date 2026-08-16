@@ -15,6 +15,7 @@ use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinit
 use phoenix_workflow::Timestamp;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -547,6 +548,7 @@ pub struct InMemoryStorage {
     materialize_authoritative_user_message_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     materialize_authoritative_user_message_release:
         Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    panic_authoritative_user_message_materialization: AtomicBool,
     active_direct_turn: Mutex<Option<crate::runtime::traits::LoadedActiveDirectTurn>>,
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -594,6 +596,7 @@ impl InMemoryStorage {
             materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
             materialize_authoritative_user_message_started: Mutex::new(None),
             materialize_authoritative_user_message_release: Mutex::new(None),
+            panic_authoritative_user_message_materialization: AtomicBool::new(false),
             active_direct_turn: Mutex::new(None),
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
@@ -808,6 +811,11 @@ impl InMemoryStorage {
             .lock()
             .unwrap()
             .push_back(result);
+    }
+
+    pub fn panic_authoritative_user_message_materialization(&self) {
+        self.panic_authoritative_user_message_materialization
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn gate_authoritative_user_message_materialization(
@@ -1220,6 +1228,12 @@ impl MessageStore for InMemoryStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             });
+        if self
+            .panic_authoritative_user_message_materialization
+            .swap(false, Ordering::SeqCst)
+        {
+            panic!("injected direct-turn authority-boundary panic");
+        }
         if let Some(started) = self
             .materialize_authoritative_user_message_started
             .lock()

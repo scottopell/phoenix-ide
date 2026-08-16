@@ -999,7 +999,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(
+        if let Err(error) = tls::serve_https(
             listener,
             app,
             loaded_tls.server,
@@ -1008,7 +1008,11 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             &runtime_for_fatal,
             &bash_handles_for_shutdown,
         )
-        .await?;
+        .await
+        {
+            tracing_handles.shutdown_tracer();
+            return Err(error);
+        }
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,

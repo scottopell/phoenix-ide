@@ -5028,34 +5028,36 @@ where
                 let (reserved_broadcast_range, reserved_seqs) =
                     self.broadcast_tx.reserve_next_persisted_message_range(1);
                 let _reserved_broadcast_range = reserved_broadcast_range;
-                let materialization = self
-                    .storage
-                    .materialize_authoritative_user_message(
-                        &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
-                            authority,
-                            payload,
-                            sequence_id: reserved_seqs[0],
-                            created_at: phoenix_workflow::Timestamp(now),
-                            accepted_state: self
-                                .proposed_direct_turn_state
-                                .as_ref()
-                                .map(|proposed| proposed.state.clone())
-                                .ok_or_else(|| {
-                                    "authoritative materialization missing proposed state"
-                                        .to_string()
-                                })?,
-                            state_updated_at: self
-                                .proposed_direct_turn_state
-                                .as_ref()
-                                .map(|proposed| proposed.updated_at)
-                                .ok_or_else(|| {
-                                    "authoritative materialization missing proposed timestamp"
-                                        .to_string()
-                                })?,
-                            now: phoenix_workflow::Timestamp(now),
-                        },
-                    )
-                    .await;
+                let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
+                    authority,
+                    payload,
+                    sequence_id: reserved_seqs[0],
+                    created_at: phoenix_workflow::Timestamp(now),
+                    accepted_state: self
+                        .proposed_direct_turn_state
+                        .as_ref()
+                        .map(|proposed| proposed.state.clone())
+                        .ok_or_else(|| {
+                            "authoritative materialization missing proposed state".to_string()
+                        })?,
+                    state_updated_at: self
+                        .proposed_direct_turn_state
+                        .as_ref()
+                        .map(|proposed| proposed.updated_at)
+                        .ok_or_else(|| {
+                            "authoritative materialization missing proposed timestamp".to_string()
+                        })?,
+                    now: phoenix_workflow::Timestamp(now),
+                };
+                let storage = self.storage.clone();
+                let boundary_owner = tokio::spawn(async move {
+                    storage.materialize_authoritative_user_message(&input).await
+                });
+                let materialization = boundary_owner.await.map_err(|error| {
+                    tracing::error!(?error, "direct-turn authority boundary owner disappeared");
+                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
+                        .to_string()
+                })?;
                 let materialization = match materialization {
                     Ok(materialization) => materialization,
                     Err(error) => {
@@ -12527,6 +12529,36 @@ mod authoritative_user_message_effect_tests {
             broadcast_rx.try_recv(),
             Ok(SseEvent::Message { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_turn_authority_boundary_panic_is_fatal_without_adopting_state() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        storage.panic_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
     }
 
     #[tokio::test]
