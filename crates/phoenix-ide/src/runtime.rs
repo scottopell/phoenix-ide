@@ -10289,12 +10289,7 @@ mod scope_liveness_tests {
             .await
             .expect("set context-exhausted");
         // Wire the continuation edge the chain walk reads.
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("leaf")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "leaf").await;
         // Refresh the in-memory row so `continued_in_conv_id` is populated.
         let parent = mgr.db().get_conversation("parent").await.expect("get");
         assert_eq!(
@@ -10352,12 +10347,7 @@ mod scope_liveness_tests {
             .await
             .expect("terminate successor");
         // Wire the continuation edge the chain walk reads.
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("successor")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "successor").await;
 
         assert!(
             !mgr.scope_has_live_conversation(&scope).await.unwrap(),
@@ -10383,12 +10373,7 @@ mod scope_liveness_tests {
             .await
             .expect("set handed-off");
         // successor stays non-terminal (live).
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("successor")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "successor").await;
 
         assert!(
             !mgr.scope_has_live_conversation_excluding(&scope, "successor")
@@ -10410,6 +10395,22 @@ mod scope_liveness_tests {
 
     /// Helper: wire a `continued_in_conv_id` edge `from` → `to`.
     async fn wire_continuation(mgr: &RuntimeManager, from: &str, to: &str) {
+        let product_conversation_id = mgr
+            .db()
+            .get_conversation(from)
+            .await
+            .expect("get predecessor")
+            .product_conversation_id;
+        sqlx::query(
+            "UPDATE conversations
+             SET runtime_role = 'user', parent_conversation_id = NULL
+             WHERE id = ?1 AND product_conversation_id = ?2",
+        )
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("promote continuation transcript");
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
             .bind(to)
             .bind(from)

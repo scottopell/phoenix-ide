@@ -10,10 +10,44 @@ use tokio::sync::broadcast;
 
 /// Build a 3-member linear chain and return the ids in chain order.
 async fn build_linear_chain(db: &Database, ids: &[&str]) {
-    for id in ids {
-        db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-            .await
-            .unwrap();
+    let root = db
+        .create_conversation(
+            ids[0],
+            &format!("slug-{}", ids[0]),
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for id in &ids[1..] {
+        let now = chrono::Utc::now().to_rfc3339();
+        let scope_id = format!("scope-{id}");
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+        )
+        .bind(&scope_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+        )
+        .bind(id)
+        .bind(root.product_conversation_id.as_str())
+        .bind(format!("slug-{id}"))
+        .bind(scope_id)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
     }
     for pair in ids.windows(2) {
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")

@@ -12685,12 +12685,45 @@ pub(crate) mod hard_delete_cascade_tests {
     /// test helper. The cascade tests only need the linkage; they don't
     /// exercise the `continue_conversation` gating on `context_exhausted`.
     async fn build_chain_for_test(state: &AppState, ids: &[&str]) {
-        for id in ids {
-            state
-                .db
-                .create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-                .await
-                .expect("create");
+        let root = state
+            .db
+            .create_conversation(
+                ids[0],
+                &format!("slug-{}", ids[0]),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        for id in &ids[1..] {
+            let now = chrono::Utc::now().to_rfc3339();
+            let scope_id = format!("scope-{id}");
+            sqlx::query(
+                "INSERT INTO work_scopes (
+                     id, authority_kind, environment_kind, cwd, created_at, updated_at
+                 ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+            )
+            .bind(&scope_id)
+            .bind(&now)
+            .execute(state.db.pool())
+            .await
+            .expect("scope");
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, user_initiated, runtime_role,
+                     work_scope_id, state_updated_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+            )
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .bind(format!("slug-{id}"))
+            .bind(scope_id)
+            .bind(now)
+            .execute(state.db.pool())
+            .await
+            .expect("create");
         }
         for pair in ids.windows(2) {
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
@@ -12769,49 +12802,29 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn chain_delete_preflights_coordinator_role_before_mutation() {
+    async fn chain_rejects_coordinator_role_in_ordinary_aggregate_before_delete() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cc-a", "cc-b"]).await;
-        sqlx::query(
+        assert!(sqlx::query(
             "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'cc-b'",
         )
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
-        let err = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("cc-a".to_string()),
-        )
+        .execute(state.db.pool())
         .await
-        .expect_err("Coordinator chain must be immutable");
-        match err {
-            AppError::Conflict(detail) => {
-                assert_eq!(detail.error_type, "coordinator_lifecycle");
-            }
-            other => panic!("expected 409, got {other:?}"),
-        }
+        .is_err());
         assert!(state.db.get_conversation("cc-a").await.is_ok());
         assert!(state.db.get_conversation("cc-b").await.is_ok());
     }
 
     #[tokio::test]
-    async fn chain_archive_preflights_coordinator_role_before_mutation() {
+    async fn chain_rejects_coordinator_role_in_ordinary_aggregate_before_archive() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["ca-a", "ca-b"]).await;
-        sqlx::query(
+        assert!(sqlx::query(
             "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'ca-b'",
         )
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
-        crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("ca-a".to_string()),
-        )
+        .execute(state.db.pool())
         .await
-        .expect_err("Coordinator chain must be immutable");
+        .is_err());
         assert!(!state.db.get_conversation("ca-a").await.unwrap().archived);
         assert!(!state.db.get_conversation("ca-b").await.unwrap().archived);
     }
@@ -13108,25 +13121,47 @@ pub(crate) mod hard_delete_cascade_tests {
             task_title: crate::db::NonEmptyString::new("test chain").unwrap(),
         };
 
-        for id in ids {
-            state
-                .db
-                .create_conversation_with_project(
-                    id,
-                    &format!("slug-{id}"),
-                    worktree.to_str().unwrap(),
-                    true,
-                    None,
-                    None,
-                    Some(&project.id),
-                    &mode,
-                    None,
-                    None,
-                    None,
-                    crate::llm_language::LlmLanguage::default(),
-                )
-                .await
-                .expect("create conv");
+        let root_id = ids[0];
+        let root = state
+            .db
+            .create_conversation_with_project(
+                root_id,
+                &format!("slug-{root_id}"),
+                worktree.to_str().unwrap(),
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create root conv");
+        for id in &ids[1..] {
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, title, user_initiated,
+                     state, state_kind, state_updated_at, created_at, updated_at,
+                     archived, model, project_id, desired_base_branch,
+                     cm_kind, cm_task_id, cm_task_title, runtime_role, work_scope_id
+                 )
+                 SELECT ?1, product_conversation_id, ?2, ?3, 1,
+                        state, state_kind, ?4, ?4, ?4,
+                        0, model, project_id, desired_base_branch,
+                        cm_kind, cm_task_id, cm_task_title, 'user', work_scope_id
+                 FROM conversations WHERE id = ?5",
+            )
+            .bind(id)
+            .bind(format!("slug-{id}"))
+            .bind(format!("Title {id}"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(&root.id)
+            .execute(state.db.pool())
+            .await
+            .expect("create continuation member");
         }
         for pair in ids.windows(2) {
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
