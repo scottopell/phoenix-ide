@@ -8,7 +8,7 @@
 -- arbitration, steering, and exact-ID reconciliation.
 --
 -- Requirement traceability: REQ-DWF-038, REQ-DWF-CHAT-001 through
--- REQ-DWF-CHAT-014.
+-- REQ-DWF-CHAT-016.
 
 use "./durable-workflows.allium" as dwf
 use "../bedrock/bedrock.allium" as bedrock
@@ -40,6 +40,13 @@ enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation 
 enum RuntimeSlotStatus { idle | accepted }
 enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
 enum CommittedOutcomeKind { RuntimeAccepted | QueuedSteering }
+enum DirectTurnReconciliationKind {
+    CommittedMaterialization
+    | ConfirmedNonCommit
+    | AmbiguousMaterialization
+    | AmbiguousPostMaterialization
+    | StaleAuthority
+}
 enum DirectChatOutcomeKind {
     RetryableUnaccepted
     | RuntimeAccepted
@@ -81,6 +88,13 @@ value PreparedTurnFingerprint {
 value AcceptedTurnRef {
     workflow_id: String
     canonical_delivery_id: String?
+}
+
+value DirectTurnReconciliationResult {
+    accepted_turn: AcceptedTurnRef
+    conversation_id: String
+    generation: Integer
+    kind: DirectTurnReconciliationKind
 }
 
 value CommittedOutcome {
@@ -183,6 +197,14 @@ entity DirectChatConsumerCursor {
 -- independent_prepared_events_emitted(request, targets)
 -- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
 -- direct_chat_close_settlement_request(product_conversation, attempt_id)
+-- canonical_materialization_preserved(result), exact_claim_released(result)
+-- claim_retained_or_owed(result), provider_dispatch_at_most_once(result)
+-- accepted_turn_authority_unchanged(result)
+-- RuntimeIncarnationAbandonmentRequested(conversation_id), no_replacement_requested_by_recovery_handler(conversation_id)
+-- remaining_discovery_candidates_continue(acceptance), startup_readiness_can_complete()
+-- target_bound_key_for(accepted_turn)
+-- ambiguous_incarnation_closes_without_fabricated_event(turn_key), replacement_init_matches_durable_materialization(turn_key)
+-- provider_dispatch_is_at_most_once(turn_key), confirmed_non_commit_is_retryable(turn_key), recovery_failure_is_target_local(resolved_target)
 
 ------------------------------------------------------------
 -- Invariants
@@ -416,6 +438,68 @@ rule StaleGenerationSettlementCannotMutateCurrentAcceptedTurn {
     ensures: bedrock/CloseSettlementProgressed(acceptance.resolved_target.product_conversation, attempt_id)
 }
 
+rule CommittedMaterializationPreservesCanonicalAuthority {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = CommittedMaterialization
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: canonical_materialization_preserved(result)
+    ensures: claim_retained_or_owed(result)
+    ensures: provider_dispatch_at_most_once(result)
+}
+
+rule ConfirmedNonCommitReleasesExactClaimForRetry {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = ConfirmedNonCommit
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: exact_claim_released(result)
+    ensures: retryable_unaccepted_outcome(target_bound_key_for(result.accepted_turn))
+}
+
+rule AmbiguousMaterializationAbandonsRuntimeIncarnation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = AmbiguousMaterialization
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: claim_retained_or_owed(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
+}
+
+rule AmbiguousPostMaterializationRecoveryAbandonsRuntimeIncarnation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = AmbiguousPostMaterialization
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: canonical_materialization_preserved(result)
+    ensures: claim_retained_or_owed(result)
+    ensures: provider_dispatch_at_most_once(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
+}
+
+rule StaleGenerationIsClassifiedByExactReconciliation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.generation != current_generation_for(result.accepted_turn)
+
+    ensures: result.kind = StaleAuthority
+}
+
+rule StaleDirectTurnReconciliationCannotMutateCurrentAuthority {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = StaleAuthority
+
+    ensures: accepted_turn_authority_unchanged(result)
+}
+
+rule DirectTurnRecoveryFailureIsConversationLocal {
+    when: DirectTurnRecoveryCandidateFailed(acceptance)
+
+    ensures: remaining_discovery_candidates_continue(acceptance)
+    ensures: startup_readiness_can_complete()
+}
+
 rule CoordinatorMultiTargetFanOutCreatesIndependentOrdinaryAcceptances {
     when: CoordinatorDirectChatRequested(coordinator, request)
     requires: target_preparations_are_independent(request)
@@ -448,6 +532,11 @@ surface DirectTurnRefinementVerification {
         same_key_race_converges_or_conflicts(turn_key)
         different_key_race_is_target_local(resolved_target)
         restart_preserves_committed_outcome(turn_key)
+        ambiguous_incarnation_closes_without_fabricated_event(turn_key)
+        replacement_init_matches_durable_materialization(turn_key)
+        provider_dispatch_is_at_most_once(turn_key)
+        confirmed_non_commit_is_retryable(turn_key)
+        recovery_failure_is_target_local(resolved_target)
 
     @guarantee PureModelRefinement
         -- Every repository command normalizes to the same aggregate and owed child
@@ -477,6 +566,25 @@ surface DirectTurnRefinementVerification {
 -- Verification surfaces
 ------------------------------------------------------------
 
+surface DirectTurnReconciliationSurface {
+    facing accepted_turn: AcceptedTurnRef
+    facing generation: Integer
+
+    exposes:
+        DirectTurnReconciliationResult
+
+    @guarantee ClosedRepositoryResultFamily
+        -- One exact repository reconciliation command for accepted_turn and
+        -- generation returns exactly one closed result variant. No runtime error,
+        -- missing canonical-message projection, conversation projection, runtime
+        -- absence, or cleanup outcome independently supplies the result kind.
+
+    @guarantee AmbiguityIsInconclusiveRepositoryAuthority
+        -- An ambiguous variant means the exact repository command cannot conclude
+        -- whether its durable boundary committed. It is not inferred from a
+        -- missing message or any other projection.
+}
+
 surface DirectChatDispositionSurface {
     facing turn_key: TargetBoundTurnKey
 
@@ -504,6 +612,11 @@ surface DirectChatCrashAndRaceVerification {
         same_key_race_converges_or_conflicts(turn_key)
         different_key_race_is_target_local(resolved_target)
         restart_preserves_committed_outcome(turn_key)
+        ambiguous_incarnation_closes_without_fabricated_event(turn_key)
+        replacement_init_matches_durable_materialization(turn_key)
+        provider_dispatch_is_at_most_once(turn_key)
+        confirmed_non_commit_is_retryable(turn_key)
+        recovery_failure_is_target_local(resolved_target)
 
     @guarantee RuntimeBoundaryCoverage
         -- Verification covers crash after observation, crash after durable
@@ -512,6 +625,11 @@ surface DirectChatCrashAndRaceVerification {
     @guarantee SteeringCoverage
         -- Verification covers queued-steering commitment, steering conversion,
         -- and replay of either committed outcome.
+
+    @guarantee AmbiguousIncarnationRecoveryCoverage
+        -- Verification distinguishes committed materialization, exact confirmed
+        -- non-commit, and unresolved ambiguity; proves old-subscriber closure,
+        -- durable resnapshot, at-most-once dispatch, and target-local readiness.
 }
 
 surface DirectChatMutableInputVerification {

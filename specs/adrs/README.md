@@ -47,6 +47,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [033](033_offline-database-rollback-and-foundation-storage.md) | Database rollback is offline and Foundation observations use relational scalar storage | Accepted | REQ-GITREP-001–004; `RepositoryLocatorObservation`, `DefaultBranchObservation` |
 | [034](034_compatibility-guarantees-are-explicit-and-data-aware.md) | Compatibility guarantees are explicit and data-aware | Accepted | REQ-COMP-001–005 |
 | [035](035_repository-authority-activation-is-consumer-triggered-and-offline.md) | Repository authority activation is consumer-triggered and offline | Accepted | REQ-GITREP-004/009; `GitRepository`, `WorkScope.repository`, repository authority generation |
+| [036](036_ambiguous-direct-turn-recovery-abandons-live-stream-incarnation.md) | Ambiguous direct-turn recovery abandons the live stream incarnation | Accepted | REQ-DWF-CHAT-012–014, REQ-DWF-CHAT-016; `DirectTurnReconciliationResult`, `SseStream`, `ReplayRing` |
 
 ## For agents: which decisions bind your task
 
@@ -68,7 +69,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying native process resource sampling, Work Scope health, or resource-observation freshness | 009 |
 | Specifying native macOS self-deployment, activation, or rollback | 010 |
 | Specifying wake-plane registration receipts, durable wake observations, or wake resume outbox | 006, 011, 012 |
-| Specifying the shared durable workflow engine, profiles, migration, or drain | 013, 014, 015, 016, 019, 020, 024 |
+| Specifying the shared durable workflow engine, profiles, migration, drain, or ambiguous direct-turn recovery | 013, 014, 015, 016, 019, 020, 024, 036 |
 | Specifying product conversation lifecycle versus WorkScope resource ownership, continuation topology, or worktree lifecycle across continuations | 026 |
 | Specifying ProductConversation persistence identity, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031, then 026 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
@@ -109,6 +110,7 @@ ADR-000 (adopt spEARS v2 for new work)
           ├── ADR-019 (Runtime ownership requires positive evidence)
           └── ADR-020 (Durable-workflow core matches one scheduler authority and durable acknowledgement)
               └── ADR-024 (Direct-turn authority is partitioned by semantic fact)
+                  └── ADR-036 (Ambiguous direct-turn recovery abandons the live stream incarnation)
       ├── ADR-025 (Continuation compaction is an idempotent durable operation)
       ├── ADR-021 (The Coordinator surface is chat-only)
       │   └── ADR-022 (The Coordinator uses bounded relational evidence)

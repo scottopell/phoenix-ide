@@ -484,6 +484,13 @@ Correctness SHALL NOT depend on sleeps, polling cadence, timestamps that infer
 semantic ownership, manual sequence rewind discipline, provider-response-derived
 tool authority, or mutable runtime steering truth.
 
+Verification SHALL distinguish exact committed materialization, exact confirmed
+non-commit for the accepted turn and generation, and unresolved ambiguity. It
+SHALL prove that ambiguous incarnation abandonment closes the old stream without
+fabricated events, that a replacement `Init` reflects authoritative durable state,
+that provider dispatch remains at most once, and that one conversation's recovery
+failure does not block independent conversations or worker readiness.
+
 ### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
 
 WHEN destructive lifecycle orchestration must settle durable direct-turn work before
@@ -507,6 +514,31 @@ Once ownership release for that exact accepted turn has begun, a user-visible ca
 Close MAY stop further retirement progression but SHALL NOT require or invent a second
 settlement cancellation path; the original settlement completion remains the release
 boundary.
+
+### REQ-DWF-CHAT-016: Ambiguous Recovery Abandons the Live Stream Incarnation
+
+WHEN direct-turn materialization or post-materialization recovery cannot prove a
+coherent continuation of the current runtime and SSE stream incarnation
+THE SYSTEM SHALL terminate that runtime and stream incarnation, remove the exact
+runtime identity, and drop every manager and runtime sender for its broadcaster
+before any replacement runtime is created.
+
+The abandoned broadcaster, replay ring, subscriber, or reserved cursor SHALL NOT
+be transferred, retained for replacement, repaired, rewound, or completed with a
+fabricated event. A later client reconnect or durable-discovery pass MAY create a
+fresh runtime and stream incarnation only after old sender ownership is absent,
+and its first event SHALL be an authoritative `Init` reconstructed from committed
+SQLite state plus replay state owned only by the fresh incarnation.
+
+The direct-turn claim SHALL be released only when an exact typed repository result
+proves non-commit for the exact accepted turn and generation. Committed
+materialization SHALL preserve canonical message identity and at-most-once provider
+dispatch. Unresolved ambiguity SHALL retain the durable claim or owed work for
+later reconciliation; runtime absence, a missing projected message, projected
+conversation state, and cleanup outcomes SHALL NOT prove non-commit.
+
+Failure to reconcile one conversation SHALL NOT block independent conversations
+or completion of the worker's startup-readiness pass.
 
 ### REQ-DWF-CHAT-011: Crash, Race, and Mutable-Input Verification
 
@@ -746,4 +778,4 @@ Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042,
 REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
 REQ-DWF-CREATE-005 as defined in this document. Direct-chat authority and
 refinement are additionally governed by REQ-DWF-CHAT-012 through
-REQ-DWF-CHAT-014.
+REQ-DWF-CHAT-016.

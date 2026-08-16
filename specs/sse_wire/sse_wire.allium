@@ -256,6 +256,7 @@ entity StreamMessage {
 -- before its tool round completes) would otherwise vanish on reconnect.
 entity ReplayRing {
     conversation_id: String
+    stream_incarnation: String
     -- The sequence_id of the persisted Message that last reset this
     -- ring. All entries have sequence_id strictly greater than this.
     -- Starts at 0 for a freshly-created conversation.
@@ -274,6 +275,7 @@ entity ReplayRing {
 -- Closed when the client disconnects or broadcast lag is detected.
 entity SseStream {
     conversation_id: String
+    stream_incarnation: String
     status: StreamStatus
     -- True once the init event has been delivered. No other event
     -- may be delivered before init_sent becomes true.
@@ -305,6 +307,13 @@ entity SseStream {
 -- Enumerations
 ------------------------------------------------------------
 
+entity BroadcasterIncarnation {
+    conversation_id: String
+    stream_incarnation: String
+    sender_owners: Integer
+    replacement_retained: Boolean
+}
+
 enum StreamStatus { open | closed }
 enum AggregateBoundLiveCarrierKind {
     message | state_change | token | message_updated | agent_done |
@@ -334,6 +343,13 @@ config {
     -- evicts oldest-first and sets the ring's truncated flag.
     replay_ring_capacity: Integer = 512
 }
+
+-- current_stream_incarnation(conversation_id)
+-- RuntimeIncarnationAbandonmentRequested(conversation_id, stream_incarnation)
+-- ClientSubscribesAfterAbandonment(conversation_id, abandoned_incarnation, snapshot)
+-- SnapshotReplayBelongsToIncarnation(snapshot, stream_incarnation)
+-- no_fabricated_event_for_abandoned_incarnation(conversation_id, stream_incarnation)
+-- no_reserved_cursor_transfer(conversation_id, stream_incarnation)
 
 ------------------------------------------------------------
 -- Rules — stream lifecycle
@@ -389,6 +405,7 @@ rule StreamOpened {
 
     ensures: SseStream.created(
         conversation_id: conversation_id,
+        stream_incarnation: snapshot.stream_incarnation,
         status: open,
         init_sent: true,
         last_delivered_seq: snapshot.last_sequence_id,
@@ -461,6 +478,47 @@ rule LagCloseStream {
         -- lifecycle.
 }
 
+rule AmbiguousRuntimeIncarnationDropsAllSenderOwnership {
+    when: RuntimeIncarnationAbandonmentRequested(conversation_id, stream_incarnation)
+    let broadcaster = BroadcasterIncarnation{conversation_id: conversation_id, stream_incarnation: stream_incarnation}
+
+    ensures: broadcaster.sender_owners = 0
+    ensures: not broadcaster.replacement_retained
+    ensures:
+        for stream in SseStreams where conversation_id = conversation_id and stream_incarnation = stream_incarnation:
+            stream.status = closed
+
+    @guidance
+        -- Remove the exact runtime identity and drop every manager/runtime sender
+        -- before any reconnect or durable-discovery pass may create a replacement.
+        -- The abandoned broadcaster is never deposited into replacement retention.
+}
+
+rule AbandonedIncarnationEmitsNoRepairEvent {
+    when: RuntimeIncarnationAbandonmentRequested(conversation_id, stream_incarnation)
+
+    ensures: no_fabricated_event_for_abandoned_incarnation(conversation_id, stream_incarnation)
+    ensures: no_reserved_cursor_transfer(conversation_id, stream_incarnation)
+}
+
+rule ReplacementIncarnationStartsFromAuthoritativeInit {
+    when: ClientSubscribesAfterAbandonment(conversation_id, abandoned_incarnation, snapshot)
+
+    requires: BroadcasterIncarnation{conversation_id: conversation_id, stream_incarnation: abandoned_incarnation}.sender_owners = 0
+    requires: snapshot.stream_incarnation != abandoned_incarnation
+    requires: SnapshotUsesPersistedMessagesAsTranscriptAuthority(snapshot, conversation_id)
+    requires: SnapshotReplayBelongsToIncarnation(snapshot, snapshot.stream_incarnation)
+
+    ensures: SseStream.created(
+        conversation_id: conversation_id,
+        stream_incarnation: snapshot.stream_incarnation,
+        status: open,
+        init_sent: true,
+        last_delivered_seq: snapshot.last_sequence_id,
+        init_snapshot: snapshot
+    )
+}
+
 ------------------------------------------------------------
 -- Invariants — init snapshot gap freedom
 ------------------------------------------------------------
@@ -478,7 +536,7 @@ invariant InitSnapshotNoDurableGap {
                 InitSnapshotIncludesMessage(stream.init_snapshot, msg)
 
     for stream in SseStreams:
-        for entry in ReplayRing{conversation_id: stream.conversation_id}.entries:
+        for entry in ReplayRing{conversation_id: stream.conversation_id, stream_incarnation: stream.stream_incarnation}.entries:
             (entry.sequence_id > stream.init_snapshot.pending_anchor_sequence_id
              and entry.sequence_id <= stream.init_snapshot.last_sequence_id) implies
                 InitSnapshotIncludesPendingEvent(stream.init_snapshot, entry)
@@ -614,7 +672,7 @@ rule PersistedMessageClearsReplayRing {
 
     let root_conversation_id = DurableRootOf(msg.conversation_id)
     let root_sequence_id = root_sequence_for_persisted_message(msg)
-    let ring = ReplayRing{conversation_id: root_conversation_id}
+    let ring = ReplayRing{conversation_id: root_conversation_id, stream_incarnation: current_stream_incarnation(root_conversation_id)}
 
     requires: exists RootProjectedEventCommitted(
         root_conversation_id: root_conversation_id,
@@ -725,7 +783,7 @@ rule EphemeralEventAppendedToReplayRing {
         "llm_first_byte", "llm_attempt"
     }
 
-    let ring = ReplayRing{conversation_id: conv_id}
+    let ring = ReplayRing{conversation_id: conv_id, stream_incarnation: current_stream_incarnation(conv_id)}
 
     requires: entry.sequence_id > ring.anchor_sequence_id
 
@@ -781,7 +839,7 @@ rule DurableStateProjectionBroadcastLiveOnly {
         "conversation_hard_deleted"
     }
 
-    let ring = ReplayRing{conversation_id: conv_id}
+    let ring = ReplayRing{conversation_id: conv_id, stream_incarnation: current_stream_incarnation(conv_id)}
 
     ensures: ring.entries = ring.entries
     ensures: ring.anchor_sequence_id = ring.anchor_sequence_id
@@ -815,7 +873,7 @@ rule EagerAssistantMessageAppendedToReplayRing {
     requires: entry.event_type = "message"
     requires: not exists PersistedMessage{message_id: entry.payload.message_id, conversation_id: conv_id}
 
-    let ring = ReplayRing{conversation_id: conv_id}
+    let ring = ReplayRing{conversation_id: conv_id, stream_incarnation: current_stream_incarnation(conv_id)}
 
     requires: entry.sequence_id > ring.anchor_sequence_id
 
@@ -1400,6 +1458,19 @@ invariant InitSnapshotMirrorsRing {
         for ring in ReplayRings:
             ring.conversation_id = stream.conversation_id
                 implies stream.init_snapshot.pending_anchor_sequence_id = ring.anchor_sequence_id
+}
+
+invariant ReplayRingBelongsToOneStreamIncarnation {
+    for stream in SseStreams:
+        for ring in ReplayRings:
+            (ring.conversation_id = stream.conversation_id
+             and ring.stream_incarnation = stream.stream_incarnation) implies
+                stream.init_snapshot.stream_incarnation = ring.stream_incarnation
+}
+
+invariant ClosedAbandonedIncarnationHasNoSenderOwner {
+    for broadcaster in BroadcasterIncarnations:
+        broadcaster.sender_owners = 0 implies not broadcaster.replacement_retained
 }
 
 invariant RootConversationInitUsesDurableAggregateProjection {
