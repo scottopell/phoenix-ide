@@ -1,0 +1,323 @@
+use crate::{DbError, DbResult};
+use std::time::{Duration, Instant};
+use tracing::field;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqliteOperation {
+    DirectTurnTerminalSettlement,
+    FtsDeleteConversation,
+    FtsDeleteMessage,
+    FtsHideMessage,
+    FtsIndexMessage,
+    FtsReconcileUpsert,
+    FtsUpsert,
+}
+
+impl SqliteOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectTurnTerminalSettlement => "direct_turn.terminal_settlement",
+            Self::FtsDeleteConversation => "fts.delete_conversation",
+            Self::FtsDeleteMessage => "fts.delete_message",
+            Self::FtsHideMessage => "fts.hide_message",
+            Self::FtsIndexMessage => "fts.index_message",
+            Self::FtsReconcileUpsert => "fts.reconcile_upsert",
+            Self::FtsUpsert => "fts.upsert",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlitePhase {
+    TransactionAcquisition,
+    Statement,
+    LocatorLookup,
+    FtsRowDelete,
+    LocatorDelete,
+    FtsInsert,
+    LocatorInsert,
+    Commit,
+}
+
+impl SqlitePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransactionAcquisition => "transaction_acquisition",
+            Self::Statement => "statement",
+            Self::LocatorLookup => "locator_lookup",
+            Self::FtsRowDelete => "fts_row_delete",
+            Self::LocatorDelete => "locator_delete",
+            Self::FtsInsert => "fts_insert",
+            Self::LocatorInsert => "locator_insert",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteResultCodes {
+    primary: i32,
+    extended: i32,
+}
+
+impl SqliteResultCodes {
+    fn from_error(error: &sqlx::Error) -> Option<Self> {
+        let extended = error.as_database_error()?.code()?.parse::<i32>().ok()?;
+        Some(Self {
+            primary: extended & 0xff,
+            extended,
+        })
+    }
+}
+
+pub(crate) struct SqliteTelemetry {
+    operation: SqliteOperation,
+    retry_count: u32,
+    started_at: Instant,
+}
+
+impl SqliteTelemetry {
+    pub(crate) fn new(operation: SqliteOperation) -> Self {
+        Self {
+            operation,
+            retry_count: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(crate) async fn observe_sqlx<T>(
+        &self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        let phase_started_at = Instant::now();
+        let result = operation.await;
+        result.inspect_err(|error| {
+            self.record_failure(phase, phase_started_at.elapsed(), error);
+        })
+    }
+
+    pub(crate) async fn observe_db<T>(
+        &self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        let phase_started_at = Instant::now();
+        let result = operation.await;
+        result.inspect_err(|error| {
+            if let DbError::Sqlx(sqlx_error) = error {
+                self.record_failure(phase, phase_started_at.elapsed(), sqlx_error);
+            }
+        })
+    }
+
+    fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
+        let elapsed_ms = elapsed_millis(self.started_at.elapsed());
+        let phase_elapsed_ms = elapsed_millis(phase_elapsed);
+        let attempt = self.retry_count.saturating_add(1);
+        let codes = SqliteResultCodes::from_error(error);
+        let parent = tracing::Span::current();
+        let span = tracing::error_span!(
+            target: "phoenix_db::otel",
+            parent: &parent,
+            "db.failure",
+            db.system = "sqlite",
+            db.operation = self.operation.as_str(),
+            db.phase = phase.as_str(),
+            db.attempt = attempt,
+            db.retry_count = self.retry_count,
+            db.elapsed_ms = elapsed_ms,
+            db.phase_elapsed_ms = phase_elapsed_ms,
+            db.sqlite.primary_code = field::Empty,
+            db.sqlite.extended_code = field::Empty,
+        );
+        if let Some(codes) = codes {
+            span.record("db.sqlite.primary_code", i64::from(codes.primary));
+            span.record("db.sqlite.extended_code", i64::from(codes.extended));
+        }
+
+        let _entered = span.enter();
+        if let Some(codes) = codes {
+            tracing::error!(
+                target: "phoenix_db::observability",
+                db_system = "sqlite",
+                db_operation = self.operation.as_str(),
+                db_phase = phase.as_str(),
+                db_attempt = attempt,
+                db_retry_count = self.retry_count,
+                db_elapsed_ms = elapsed_ms,
+                db_phase_elapsed_ms = phase_elapsed_ms,
+                db_sqlite_primary_code = codes.primary,
+                db_sqlite_extended_code = codes.extended,
+                "SQLite operation failed"
+            );
+        } else {
+            tracing::error!(
+                target: "phoenix_db::observability",
+                db_system = "sqlite",
+                db_operation = self.operation.as_str(),
+                db_phase = phase.as_str(),
+                db_attempt = attempt,
+                db_retry_count = self.retry_count,
+                db_elapsed_ms = elapsed_ms,
+                db_phase_elapsed_ms = phase_elapsed_ms,
+                "SQLite operation failed without a database result code"
+            );
+        }
+    }
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::retrieval::fts_upsert;
+    use crate::{Database, Message, MessageContent, MessageType};
+    use chrono::Utc;
+    use libsqlite3_sys as ffi;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().target() != "phoenix_db::observability" {
+                return;
+            }
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.events.lock().expect("event capture lock").push(fields);
+        }
+    }
+
+    struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    #[test]
+    fn primary_code_is_derived_from_extended_code() {
+        let codes = SqliteResultCodes {
+            primary: ffi::SQLITE_BUSY_SNAPSHOT & 0xff,
+            extended: ffi::SQLITE_BUSY_SNAPSHOT,
+        };
+        assert_eq!(codes.primary, ffi::SQLITE_BUSY);
+        assert_eq!(codes.extended, ffi::SQLITE_BUSY_SNAPSHOT);
+    }
+
+    #[test]
+    fn telemetry_vocabulary_is_bounded() {
+        assert_eq!(
+            SqliteOperation::DirectTurnTerminalSettlement.as_str(),
+            "direct_turn.terminal_settlement"
+        );
+        assert_eq!(SqliteOperation::FtsUpsert.as_str(), "fts.upsert");
+        assert_eq!(SqlitePhase::LocatorLookup.as_str(), "locator_lookup");
+        assert_eq!(SqlitePhase::Commit.as_str(), "commit");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_fts_lock_contention_records_exact_phase_and_codes_without_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contention.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", path.to_string_lossy()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::ZERO)
+                .foreign_keys(true);
+        let contending_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        let mut writer = db.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = fts_upsert(
+            &contending_pool,
+            &Message {
+                message_id: "sensitive-message-id".to_string(),
+                conversation_id: "busy-conversation".to_string(),
+                sequence_id: 1,
+                message_type: MessageType::User,
+                content: MessageContent::user("sensitive payload sentinel"),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap_err();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        let codes = SqliteResultCodes::from_error(&error).expect("SQLite result codes");
+        assert_eq!(codes.primary, ffi::SQLITE_BUSY);
+
+        let events = capture.events.lock().expect("event capture lock");
+        assert_eq!(events.len(), 1, "one failed database phase is recorded");
+        let event = &events[0];
+        assert_eq!(
+            event.get("db_operation").map(String::as_str),
+            Some("fts.upsert")
+        );
+        assert_eq!(
+            event.get("db_phase").map(String::as_str),
+            Some("locator_delete")
+        );
+        assert_eq!(event.get("db_attempt").map(String::as_str), Some("1"));
+        assert_eq!(event.get("db_retry_count").map(String::as_str), Some("0"));
+        assert_eq!(
+            event.get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
+        );
+        assert_eq!(
+            event.get("db_sqlite_extended_code").map(String::as_str),
+            Some(codes.extended.to_string()).as_deref()
+        );
+        let rendered = format!("{event:?}");
+        assert!(!rendered.contains("sensitive-message-id"));
+        assert!(!rendered.contains("sensitive payload sentinel"));
+    }
+}

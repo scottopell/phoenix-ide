@@ -423,6 +423,7 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "direct_turn.settle"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
+    ("phoenix_db::otel", "db.failure"),
 ];
 
 pub(crate) fn conversation_cancel_span(conversation_id: &str) -> tracing::Span {
@@ -849,6 +850,21 @@ mod tests {
             continuation_settlement.record("outcome", "reconciled_duplicate");
             continuation_settlement.record("commit_probe", "retry");
             drop(continuation_settlement);
+            let db_failure = tracing::error_span!(
+                target: "phoenix_db::otel",
+                parent: &turn,
+                "db.failure",
+                db.system = "sqlite",
+                db.operation = "direct_turn.terminal_settlement",
+                db.phase = "commit",
+                db.attempt = 1_u64,
+                db.retry_count = 0_u64,
+                db.elapsed_ms = 12_u64,
+                db.phase_elapsed_ms = 3_u64,
+                db.sqlite.primary_code = 5_i64,
+                db.sqlite.extended_code = 517_i64,
+            );
+            drop(db_failure);
             drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
@@ -898,7 +914,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 10);
+        assert_eq!(spans.len(), 11);
         assert_eq!(
             spans
                 .iter()
@@ -913,6 +929,7 @@ mod tests {
                 "browser.conversation_open",
                 "direct_turn.settle",
                 "direct_turn.settle",
+                "db.failure",
                 "conversation.turn",
                 "llm.request"
             ]
@@ -933,6 +950,25 @@ mod tests {
             "TTFT must remain numeric for TraceQL comparisons: {:?}",
             ttft.value
         );
+        let db_failure = spans
+            .iter()
+            .find(|span| span.name == "db.failure")
+            .expect("database failure span exported");
+        let primary_code = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.sqlite.primary_code")
+            .expect("primary SQLite code exported");
+        let extended_code = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.sqlite.extended_code")
+            .expect("extended SQLite code exported");
+        assert!(matches!(primary_code.value, opentelemetry::Value::I64(5)));
+        assert!(matches!(
+            extended_code.value,
+            opentelemetry::Value::I64(517)
+        ));
         for required in [
             "gpt-test",
             "openai",

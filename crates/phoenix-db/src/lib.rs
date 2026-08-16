@@ -8,6 +8,7 @@ mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
+mod sqlite_telemetry;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine

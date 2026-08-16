@@ -1,4 +1,5 @@
 use super::WorkflowRepository;
+use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -1147,11 +1148,26 @@ impl WorkflowRepository {
         input: &TerminalizeAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let mut tx = self.begin_tx().await?;
-        let step = self
-            .terminalize_authoritative_turn_in_tx(&mut tx, input)
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
             .await?;
-        finish_workflow_transaction_at_cut(tx, cut).await?;
+        let step = telemetry
+            .observe_db(
+                SqlitePhase::Statement,
+                self.terminalize_authoritative_turn_in_tx(&mut tx, input),
+            )
+            .await?;
+        if cut == TransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(injected_cut(cut));
+        }
+        telemetry
+            .observe_db(SqlitePhase::Commit, tx.commit())
+            .await?;
+        if cut == TransactionCut::AfterCommit {
+            return Err(injected_cut(cut));
+        }
         Ok(step)
     }
 
