@@ -2,6 +2,9 @@ use crate::{DbError, DbResult};
 use std::time::{Duration, Instant};
 use tracing::field;
 
+const SLOW_POOL_ACQUISITION: Duration = Duration::from_millis(100);
+const SLOW_TRANSACTION: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqliteOperation {
     ConversationDelete,
@@ -39,6 +42,7 @@ pub(crate) enum SqlitePhase {
     FtsInsert,
     LocatorInsert,
     Commit,
+    Rollback,
 }
 
 impl SqlitePhase {
@@ -52,6 +56,98 @@ impl SqlitePhase {
             Self::FtsInsert => "fts_insert",
             Self::LocatorInsert => "locator_insert",
             Self::Commit => "commit",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteTransactionOutcome {
+    Committed,
+    RolledBack,
+}
+
+impl SqliteTransactionOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::RolledBack => "rolled_back",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowSqlitePhase {
+    PoolAcquisition,
+    Transaction,
+    PoolAcquisitionAndTransaction,
+}
+
+impl SlowSqlitePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PoolAcquisition => "pool_acquisition",
+            Self::Transaction => "transaction",
+            Self::PoolAcquisitionAndTransaction => "pool_acquisition_and_transaction",
+        }
+    }
+}
+
+#[must_use = "transaction timing must be completed with the transaction"]
+pub(crate) struct SuccessfulTransactionTiming {
+    acquisition_elapsed: Duration,
+    transaction_started_at: Instant,
+}
+
+#[must_use = "pool acquisition timing must be attached to its transaction"]
+pub(crate) struct SuccessfulPoolAcquisitionTiming {
+    acquisition_elapsed: Duration,
+}
+
+impl SuccessfulPoolAcquisitionTiming {
+    pub(crate) fn transaction_started(self) -> SuccessfulTransactionTiming {
+        SuccessfulTransactionTiming {
+            acquisition_elapsed: self.acquisition_elapsed,
+            transaction_started_at: Instant::now(),
+        }
+    }
+}
+
+impl SuccessfulTransactionTiming {
+    #[cfg(test)]
+    fn from_boundaries(acquisition_started_at: Instant, transaction_started_at: Instant) -> Self {
+        Self {
+            acquisition_elapsed: transaction_started_at
+                .saturating_duration_since(acquisition_started_at),
+            transaction_started_at,
+        }
+    }
+
+    fn complete_at(self, transaction_ended_at: Instant) -> CompletedTransactionTiming {
+        CompletedTransactionTiming {
+            acquisition_elapsed: self.acquisition_elapsed,
+            transaction_elapsed: transaction_ended_at
+                .saturating_duration_since(self.transaction_started_at),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedTransactionTiming {
+    acquisition_elapsed: Duration,
+    transaction_elapsed: Duration,
+}
+
+impl CompletedTransactionTiming {
+    const fn slow_phase(self) -> Option<SlowSqlitePhase> {
+        match (
+            self.acquisition_elapsed.as_millis() >= SLOW_POOL_ACQUISITION.as_millis(),
+            self.transaction_elapsed.as_millis() >= SLOW_TRANSACTION.as_millis(),
+        ) {
+            (true, true) => Some(SlowSqlitePhase::PoolAcquisitionAndTransaction),
+            (true, false) => Some(SlowSqlitePhase::PoolAcquisition),
+            (false, true) => Some(SlowSqlitePhase::Transaction),
+            (false, false) => None,
         }
     }
 }
@@ -137,6 +233,97 @@ impl SqliteTelemetry {
         })
     }
 
+    pub(crate) async fn observe_pool_acquisition_sqlx<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<(T, SuccessfulPoolAcquisitionTiming), sqlx::Error> {
+        let acquisition_started_at = Instant::now();
+        let value = self
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, operation)
+            .await?;
+        Ok((
+            value,
+            SuccessfulPoolAcquisitionTiming {
+                acquisition_elapsed: acquisition_started_at.elapsed(),
+            },
+        ))
+    }
+
+    pub(crate) async fn observe_commit_db<T>(
+        &self,
+        timing: SuccessfulTransactionTiming,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        self.observe_transaction_completion_db(
+            timing,
+            SqlitePhase::Commit,
+            SqliteTransactionOutcome::Committed,
+            operation,
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_rollback_db<T>(
+        &self,
+        timing: SuccessfulTransactionTiming,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        self.observe_transaction_completion_db(
+            timing,
+            SqlitePhase::Rollback,
+            SqliteTransactionOutcome::RolledBack,
+            operation,
+        )
+        .await
+    }
+
+    async fn observe_transaction_completion_db<T>(
+        &self,
+        timing: SuccessfulTransactionTiming,
+        phase: SqlitePhase,
+        outcome: SqliteTransactionOutcome,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        let value = self.observe_db(phase, operation).await?;
+        self.record_slow_success(timing.complete_at(Instant::now()), outcome);
+        Ok(value)
+    }
+
+    fn record_slow_success(
+        &self,
+        timing: CompletedTransactionTiming,
+        outcome: SqliteTransactionOutcome,
+    ) {
+        let Some(slow_phase) = timing.slow_phase() else {
+            return;
+        };
+        let pool_acquisition_ms = elapsed_millis(timing.acquisition_elapsed);
+        let transaction_ms = elapsed_millis(timing.transaction_elapsed);
+        let parent = tracing::Span::current();
+        let span = tracing::warn_span!(
+            target: "phoenix_db::otel",
+            parent: &parent,
+            "db.slow_operation",
+            db.system = "sqlite",
+            db.operation = self.operation.as_str(),
+            db.outcome = outcome.as_str(),
+            db.slow_phase = slow_phase.as_str(),
+            db.pool_acquisition_ms = trace_millis(pool_acquisition_ms),
+            db.transaction_ms = trace_millis(transaction_ms),
+        );
+        let _entered = span.enter();
+        tracing::warn!(
+            target: "phoenix_db::observability",
+            db_system = "sqlite",
+            db_operation = self.operation.as_str(),
+            db_outcome = outcome.as_str(),
+            db_slow_phase = slow_phase.as_str(),
+            db_pool_acquisition_ms = pool_acquisition_ms,
+            db_transaction_ms = transaction_ms,
+            "slow successful SQLite operation"
+        );
+    }
+
     fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
@@ -151,8 +338,8 @@ impl SqliteTelemetry {
             db.operation = self.operation.as_str(),
             db.phase = phase.as_str(),
             db.error.kind = error_kind,
-            db.elapsed_ms = elapsed_ms,
-            db.phase_elapsed_ms = phase_elapsed_ms,
+            db.elapsed_ms = trace_millis(elapsed_ms),
+            db.phase_elapsed_ms = trace_millis(phase_elapsed_ms),
             db.sqlite.primary_code = field::Empty,
             db.sqlite.extended_code = field::Empty,
             otel.status_code = "ERROR",
@@ -195,11 +382,16 @@ fn elapsed_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn trace_millis(elapsed_ms: u64) -> i64 {
+    i64::try_from(elapsed_ms).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id};
     use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
 
     #[derive(Clone, Default)]
@@ -227,6 +419,34 @@ pub(crate) mod test_support {
         }
     }
 
+    #[derive(Clone, Default)]
+    pub(crate) struct SpanCapture {
+        spans: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl SpanCapture {
+        pub(crate) fn spans(&self) -> Vec<BTreeMap<String, String>> {
+            self.spans.lock().expect("span capture lock").clone()
+        }
+    }
+
+    impl<S> Layer<S> for SpanCapture
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
+            if attributes.metadata().target() != "phoenix_db::otel" {
+                return;
+            }
+            let mut fields = BTreeMap::from([(
+                "span.name".to_owned(),
+                attributes.metadata().name().to_owned(),
+            )]);
+            attributes.record(&mut FieldCapture(&mut fields));
+            self.spans.lock().expect("span capture lock").push(fields);
+        }
+    }
+
     struct FieldCapture<'a>(&'a mut BTreeMap<String, String>);
 
     impl Visit for FieldCapture<'_> {
@@ -250,7 +470,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::EventCapture;
+    use super::test_support::{EventCapture, SpanCapture};
     use super::*;
     use crate::retrieval::fts_upsert;
     use crate::{Database, Message, MessageContent, MessageType};
@@ -287,6 +507,215 @@ mod tests {
         );
         assert_eq!(SqlitePhase::LocatorLookup.as_str(), "locator_lookup");
         assert_eq!(SqlitePhase::Commit.as_str(), "commit");
+        assert_eq!(SqlitePhase::Rollback.as_str(), "rollback");
+        assert_eq!(SqliteTransactionOutcome::Committed.as_str(), "committed");
+        assert_eq!(SqliteTransactionOutcome::RolledBack.as_str(), "rolled_back");
+        assert_eq!(
+            SlowSqlitePhase::PoolAcquisition.as_str(),
+            "pool_acquisition"
+        );
+        assert_eq!(SlowSqlitePhase::Transaction.as_str(), "transaction");
+        assert_eq!(
+            SlowSqlitePhase::PoolAcquisitionAndTransaction.as_str(),
+            "pool_acquisition_and_transaction"
+        );
+    }
+
+    #[test]
+    fn transaction_timing_separates_pool_wait_and_excludes_retry_backoff() {
+        let origin = Instant::now();
+        let retry_backoff = Duration::from_secs(5);
+        let acquisition_started_at = origin + retry_backoff;
+        let transaction_started_at = acquisition_started_at + Duration::from_millis(120);
+        let timing = SuccessfulTransactionTiming::from_boundaries(
+            acquisition_started_at,
+            transaction_started_at,
+        )
+        .complete_at(transaction_started_at + Duration::from_millis(40));
+
+        assert_eq!(timing.acquisition_elapsed, Duration::from_millis(120));
+        assert_eq!(timing.transaction_elapsed, Duration::from_millis(40));
+        assert_ne!(
+            timing.transaction_elapsed,
+            retry_backoff + Duration::from_millis(160)
+        );
+    }
+
+    #[test]
+    fn slow_thresholds_are_inclusive_and_fast_success_emits_nothing() {
+        let fast_acquisition = Duration::from_millis(99);
+        let fast_transaction = Duration::from_millis(249);
+        assert_eq!(
+            CompletedTransactionTiming {
+                acquisition_elapsed: fast_acquisition,
+                transaction_elapsed: fast_transaction,
+            }
+            .slow_phase(),
+            None
+        );
+        assert_eq!(
+            CompletedTransactionTiming {
+                acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                transaction_elapsed: fast_transaction,
+            }
+            .slow_phase(),
+            Some(SlowSqlitePhase::PoolAcquisition)
+        );
+        assert_eq!(
+            CompletedTransactionTiming {
+                acquisition_elapsed: fast_acquisition,
+                transaction_elapsed: SLOW_TRANSACTION,
+            }
+            .slow_phase(),
+            Some(SlowSqlitePhase::Transaction)
+        );
+        assert_eq!(
+            CompletedTransactionTiming {
+                acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                transaction_elapsed: SLOW_TRANSACTION,
+            }
+            .slow_phase(),
+            Some(SlowSqlitePhase::PoolAcquisitionAndTransaction)
+        );
+
+        let events = EventCapture::default();
+        let spans = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(events.clone())
+            .with(spans.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement)
+                .record_slow_success(
+                    CompletedTransactionTiming {
+                        acquisition_elapsed: fast_acquisition,
+                        transaction_elapsed: fast_transaction,
+                    },
+                    SqliteTransactionOutcome::Committed,
+                );
+        });
+        assert!(events.events().is_empty());
+        assert!(spans.spans().is_empty());
+    }
+
+    #[test]
+    fn slow_success_emits_one_bounded_privacy_safe_signal() {
+        let events = EventCapture::default();
+        let spans = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(events.clone())
+            .with(spans.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement)
+                .record_slow_success(
+                    CompletedTransactionTiming {
+                        acquisition_elapsed: Duration::from_millis(150),
+                        transaction_elapsed: Duration::from_millis(300),
+                    },
+                    SqliteTransactionOutcome::RolledBack,
+                );
+        });
+
+        let captured_events = events.events();
+        assert_eq!(captured_events.len(), 1);
+        let event = &captured_events[0];
+        assert_eq!(
+            event.get("db_operation").map(String::as_str),
+            Some("direct_turn.terminal_settlement")
+        );
+        assert_eq!(
+            event.get("db_slow_phase").map(String::as_str),
+            Some("pool_acquisition_and_transaction")
+        );
+        assert_eq!(
+            event.get("db_pool_acquisition_ms").map(String::as_str),
+            Some("150")
+        );
+        assert_eq!(
+            event.get("db_transaction_ms").map(String::as_str),
+            Some("300")
+        );
+
+        let captured_spans = spans.spans();
+        assert_eq!(captured_spans.len(), 1);
+        let span = &captured_spans[0];
+        assert_eq!(
+            span.get("span.name").map(String::as_str),
+            Some("db.slow_operation")
+        );
+        assert_eq!(span.get("db.system").map(String::as_str), Some("sqlite"));
+        assert_eq!(
+            span.get("db.outcome").map(String::as_str),
+            Some("rolled_back")
+        );
+        assert_eq!(
+            span.get("db.pool_acquisition_ms").map(String::as_str),
+            Some("150")
+        );
+        assert_eq!(
+            span.get("db.transaction_ms").map(String::as_str),
+            Some("300")
+        );
+        let rendered = format!("{captured_events:?}{captured_spans:?}");
+        for forbidden in ["conversation_id", "message_id", "SELECT", "/Users/"] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_transaction_boundaries_emit_only_failure_telemetry() {
+        let events = EventCapture::default();
+        let spans = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(events.clone())
+            .with(spans.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement)
+            .observe_pool_acquisition_sqlx(async { Err::<(), _>(sqlx::Error::PoolClosed) })
+            .await;
+
+        assert!(matches!(result, Err(sqlx::Error::PoolClosed)));
+        let origin = Instant::now();
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let commit = telemetry
+            .observe_commit_db(
+                SuccessfulTransactionTiming::from_boundaries(origin, origin),
+                async { Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed)) },
+            )
+            .await;
+        let rollback = telemetry
+            .observe_rollback_db(
+                SuccessfulTransactionTiming::from_boundaries(origin, origin),
+                async { Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed)) },
+            )
+            .await;
+        assert!(matches!(
+            commit,
+            Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+        assert!(matches!(
+            rollback,
+            Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+
+        let captured_events = events.events();
+        assert_eq!(captured_events.len(), 3);
+        assert_eq!(
+            captured_events
+                .iter()
+                .map(|event| event.get("db_phase").map(String::as_str))
+                .collect::<Vec<_>>(),
+            [
+                Some("transaction_acquisition"),
+                Some("commit"),
+                Some("rollback")
+            ]
+        );
+        let captured_spans = spans.spans();
+        assert_eq!(captured_spans.len(), 3);
+        assert!(captured_spans.iter().all(|span| span
+            .get("span.name")
+            .is_some_and(|name| name == "db.failure")));
     }
 
     #[tokio::test(flavor = "current_thread")]

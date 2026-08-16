@@ -31,3 +31,11 @@ Measure successful-but-slow SQLite pool acquisition and transaction duration wit
 ## Complexity gate
 
 This batch adds no generic SQL instrumentation, per-statement timing, retry accounting, database framework, or durable telemetry policy. The fast path pays for clock reads and small stack state only; it creates no tracing span or event. Expand the operation set only when production traces identify another semantic owner.
+
+## Overhead evidence
+
+A release-mode five-million-iteration measurement of the complete fast telemetry path (timer construction, five monotonic clock reads, threshold classification, and no emitted signal) measured 124 ns per operation on the development host. The benchmark-only test was removed after measurement.
+
+## Local trace evidence
+
+A transport smoke test exported `db.slow_operation` under `conversation.turn` with service `phoenix-ide` to local VictoriaTraces. A 10-minute query limited to 10 results returned trace `ce8baaaceb8e65db97cfa8e853a2d30a`; a numeric `span.db.pool_acquisition_ms = 9876` query matched it, and the exact trace contained only the bounded database fields. The collector logged no warning for the accepted insert. The smoke-only test was removed after verification.

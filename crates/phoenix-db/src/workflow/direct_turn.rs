@@ -17,7 +17,7 @@ use phoenix_workflow::{
     TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 
 use super::{
     CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
@@ -1008,9 +1008,15 @@ impl WorkflowRepository {
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
         let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+        let (mut connection, pool_timing) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, async {
+                Ok(super::WorkflowTx::new(connection.begin().await?))
+            })
+            .await?;
+        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::persist_continuation_start_tx(
@@ -1041,11 +1047,15 @@ impl WorkflowRepository {
         match outcome {
             crate::ContinuationCommitOutcome::Applied => {
                 telemetry
-                    .observe_db(SqlitePhase::Commit, tx.commit())
+                    .observe_commit_db(transaction_timing, tx.commit())
                     .await?;
             }
             crate::ContinuationCommitOutcome::Duplicate
-            | crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
+            | crate::ContinuationCommitOutcome::Stale => {
+                telemetry
+                    .observe_rollback_db(transaction_timing, tx.rollback())
+                    .await?;
+            }
         }
         Ok(outcome)
     }
@@ -1056,9 +1066,15 @@ impl WorkflowRepository {
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<Option<String>> {
         let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+        let (mut connection, pool_timing) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, async {
+                Ok(super::WorkflowTx::new(connection.begin().await?))
+            })
+            .await?;
+        let transaction_timing = pool_timing.transaction_started();
         let summary = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let summary = crate::reconcile_legacy_half_committed_continuation_tx(
@@ -1093,11 +1109,13 @@ impl WorkflowRepository {
             })
             .await?;
         let Some(summary) = summary else {
-            tx.rollback().await?;
+            telemetry
+                .observe_rollback_db(transaction_timing, tx.rollback())
+                .await?;
             return Ok(None);
         };
         telemetry
-            .observe_db(SqlitePhase::Commit, tx.commit())
+            .observe_commit_db(transaction_timing, tx.commit())
             .await?;
         Ok(Some(summary))
     }
@@ -1107,9 +1125,15 @@ impl WorkflowRepository {
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
         let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+        let (mut connection, pool_timing) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, async {
+                Ok(super::WorkflowTx::new(connection.begin().await?))
+            })
+            .await?;
+        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::commit_continuation_tx(
@@ -1143,10 +1167,12 @@ impl WorkflowRepository {
             })
             .await?;
         if outcome == crate::ContinuationCommitOutcome::Stale {
-            tx.rollback().await?;
+            telemetry
+                .observe_rollback_db(transaction_timing, tx.rollback())
+                .await?;
         } else {
             telemetry
-                .observe_db(SqlitePhase::Commit, tx.commit())
+                .observe_commit_db(transaction_timing, tx.commit())
                 .await?;
         }
         Ok(outcome)
@@ -1174,9 +1200,15 @@ impl WorkflowRepository {
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
         let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+        let (mut connection, pool_timing) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, async {
+                Ok(super::WorkflowTx::new(connection.begin().await?))
+            })
+            .await?;
+        let transaction_timing = pool_timing.transaction_started();
         let step = telemetry
             .observe_db(
                 SqlitePhase::Statement,
@@ -1184,11 +1216,13 @@ impl WorkflowRepository {
             )
             .await?;
         if cut == TransactionCut::BeforeCommit {
-            tx.rollback().await?;
+            telemetry
+                .observe_rollback_db(transaction_timing, tx.rollback())
+                .await?;
             return Err(injected_cut(cut));
         }
         telemetry
-            .observe_db(SqlitePhase::Commit, tx.commit())
+            .observe_commit_db(transaction_timing, tx.commit())
             .await?;
         if cut == TransactionCut::AfterCommit {
             return Err(injected_cut(cut));
