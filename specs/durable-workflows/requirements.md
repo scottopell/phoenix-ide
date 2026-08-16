@@ -491,10 +491,15 @@ SHALL prove that error-boundary incarnation abandonment closes the old stream wi
 fabricated events, that a replacement `Init` reflects authoritative durable state,
 that provider dispatch remains at most once, and that one conversation's recovery
 failure does not block independent conversations or worker readiness.
-A primary materialization error SHALL abandon the current stream incarnation even
-when exact repository reconciliation proves that the durable commit occurred.
-Durable truth governs claim and message authority; crossing the ambiguous error
-boundary governs the stream-incarnation outcome.
+Once a fresh-materialization preflight reserves an SSE sequence, only a fresh
+committed materialization MAY continue that stream incarnation. Exact replay,
+confirmed non-commit, stale authority, commit proved after a primary error,
+unresolved ambiguity, or adapter failure after that reservation SHALL abandon the
+incarnation without fabricating or repairing the reserved sequence. Durable truth
+governs claim and message authority: confirmed non-commit releases only the exact
+claim, while replay, stale, committed, and ambiguous outcomes preserve their
+repository-defined authority. A replay or stale result returned by preflight before
+any sequence reservation MAY remain non-abandoning.
 
 ### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
 

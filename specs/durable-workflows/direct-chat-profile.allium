@@ -207,6 +207,7 @@ entity DirectChatConsumerCursor {
 -- target_bound_key_for(accepted_turn)
 -- ambiguous_incarnation_closes_without_fabricated_event(turn_key), replacement_init_matches_durable_materialization(turn_key)
 -- provider_dispatch_is_at_most_once(turn_key), confirmed_non_commit_is_retryable(turn_key), recovery_failure_is_target_local(resolved_target)
+-- materialization_preflight_is_conclusive(result), sse_sequence_reserved_for(result)
 
 ------------------------------------------------------------
 -- Invariants
@@ -440,6 +441,14 @@ rule StaleGenerationSettlementCannotMutateCurrentAcceptedTurn {
     ensures: bedrock/CloseSettlementProgressed(acceptance.resolved_target.product_conversation, attempt_id)
 }
 
+rule ConclusivePreflightReplayOrStaleDoesNotReserveSequence {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: materialization_preflight_is_conclusive(result)
+    requires: result.kind = ExactReplay or result.kind = StaleAuthority
+
+    ensures: not sse_sequence_reserved_for(result)
+}
+
 rule FreshCommitPreservesCanonicalAuthority {
     when: ExactDirectTurnReconciliationReturned(result)
     requires: result.kind = FreshCommit
@@ -450,14 +459,16 @@ rule FreshCommitPreservesCanonicalAuthority {
     ensures: provider_dispatch_at_most_once(result)
 }
 
-rule ExactReplayPreservesCoherentIncarnation {
+rule PostReservationExactReplayAbandonsRuntimeIncarnation {
     when: ExactDirectTurnReconciliationReturned(result)
     requires: result.kind = ExactReplay
-    requires: result.generation = current_generation_for(result.accepted_turn)
+    requires: sse_sequence_reserved_for(result)
 
     ensures: canonical_materialization_preserved(result)
     ensures: claim_retained_or_owed(result)
     ensures: provider_dispatch_at_most_once(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
 }
 
 rule ConfirmedNonCommitReleasesExactClaimForRetry {
@@ -467,6 +478,16 @@ rule ConfirmedNonCommitReleasesExactClaimForRetry {
 
     ensures: exact_claim_released(result)
     ensures: retryable_unaccepted_outcome(target_bound_key_for(result.accepted_turn))
+}
+
+rule PostReservationConfirmedNonCommitAbandonsRuntimeIncarnation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = ConfirmedNonCommit
+    requires: sse_sequence_reserved_for(result)
+
+    ensures: exact_claim_released(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
 }
 
 rule CommittedAfterAmbiguousErrorAbandonsRuntimeIncarnation {
@@ -499,6 +520,16 @@ rule AmbiguousPostMaterializationRecoveryAbandonsRuntimeIncarnation {
     ensures: canonical_materialization_preserved(result)
     ensures: claim_retained_or_owed(result)
     ensures: provider_dispatch_at_most_once(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
+}
+
+rule PostReservationStaleAuthorityAbandonsWithoutMutation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = StaleAuthority
+    requires: sse_sequence_reserved_for(result)
+
+    ensures: accepted_turn_authority_unchanged(result)
     ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
     ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
 }

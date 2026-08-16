@@ -52,10 +52,13 @@ claim, generation fence, and at-most-once provider-dispatch authority. Ambiguous
 results retain the claim or owed work; stale results do not mutate current
 authority.
 
-When the primary materialization call crosses an ambiguous error boundary, Phoenix
-abandons the stream incarnation whether reconciliation proves durable commit or
-remains inconclusive. Durable truth governs claim and canonical-message authority;
-error-boundary provenance governs the stream action. Phoenix exits the affected
+After fresh-materialization preflight reserves an SSE sequence, Phoenix abandons
+the stream incarnation for every result except fresh commit: exact replay,
+confirmed non-commit, stale authority, commit proved after an ambiguous error,
+unresolved ambiguity, or adapter failure. A conclusive replay or stale result from
+preflight occurs before reservation and does not require abandonment. Durable truth
+governs claim and canonical-message authority; crossing the post-reservation
+boundary governs the stream action. Phoenix exits the affected
 runtime, identity-removes its exact handle, and drops all manager/runtime sender
 ownership for the old
 broadcaster. It does not deposit that broadcaster into replacement retention,
@@ -83,9 +86,9 @@ completing.
 - **Negative:** Work whose exact repository outcome remains ambiguous stays owed
   until a later reconciliation can classify it; it is not made retryable by
   inference.
-- **Negative:** Even a durable commit proved after a primary ambiguous error
-  causes a reconnect, because the abandoned stream may contain an unresolved
-  reservation or have missed the canonical broadcast.
+- **Negative:** Every non-fresh result after sequence reservation causes a
+  reconnect, including exact replay, confirmed non-commit, and stale authority,
+  because that live stream otherwise contains an unfillable cursor reservation.
 - **Neutral:** Ordinary replay-ring reconnect behavior remains unchanged while an
   incarnation is coherent.
 

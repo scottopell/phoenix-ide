@@ -4702,7 +4702,9 @@ where
                     Ok(materialization) => materialization,
                     Err(error) => {
                         self.direct_turn_materialization_aborted = true;
-                        tracing::warn!(conversation_id = %self.context.conversation_id, %error, "direct-turn materialization failed; restoring reducer state for retry");
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                        tracing::warn!(conversation_id = %self.context.conversation_id, %error, "direct-turn materialization adapter failed after sequence reservation; abandoning stream incarnation");
                         return Ok(None);
                     }
                 };
@@ -4717,11 +4719,8 @@ where
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::ConfirmedNonCommitReleased
-                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
-                        self.direct_turn_materialization_aborted = true;
-                        Ok(None)
-                    }
-                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError => {
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError => {
                         self.direct_turn_materialization_aborted = true;
                         self.recovery_disposition =
                             RuntimeRecoveryDisposition::AbandonStreamIncarnation;
@@ -10545,39 +10544,47 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn committed_after_ambiguous_error_abandons_without_old_stream_event() {
+    async fn every_non_fresh_post_reservation_outcome_abandons_without_old_stream_event() {
         use tokio::sync::broadcast::error::TryRecvError;
 
-        let (mut rt, _storage, mut rx) = runtime(
-            DirectTurnMaterializationEligibility::Fresh,
+        let outcomes = [
+            AuthoritativeUserMessageMaterialization::ExactReplay,
             AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError,
-        );
-        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
-            payload: payload("msg-direct"),
-            authority: authority(),
-            idempotent: true,
-        })
-        .await
-        .unwrap();
-
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-        assert!(rt.broadcast_tx.snapshot_pending().3.is_empty());
-        assert_eq!(
-            rt.run().await,
-            RuntimeExitDisposition::AbandonStreamIncarnation
-        );
-    }
-
-    #[tokio::test]
-    async fn unresolved_materialization_ambiguity_abandons_without_old_stream_event() {
-        use tokio::sync::broadcast::error::TryRecvError;
-
-        let (mut rt, _storage, mut rx) = runtime(
-            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::ConfirmedNonCommitReleased,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
             AuthoritativeUserMessageMaterialization::Ambiguous {
                 error: "reconciliation unavailable".to_string(),
             },
+        ];
+        for outcome in outcomes {
+            let (mut rt, _storage, mut rx) =
+                runtime(DirectTurnMaterializationEligibility::Fresh, outcome);
+            let broadcaster = rt.broadcast_tx.clone();
+            rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: true,
+            })
+            .await
+            .unwrap();
+
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            assert_eq!(broadcaster.current_seq(), 1);
+            assert!(broadcaster.snapshot_pending().3.is_empty());
+            assert_eq!(
+                rt.run().await,
+                RuntimeExitDisposition::AbandonStreamIncarnation
+            );
+            broadcaster.abandon();
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
+        }
+
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
+        storage.queue_materialize_authoritative_user_message_error("adapter failure");
+        let broadcaster = rt.broadcast_tx.clone();
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
             payload: payload("msg-direct"),
             authority: authority(),
@@ -10585,13 +10592,15 @@ mod authoritative_user_message_effect_tests {
         })
         .await
         .unwrap();
-
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
-        assert!(rt.broadcast_tx.snapshot_pending().3.is_empty());
+        assert_eq!(broadcaster.current_seq(), 1);
+        assert!(broadcaster.snapshot_pending().3.is_empty());
         assert_eq!(
             rt.run().await,
             RuntimeExitDisposition::AbandonStreamIncarnation
         );
+        broadcaster.abandon();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
     }
 
     #[tokio::test]
