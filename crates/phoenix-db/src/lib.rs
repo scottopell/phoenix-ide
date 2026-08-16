@@ -6644,7 +6644,7 @@ impl Database {
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::CreateTaskApprovalHandoff);
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;
@@ -8233,7 +8233,7 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::ConversationDelete);
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;
@@ -9350,11 +9350,7 @@ impl Database {
             .get("hidden")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let fts_telemetry = SqliteTelemetry::new(if hidden {
-            SqliteOperation::FtsHideMessage
-        } else {
-            SqliteOperation::FtsIndexMessage
-        });
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::UpdateMessageDisplayData);
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;

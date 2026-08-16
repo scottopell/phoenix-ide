@@ -4,25 +4,27 @@ use tracing::field;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqliteOperation {
+    ConversationDelete,
+    CreateTaskApprovalHandoff,
     DirectTurnTerminalSettlement,
     FtsDeleteConversation,
     FtsDeleteMessage,
-    FtsHideMessage,
-    FtsIndexMessage,
     FtsReconcileUpsert,
     FtsUpsert,
+    UpdateMessageDisplayData,
 }
 
 impl SqliteOperation {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::ConversationDelete => "conversation.delete",
+            Self::CreateTaskApprovalHandoff => "conversation.task_approval_handoff",
             Self::DirectTurnTerminalSettlement => "direct_turn.terminal_settlement",
             Self::FtsDeleteConversation => "fts.delete_conversation",
             Self::FtsDeleteMessage => "fts.delete_message",
-            Self::FtsHideMessage => "fts.hide_message",
-            Self::FtsIndexMessage => "fts.index_message",
             Self::FtsReconcileUpsert => "fts.reconcile_upsert",
             Self::FtsUpsert => "fts.upsert",
+            Self::UpdateMessageDisplayData => "message.update_display_data",
         }
     }
 }
@@ -275,6 +277,14 @@ mod tests {
             "direct_turn.terminal_settlement"
         );
         assert_eq!(SqliteOperation::FtsUpsert.as_str(), "fts.upsert");
+        assert_eq!(
+            SqliteOperation::CreateTaskApprovalHandoff.as_str(),
+            "conversation.task_approval_handoff"
+        );
+        assert_eq!(
+            SqliteOperation::UpdateMessageDisplayData.as_str(),
+            "message.update_display_data"
+        );
         assert_eq!(SqlitePhase::LocatorLookup.as_str(), "locator_lookup");
         assert_eq!(SqlitePhase::Commit.as_str(), "commit");
     }
@@ -395,7 +405,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].get("db_operation").map(String::as_str),
-            Some("fts.delete_conversation")
+            Some("conversation.delete")
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
@@ -461,7 +471,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].get("db_operation").map(String::as_str),
-            Some("fts.index_message")
+            Some("message.update_display_data")
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
