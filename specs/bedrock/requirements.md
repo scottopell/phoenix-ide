@@ -356,6 +356,41 @@ AND materialize the pending continuation operation at startup
 
 ---
 
+### REQ-BED-033: Unclassified Local Persistence Authority Fails Stop
+
+WHEN the owning execution boundary determines under REQ-DWF-043 that the durable
+fact needed to continue cannot be established
+THE SYSTEM SHALL stop admission and semantic publication
+AND SHALL NOT perform database-backed cleanup that depends on the suspect
+persistence path
+AND SHALL terminate the process nonzero.
+
+WHEN a task that owns this local SQLite authority boundary panics, exits
+unexpectedly, or is cancelled before delivering a typed result
+THE SYSTEM SHALL apply the same fail-stop behavior unless the one exact authority
+query against the owning authoritative rows establishes the durable fact needed
+to continue.
+
+Failure of a task that does not own this local SQLite authority boundary SHALL
+remain governed by its feature's ordinary failure contract.
+
+THE SYSTEM SHALL NOT represent inability to establish local persistence authority
+as conversation or workflow semantic state.
+
+WHEN the failed process has stopped and another Phoenix process opens the same
+authoritative SQLite database
+THE SYSTEM SHALL reconstruct conversation and workflow authority from SQLite
+AND SHALL NOT require continuity of process-local runtime, SSE, replay-buffer,
+task, timer, or connection identity.
+
+**Rationale:** If Phoenix cannot read SQLite well enough to establish the durable
+facts needed to continue safely, it stops. Another process reconstructs from
+SQLite rather than coordinating repair across independent in-memory owners. This
+local authority rule does not replace feature-owned recovery contracts for genuine
+ambiguous external outcomes.
+
+---
+
 ### REQ-BED-008: Sub-Agent Spawning
 
 WHEN LLM requests sub-agent spawn

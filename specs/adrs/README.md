@@ -47,6 +47,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [033](033_offline-database-rollback-and-foundation-storage.md) | Database rollback is offline and Foundation observations use relational scalar storage | Accepted | REQ-GITREP-001–004; `RepositoryLocatorObservation`, `DefaultBranchObservation` |
 | [034](034_compatibility-guarantees-are-explicit-and-data-aware.md) | Compatibility guarantees are explicit and data-aware | Accepted | REQ-COMP-001–005 |
 | [035](035_repository-authority-activation-is-consumer-triggered-and-offline.md) | Repository authority activation is consumer-triggered and offline | Accepted | REQ-GITREP-004/009; `GitRepository`, `WorkScope.repository`, repository authority generation |
+| [036](036_local-sqlite-authority-loss-fails-stop.md) | Local SQLite authority loss fails stop | Accepted | REQ-DWF-043, REQ-DWF-CHAT-013, REQ-BED-033 |
 
 ## For agents: which decisions bind your task
 
@@ -73,6 +74,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying ProductConversation persistence identity, Close-attempt ownership, or staged lifecycle/attachment authority cutover | 031, then 026 |
 | Specifying hidden GitRepository identity, mutable repository locator/default-branch observations, database replacement/rollback, retained restart-repair evidence, repository authority activation, or repository survival beyond one deleted conversation | 035 for activation, then 033, 032, 031, and 026 |
 | Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 014, 019 |
+| Specifying local SQLite authority classification, persistence-health fail-stop, or restart reconstruction | 036, then 024, 020, 014 |
 | Specifying observations, receipts, reducer delivery, or runtime acceptance | 015, 019 |
 | Specifying cross-platform production deployment, Linux activation, or shared candidate preparation | 017, 010 for launchd refinements |
 | Adding compatibility, downgrade, rollback, database-replacement, or internal SQLite timestamp guarantees | 034, then the owning feature ADRs (033 for GitRepository Foundation) |
@@ -97,6 +99,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-008 (Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting)
       ├── ADR-009 (Native process metrics use shared demand-driven observation generations)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
+      ├── ADR-036 (Local SQLite authority loss fails stop)
+      │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   └── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │       └── ADR-018 (release updates use published release previews and approval-bound installations)
