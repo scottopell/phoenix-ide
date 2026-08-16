@@ -29,8 +29,19 @@ impl ProductConversationId {
     }
 
     #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl Default for ProductConversationId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

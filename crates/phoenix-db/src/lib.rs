@@ -3776,10 +3776,7 @@ impl Database {
                     product_conversation_id
                 } else {
                     let product_conversation_id =
-                        phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                            uuid::Uuid::new_v4().to_string(),
-                        )
-                        .expect("UUID ProductConversation identity is non-empty");
+                        phoenix_core::domain::product_conversation::ProductConversationId::new();
                     sqlx::query(
                         "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
                      VALUES (?1, 'ordinary', 'open')",
@@ -3931,10 +3928,7 @@ impl Database {
             let id = uuid::Uuid::new_v4().to_string();
             let slug = format!("coordinator-{}", id.get(..8).unwrap_or(&id));
             let product_conversation_id =
-                phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                        uuid::Uuid::new_v4().to_string(),
-                    )
-                    .expect("UUID ProductConversation identity is non-empty");
+                phoenix_core::domain::product_conversation::ProductConversationId::new();
             sqlx::query(
                 "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
                  VALUES (?1, 'coordinator', NULL)",
@@ -4533,10 +4527,7 @@ impl Database {
         let (created_work_scope_id, authority_kind, environment) =
             Self::new_scope_for_conversation(cwd, &cm);
         let product_conversation_id =
-            phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                uuid::Uuid::new_v4().to_string(),
-            )
-            .expect("UUID ProductConversation identity is non-empty");
+            phoenix_core::domain::product_conversation::ProductConversationId::new();
         sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
              VALUES (?1, 'ordinary', 'open')",

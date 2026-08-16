@@ -1567,10 +1567,7 @@ fn build_child_conversation(
     Conversation {
         id: conv_id.to_string(),
         product_conversation_id:
-            phoenix_core::domain::product_conversation::ProductConversationId::parse(
-                uuid::Uuid::new_v4().to_string(),
-            )
-            .expect("UUID ProductConversation identity is non-empty"),
+            phoenix_core::domain::product_conversation::ProductConversationId::new(),
         runtime_role: phoenix_core::work_scope::RuntimeRole::User,
         attached_work_scope_id: None,
         slug: Some(slug.clone()),

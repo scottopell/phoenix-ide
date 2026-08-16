@@ -660,8 +660,7 @@ async fn validate_topology_tx(
         .any(|member| member.conversation.product_conversation_id != *product_conversation_id)
     {
         return Err(close_precondition(format!(
-            "topology contains a conversation outside ProductConversation {}",
-            product_conversation_id
+            "topology contains a conversation outside ProductConversation {product_conversation_id}"
         )));
     }
 
