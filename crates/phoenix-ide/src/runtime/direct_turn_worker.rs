@@ -120,7 +120,16 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
             for candidate in page.candidates {
-                self.dispatch_candidate(candidate, self.clock.now()).await?;
+                let conversation_id = candidate.conversation.0.clone();
+                let turn_id = candidate.turn_id.0;
+                if let Err(error) = self.dispatch_candidate(candidate, self.clock.now()).await {
+                    tracing::warn!(
+                        %conversation_id,
+                        turn_id,
+                        %error,
+                        "direct-turn candidate failed; continuing independent candidates"
+                    );
+                }
             }
             if exhausted {
                 break;
@@ -338,6 +347,7 @@ mod tests {
 
     struct RecordingDispatcher {
         result: Mutex<Result<(), String>>,
+        fail_conversation: Mutex<Option<String>>,
         events: Mutex<Vec<(String, Event)>>,
     }
 
@@ -345,6 +355,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 result: Mutex::new(Ok(())),
+                fail_conversation: Mutex::new(None),
                 events: Mutex::new(Vec::new()),
             }
         }
@@ -357,6 +368,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((conversation_id.to_string(), event));
+            if self.fail_conversation.lock().unwrap().as_deref() == Some(conversation_id) {
+                return Err("conversation-local failure".to_string());
+            }
             self.result.lock().unwrap().clone()
         }
     }
@@ -705,6 +719,49 @@ mod tests {
                 .await
                 .unwrap();
         assert!(terminal_kind.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_conversation_failure_does_not_block_later_candidate_or_readiness() {
+        let db = Database::open_in_memory().await.unwrap();
+        for conversation_id in ["conv-a", "conv-b"] {
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+        }
+        let repo = WorkflowRepository::new(db.pool().clone());
+        for (conversation_id, key) in [("conv-a", "bad"), ("conv-b", "healthy")] {
+            let prepared = PreparedTurn::from_exact_payload(
+                &ConversationAuthority(conversation_id.to_string()),
+                prepared_payload(&format!("message-{key}"))
+                    .to_exact_bytes()
+                    .unwrap(),
+            );
+            repo.accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new(key).unwrap(),
+                prepared,
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .unwrap();
+        }
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        *dispatcher.fail_conversation.lock().unwrap() = Some("conv-a".to_string());
+        let (_kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker = worker(repo, dispatcher.clone(), 10, 1);
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        ready_rx
+            .await
+            .expect("startup readiness survives local failure");
+        let events = dispatcher.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "conv-a");
+        assert_eq!(events[1].0, "conv-b");
+        drop(events);
+        handle.abort();
     }
 
     #[tokio::test]

@@ -549,6 +549,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
+    settle_active_direct_turn_stale_once: Mutex<bool>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
@@ -589,6 +590,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
+            settle_active_direct_turn_stale_once: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
@@ -638,6 +640,10 @@ impl InMemoryStorage {
             .settle_active_direct_turn_commit_error_once
             .lock()
             .unwrap() = true;
+    }
+
+    pub fn set_settle_active_direct_turn_stale_once(&self) {
+        *self.settle_active_direct_turn_stale_once.lock().unwrap() = true;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -1140,7 +1146,7 @@ impl MessageStore for InMemoryStorage {
     async fn settle_active_direct_turn(
         &self,
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::traits::ActiveDirectTurnSettlementOutcome {
         self.settle_active_direct_turn_calls
             .lock()
             .unwrap()
@@ -1161,29 +1167,21 @@ impl MessageStore for InMemoryStorage {
         if let Some(release) = release {
             let _ = release.await;
         }
+        if std::mem::take(&mut *self.settle_active_direct_turn_stale_once.lock().unwrap()) {
+            return crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority;
+        }
         if std::mem::take(
             &mut *self
                 .settle_active_direct_turn_commit_error_once
                 .lock()
                 .unwrap(),
         ) {
-            let conversation_id = self
-                .states
-                .lock()
-                .unwrap()
-                .keys()
-                .next()
-                .cloned()
-                .expect("test settlement requires seeded conversation state");
-            self.states
-                .lock()
-                .unwrap()
-                .insert(conversation_id, settlement.state.clone());
-            *self.active_direct_turn.lock().unwrap() = None;
-            return Err("ambiguous active direct turn settlement".to_string());
+            return crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous {
+                error: "ambiguous active direct turn settlement".to_string(),
+            };
         }
         *self.active_direct_turn.lock().unwrap() = None;
-        Ok(())
+        crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled
     }
 
     async fn settle_continuation_direct_turn(

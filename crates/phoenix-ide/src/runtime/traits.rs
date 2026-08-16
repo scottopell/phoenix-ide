@@ -24,12 +24,17 @@ pub struct LoadedActiveDirectTurn {
 
 #[derive(Debug, Clone)]
 pub enum AuthoritativeUserMessageMaterialization {
-    Materialized {
+    FreshCommit {
         message: Box<Message>,
         active: ActiveDirectTurn,
     },
     ExactReplay,
+    CommittedAfterAmbiguousError,
+    ConfirmedNonCommitReleased,
     StaleAuthority,
+    Ambiguous {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +60,13 @@ pub struct ActiveDirectTurnSettlement {
     pub terminal: ActiveDirectTurnTerminal,
     pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveDirectTurnSettlementOutcome {
+    Settled,
+    StaleAuthority,
+    Ambiguous { error: String },
 }
 
 #[derive(Clone, Debug)]
@@ -216,7 +228,7 @@ pub trait MessageStore: Send + Sync {
     async fn settle_active_direct_turn(
         &self,
         settlement: &ActiveDirectTurnSettlement,
-    ) -> Result<(), String>;
+    ) -> ActiveDirectTurnSettlementOutcome;
 
     async fn settle_continuation_direct_turn(
         &self,
@@ -616,7 +628,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     async fn settle_active_direct_turn(
         &self,
         settlement: &ActiveDirectTurnSettlement,
-    ) -> Result<(), String> {
+    ) -> ActiveDirectTurnSettlementOutcome {
         (**self).settle_active_direct_turn(settlement).await
     }
 
@@ -1085,12 +1097,14 @@ impl MessageStore for DatabaseStorage {
         &self,
         input: &AuthoritativeUserMessageAdoptionInput,
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
-        use phoenix_db::workflow::{MaterializeAuthoritativeTurnInput, WorkflowRepository};
-        use phoenix_workflow::{AuthorityOutcome, TurnAuthorityId, TurnOutcome};
+        use phoenix_db::workflow::{
+            MaterializeAuthoritativeTurnInput, MaterializeDirectTurnResult, WorkflowRepository,
+        };
+        use phoenix_workflow::TurnAuthorityId;
         let repo = WorkflowRepository::new(self.db.pool().clone());
         let local_authority = direct_turn_local_authority(&input.authority);
         let materialized = repo
-            .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            .materialize_authoritative_turn_reconciled(&MaterializeAuthoritativeTurnInput {
                 turn_id: TurnAuthorityId(input.authority.turn_id.0),
                 authority: local_authority,
                 prepared: input.payload.clone(),
@@ -1100,29 +1114,32 @@ impl MessageStore for DatabaseStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             })
-            .await
-            .map_err(|error| error.to_string())?;
-        match (
-            materialized.authority_outcome,
-            materialized.outcome,
-            materialized.message,
-        ) {
-            (AuthorityOutcome::Authorized, TurnOutcome::Materialized { .. }, Some(message)) => {
-                Ok(AuthoritativeUserMessageMaterialization::Materialized {
+            .await;
+        match materialized {
+            MaterializeDirectTurnResult::FreshCommit { message } => {
+                Ok(AuthoritativeUserMessageMaterialization::FreshCommit {
                     message: Box::new(message),
                     active: ActiveDirectTurn {
-                        turn_id: materialized.canonical_turn.id,
-                        generation: materialized.canonical_turn.generation,
+                        turn_id: TurnAuthorityId(input.authority.turn_id.0),
+                        generation: input.authority.generation.0,
                     },
                 })
             }
-            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, Some(_)) => {
+            MaterializeDirectTurnResult::ExactReplay { message: _ } => {
                 Ok(AuthoritativeUserMessageMaterialization::ExactReplay)
             }
-            (AuthorityOutcome::Authorized, TurnOutcome::MaterializationReplay { .. }, None) => {
-                Err("direct-turn replay did not return canonical message".to_string())
+            MaterializeDirectTurnResult::CommittedAfterAmbiguousError { message: _ } => {
+                Ok(AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError)
             }
-            _ => Ok(AuthoritativeUserMessageMaterialization::StaleAuthority),
+            MaterializeDirectTurnResult::ConfirmedNonCommitReleased => {
+                Ok(AuthoritativeUserMessageMaterialization::ConfirmedNonCommitReleased)
+            }
+            MaterializeDirectTurnResult::StaleAuthority => {
+                Ok(AuthoritativeUserMessageMaterialization::StaleAuthority)
+            }
+            MaterializeDirectTurnResult::Ambiguous { error } => {
+                Ok(AuthoritativeUserMessageMaterialization::Ambiguous { error })
+            }
         }
     }
 
@@ -1153,23 +1170,37 @@ impl MessageStore for DatabaseStorage {
     async fn settle_active_direct_turn(
         &self,
         settlement: &ActiveDirectTurnSettlement,
-    ) -> Result<(), String> {
+    ) -> ActiveDirectTurnSettlementOutcome {
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        repo.terminalize_authoritative_turn(
-            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
-                command: direct_turn_terminal_command(
-                    &settlement.turn,
-                    settlement.terminal.clone(),
-                ),
-                projection: Some(phoenix_db::workflow::PersistedConversationProjection {
-                    state: settlement.state.clone(),
-                    state_updated_at: settlement.state_updated_at,
-                }),
+        let result = repo
+            .terminalize_authoritative_turn(
+                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                    command: direct_turn_terminal_command(
+                        &settlement.turn,
+                        settlement.terminal.clone(),
+                    ),
+                    projection: Some(phoenix_db::workflow::PersistedConversationProjection {
+                        state: settlement.state.clone(),
+                        state_updated_at: settlement.state_updated_at,
+                    }),
+                },
+            )
+            .await;
+        match result {
+            Ok(step)
+                if matches!(
+                    step.outcome,
+                    phoenix_workflow::TurnOutcome::Terminal { .. }
+                        | phoenix_workflow::TurnOutcome::TerminalReplay { .. }
+                ) =>
+            {
+                ActiveDirectTurnSettlementOutcome::Settled
+            }
+            Ok(_) => ActiveDirectTurnSettlementOutcome::StaleAuthority,
+            Err(error) => ActiveDirectTurnSettlementOutcome::Ambiguous {
+                error: error.to_string(),
             },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        }
     }
 
     async fn settle_continuation_direct_turn(

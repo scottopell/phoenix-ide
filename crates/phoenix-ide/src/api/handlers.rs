@@ -3843,7 +3843,7 @@ async fn stream_conversation(
     // snapshot read or runtime materialization. The eventual runtime inherits
     // this broadcaster, so events cannot fall into a subscribe/start gap.
     let broadcaster_started = std::time::Instant::now();
-    let broadcast_tx = state.runtime.conversation_broadcaster(&id).await;
+    let (broadcast_tx, broadcast_rx) = state.runtime.acquire_sse_broadcaster(&id).await;
     init_trace.record_ms(
         "stream.broadcaster_reservation_ms",
         broadcaster_started.elapsed(),
@@ -3853,7 +3853,6 @@ async fn stream_conversation(
         receivers_before = broadcast_tx.receiver_count(),
         "SSE client subscribing"
     );
-    let broadcast_rx = broadcast_tx.subscribe();
 
     // Runtime materialization is not part of transport readiness. Its
     // single-flight owner publishes any failure once on the reserved channel.
@@ -8600,6 +8599,75 @@ mod conversation_cwd_validation_tests {
         }));
         assert!(!stream_state_starts_runtime(&ConvState::Terminal));
         assert!(stream_state_starts_runtime(&ConvState::Idle));
+    }
+
+    #[tokio::test]
+    async fn reconnect_init_uses_fresh_incarnation_and_sqlite_canonical_message_once() {
+        use futures::StreamExt;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let conversation_id = "authoritative-reconnect-init";
+        let canonical_message_id = "canonical-direct-turn-message";
+        state
+            .db
+            .create_conversation(conversation_id, conversation_id, "/", true, None, None)
+            .await
+            .expect("create conversation");
+        state
+            .db
+            .add_message(
+                canonical_message_id,
+                conversation_id,
+                &crate::db::MessageContent::User(crate::db::UserContent::new("canonical")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist canonical message");
+        state
+            .db
+            .update_conversation_state(conversation_id, &ConvState::Terminal)
+            .await
+            .expect("terminal state prevents runtime startup");
+
+        let old_broadcaster = crate::runtime::SseBroadcaster::new(16, 0);
+        let old_incarnation = old_broadcaster.stream_incarnation().to_string();
+        let mut old_receiver = old_broadcaster.subscribe();
+        drop(old_broadcaster);
+        assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
+
+        let response = stream_conversation(
+            State(state.clone()),
+            Path(conversation_id.to_string()),
+            Query(StreamConversationQuery::default()),
+        )
+        .await
+        .expect("reconnect stream")
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.expect("init frame").expect("init bytes");
+        let frame = std::str::from_utf8(&first).expect("utf8 SSE");
+        let data = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("init data line");
+        let init: serde_json::Value = serde_json::from_str(data).expect("init JSON");
+
+        assert_eq!(init["type"], "init");
+        assert_ne!(init["stream_incarnation"], old_incarnation);
+        let messages = init["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["message_id"] == canonical_message_id)
+                .count(),
+            1
+        );
+        assert!(init["pending_events"]
+            .as_array()
+            .expect("pending events")
+            .is_empty());
     }
 
     #[tokio::test]

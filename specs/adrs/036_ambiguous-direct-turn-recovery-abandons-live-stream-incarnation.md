@@ -39,9 +39,10 @@ accepts a validated `Init` built from durable state.
 Adopt option 3.
 
 One exact repository reconciliation command for an accepted turn and generation
-returns a closed typed result: committed materialization, confirmed non-commit,
-ambiguous materialization, ambiguous post-materialization recovery, or stale
-authority. Runtime errors, missing projected messages, projected conversation
+returns a closed typed result: fresh commit, ordinary exact replay, commit proved
+only after a primary ambiguous error, confirmed non-commit, unresolved ambiguity,
+ambiguous post-materialization recovery, or stale authority. Runtime errors,
+missing projected messages, projected conversation
 state, runtime absence, and cleanup outcomes cannot independently classify that
 result.
 
@@ -51,8 +52,12 @@ claim, generation fence, and at-most-once provider-dispatch authority. Ambiguous
 results retain the claim or owed work; stale results do not mutate current
 authority.
 
-For either ambiguous result, Phoenix exits the affected runtime, identity-removes
-its exact handle, and drops all manager/runtime sender ownership for the old
+When the primary materialization call crosses an ambiguous error boundary, Phoenix
+abandons the stream incarnation whether reconciliation proves durable commit or
+remains inconclusive. Durable truth governs claim and canonical-message authority;
+error-boundary provenance governs the stream action. Phoenix exits the affected
+runtime, identity-removes its exact handle, and drops all manager/runtime sender
+ownership for the old
 broadcaster. It does not deposit that broadcaster into replacement retention,
 transfer its replay ring or reserved cursor, fabricate a repair event, or create a
 replacement from the ambiguity handler. Only a subsequent client reconnect or
@@ -78,6 +83,9 @@ completing.
 - **Negative:** Work whose exact repository outcome remains ambiguous stays owed
   until a later reconciliation can classify it; it is not made retryable by
   inference.
+- **Negative:** Even a durable commit proved after a primary ambiguous error
+  causes a reconnect, because the abandoned stream may contain an unresolved
+  reservation or have missed the canonical broadcast.
 - **Neutral:** Ordinary replay-ring reconnect behavior remains unchanged while an
   incarnation is coherent.
 

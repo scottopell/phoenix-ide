@@ -227,6 +227,26 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 }
 
 /// Manager for all conversation runtimes
+#[derive(Clone, Debug)]
+enum RuntimeMaterializationError {
+    Ordinary(String),
+    AbandonIncarnation(String),
+}
+
+impl std::fmt::Display for RuntimeMaterializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ordinary(error) | Self::AbandonIncarnation(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl From<String> for RuntimeMaterializationError {
+    fn from(error: String) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -257,6 +277,8 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    startup_direct_turn_settlement_ambiguity: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
@@ -687,7 +709,7 @@ impl Drop for ReservedBroadcastRange {
 ///    with the same `message_id` will fire path #2, clearing this entry.
 #[derive(Clone)]
 pub struct SseBroadcaster {
-    tx: broadcast::Sender<SseEvent>,
+    tx: Arc<Mutex<Option<broadcast::Sender<SseEvent>>>>,
     /// Identity of this in-memory cursor/replay incarnation. Changes whenever
     /// a new broadcaster is created after replay state was lost.
     stream_incarnation: Arc<str>,
@@ -720,7 +742,7 @@ impl SseBroadcaster {
         let mut ring = ReplayRing::new();
         ring.anchor_seq = initial_last_seq;
         Self {
-            tx,
+            tx: Arc::new(Mutex::new(Some(tx))),
             stream_incarnation: Arc::from(uuid::Uuid::new_v4().to_string()),
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
@@ -737,7 +759,14 @@ impl SseBroadcaster {
     }
 
     fn same_channel(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+        Arc::ptr_eq(&self.tx, &other.tx)
+    }
+
+    fn abandon(&self) {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        gate.queued.clear();
+        gate.reserved_until = None;
+        self.tx.lock().expect("SSE sender mutex").take();
     }
 
     /// Atomically allocate the next `sequence_id` and return it.
@@ -774,7 +803,12 @@ impl SseBroadcaster {
 
     /// Subscribe to the SSE broadcast stream.
     pub fn subscribe(&self) -> broadcast::Receiver<SseEvent> {
-        self.tx.subscribe()
+        if let Some(tx) = self.tx.lock().expect("SSE sender mutex").as_ref() {
+            return tx.subscribe();
+        }
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        rx
     }
 
     /// Number of active receivers on the underlying broadcast channel.
@@ -782,7 +816,11 @@ impl SseBroadcaster {
     /// are being sent to a channel with no SSE clients subscribed
     /// (possible indicator of the "spinner-forever" stranding scenario).
     pub fn receiver_count(&self) -> usize {
-        self.tx.receiver_count()
+        self.tx
+            .lock()
+            .expect("SSE sender mutex")
+            .as_ref()
+            .map_or(0, broadcast::Sender::receiver_count)
     }
 
     /// Send an event that has already been stamped with a `sequence_id`,
@@ -802,6 +840,8 @@ impl SseBroadcaster {
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
     fn send_with_ring_raw(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        let sender = self.tx.lock().expect("SSE sender mutex");
+        let sender = sender.as_ref().ok_or(())?;
         match op {
             RingOp::Anchor => {
                 self.ring.lock().expect("ReplayRing mutex").reset(seq);
@@ -817,19 +857,17 @@ impl SseBroadcaster {
             }
             RingOp::BroadcastOnly => {}
         }
-        self.tx.send(event).map_err(|_| ())
+        sender.send(event).map_err(|_| ())
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate
+            .reserved_until
+            .is_some_and(|reserved_until| seq > reserved_until)
         {
-            let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-            if gate
-                .reserved_until
-                .is_some_and(|reserved_until| seq > reserved_until)
-            {
-                gate.queued.push(QueuedBroadcast { event, seq, op });
-                return Ok(self.tx.receiver_count());
-            }
+            gate.queued.push(QueuedBroadcast { event, seq, op });
+            return Ok(self.receiver_count());
         }
         self.send_with_ring_raw(event, seq, op)
     }
@@ -1587,6 +1625,8 @@ impl RuntimeManager {
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            startup_direct_turn_settlement_ambiguity: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
             message_acceptance: ConversationMutexGates::default(),
@@ -2565,6 +2605,97 @@ impl RuntimeManager {
         })
     }
 
+    async fn abandon_startup_broadcaster(
+        &self,
+        conversation_id: &str,
+        broadcaster: SseBroadcaster,
+    ) {
+        let admission = self.conversation_admission(conversation_id).await;
+        let _admission_guard = admission.lock().await;
+        let _creations_guard = self.runtime_creations.lock().await;
+        let reserved = {
+            let mut reservations = self.evicted_broadcasters.write().await;
+            if reservations
+                .get(conversation_id)
+                .is_some_and(|reserved| reserved.same_channel(&broadcaster))
+            {
+                reservations.remove(conversation_id)
+            } else {
+                None
+            }
+        };
+        if reserved.is_some() {
+            self.evicted_model_upgrades
+                .write()
+                .await
+                .remove(conversation_id);
+        }
+        broadcaster.abandon();
+        if let Some(reserved) = reserved.as_ref() {
+            reserved.abandon();
+        }
+        drop(reserved);
+        drop(broadcaster);
+    }
+
+    #[cfg(test)]
+    async fn abandon_runtime_incarnation(
+        &self,
+        conversation_id: &str,
+        expected_identity: &Arc<()>,
+    ) -> bool {
+        let admission = self.conversation_admission(conversation_id).await;
+        let _admission_guard = admission.lock().await;
+        let _creations_guard = self.runtime_creations.lock().await;
+        self.abandon_runtime_incarnation_while_locked(conversation_id, expected_identity)
+            .await
+    }
+
+    async fn abandon_runtime_incarnation_while_locked(
+        &self,
+        conversation_id: &str,
+        expected_identity: &Arc<()>,
+    ) -> bool {
+        let removed = {
+            let mut runtimes = self.runtimes.write().await;
+            if runtimes
+                .get(conversation_id)
+                .is_some_and(|handle| Arc::ptr_eq(&handle.identity, expected_identity))
+            {
+                runtimes.remove(conversation_id)
+            } else {
+                None
+            }
+        };
+        let Some(handle) = removed else {
+            return false;
+        };
+        let reserved = {
+            let mut reservations = self.evicted_broadcasters.write().await;
+            if reservations
+                .get(conversation_id)
+                .is_some_and(|broadcaster| broadcaster.same_channel(&handle.broadcast_tx))
+            {
+                reservations.remove(conversation_id)
+            } else {
+                None
+            }
+        };
+        if reserved.is_some() {
+            self.evicted_model_upgrades
+                .write()
+                .await
+                .remove(conversation_id);
+        }
+        handle.broadcast_tx.abandon();
+        if let Some(broadcaster) = reserved.as_ref() {
+            broadcaster.abandon();
+        }
+        drop(handle);
+        drop(reserved);
+        true
+    }
+
     async fn handle_runtime_exit(
         &self,
         conv: &crate::db::Conversation,
@@ -2916,13 +3047,26 @@ impl RuntimeManager {
             // Its sender targets this exited runtime's event channel.
             timeout_task.abort();
 
+            if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
+                let admission = manager_for_cleanup.conversation_admission(&conv_id).await;
+                let admission_guard = admission.lock().await;
+                let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
+                let removed = manager_for_cleanup
+                    .abandon_runtime_incarnation_while_locked(&conv_id, &sub_agent_identity)
+                    .await;
+                drop(creations_guard);
+                drop(admission_guard);
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    removed_exact_runtime = removed,
+                    "Ambiguous sub-agent runtime incarnation abandoned"
+                );
+                return;
+            }
             manager_for_cleanup
                 .handle_runtime_exit(&cleanup_conversation, disposition)
                 .await;
 
-            // Only remove this sub-agent's entry. The identity check guards
-            // against the (unlikely) case where a replacement was inserted
-            // under the same key between run() finishing and this write lock.
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
                 if runtimes
@@ -2991,12 +3135,11 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
-        if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
-            return Ok(handle);
-        }
-
         let (mut result_rx, is_owner) = {
             let mut creations = self.runtime_creations.lock().await;
+            if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
+                return Ok(handle);
+            }
             if let Some(result_tx) = creations.get(conversation_id) {
                 (result_tx.subscribe(), false)
             } else {
@@ -3038,13 +3181,25 @@ impl RuntimeManager {
                     result
                 });
                 let result = worker.await.unwrap_or_else(|error| {
-                    Err(format!("runtime materialization task failed: {error}"))
+                    Err(RuntimeMaterializationError::Ordinary(format!(
+                        "runtime materialization task failed: {error}"
+                    )))
                 });
 
-                if let Err(error) = &result {
-                    if is_invalid_runtime_cwd_error(error) {
+                match &result {
+                    Err(RuntimeMaterializationError::AbandonIncarnation(error)) => {
+                        tracing::warn!(
+                            conv_id = %conversation_id,
+                            %error,
+                            "Runtime initialization abandoned its SSE incarnation"
+                        );
+                    }
+                    Err(RuntimeMaterializationError::Ordinary(error))
+                        if is_invalid_runtime_cwd_error(error) =>
+                    {
                         tracing::warn!(conv_id = %conversation_id, error = %error, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
-                    } else {
+                    }
+                    Err(RuntimeMaterializationError::Ordinary(error)) => {
                         tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
                         let broadcaster = manager.conversation_broadcaster(&conversation_id).await;
                         let _ = broadcaster.send_seq(|sequence_id| SseEvent::Error {
@@ -3052,7 +3207,9 @@ impl RuntimeManager {
                             error: user_facing_error::UserFacingError::internal(),
                         });
                     }
+                    Ok(_) => {}
                 }
+                let result = result.map_err(|error| error.to_string());
 
                 let result_tx = {
                     let mut creations = manager.runtime_creations.lock().await;
@@ -3110,7 +3267,7 @@ impl RuntimeManager {
     async fn materialize_runtime(
         self: &Arc<Self>,
         conversation_id: &str,
-    ) -> Result<ConversationHandle, String> {
+    ) -> Result<ConversationHandle, RuntimeMaterializationError> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
         }
@@ -3209,7 +3366,11 @@ impl RuntimeManager {
             None if is_sub_agent => {
                 crate::work_scope::ResourceScopeKey::Unattached(conv.id.clone())
             }
-            None => return Err("ordinary conversation is missing its work scope".to_string()),
+            None => {
+                return Err(RuntimeMaterializationError::Ordinary(
+                    "ordinary conversation is missing its work scope".to_string(),
+                ));
+            }
         };
         context.resource_authority = match conv.conv_mode {
             ConvMode::Explore { .. } => crate::work_scope::ResourceAuthority::Restricted,
@@ -3451,7 +3612,20 @@ impl RuntimeManager {
                 None
             };
             if let Some(terminal) = recovered_terminal {
-                crate::runtime::traits::MessageStore::settle_active_direct_turn(
+                #[cfg(test)]
+                if self
+                    .startup_direct_turn_settlement_ambiguity
+                    .lock()
+                    .await
+                    .remove(conversation_id)
+                {
+                    self.abandon_startup_broadcaster(conversation_id, broadcaster)
+                        .await;
+                    return Err(RuntimeMaterializationError::AbandonIncarnation(
+                        "injected startup direct-turn settlement ambiguity".to_string(),
+                    ));
+                }
+                match crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
                     &crate::runtime::traits::ActiveDirectTurnSettlement {
                         turn: loaded.active,
@@ -3460,8 +3634,23 @@ impl RuntimeManager {
                         state_updated_at: initial_state_updated_at,
                     },
                 )
-                .await?;
-                None
+                .await
+                {
+                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled
+                    | crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                        None
+                    }
+                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous {
+                        error,
+                    } => {
+                        let error = format!(
+                            "startup direct-turn terminal settlement remained ambiguous: {error}"
+                        );
+                        self.abandon_startup_broadcaster(conversation_id, broadcaster)
+                            .await;
+                        return Err(RuntimeMaterializationError::AbandonIncarnation(error));
+                    }
+                }
             } else {
                 Some(loaded.active)
             }
@@ -3620,13 +3809,26 @@ impl RuntimeManager {
 
         tokio::spawn(async move {
             let disposition = runtime.run().await;
+            if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
+                let admission = manager_for_cleanup.conversation_admission(&conv_id).await;
+                let admission_guard = admission.lock().await;
+                let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
+                let removed = manager_for_cleanup
+                    .abandon_runtime_incarnation_while_locked(&conv_id, &cleanup_identity)
+                    .await;
+                drop(creations_guard);
+                drop(admission_guard);
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    removed_exact_runtime = removed,
+                    "Ambiguous runtime incarnation abandoned"
+                );
+                return;
+            }
             manager_for_cleanup
                 .handle_runtime_exit(&cleanup_conversation, disposition)
                 .await;
 
-            // Only remove this runtime's HashMap entry. After evict_runtime()
-            // a new runtime may have been inserted under the same key; we must
-            // not evict that replacement.
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
                 if runtimes
@@ -4095,6 +4297,17 @@ impl RuntimeManager {
         Ok(handle.broadcast_tx.subscribe())
     }
 
+    pub async fn acquire_sse_broadcaster(
+        &self,
+        conversation_id: &str,
+    ) -> (SseBroadcaster, broadcast::Receiver<SseEvent>) {
+        let admission = self.conversation_admission(conversation_id).await;
+        let _admission_guard = admission.lock().await;
+        let broadcaster = self.conversation_broadcaster(conversation_id).await;
+        let receiver = broadcaster.subscribe();
+        (broadcaster, receiver)
+    }
+
     /// Peek at the runtime handle for a conversation without starting one.
     /// Returns `None` if no runtime is currently registered for `conversation_id`.
     ///
@@ -4149,7 +4362,8 @@ impl RuntimeManager {
 
     /// Return the durable live-update channel for a conversation without starting its runtime.
     pub async fn conversation_broadcaster(&self, conversation_id: &str) -> SseBroadcaster {
-        if let Some(handle) = self.try_get_handle(conversation_id).await {
+        let _creations = self.runtime_creations.lock().await;
+        if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return handle.broadcast_tx;
         }
         let initial_last_seq = self
@@ -4631,6 +4845,43 @@ mod broadcaster_tests {
              ephemeral seqs ({last_ephemeral})"
         );
         assert_eq!(message_seq, last_ephemeral + 1);
+    }
+
+    #[tokio::test]
+    async fn abandoning_shared_broadcaster_closes_existing_receiver_without_events() {
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let clone = broadcaster.clone();
+        let mut receiver = clone.subscribe();
+        let (_reservation, _sequence_id) = broadcaster.reserve_next_persisted_message_after(0);
+
+        broadcaster.abandon();
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+        assert!(matches!(receiver.recv().await, Err(RecvError::Closed)));
+        assert!(clone
+            .send_seq(|seq| token_event(seq, "must-not-send"))
+            .is_err());
+        assert!(clone.snapshot_pending().3.is_empty());
+    }
+
+    #[test]
+    fn normal_clone_send_and_replay_ring_behavior_is_unchanged() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let clone = broadcaster.clone();
+        let mut receiver = broadcaster.subscribe();
+
+        let sent = clone
+            .send_seq(|sequence_id| token_event(sequence_id, "normal"))
+            .expect("normal cloned send");
+
+        assert_eq!(sent, 1);
+        assert!(matches!(
+            receiver.try_recv().expect("normal event"),
+            SseEvent::Token { ref text, .. } if text == "normal"
+        ));
+        assert_eq!(broadcaster.snapshot_pending().3.len(), 1);
     }
 
     #[test]
@@ -5322,6 +5573,146 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    fn idle_handle_with_broadcaster(
+        broadcaster: SseBroadcaster,
+        identity: Arc<()>,
+    ) -> ConversationHandle {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        ConversationHandle {
+            event_tx,
+            acknowledged_event_tx,
+            turn_trigger: TurnTriggerSlot::default(),
+            broadcast_tx: broadcaster,
+            identity,
+            state_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn abandonment_is_exact_identity_scoped() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "abandon-identity-mismatch";
+        let expected_old_identity = Arc::new(());
+        let newer_identity = Arc::new(());
+        let newer_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let mut newer_receiver = newer_broadcaster.subscribe();
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            idle_handle_with_broadcaster(newer_broadcaster.clone(), Arc::clone(&newer_identity)),
+        );
+        manager
+            .evicted_broadcasters
+            .write()
+            .await
+            .insert(conversation_id.to_string(), newer_broadcaster.clone());
+
+        assert!(
+            !manager
+                .abandon_runtime_incarnation(conversation_id, &expected_old_identity)
+                .await
+        );
+
+        let current = manager
+            .runtimes
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+            .expect("newer runtime survives");
+        assert!(Arc::ptr_eq(&current.identity, &newer_identity));
+        assert!(manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
+        newer_broadcaster
+            .send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                state: ConvState::Idle,
+                presentation_mode: "idle".to_string(),
+                state_updated_at: chrono::Utc::now(),
+            })
+            .expect("newer broadcaster remains live");
+        assert!(matches!(
+            newer_receiver
+                .try_recv()
+                .expect("newer subscriber remains live"),
+            SseEvent::StateChange { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_exact_abandonment_and_gets_fresh_incarnation() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "abandon-reconnect-order";
+        let old_identity = Arc::new(());
+        let old_broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let old_incarnation = old_broadcaster.stream_incarnation().to_string();
+        let mut old_receiver = old_broadcaster.subscribe();
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            idle_handle_with_broadcaster(old_broadcaster.clone(), Arc::clone(&old_identity)),
+        );
+        manager
+            .evicted_broadcasters
+            .write()
+            .await
+            .insert(conversation_id.to_string(), old_broadcaster.clone());
+
+        let admission = manager.conversation_admission(conversation_id).await;
+        let admission_guard = admission.lock().await;
+        let (acquisition_started_tx, acquisition_started_rx) = tokio::sync::oneshot::channel();
+        let acquiring_manager = Arc::clone(&manager);
+        let acquiring_id = conversation_id.to_string();
+        let acquisition = tokio::spawn(async move {
+            acquisition_started_tx.send(()).expect("signal acquisition");
+            acquiring_manager
+                .acquire_sse_broadcaster(&acquiring_id)
+                .await
+        });
+        acquisition_started_rx.await.expect("acquisition started");
+        tokio::task::yield_now().await;
+        assert!(!acquisition.is_finished());
+
+        assert!({
+            let _creations_guard = manager.runtime_creations.lock().await;
+            manager
+                .abandon_runtime_incarnation_while_locked(conversation_id, &old_identity)
+                .await
+        });
+        assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert!(manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .is_none());
+        assert!(!acquisition.is_finished());
+
+        drop(admission_guard);
+        let (fresh_broadcaster, _fresh_receiver) = acquisition.await.expect("acquisition task");
+        assert_ne!(
+            fresh_broadcaster.stream_incarnation(),
+            old_incarnation,
+            "reconnect must receive a distinct stream incarnation"
+        );
+        assert!(!fresh_broadcaster.same_channel(&old_broadcaster));
+        assert!(old_broadcaster
+            .send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                state: ConvState::Idle,
+                presentation_mode: "idle".to_string(),
+                state_updated_at: chrono::Utc::now(),
+            })
+            .is_err());
+        assert!(old_broadcaster.snapshot_pending().3.is_empty());
     }
 
     fn stale_creation_event() -> Event {
@@ -6668,6 +7059,158 @@ mod scope_liveness_tests {
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
         assert!(!needs_auto_continue);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn startup_terminal_ambiguity_abandons_stream_and_retains_materialized_claim() {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "startup-terminal-ambiguity";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                text: "resume me".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "startup-ambiguous-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "resume me".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let repo = WorkflowRepository::new(manager.db().pool().clone());
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("startup-ambiguous").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority(conversation_id.to_string()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let authority = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(9_000_000_000_000_000_000),
+            })
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority,
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::Error {
+                    message: "startup recovery".to_string(),
+                    error_kind: crate::db::ErrorKind::ServerError,
+                    resets_at: None,
+                },
+            )
+            .await
+            .expect("persist startup terminal state");
+
+        assert!(matches!(
+            repo.load_active_runtime_turn(&ConversationAuthority(conversation_id.to_string()))
+                .await
+                .unwrap()
+                .expect("live materialized claim before startup")
+                .materialization,
+            phoenix_workflow::Materialization::Materialized { .. }
+        ));
+
+        let old_broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let old_incarnation = old_broadcaster.stream_incarnation().to_string();
+        let mut old_receiver = old_broadcaster.subscribe();
+        manager
+            .startup_direct_turn_settlement_ambiguity
+            .lock()
+            .await
+            .insert(conversation_id.to_string());
+
+        let Err(error) = manager.get_or_create(conversation_id).await else {
+            panic!("startup ambiguity must fail this incarnation");
+        };
+        assert!(error.contains("startup direct-turn settlement ambiguity"));
+        assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
+        assert!(old_broadcaster.snapshot_pending().3.is_empty());
+        assert!(manager
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .is_none());
+        let active = repo
+            .load_active_runtime_turn(&ConversationAuthority(conversation_id.to_string()))
+            .await
+            .unwrap()
+            .expect("materialized claim remains owed");
+        assert!(matches!(
+            active.materialization,
+            phoenix_workflow::Materialization::Materialized { .. }
+        ));
+
+        let (fresh_broadcaster, _fresh_receiver) =
+            manager.acquire_sse_broadcaster(conversation_id).await;
+        assert_ne!(fresh_broadcaster.stream_incarnation(), old_incarnation);
+        let messages = manager.db().get_messages(conversation_id).await.unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message.message_id == format!("{conversation_id}:startup-ambiguous-message")
+                })
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

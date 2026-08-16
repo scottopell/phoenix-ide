@@ -41,9 +41,11 @@ enum RuntimeSlotStatus { idle | accepted }
 enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
 enum CommittedOutcomeKind { RuntimeAccepted | QueuedSteering }
 enum DirectTurnReconciliationKind {
-    CommittedMaterialization
+    FreshCommit
+    | ExactReplay
+    | CommittedAfterAmbiguousError
     | ConfirmedNonCommit
-    | AmbiguousMaterialization
+    | AmbiguousAfterPrimaryError
     | AmbiguousPostMaterialization
     | StaleAuthority
 }
@@ -438,9 +440,19 @@ rule StaleGenerationSettlementCannotMutateCurrentAcceptedTurn {
     ensures: bedrock/CloseSettlementProgressed(acceptance.resolved_target.product_conversation, attempt_id)
 }
 
-rule CommittedMaterializationPreservesCanonicalAuthority {
+rule FreshCommitPreservesCanonicalAuthority {
     when: ExactDirectTurnReconciliationReturned(result)
-    requires: result.kind = CommittedMaterialization
+    requires: result.kind = FreshCommit
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: canonical_materialization_preserved(result)
+    ensures: claim_retained_or_owed(result)
+    ensures: provider_dispatch_at_most_once(result)
+}
+
+rule ExactReplayPreservesCoherentIncarnation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = ExactReplay
     requires: result.generation = current_generation_for(result.accepted_turn)
 
     ensures: canonical_materialization_preserved(result)
@@ -457,9 +469,21 @@ rule ConfirmedNonCommitReleasesExactClaimForRetry {
     ensures: retryable_unaccepted_outcome(target_bound_key_for(result.accepted_turn))
 }
 
-rule AmbiguousMaterializationAbandonsRuntimeIncarnation {
+rule CommittedAfterAmbiguousErrorAbandonsRuntimeIncarnation {
     when: ExactDirectTurnReconciliationReturned(result)
-    requires: result.kind = AmbiguousMaterialization
+    requires: result.kind = CommittedAfterAmbiguousError
+    requires: result.generation = current_generation_for(result.accepted_turn)
+
+    ensures: canonical_materialization_preserved(result)
+    ensures: claim_retained_or_owed(result)
+    ensures: provider_dispatch_at_most_once(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
+}
+
+rule AmbiguousPrimaryErrorAbandonsRuntimeIncarnation {
+    when: ExactDirectTurnReconciliationReturned(result)
+    requires: result.kind = AmbiguousAfterPrimaryError
     requires: result.generation = current_generation_for(result.accepted_turn)
 
     ensures: claim_retained_or_owed(result)
@@ -575,14 +599,17 @@ surface DirectTurnReconciliationSurface {
 
     @guarantee ClosedRepositoryResultFamily
         -- One exact repository reconciliation command for accepted_turn and
-        -- generation returns exactly one closed result variant. No runtime error,
-        -- missing canonical-message projection, conversation projection, runtime
-        -- absence, or cleanup outcome independently supplies the result kind.
+        -- generation returns exactly one closed result variant. Fresh commit,
+        -- ordinary exact replay, and commit proven only after a primary ambiguous
+        -- error are distinct. No runtime error, missing canonical-message
+        -- projection, conversation projection, runtime absence, or cleanup outcome
+        -- independently supplies durable truth.
 
     @guarantee AmbiguityIsInconclusiveRepositoryAuthority
         -- An ambiguous variant means the exact repository command cannot conclude
-        -- whether its durable boundary committed. It is not inferred from a
-        -- missing message or any other projection.
+        -- whether its durable boundary committed. Error-boundary provenance still
+        -- abandons the stream when reconciliation proves commit. Neither result is
+        -- inferred from a missing message or any other projection.
 }
 
 surface DirectChatDispositionSurface {

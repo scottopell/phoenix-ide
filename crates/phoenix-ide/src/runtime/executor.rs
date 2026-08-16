@@ -60,6 +60,7 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum RuntimeExitDisposition {
     Terminal,
     Interrupted,
+    AbandonStreamIncarnation,
 }
 
 struct TerminalTransitionRetry {
@@ -1694,6 +1695,7 @@ enum RuntimeRecoveryDisposition {
     #[default]
     Continue,
     RecreateFromDatabase,
+    AbandonStreamIncarnation,
 }
 
 /// Generic conversation runtime that can work with any storage, LLM, and tool implementations
@@ -2350,6 +2352,13 @@ where
         //   deadline          — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery          — credential helper settlement (REQ-BED-030)
         loop {
+            if self.recovery_disposition == RuntimeRecoveryDisposition::AbandonStreamIncarnation {
+                tracing::warn!(
+                    conversation_id = %self.context.conversation_id,
+                    "Exiting ambiguous direct-turn runtime and abandoning its SSE incarnation"
+                );
+                return RuntimeExitDisposition::AbandonStreamIncarnation;
+            }
             if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
                 tracing::warn!(
                     conversation_id = %self.context.conversation_id,
@@ -3509,6 +3518,9 @@ where
                 )
                 .await?;
         }
+        if self.recovery_disposition == RuntimeRecoveryDisposition::AbandonStreamIncarnation {
+            return Ok(None);
+        }
         if broadcast {
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                 sequence_id: seq,
@@ -3663,29 +3675,41 @@ where
             settlement.terminal.variant_name(),
             settlement.state.variant_name(),
         );
-        let result = match self
+        match self
             .storage
             .settle_active_direct_turn(&settlement)
             .instrument(span.clone())
             .await
         {
-            Ok(()) => {
+            crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled => {
                 span.record("outcome", "committed");
-                span.record("commit_probe", "not_needed");
                 self.active_direct_turn = None;
                 self.direct_turn_cancellation_initiated = false;
-                Ok(())
+                self.settle_turn_span();
             }
-            Err(error) => {
+            crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                span.record("outcome", "stale_authority");
+                self.active_direct_turn = None;
+                self.direct_turn_cancellation_initiated = false;
+                self.settle_turn_span();
+            }
+            crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous { error } => {
+                span.record("outcome", "ambiguous");
                 span.record("error.message", error.as_str());
-                self.reconcile_failed_direct_turn_settlement(settlement, terminal, error, span)
-                    .await
+                tracing::warn!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    %error,
+                    "Direct-turn settlement remains ambiguous; abandoning stream incarnation"
+                );
+                self.pending_direct_turn_terminal = Some(terminal);
+                self.recovery_disposition = RuntimeRecoveryDisposition::AbandonStreamIncarnation;
             }
-        };
-        if result.is_ok() {
-            self.settle_turn_span();
         }
-        result
+        Ok(())
     }
 
     async fn try_reconcile_durable_continuation_terminal(
@@ -3752,113 +3776,6 @@ where
                 presentation_mode: self.state.presentation_mode().to_string(),
             });
         true
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn reconcile_failed_direct_turn_settlement(
-        &mut self,
-        settlement: crate::runtime::traits::ActiveDirectTurnSettlement,
-        terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
-        error: String,
-        span: tracing::Span,
-    ) -> Result<(), String> {
-        let snapshot = match self
-            .storage
-            .get_state_snapshot(&self.context.conversation_id)
-            .instrument(span.clone())
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(probe_error) => {
-                span.record("outcome", "commit_probe_failed");
-                span.record("commit_probe", "state_read_failed");
-                span.record("probe.error.message", probe_error.as_str());
-                span.record("otel.status_code", "ERROR");
-                tracing::error!(
-                    parent: &span,
-                    conv_id = %self.context.conversation_id,
-                    turn_id = settlement.turn.turn_id.0,
-                    generation = settlement.turn.generation,
-                    terminal_kind = settlement.terminal.variant_name(),
-                    settlement_error = %error,
-                    probe_error = %probe_error,
-                    "Direct-turn settlement failed and commit probe could not read conversation state"
-                );
-                return Err(probe_error);
-            }
-        };
-        span.record("durable_state", snapshot.state.variant_name());
-        let active = match self
-            .storage
-            .load_active_direct_turn(&self.context.conversation_id)
-            .instrument(span.clone())
-            .await
-        {
-            Ok(active) => active,
-            Err(probe_error) => {
-                span.record("outcome", "commit_probe_failed");
-                span.record("commit_probe", "turn_read_failed");
-                span.record("probe.error.message", probe_error.as_str());
-                span.record("otel.status_code", "ERROR");
-                tracing::error!(
-                    parent: &span,
-                    conv_id = %self.context.conversation_id,
-                    turn_id = settlement.turn.turn_id.0,
-                    generation = settlement.turn.generation,
-                    terminal_kind = settlement.terminal.variant_name(),
-                    settlement_error = %error,
-                    probe_error = %probe_error,
-                    "Direct-turn settlement failed and commit probe could not read active turn"
-                );
-                return Err(probe_error);
-            }
-        };
-        let turn_still_active = active
-            .as_ref()
-            .is_some_and(|loaded| loaded.active == settlement.turn);
-        span.record("active_turn_present", active.is_some());
-        span.record("turn_still_active", turn_still_active);
-        let committed = snapshot.state == settlement.state
-            && active
-                .as_ref()
-                .is_none_or(|loaded| loaded.active != settlement.turn);
-        if committed {
-            span.record("outcome", "reconciled_committed");
-            span.record("commit_probe", "committed");
-            tracing::warn!(
-                parent: &span,
-                conv_id = %self.context.conversation_id,
-                turn_id = settlement.turn.turn_id.0,
-                generation = settlement.turn.generation,
-                terminal_kind = settlement.terminal.variant_name(),
-                settlement_error = %error,
-                "Direct-turn settlement returned an error after commit; reconciled committed state"
-            );
-            self.state = snapshot.state;
-            self.state_updated_at = snapshot.state_updated_at;
-            self.active_direct_turn = None;
-            self.direct_turn_cancellation_initiated = false;
-            return Ok(());
-        }
-
-        span.record("outcome", "failed_still_owed");
-        span.record("commit_probe", "still_owed");
-        span.record("otel.status_code", "ERROR");
-        tracing::error!(
-            parent: &span,
-            conv_id = %self.context.conversation_id,
-            turn_id = settlement.turn.turn_id.0,
-            generation = settlement.turn.generation,
-            terminal_kind = settlement.terminal.variant_name(),
-            target_state = settlement.state.variant_name(),
-            durable_state = snapshot.state.variant_name(),
-            active_turn_present = active.is_some(),
-            turn_still_active,
-            settlement_error = %error,
-            "Direct-turn settlement failed before commit; terminal obligation remains owed"
-        );
-        self.pending_direct_turn_terminal = Some(terminal);
-        Err(error)
     }
 
     /// If the current state transition is a steering-queue drain hook point and
@@ -4790,7 +4707,7 @@ where
                     }
                 };
                 match materialization {
-                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::FreshCommit {
                         message,
                         active,
                     } => {
@@ -4799,8 +4716,26 @@ where
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::ConfirmedNonCommitReleased
                     | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
                         self.direct_turn_materialization_aborted = true;
+                        Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError => {
+                        self.direct_turn_materialization_aborted = true;
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                        Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::Ambiguous { error } => {
+                        tracing::warn!(
+                            conversation_id = %self.context.conversation_id,
+                            %error,
+                            "Direct-turn materialization remained ambiguous after exact repository reconciliation"
+                        );
+                        self.direct_turn_materialization_aborted = true;
+                        self.recovery_disposition =
+                            RuntimeRecoveryDisposition::AbandonStreamIncarnation;
                         Ok(None)
                     }
                 }
@@ -5260,22 +5195,26 @@ where
                                             .expect("direct-turn settlement has telemetry span"),
                                     )
                                     .await;
-                                if let Err(recovery_error) = recovery_result {
-                                    if let Some(span) = &settlement_span {
-                                        span.record("outcome", "recovery_settlement_failed");
-                                        span.record("probe.error.message", recovery_error.as_str());
-                                        span.record("otel.status_code", "ERROR");
+                                match recovery_result {
+                                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled
+                                    | crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                                        if let Some(span) = &settlement_span {
+                                            span.record("outcome", "recovery_state_committed");
+                                        }
+                                        self.active_direct_turn = None;
+                                        self.pending_direct_turn_terminal = None;
+                                        self.direct_turn_cancellation_initiated = false;
+                                        self.settle_turn_span();
                                     }
-                                    return Err(recovery_error);
+                                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous { error } => {
+                                        if let Some(span) = &settlement_span {
+                                            span.record("outcome", "recovery_settlement_ambiguous");
+                                            span.record("error.message", error.as_str());
+                                        }
+                                        self.recovery_disposition = RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                                        return Ok(None);
+                                    }
                                 }
-                                if let Some(span) = &settlement_span {
-                                    span.record("outcome", "recovery_state_committed");
-                                    span.record("commit_probe", "fallback_settlement");
-                                }
-                                self.active_direct_turn = None;
-                                self.pending_direct_turn_terminal = None;
-                                self.direct_turn_cancellation_initiated = false;
-                                self.settle_turn_span();
                             } else {
                                 self.storage
                                     .update_state(
@@ -10568,7 +10507,7 @@ mod authoritative_user_message_effect_tests {
     async fn fresh_materialized_emits_one_persisted_reserved_message() {
         let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
-            AuthoritativeUserMessageMaterialization::Materialized {
+            AuthoritativeUserMessageMaterialization::FreshCommit {
                 message: Box::new(message("msg-direct", 1)),
                 active: crate::runtime::traits::ActiveDirectTurn {
                     turn_id: phoenix_workflow::TurnAuthorityId(1),
@@ -10602,6 +10541,56 @@ mod authoritative_user_message_effect_tests {
                 turn_id: phoenix_workflow::TurnAuthorityId(1),
                 generation: 0,
             }))
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_after_ambiguous_error_abandons_without_old_stream_event() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, _storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::CommittedAfterAmbiguousError,
+        );
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(rt.broadcast_tx.snapshot_pending().3.is_empty());
+        assert_eq!(
+            rt.run().await,
+            RuntimeExitDisposition::AbandonStreamIncarnation
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_materialization_ambiguity_abandons_without_old_stream_event() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, _storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Ambiguous {
+                error: "reconciliation unavailable".to_string(),
+            },
+        );
+        rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload("msg-direct"),
+            authority: authority(),
+            idempotent: true,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(rt.broadcast_tx.snapshot_pending().3.is_empty());
+        assert_eq!(
+            rt.run().await,
+            RuntimeExitDisposition::AbandonStreamIncarnation
         );
     }
 
@@ -11452,8 +11441,41 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_recoverable_failure_settlement_reconciles_committed_authority() {
-        let (mut rt, storage, _rx) = runtime(
+    async fn stale_terminal_settlement_is_non_abandoning_and_non_broadcasting() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(70),
+            generation: 4,
+        }));
+        storage.set_active_direct_turn(rt.active_direct_turn.as_deref().cloned());
+        storage.set_settle_active_direct_turn_stale_once();
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                reason: "stale".to_string(),
+            },
+        ));
+
+        rt.persist_state_effect(false).await.unwrap();
+
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::Continue
+        );
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_terminal_settlement_abandons_without_projection_recovery_event() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage, mut rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
@@ -11491,12 +11513,13 @@ mod authoritative_user_message_effect_tests {
 
         rt.persist_state_effect(false).await.unwrap();
 
-        assert!(rt.active_direct_turn.is_none());
-        assert!(rt.pending_direct_turn_terminal.is_none());
-        assert!(matches!(
-            storage.get_current_state(&rt.context.conversation_id),
-            Some(ConvState::RecoverableContinuationFailure { .. })
-        ));
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::AbandonStreamIncarnation
+        );
+        assert!(rt.active_direct_turn.is_some());
+        assert!(rt.pending_direct_turn_terminal.is_some());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]

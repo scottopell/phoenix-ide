@@ -484,12 +484,17 @@ Correctness SHALL NOT depend on sleeps, polling cadence, timestamps that infer
 semantic ownership, manual sequence rewind discipline, provider-response-derived
 tool authority, or mutable runtime steering truth.
 
-Verification SHALL distinguish exact committed materialization, exact confirmed
+Verification SHALL distinguish fresh committed materialization, ordinary exact
+replay, commit proven only after a primary ambiguous error, exact confirmed
 non-commit for the accepted turn and generation, and unresolved ambiguity. It
-SHALL prove that ambiguous incarnation abandonment closes the old stream without
+SHALL prove that error-boundary incarnation abandonment closes the old stream without
 fabricated events, that a replacement `Init` reflects authoritative durable state,
 that provider dispatch remains at most once, and that one conversation's recovery
 failure does not block independent conversations or worker readiness.
+A primary materialization error SHALL abandon the current stream incarnation even
+when exact repository reconciliation proves that the durable commit occurred.
+Durable truth governs claim and message authority; crossing the ambiguous error
+boundary governs the stream-incarnation outcome.
 
 ### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
 

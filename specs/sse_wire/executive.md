@@ -30,9 +30,9 @@ The `.allium` spec is the authoritative behavioural contract. This table maps im
 |---|---|
 | **StreamOpened** (init delivered first) | `crates/phoenix-ide/src/api/sse.rs` — `init_event` is the first item in the stream |
 | **LagCloseStream** (close on broadcast lag) | `crates/phoenix-ide/src/api/sse.rs` — `BroadcastStreamRecvError::Lagged` returns `None`, ending the stream |
-| **AmbiguousRuntimeIncarnationDropsAllSenderOwnership** | **Normative target — implementation pending.** Exact runtime cleanup must drop all old broadcaster senders without `evicted_broadcasters` retention before later reconnect/discovery creates a replacement. |
-| **AbandonedIncarnationEmitsNoRepairEvent** | **Normative target — implementation pending.** No filler event, replay-ring transfer, or reserved-cursor repair crosses an abandoned incarnation. |
-| **ReplacementIncarnationStartsFromAuthoritativeInit** | Existing reconnect and init-first boundaries are implemented; the direct-turn abandonment trigger and end-to-end regression coverage remain pending. |
+| **AmbiguousRuntimeIncarnationDropsAllSenderOwnership** | `RuntimeManager::abandon_runtime_incarnation_while_locked`, `RuntimeManager::abandon_startup_broadcaster`, and `SseBroadcaster::abandon` exact-remove matching ownership and revoke shared sender clones before existing acquisition gates reopen. |
+| **AbandonedIncarnationEmitsNoRepairEvent** | Executor, manager, and broadcaster regressions prove that ambiguous materialization/terminal recovery emits no filler, canonical-message repair, state event, or replay-ring entry on the abandoned incarnation. |
+| **ReplacementIncarnationStartsFromAuthoritativeInit** | `RuntimeManager::acquire_sse_broadcaster` atomically captures a fresh subscription; the real SSE handler regression proves the first `Init` has a distinct incarnation, one canonical SQLite message, and no abandoned pending event. |
 | **MessageCommittedToDb → MessageBroadcast** (persist-then-broadcast) | `crates/phoenix-ide/src/runtime.rs` — `SseBroadcaster::send_persisted_message` is called only after `db.save_message` returns Ok |
 | **MessageUpdatedBroadcast** | `SseWireEvent::MessageUpdated` in `crates/phoenix-ide/src/api/wire.rs`; emitted on field mutations |
 | **StateChangeBroadcast** | Emitted via `broadcast_tx.send_seq` on `ConvState` transitions (`runtime.rs`) |

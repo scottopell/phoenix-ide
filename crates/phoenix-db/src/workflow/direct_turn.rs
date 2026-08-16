@@ -28,6 +28,7 @@ enum TransactionCut {
     None,
     BeforeCommit,
     AfterCommit,
+    BeforeCommitReconciliationUnavailable,
 }
 
 const DIRECT_TURN_ACCEPTED_TRANSITION_ID: u64 = 1;
@@ -163,6 +164,16 @@ pub struct MaterializeAuthoritativeTurnResult {
     pub delivery: Option<super::LocalDeliveryRecord>,
     pub canonical_turn: DurableTurn,
     pub message: Option<Message>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MaterializeDirectTurnResult {
+    FreshCommit { message: Message },
+    ExactReplay { message: Message },
+    CommittedAfterAmbiguousError { message: Message },
+    ConfirmedNonCommitReleased,
+    StaleAuthority,
+    Ambiguous { error: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -500,11 +511,10 @@ impl WorkflowRepository {
         })
     }
 
-    pub async fn release_authoritative_turn_dispatch_failure(
-        &self,
+    async fn release_authoritative_turn_dispatch_failure_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         input: &ReleaseAuthoritativeTurnInput,
     ) -> DbResult<AuthorityOutcome> {
-        let mut tx = self.begin_tx().await?;
         let updated = sqlx::query(
             "DELETE FROM workflow_reclaimable_leases
              WHERE workflow_id = ?1 AND attempt_id = ?2 AND lease_until > ?3
@@ -532,11 +542,10 @@ impl WorkflowRepository {
             input.authority.process_incarnation.0,
             "process_incarnation",
         )?)
-        .execute(&mut *tx.tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if updated == 0 {
-            tx.rollback().await?;
             return Ok(AuthorityOutcome::StaleAuthority);
         }
         let attempts_updated = sqlx::query(
@@ -558,7 +567,7 @@ impl WorkflowRepository {
             input.authority.process_incarnation.0,
             "process_incarnation",
         )?)
-        .execute(&mut *tx.tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         let effects_updated = sqlx::query(
@@ -575,15 +584,28 @@ impl WorkflowRepository {
             "declared_workflow_version",
         )?)
         .bind(to_i64(input.authority.generation.0, "generation")?)
-        .execute(&mut *tx.tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
         if attempts_updated != 1 || effects_updated != 1 {
-            tx.rollback().await?;
             return Ok(AuthorityOutcome::StaleAuthority);
         }
-        tx.commit().await?;
         Ok(AuthorityOutcome::Authorized)
+    }
+
+    pub async fn release_authoritative_turn_dispatch_failure(
+        &self,
+        input: &ReleaseAuthoritativeTurnInput,
+    ) -> DbResult<AuthorityOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let outcome =
+            Self::release_authoritative_turn_dispatch_failure_in_tx(&mut tx.tx, input).await?;
+        if outcome == AuthorityOutcome::Authorized {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(outcome)
     }
 
     pub async fn load_active_runtime_turn(
@@ -813,6 +835,155 @@ impl WorkflowRepository {
             return Ok(DirectTurnMaterializationEligibility::StaleAuthority);
         }
         Ok(DirectTurnMaterializationEligibility::Fresh)
+    }
+
+    pub async fn materialize_authoritative_turn_reconciled(
+        &self,
+        input: &MaterializeAuthoritativeTurnInput,
+    ) -> MaterializeDirectTurnResult {
+        self.materialize_authoritative_turn_reconciled_at_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn materialize_authoritative_turn_reconciled_at_cut(
+        &self,
+        input: &MaterializeAuthoritativeTurnInput,
+        cut: TransactionCut,
+    ) -> MaterializeDirectTurnResult {
+        match self
+            .materialize_authoritative_turn_at_cut(
+                input,
+                if cut == TransactionCut::BeforeCommitReconciliationUnavailable {
+                    TransactionCut::BeforeCommit
+                } else {
+                    cut
+                },
+            )
+            .await
+        {
+            Ok(result)
+                if matches!(result.outcome, TurnOutcome::MaterializationReplay { .. })
+                    && result.message.is_none() =>
+            {
+                match self.load_exact_materialized_replay(input).await {
+                    Ok(message) => MaterializeDirectTurnResult::ExactReplay { message },
+                    Err(error) => MaterializeDirectTurnResult::Ambiguous {
+                        error: format!("exact materialization replay load failed: {error}"),
+                    },
+                }
+            }
+            Ok(result) => materialization_result_from_committed(result),
+            Err(error) if cut == TransactionCut::BeforeCommitReconciliationUnavailable => {
+                MaterializeDirectTurnResult::Ambiguous {
+                    error: format!(
+                        "materialization failed: {error}; exact reconciliation unavailable"
+                    ),
+                }
+            }
+            Err(error) => {
+                self.reconcile_materialization_error(input, error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn load_exact_materialized_replay(
+        &self,
+        input: &MaterializeAuthoritativeTurnInput,
+    ) -> DbResult<Message> {
+        let mut tx = self.begin_tx().await?;
+        let turn = load_turn_for_workflow_tx(
+            &self.pool,
+            &mut tx.tx,
+            input.turn_id,
+            input.authority.workflow_id,
+        )
+        .await?
+        .ok_or_else(|| conflict(TurnConflict::UnknownTurn))?;
+        if turn.generation != input.authority.generation.0 {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::StaleGeneration {
+                actual: turn.generation,
+            }));
+        }
+        let stored_prepared = load_prepared_payload_tx(&mut tx.tx, turn.id).await?;
+        verify_prepared_payload(&turn, &stored_prepared, &input.prepared)?;
+        let Materialization::Materialized { message_id } = &turn.materialization else {
+            tx.rollback().await?;
+            return Err(conflict(TurnConflict::CorruptAggregate(
+                "materialization replay lost canonical identity",
+            )));
+        };
+        let message = load_message_by_id_tx(&mut tx.tx, &message_id.0).await?;
+        verify_existing_materialized_message_without_sequence(&message, &turn, &input.prepared)?;
+        tx.rollback().await?;
+        Ok(message)
+    }
+
+    async fn reconcile_materialization_error(
+        &self,
+        input: &MaterializeAuthoritativeTurnInput,
+        materialization_error: String,
+    ) -> MaterializeDirectTurnResult {
+        match self.reconcile_materialization_error_in_tx(input).await {
+            Ok(result) => result,
+            Err(reconciliation_error) => MaterializeDirectTurnResult::Ambiguous {
+                error: format!(
+                    "materialization failed: {materialization_error}; exact reconciliation failed: {reconciliation_error}"
+                ),
+            },
+        }
+    }
+
+    async fn reconcile_materialization_error_in_tx(
+        &self,
+        input: &MaterializeAuthoritativeTurnInput,
+    ) -> DbResult<MaterializeDirectTurnResult> {
+        let mut tx = self.begin_tx().await?;
+        let Some(turn) = load_turn_for_workflow_tx(
+            &self.pool,
+            &mut tx.tx,
+            input.turn_id,
+            input.authority.workflow_id,
+        )
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(MaterializeDirectTurnResult::StaleAuthority);
+        };
+        if turn.generation != input.authority.generation.0 {
+            tx.rollback().await?;
+            return Ok(MaterializeDirectTurnResult::StaleAuthority);
+        }
+        let stored_prepared = load_prepared_payload_tx(&mut tx.tx, turn.id).await?;
+        verify_prepared_payload(&turn, &stored_prepared, &input.prepared)?;
+        if let phoenix_workflow::Materialization::Materialized {
+            message_id: canonical_message_id,
+        } = &turn.materialization
+        {
+            let message = load_message_by_id_tx(&mut tx.tx, &canonical_message_id.0).await?;
+            verify_existing_materialized_message_without_sequence(
+                &message,
+                &turn,
+                &input.prepared,
+            )?;
+            tx.rollback().await?;
+            return Ok(MaterializeDirectTurnResult::CommittedAfterAmbiguousError { message });
+        }
+        let released = Self::release_authoritative_turn_dispatch_failure_in_tx(
+            &mut tx.tx,
+            &ReleaseAuthoritativeTurnInput {
+                authority: input.authority.clone(),
+                now: input.now,
+            },
+        )
+        .await?;
+        if released != AuthorityOutcome::Authorized {
+            tx.rollback().await?;
+            return Ok(MaterializeDirectTurnResult::StaleAuthority);
+        }
+        tx.commit().await?;
+        Ok(MaterializeDirectTurnResult::ConfirmedNonCommitReleased)
     }
 
     pub async fn materialize_authoritative_turn(
@@ -1467,6 +1638,35 @@ async fn load_prepared_turn_from_row(
     )
     .await?;
     rehydrate_prepared_from_parts(row.get("prepared_fingerprint"), &conversation, &payload)
+}
+
+fn materialization_result_from_committed(
+    result: MaterializeAuthoritativeTurnResult,
+) -> MaterializeDirectTurnResult {
+    if let (TurnOutcome::MaterializationReplay { .. }, Some(message)) =
+        (&result.outcome, &result.message)
+    {
+        return MaterializeDirectTurnResult::ExactReplay {
+            message: message.clone(),
+        };
+    }
+    if result.authority_outcome != AuthorityOutcome::Authorized {
+        return MaterializeDirectTurnResult::StaleAuthority;
+    }
+    match (result.outcome, result.message) {
+        (TurnOutcome::Materialized { .. }, Some(message)) => {
+            MaterializeDirectTurnResult::FreshCommit { message }
+        }
+        (TurnOutcome::MaterializationReplay { .. }, Some(_)) => unreachable!(),
+        (_, Some(_)) => MaterializeDirectTurnResult::Ambiguous {
+            error: "authorized direct-turn materialization returned an unexpected outcome"
+                .to_string(),
+        },
+        (_, None) => MaterializeDirectTurnResult::Ambiguous {
+            error: "authorized direct-turn materialization returned no canonical message"
+                .to_string(),
+        },
+    }
 }
 
 fn verify_prepared_payload(
@@ -2839,6 +3039,220 @@ mod tests {
                 .outcome,
             TurnOutcome::MaterializationReplay { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn reconciled_materialization_result_preserves_truth_and_error_boundary() {
+        let fresh_repo = repo().await;
+        let created = fresh_repo
+            .accept_authoritative_turn(&input("conv-a", "reconciled-fresh", 20))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = fresh_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = fresh_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 20))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let materialize = materialize_input(
+            turn_id,
+            authority.clone(),
+            1,
+            1,
+            "message-conv-a-reconciled-fresh",
+            20,
+        );
+        assert!(matches!(
+            fresh_repo
+                .materialize_authoritative_turn_reconciled(&materialize)
+                .await,
+            MaterializeDirectTurnResult::FreshCommit { .. }
+        ));
+        let replay = fresh_repo
+            .materialize_authoritative_turn_reconciled(&materialize)
+            .await;
+        assert!(
+            matches!(replay, MaterializeDirectTurnResult::ExactReplay { .. }),
+            "unexpected replay result: {replay:?}"
+        );
+
+        let before_repo = repo().await;
+        let created = before_repo
+            .accept_authoritative_turn(&input("conv-a", "reconciled-before", 21))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = before_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = before_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 21))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        assert!(matches!(
+            before_repo
+                .materialize_authoritative_turn_reconciled_at_cut(
+                    &materialize_input(
+                        turn_id,
+                        authority,
+                        1,
+                        1,
+                        "message-conv-a-reconciled-before",
+                        21,
+                    ),
+                    TransactionCut::BeforeCommit,
+                )
+                .await,
+            MaterializeDirectTurnResult::ConfirmedNonCommitReleased
+        ));
+        assert!(before_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 22))
+            .await
+            .unwrap()
+            .authority
+            .is_some());
+
+        let after_repo = repo().await;
+        let created = after_repo
+            .accept_authoritative_turn(&input("conv-a", "reconciled-after", 23))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = after_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = after_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 23))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        assert!(matches!(
+            after_repo
+                .materialize_authoritative_turn_reconciled_at_cut(
+                    &materialize_input(
+                        turn_id,
+                        authority,
+                        1,
+                        1,
+                        "message-conv-a-reconciled-after",
+                        23,
+                    ),
+                    TransactionCut::AfterCommit,
+                )
+                .await,
+            MaterializeDirectTurnResult::CommittedAfterAmbiguousError { .. }
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv-a' AND message_id = 'conv-a:message-conv-a-reconciled-after'"
+            )
+            .fetch_one(&after_repo.pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let ambiguous_repo = repo().await;
+        let created = ambiguous_repo
+            .accept_authoritative_turn(&input("conv-a", "reconciled-ambiguous", 24))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = ambiguous_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = ambiguous_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 24))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        assert!(matches!(
+            ambiguous_repo
+                .materialize_authoritative_turn_reconciled_at_cut(
+                    &materialize_input(
+                        turn_id,
+                        authority,
+                        1,
+                        1,
+                        "message-conv-a-reconciled-ambiguous",
+                        24,
+                    ),
+                    TransactionCut::BeforeCommitReconciliationUnavailable,
+                )
+                .await,
+            MaterializeDirectTurnResult::Ambiguous { .. }
+        ));
+        assert!(ambiguous_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 25))
+            .await
+            .unwrap()
+            .authority
+            .is_none());
+
+        let stale_repo = repo().await;
+        let created = stale_repo
+            .accept_authoritative_turn(&input("conv-a", "reconciled-stale", 26))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = stale_repo
+            .workflow_id_for_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut authority = stale_repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 26))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        authority.generation = Generation(authority.generation.0 + 1);
+        assert!(matches!(
+            stale_repo
+                .materialize_authoritative_turn_reconciled(&materialize_input(
+                    turn_id,
+                    authority,
+                    1,
+                    1,
+                    "message-conv-a-reconciled-stale",
+                    26,
+                ))
+                .await,
+            MaterializeDirectTurnResult::StaleAuthority
+        ));
+        let turn = stale_repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(turn.generation, 0);
+        assert_eq!(turn.materialization, Materialization::Unmaterialized);
     }
 
     #[tokio::test]
