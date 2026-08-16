@@ -7,8 +7,8 @@
 -- typed acceptance or replay dispositions, target-local runtime-slot
 -- arbitration, steering, and exact-ID reconciliation.
 --
--- Requirement traceability: REQ-DWF-038, REQ-DWF-CHAT-001 through
--- REQ-DWF-CHAT-014.
+-- Requirement traceability: REQ-DWF-038, REQ-DWF-043,
+-- REQ-DWF-CHAT-001 through REQ-DWF-CHAT-014.
 
 use "./durable-workflows.allium" as dwf
 use "../bedrock/bedrock.allium" as bedrock
@@ -40,6 +40,8 @@ enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation 
 enum RuntimeSlotStatus { idle | accepted }
 enum ConsumerProgressStatus { owed | in_progress | delivered | failed | suppressed }
 enum CommittedOutcomeKind { RuntimeAccepted | QueuedSteering }
+enum AuthoritativeMaterializationStatus { proposed | committed }
+enum LocalPersistenceAuthorityResult { DurableFactEstablished | DurableFactUnclassified }
 enum DirectChatOutcomeKind {
     RetryableUnaccepted
     | RuntimeAccepted
@@ -118,7 +120,13 @@ entity DirectChatAcceptance {
     committed_outcome: CommittedOutcome?
     runtime_delivery: dwf/Delivery?
     runtime_acceptance: dwf/RuntimeAcceptance?
+    materialization_status: AuthoritativeMaterializationStatus
     accepted_at: Timestamp
+}
+
+entity LocalPersistenceAuthorityBoundary {
+    acceptance: DirectChatAcceptance
+    result: LocalPersistenceAuthorityResult
 }
 
 entity RuntimeTargetSlot {
@@ -183,6 +191,8 @@ entity DirectChatConsumerCursor {
 -- independent_prepared_events_emitted(request, targets)
 -- replay_preserves_prepared_payload(acceptance, prepared_payload), acceptance_created_once(turn_key)
 -- direct_chat_close_settlement_request(product_conversation, attempt_id)
+-- observer_semantic_state_is_committed(acceptance), routing_semantic_state_is_committed(acceptance)
+-- admission_semantic_state_is_committed(acceptance), no_semantic_state_established(acceptance)
 
 ------------------------------------------------------------
 -- Invariants
@@ -222,6 +232,19 @@ invariant RuntimeAcceptanceMatchesExactAcceptedTurn {
     -- Runtime acceptance, when present, always references the exact accepted turn
     -- identity rather than a transcript offset, pagination window, or latest-
     -- message guess.
+    true
+}
+
+invariant ProposedStateIsNotRuntimeAuthority {
+    -- A proposed direct-turn transition cannot establish observer-, routing-, or
+    -- admission-visible semantic state. Those views become authoritative only
+    -- after the owning materialization transaction commits.
+    true
+}
+
+invariant FailStopIsOutsideConversationState {
+    -- DurableFactUnclassified selects the process fail-stop boundary and never a
+    -- conversation or workflow semantic state.
     true
 }
 
@@ -279,6 +302,7 @@ rule NewAcceptanceBeginsRetryableUntilCommittedOutcomeExists {
         committed_outcome: null,
         runtime_delivery: null,
         runtime_acceptance: null,
+        materialization_status: proposed,
         accepted_at: now()
     )
     ensures: retryable_unaccepted_outcome(turn_key)
@@ -304,11 +328,31 @@ rule SameKeyConflictRejectsDifferentPreparedFingerprint {
     ensures: conflicting_key_reuse_outcome(conflicting_fingerprint(same_key_existing_acceptance(turn_key)))
 }
 
+rule AuthoritativeMaterializationCommitsProposedState {
+    when: AuthoritativeDirectTurnMaterializationCommitted(acceptance)
+    requires: acceptance.materialization_status = proposed
+
+    ensures: acceptance.materialization_status = committed
+}
+
+rule UnclassifiedLocalAuthorityRequestsFailStop {
+    when: LocalPersistenceAuthorityClassified(acceptance, result)
+    requires: result = DurableFactUnclassified
+
+    ensures: LocalPersistenceAuthorityBoundary.created(
+        acceptance: acceptance,
+        result: result
+    )
+    ensures: DirectChatFailStopRequested(acceptance)
+    ensures: no_semantic_state_established(acceptance)
+}
+
 rule RuntimeAcceptanceWinsThePerTargetSlot {
     when: RuntimeAdmissionRequested(acceptance)
     requires: acceptance.committed_outcome = null
     requires: runtime_admission_is_per_target(acceptance.resolved_target)
     requires: runtime_slot_for(acceptance.resolved_target) = null or slot_is_available(runtime_slot_for(acceptance.resolved_target))
+    requires: acceptance.materialization_status = committed
 
     let delivery = canonical_delivery_for(acceptance)
     let runtime_acceptance = runtime_acceptance_for(delivery)
@@ -321,6 +365,9 @@ rule RuntimeAcceptanceWinsThePerTargetSlot {
     ensures: acceptance.runtime_delivery = delivery
     ensures: acceptance.runtime_acceptance = runtime_acceptance
     ensures: acceptance.committed_outcome = CommittedOutcome{kind: RuntimeAccepted, runtime_accepted: runtime_accepted_ref(acceptance)}
+    ensures: observer_semantic_state_is_committed(acceptance)
+    ensures: routing_semantic_state_is_committed(acceptance)
+    ensures: admission_semantic_state_is_committed(acceptance)
     ensures: runtime_accepted_outcome(runtime_accepted_ref(acceptance))
 }
 
@@ -330,6 +377,7 @@ rule RuntimeContentionQueuesSteeringWithoutRevokingAcceptance {
     requires: runtime_admission_is_per_target(acceptance.resolved_target)
     requires: runtime_slot_for(acceptance.resolved_target) != null
     requires: not slot_is_available(runtime_slot_for(acceptance.resolved_target))
+    requires: acceptance.materialization_status = committed
 
     ensures: acceptance.committed_outcome = CommittedOutcome{kind: QueuedSteering, queued_steering: queued_steering_ref(acceptance)}
     ensures: queued_steering_outcome(queued_steering_ref(acceptance))

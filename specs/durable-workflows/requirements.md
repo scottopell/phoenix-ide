@@ -38,6 +38,37 @@ and execution scheduling.
 A profile adapter or effect handler SHALL NOT maintain a competing execution
 status, delivery lifecycle, or scheduling authority.
 
+### REQ-DWF-043: Durable Facts Survive Process Loss
+
+Phoenix MAY stop after almost any instruction. WHEN a Phoenix process stops and
+another process opens the same authoritative SQLite database
+THE SYSTEM SHALL use committed authoritative rows and durable time to discover
+every unfinished durable obligation.
+
+Correctness SHALL NOT depend on retaining an in-memory worker, task, timer, kick,
+runtime object, provider task, SSE connection, replay buffer, or process-local
+event queue. Those process-local mechanisms MAY reduce latency or project durable
+facts, but their identity and continuity SHALL be disposable. A profile adapter,
+runtime, SSE stream, or UI view SHALL NOT independently redefine the durable fact
+it projects.
+
+THE owning command boundary SHALL return a closed command-scoped sum type that
+structurally distinguishes `DurableFactEstablished`, carrying the typed domain
+result, from `DurableFactUnclassified`. An ordinary database or library error
+result SHALL NOT by itself establish either commit or non-commit.
+
+WHEN an authoritative local SQLite command returns `DurableFactUnclassified`
+THE owning boundary MAY perform one exact classification query against the rows
+that are authoritative for the fact needed to continue. WHEN that query returns
+`DurableFactEstablished`, THE SYSTEM SHALL follow its typed domain result. IF the
+exact query is unavailable or returns `DurableFactUnclassified`, THE owning
+execution boundary SHALL fail stop rather than create durable workflow or
+conversation state for epistemic uncertainty.
+
+This local classification boundary SHALL NOT replace the recovery policy for a
+genuine external outcome. Genuine external outcomes remain governed by their
+feature-owned normative recovery contract.
+
 ### REQ-DWF-003: Normalized Core and Typed Profile Ownership
 
 THE engine SHALL persist queryable execution and authority facts as normalized
@@ -464,6 +495,17 @@ collapsing independently claimable LLM or tool effects into one scalar turn phas
 A terminal command SHALL atomically advance generation, release live conversation
 ownership, and interrupt or suppress every nonterminal child effect.
 
+WHEN a direct turn progresses from a proposed transition into materialized runtime
+state
+THE proposed transition plan and proposed `ConvState` SHALL remain structurally
+distinct from the committed semantic state claimed by that direct turn until the
+owning SQLite transaction commits
+AND that transaction SHALL materialize the accepted turn and its reducer projection
+before the runtime exposes that semantic state as its adopted committed state or
+publishes it
+AND a live observer, routing decision, or admission decision SHALL NOT treat the
+proposed state as committed authority.
+
 WHEN a materialized runtime direct turn reaches a terminal or rest reducer state
 THE SYSTEM SHALL persist that reducer projection in the same transaction as the terminal command
 AND SHALL NOT publish the terminal or rest state to live observers before that transaction commits.
@@ -742,7 +784,7 @@ authority:
 - REQ-DWF-021 Deprecated — mixed-authority semantic-parity semantics removed from the current contract
 - REQ-DWF-022 Deprecated — shadow/drain client-boundary semantics superseded by REQ-DWF-029 through REQ-DWF-042
 
-Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-042,
+Current normative authority is REQ-DWF-017, REQ-DWF-029 through REQ-DWF-043,
 REQ-DWF-WAKE-001 through REQ-DWF-WAKE-005, and REQ-DWF-CREATE-001 through
 REQ-DWF-CREATE-005 as defined in this document. Direct-chat authority and
 refinement are additionally governed by REQ-DWF-CHAT-012 through
