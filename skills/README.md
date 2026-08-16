@@ -82,6 +82,7 @@ We're starting conservatively to learn how agents consume skills:
 |-------|-------------|
 | [phoenix-development](phoenix-development/SKILL.md) | Root-cause-first Phoenix implementation loop, source-of-truth routing, validation, and specialized-skill handoffs |
 | [phoenix-explore](phoenix-explore/SKILL.md) | Breadth-first investigation of ambiguous feedback across Phoenix's easy-to-miss system boundaries |
+| [phoenix-adversarial-review](phoenix-adversarial-review/SKILL.md) | Evidence-backed falsification review for agent-authored changes, including exact-HEAD and lineage-confirmed Codex comparisons |
 | [phoenix-ladle-fixture](phoenix-ladle-fixture/SKILL.md) | End-to-end workflow for adding Phoenix UI Ladle fixtures, QA capture scripts, `./dev.py qa` wiring, and fixture best practices |
 | [phoenix-extract-crate](phoenix-extract-crate/SKILL.md) | Methodology for splitting a large crate into a layered, acyclic workspace: what sinks to the base crate vs. stays, breaking cycles, sequencing incremental refactors that stay shippable |
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |

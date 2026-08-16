@@ -3,7 +3,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SKILL_DIR = ROOT / ".agents" / "skills" / "phoenix-adversarial-review"
+SKILL_DIR = ROOT / "skills" / "phoenix-adversarial-review"
+DISCOVERY_LINK = ROOT / ".agents" / "skills" / "phoenix-adversarial-review"
 SKILL = SKILL_DIR / "SKILL.md"
 
 
@@ -11,6 +12,14 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = SKILL.read_text()
+
+    def test_phoenix_skill_uses_canonical_source_and_discovery_symlink(self):
+        self.assertTrue(SKILL_DIR.is_dir())
+        self.assertTrue(DISCOVERY_LINK.is_symlink())
+        self.assertEqual(
+            DISCOVERY_LINK.readlink(), Path("../../skills/phoenix-adversarial-review")
+        )
+        self.assertEqual(DISCOVERY_LINK.resolve(), SKILL_DIR.resolve())
 
     def test_discovery_metadata_has_exact_name_and_review_triggers(self):
         frontmatter = self.text.split("---", 2)[1]
