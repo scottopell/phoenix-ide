@@ -203,6 +203,8 @@ entity DirectChatConsumerCursor {
 -- claim_retained_or_owed(result), provider_dispatch_at_most_once(result)
 -- accepted_turn_authority_unchanged(result)
 -- RuntimeIncarnationAbandonmentRequested(conversation_id), no_replacement_requested_by_recovery_handler(conversation_id)
+-- DirectTurnTerminalSettlementReturned(result), terminal_claim_authority_unchanged(result)
+-- no_old_stream_projection_or_lifecycle_event(result)
 -- remaining_discovery_candidates_continue(acceptance), startup_readiness_can_complete()
 -- target_bound_key_for(accepted_turn)
 -- ambiguous_incarnation_closes_without_fabricated_event(turn_key), replacement_init_matches_durable_materialization(turn_key)
@@ -546,6 +548,16 @@ rule StaleDirectTurnReconciliationCannotMutateCurrentAuthority {
     requires: result.kind = StaleAuthority
 
     ensures: accepted_turn_authority_unchanged(result)
+}
+
+rule StaleTerminalSettlementAbandonsWithoutLosingProjection {
+    when: DirectTurnTerminalSettlementReturned(result)
+    requires: result.kind = StaleAuthority
+
+    ensures: terminal_claim_authority_unchanged(result)
+    ensures: no_old_stream_projection_or_lifecycle_event(result)
+    ensures: RuntimeIncarnationAbandonmentRequested(result.conversation_id)
+    ensures: no_replacement_requested_by_recovery_handler(result.conversation_id)
 }
 
 rule DirectTurnRecoveryFailureIsConversationLocal {

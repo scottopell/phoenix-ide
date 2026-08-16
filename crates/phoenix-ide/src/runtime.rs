@@ -236,6 +236,17 @@ enum RuntimeMaterializationError {
     },
 }
 
+#[derive(Clone)]
+enum RuntimeMaterializationSuccess {
+    Existing(ConversationHandle),
+    Published,
+}
+
+enum RuntimePublicationOutcome {
+    Published { handle: ConversationHandle },
+    Abandoned { broadcaster: SseBroadcaster },
+}
+
 impl std::fmt::Display for RuntimeMaterializationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -282,6 +293,10 @@ pub struct RuntimeManager {
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_publication_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_executor_spawns: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     startup_direct_turn_settlement_ambiguity: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
@@ -1650,6 +1665,10 @@ impl RuntimeManager {
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
+            runtime_publication_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_executor_spawns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             startup_direct_turn_settlement_ambiguity: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
@@ -2635,33 +2654,27 @@ impl RuntimeManager {
         expected_identity: Option<&Arc<()>>,
         expected_broadcaster: &SseBroadcaster,
     ) -> bool {
-        let removed = {
-            let mut runtimes = self.runtimes.write().await;
-            if runtimes.get(conversation_id).is_some_and(|handle| {
-                expected_identity.is_some_and(|identity| Arc::ptr_eq(&handle.identity, identity))
-                    || handle.broadcast_tx.same_channel(expected_broadcaster)
-            }) {
-                runtimes.remove(conversation_id)
-            } else {
-                None
-            }
+        let mut runtimes = self.runtimes.write().await;
+        let mut reservations = self.evicted_broadcasters.write().await;
+        let mut model_upgrades = self.evicted_model_upgrades.write().await;
+        let removed = if runtimes.get(conversation_id).is_some_and(|handle| {
+            expected_identity.is_some_and(|identity| Arc::ptr_eq(&handle.identity, identity))
+                || handle.broadcast_tx.same_channel(expected_broadcaster)
+        }) {
+            runtimes.remove(conversation_id)
+        } else {
+            None
         };
-        let reserved = {
-            let mut reservations = self.evicted_broadcasters.write().await;
-            if reservations
-                .get(conversation_id)
-                .is_some_and(|broadcaster| broadcaster.same_channel(expected_broadcaster))
-            {
-                reservations.remove(conversation_id)
-            } else {
-                None
-            }
+        let reserved = if reservations
+            .get(conversation_id)
+            .is_some_and(|broadcaster| broadcaster.same_channel(expected_broadcaster))
+        {
+            reservations.remove(conversation_id)
+        } else {
+            None
         };
         if reserved.is_some() {
-            self.evicted_model_upgrades
-                .write()
-                .await
-                .remove(conversation_id);
+            model_upgrades.remove(conversation_id);
         }
         expected_broadcaster.abandon();
         if let Some(handle) = removed.as_ref() {
@@ -2670,6 +2683,9 @@ impl RuntimeManager {
         if let Some(broadcaster) = reserved.as_ref() {
             broadcaster.abandon();
         }
+        drop(model_upgrades);
+        drop(reservations);
+        drop(runtimes);
         let removed_owned_incarnation = removed.is_some() || reserved.is_some();
         drop(removed);
         drop(reserved);
@@ -3118,26 +3134,27 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
-        let (mut result_rx, is_owner) = {
+        let (mut result_rx, owner_result_tx) = {
             let mut creations = self.runtime_creations.lock().await;
             if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
                 return Ok(handle);
             }
             if let Some(result_tx) = creations.get(conversation_id) {
-                (result_tx.subscribe(), false)
+                (result_tx.subscribe(), None)
             } else {
                 let (result_tx, result_rx) = watch::channel(None);
-                creations.insert(conversation_id.to_string(), result_tx);
-                (result_rx, true)
+                creations.insert(conversation_id.to_string(), result_tx.clone());
+                (result_rx, Some(result_tx))
             }
         };
 
-        if is_owner {
+        if let Some(owner_result_tx) = owner_result_tx {
             let manager = Arc::clone(self);
             let conversation_id = conversation_id.to_string();
             tokio::spawn(async move {
                 let worker_manager = Arc::clone(&manager);
                 let worker_conversation_id = conversation_id.clone();
+                let worker_result_tx = owner_result_tx.clone();
                 let worker = tokio::spawn(async move {
                     let span = tracing::info_span!(
                         target: "phoenix_ide::otel",
@@ -3149,7 +3166,7 @@ impl RuntimeManager {
                     let started = std::time::Instant::now();
                     let result = async {
                         worker_manager
-                            .materialize_runtime(&worker_conversation_id)
+                            .materialize_runtime(&worker_conversation_id, &worker_result_tx)
                             .await
                     }
                     .instrument(span.clone())
@@ -3168,6 +3185,10 @@ impl RuntimeManager {
                         "runtime materialization task failed: {error}"
                     )))
                 });
+
+                if matches!(result, Ok(RuntimeMaterializationSuccess::Published)) {
+                    return;
+                }
 
                 if let Err(RuntimeMaterializationError::Ordinary(error)) = &result {
                     if !is_invalid_runtime_cwd_error(error) {
@@ -3209,7 +3230,12 @@ impl RuntimeManager {
                         tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
                         Err(error)
                     }
-                    Ok(handle) => Ok(handle),
+                    Ok(RuntimeMaterializationSuccess::Existing(handle)) => Ok(handle),
+                    Ok(RuntimeMaterializationSuccess::Published) => {
+                        unreachable!(
+                            "published runtime result is finalized by the publication fence"
+                        )
+                    }
                 };
                 result_tx.send_replace(Some(result));
                 drop(result_tx);
@@ -3255,12 +3281,130 @@ impl RuntimeManager {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn spawn_published_runtime(
+        self: &Arc<Self>,
+        runtime: ProductionRuntime,
+        conversation_id: String,
+        cleanup_conversation: crate::db::Conversation,
+        broadcaster: SseBroadcaster,
+        identity: Arc<()>,
+    ) {
+        #[cfg(test)]
+        self.runtime_executor_spawns.fetch_add(1, Ordering::AcqRel);
+        let manager_for_cleanup = Arc::clone(self);
+        tokio::spawn(async move {
+            let disposition = runtime.run().await;
+            if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
+                let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
+                let removed = manager_for_cleanup
+                    .abandon_incarnation_while_creations_locked(
+                        &conversation_id,
+                        Some(&identity),
+                        &broadcaster,
+                    )
+                    .await;
+                drop(creations_guard);
+                tracing::warn!(
+                    conv_id = %conversation_id,
+                    removed_exact_runtime = removed,
+                    "Ambiguous runtime incarnation abandoned"
+                );
+                return;
+            }
+            manager_for_cleanup
+                .handle_runtime_exit(&cleanup_conversation, disposition)
+                .await;
+
+            let removed = {
+                let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                if runtimes
+                    .get(&conversation_id)
+                    .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &identity))
+                {
+                    runtimes.remove(&conversation_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                tracing::info!(conv_id = %conversation_id, "Conversation runtime finished and cleaned up");
+            } else {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    "Runtime cleanup: entry replaced after eviction, skipping remove"
+                );
+            }
+        });
+    }
+
+    async fn publish_runtime_if_incarnation_live(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        result_tx: &RuntimeMaterializationSender,
+        handle: ConversationHandle,
+        runtime: ProductionRuntime,
+        cleanup_conversation: crate::db::Conversation,
+    ) -> RuntimePublicationOutcome {
+        let mut creations = self.runtime_creations.lock().await;
+        let mut runtimes = self.runtimes.write().await;
+        let mut reservations = self.evicted_broadcasters.write().await;
+        let mut model_upgrades = self.evicted_model_upgrades.write().await;
+        let broadcaster = handle.broadcast_tx.clone();
+        let broadcaster_gate = handle
+            .broadcast_tx
+            .gate
+            .lock()
+            .expect("BroadcastGate mutex");
+        let sender = handle.broadcast_tx.tx.lock().expect("SSE sender mutex");
+
+        let owns_creation_slot = creations
+            .get(conversation_id)
+            .is_some_and(|current| current.same_channel(result_tx));
+        if !owns_creation_slot || sender.is_none() {
+            return RuntimePublicationOutcome::Abandoned { broadcaster };
+        }
+
+        let removed_matching_reservation = reservations
+            .get(conversation_id)
+            .is_some_and(|reserved| reserved.same_channel(&handle.broadcast_tx));
+        if removed_matching_reservation {
+            reservations.remove(conversation_id);
+            model_upgrades.remove(conversation_id);
+        }
+        runtimes.insert(conversation_id.to_string(), handle.clone());
+        self.spawn_published_runtime(
+            runtime,
+            conversation_id.to_string(),
+            cleanup_conversation,
+            handle.broadcast_tx.clone(),
+            Arc::clone(&handle.identity),
+        );
+        let _ = result_tx.send_replace(Some(Ok(handle.clone())));
+        if creations
+            .get(conversation_id)
+            .is_some_and(|current| current.same_channel(result_tx))
+        {
+            creations.remove(conversation_id);
+        }
+
+        drop(sender);
+        drop(broadcaster_gate);
+        drop(model_upgrades);
+        drop(reservations);
+        drop(runtimes);
+        drop(creations);
+        RuntimePublicationOutcome::Published { handle }
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn materialize_runtime(
         self: &Arc<Self>,
         conversation_id: &str,
-    ) -> Result<ConversationHandle, RuntimeMaterializationError> {
+        result_tx: &RuntimeMaterializationSender,
+    ) -> Result<RuntimeMaterializationSuccess, RuntimeMaterializationError> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
-            return Ok(handle);
+            return Ok(RuntimeMaterializationSuccess::Existing(handle));
         }
 
         #[cfg(test)]
@@ -3425,9 +3569,9 @@ impl RuntimeManager {
         // (task 02710).
         let evicted_for_model_upgrade = self
             .evicted_model_upgrades
-            .write()
+            .read()
             .await
-            .remove(conversation_id);
+            .contains(conversation_id);
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -3753,100 +3897,50 @@ impl RuntimeManager {
             .with_steering_queue(steering_queue)
             .with_steering_projection_gate(steering_projection_gate);
 
-        // Start runtime in background
-        let conv_id = conversation_id.to_string();
-        let manager_for_cleanup = Arc::clone(self);
-        let cleanup_broadcaster = broadcaster.clone();
-        // Shared with the executor: event senders deposit their ambient span
-        // here so the turn it starts can link back to the triggering request.
         let turn_trigger = runtime.turn_trigger_slot();
-        // Unique token for this runtime instance. Cleanup guards against
-        // removing a replacement entry created after eviction.
-        let identity = Arc::new(());
-        let cleanup_identity = identity.clone();
         let handle = ConversationHandle {
-            event_tx: event_tx.clone(),
-            acknowledged_event_tx: acknowledged_event_tx.clone(),
-            turn_trigger: turn_trigger.clone(),
-            broadcast_tx: broadcaster.clone(),
-            identity: identity.clone(),
-            state_rx: state_rx.clone(),
+            event_tx,
+            acknowledged_event_tx,
+            turn_trigger,
+            broadcast_tx: broadcaster,
+            identity: Arc::new(()),
+            state_rx,
         };
-        // Another caller may have completed construction while this caller was
-        // awaiting DB/tool setup. Publish exactly one runtime and discard the
-        // losing, not-yet-spawned executor.
+
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .runtime_publication_barriers
+            .lock()
+            .await
+            .remove(conversation_id)
         {
-            let mut runtimes = self.runtimes.write().await;
-            let mut reservations = self.evicted_broadcasters.write().await;
-            if let Some(existing) = runtimes.get(conversation_id) {
-                let existing = existing.clone();
-                reservations.remove(conversation_id);
-                return Ok(existing);
-            }
-            runtimes.insert(
-                conversation_id.to_string(),
-                ConversationHandle {
-                    event_tx,
-                    acknowledged_event_tx,
-                    turn_trigger,
-                    broadcast_tx: broadcaster,
-                    identity,
-                    state_rx,
-                },
-            );
-            // The live handle and reservation hand-off change atomically under
-            // the same lock order used by `conversation_broadcaster`.
-            reservations.remove(conversation_id);
+            barrier.wait().await;
+            barrier.wait().await;
         }
 
-        tokio::spawn(async move {
-            let disposition = runtime.run().await;
-            if disposition == executor::RuntimeExitDisposition::AbandonStreamIncarnation {
-                let creations_guard = manager_for_cleanup.runtime_creations.lock().await;
-                let removed = manager_for_cleanup
-                    .abandon_incarnation_while_creations_locked(
-                        &conv_id,
-                        Some(&cleanup_identity),
-                        &cleanup_broadcaster,
-                    )
-                    .await;
-                drop(creations_guard);
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    removed_exact_runtime = removed,
-                    "Ambiguous runtime incarnation abandoned"
-                );
-                return;
-            }
-            manager_for_cleanup
-                .handle_runtime_exit(&cleanup_conversation, disposition)
-                .await;
-
-            let removed = {
-                let mut runtimes = manager_for_cleanup.runtimes.write().await;
-                if runtimes
-                    .get(&conv_id)
-                    .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
-                {
-                    runtimes.remove(&conv_id);
-                    true
-                } else {
-                    false
-                }
-            };
-            if removed {
-                tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
-            } else {
-                tracing::debug!(
-                    conv_id = %conv_id,
-                    "Runtime cleanup: entry replaced after eviction, skipping remove"
-                );
-            }
-        });
-
+        let publication = self
+            .publish_runtime_if_incarnation_live(
+                conversation_id,
+                result_tx,
+                handle,
+                runtime,
+                cleanup_conversation,
+            )
+            .await;
         drop(steering_projection_guard);
 
-        Ok(handle)
+        match publication {
+            RuntimePublicationOutcome::Published { handle } => {
+                drop(handle);
+                Ok(RuntimeMaterializationSuccess::Published)
+            }
+            RuntimePublicationOutcome::Abandoned { broadcaster } => {
+                Err(RuntimeMaterializationError::AbandonIncarnation {
+                    error: "runtime broadcaster was abandoned before publication".to_string(),
+                    broadcaster,
+                })
+            }
+        }
     }
 
     /// Inject a fake live handle carrying a specific `ConvState` into the
@@ -3921,28 +4015,22 @@ impl RuntimeManager {
         conversation_id: &str,
         reason: EvictionReason,
     ) {
-        let old = {
-            let mut runtimes = self.runtimes.write().await;
-            let mut reservations = self.evicted_broadcasters.write().await;
-            let old = runtimes.remove(conversation_id);
-            if let Some(handle) = &old {
-                reservations.insert(conversation_id.to_string(), handle.broadcast_tx.clone());
-            }
-            old
-        };
-
-        // Record the cause unconditionally (even if no runtime was live): the
-        // next get_or_create recreates the conversation with the new model and
-        // its recovery message should name the real cause (task 02710).
+        let mut runtimes = self.runtimes.write().await;
+        let mut reservations = self.evicted_broadcasters.write().await;
+        let mut model_upgrades = self.evicted_model_upgrades.write().await;
+        let old = runtimes.remove(conversation_id);
+        if let Some(handle) = &old {
+            reservations.insert(conversation_id.to_string(), handle.broadcast_tx.clone());
+        }
         match reason {
             EvictionReason::ModelUpgrade => {
-                self.evicted_model_upgrades
-                    .write()
-                    .await
-                    .insert(conversation_id.to_string());
+                model_upgrades.insert(conversation_id.to_string());
             }
             EvictionReason::CreationProvisioned | EvictionReason::SteeringReconciliation => {}
         }
+        drop(model_upgrades);
+        drop(reservations);
+        drop(runtimes);
 
         if let Some(handle) = old {
             let receivers = handle.broadcast_tx.receiver_count();
@@ -7190,6 +7278,129 @@ mod scope_liveness_tests {
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
         assert!(!needs_auto_continue);
+    }
+
+    async fn publication_test_manager(conversation_id: &str) -> Arc<RuntimeManager> {
+        let manager = Arc::new(test_manager().await);
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        manager
+    }
+
+    #[tokio::test]
+    async fn abandoned_candidate_cannot_publish_or_spawn_runtime() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let conversation_id = "publication-abandoned-candidate";
+        let manager = publication_test_manager(conversation_id).await;
+        let candidate = manager.conversation_broadcaster(conversation_id).await;
+        let mut subscriber = candidate.subscribe();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_publication_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let owner = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let mut waiter = Box::pin(manager.get_or_create(conversation_id));
+        assert!(matches!(
+            futures::poll!(&mut waiter),
+            std::task::Poll::Pending
+        ));
+
+        let creations = manager.runtime_creations.lock().await;
+        manager
+            .abandon_incarnation_while_creations_locked(conversation_id, None, &candidate)
+            .await;
+        drop(creations);
+        barrier.wait().await;
+
+        let Err(error) = owner.await.expect("owner task") else {
+            panic!("abandoned candidate must fail publication");
+        };
+        let Err(waiter_error) = waiter.await else {
+            panic!("joined waiter must fail with abandoned publication");
+        };
+        assert!(error.contains("abandoned before publication"));
+        assert_eq!(waiter_error, error);
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert_eq!(manager.runtime_executor_spawns.load(Ordering::Acquire), 0);
+        assert!(matches!(subscriber.try_recv(), Err(TryRecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn live_candidate_publication_spawns_and_publishes_once() {
+        let conversation_id = "publication-live-candidate";
+        let manager = publication_test_manager(conversation_id).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_publication_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let owner = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let waiter = Box::pin(manager.get_or_create(conversation_id));
+        barrier.wait().await;
+
+        let owner_handle = owner.await.expect("owner task").expect("owner handle");
+        let waiter_handle = waiter.await.expect("waiter handle");
+        assert!(Arc::ptr_eq(&owner_handle.identity, &waiter_handle.identity));
+        assert!(manager
+            .runtimes
+            .read()
+            .await
+            .get(conversation_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.identity, &owner_handle.identity)));
+        assert_eq!(manager.runtime_executor_spawns.load(Ordering::Acquire), 1);
+        assert!(!manager
+            .runtime_creations
+            .lock()
+            .await
+            .contains_key(conversation_id));
+    }
+
+    #[tokio::test]
+    async fn abandoning_distinct_old_broadcaster_does_not_block_candidate_publication() {
+        let conversation_id = "publication-distinct-old-incarnation";
+        let manager = publication_test_manager(conversation_id).await;
+        let candidate = manager.conversation_broadcaster(conversation_id).await;
+        let old = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_publication_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let owner = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+
+        let creations = manager.runtime_creations.lock().await;
+        assert!(
+            !manager
+                .abandon_incarnation_while_creations_locked(conversation_id, None, &old)
+                .await
+        );
+        drop(creations);
+        barrier.wait().await;
+
+        let handle = owner.await.expect("owner task").expect("published handle");
+        assert!(handle.broadcast_tx.same_channel(&candidate));
+        assert!(!handle.broadcast_tx.same_channel(&old));
+        assert_eq!(manager.runtime_executor_spawns.load(Ordering::Acquire), 1);
     }
 
     #[allow(clippy::too_many_lines)]

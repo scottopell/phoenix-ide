@@ -3729,9 +3729,16 @@ where
             }
             crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
                 span.record("outcome", "stale_authority");
-                self.active_direct_turn = None;
-                self.direct_turn_cancellation_initiated = false;
-                self.settle_turn_span();
+                tracing::warn!(
+                    parent: &span,
+                    conv_id = %self.context.conversation_id,
+                    turn_id = settlement.turn.turn_id.0,
+                    generation = settlement.turn.generation,
+                    terminal_kind = settlement.terminal.variant_name(),
+                    "Direct-turn settlement lost authority; abandoning stream incarnation"
+                );
+                self.pending_direct_turn_terminal = Some(terminal);
+                self.recovery_disposition = RuntimeRecoveryDisposition::AbandonStreamIncarnation;
             }
             crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous { error } => {
                 span.record("outcome", "ambiguous");
@@ -11515,7 +11522,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn stale_terminal_settlement_is_non_abandoning_and_non_broadcasting() {
+    async fn stale_terminal_settlement_abandons_without_projection_publication() {
         use tokio::sync::broadcast::error::TryRecvError;
 
         let (mut rt, storage, mut rx) = runtime(
@@ -11534,15 +11541,28 @@ mod authoritative_user_message_effect_tests {
             },
         ));
 
-        rt.persist_state_effect(false).await.unwrap();
+        rt.state = ConvState::Error {
+            message: "losing terminal projection".to_string(),
+            error_kind: crate::db::ErrorKind::ServerError,
+            resets_at: None,
+        };
+        rt.persist_state_effect(true).await.unwrap();
 
         assert_eq!(
             rt.recovery_disposition,
-            RuntimeRecoveryDisposition::Continue
+            RuntimeRecoveryDisposition::AbandonStreamIncarnation
         );
-        assert!(rt.active_direct_turn.is_none());
-        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(rt.active_direct_turn.is_some());
+        assert!(rt.pending_direct_turn_terminal.is_some());
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            rt.run().await,
+            RuntimeExitDisposition::AbandonStreamIncarnation
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty | TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]
