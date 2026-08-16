@@ -1,4 +1,5 @@
 use super::WorkflowRepository;
+use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -1006,30 +1007,42 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let mut tx = self.begin_tx().await?;
-        let outcome = crate::persist_continuation_start_tx(
-            &mut tx.tx,
-            &input.conversation_id,
-            &input.operation_id,
-            &input.message,
-            &input.completed_state,
-            input.state_updated_at,
-        )
-        .await?;
-        match outcome {
-            crate::ContinuationCommitOutcome::Applied => {
-                self.terminalize_authoritative_turn_in_tx(
-                    &mut tx,
-                    &TerminalizeAuthoritativeTurnInput {
-                        command: input.command.clone(),
-                        projection: Some(PersistedConversationProjection {
-                            state: input.completed_state.clone(),
-                            state_updated_at: input.state_updated_at,
-                        }),
-                    },
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+            .await?;
+        let outcome = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                let outcome = crate::persist_continuation_start_tx(
+                    &mut tx.tx,
+                    &input.conversation_id,
+                    &input.operation_id,
+                    &input.message,
+                    &input.completed_state,
+                    input.state_updated_at,
                 )
                 .await?;
-                tx.commit().await?;
+                if outcome == crate::ContinuationCommitOutcome::Applied {
+                    self.terminalize_authoritative_turn_in_tx(
+                        &mut tx,
+                        &TerminalizeAuthoritativeTurnInput {
+                            command: input.command.clone(),
+                            projection: Some(PersistedConversationProjection {
+                                state: input.completed_state.clone(),
+                                state_updated_at: input.state_updated_at,
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+                Ok(outcome)
+            })
+            .await?;
+        match outcome {
+            crate::ContinuationCommitOutcome::Applied => {
+                telemetry
+                    .observe_db(SqlitePhase::Commit, tx.commit())
+                    .await?;
             }
             crate::ContinuationCommitOutcome::Duplicate
             | crate::ContinuationCommitOutcome::Stale => tx.rollback().await?,
@@ -1042,38 +1055,50 @@ impl WorkflowRepository {
         conversation_id: &str,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<Option<String>> {
-        let mut tx = self.begin_tx().await?;
-        let summary = crate::reconcile_legacy_half_committed_continuation_tx(
-            &mut tx.tx,
-            conversation_id,
-            state_updated_at,
-        )
-        .await?;
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+            .await?;
+        let summary = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                let summary = crate::reconcile_legacy_half_committed_continuation_tx(
+                    &mut tx.tx,
+                    conversation_id,
+                    state_updated_at,
+                )
+                .await?;
+                let Some(summary) = summary else {
+                    return Ok(None);
+                };
+
+                let conversation = ConversationAuthority(conversation_id.to_string());
+                if let Some(turn) =
+                    load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
+                {
+                    self.terminalize_authoritative_turn_in_tx(
+                        &mut tx,
+                        &TerminalizeAuthoritativeTurnInput {
+                            command: TurnCommand::Fail {
+                                turn_id: turn.id,
+                                expected_generation: turn.generation,
+                                reason: "legacy continuation operation interrupted after summary persistence"
+                                    .to_string(),
+                            },
+                            projection: None,
+                        },
+                    )
+                    .await?;
+                }
+                Ok(Some(summary))
+            })
+            .await?;
         let Some(summary) = summary else {
             tx.rollback().await?;
             return Ok(None);
         };
-
-        let conversation = ConversationAuthority(conversation_id.to_string());
-        if let Some(turn) =
-            load_active_runtime_turn_tx(&self.pool, &mut tx.tx, &conversation).await?
-        {
-            self.terminalize_authoritative_turn_in_tx(
-                &mut tx,
-                &TerminalizeAuthoritativeTurnInput {
-                    command: TurnCommand::Fail {
-                        turn_id: turn.id,
-                        expected_generation: turn.generation,
-                        reason:
-                            "legacy continuation operation interrupted after summary persistence"
-                                .to_string(),
-                    },
-                    projection: None,
-                },
-            )
+        telemetry
+            .observe_db(SqlitePhase::Commit, tx.commit())
             .await?;
-        }
-        tx.commit().await?;
         Ok(Some(summary))
     }
 
@@ -1081,49 +1106,50 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let mut tx = self.begin_tx().await?;
-        let outcome = crate::commit_continuation_tx(
-            &mut tx.tx,
-            &input.conversation_id,
-            &input.operation_id,
-            &input.message,
-            &input.completed_state,
-            input.state_updated_at,
-        )
-        .await?;
-        match outcome {
-            crate::ContinuationCommitOutcome::Applied => {
-                self.terminalize_authoritative_turn_in_tx(
-                    &mut tx,
-                    &TerminalizeAuthoritativeTurnInput {
-                        command: input.command.clone(),
-                        projection: Some(PersistedConversationProjection {
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
+            .await?;
+        let outcome = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                let outcome = crate::commit_continuation_tx(
+                    &mut tx.tx,
+                    &input.conversation_id,
+                    &input.operation_id,
+                    &input.message,
+                    &input.completed_state,
+                    input.state_updated_at,
+                )
+                .await?;
+                let projection = match outcome {
+                    crate::ContinuationCommitOutcome::Applied => {
+                        Some(PersistedConversationProjection {
                             state: input.completed_state.clone(),
                             state_updated_at: input.state_updated_at,
-                        }),
-                    },
-                )
-                .await?;
-                tx.commit().await?;
-                Ok(crate::ContinuationCommitOutcome::Applied)
-            }
-            crate::ContinuationCommitOutcome::Duplicate => {
+                        })
+                    }
+                    crate::ContinuationCommitOutcome::Duplicate => None,
+                    crate::ContinuationCommitOutcome::Stale => return Ok(outcome),
+                };
                 self.terminalize_authoritative_turn_in_tx(
                     &mut tx,
                     &TerminalizeAuthoritativeTurnInput {
                         command: input.command.clone(),
-                        projection: None,
+                        projection,
                     },
                 )
                 .await?;
-                tx.commit().await?;
-                Ok(crate::ContinuationCommitOutcome::Duplicate)
-            }
-            crate::ContinuationCommitOutcome::Stale => {
-                tx.rollback().await?;
-                Ok(crate::ContinuationCommitOutcome::Stale)
-            }
+                Ok(outcome)
+            })
+            .await?;
+        if outcome == crate::ContinuationCommitOutcome::Stale {
+            tx.rollback().await?;
+        } else {
+            telemetry
+                .observe_db(SqlitePhase::Commit, tx.commit())
+                .await?;
         }
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -1147,11 +1173,26 @@ impl WorkflowRepository {
         input: &TerminalizeAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let mut tx = self.begin_tx().await?;
-        let step = self
-            .terminalize_authoritative_turn_in_tx(&mut tx, input)
+        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let mut tx = telemetry
+            .observe_db(SqlitePhase::TransactionAcquisition, self.begin_tx())
             .await?;
-        finish_workflow_transaction_at_cut(tx, cut).await?;
+        let step = telemetry
+            .observe_db(
+                SqlitePhase::Statement,
+                self.terminalize_authoritative_turn_in_tx(&mut tx, input),
+            )
+            .await?;
+        if cut == TransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(injected_cut(cut));
+        }
+        telemetry
+            .observe_db(SqlitePhase::Commit, tx.commit())
+            .await?;
+        if cut == TransactionCut::AfterCommit {
+            return Err(injected_cut(cut));
+        }
         Ok(step)
     }
 
@@ -2375,11 +2416,13 @@ fn map_constraint(error: sqlx::Error) -> DbError {
 mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
+    use crate::sqlite_telemetry::test_support::EventCapture;
     use crate::workflow::wake::{WakeRegistrationOutcome, WakeRepository};
     use crate::Database;
     use crate::LocalAttemptAuthority;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
+    use tracing_subscriber::prelude::*;
 
     async fn repo() -> WorkflowRepository {
         let db = Database::open_in_memory().await.unwrap();
@@ -3059,6 +3102,172 @@ mod tests {
                 .unwrap()
                 .generation,
             1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuation_settlement_contention_records_statement_failure() {
+        let (directory, setup_repo, _) = open_workflow_repo_pair().await;
+        let created = setup_repo
+            .accept_authoritative_turn(&input("conv-a", "continuation-contention", 9))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let operation_id = "continuation-contention-operation";
+        let awaiting = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: operation_id.to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&awaiting).unwrap())
+            .bind("awaiting_continuation")
+            .execute(&setup_repo.pool)
+            .await
+            .unwrap();
+        let completed = ConvState::ContextExhausted {
+            summary: "durable summary".to_string(),
+        };
+        let content = crate::MessageContent::continuation("durable summary");
+        let settlement = AtomicContinuationSettlementInput {
+            conversation_id: "conv-a".to_string(),
+            operation_id: operation_id.to_string(),
+            message: crate::Message {
+                message_id: format!("continuation-conv-a-{operation_id}"),
+                conversation_id: "conv-a".to_string(),
+                sequence_id: 1,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            },
+            completed_state: completed,
+            state_updated_at: Utc::now(),
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+        };
+
+        let path = directory.path().join("direct-turn.db");
+        let contending_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let contending_repo = WorkflowRepository::new(contending_pool);
+        let mut writer = setup_repo.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = contending_repo
+            .settle_continuation_direct_turn_atomically(&settlement)
+            .await
+            .unwrap_err();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        assert!(matches!(error, DbError::Sqlx(_)));
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("direct_turn.terminal_settlement")
+        );
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("statement")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_continuation_reconciliation_records_statement_failure() {
+        let (directory, setup_repo, _) = open_workflow_repo_pair().await;
+        let awaiting = ConvState::AwaitingContinuation {
+            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+                operation_id: phoenix_core::domain::sm_state::LEGACY_CONTINUATION_OPERATION_ID
+                    .to_string(),
+                rejected_tool_calls: Vec::new(),
+                attempt: 1,
+            },
+        };
+        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'conv-a'")
+            .bind(serde_json::to_string(&awaiting).unwrap())
+            .bind("awaiting_continuation")
+            .execute(&setup_repo.pool)
+            .await
+            .unwrap();
+        let content = crate::MessageContent::continuation("legacy durable summary");
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES ('legacy-continuation', 'conv-a', 1, 'continuation', ?1, ?2)",
+        )
+        .bind(serde_json::to_string(&content.to_stored_json()).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&setup_repo.pool)
+        .await
+        .unwrap();
+
+        let path = directory.path().join("direct-turn.db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+                    .unwrap()
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let contending_repo = WorkflowRepository::new(pool);
+        let mut writer = setup_repo.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = contending_repo
+            .reconcile_legacy_continuation_atomically("conv-a", Utc::now())
+            .await
+            .unwrap_err();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        assert!(matches!(error, DbError::Sqlx(_)));
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("direct_turn.terminal_settlement")
+        );
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("statement")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
         );
     }
 

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{Message, MessageType};
@@ -619,9 +620,14 @@ impl MessageRetriever for Fts5Retriever {
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
 pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    fts_upsert_conn(&mut tx, message).await?;
-    tx.commit().await?;
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+    let mut tx = telemetry
+        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+        .await?;
+    fts_upsert_conn_with_telemetry(&mut tx, message, &telemetry).await?;
+    telemetry
+        .observe_sqlx(SqlitePhase::Commit, tx.commit())
+        .await?;
     Ok(())
 }
 
@@ -638,35 +644,67 @@ pub async fn fts_upsert_conn(
     conn: &mut sqlx::SqliteConnection,
     message: &Message,
 ) -> Result<(), sqlx::Error> {
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+    fts_upsert_conn_with_telemetry(conn, message, &telemetry).await
+}
+
+pub(crate) async fn fts_upsert_conn_with_telemetry(
+    conn: &mut sqlx::SqliteConnection,
+    message: &Message,
+    telemetry: &SqliteTelemetry,
+) -> Result<(), sqlx::Error> {
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    delete_message_rows(conn, &message.message_id).await?;
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
-        .bind(text)
-        .execute(&mut *conn)
+    delete_message_rows(conn, &message.message_id, telemetry).await?;
+    let inserted = telemetry
+        .observe_sqlx(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+                .bind(text)
+                .execute(&mut *conn),
+        )
         .await?;
-    record_fts_row(conn, inserted.last_insert_rowid(), message, &fingerprint).await?;
+    record_fts_row(
+        conn,
+        inserted.last_insert_rowid(),
+        message,
+        &fingerprint,
+        telemetry,
+    )
+    .await?;
     Ok(())
 }
 
 async fn delete_message_rows(
     conn: &mut sqlx::SqliteConnection,
     message_id: &str,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    let rowids: Vec<i64> =
-        sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = ?1")
-            .bind(message_id)
-            .fetch_all(&mut *conn)
-            .await?;
+    let rowids: Vec<i64> = telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorLookup,
+            sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = ?1")
+                .bind(message_id)
+                .fetch_all(&mut *conn),
+        )
+        .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-            .bind(rowid)
-            .execute(&mut *conn)
+        telemetry
+            .observe_sqlx(
+                SqlitePhase::FtsRowDelete,
+                sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                    .bind(rowid)
+                    .execute(&mut *conn),
+            )
             .await?;
     }
-    sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
-        .bind(message_id)
-        .execute(&mut *conn)
+    telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorDelete,
+            sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
+                .bind(message_id)
+                .execute(&mut *conn),
+        )
         .await?;
     Ok(())
 }
@@ -676,20 +714,25 @@ async fn record_fts_row(
     fts_rowid: i64,
     message: &Message,
     fingerprint: &str,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO message_fts_rows
-         (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
-         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
-    )
-    .bind(fts_rowid)
-    .bind(&message.message_id)
-    .bind(&message.conversation_id)
-    .bind(message.message_type.to_string())
-    .bind(message.created_at.to_rfc3339())
-    .bind(fingerprint)
-    .execute(&mut *conn)
-    .await?;
+    telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorInsert,
+            sqlx::query(
+                "INSERT INTO message_fts_rows
+                 (fts_rowid, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash)
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
+            )
+            .bind(fts_rowid)
+            .bind(&message.message_id)
+            .bind(&message.conversation_id)
+            .bind(message.message_type.to_string())
+            .bind(message.created_at.to_rfc3339())
+            .bind(fingerprint)
+            .execute(&mut *conn),
+        )
+        .await?;
     Ok(())
 }
 
@@ -713,81 +756,118 @@ pub async fn fts_reconcile_upsert(
     message: &Message,
     observed: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsReconcileUpsert);
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    let mut tx = pool.begin().await?;
+    let mut tx = telemetry
+        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+        .await?;
     if let Some(prev) = observed {
         // Replace a stale row only while it still carries the observed hash.
-        let candidates: Vec<(i64, bool)> = sqlx::query(
-            "SELECT r.fts_rowid, f.rowid IS NOT NULL AS physical_match
-             FROM message_fts_rows r
-             LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
-             WHERE r.message_id = ?1 AND r.content_hash = ?2",
-        )
-        .bind(&message.message_id)
-        .bind(prev)
-        .try_map(|row: sqlx::sqlite::SqliteRow| {
-            Ok((
-                row.try_get::<i64, _>("fts_rowid")?,
-                row.try_get::<bool, _>("physical_match")?,
-            ))
-        })
-        .fetch_all(&mut *tx)
-        .await?;
+        let candidates: Vec<(i64, bool)> = telemetry
+            .observe_sqlx(
+                SqlitePhase::LocatorLookup,
+                sqlx::query(
+                    "SELECT r.fts_rowid, f.rowid IS NOT NULL AS physical_match
+                     FROM message_fts_rows r
+                     LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
+                     WHERE r.message_id = ?1 AND r.content_hash = ?2",
+                )
+                .bind(&message.message_id)
+                .bind(prev)
+                .try_map(|row: sqlx::sqlite::SqliteRow| {
+                    Ok((
+                        row.try_get::<i64, _>("fts_rowid")?,
+                        row.try_get::<bool, _>("physical_match")?,
+                    ))
+                })
+                .fetch_all(&mut *tx),
+            )
+            .await?;
         if candidates.is_empty() || candidates.iter().any(|(_, matches)| !matches) {
             tx.rollback().await?;
             return Ok(false);
         }
         for (rowid, _) in &candidates {
-            let deleted = sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-                .bind(rowid)
-                .execute(&mut *tx)
+            let deleted = telemetry
+                .observe_sqlx(
+                    SqlitePhase::FtsRowDelete,
+                    sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                        .bind(rowid)
+                        .execute(&mut *tx),
+                )
                 .await?;
             if deleted.rows_affected() != 1 {
                 tx.rollback().await?;
                 return Ok(false);
             }
-            sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
-                .bind(rowid)
-                .execute(&mut *tx)
+            telemetry
+                .observe_sqlx(
+                    SqlitePhase::LocatorDelete,
+                    sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
+                        .bind(rowid)
+                        .execute(&mut *tx),
+                )
                 .await?;
         }
     } else {
         // Insert an absent row only while it is still absent.
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE message_id = ?1")
-                .bind(&message.message_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let existing: i64 = telemetry
+            .observe_sqlx(
+                SqlitePhase::LocatorLookup,
+                sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE message_id = ?1")
+                    .bind(&message.message_id)
+                    .fetch_one(&mut *tx),
+            )
+            .await?;
         if existing > 0 {
             tx.rollback().await?;
             return Ok(false);
         }
     }
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
-        .bind(text)
-        .execute(&mut *tx)
+    let inserted = telemetry
+        .observe_sqlx(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+                .bind(text)
+                .execute(&mut *tx),
+        )
         .await?;
-    record_fts_row(&mut tx, inserted.last_insert_rowid(), message, &fingerprint).await?;
-    tx.commit().await?;
+    record_fts_row(
+        &mut tx,
+        inserted.last_insert_rowid(),
+        message,
+        &fingerprint,
+        &telemetry,
+    )
+    .await?;
+    telemetry
+        .observe_sqlx(SqlitePhase::Commit, tx.commit())
+        .await?;
     Ok(true)
 }
 
 pub(crate) async fn fts_index_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id).await?;
+    delete_message_rows(tx, &message.message_id, telemetry).await?;
     let text = index_text(message);
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
-        .bind(&text)
-        .execute(&mut **tx)
+    let inserted = telemetry
+        .observe_sqlx(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+                .bind(&text)
+                .execute(&mut **tx),
+        )
         .await?;
     record_fts_row(
         tx,
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(&text),
+        telemetry,
     )
     .await
 }
@@ -795,16 +875,21 @@ pub(crate) async fn fts_index_message_tx(
 pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    telemetry: &SqliteTelemetry,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id).await?;
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES ('')")
-        .execute(&mut **tx)
+    delete_message_rows(tx, &message.message_id, telemetry).await?;
+    let inserted = telemetry
+        .observe_sqlx(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES ('')").execute(&mut **tx),
+        )
         .await?;
     record_fts_row(
         tx,
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(""),
+        telemetry,
     )
     .await
 }
@@ -814,9 +899,14 @@ pub(crate) async fn fts_hide_message_tx(
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete fails.
 pub async fn fts_delete_message(pool: &SqlitePool, message_id: &str) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    delete_message_rows(&mut tx, message_id).await?;
-    tx.commit().await?;
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteMessage);
+    let mut tx = telemetry
+        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+        .await?;
+    delete_message_rows(&mut tx, message_id, &telemetry).await?;
+    telemetry
+        .observe_sqlx(SqlitePhase::Commit, tx.commit())
+        .await?;
     Ok(())
 }
 
@@ -829,9 +919,14 @@ pub async fn fts_delete_conversation(
     pool: &SqlitePool,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    fts_delete_conversation_conn(&mut tx, conversation_id).await?;
-    tx.commit().await?;
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+    let mut tx = telemetry
+        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+        .await?;
+    fts_delete_conversation_conn_with_telemetry(&mut tx, conversation_id, &telemetry).await?;
+    telemetry
+        .observe_sqlx(SqlitePhase::Commit, tx.commit())
+        .await?;
     Ok(())
 }
 
@@ -847,20 +942,40 @@ pub async fn fts_delete_conversation_conn(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let rowids: Vec<i64> =
-        sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
-            .bind(conversation_id)
-            .fetch_all(&mut *conn)
-            .await?;
+    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+    fts_delete_conversation_conn_with_telemetry(conn, conversation_id, &telemetry).await
+}
+
+pub(crate) async fn fts_delete_conversation_conn_with_telemetry(
+    conn: &mut sqlx::SqliteConnection,
+    conversation_id: &str,
+    telemetry: &SqliteTelemetry,
+) -> Result<(), sqlx::Error> {
+    let rowids: Vec<i64> = telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorLookup,
+            sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .fetch_all(&mut *conn),
+        )
+        .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-            .bind(rowid)
-            .execute(&mut *conn)
+        telemetry
+            .observe_sqlx(
+                SqlitePhase::FtsRowDelete,
+                sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                    .bind(rowid)
+                    .execute(&mut *conn),
+            )
             .await?;
     }
-    sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
-        .bind(conversation_id)
-        .execute(&mut *conn)
+    telemetry
+        .observe_sqlx(
+            SqlitePhase::LocatorDelete,
+            sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut *conn),
+        )
         .await?;
     Ok(())
 }

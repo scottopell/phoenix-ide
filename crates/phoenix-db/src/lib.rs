@@ -8,6 +8,7 @@ mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
+mod sqlite_telemetry;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
@@ -45,6 +46,7 @@ use phoenix_core::domain::llm_types::{
     ProviderStreamTelemetry, ServiceTier, StreamTelemetryOutputKind,
 };
 use serde::{Deserialize, Serialize};
+use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -6642,116 +6644,149 @@ impl Database {
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE work_scopes SET authority_kind = 'work', updated_at = ?1 WHERE id = ?2",
-        )
-        .bind(&now_str)
-        .bind(work_scope_id.as_str())
-        .execute(&mut *tx)
-        .await?;
-        Self::update_work_scope_environment_tx(
-            &mut tx,
-            &work_scope_id,
-            Self::environment_for_mode(&approval.worktree_path, &cm),
-            &now_str,
-        )
-        .await?;
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::CreateTaskApprovalHandoff);
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
+        fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query(
+                    "UPDATE work_scopes SET authority_kind = 'work', updated_at = ?1 WHERE id = ?2",
+                )
+                .bind(&now_str)
+                .bind(work_scope_id.as_str())
+                .execute(&mut *tx),
+            )
+            .await?;
+        fts_telemetry
+            .observe_db(
+                SqlitePhase::Statement,
+                Self::update_work_scope_environment_tx(
+                    &mut tx,
+                    &work_scope_id,
+                    Self::environment_for_mode(&approval.worktree_path, &cm),
+                    &now_str,
+                ),
+            )
+            .await?;
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
-            let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, service_tier)
+            let inserted = fts_telemetry
+                .observe_sqlx(SqlitePhase::Statement, async {
+                    match sqlx::query(
+                        "INSERT INTO conversations (id, slug, title, parent_conversation_id, user_initiated, state, state_kind, state_updated_at, created_at, updated_at, archived, transcript_generation, model, effort, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint, runtime_role, work_scope_id, service_tier)
                  VALUES (?1, ?2, ?3, NULL, 1, ?4, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11, ?12, ?13, ?14, ?15, 'user', ?16, ?17)",
-            )
-            .bind(&new_id)
-            .bind(&candidate_slug)
-            .bind(&title_for_insert)
-            .bind(&seeded_state)
-            .bind(conv_state_kind(&ConvState::SeededLlmRequesting {
-                seed_message_id: seed_message_id.clone(),
-                attempt: 1,
-            }))
-            .bind(&now_str)
-            .bind(parent.model.as_deref())
-            .bind(parent.effort.map(ModelEffort::as_wire_name))
-            .bind(parent.project_id.as_deref())
-            .bind(parent.desired_base_branch.as_deref())
-            .bind(parent.llm_language.as_str())
-            .bind(cm.kind)
-            .bind(cm.task_id)
-            .bind(cm.task_title)
-            .bind(cm.next_taskmd_id_hint)
-            .bind(work_scope_id.as_str())
-            .bind(parent.service_tier.as_wire_name())
-            .execute(&mut *tx)
-            .await;
+                    )
+                    .bind(&new_id)
+                    .bind(&candidate_slug)
+                    .bind(&title_for_insert)
+                    .bind(&seeded_state)
+                    .bind(conv_state_kind(&ConvState::SeededLlmRequesting {
+                        seed_message_id: seed_message_id.clone(),
+                        attempt: 1,
+                    }))
+                    .bind(&now_str)
+                    .bind(parent.model.as_deref())
+                    .bind(parent.effort.map(ModelEffort::as_wire_name))
+                    .bind(parent.project_id.as_deref())
+                    .bind(parent.desired_base_branch.as_deref())
+                    .bind(parent.llm_language.as_str())
+                    .bind(cm.kind)
+                    .bind(cm.task_id)
+                    .bind(cm.task_title)
+                    .bind(cm.next_taskmd_id_hint)
+                    .bind(work_scope_id.as_str())
+                    .bind(parent.service_tier.as_wire_name())
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        Ok(_) => Ok(true),
+                        Err(sqlx::Error::Database(ref error))
+                            if is_sqlite_unique_constraint(error.as_ref()) =>
+                        {
+                            Ok(false)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+                .await?;
 
-            match result {
-                Ok(_) => break candidate_slug,
-                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
-                    slug_offset += 1;
-                    candidate_slug = if slug_offset <= 20 {
-                        format!("{base_slug}-{}", slug_offset + 1)
-                    } else {
-                        let uid = uuid::Uuid::new_v4().to_string();
-                        format!("{base_slug}-{}", uid.get(..8).unwrap_or(&uid))
-                    };
-                }
-                Err(e) => return Err(DbError::Sqlx(e)),
+            if inserted {
+                break candidate_slug;
             }
+            slug_offset += 1;
+            candidate_slug = if slug_offset <= 20 {
+                format!("{base_slug}-{}", slug_offset + 1)
+            } else {
+                let uid = uuid::Uuid::new_v4().to_string();
+                format!("{base_slug}-{}", uid.get(..8).unwrap_or(&uid))
+            };
         };
 
-        sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Statement, sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL, ?6)",
-        )
-        .bind(&seed_message_id)
-        .bind(&new_id)
-        .bind(seed_content.message_type().to_string())
-        .bind(&seed_content_str)
-        .bind(&seed_display_str)
-        .bind(&now_str)
-        .execute(&mut *tx)
-        .await?;
+            )
+            .bind(&seed_message_id)
+            .bind(&new_id)
+            .bind(seed_content.message_type().to_string())
+            .bind(&seed_content_str)
+            .bind(&seed_display_str)
+            .bind(&now_str)
+            .execute(&mut *tx))
+            .await?;
         // Uniform with every other user/skill write: attachments (none for a
         // meta seed today) live in the child tables, never the content blob.
-        insert_message_attachments(&mut tx, &seed_message_id, &seed_content).await?;
+        fts_telemetry
+            .observe_db(
+                SqlitePhase::Statement,
+                insert_message_attachments(&mut tx, &seed_message_id, &seed_content),
+            )
+            .await?;
 
-        let parent_next_sequence_id: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-        )
-        .bind(parent_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let parent_next_sequence_id: i64 = fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+                )
+                .bind(parent_id)
+                .fetch_one(&mut *tx),
+            )
+            .await?;
 
         let handoff_summary_msg_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Statement, sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
-        )
-        .bind(&handoff_summary_msg_id)
-        .bind(parent_id)
-        .bind(parent_next_sequence_id)
-        .bind(handoff_summary.message_type().to_string())
-        .bind(&handoff_summary_str)
-        .bind(&now_str)
-        .execute(&mut *tx)
-        .await?;
+            )
+            .bind(&handoff_summary_msg_id)
+            .bind(parent_id)
+            .bind(parent_next_sequence_id)
+            .bind(handoff_summary.message_type().to_string())
+            .bind(&handoff_summary_str)
+            .bind(&now_str)
+            .execute(&mut *tx))
+            .await?;
 
-        let updated = sqlx::query(
-            "UPDATE conversations
+        let updated = fts_telemetry
+            .observe_sqlx(SqlitePhase::Statement, sqlx::query(
+                "UPDATE conversations
              SET continued_in_conv_id = ?1, state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4
              WHERE id = ?5 AND continued_in_conv_id IS NULL",
-        )
-        .bind(&new_id)
-        .bind(&handed_off_state)
-        .bind(conv_state_kind(&ConvState::HandedOff {
-            successor_conv_id: new_id.clone(),
-        }))
-        .bind(&now_str)
-        .bind(parent_id)
-        .execute(&mut *tx)
-        .await?;
+            )
+            .bind(&new_id)
+            .bind(&handed_off_state)
+            .bind(conv_state_kind(&ConvState::HandedOff {
+                successor_conv_id: new_id.clone(),
+            }))
+            .bind(&now_str)
+            .bind(parent_id)
+            .execute(&mut *tx))
+            .await?;
         if updated.rows_affected() == 0 {
             drop(tx);
             let refetched = self.get_conversation(parent_id).await?;
@@ -6786,10 +6821,12 @@ impl Database {
             usage_data: None,
             created_at: now,
         };
-        retrieval::fts_upsert_conn(&mut tx, &seed_msg).await?;
-        retrieval::fts_upsert_conn(&mut tx, &handoff_msg).await?;
+        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &seed_msg, &fts_telemetry).await?;
+        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &handoff_msg, &fts_telemetry).await?;
 
-        tx.commit().await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
 
         Ok(Conversation {
             id: new_id,
@@ -8196,26 +8233,39 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM workflows
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::ConversationDelete);
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
+        fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query(
+                    "DELETE FROM workflows
              WHERE workflow_id IN (
                  SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
              )",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
+                )
+                .bind(id)
+                .execute(&mut *tx),
+            )
+            .await?;
+        let result = fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query("DELETE FROM conversations WHERE id = ?1")
+                    .bind(id)
+                    .execute(&mut *tx),
+            )
             .await?;
         if result.rows_affected() == 0 {
             // tx dropped without commit → rollback.
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        retrieval::fts_delete_conversation_conn(&mut tx, id).await?;
-        tx.commit().await?;
+        retrieval::fts_delete_conversation_conn_with_telemetry(&mut tx, id, &fts_telemetry).await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
         Ok(())
     }
 
@@ -9296,40 +9346,53 @@ impl Database {
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let mut message = self.get_message_by_id(message_id).await?;
         message.display_data = Some(display_data.clone());
-        let mut tx = self.pool.begin().await?;
-        let conversation_id: Option<String> = sqlx::query_scalar(
-            "UPDATE messages
-             SET display_data = ?1
-             WHERE message_id = ?2
-             RETURNING conversation_id",
-        )
-        .bind(&display_str)
-        .bind(message_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(conversation_id) = conversation_id else {
-            tx.rollback().await?;
-            return Err(DbError::MessageNotFound(message_id.to_string()));
-        };
-        let transcript_generation: i64 = sqlx::query_scalar(
-            "UPDATE conversations
-             SET transcript_generation = transcript_generation + 1
-             WHERE id = ?1
-             RETURNING transcript_generation",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await?;
         let hidden = display_data
             .get("hidden")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::UpdateMessageDisplayData);
+        let mut tx = fts_telemetry
+            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+            .await?;
+        let conversation_id: Option<String> = fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query_scalar(
+                    "UPDATE messages
+             SET display_data = ?1
+             WHERE message_id = ?2
+             RETURNING conversation_id",
+                )
+                .bind(&display_str)
+                .bind(message_id)
+                .fetch_optional(&mut *tx),
+            )
+            .await?;
+        let Some(conversation_id) = conversation_id else {
+            tx.rollback().await?;
+            return Err(DbError::MessageNotFound(message_id.to_string()));
+        };
+        let transcript_generation: i64 = fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query_scalar(
+                    "UPDATE conversations
+             SET transcript_generation = transcript_generation + 1
+             WHERE id = ?1
+             RETURNING transcript_generation",
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx),
+            )
+            .await?;
         if hidden {
-            retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+            retrieval::fts_hide_message_tx(&mut tx, &message, &fts_telemetry).await?;
         } else {
-            retrieval::fts_index_message_tx(&mut tx, &message).await?;
+            retrieval::fts_index_message_tx(&mut tx, &message, &fts_telemetry).await?;
         }
-        tx.commit().await?;
+        fts_telemetry
+            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .await?;
         Ok(transcript_generation)
     }
 

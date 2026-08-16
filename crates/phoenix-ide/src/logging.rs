@@ -35,6 +35,9 @@ mod rotation;
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+const SQLITE_FAILURE_LOG_DIRECTIVE: &str = "phoenix_db::observability=error";
+const DEFAULT_LOG_FILTER: &str =
+    "phoenix_ide=debug,tower_http=debug,phoenix_db::observability=error";
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
 
 pub(crate) fn process_log_config() -> &'static LogConfig {
@@ -423,6 +426,7 @@ const OTEL_SPANS: &[(&str, &str)] = &[
     ("phoenix_ide::otel", "direct_turn.settle"),
     ("phoenix_ide::otel", "tool.execute"),
     ("phoenix_llm::otel", "llm.request"),
+    ("phoenix_db::otel", "db.failure"),
 ];
 
 pub(crate) fn conversation_cancel_span(conversation_id: &str) -> tracing::Span {
@@ -722,8 +726,36 @@ fn invalid_input<T>(message: impl Into<String>) -> std::io::Result<T> {
 /// Create a fresh `EnvFilter` from the environment. Used per-sink because
 /// `EnvFilter` does not implement Clone.
 fn make_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into())
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
+    ensure_sqlite_failure_events(filter)
+}
+
+fn ensure_sqlite_failure_events(filter: EnvFilter) -> EnvFilter {
+    if filter
+        .to_string()
+        .split(',')
+        .any(sqlite_failure_events_are_configured)
+    {
+        filter
+    } else {
+        filter.add_directive(
+            SQLITE_FAILURE_LOG_DIRECTIVE
+                .parse()
+                .expect("static SQLite failure log directive is valid"),
+        )
+    }
+}
+
+fn sqlite_failure_events_are_configured(directive: &str) -> bool {
+    if directive
+        .parse::<tracing::level_filters::LevelFilter>()
+        .is_ok()
+    {
+        return true;
+    }
+    directive
+        .rsplit_once('=')
+        .is_some_and(|(target, _)| matches!(target, "phoenix_db" | "phoenix_db::observability"))
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -849,6 +881,21 @@ mod tests {
             continuation_settlement.record("outcome", "reconciled_duplicate");
             continuation_settlement.record("commit_probe", "retry");
             drop(continuation_settlement);
+            let db_failure = tracing::error_span!(
+                target: "phoenix_db::otel",
+                parent: &turn,
+                "db.failure",
+                db.system = "sqlite",
+                db.operation = "direct_turn.terminal_settlement",
+                db.phase = "commit",
+                db.error.kind = "database",
+                db.elapsed_ms = 12_u64,
+                db.phase_elapsed_ms = 3_u64,
+                db.sqlite.primary_code = 5_i64,
+                db.sqlite.extended_code = 517_i64,
+                otel.status_code = "ERROR",
+            );
+            drop(db_failure);
             drop(turn);
             let llm = tracing::info_span!(
                 target: "phoenix_llm::otel",
@@ -898,7 +945,7 @@ mod tests {
         provider.force_flush().expect("flush spans");
 
         let spans = exporter.get_finished_spans().expect("exported spans");
-        assert_eq!(spans.len(), 10);
+        assert_eq!(spans.len(), 11);
         assert_eq!(
             spans
                 .iter()
@@ -913,6 +960,7 @@ mod tests {
                 "browser.conversation_open",
                 "direct_turn.settle",
                 "direct_turn.settle",
+                "db.failure",
                 "conversation.turn",
                 "llm.request"
             ]
@@ -933,6 +981,38 @@ mod tests {
             "TTFT must remain numeric for TraceQL comparisons: {:?}",
             ttft.value
         );
+        let db_failure = spans
+            .iter()
+            .find(|span| span.name == "db.failure")
+            .expect("database failure span exported");
+        let primary_code = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.sqlite.primary_code")
+            .expect("primary SQLite code exported");
+        let extended_code = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.sqlite.extended_code")
+            .expect("extended SQLite code exported");
+        let error_kind = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.error.kind")
+            .expect("bounded database error kind exported");
+        assert!(matches!(primary_code.value, opentelemetry::Value::I64(5)));
+        assert!(matches!(
+            extended_code.value,
+            opentelemetry::Value::I64(517)
+        ));
+        assert!(matches!(
+            &error_kind.value,
+            opentelemetry::Value::String(value) if value.as_str() == "database"
+        ));
+        assert!(matches!(
+            db_failure.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
         for required in [
             "gpt-test",
             "openai",
@@ -988,6 +1068,43 @@ mod tests {
     #[test]
     fn stdout_defaults_on_when_unset() {
         assert!(stdout_enabled(None));
+    }
+
+    #[test]
+    fn default_log_filter_keeps_sqlite_failure_events() {
+        let filter = EnvFilter::try_new(DEFAULT_LOG_FILTER).unwrap();
+        assert!(filter
+            .to_string()
+            .split(',')
+            .any(|directive| directive == "phoenix_db::observability=error"));
+    }
+
+    #[test]
+    fn supplied_log_filter_keeps_sqlite_failures_unless_explicitly_configured() {
+        let filter = ensure_sqlite_failure_events(EnvFilter::try_new("phoenix_ide=info").unwrap());
+        assert!(filter
+            .to_string()
+            .split(',')
+            .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE));
+
+        let explicit = ensure_sqlite_failure_events(
+            EnvFilter::try_new("phoenix_db::observability=off").unwrap(),
+        );
+        assert!(explicit
+            .to_string()
+            .split(',')
+            .any(|directive| directive == "phoenix_db::observability=off"));
+
+        for broad in ["off", "warn", "phoenix_db=off", "phoenix_db=info"] {
+            let filter = ensure_sqlite_failure_events(EnvFilter::try_new(broad).unwrap());
+            assert!(
+                !filter
+                    .to_string()
+                    .split(',')
+                    .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE),
+                "{broad} already configures the SQLite failure target"
+            );
+        }
     }
 
     #[test]
