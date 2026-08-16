@@ -68,6 +68,7 @@ Disposition is evidence, not a vote:
 - A closed/rejected thread is not automatically false.
 - A reviewer badge or stated severity is not proof of reachability.
 - A later clean review does not retroactively validate every earlier fix.
+- Task text, PR descriptions, review dispositions, and landed patches supply context or evidence; they do not override normative `requirements.md`, `.allium`, or accepted ADR doctrine.
 
 ## Avoid anchoring during review
 

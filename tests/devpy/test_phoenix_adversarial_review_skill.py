@@ -49,6 +49,19 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
         self.assertIn("states the direction and commit distance", evidence)
         self.assertIn("cannot reveal self-review misses", evidence)
 
+    def test_durable_doctrine_separates_publication_local_loss_and_external_ambiguity(self):
+        probes = (SKILL_DIR / "references" / "probes.md").read_text()
+        for concept in (
+            "Transaction / publication",
+            "Local SQLite authority loss",
+            "exact-query-or-fail-stop",
+            "External ambiguity",
+            "committed authoritative SQLite rows and durable time",
+        ):
+            self.assertIn(concept, probes)
+        self.assertIn("Task/PR intent supplies scope and non-goal context", self.text)
+        self.assertIn("Do not apply this rule to genuine external ambiguity", self.text)
+
     def test_finding_contract_requires_reachable_failure_and_counterevidence(self):
         for field in ("**Anchor:**", "**Trigger:**", "**Mechanism:**", "**Impact:**"):
             self.assertIn(field, self.text)

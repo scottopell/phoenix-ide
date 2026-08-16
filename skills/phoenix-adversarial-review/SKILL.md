@@ -8,7 +8,7 @@ argument-hint: <diff-or-pr-scope>
 
 Try to break the change, not explain it. A useful review produces a small set of source-grounded defects—or says that no candidate survived falsification.
 
-Repository requirements, Allium, ADRs, and task/PR intent are authorities. Prior reviews, production records, and Codex findings are evidence, never requirements.
+Repository `requirements.md` files and `.allium` specs are normative behavior authorities. ADRs are authoritative decision history and doctrine. Task/PR intent supplies scope and non-goal context; it does not override those authorities. Prior reviews, production records, and Codex findings are evidence, never requirements.
 
 ## 1. Freeze the review target
 
@@ -36,7 +36,9 @@ Then state privately:
 - the invariants the change relies on;
 - producers, durable owners, and consumers of changed data;
 - boundaries crossed: UI, API/SSE, runtime, persistence, provider/tool, process, host, or Git;
-- what can outlive the request, process, worktree, or deployment.
+- what can outlive the request, process, worktree, or deployment;
+- which facts committed SQLite rows and durable time own, versus which process-local runtimes, tasks, timers, kicks, queues, SSE streams, caches, and UI views merely project;
+- which outcomes are local SQLite authority results versus genuinely ambiguous external outcomes with feature-owned recovery contracts.
 
 Do not review only the edited lines. Trace one layer upstream and downstream of every changed contract.
 
@@ -48,13 +50,14 @@ Always perform these gap-informed moves when applicable:
 
 - **Producer/consumer literal check:** compare discriminants, marker strings, field names, enum cases, encodings, and defaults at the exact write and read sites. Do not infer parity from shared terminology.
 - **Incarnation check:** follow identity creation through restart, respawn, retry, rekey, migration, and reuse. An identity assigned correctly at construction may become stale when the resource is replaced in place.
-- **Recovery without memory check:** erase process-local registries and caches mentally. Verify durable identity can reconstruct or safely reject surviving external resources.
-- **Commit-before-effect check:** at every async boundary, cancellation path, or error return, ask which state/effect has already happened and whether its durable owner was established first.
+- **Recovery without process identity check:** erase process-local runtimes, tasks, timers, kicks, queues, SSE streams, and caches mentally. Verify another process can discover unfinished obligations from committed SQLite rows and durable time; process-local continuity may improve latency but must be disposable.
+- **Commit-before-publication check:** distinguish a privately proposed transition from adopted committed state. For direct-turn semantic state, verify the owning SQLite transaction commits materialization and reducer projection before observer publication or use by routing/admission; stale, replayed, or failed materialization must not leak the proposal.
+- **Local-authority loss check:** when an authoritative same-process SQLite command returns no typed result, permit at most one exact classification query against the rows owning the needed fact. If it cannot classify the fact, require process fail-stop without semantic uncertainty state, continued admission/publication, or cleanup through the suspect persistence path. Do not apply this rule to genuine external ambiguity.
 - **One-authority check:** look for two representations, selectors, caches, timestamps, or status fields claiming the same fact.
 - **Error-path data check:** follow observations and state changes through `Err`, timeout, stale, duplicate, partial-success, and cleanup paths—not only returned success values.
 - **Test oracle check:** mutate the behavior mentally. Would the test fail for the right reason, or only prove that a mock was called / an error occurred?
 
-For timer, retry, wake, cancellation, or concurrent code, trace causal completion and ownership. A sleep or timeout is not synchronization.
+For timer, retry, wake, cancellation, or concurrent code, trace causal completion, durable ownership, and publication ordering. A sleep or timeout is not synchronization. If a task owns the exact local SQLite authority boundary, panic, unexpected exit, or cancellation without a typed result selects the same exact-query-or-fail-stop rule; ordinary task failure remains feature-owned.
 
 ## 4. Falsify every candidate
 
@@ -140,6 +143,10 @@ If nothing survives falsification, say **“No actionable findings.”** Still r
 - Reporting raw inline-comment count as defect count.
 - Calling a same-PR review a near-match without inspecting ancestry and the intervening diff.
 - Treating Codex-wide trends as evidence that local reviewers missed those defects.
+- Treating task or PR wording as behavior authority over requirements, Allium, or ADR doctrine.
+- Publishing or adopting proposed direct-turn state before its owning materialization transaction commits.
+- Inventing conversation/workflow uncertainty, in-process runtime replacement, or cleanup after an unclassified local SQLite authority failure instead of exact-query-or-fail-stop.
+- Applying local SQLite fail-stop doctrine to genuine external ambiguity governed by a feature-owned recovery contract.
 - Treating lint/style, speculative future needs, or alternative taste as defects.
 - Severity inflation without a reachable failure scenario.
 - Duplicating one root cause at every symptom.
