@@ -5245,8 +5245,7 @@ where
                                     )
                                     .await;
                                 match recovery_result {
-                                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled
-                                    | crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled => {
                                         if let Some(span) = &settlement_span {
                                             span.record("outcome", "recovery_state_committed");
                                         }
@@ -5255,12 +5254,26 @@ where
                                         self.direct_turn_cancellation_initiated = false;
                                         self.settle_turn_span();
                                     }
+                                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                                        if let Some(span) = &settlement_span {
+                                            span.record("outcome", "recovery_settlement_stale");
+                                        }
+                                        self.pending_direct_turn_terminal = Some(Box::new(
+                                            crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
+                                                reason: error.clone(),
+                                            },
+                                        ));
+                                        self.recovery_disposition = RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                                        reserved_range.abandon();
+                                        return Ok(None);
+                                    }
                                     crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous { error } => {
                                         if let Some(span) = &settlement_span {
                                             span.record("outcome", "recovery_settlement_ambiguous");
                                             span.record("error.message", error.as_str());
                                         }
                                         self.recovery_disposition = RuntimeRecoveryDisposition::AbandonStreamIncarnation;
+                                        reserved_range.abandon();
                                         return Ok(None);
                                     }
                                 }
@@ -11161,6 +11174,83 @@ mod authoritative_user_message_effect_tests {
                 .unwrap(),
             ConvState::RecoverableContinuationFailure { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_continuation_fallback_abandons_reserved_projection_and_queue() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage, mut rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let request = phoenix_core::domain::sm_state::ContinuationSummaryRequest {
+            operation_id: "stale-fallback".to_string(),
+            rejected_tool_calls: Vec::new(),
+            attempt: 1,
+        };
+        let winner_state = ConvState::AwaitingContinuation {
+            request: request.clone(),
+        };
+        storage
+            .update_state(&rt.context.conversation_id, &winner_state, Utc::now())
+            .await
+            .unwrap();
+        storage.set_active_direct_turn(Some(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(41),
+            generation: 0,
+        }));
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(41),
+            generation: 0,
+        }));
+        rt.state = ConvState::ContextExhausted {
+            summary: "losing summary".to_string(),
+        };
+        storage.set_fail_continuation_commit(true);
+        storage.set_settle_active_direct_turn_stale_once();
+        let (settlement_started, release_settlement) = storage.gate_active_direct_turn_settlement();
+        let broadcaster = rt.broadcast_tx.clone();
+
+        let (result, ()) = tokio::join!(
+            rt.execute_effect(Effect::ContinuationCommit {
+                request,
+                summary: "losing summary".to_string(),
+            }),
+            async {
+                settlement_started
+                    .await
+                    .expect("fallback settlement starts");
+                broadcaster
+                    .send_seq(|sequence_id| SseEvent::AgentDone { sequence_id })
+                    .expect("event queues above reserved fallback state");
+                release_settlement
+                    .send(())
+                    .expect("release stale settlement");
+            }
+        );
+        result.unwrap();
+
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::AbandonStreamIncarnation
+        );
+        assert!(rt.active_direct_turn.is_some());
+        assert!(rt.pending_direct_turn_terminal.is_some());
+        assert_eq!(
+            storage
+                .get_state(&rt.context.conversation_id)
+                .await
+                .unwrap(),
+            winner_state
+        );
+        assert!(broadcaster.snapshot_pending().3.is_empty());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
+        assert_eq!(
+            rt.run().await,
+            RuntimeExitDisposition::AbandonStreamIncarnation
+        );
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Closed)));
     }
 
     #[tokio::test]

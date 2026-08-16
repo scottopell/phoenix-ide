@@ -8658,6 +8658,7 @@ mod conversation_cwd_validation_tests {
 
         assert_eq!(init["type"], "init");
         assert_ne!(init["stream_incarnation"], old_incarnation);
+        assert_eq!(init["conversation"]["state"]["type"], "terminal");
         let messages = init["messages"].as_array().expect("messages array");
         assert_eq!(
             messages

@@ -300,6 +300,8 @@ pub struct RuntimeManager {
     #[cfg(test)]
     startup_direct_turn_settlement_ambiguity: AsyncMutex<HashSet<String>>,
     #[cfg(test)]
+    startup_direct_turn_settlement_stale: AsyncMutex<HashSet<String>>,
+    #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
@@ -1670,6 +1672,8 @@ impl RuntimeManager {
             runtime_executor_spawns: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             startup_direct_turn_settlement_ambiguity: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            startup_direct_turn_settlement_stale: AsyncMutex::new(HashSet::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
             message_acceptance: ConversationMutexGates::default(),
@@ -3759,20 +3763,36 @@ impl RuntimeManager {
                         broadcaster,
                     });
                 }
-                match crate::runtime::traits::MessageStore::settle_active_direct_turn(
-                    &storage,
-                    &crate::runtime::traits::ActiveDirectTurnSettlement {
-                        turn: loaded.active,
-                        terminal,
-                        state: initial_state.clone(),
-                        state_updated_at: initial_state_updated_at,
-                    },
-                )
-                .await
-                {
-                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled
-                    | crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
-                        None
+                #[cfg(test)]
+                let inject_stale = self
+                    .startup_direct_turn_settlement_stale
+                    .lock()
+                    .await
+                    .remove(conversation_id);
+                #[cfg(not(test))]
+                let inject_stale = false;
+                let settlement_outcome = if inject_stale {
+                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority
+                } else {
+                    crate::runtime::traits::MessageStore::settle_active_direct_turn(
+                        &storage,
+                        &crate::runtime::traits::ActiveDirectTurnSettlement {
+                            turn: loaded.active,
+                            terminal,
+                            state: initial_state.clone(),
+                            state_updated_at: initial_state_updated_at,
+                        },
+                    )
+                    .await
+                };
+                match settlement_outcome {
+                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Settled => None,
+                    crate::runtime::traits::ActiveDirectTurnSettlementOutcome::StaleAuthority => {
+                        return Err(RuntimeMaterializationError::AbandonIncarnation {
+                            error: "startup direct-turn terminal settlement lost authority"
+                                .to_string(),
+                            broadcaster,
+                        });
                     }
                     crate::runtime::traits::ActiveDirectTurnSettlementOutcome::Ambiguous {
                         error,
@@ -7278,6 +7298,128 @@ mod scope_liveness_tests {
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
         assert!(!needs_auto_continue);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn startup_stale_terminal_settlement_abandons_before_handle_publication() {
+        use phoenix_core::domain::sm_event::{
+            PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
+            SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
+        };
+        use phoenix_db::workflow::{
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
+            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+        };
+        use phoenix_workflow::{
+            AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
+            ProcessIncarnation, Timestamp, TurnOutcome,
+        };
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let conversation_id = "startup-stale-settlement";
+        let manager = Arc::new(test_manager().await);
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let payload = PreparedDirectTurnPayload::from_parts(
+            SubmittedDirectTurnIdentity {
+                text: "resume me".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "startup-stale-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            PreparedDirectTurnDelivery {
+                text: "resume me".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let repo = WorkflowRepository::new(manager.db().pool().clone());
+        let accepted = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("startup-stale").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &ConversationAuthority(conversation_id.to_string()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let authority = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(2),
+                lease_until: LeaseExpiry(9_000_000_000_000_000_000),
+            })
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        repo.materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority,
+            prepared: payload,
+            sequence_id: 1,
+            created_at: Timestamp(3),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: Utc::now(),
+            now: Timestamp(3),
+        })
+        .await
+        .unwrap();
+        manager
+            .db()
+            .update_conversation_state(
+                conversation_id,
+                &ConvState::Error {
+                    message: "startup stale recovery".to_string(),
+                    error_kind: crate::db::ErrorKind::ServerError,
+                    resets_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let old_broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut old_receiver = old_broadcaster.subscribe();
+        manager
+            .startup_direct_turn_settlement_stale
+            .lock()
+            .await
+            .insert(conversation_id.to_string());
+
+        let Err(error) = manager.get_or_create(conversation_id).await else {
+            panic!("startup stale settlement must reject old snapshot runtime");
+        };
+        assert!(error.contains("lost authority"));
+        assert!(manager.runtimes.read().await.get(conversation_id).is_none());
+        assert_eq!(manager.runtime_executor_spawns.load(Ordering::Acquire), 0);
+        assert!(matches!(old_receiver.try_recv(), Err(TryRecvError::Closed)));
+        assert!(repo
+            .load_active_runtime_turn(&ConversationAuthority(conversation_id.to_string()))
+            .await
+            .unwrap()
+            .is_some());
+
+        let (fresh, _receiver) = manager.acquire_sse_broadcaster(conversation_id).await;
+        assert!(!fresh.same_channel(&old_broadcaster));
     }
 
     async fn publication_test_manager(conversation_id: &str) -> Arc<RuntimeManager> {
