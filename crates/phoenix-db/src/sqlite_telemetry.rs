@@ -406,4 +406,71 @@ mod tests {
             Some("pool_closed")
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caller_owned_fts_transaction_records_first_source_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caller-owned-statement.db");
+        let setup = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(setup.pool())
+            .await
+            .unwrap();
+        setup
+            .create_conversation("busy-conversation", "Busy", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        setup
+            .add_message(
+                "busy-message",
+                "busy-conversation",
+                &MessageContent::user("source payload sentinel"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rw", path.to_string_lossy()))
+                .unwrap()
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::ZERO)
+                .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = Database::from_pool_for_tests(pool, path.to_string_lossy().into_owned());
+        let mut writer = setup.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let error = db
+            .update_message_display_data("busy-message", &serde_json::json!({"hidden": false}))
+            .await;
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+
+        assert!(matches!(error, Err(crate::DbError::Sqlx(_))));
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("fts.index_message")
+        );
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("statement")
+        );
+        assert_eq!(
+            events[0].get("db_sqlite_primary_code").map(String::as_str),
+            Some("5")
+        );
+        assert!(!format!("{:?}", events[0]).contains("source payload sentinel"));
+    }
 }

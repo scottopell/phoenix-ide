@@ -734,7 +734,7 @@ fn ensure_sqlite_failure_events(filter: EnvFilter) -> EnvFilter {
     if filter
         .to_string()
         .split(',')
-        .any(|directive| directive.starts_with("phoenix_db::observability="))
+        .any(sqlite_failure_events_are_configured)
     {
         filter
     } else {
@@ -744,6 +744,18 @@ fn ensure_sqlite_failure_events(filter: EnvFilter) -> EnvFilter {
                 .expect("static SQLite failure log directive is valid"),
         )
     }
+}
+
+fn sqlite_failure_events_are_configured(directive: &str) -> bool {
+    if directive
+        .parse::<tracing::level_filters::LevelFilter>()
+        .is_ok()
+    {
+        return true;
+    }
+    directive
+        .rsplit_once('=')
+        .is_some_and(|(target, _)| matches!(target, "phoenix_db" | "phoenix_db::observability"))
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -1082,6 +1094,17 @@ mod tests {
             .to_string()
             .split(',')
             .any(|directive| directive == "phoenix_db::observability=off"));
+
+        for broad in ["off", "warn", "phoenix_db=off", "phoenix_db=info"] {
+            let filter = ensure_sqlite_failure_events(EnvFilter::try_new(broad).unwrap());
+            assert!(
+                !filter
+                    .to_string()
+                    .split(',')
+                    .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE),
+                "{broad} already configures the SQLite failure target"
+            );
+        }
     }
 
     #[test]
