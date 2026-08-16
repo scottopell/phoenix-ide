@@ -1191,12 +1191,30 @@ mod tests {
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
-        db.create_conversation("root", "root", "/tmp", true, None, None)
+        let root = db
+            .create_conversation("root", "root", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.create_conversation("leaf", "leaf", "/tmp", true, None, None)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES ('scope-leaf', 'restricted_explore', 'unowned_cwd', '/tmp',
+                       '2025-01-01', '2025-01-01')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES ('leaf', ?1, 'leaf', 1, 'user', 'scope-leaf',
+                       '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
         db.create_conversation("idle", "idle", "/tmp", true, None, None)
             .await
             .unwrap();
