@@ -2,6 +2,8 @@
 
 Measure successful-but-slow SQLite pool acquisition and transaction duration without widening failure telemetry or changing database behavior.
 
+Pull request: [#693](https://github.com/scottopell/phoenix-ide/pull/693)
+
 ## Scope
 
 - Add bounded or sampled successful-path measurements for pool acquisition and transaction duration.
