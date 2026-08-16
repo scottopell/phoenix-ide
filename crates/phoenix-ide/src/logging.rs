@@ -35,6 +35,7 @@ mod rotation;
 
 const FATAL_LOG_ENV: &str = "PHOENIX_FATAL_LOG_FILE";
 const MAX_FATAL_LOG_BYTES: usize = 64 * 1024;
+const SQLITE_FAILURE_LOG_DIRECTIVE: &str = "phoenix_db::observability=error";
 const DEFAULT_LOG_FILTER: &str =
     "phoenix_ide=debug,tower_http=debug,phoenix_db::observability=error";
 static PROCESS_LOG_CONFIG: OnceLock<LogConfig> = OnceLock::new();
@@ -725,7 +726,24 @@ fn invalid_input<T>(message: impl Into<String>) -> std::io::Result<T> {
 /// Create a fresh `EnvFilter` from the environment. Used per-sink because
 /// `EnvFilter` does not implement Clone.
 fn make_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG_FILTER.into())
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
+    ensure_sqlite_failure_events(filter)
+}
+
+fn ensure_sqlite_failure_events(filter: EnvFilter) -> EnvFilter {
+    if filter
+        .to_string()
+        .split(',')
+        .any(|directive| directive.starts_with("phoenix_db::observability="))
+    {
+        filter
+    } else {
+        filter.add_directive(
+            SQLITE_FAILURE_LOG_DIRECTIVE
+                .parse()
+                .expect("static SQLite failure log directive is valid"),
+        )
+    }
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -858,6 +876,7 @@ mod tests {
                 db.system = "sqlite",
                 db.operation = "direct_turn.terminal_settlement",
                 db.phase = "commit",
+                db.error.kind = "database",
                 db.elapsed_ms = 12_u64,
                 db.phase_elapsed_ms = 3_u64,
                 db.sqlite.primary_code = 5_i64,
@@ -964,10 +983,19 @@ mod tests {
             .iter()
             .find(|attribute| attribute.key.as_str() == "db.sqlite.extended_code")
             .expect("extended SQLite code exported");
+        let error_kind = db_failure
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "db.error.kind")
+            .expect("bounded database error kind exported");
         assert!(matches!(primary_code.value, opentelemetry::Value::I64(5)));
         assert!(matches!(
             extended_code.value,
             opentelemetry::Value::I64(517)
+        ));
+        assert!(matches!(
+            &error_kind.value,
+            opentelemetry::Value::String(value) if value.as_str() == "database"
         ));
         assert!(matches!(
             db_failure.status,
@@ -1037,6 +1065,23 @@ mod tests {
             .to_string()
             .split(',')
             .any(|directive| directive == "phoenix_db::observability=error"));
+    }
+
+    #[test]
+    fn supplied_log_filter_keeps_sqlite_failures_unless_explicitly_configured() {
+        let filter = ensure_sqlite_failure_events(EnvFilter::try_new("phoenix_ide=info").unwrap());
+        assert!(filter
+            .to_string()
+            .split(',')
+            .any(|directive| directive == SQLITE_FAILURE_LOG_DIRECTIVE));
+
+        let explicit = ensure_sqlite_failure_events(
+            EnvFilter::try_new("phoenix_db::observability=off").unwrap(),
+        );
+        assert!(explicit
+            .to_string()
+            .split(',')
+            .any(|directive| directive == "phoenix_db::observability=off"));
     }
 
     #[test]

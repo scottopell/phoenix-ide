@@ -70,6 +70,32 @@ impl SqliteResultCodes {
     }
 }
 
+const fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::PoolTimedOut => "pool_timeout",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::WorkerCrashed => "worker_crashed",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::RowNotFound => "row_not_found",
+        sqlx::Error::TypeNotFound { .. } => "type_not_found",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "column_index_out_of_bounds",
+        sqlx::Error::ColumnNotFound(_) => "column_not_found",
+        sqlx::Error::ColumnDecode { .. } => "column_decode",
+        sqlx::Error::Encode(_) => "encode",
+        sqlx::Error::Decode(_) => "decode",
+        sqlx::Error::Configuration(_) => "configuration",
+        sqlx::Error::InvalidArgument(_) => "invalid_argument",
+        sqlx::Error::AnyDriverError(_) => "any_driver",
+        sqlx::Error::InvalidSavePointStatement => "invalid_savepoint",
+        sqlx::Error::BeginFailed => "begin_failed",
+        sqlx::Error::Migrate(_) => "migrate",
+        _ => "other",
+    }
+}
+
 pub(crate) struct SqliteTelemetry {
     operation: SqliteOperation,
     started_at: Instant,
@@ -113,6 +139,7 @@ impl SqliteTelemetry {
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
         let codes = SqliteResultCodes::from_error(error);
+        let error_kind = sqlx_error_kind(error);
         let parent = tracing::Span::current();
         let span = tracing::error_span!(
             target: "phoenix_db::otel",
@@ -121,6 +148,7 @@ impl SqliteTelemetry {
             db.system = "sqlite",
             db.operation = self.operation.as_str(),
             db.phase = phase.as_str(),
+            db.error.kind = error_kind,
             db.elapsed_ms = elapsed_ms,
             db.phase_elapsed_ms = phase_elapsed_ms,
             db.sqlite.primary_code = field::Empty,
@@ -139,6 +167,7 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
+                db_error_kind = error_kind,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
                 db_sqlite_primary_code = codes.primary,
@@ -151,6 +180,7 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
+                db_error_kind = error_kind,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
                 "SQLite operation failed without a database result code"
@@ -318,6 +348,10 @@ mod tests {
             event.get("db_sqlite_extended_code").map(String::as_str),
             Some(codes.extended.to_string()).as_deref()
         );
+        assert_eq!(
+            event.get("db_error_kind").map(String::as_str),
+            Some("database")
+        );
         assert!(!event.contains_key("db_attempt"));
         assert!(!event.contains_key("db_retry_count"));
         let rendered = format!("{event:?}");
@@ -366,6 +400,10 @@ mod tests {
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
             Some("transaction_acquisition")
+        );
+        assert_eq!(
+            events[0].get("db_error_kind").map(String::as_str),
+            Some("pool_closed")
         );
     }
 }
