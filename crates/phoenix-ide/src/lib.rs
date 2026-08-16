@@ -1909,7 +1909,7 @@ mod reconcile_worktrees_tests {
             to_conversation
                 .attached_work_scope_id
                 .as_ref()
-                .map(|id| id.as_str()),
+                .map(phoenix_core::work_scope::WorkScopeId::as_str),
         )
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(db.pool())
