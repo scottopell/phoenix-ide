@@ -560,24 +560,19 @@ pub struct RecordCloseRetirementEvidenceRequest {
 
 async fn read_topology_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    addressed_id: &str,
+    product_conversation_id: &ProductConversationId,
 ) -> DbResult<Option<CloseFoundationTopology>> {
     let rows = sqlx::query(
-        "WITH RECURSIVE backward(id, depth, path) AS (
-             SELECT id, 0, json_array(id)
-             FROM conversations
-             WHERE id = ?1
-             UNION ALL
-             SELECT p.id, backward.depth + 1,
-                    json_insert(backward.path, '$[#]', p.id)
-             FROM conversations p
-             JOIN backward ON p.continued_in_conv_id = backward.id
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM json_each(backward.path) visited WHERE visited.value = p.id
-             )
-         ),
-         root AS (
-             SELECT id FROM backward ORDER BY depth DESC LIMIT 1
+        "WITH RECURSIVE root AS (
+             SELECT candidate.id
+             FROM conversations candidate
+             WHERE candidate.product_conversation_id = ?1
+               AND candidate.parent_conversation_id IS NULL
+               AND candidate.runtime_role IN ('user', 'coordinator')
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations predecessor
+                   WHERE predecessor.continued_in_conv_id = candidate.id
+               )
          ),
          forward(id, next_id, depth, path) AS (
              SELECT c.id, c.continued_in_conv_id, 0, json_array(c.id)
@@ -588,9 +583,11 @@ async fn read_topology_tx(
                     json_insert(forward.path, '$[#]', c.id)
              FROM conversations c
              JOIN forward ON c.id = forward.next_id
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM json_each(forward.path) visited WHERE visited.value = c.id
-             )
+             WHERE c.product_conversation_id = ?1
+               AND c.parent_conversation_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(forward.path) visited WHERE visited.value = c.id
+               )
          )
          SELECT c.id, c.product_conversation_id, c.slug, c.title,
                 COALESCE(c.sub_agent_cwd_override, e.cwd, '') AS cwd,
@@ -617,7 +614,7 @@ async fn read_topology_tx(
          LEFT JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
          ORDER BY forward.depth",
     )
-    .bind(addressed_id)
+    .bind(product_conversation_id.as_str())
     .fetch_all(&mut **tx)
     .await?;
 
@@ -645,22 +642,26 @@ async fn read_topology_tx(
         latest: latest.conversation,
         members,
     };
-    validate_topology_tx(tx, &topology, addressed_id).await?;
+    validate_topology_tx(tx, &topology, product_conversation_id).await?;
     Ok(Some(topology))
 }
 
 async fn validate_topology_tx(
     tx: &mut Transaction<'_, Sqlite>,
     topology: &CloseFoundationTopology,
-    addressed_id: &str,
+    product_conversation_id: &ProductConversationId,
 ) -> DbResult<()> {
     if topology.members.is_empty() {
         return Err(close_precondition("topology is empty"));
     }
-    if topology.latest.id != addressed_id {
+    if topology
+        .members
+        .iter()
+        .any(|member| member.conversation.product_conversation_id != *product_conversation_id)
+    {
         return Err(close_precondition(format!(
-            "addressed conversation {} is not topology latest {}",
-            addressed_id, topology.latest.id
+            "topology contains a conversation outside ProductConversation {}",
+            product_conversation_id
         )));
     }
 
@@ -802,12 +803,12 @@ fn encode_aggregate_snapshot_component<'a>(
 impl Database {
     pub async fn close_foundation_topology(
         &self,
-        addressed_id: &str,
+        product_conversation_id: &ProductConversationId,
     ) -> DbResult<CloseFoundationTopology> {
         let mut tx = self.pool.begin().await?;
-        let topology = read_topology_tx(&mut tx, addressed_id)
+        let topology = read_topology_tx(&mut tx, product_conversation_id)
             .await?
-            .ok_or_else(|| DbError::CloseFoundationNotFound(addressed_id.to_string()))?;
+            .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
         tx.commit().await?;
         Ok(topology)
     }
@@ -815,7 +816,7 @@ impl Database {
     #[allow(clippy::too_many_lines)]
     pub async fn begin_close_foundation(
         &self,
-        addressed_id: &str,
+        product_conversation_id: &ProductConversationId,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
@@ -844,14 +845,16 @@ impl Database {
             .bind(attempt_id)
             .fetch_all(&mut *tx)
             .await?;
-            let addressed_matches_captured_latest = captured_members.iter().any(|row| {
-                row.try_get::<String, _>("conversation_id")
-                    .map(|conversation_id| conversation_id == addressed_id)
-                    .unwrap_or(false)
-            });
-            if !addressed_matches_captured_latest {
+            if obligation.product_conversation_id() != product_conversation_id {
                 return Err(DbError::CloseFoundationConflict(format!(
-                    "attempt {attempt_id} does not capture addressed conversation {addressed_id} as latest"
+                    "attempt {attempt_id} belongs to ProductConversation {}, not {}",
+                    obligation.product_conversation_id(),
+                    product_conversation_id
+                )));
+            }
+            if captured_members.len() != 1 {
+                return Err(DbError::CloseFoundationConflict(format!(
+                    "attempt {attempt_id} does not capture exactly one latest transcript"
                 )));
             }
 
@@ -859,10 +862,10 @@ impl Database {
             return Ok(obligation);
         }
 
-        let topology = read_topology_tx(&mut tx, addressed_id)
+        let topology = read_topology_tx(&mut tx, product_conversation_id)
             .await?
-            .ok_or_else(|| DbError::CloseFoundationNotFound(addressed_id.to_string()))?;
-        validate_begin_preconditions(&topology, addressed_id)?;
+            .ok_or_else(|| DbError::CloseFoundationNotFound(product_conversation_id.to_string()))?;
+        validate_begin_preconditions(&topology, &topology.latest.id)?;
 
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -870,14 +873,14 @@ impl Database {
              FROM close_obligations
              WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
-        .bind(&topology.root.id)
+        .bind(product_conversation_id.as_str())
         .fetch_optional(&mut *tx)
         .await?
         {
             let obligation = parse_close_obligation_row(row)?;
             return Err(DbError::CloseFoundationConflict(format!(
-                "root {} already has active close attempt {} in phase {}",
-                topology.root.id,
+                "ProductConversation {} already has active close attempt {} in phase {}",
+                product_conversation_id,
                 obligation.attempt_id(),
                 obligation.phase().as_str()
             )));
@@ -890,7 +893,7 @@ impl Database {
              ) VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
         )
         .bind(attempt_id)
-        .bind(&topology.root.id)
+        .bind(product_conversation_id.as_str())
         .bind(ClosePhase::AwaitingBlockerResolution.as_str())
         .bind(&now)
         .execute(&mut *tx)
@@ -2793,7 +2796,7 @@ mod tests {
         let contender_db = db.clone();
         let contender = tokio::spawn(async move {
             contender_db
-                .begin_close_foundation("race-root", "loser")
+                .begin_close_foundation(&product_id("race-root"), "loser")
                 .await
         });
         tokio::task::yield_now().await;
@@ -2812,7 +2815,10 @@ mod tests {
         set_archived(&db, "mid", false).await;
         set_archived(&db, "leaf", false).await;
 
-        let topology = db.close_foundation_topology("leaf").await.unwrap();
+        let topology = db
+            .close_foundation_topology(&product_id("root"))
+            .await
+            .unwrap();
         assert_eq!(topology.root.id, "root");
         assert_eq!(topology.latest.id, "leaf");
         assert_eq!(topology.member_ids(), vec!["root", "mid", "leaf"]);
@@ -2821,7 +2827,7 @@ mod tests {
         assert_eq!(topology.members[2].role, CloseMemberRole::Latest);
 
         let obligation = db
-            .begin_close_foundation("leaf", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(obligation.attempt_id().as_str(), "attempt-1");
@@ -2959,46 +2965,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_seal_rejects_ordinal_zero_with_live_predecessor() {
+    async fn topology_rejects_cross_aggregate_predecessor_before_seal() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "predecessor").await;
         create_root(&db, "root").await;
-        create_child(&db, "leaf", "root").await;
-        sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'root' WHERE id = 'predecessor'",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO close_obligations (
-                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
-             ) VALUES (
-                 'attempt-root-predecessor', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
-             )",
-        )
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO close_attempt_members (
-                 attempt_id, conversation_id, member_role, continuation_ordinal,
-                 captured_continued_in_conv_id, captured_state_kind, captured_runtime_role,
-                 captured_work_scope_id, captured_at
-             ) VALUES
-                 ('attempt-root-predecessor', 'root', 'root', 0, 'leaf', 'idle', 'user', NULL, ?1),
-                 ('attempt-root-predecessor', 'leaf', 'latest', 1, NULL, 'idle', 'user', NULL, ?1)",
-        )
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
         assert!(sqlx::query(
-            "UPDATE close_obligations SET topology_sealed = 1
-             WHERE attempt_id = 'attempt-root-predecessor'",
+            "UPDATE conversations SET continued_in_conv_id = 'root' WHERE id = 'predecessor'",
         )
         .execute(db.pool())
         .await
@@ -3006,44 +2978,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_seal_rejects_non_root_with_multiple_live_predecessors() {
+    async fn topology_rejects_cross_aggregate_second_predecessor_before_seal() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         create_root(&db, "fork").await;
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO close_obligations (
-                 attempt_id, product_conversation_id, phase, created_at, updated_at, completed_at
-             ) VALUES (
-                 'attempt-double-predecessor', 'root', 'awaiting_blocker_resolution', ?1, ?1, NULL
-             )",
-        )
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO close_attempt_members (
-                 attempt_id, conversation_id, member_role, continuation_ordinal,
-                 captured_continued_in_conv_id, captured_state_kind, captured_runtime_role,
-                 captured_work_scope_id, captured_at
-             ) VALUES
-                 ('attempt-double-predecessor', 'root', 'root', 0, 'leaf', 'idle', 'user', NULL, ?1),
-                 ('attempt-double-predecessor', 'leaf', 'latest', 1, NULL, 'idle', 'user', NULL, ?1)",
-        )
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
         assert!(sqlx::query(
-            "UPDATE close_obligations SET topology_sealed = 1
-             WHERE attempt_id = 'attempt-double-predecessor'",
+            "UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'"
         )
         .execute(db.pool())
         .await
@@ -3056,9 +2997,12 @@ mod tests {
         create_root(&db, "a|b").await;
         create_child(&db, "b", "a|b").await;
 
-        let topology = db.close_foundation_topology("b").await.unwrap();
+        let topology = db
+            .close_foundation_topology(&product_id("a|b"))
+            .await
+            .unwrap();
         assert_eq!(topology.member_ids(), vec!["a|b", "b"]);
-        db.begin_close_foundation("b", "attempt-delimiter")
+        db.begin_close_foundation(&product_id("a|b"), "attempt-delimiter")
             .await
             .unwrap();
         assert_eq!(
@@ -3075,11 +3019,14 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
 
-        let topology = db.close_foundation_topology("root").await.unwrap();
+        let topology = db
+            .close_foundation_topology(&product_id("root"))
+            .await
+            .unwrap();
         assert_eq!(topology.member_ids(), vec!["root"]);
         assert_eq!(topology.members[0].role, CloseMemberRole::RootLatest);
 
-        db.begin_close_foundation("root", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -3102,7 +3049,7 @@ mod tests {
         .await
         .unwrap();
 
-        db.begin_close_foundation("root", "attempt-unresolved")
+        db.begin_close_foundation(&product_id("root"), "attempt-unresolved")
             .await
             .unwrap();
         let scopes = db
@@ -3198,16 +3145,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_is_rejected() {
+    async fn aggregate_identity_derives_latest_instead_of_rejecting_predecessor() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
 
-        let err = db
-            .begin_close_foundation("root", "attempt-1")
+        let obligation = db
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
+            .unwrap();
+        assert_eq!(obligation.product_conversation_id(), &product_id("root"));
+        let topology = db
+            .close_foundation_topology(&product_id("root"))
+            .await
+            .unwrap();
+        assert_eq!(topology.latest.id, "leaf");
     }
 
     #[tokio::test]
@@ -3217,7 +3169,7 @@ mod tests {
         set_state(&db, "root", approval_state()).await;
 
         let err = db
-            .begin_close_foundation("root", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -3300,7 +3252,7 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(id, &format!("attempt-{id}"))
+                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -3327,7 +3279,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            db.begin_close_foundation("root", "attempt-1")
+            db.begin_close_foundation(&product_id("root"), "attempt-1")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -3343,7 +3295,7 @@ mod tests {
         set_state(&db, "mid", awaiting_continuation_state()).await;
 
         let err = db
-            .begin_close_foundation("leaf", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
@@ -3381,7 +3333,7 @@ mod tests {
             create_root(&db, id).await;
             set_state(&db, id, state).await;
             let obligation = db
-                .begin_close_foundation(id, &format!("attempt-{id}"))
+                .begin_close_foundation(&product_id(id), &format!("attempt-{id}"))
                 .await
                 .unwrap();
             assert_eq!(obligation.product_conversation_id().as_str(), id);
@@ -3401,7 +3353,7 @@ mod tests {
         create_root(&db, "approval").await;
         set_state(&db, "approval", approval_state()).await;
         assert!(matches!(
-            db.begin_close_foundation("approval", "attempt-approval")
+            db.begin_close_foundation(&product_id("approval"), "attempt-approval")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -3410,7 +3362,7 @@ mod tests {
         create_root(&db, "awaiting").await;
         set_state(&db, "awaiting", awaiting_continuation_state()).await;
         assert!(matches!(
-            db.begin_close_foundation("awaiting", "attempt-awaiting")
+            db.begin_close_foundation(&product_id("awaiting"), "attempt-awaiting")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -3424,14 +3376,14 @@ mod tests {
         create_child(&db, "latest", "root").await;
 
         let first = db
-            .begin_close_foundation("latest", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
 
         set_state(&db, "latest", ConvState::LlmRequesting { attempt: 2 }).await;
 
         let second = db
-            .begin_close_foundation("latest", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -3462,16 +3414,18 @@ mod tests {
         .execute(db.pool())
         .await
         .is_err());
-        sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'latest'")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        assert!(
+            sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'latest'")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
         assert_eq!(
             db.get_conversation("latest")
                 .await
                 .unwrap()
                 .attached_work_scope_id,
-            None
+            Some(latest_scope.clone())
         );
         assert!(
             sqlx::query("UPDATE work_scopes SET worktree_path = '/tmp/rebound' WHERE id = ?1",)
@@ -3481,16 +3435,16 @@ mod tests {
                 .is_err()
         );
         let third = db
-            .begin_close_foundation("latest", "attempt-1")
+            .begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         assert_eq!(first, third);
 
         let err = db
-            .begin_close_foundation("root", "attempt-2")
+            .begin_close_foundation(&product_id("root"), "attempt-2")
             .await
             .unwrap_err();
-        assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
+        assert!(matches!(err, DbError::CloseFoundationConflict(_)));
     }
 
     #[tokio::test]
@@ -3526,7 +3480,7 @@ mod tests {
         .unwrap();
 
         let error = db
-            .begin_close_foundation("latest", "attempt-partial")
+            .begin_close_foundation(&product_id("root"), "attempt-partial")
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3562,7 +3516,7 @@ mod tests {
             .unwrap();
 
         let error = db
-            .begin_close_foundation("root", "attempt-nul")
+            .begin_close_foundation(&product_id("root"), "attempt-nul")
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3610,7 +3564,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         let members = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -3629,7 +3583,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
 
@@ -3639,7 +3593,10 @@ mod tests {
         .execute(db.pool())
         .await
         .is_err());
-        let live = db.close_foundation_topology("leaf").await.unwrap();
+        let live = db
+            .close_foundation_topology(&product_id("root"))
+            .await
+            .unwrap();
         assert_eq!(live.member_ids(), vec!["root", "leaf"]);
 
         let snapshots = db.list_close_attempt_members("attempt-1").await.unwrap();
@@ -3657,7 +3614,7 @@ mod tests {
         create_child(&db, "latest", "root").await;
         set_archived(&db, "latest", true).await;
         let error = db
-            .begin_close_foundation("root", "attempt-archived-member")
+            .begin_close_foundation(&product_id("root"), "attempt-archived-member")
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::CloseFoundationPrecondition(_)));
@@ -3669,7 +3626,7 @@ mod tests {
         create_root(&db, "archived").await;
         set_archived(&db, "archived", true).await;
         assert!(matches!(
-            db.begin_close_foundation("archived", "attempt-a")
+            db.begin_close_foundation(&product_id("archived"), "attempt-a")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -3678,16 +3635,16 @@ mod tests {
         create_root(&db, "subagent").await;
         set_runtime_role(&db, "subagent", RuntimeRole::SubAgent).await;
         assert!(matches!(
-            db.begin_close_foundation("subagent", "attempt-b")
+            db.begin_close_foundation(&product_id("subagent"), "attempt-b")
                 .await
                 .unwrap_err(),
-            DbError::CloseFoundationPrecondition(_)
+            DbError::CloseFoundationNotFound(_)
         ));
 
         create_root(&db, "not-user-init").await;
         set_user_initiated(&db, "not-user-init", false).await;
         assert!(matches!(
-            db.begin_close_foundation("not-user-init", "attempt-c")
+            db.begin_close_foundation(&product_id("not-user-init"), "attempt-c")
                 .await
                 .unwrap_err(),
             DbError::CloseFoundationPrecondition(_)
@@ -3705,34 +3662,25 @@ mod tests {
             .await
             .unwrap();
 
-        let err = db.close_foundation_topology("leaf").await.unwrap_err();
+        let err = db
+            .close_foundation_topology(&product_id("root"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
     }
 
     #[tokio::test]
-    async fn topology_rejects_two_predecessors_deterministically() {
+    async fn topology_rejects_cross_aggregate_fork_deterministically() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        create_child(&db, "mid", "root").await;
-        create_child(&db, "leaf", "mid").await;
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        db.create_conversation("fork", "fork", "/tmp", false, Some("mid"), None)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(db.pool())
-            .await
-            .unwrap();
-
-        let err = db.close_foundation_topology("leaf").await.unwrap_err();
-        assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
+        create_child(&db, "leaf", "root").await;
+        create_root(&db, "fork").await;
+        assert!(sqlx::query(
+            "UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'"
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -3757,7 +3705,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -3816,7 +3764,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-concurrent-inspection")
+        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inspection")
             .await
             .unwrap();
         set_close_phase(
@@ -3862,7 +3810,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -3893,7 +3841,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-reentry")
+        db.begin_close_foundation(&product_id("root"), "attempt-reentry")
             .await
             .unwrap();
         set_close_phase(
@@ -4002,7 +3950,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("leaf", "attempt-clean")
+        db.begin_close_foundation(&product_id("root"), "attempt-clean")
             .await
             .unwrap();
         set_close_phase(
@@ -4037,7 +3985,7 @@ mod tests {
     async fn replace_close_inspection_no_scopes_skip_loss_confirmation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-empty")
+        db.begin_close_foundation(&product_id("root"), "attempt-empty")
             .await
             .unwrap();
         set_close_phase(
@@ -4104,7 +4052,7 @@ mod tests {
             .unwrap();
         assert_eq!(leaf_scope, none_scope);
 
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         let captured = db.list_close_attempt_scopes("attempt-1").await.unwrap();
@@ -4164,7 +4112,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -4302,7 +4250,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -4343,7 +4291,7 @@ mod tests {
     async fn replace_close_inspection_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -4397,7 +4345,7 @@ mod tests {
             .await
             .unwrap();
         set_state(&db, "other-root", ConvState::Terminal).await;
-        db.begin_close_foundation("root", "attempt-terminal-owner")
+        db.begin_close_foundation(&product_id("root"), "attempt-terminal-owner")
             .await
             .unwrap();
         set_close_phase(
@@ -4439,7 +4387,7 @@ mod tests {
             .unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-concurrent-inventory")
+        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-inventory")
             .await
             .unwrap();
         set_close_phase(
@@ -4476,7 +4424,7 @@ mod tests {
     async fn zero_scope_inventory_requires_exact_authorized_snapshot() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-zero")
+        db.begin_close_foundation(&product_id("root"), "attempt-zero")
             .await
             .unwrap();
         let request = CaptureCloseRetirementInventoryRequest {
@@ -4506,7 +4454,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("root", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -4603,7 +4551,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db2.begin_close_foundation("root-2", "attempt-2")
+        db2.begin_close_foundation(&product_id("root-2"), "attempt-2")
             .await
             .unwrap();
         set_close_phase(&db2, "attempt-2", ClosePhase::RetirementRequested).await;
@@ -4652,7 +4600,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("root", "attempt-partial")
+        db.begin_close_foundation(&product_id("root"), "attempt-partial")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-partial", ClosePhase::RetirementRequested).await;
@@ -4722,7 +4670,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("root", "attempt-incomplete")
+        db.begin_close_foundation(&product_id("root"), "attempt-incomplete")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-incomplete", ClosePhase::RetirementRequested).await;
@@ -4786,7 +4734,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        db.begin_close_foundation("root", "attempt-shared")
+        db.begin_close_foundation(&product_id("root"), "attempt-shared")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-shared", ClosePhase::RetirementRequested).await;
@@ -4816,7 +4764,7 @@ mod tests {
     async fn cancelled_completion_round_trips_typed_outcome() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-cancelled")
+        db.begin_close_foundation(&product_id("root"), "attempt-cancelled")
             .await
             .unwrap();
         sqlx::query(
@@ -4852,7 +4800,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -5048,7 +4996,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("root", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -5131,7 +5079,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-concurrent-evidence")
+        db.begin_close_foundation(&product_id("root"), "attempt-concurrent-evidence")
             .await
             .unwrap();
         set_close_phase(
@@ -5191,7 +5139,7 @@ mod tests {
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
 
@@ -5261,7 +5209,7 @@ mod tests {
             .attached_work_scope_id
             .unwrap();
         let tmux_identity = LossItemIdentity::Opaque(OpaqueIdentity::parse("tmux:1").unwrap());
-        db.begin_close_foundation("leaf", "prior-attempt")
+        db.begin_close_foundation(&product_id("root"), "prior-attempt")
             .await
             .unwrap();
         set_close_phase(&db, "prior-attempt", ClosePhase::RetirementRequested).await;
@@ -5303,7 +5251,7 @@ mod tests {
         .await
         .unwrap();
 
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::RetirementRequested).await;
@@ -5593,7 +5541,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        db.begin_close_foundation("leaf", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         set_close_phase(&db, "attempt-1", ClosePhase::AwaitingRetirementInspection).await;
@@ -5688,7 +5636,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("leaf", "attempt-lossy")
+        db.begin_close_foundation(&product_id("root"), "attempt-lossy")
             .await
             .unwrap();
         set_close_phase(
@@ -5739,7 +5687,7 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
-        db.begin_close_foundation("leaf", "attempt-clean-branch")
+        db.begin_close_foundation(&product_id("root"), "attempt-clean-branch")
             .await
             .unwrap();
         set_close_phase(
@@ -5908,7 +5856,7 @@ mod tests {
     async fn retirement_evidence_rejects_untargeted_scope() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
-        db.begin_close_foundation("root", "attempt-1")
+        db.begin_close_foundation(&product_id("root"), "attempt-1")
             .await
             .unwrap();
         let other_scope = WorkScopeId::parse("close-scope-other").unwrap();

@@ -3483,8 +3483,17 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
+                "INSERT OR IGNORE INTO product_conversations (id, kind, ordinary_lifecycle)
+                 VALUES (?1, 'ordinary', 'open')",
+            )
+            .bind(conversation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
                 "INSERT OR IGNORE INTO conversations
-                 (id, runtime_role, work_scope_id) VALUES (?1, 'user', ?2)",
+                 (id, product_conversation_id, runtime_role, work_scope_id)
+                 VALUES (?1, ?1, 'user', ?2)",
             )
             .bind(conversation_id)
             .bind(work_scope_id)

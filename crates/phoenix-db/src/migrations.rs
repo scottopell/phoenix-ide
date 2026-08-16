@@ -11508,6 +11508,23 @@ mod tests {
             .unwrap();
         }
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (66, 'temporarily_skip_product_conversation_migration')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         run_pending_migrations(&pool).await.unwrap();
 
         // Wire chain edges *after* migrations so 003 (the column) is in place.

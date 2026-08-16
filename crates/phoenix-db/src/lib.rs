@@ -8261,7 +8261,16 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
 
+        sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES (?1, 'ordinary', 'open')
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(child.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
         insert_conversation_tx(&mut tx, child).await?;
+
         for msg in seed_messages {
             insert_message_tx(&mut tx, msg).await?;
         }
@@ -16083,12 +16092,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(conv.id, "test-id");
+        assert_ne!(conv.product_conversation_id.as_str(), conv.id);
         assert_eq!(conv.slug, Some("test-slug".to_string()));
         assert_eq!(conv.cwd, "/tmp/test");
         assert!(matches!(conv.state, ConvState::Idle));
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+        assert_eq!(
+            fetched.product_conversation_id,
+            conv.product_conversation_id
+        );
     }
 
     #[tokio::test]
@@ -19261,6 +19275,10 @@ mod tests {
 
         assert_eq!(child.attached_work_scope_id, None);
         assert_eq!(child.effort, Some(ModelEffort::High));
+        assert_eq!(
+            child.product_conversation_id,
+            parent.product_conversation_id
+        );
     }
 
     async fn open_file_backed_test_db(name: &str) -> (tempfile::TempDir, Database) {
@@ -19548,6 +19566,8 @@ mod tests {
         db.create_conversation("conv-child", "child-slug", "/tmp", true, None, None)
             .await
             .unwrap();
+        let parent_product_id = fresh.product_conversation_id;
+        recreate_test_conversation_in_product(&db, "conv-child", parent_product_id).await;
 
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
             .bind("conv-child")
@@ -19788,6 +19808,11 @@ mod tests {
         };
         let persisted_new_conv = db.get_conversation(&new_conv.id).await.unwrap();
         assert_eq!(persisted_new_conv.effort, Some(ModelEffort::High));
+        assert_eq!(
+            new_conv.product_conversation_id,
+            parent.product_conversation_id
+        );
+        assert_ne!(new_conv.id, new_conv.product_conversation_id.as_str());
 
         // Inheritance: every ConvMode::Work field copied verbatim.
         match (&parent.conv_mode, &new_conv.conv_mode) {
@@ -20189,6 +20214,31 @@ mod tests {
     // Phoenix Chains v1 (task 02686): chain_name + chain walk methods
     // ------------------------------------------------------------------
 
+    async fn recreate_test_conversation_in_product(
+        db: &Database,
+        id: &str,
+        product_conversation_id: phoenix_core::domain::product_conversation::ProductConversationId,
+    ) {
+        let mut conversation = db.get_conversation(id).await.unwrap();
+        let old_product_conversation_id = conversation.product_conversation_id.clone();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+            .bind(old_product_conversation_id.as_str())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        conversation.product_conversation_id = product_conversation_id;
+        let mut tx = db.pool.begin().await.unwrap();
+        insert_conversation_tx(&mut tx, &conversation)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     /// Build a 3-member linear continuation chain `a -> b -> c` and return
     /// the ids in chain order. Uses raw SQL to bypass `continue_conversation`'s
     /// gating on `ContextExhausted` parents — the walk methods are invariant
@@ -20198,6 +20248,43 @@ mod tests {
             db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
                 .await
                 .unwrap();
+        }
+        let root_product_conversation_id = db
+            .get_conversation(ids[0])
+            .await
+            .unwrap()
+            .product_conversation_id;
+        for id in &ids[1..] {
+            let conversation = db.get_conversation(id).await.unwrap();
+            sqlx::query("DELETE FROM conversations WHERE id = ?1")
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+                .bind(conversation.product_conversation_id.as_str())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, user_initiated, runtime_role,
+                     state_updated_at, created_at, updated_at, work_scope_id
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?4, ?4, ?5)",
+            )
+            .bind(id)
+            .bind(root_product_conversation_id.as_str())
+            .bind(format!("slug-{id}"))
+            .bind(Utc::now().to_rfc3339())
+            .bind(
+                conversation
+                    .attached_work_scope_id
+                    .as_ref()
+                    .map(WorkScopeId::as_str),
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
         }
         for pair in ids.windows(2) {
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
@@ -22489,6 +22576,13 @@ mod tests {
         let scope =
             retirement_fixture(&db, "predecessor", RuntimeRole::User, &ConvState::Terminal).await;
         retirement_fixture(&db, "successor", RuntimeRole::User, &ConvState::Terminal).await;
+        let predecessor = db.get_conversation("predecessor").await.unwrap();
+        recreate_test_conversation_in_product(
+            &db,
+            "successor",
+            predecessor.product_conversation_id,
+        )
+        .await;
         sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'successor'")
             .bind(scope.as_str())
             .execute(db.pool())
