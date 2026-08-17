@@ -47,6 +47,10 @@ pub enum AuthoritativeUserMessageMaterialization {
         message: Box<Message>,
         active: ActiveDirectTurn,
     },
+    ClassifiedCommitted {
+        message: Box<Message>,
+        active: ActiveDirectTurn,
+    },
     ExactReplay,
     NotCommitted,
     StaleAuthority,
@@ -1344,6 +1348,15 @@ impl MessageStore for DatabaseStorage {
             LocalAuthorityResult::DurableFactEstablished(
                 MaterializeAuthoritativeTurnOutcome::ExactReplay(_),
             ) => AuthoritativeUserMessageMaterialization::ExactReplay,
+            LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(materialization),
+            ) => AuthoritativeUserMessageMaterialization::ClassifiedCommitted {
+                message: materialization.message,
+                active: ActiveDirectTurn {
+                    turn_id: materialization.turn_id,
+                    generation: materialization.generation,
+                },
+            },
             LocalAuthorityResult::DurableFactEstablished(
                 MaterializeAuthoritativeTurnOutcome::NotCommitted,
             ) => AuthoritativeUserMessageMaterialization::NotCommitted,

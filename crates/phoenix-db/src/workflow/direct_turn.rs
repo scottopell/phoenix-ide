@@ -180,6 +180,7 @@ pub struct AuthoritativeTurnMaterialization {
 pub enum MaterializeAuthoritativeTurnOutcome {
     Materialized(AuthoritativeTurnMaterialization),
     ExactReplay(AuthoritativeTurnMaterialization),
+    ClassifiedCommitted(AuthoritativeTurnMaterialization),
     NotCommitted,
     StaleAuthority,
     CommandRejected(TurnConflict),
@@ -1216,7 +1217,7 @@ impl WorkflowRepository {
                     },
                 ));
             }
-            return Ok(MaterializeAuthoritativeTurnOutcome::ExactReplay(
+            return Ok(MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(
                 AuthoritativeTurnMaterialization {
                     message: Box::new(message),
                     turn_id: input.turn_id,
@@ -4246,7 +4247,7 @@ mod tests {
             matches!(
                 after_commit,
                 crate::workflow::LocalAuthorityResult::DurableFactEstablished(
-                    MaterializeAuthoritativeTurnOutcome::ExactReplay(_)
+                    MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(_)
                 )
             ),
             "unexpected classified after-commit outcome: {after_commit:?}"

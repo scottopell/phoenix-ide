@@ -1740,6 +1740,24 @@ struct ProposedDirectTurnState {
     updated_at: DateTime<Utc>,
 }
 
+struct AuthorityBoundaryOwnerGuard {
+    fatal_tx: Option<watch::Sender<Option<&'static str>>>,
+}
+
+impl AuthorityBoundaryOwnerGuard {
+    fn disarm(&mut self) {
+        self.fatal_tx = None;
+    }
+}
+
+impl Drop for AuthorityBoundaryOwnerGuard {
+    fn drop(&mut self) {
+        if let Some(fatal_tx) = self.fatal_tx.take() {
+            let _ = fatal_tx.send(Some("direct_turn_boundary_owner_disappeared"));
+        }
+    }
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1964,6 +1982,7 @@ where
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
+    fatal_local_authority_tx: Option<watch::Sender<Option<&'static str>>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2100,6 +2119,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
+            fatal_local_authority_tx: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2150,6 +2170,14 @@ where
     /// and lets HTTP handlers read live state without consulting the DB.
     pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
         self.state_watcher = Some(tx);
+        self
+    }
+
+    pub fn with_fatal_local_authority_signal(
+        mut self,
+        tx: watch::Sender<Option<&'static str>>,
+    ) -> Self {
+        self.fatal_local_authority_tx = Some(tx);
         self
     }
 
@@ -5053,11 +5081,15 @@ where
                 let boundary_owner = tokio::spawn(async move {
                     storage.materialize_authoritative_user_message(&input).await
                 });
+                let mut owner_guard = AuthorityBoundaryOwnerGuard {
+                    fatal_tx: self.fatal_local_authority_tx.clone(),
+                };
                 let materialization = boundary_owner.await.map_err(|error| {
                     tracing::error!(?error, "direct-turn authority boundary owner disappeared");
                     "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
                         .to_string()
                 })?;
+                owner_guard.disarm();
                 let materialization = match materialization {
                     Ok(materialization) => materialization,
                     Err(error) => {
@@ -5068,6 +5100,10 @@ where
                 };
                 match materialization {
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
+                        message,
+                        active,
+                    }
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::ClassifiedCommitted {
                         message,
                         active,
                     } => {
@@ -12486,6 +12522,39 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn classifier_proven_commit_is_adopted_and_published() {
+        let (mut rt, _storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::ClassifiedCommitted {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        rt.apply_transition_result(result).await.unwrap();
+
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn proposed_direct_turn_state_is_not_observable_before_materialization_returns() {
         let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
@@ -12529,6 +12598,50 @@ mod authoritative_user_message_effect_tests {
             broadcast_rx.try_recv(),
             Ok(SseEvent::Message { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_owner_signals_fatal_authority_loss() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (fatal_tx, mut fatal_rx) = tokio::sync::watch::channel(None);
+        rt = rt.with_fatal_local_authority_signal(fatal_tx);
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let mut transition = Box::pin(rt.apply_transition_result(result));
+        tokio::select! {
+            started = materialization_started => started.expect("materialization started"),
+            result = &mut transition => panic!("transition returned before cancellation: {result:?}"),
+        }
+        drop(transition);
+
+        fatal_rx.changed().await.expect("fatal signal published");
+        assert_eq!(
+            *fatal_rx.borrow(),
+            Some("direct_turn_boundary_owner_disappeared")
+        );
+        assert_no_broadcast(&mut broadcast_rx);
+        release_materialization
+            .send(())
+            .expect("release supervised boundary task");
     }
 
     #[tokio::test]

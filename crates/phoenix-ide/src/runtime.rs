@@ -2996,7 +2996,9 @@ impl RuntimeManager {
 
         // Live-state watch channel for sub-agent (seeded Idle; transitions publish updates).
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
-        let runtime = runtime.with_state_watcher(sub_state_tx);
+        let runtime = runtime
+            .with_state_watcher(sub_state_tx)
+            .with_fatal_local_authority_signal(self.fatal_local_authority_tx.clone());
 
         // Seed the sub-agent's trigger slot with the parent's turn context. A
         // sub-agent's whole life is one turn (it never leaves "working"
@@ -4108,7 +4110,9 @@ impl RuntimeManager {
         // The executor writes to `state_tx` on every transition; the handle
         // exposes `state_rx` to HTTP handlers via `effective_conversation_state`.
         let (state_tx, state_rx) = watch::channel(initial_state);
-        let runtime = runtime.with_state_watcher(state_tx);
+        let runtime = runtime
+            .with_state_watcher(state_tx)
+            .with_fatal_local_authority_signal(self.fatal_local_authority_tx.clone());
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
