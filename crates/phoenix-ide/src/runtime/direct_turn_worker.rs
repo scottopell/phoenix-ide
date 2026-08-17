@@ -121,9 +121,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         mut kick_rx: watch::Receiver<u64>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), StartupReconciliationError> {
-        loop {
+        let mut wait = loop {
             match self.run_once().await {
-                Ok(_) => break,
+                Ok(wait) => break wait,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::StillOwed(error) => {
                         tracing::warn!(
@@ -135,19 +135,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             }
-        }
+        };
         let _ = ready_tx.send(());
         loop {
-            let wait = match self.run_once().await {
-                Ok(wait) => wait,
-                Err(error) => match StartupReconciliationError::from(error) {
-                    StartupReconciliationError::StillOwed(error) => {
-                        tracing::warn!(%error, "direct-turn worker pass remains owed; retrying");
-                        ERROR_RETRY_INTERVAL
-                    }
-                    fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
-                },
-            };
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
             tokio::select! {
@@ -158,6 +148,16 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     }
                 }
             }
+            wait = match self.run_once().await {
+                Ok(wait) => wait,
+                Err(error) => match StartupReconciliationError::from(error) {
+                    StartupReconciliationError::StillOwed(error) => {
+                        tracing::warn!(%error, "direct-turn worker pass remains owed; retrying");
+                        ERROR_RETRY_INTERVAL
+                    }
+                    fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
+                },
+            };
         }
     }
 
@@ -1003,7 +1003,10 @@ mod tests {
             dispatcher.terminal_attempts.lock().unwrap().as_slice(),
             &["conv-a".to_string(), "conv-a".to_string()]
         );
-        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
+        );
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }
