@@ -468,7 +468,7 @@ SELECT
         'message', 'Phoenix restarted before this direct turn recorded an exact terminal result',
         'error_kind', 'server_error'
     ),
-    COALESCE(NULLIF(c.state_updated_at, ''), CURRENT_TIMESTAMP),
+    COALESCE(NULLIF(c.state_updated_at, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     NULL
 FROM durable_turns AS t
 JOIN conversations AS c ON c.id = t.conversation_id
@@ -8973,7 +8973,7 @@ mod tests {
                  owns_conversation INTEGER NOT NULL
              );
              INSERT INTO conversations VALUES (
-                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', '2026-01-01T00:00:00Z'
+                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', ''
              );
              INSERT INTO durable_turns VALUES (
                  661, 'legacy', 3, 'Runtime', 'canonical-user', NULL, 1
@@ -8999,6 +8999,13 @@ mod tests {
             "error"
         );
         assert_eq!(row.3, 3);
+        let timestamp: String = sqlx::query_scalar(
+            "SELECT target_state_updated_at FROM direct_turn_terminal_obligations WHERE turn_id = 661",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        chrono::DateTime::parse_from_rfc3339(&timestamp).expect("fallback timestamp is RFC3339");
     }
 
     #[tokio::test]

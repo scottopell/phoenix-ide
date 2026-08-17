@@ -1487,25 +1487,6 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     deterministic_explore_branch_for_worktree(worktree_path)
 }
 
-fn rematerialize_runtime_after_exit(
-    manager: Arc<RuntimeManager>,
-    conversation_id: String,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(async move {
-        match manager.get_or_create(&conversation_id).await {
-            Ok(_) => tracing::info!(
-                conv_id = %conversation_id,
-                "Runtime rematerialized from durable terminal obligation"
-            ),
-            Err(error) => tracing::error!(
-                conv_id = %conversation_id,
-                %error,
-                "Runtime rematerialization from durable terminal obligation failed"
-            ),
-        }
-    })
-}
-
 impl RuntimeManager {
     pub fn new(
         db: Database,
@@ -3125,6 +3106,48 @@ impl RuntimeManager {
         Ok(())
     }
 
+    pub(crate) async fn settle_database_terminal_obligation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let Some(obligation) = repo
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let command = match obligation.terminal {
+            phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
+                turn_id: obligation.turn_id,
+                expected_generation: obligation.expected_generation,
+            },
+            phoenix_workflow::TurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
+                turn_id: obligation.turn_id,
+                expected_generation: obligation.expected_generation,
+            },
+            phoenix_workflow::TurnTerminal::Failed { reason } => {
+                phoenix_workflow::TurnCommand::Fail {
+                    turn_id: obligation.turn_id,
+                    expected_generation: obligation.expected_generation,
+                    reason,
+                }
+            }
+        };
+        repo.terminalize_authoritative_turn(
+            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                command,
+                projection: Some(obligation.projection),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn materialize_runtime(
         self: &Arc<Self>,
@@ -3160,11 +3183,21 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let conv = self
+        let mut conv = self
             .db
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
+        if self
+            .settle_database_terminal_obligation(conversation_id)
+            .await?
+        {
+            conv = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         let cleanup_conversation = conv.clone();
 
@@ -3676,10 +3709,7 @@ impl RuntimeManager {
                 );
             }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
-                tokio::spawn(rematerialize_runtime_after_exit(
-                    Arc::clone(&manager_for_cleanup),
-                    conv_id,
-                ));
+                manager_for_cleanup.kick_direct_turn_worker();
             }
         });
 
@@ -6856,7 +6886,10 @@ mod scope_liveness_tests {
         assert_eq!(recovered.expected_generation, 0);
 
         let mgr = Arc::new(mgr);
-        rematerialize_runtime_after_exit(Arc::clone(&mgr), conversation_id.to_string()).await;
+        assert!(mgr
+            .settle_database_terminal_obligation(conversation_id)
+            .await
+            .expect("settle database-only terminal obligation"));
 
         let durable_turn = repo
             .load_authoritative_turn(turn_id)

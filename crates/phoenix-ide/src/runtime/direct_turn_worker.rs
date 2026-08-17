@@ -58,7 +58,9 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
 type PreDispatchHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>;
 
-impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
+impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
+    DirectTurnWorker<D, C>
+{
     pub(crate) fn new(
         repo: WorkflowRepository,
         dispatcher: Arc<D>,
@@ -110,6 +112,17 @@ impl<D: DirectTurnDispatcher, C: DirectTurnClock> DirectTurnWorker<D, C> {
     }
 
     pub(crate) async fn run_once(&self) -> Result<Duration, String> {
+        for obligation in self
+            .repo
+            .list_discoverable_terminal_obligations(DISCOVERY_BATCH_LIMIT)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            self.dispatcher
+                .settle_terminal_obligation(&obligation.conversation.0)
+                .await?;
+        }
+
         let mut cursor = None;
         loop {
             let page = self
@@ -265,6 +278,11 @@ pub(crate) trait DirectTurnDispatcher: Send + Sync + 'static {
     async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String>;
 }
 
+#[async_trait]
+pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
+    async fn settle_terminal_obligation(&self, conversation_id: &str) -> Result<(), String>;
+}
+
 struct ProductionDirectTurnDispatcher {
     manager: Arc<RuntimeManager>,
 }
@@ -285,6 +303,16 @@ impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
             .send(event)
             .await
             .map_err(|error| format!("Failed to send direct-turn event: {error}"))
+    }
+}
+
+#[async_trait]
+impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
+    async fn settle_terminal_obligation(&self, conversation_id: &str) -> Result<(), String> {
+        self.manager
+            .settle_database_terminal_obligation(conversation_id)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -338,15 +366,30 @@ mod tests {
 
     struct RecordingDispatcher {
         result: Mutex<Result<(), String>>,
+        terminal_result: Mutex<Result<(), String>>,
         events: Mutex<Vec<(String, Event)>>,
+        terminal_attempts: Mutex<Vec<String>>,
     }
 
     impl Default for RecordingDispatcher {
         fn default() -> Self {
             Self {
                 result: Mutex::new(Ok(())),
+                terminal_result: Mutex::new(Ok(())),
                 events: Mutex::new(Vec::new()),
+                terminal_attempts: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    #[async_trait]
+    impl TerminalObligationDispatcher for RecordingDispatcher {
+        async fn settle_terminal_obligation(&self, conversation_id: &str) -> Result<(), String> {
+            self.terminal_attempts
+                .lock()
+                .unwrap()
+                .push(conversation_id.to_string());
+            self.terminal_result.lock().unwrap().clone()
         }
     }
 
@@ -460,6 +503,71 @@ mod tests {
             .unwrap();
         assert_eq!(wait, EMPTY_RESCAN_INTERVAL);
         assert!(dispatcher.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_obligation_is_discovered_and_retried_by_owned_worker() {
+        let (repo, dispatcher) = fixture().await;
+        let turn_id = accept(&repo, "terminal-obligation").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(10),
+                lease_until: LeaseExpiry(40),
+            })
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        let generation = authority.generation.0;
+        repo.materialize_authoritative_turn(
+            &phoenix_db::workflow::MaterializeAuthoritativeTurnInput {
+                turn_id,
+                authority,
+                prepared: prepared_payload("message-terminal-obligation"),
+                sequence_id: 99,
+                created_at: Timestamp(99),
+                accepted_state: phoenix_core::domain::db_schema::ConvState::LlmRequesting {
+                    attempt: 1,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp(99, 0).unwrap(),
+                now: Timestamp(10),
+            },
+        )
+        .await
+        .unwrap();
+        repo.persist_terminal_obligation(
+            &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: generation,
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: phoenix_core::domain::sm_state::ConvState::Idle,
+                    state_updated_at: chrono::Utc::now(),
+                },
+                response_message_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        *dispatcher.terminal_result.lock().unwrap() = Err("transient".to_string());
+
+        assert!(worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .is_err());
+        *dispatcher.terminal_result.lock().unwrap() = Ok(());
+        worker(repo, dispatcher.clone(), 11, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatcher.terminal_attempts.lock().unwrap().as_slice(),
+            &["conv-a".to_string(), "conv-a".to_string()]
+        );
     }
 
     #[tokio::test]

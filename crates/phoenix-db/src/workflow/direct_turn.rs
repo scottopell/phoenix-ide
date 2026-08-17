@@ -95,6 +95,12 @@ pub struct DiscoverableAcceptedTurnPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverableTerminalObligation {
+    pub turn_id: TurnAuthorityId,
+    pub conversation: ConversationAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmittedIdentityChanged {
     pub turn: DurableTurn,
     pub stored: SubmittedDirectTurnIdentity,
@@ -1210,6 +1216,36 @@ impl WorkflowRepository {
             cut,
         )
         .await
+    }
+
+    pub async fn list_discoverable_terminal_obligations(
+        &self,
+        limit: usize,
+    ) -> DbResult<Vec<DiscoverableTerminalObligation>> {
+        let limit = i64::try_from(limit)
+            .map_err(|_| DbError::Serialization("terminal discovery limit overflow".to_string()))?;
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT o.turn_id, t.conversation_id
+             FROM direct_turn_terminal_obligations AS o
+             JOIN durable_turns AS t ON t.turn_id = o.turn_id
+             WHERE t.disposition = 'Runtime'
+               AND t.terminal_kind IS NULL
+               AND t.owns_conversation = 1
+               AND t.generation = o.expected_generation
+             ORDER BY o.turn_id ASC
+             LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(turn_id, conversation_id)| {
+                Ok(DiscoverableTerminalObligation {
+                    turn_id: TurnAuthorityId(to_u64(turn_id, "turn_id")?),
+                    conversation: ConversationAuthority(conversation_id),
+                })
+            })
+            .collect()
     }
 
     pub async fn persist_terminal_obligation(
