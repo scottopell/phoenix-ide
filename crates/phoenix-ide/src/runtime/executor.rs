@@ -1753,7 +1753,7 @@ impl AuthorityBoundaryOwnerGuard {
 impl Drop for AuthorityBoundaryOwnerGuard {
     fn drop(&mut self) {
         if let Some(fatal_tx) = self.fatal_tx.take() {
-            let _ = fatal_tx.send(Some("direct_turn_boundary_owner_disappeared"));
+            fatal_tx.send_replace(Some("direct_turn_boundary_owner_disappeared"));
         }
     }
 }
