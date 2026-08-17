@@ -325,8 +325,7 @@ detail area between transcript and composer:
   error card rather than disappearing
 
 WHEN the server state permits cancellation
-THE SYSTEM SHALL expose the cancel control, including while provisioning,
-awaiting recovery, or awaiting commission-review approval
+THE SYSTEM SHALL expose the cancel control, including while provisioning, or awaiting recovery
 
 WHEN deciding whether the agent is busy
 THE SYSTEM SHALL use the server's presentation_mode, not re-derive it from

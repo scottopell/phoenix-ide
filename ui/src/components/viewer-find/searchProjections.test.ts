@@ -757,45 +757,6 @@ describe('buildConversationSearchProjection', () => {
     });
   });
 
-  it('projects visible commission-review summaries instead of opaque result text', () => {
-    const displayData = {
-      kind: 'commission_review', status: 'success', review_status: 'completed', findings_status: 'available', findings_trust: 'high', retry_recommendation: 'do_not_retry',
-      stage_status: {}, finding_summary: { total: 1, critical: 0, high: 1, medium: 0, low: 0 }, warnings_summary: ['Review warning'],
-      summary: { target: { repo_root: '/repo', base: 'main', head: 'feature' }, files_changed: 2, files_reviewed: 1, insertions: 4, deletions: 1, elapsed_ms: 100, reviewer_summary: 'Summary visible' },
-      unreviewed: [{ file: 'src/unreviewed.ts', reason: 'too_large' }],
-      findings: [{ severity: 'high', file: 'src/finding.ts', line: 7, title: 'Visible finding title', rationale: 'Visible rationale' }], warnings: [],
-    };
-    const result = toolMsg('review-result', 'review-tool', { result: 'opaque-hidden-result' });
-    result.display_data = displayData;
-    const units: RenderUnit[] = [{
-      kind: 'agent_turn', key: 'review', isFirstInTurn: true,
-      agent: agentMsg('review', [{ type: 'tool_use', id: 'review-tool', name: 'commission_review', input: { brief: 'Review it' } }]),
-      toolResultsByUseId: new Map([['review-tool', result]]),
-    }];
-
-    const finding = buildConversationSearchProjection(units, 'Visible finding title', { density: 'full' });
-    expect(finding.matches).toHaveLength(1);
-    expect(finding.sources.find((source) => source.fragmentId === 'commission-review-finding-0')?.revealTarget).toEqual({
-      kind: 'tool-result-commission-review', toolUseId: 'review-tool', fragmentId: 'commission-review-finding-0',
-    });
-    expect(buildConversationSearchProjection(units, 'opaque-hidden-result', { density: 'full' }).matches).toHaveLength(0);
-
-    const extraFindings = Array.from({ length: 6 }, (_, index) => ({
-      severity: 'low', file: `src/finding-${index}.ts`, line: index + 1,
-      title: index === 5 ? 'Sixth visible finding' : `Finding ${index + 1}`,
-      rationale: `Rationale ${index + 1}`,
-    }));
-    displayData.findings = extraFindings;
-    displayData.finding_summary = { total: 6, critical: 0, high: 0, medium: 0, low: 6 };
-
-    expect(buildConversationSearchProjection(units, 'Sixth visible finding', {
-      density: 'full', commissionReviewCanOpenFullReview: false,
-    }).matches).toHaveLength(1);
-    expect(buildConversationSearchProjection(units, 'Sixth visible finding', {
-      density: 'full', commissionReviewCanOpenFullReview: true,
-    }).matches).toHaveLength(0);
-  });
-
   it('indexes tool results but excludes unowned tool header and input metadata', () => {
     const units: RenderUnit[] = [
       {

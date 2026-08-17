@@ -8658,12 +8658,10 @@ impl Database {
         //     is in the JSON column and must survive restart
         //   - awaiting_user_response: user questions pending; state data (questions/tool_use_id)
         //     is in the JSON column and must survive restart
-        //   - awaiting_commission_review_approval: capital-spend review approval pending; state data
-        //     carries the unpersisted assistant message/tool_use and must survive restart
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
                    FROM durable_turns AS obligated_turn
@@ -12258,7 +12256,6 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
         ConvState::AwaitingRecovery { .. } => "awaiting_recovery",
         ConvState::AwaitingTaskApproval { .. } => "awaiting_task_approval",
         ConvState::AwaitingUserResponse { .. } => "awaiting_user_response",
-        ConvState::AwaitingCommissionReviewApproval { .. } => "awaiting_commission_review_approval",
         ConvState::ContextExhausted { .. } => "context_exhausted",
         ConvState::HandedOff { .. } => "handed_off",
         ConvState::Terminal => "terminal",
@@ -17259,67 +17256,6 @@ mod tests {
             assert_eq!(priority, phoenix_core::task_source::Priority::P1);
             assert_eq!(plan, "Step 1: read code\nStep 2: fix bug");
         }
-    }
-
-    #[tokio::test]
-    async fn test_reset_preserves_awaiting_commission_review_approval_state() {
-        use phoenix_core::domain::llm_types::ContentBlock;
-        use phoenix_core::domain::sm_state::{
-            AssistantMessage, CommissionReviewApprovalScope, CommissionReviewInput,
-        };
-
-        let db = Database::open_in_memory().await.unwrap();
-
-        db.create_conversation(
-            "conv-commission",
-            "slug-commission",
-            "/tmp",
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let approval_state = ConvState::AwaitingCommissionReviewApproval {
-            tool_use_id: "tool-review-1".to_string(),
-            request: CommissionReviewInput {
-                brief: "Ready for review".to_string(),
-                focus: Some("correctness".to_string()),
-            },
-            scope: CommissionReviewApprovalScope {
-                kind: "committed_branch_diff".to_string(),
-                repo_root: "/tmp".to_string(),
-                base: "refs/remotes/origin/main".to_string(),
-                head: "task".to_string(),
-                approved_head: None,
-                approved_base: None,
-                dirty: false,
-                changed_files: 0,
-                insertions: 0,
-                deletions: 0,
-            },
-            assistant_message: AssistantMessage::new(
-                "req".to_string(),
-                vec![ContentBlock::text("requesting review")],
-                None,
-                None,
-            ),
-        };
-        db.update_conversation_state("conv-commission", &approval_state)
-            .await
-            .unwrap();
-
-        db.reset_all_to_idle().await.unwrap();
-
-        let conv_after = db.get_conversation("conv-commission").await.unwrap();
-        assert!(
-            matches!(
-                conv_after.state,
-                ConvState::AwaitingCommissionReviewApproval { .. }
-            ),
-            "AwaitingCommissionReviewApproval state should be preserved after reset"
-        );
     }
 
     #[tokio::test]

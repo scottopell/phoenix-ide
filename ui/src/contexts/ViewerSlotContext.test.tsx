@@ -101,54 +101,6 @@ describe('ViewerSlot — message kind', () => {
   );
 });
 
-describe('ViewerSlot — commission-review kind', () => {
-  it('opens a commission review, encoding request sequence id in the URL', () => {
-    const h = renderSlot();
-    act(() => { h.get().openCommissionReview(42); });
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 42 });
-    expect(h.search()).toContain('viewer=commission-review');
-    expect(h.search()).toContain('review=42');
-  });
-
-  it('parses a commission review URL on cold entry', () => {
-    const h = renderSlot('/c/conv-A?viewer=commission-review&review=7');
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
-  });
-
-  it('restores and changes commission review presentation without changing identity', () => {
-    const h = renderSlot('/c/conv-A?viewer=commission-review&review=7&presentation=fullscreen');
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'fullscreen', requestSequenceId: 7 });
-    act(() => { h.get().setPresentation('pane'); });
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
-    expect(h.search()).toContain('review=7');
-  });
-
-  it('defaults legacy review URLs to pane', () => {
-    const h = renderSlot('/c/conv-A?viewer=commission-review&review=7');
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 7 });
-  });
-
-  it('normalizes commission review URLs with invalid ids to none', async () => {
-    const missing = renderSlot('/c/conv-A?viewer=commission-review');
-    expect(missing.get().slot.kind).toBe('none');
-    await waitFor(() => { expect(missing.search()).not.toContain('viewer='); });
-
-    const zero = renderSlot('/c/conv-A?viewer=commission-review&review=0');
-    expect(zero.get().slot.kind).toBe('none');
-    await waitFor(() => { expect(zero.search()).not.toContain('viewer='); });
-  });
-
-  it('clears commission review params when switching to another viewer kind', () => {
-    const h = renderSlot();
-    act(() => { h.get().openCommissionReview(42); });
-    expect(h.search()).toContain('review=42');
-
-    act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
-    expect(h.get().slot.kind).toBe('prose');
-    expect(h.search()).not.toContain('review=');
-  });
-});
-
 describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
   it('opens the inspector, encoding the opaque handle in the URL', () => {
     const h = renderSlot();
@@ -215,19 +167,6 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     expect(h.get().slot.kind).toBe('prose');
     expect(h.search()).toContain('viewer=prose');
     expect(h.search()).toContain('file=%2Frepo%2Fb.ts');
-  });
-
-  it('opening commission review while prose is open removes the file/root params', () => {
-    const h = renderSlot();
-    act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
-    expect(h.search()).toContain('file=');
-
-    act(() => { h.get().openCommissionReview(15); });
-    expect(h.get().slot).toEqual({ kind: 'commission-review', presentation: 'pane', requestSequenceId: 15 });
-    expect(h.search()).toContain('viewer=commission-review');
-    expect(h.search()).toContain('review=15');
-    expect(h.search()).not.toContain('file=');
-    expect(h.search()).not.toContain('root=');
   });
 
   it('writes only valid positive integer line targets for prose opens', () => {

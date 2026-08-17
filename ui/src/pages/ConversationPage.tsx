@@ -12,7 +12,6 @@ import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
-import { canShowCommissionReviewViewer } from './commissionReviewViewerPrecedence';
 import {
   decideRouteFocus,
   reduceRouteFocusState,
@@ -100,9 +99,6 @@ const ConversationDiffViewer = lazy(() =>
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
-const CommissionReviewApproval = lazy(() =>
-  import('../components/CommissionReviewApproval').then((m) => ({ default: m.CommissionReviewApproval })),
-);
 const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
 );
@@ -121,10 +117,6 @@ const ProcessInspectorPanel = lazy(() =>
 const MessageViewer = lazy(() =>
   import('../components/MessageViewer').then((m) => ({ default: m.MessageViewer })),
 );
-const CommissionReviewViewer = lazy(() =>
-  import('../features/commissionReview/CommissionReviewViewer').then((m) => ({ default: m.CommissionReviewViewer })),
-);
-
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
@@ -339,9 +331,7 @@ function ConversationPageContent({
   const inspectOpen = inspectSlot !== null;
   const messageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   const messageOpen = messageSlot !== null;
-  const commissionReviewSlot = viewerSlot.slot.kind === 'commission-review' ? viewerSlot.slot : null;
   const proseSlot = viewerSlot.slot.kind === 'prose' ? viewerSlot.slot : null;
-  const commissionReviewOpen = commissionReviewSlot !== null;
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
   const handleCloseInspector = viewerSlot.close;
@@ -356,9 +346,6 @@ function ConversationPageContent({
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
   const isWideDesktop = useIsWideDesktop();
-  const handleOpenCommissionReview = useCallback((requestSequenceId: number) => {
-    viewerSlot.openCommissionReview(requestSequenceId);
-  }, [viewerSlot]);
   const VIEWER_PANE_MIN = 360;
   const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({
@@ -1508,26 +1495,6 @@ function ConversationPageContent({
     }
   };
 
-  const handleApproveCommissionReview = async () => {
-    if (!conversationId) return;
-    try {
-      await api.approveCommissionReview(conversationId);
-    } catch (err) {
-      console.error('Failed to approve commission review:', err);
-      throw err;
-    }
-  };
-
-  const handleRejectCommissionReview = async () => {
-    if (!conversationId) return;
-    try {
-      await api.rejectCommissionReview(conversationId);
-    } catch (err) {
-      console.error('Failed to reject commission review:', err);
-      throw err;
-    }
-  };
-
   const handleTaskFeedback = async (annotations: string) => {
     if (!conversationId || isArchived) return;
     try {
@@ -1753,7 +1720,6 @@ function ConversationPageContent({
   const inspectViewerOpen = !isArchived && inspectOpen;
   const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
   const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
-  const commissionReviewViewerOpen = canShowCommissionReviewViewer(canOpenMessageSidepanel, commissionReviewOpen, atom.phase.type);
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -1982,20 +1948,6 @@ function ConversationPageContent({
         </div>
       );
     }
-    if (commissionReviewViewerOpen && commissionReviewSlot) {
-      return (
-        <div id="app">
-          <Suspense fallback={null}>
-            <CommissionReviewViewer
-              sequenceId={commissionReviewSlot.requestSequenceId}
-              messages={viewableMessages}
-              onClose={handleCloseMessageViewer}
-              inline
-            />
-          </Suspense>
-        </div>
-      );
-    }
   }
 
   // Derived: model context window is a pure function of the current model's
@@ -2054,7 +2006,6 @@ function ConversationPageContent({
       || browserViewerOpen
       || inspectViewerOpen
       || (messageViewerOpen && messageSlot?.presentation === 'pane')
-      || commissionReviewViewerOpen
     );
 
   const terminalSplitPane = showTerminal ? (
@@ -2131,7 +2082,6 @@ function ConversationPageContent({
         onRetry={handleRetry}
         onCancelSteering={isArchived ? undefined : handleCancelSteering}
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
-        onOpenCommissionReview={canOpenMessageSidepanel ? handleOpenCommissionReview : undefined}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         enableMessageSidepanel={canOpenMessageSidepanel}
@@ -2569,17 +2519,6 @@ function ConversationPageContent({
           />
         </Suspense>
       )}
-      {atom.phase.type === 'awaiting_commission_review_approval' && (
-        <Suspense fallback={null}>
-          <CommissionReviewApproval
-            brief={atom.phase.brief}
-            focus={atom.phase.focus}
-            scope={atom.phase.scope}
-            onApprove={handleApproveCommissionReview}
-            onReject={handleRejectCommissionReview}
-          />
-        </Suspense>
-      )}
 
       <Toast messages={toasts} onDismiss={dismissToast} />
 
@@ -2683,18 +2622,6 @@ function ConversationPageContent({
           />
         </Suspense>
       )}
-      {commissionReviewViewerOpen && commissionReviewSlot && !showSplitPaneViewer && (
-        <Suspense fallback={null}>
-          <CommissionReviewViewer
-            sequenceId={commissionReviewSlot.requestSequenceId}
-            messages={viewableMessages}
-            onClose={handleCloseMessageViewer}
-            presentation={commissionReviewSlot.presentation}
-            canTogglePresentation={isWideDesktop}
-            onPresentationChange={viewerSlot.setPresentation}
-          />
-        </Suspense>
-      )}
       {showSplitPaneViewer && (
         <>
           <div
@@ -2777,16 +2704,6 @@ function ConversationPageContent({
                   onClose={handleCloseMessageViewer}
                   onSendNotes={isWideDesktop && messageSlot.presentation === 'fullscreen' ? handleSendFocusedNotes : handleSendNotes}
                   presentation={messageSlot.presentation}
-                  canTogglePresentation
-                  onPresentationChange={viewerSlot.setPresentation}
-                  inline
-                />
-              ) : commissionReviewViewerOpen && commissionReviewSlot ? (
-                <CommissionReviewViewer
-                  sequenceId={commissionReviewSlot.requestSequenceId}
-                  messages={viewableMessages}
-                  onClose={handleCloseMessageViewer}
-                  presentation={commissionReviewSlot.presentation}
                   canTogglePresentation
                   onPresentationChange={viewerSlot.setPresentation}
                   inline

@@ -17,10 +17,10 @@ use super::event::{
 };
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
-    ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
-    RecoverableContinuationFailure, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome,
-    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
+    ParentState, RecoverableContinuationFailure, RecoveryKind, RecoveryResumeTarget,
+    SubAgentOutcome, SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome,
+    ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -301,23 +301,6 @@ enum AskUserQuestionCall<'a> {
     Malformed(&'a str),
 }
 
-enum CommissionReviewCall<'a> {
-    Typed(&'a super::state::CommissionReviewInput),
-    Malformed(&'a str),
-}
-
-const COMMISSION_REVIEW_SCOPE_UNAVAILABLE: &str = "commission_review is unavailable: this conversation does not have a current committed branch diff scope.";
-
-fn commission_review_scope_from_context(
-    context: &ConvContext,
-) -> Result<super::state::CommissionReviewApprovalScope, String> {
-    match context.commission_review_approval.as_ref() {
-        Some(CommissionReviewApprovalAvailability::Available(scope)) => Ok(scope.clone()),
-        Some(CommissionReviewApprovalAvailability::Unavailable { reason }) => Err(reason.clone()),
-        None => Err(COMMISSION_REVIEW_SCOPE_UNAVAILABLE.to_string()),
-    }
-}
-
 /// Result of a state transition
 #[derive(Debug, Clone)]
 pub struct TransitionResult {
@@ -433,9 +416,6 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // transition_parent: explicit reject arms
         ConvState::AwaitingTaskApproval { .. } => Err(TransitionError::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Err(TransitionError::AwaitingUserResponse),
-        ConvState::AwaitingCommissionReviewApproval { .. } => {
-            Err(TransitionError::AwaitingUserResponse)
-        }
         ConvState::ContextExhausted { .. } => Err(TransitionError::ContextExhausted),
         ConvState::HandedOff { .. } | ConvState::Terminal => {
             Err(TransitionError::ConversationTerminal)
@@ -1958,126 +1938,14 @@ pub fn transition_parent(
                 .with_effect(Effect::notify_agent_done()),
         ),
 
-        // ============================================================
-        // Parent-only state: AwaitingCommissionReviewApproval
-        // ============================================================
         (
-            ParentState::AwaitingCommissionReviewApproval { .. }
-            | ParentState::AwaitingUserResponse { .. },
+            ParentState::AwaitingUserResponse { .. },
             ParentEvent::Core(
                 CoreEvent::UserMessage { .. }
                 | CoreEvent::AuthoritativeUserMessage { .. }
                 | CoreEvent::UserTriggerContinuation { .. },
             ),
         ) => Err(TransitionError::AwaitingUserResponse),
-
-        (
-            ParentState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                assistant_message,
-                scope,
-            },
-            ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
-                outcome: CommissionReviewApprovalOutcome::Approved,
-            }),
-        ) => {
-            let (Some(approved_head), Some(approved_base)) =
-                (scope.approved_head.clone(), scope.approved_base.clone())
-            else {
-                let tool_result = ToolResult::error(
-                    tool_use_id.clone(),
-                    "commission_review approval expired: the approved diff range was not frozen. Request review again to approve a fresh committed diff scope.".to_string(),
-                );
-                let checkpoint =
-                    CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
-                        .expect("commission_review approval expiry pairs exactly one tool_use");
-                return Ok(ParentTransitionResult::new(ParentState::Core(
-                    CoreState::LlmRequesting { attempt: 1 },
-                ))
-                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm));
-            };
-
-            let approved_tool = ToolCall::new(
-                tool_use_id.clone(),
-                ToolInput::ApprovedCommissionReview(
-                    phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
-                        request: request.clone(),
-                        runtime_base_branch: Some(scope.base.clone()),
-                        approved_working_dir: context.filesystem_root().display().to_string(),
-                        approved_worktree_path: context
-                            .work_scope_worktree
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
-                        approved_head: Some(approved_head),
-                        approved_base: Some(approved_base),
-                    },
-                ),
-            );
-            Ok(
-                ParentTransitionResult::new(ParentState::Core(CoreState::ToolExecuting {
-                    current_tool: approved_tool.clone(),
-                    remaining_tools: vec![],
-                    completed_results: vec![],
-                    pending_sub_agents: vec![],
-                    assistant_message: assistant_message.clone(),
-                }))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::execute_tool(approved_tool)),
-            )
-        }
-
-        (
-            ParentState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                assistant_message,
-                ..
-            },
-            ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
-                outcome: CommissionReviewApprovalOutcome::Rejected,
-            }),
-        ) => {
-            let tool_result = ToolResult::success(
-                tool_use_id.clone(),
-                serde_json::json!({
-                    "status": "rejected",
-                    "summary": {
-                        "brief": request.brief,
-                        "focus": request.focus,
-                        "reviewer_summary": "Commission review rejected before LLM execution"
-                    },
-                    "findings": [],
-                    "warnings": []
-                })
-                .to_string(),
-            );
-            let checkpoint =
-                CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
-                    .expect("commission_review rejection pairs exactly one tool_use");
-            Ok(
-                ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
-                    attempt: 1,
-                }))
-                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm),
-            )
-        }
-
-        (
-            ParentState::AwaitingCommissionReviewApproval { .. },
-            ParentEvent::Core(CoreEvent::UserCancel { .. }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()),
-        ),
 
         (
             ParentState::AwaitingUserResponse { .. },
@@ -2352,8 +2220,6 @@ pub fn transition_parent(
                         | ToolInput::SpawnAgents(_)
                         | ToolInput::SubmitResult(_)
                         | ToolInput::SubmitError(_)
-                        | ToolInput::CommissionReview(_)
-                        | ToolInput::ApprovedCommissionReview(_)
                         | ToolInput::AskUserQuestion(_)
                         | ToolInput::Unknown { .. }
                         | ToolInput::Malformed { .. } => None,
@@ -2592,171 +2458,6 @@ pub fn transition_parent(
                 .with_effect(Effect::RequestLlm));
             }
 
-            // REQ-CR-003: commission_review is a capital-spend request. Park
-            // for human approval instead of executing the review LLM in the
-            // normal tool round.
-            if let Some((tool, call)) = tool_calls.iter().find_map(|t| match &t.input {
-                ToolInput::CommissionReview(input) => Some((t, CommissionReviewCall::Typed(input))),
-                ToolInput::Malformed { name, error, .. } if name == "commission_review" => {
-                    Some((t, CommissionReviewCall::Malformed(error.as_str())))
-                }
-                ToolInput::Bash(_)
-                | ToolInput::Think(_)
-                | ToolInput::Patch(_)
-                | ToolInput::KeywordSearch(_)
-                | ToolInput::ReadImage(_)
-                | ToolInput::SpawnAgents(_)
-                | ToolInput::SubmitResult(_)
-                | ToolInput::SubmitError(_)
-                | ToolInput::ProposeTask(_)
-                | ToolInput::ApprovedCommissionReview(_)
-                | ToolInput::AskUserQuestion(_)
-                | ToolInput::Unknown { .. }
-                | ToolInput::Malformed { .. } => None,
-            }) {
-                if tool_calls.len() > 1 {
-                    let msg = "commission_review must be the only tool in response".to_string();
-                    let display_data = make_display_data(&content);
-                    let assistant_message = AssistantMessage::new(
-                        request_id.clone(),
-                        content,
-                        Some(usage_data),
-                        display_data,
-                    );
-                    let error_results: Vec<ToolResult> = tool_calls
-                        .iter()
-                        .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
-                        .collect();
-                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
-                        .expect("error_results.len() == tool_calls.len()");
-                    return Ok(ParentTransitionResult::new(ParentState::Core(
-                        CoreState::LlmRequesting { attempt: 1 },
-                    ))
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm));
-                }
-
-                let input = match call {
-                    CommissionReviewCall::Typed(input) => input,
-                    CommissionReviewCall::Malformed(err) => {
-                        let err_msg = format!(
-                            "commission_review input failed to parse: {err}. Re-emit the call with a valid `brief` string."
-                        );
-                        let display_data = make_display_data(&content);
-                        let assistant_message = AssistantMessage::new(
-                            request_id.clone(),
-                            content,
-                            Some(usage_data),
-                            display_data,
-                        );
-                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                        let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect("commission_review produces exactly one result");
-                        return Ok(ParentTransitionResult::new(ParentState::Core(
-                            CoreState::LlmRequesting { attempt: 1 },
-                        ))
-                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change())
-                        .with_effect(Effect::RequestLlm));
-                    }
-                };
-
-                if input.brief.trim().is_empty() {
-                    let err_msg = "commission_review requires a non-empty brief explaining why review is useful now".to_string();
-                    let display_data = make_display_data(&content);
-                    let assistant_message = AssistantMessage::new(
-                        request_id.clone(),
-                        content,
-                        Some(usage_data),
-                        display_data,
-                    );
-                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("commission_review produces exactly one result");
-                    return Ok(ParentTransitionResult::new(ParentState::Core(
-                        CoreState::LlmRequesting { attempt: 1 },
-                    ))
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm));
-                }
-
-                if should_trigger_continuation(
-                    &usage_data,
-                    context.context_window,
-                    context.effective_effort.level(),
-                ) {
-                    let tr = handle_context_exhaustion(
-                        context,
-                        content,
-                        tool_calls,
-                        usage_data,
-                        request_id,
-                        final_attempt,
-                    );
-                    return Ok(ParentTransitionResult {
-                        new_state: ParentState::try_from(tr.new_state)
-                            .expect("handle_context_exhaustion returns parent-valid state"),
-                        effects: tr.effects,
-                    });
-                }
-
-                let scope = match commission_review_scope_from_context(context) {
-                    Ok(scope) => scope,
-                    Err(err) => {
-                        let err_msg = err;
-                        let display_data = make_display_data(&content);
-                        let assistant_message = AssistantMessage::new(
-                            request_id.clone(),
-                            content,
-                            Some(usage_data),
-                            display_data,
-                        );
-                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                        let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect("commission_review produces exactly one result");
-                        return Ok(ParentTransitionResult::new(ParentState::Core(
-                            CoreState::LlmRequesting { attempt: 1 },
-                        ))
-                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change())
-                        .with_effect(Effect::RequestLlm));
-                    }
-                };
-
-                // Park for approval without writing a tool_result placeholder.
-                // The original assistant message is carried in state and paired
-                // with the real review result after approval; writing an ack for
-                // this tool_use here would make the approved result collide with
-                // the deterministic tool_result message id.
-                let display_data = make_display_data(&content);
-                let assistant_message = AssistantMessage::new(
-                    request_id.clone(),
-                    content,
-                    Some(usage_data),
-                    display_data,
-                );
-
-                return Ok(ParentTransitionResult::new(
-                    ParentState::AwaitingCommissionReviewApproval {
-                        tool_use_id: tool.id.clone(),
-                        request: input.clone(),
-                        scope,
-                        assistant_message,
-                    },
-                )
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change()));
-            }
-
             // REQ-AUQ-001: ask_user_question interception. Same shape as
             // propose_task: typed input takes the AwaitingUserResponse path,
             // a malformed payload surfaces the serde error to the LLM so it
@@ -2776,8 +2477,6 @@ pub fn transition_parent(
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
                 | ToolInput::ProposeTask(_)
-                | ToolInput::CommissionReview(_)
-                | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -3100,12 +2799,6 @@ pub fn transition_parent(
         // Stale TaskApprovalDecided
         (state, ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided { .. })) => {
             tracing::debug!("Absorbing stale TaskApprovalDecided");
-            Ok(ParentTransitionResult::new(state.clone()))
-        }
-
-        // Stale commission review approval decisions
-        (state, ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided { .. })) => {
-            tracing::debug!("Absorbing stale CommissionReviewApprovalDecided");
             Ok(ParentTransitionResult::new(state.clone()))
         }
 
@@ -3460,8 +3153,6 @@ pub fn transition_sub_agent(
                     | ToolInput::ReadImage(_)
                     | ToolInput::SpawnAgents(_)
                     | ToolInput::ProposeTask(_)
-                    | ToolInput::CommissionReview(_)
-                    | ToolInput::ApprovedCommissionReview(_)
                     | ToolInput::AskUserQuestion(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
@@ -3757,7 +3448,6 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
-        | ConvState::AwaitingCommissionReviewApproval { .. }
         | ConvState::Provisioning { .. }
         | ConvState::CreationFailed { .. }
         | ConvState::CreationCancelled { .. }
@@ -3926,58 +3616,10 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::CommissionReviewApprovalScope;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
-    }
-
-    fn context_with_dir(dir: &Path) -> ConvContext {
-        ConvContext::new("test-conv", dir.to_path_buf(), "test-model", 200_000)
-    }
-
-    fn git_ok(repo: &Path, args: &[&str]) {
-        let status = phoenix_core::git::command()
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    #[test]
-    fn commission_review_scope_uses_precomputed_availability() {
-        let mut ctx = test_context();
-        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Available(
-            CommissionReviewApprovalScope {
-                kind: "committed_branch_diff".to_string(),
-                repo_root: "/repo".to_string(),
-                base: "refs/remotes/origin/main".to_string(),
-                head: "HEAD".to_string(),
-                approved_head: None,
-                approved_base: None,
-                dirty: false,
-                changed_files: 0,
-                insertions: 0,
-                deletions: 0,
-            },
-        ));
-
-        let scope = commission_review_scope_from_context(&ctx).expect("scope available");
-        assert_eq!(scope.base, "refs/remotes/origin/main");
-        assert_eq!(scope.head, "HEAD");
-    }
-
-    #[test]
-    fn commission_review_scope_preserves_precomputed_unavailable_reason() {
-        let mut ctx = test_context();
-        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Unavailable {
-            reason: "commission_review refused dirty working tree".to_string(),
-        });
-
-        let err = commission_review_scope_from_context(&ctx).expect_err("scope unavailable");
-        assert_eq!(err, "commission_review refused dirty working tree");
     }
 
     fn test_tool_call(id: &str) -> ToolCall {
@@ -4216,7 +3858,6 @@ mod tests {
             | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal) => {
@@ -5057,7 +4698,6 @@ mod tests {
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5138,7 +4778,6 @@ mod tests {
         use crate::state::ContextExhaustionBehavior;
         ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-cancel".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5485,7 +5124,6 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5688,7 +5326,6 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5754,7 +5391,6 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5827,7 +5463,6 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -6984,358 +6619,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    mod commission_review_approval {
-        use super::*;
-        use crate::state::{CommissionReviewInput, ToolInput};
-        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
-
-        fn work_context() -> ConvContext {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let repo = dir.path().to_path_buf();
-            git_ok(&repo, &["init", "-q"]);
-            git_ok(&repo, &["config", "user.email", "t@t.t"]);
-            git_ok(&repo, &["config", "user.name", "t"]);
-            git_ok(&repo, &["config", "commit.gpgsign", "false"]);
-            git_ok(&repo, &["commit", "-qm", "base", "--allow-empty"]);
-            let head = phoenix_core::git::command()
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo)
-                .output()
-                .expect("git rev-parse");
-            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-            git_ok(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
-            let mut context = context_with_dir(&repo);
-            context.mode_context = Some(ModeContext::Work {
-                branch_name: "task".to_string(),
-                base_branch: "main".to_string(),
-                worktree_path: repo.display().to_string(),
-            });
-            context.commission_review_approval = Some(
-                CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
-                    kind: "committed_branch_diff".to_string(),
-                    repo_root: repo.display().to_string(),
-                    base: "refs/remotes/origin/main".to_string(),
-                    head: "task".to_string(),
-                    approved_head: None,
-                    approved_base: None,
-                    dirty: false,
-                    changed_files: 0,
-                    insertions: 0,
-                    deletions: 0,
-                }),
-            );
-            std::mem::forget(dir);
-            context
-        }
-
-        fn commission_review_event() -> Event {
-            let tool = ToolCall::new(
-                "tool-review-1",
-                ToolInput::CommissionReview(CommissionReviewInput {
-                    brief: "Ready for independent review".to_string(),
-                    focus: Some("correctness".to_string()),
-                }),
-            );
-            Event::LlmResponse {
-                content: vec![ContentBlock::ToolUse {
-                    id: "tool-review-1".to_string(),
-                    name: "commission_review".to_string(),
-                    input: serde_json::json!({
-                        "brief": "Ready for independent review",
-                        "focus": "correctness",
-                    }),
-                }],
-                tool_calls: vec![tool],
-                end_turn: false,
-                usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
-            }
-        }
-
-        fn approval_state() -> ConvState {
-            ConvState::AwaitingCommissionReviewApproval {
-                tool_use_id: "tool-review-1".to_string(),
-                request: CommissionReviewInput {
-                    brief: "Ready for independent review".to_string(),
-                    focus: None,
-                },
-                scope: CommissionReviewApprovalScope {
-                    kind: "committed_branch_diff".to_string(),
-                    repo_root: "/tmp".to_string(),
-                    base: "refs/remotes/origin/main".to_string(),
-                    head: "task".to_string(),
-                    approved_head: None,
-                    approved_base: None,
-                    dirty: false,
-                    changed_files: 0,
-                    insertions: 0,
-                    deletions: 0,
-                },
-                assistant_message: AssistantMessage::new(
-                    "req".to_string(),
-                    vec![ContentBlock::ToolUse {
-                        id: "tool-review-1".to_string(),
-                        name: "commission_review".to_string(),
-                        input: serde_json::json!({ "brief": "Ready for independent review" }),
-                    }],
-                    None,
-                    None,
-                ),
-            }
-        }
-
-        fn has_execute_tool(effects: &[Effect]) -> bool {
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::ExecuteTool { .. }))
-        }
-
-        #[test]
-        fn reject_does_not_execute_review() {
-            let result = transition(
-                &approval_state(),
-                &test_context(),
-                Event::CommissionReviewApprovalDecided {
-                    outcome: CommissionReviewApprovalOutcome::Rejected,
-                },
-            )
-            .expect("reject should settle approval state");
-
-            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
-            assert!(!has_execute_tool(&result.effects));
-        }
-
-        #[test]
-        fn approval_without_frozen_range_does_not_execute_review() {
-            let result = transition(
-                &approval_state(),
-                &test_context(),
-                Event::CommissionReviewApprovalDecided {
-                    outcome: CommissionReviewApprovalOutcome::Approved,
-                },
-            )
-            .expect("expired approval should settle as a tool error");
-
-            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
-            assert!(!has_execute_tool(&result.effects));
-            assert!(result
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
-        }
-
-        #[test]
-        fn cancel_does_not_execute_review() {
-            let result = transition(
-                &approval_state(),
-                &test_context(),
-                Event::UserCancel {
-                    reason: None,
-                    cause: crate::event::CancelCause::UserRequested,
-                },
-            )
-            .expect("cancel should settle approval state");
-
-            assert_eq!(result.new_state, ConvState::Idle);
-            assert!(!has_execute_tool(&result.effects));
-        }
-
-        #[test]
-        fn stale_approval_from_idle_is_absorbed_without_execution() {
-            let result = transition(
-                &ConvState::Idle,
-                &test_context(),
-                Event::CommissionReviewApprovalDecided {
-                    outcome: CommissionReviewApprovalOutcome::Approved,
-                },
-            )
-            .expect("stale approval should be absorbed");
-
-            assert_eq!(result.new_state, ConvState::Idle);
-            assert!(!has_execute_tool(&result.effects));
-        }
-
-        #[test]
-        fn empty_brief_does_not_enter_approval_state() {
-            let tool = ToolCall::new(
-                "tool-review-1",
-                ToolInput::CommissionReview(CommissionReviewInput {
-                    brief: "   ".to_string(),
-                    focus: None,
-                }),
-            );
-            let event = Event::LlmResponse {
-                content: vec![ContentBlock::ToolUse {
-                    id: "tool-review-1".to_string(),
-                    name: "commission_review".to_string(),
-                    input: serde_json::json!({ "brief": "   " }),
-                }],
-                tool_calls: vec![tool],
-                end_turn: false,
-                usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
-            };
-            let result = transition(
-                &ConvState::LlmRequesting { attempt: 1 },
-                &test_context(),
-                event,
-            )
-            .expect("empty brief should be returned to LLM as tool error");
-            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
-            assert!(!has_execute_tool(&result.effects));
-        }
-
-        #[test]
-        fn malformed_payload_does_not_enter_approval_state() {
-            let tool = ToolCall::new(
-                "tool-review-1",
-                ToolInput::Malformed {
-                    name: "commission_review".to_string(),
-                    input: serde_json::json!({ "brief": 12 }),
-                    error: "invalid type".to_string(),
-                },
-            );
-            let event = Event::LlmResponse {
-                content: vec![ContentBlock::ToolUse {
-                    id: "tool-review-1".to_string(),
-                    name: "commission_review".to_string(),
-                    input: serde_json::json!({ "brief": 12 }),
-                }],
-                tool_calls: vec![tool],
-                end_turn: false,
-                usage: Usage::default(),
-                request_id: "test-req-id".to_string(),
-            };
-            let result = transition(
-                &ConvState::LlmRequesting { attempt: 1 },
-                &test_context(),
-                event,
-            )
-            .expect("malformed input should be returned to LLM as tool error");
-            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
-            assert!(!has_execute_tool(&result.effects));
-        }
-
-        #[test]
-        fn commission_review_parks_for_approval() {
-            let result = transition(
-                &ConvState::LlmRequesting { attempt: 1 },
-                &work_context(),
-                commission_review_event(),
-            )
-            .expect("commission_review should enter approval state");
-            assert!(matches!(
-                result.new_state,
-                ConvState::AwaitingCommissionReviewApproval { .. }
-            ));
-            assert!(!result
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::ExecuteTool { .. })));
-        }
-
-        #[test]
-        fn approval_converts_public_input_to_runtime_owned_input() {
-            let state = ConvState::AwaitingCommissionReviewApproval {
-                tool_use_id: "tool-review-1".to_string(),
-                request: CommissionReviewInput {
-                    brief: "Ready for independent review".to_string(),
-                    focus: None,
-                },
-                scope: CommissionReviewApprovalScope {
-                    kind: "committed_branch_diff".to_string(),
-                    repo_root: "/tmp".to_string(),
-                    base: "refs/remotes/origin/develop".to_string(),
-                    head: "task".to_string(),
-                    approved_head: Some("head-sha".to_string()),
-                    approved_base: Some("base-sha".to_string()),
-                    dirty: false,
-                    changed_files: 0,
-                    insertions: 0,
-                    deletions: 0,
-                },
-                assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
-            };
-            let mut context = test_context();
-            context.mode_context = Some(ModeContext::Work {
-                branch_name: "task-branch".to_string(),
-                base_branch: "develop".to_string(),
-                worktree_path: "/tmp/wt".to_string(),
-            });
-
-            let result = transition(
-                &state,
-                &context,
-                Event::CommissionReviewApprovalDecided {
-                    outcome: CommissionReviewApprovalOutcome::Approved,
-                },
-            )
-            .expect("approval should execute review");
-
-            let execute_effect = result.effects.iter().find_map(|effect| match effect {
-                Effect::ExecuteTool { tool } => Some(tool),
-                Effect::PersistMessage { .. }
-                | Effect::PersistAuthoritativeUserMessage { .. }
-                | Effect::PersistState
-                | Effect::RequestLlm
-                | Effect::CompleteCreation { .. }
-                | Effect::MaterializeCreation { .. }
-                | Effect::BroadcastAssistantMessage { .. }
-                | Effect::AbortTool { .. }
-                | Effect::AbortLlm
-                | Effect::CancelSubAgents { .. }
-                | Effect::NotifyParent { .. }
-                | Effect::NotifyStateChange
-                | Effect::NotifyAgentDone
-                | Effect::ScheduleRetry { .. }
-                | Effect::PersistCheckpoint { .. }
-                | Effect::PersistToolResults { .. }
-                | Effect::PersistHiddenSystemMarker { .. }
-                | Effect::PersistSubAgentResults { .. }
-                | Effect::RequestContinuation { .. }
-                | Effect::BeginContinuation { .. }
-                | Effect::ContinuationCommit { .. }
-                | Effect::NotifyContextExhausted { .. }
-                | Effect::ApproveTask { .. }
-                | Effect::ApproveTaskFreshHandoff { .. }
-                | Effect::PersistForkProposal { .. }
-                | Effect::ResolveTask { .. }
-                | Effect::CommitSteeringDrain { .. } => None,
-            });
-            let tool_call = execute_effect.expect("approval should emit ExecuteTool");
-            match &tool_call.input {
-                ToolInput::ApprovedCommissionReview(input) => {
-                    assert_eq!(input.request.brief, "Ready for independent review");
-                    assert_eq!(
-                        input.runtime_base_branch.as_deref(),
-                        Some("refs/remotes/origin/develop")
-                    );
-                    assert_eq!(
-                        input.approved_working_dir,
-                        context.filesystem_root().display().to_string()
-                    );
-                    assert_eq!(input.approved_head.as_deref(), Some("head-sha"));
-                    assert_eq!(input.approved_base.as_deref(), Some("base-sha"));
-                }
-                other @ (ToolInput::Bash(_)
-                | ToolInput::Think(_)
-                | ToolInput::Patch(_)
-                | ToolInput::KeywordSearch(_)
-                | ToolInput::ReadImage(_)
-                | ToolInput::SpawnAgents(_)
-                | ToolInput::SubmitResult(_)
-                | ToolInput::SubmitError(_)
-                | ToolInput::CommissionReview(_)
-                | ToolInput::ProposeTask(_)
-                | ToolInput::AskUserQuestion(_)
-                | ToolInput::Unknown { .. }
-                | ToolInput::Malformed { .. }) => {
-                    panic!("expected approved commission review input, got {other:?}")
-                }
-            }
-        }
     }
 
     // ========================================================================

@@ -44,8 +44,7 @@ export type ViewerSlot =
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; handleId: string }
-  | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number }
-  | { kind: 'commission-review'; presentation: ViewerPresentation; requestSequenceId: number };
+  | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number };
 
 /** The slot's imperative surface. Identity-stable across slot / browser-session
  *  changes, so a command-only consumer (a button that opens a viewer) does not
@@ -59,9 +58,7 @@ export interface ViewerSlotCommands {
   openInspect: (handleId: string) => void;
   /** Open a finalized chat message in the annotatable markdown viewer. */
   openMessage: (sequenceId: number, presentation: ViewerPresentation) => void;
-  /** Open a commission review request/result pair by request agent message sequence id. */
-  openCommissionReview: (requestSequenceId: number) => void;
-  /** Change only the active prose/message/review presentation, preserving identity. */
+  /** Change only the active prose/message presentation, preserving identity. */
   setPresentation: (presentation: ViewerPresentation) => void;
   close: () => void;
 }
@@ -91,7 +88,6 @@ const LINE_PARAM = 'line';
 const END_LINE_PARAM = 'endLine';
 const HANDLE_PARAM = 'handle';
 const MESSAGE_PARAM = 'message';
-const REVIEW_PARAM = 'review';
 
 /** The full set of slot-owned search params. Every transition clears all of
  *  them and writes only the ones its kind needs, so a stale param from a prior
@@ -106,7 +102,7 @@ const SLOT_PARAMS = [
   END_LINE_PARAM,
   HANDLE_PARAM,
   MESSAGE_PARAM,
-  REVIEW_PARAM,
+  'review',
 ] as const;
 
 function clearSlotParams(next: URLSearchParams) {
@@ -178,11 +174,6 @@ function deriveSlot(
       const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
       if (sequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
       return { slot: { kind: 'message', presentation, sequenceId }, malformed: false };
-    }
-    case 'commission-review': {
-      const requestSequenceId = parseMessageParam(searchParams.get(REVIEW_PARAM));
-      if (requestSequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'commission-review', presentation, requestSequenceId }, malformed: false };
     }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
@@ -319,20 +310,8 @@ export function ViewerSlotProvider({
     });
   }, [setPatchContext, writeUrl]);
 
-  const openCommissionReview = useCallback((requestSequenceId: number) => {
-    const validSequenceId = Number.isSafeInteger(requestSequenceId) && requestSequenceId > 0 ? requestSequenceId : undefined;
-    if (validSequenceId === undefined) return;
-    setPatchContext(null);
-    writeUrl((next) => {
-      clearSlotParams(next);
-      next.set(VIEWER_PARAM, 'commission-review');
-      next.set(DIFF_PRESENTATION_PARAM, 'pane');
-      next.set(REVIEW_PARAM, String(validSequenceId));
-    });
-  }, [setPatchContext, writeUrl]);
-
   const setPresentation = useCallback((nextPresentation: ViewerPresentation) => {
-    if (slot.kind !== 'prose' && slot.kind !== 'message' && slot.kind !== 'commission-review') return;
+    if (slot.kind !== 'prose' && slot.kind !== 'message') return;
     writeUrl((next) => next.set(DIFF_PRESENTATION_PARAM, nextPresentation));
   }, [slot.kind, writeUrl]);
 
@@ -401,7 +380,7 @@ export function ViewerSlotProvider({
       || searchParams.has(DIFF_PRESENTATION_PARAM)
       || searchParams.has(DIFF_TARGET_PARAM)
       || searchParams.has(MESSAGE_PARAM)
-      || searchParams.has(REVIEW_PARAM)
+      || searchParams.has('review')
     ) {
       enteredScopeRef.current = scopeKey;
       setRestorationSettledScope(scopeKey);
@@ -513,8 +492,8 @@ export function ViewerSlotProvider({
   ]);
 
   const commands = useMemo<ViewerSlotCommands>(
-    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close }),
-    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, openCommissionReview, setPresentation, close],
+    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, setPresentation, close }),
+    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, setPresentation, close],
   );
 
   return (

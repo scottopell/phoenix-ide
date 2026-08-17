@@ -462,13 +462,6 @@ IMPORTANT:
 - If no files are truly relevant, return "No relevant files found"
 - Use absolute file paths"#;
 
-/// System prompt for the commissioned code-review tool. The model returns
-/// strict JSON findings; the shape is part of the contract.
-pub const COMMISSION_REVIEW_SYSTEM: &str = r#"You are an independent senior code reviewer for Phoenix IDE.
-Return only JSON matching this shape:
-{"findings":[{"severity":"critical|high|medium|low","confidence":"high|medium|low","file":"path","line":1,"symbol":"optional function/type/module anchor","title":"short","rationale":"why this matters","suggested_fix":"concrete fix"}],"summary":"short review summary"}
-Focus on correctness, regressions, security, data loss, race conditions, and maintainability. Do not comment on unchanged code unless the diff makes it relevant. Include symbol when a stable code symbol is available; it is a navigation hint, not a replacement for file."#;
-
 // =============================================================================
 // Chain Q&A system prompts.
 // =============================================================================

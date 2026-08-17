@@ -4764,7 +4764,7 @@ impl RuntimeManager {
                             if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
                                 .is_some()
                             {
-                                registry.with_propose_task().with_commission_review()
+                                registry.with_propose_task()
                             } else {
                                 registry
                             };
@@ -4783,7 +4783,6 @@ impl RuntimeManager {
                                 available_model_ids.clone(),
                             )
                             .with_propose_task()
-                            .with_commission_review()
                             .try_with_writing_conversation_tools(writing_tools)?,
                             None,
                         )
@@ -5731,7 +5730,6 @@ impl RuntimeManager {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::SeededLlmRequesting { .. } => {
                 tracing::debug!(
                     conv_id = %conversation_id,

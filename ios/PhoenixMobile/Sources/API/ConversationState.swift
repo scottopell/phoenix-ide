@@ -54,7 +54,6 @@ enum ConversationState: Equatable {
     case awaitingContinuation
     case awaitingUserResponse(questions: [UserQuestion])
     case awaitingTaskApproval(title: String, priority: String, plan: String)
-    case awaitingCommissionReviewApproval
     case awaitingRecovery(message: String)
     case provisioning
     case error(message: String, kind: ConversationErrorKind)
@@ -106,8 +105,6 @@ enum ConversationState: Equatable {
             else { return .other(type: type) }
             return .awaitingTaskApproval(
                 title: title, priority: priority, plan: plan)
-        case "awaiting_commission_review_approval":
-            return .awaitingCommissionReviewApproval
         case "awaiting_recovery":
             return .awaitingRecovery(
                 message: json["message"]?.stringValue ?? "Recovery in progress")
@@ -152,7 +149,7 @@ enum ConversationState: Equatable {
             return kind.isUserResumable
         case .awaitingLlm, .awaitingContinuation, .cancelling,
              .awaitingUserResponse, .awaitingTaskApproval,
-             .awaitingCommissionReviewApproval, .awaitingRecovery, .provisioning,
+             .awaitingRecovery, .provisioning,
              .contextExhausted,
              .creationFailed, .terminal, .handedOff, .other, .unknown:
             return false
@@ -162,7 +159,7 @@ enum ConversationState: Equatable {
     var isCancellable: Bool {
         switch self {
         case .llmRequesting, .toolExecuting, .awaitingSubAgents,
-             .awaitingTaskApproval, .awaitingCommissionReviewApproval,
+             .awaitingTaskApproval,
              .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,

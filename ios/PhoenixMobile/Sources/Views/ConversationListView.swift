@@ -251,8 +251,7 @@ struct StateDot: View {
         switch stateType {
         case "idle": return .green
         case "error": return .red
-        case "awaiting_user_response", "awaiting_task_approval",
-             "awaiting_commission_review_approval", "awaiting_recovery":
+        case "awaiting_user_response", "awaiting_task_approval", "awaiting_recovery":
             return .blue
         case "terminal", "context_exhausted", "handed_off": return .gray
         case nil: return .gray

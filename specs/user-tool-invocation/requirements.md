@@ -52,7 +52,7 @@ A tool is exposed to direct user invocation only when all three hold:
 1. **Authorship is meaningful** — the call represents an action a human would
    plausibly want to perform themselves, not LLM-internal cognition (`think`)
    or an inter-agent protocol message (`submit_result`, `submit_error`,
-   `ask_user_question`, `commission_review`).
+   `ask_user_question`).
 2. **Self-service** — the invocation produces a result and returns the
    conversation to idle without launching further agent activity (REQ-UTI-006).
    Tools that start agent work are user-as-director actions, deferred (see Out

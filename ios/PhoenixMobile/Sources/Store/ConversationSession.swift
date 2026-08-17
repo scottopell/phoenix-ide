@@ -450,10 +450,6 @@ final class ConversationSession {
         case .outboxed:
             break  // never blocked on connectivity by definition
         }
-        if case .cancel = action,
-           case .awaitingCommissionReviewApproval = typedState {
-            cancelNeedsAgentDoneFallback = true
-        }
         let token = UUID()
         actionAttempt = ActionAttempt(
             action: action,
@@ -604,12 +600,7 @@ final class ConversationSession {
             if let mode = snap.presentationMode {
                 conversation?.requires_action = mode == "needs_action"
             }
-            switch typedState {
-            case .awaitingCommissionReviewApproval:
-                break
-            default:
-                cancelNeedsAgentDoneFallback = false
-            }
+            cancelNeedsAgentDoneFallback = false
             clearResolvedActionIfStateAdvanced(currentState: typedState)
             messages = Self.reconcileTranscript(
                 existing: messages,
@@ -766,7 +757,7 @@ final class ConversationSession {
                 let restingStates: Set<String> = [
                     "idle", "error", "terminal", "context_exhausted", "handed_off",
                     "awaiting_user_response", "awaiting_task_approval",
-                    "awaiting_commission_review_approval", "awaiting_recovery",
+                    "awaiting_recovery",
                 ]
                 agentWorking = type.map { !restingStates.contains($0) } ?? false
             }

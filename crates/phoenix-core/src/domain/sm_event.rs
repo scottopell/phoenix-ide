@@ -396,8 +396,7 @@ impl From<PreparedDirectTurnPayload> for SteerEntry {
 
 use crate::domain::llm_types::{ContentBlock, Usage};
 use crate::domain::sm_state::{
-    CommissionReviewApprovalOutcome, PendingSubAgent, QuestionAnnotation, SubAgentOutcome,
-    TaskApprovalOutcome, ToolCall,
+    PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
 };
 use std::collections::HashMap;
 
@@ -540,9 +539,6 @@ pub enum Event {
     TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
-    CommissionReviewApprovalDecided {
-        outcome: CommissionReviewApprovalOutcome,
-    },
     /// Internal completion event emitted after fresh task approval creates the
     /// successor Work conversation.
     TaskHandoffComplete {
@@ -667,7 +663,6 @@ impl Event {
             Event::ContinuationError { .. } => "ContinuationError",
             Event::UserTriggerContinuation { .. } => "UserTriggerContinuation",
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
-            Event::CommissionReviewApprovalDecided { .. } => "CommissionReviewApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::UserQuestionDismissed => "UserQuestionDismissed",
@@ -790,9 +785,6 @@ pub enum CoreEvent {
 pub enum ParentOnlyEvent {
     TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
-    },
-    CommissionReviewApprovalDecided {
-        outcome: CommissionReviewApprovalOutcome,
     },
     TaskHandoffComplete {
         successor_conv_id: String,
@@ -999,9 +991,6 @@ impl TryFrom<Event> for ParentEvent {
                     outcome,
                 }))
             }
-            Event::CommissionReviewApprovalDecided { outcome } => Ok(ParentEvent::Parent(
-                ParentOnlyEvent::CommissionReviewApprovalDecided { outcome },
-            )),
             Event::TaskHandoffComplete { successor_conv_id } => {
                 Ok(ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete {
                     successor_conv_id,
@@ -1185,7 +1174,6 @@ impl TryFrom<Event> for SubAgentEvent {
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
             Event::TaskApprovalDecided { .. }
-            | Event::CommissionReviewApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed
@@ -1238,9 +1226,6 @@ impl ParentEvent {
             ParentEvent::Core(e) => e.variant_name(),
             ParentEvent::Parent(e) => match e {
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
-                ParentOnlyEvent::CommissionReviewApprovalDecided { .. } => {
-                    "CommissionReviewApprovalDecided"
-                }
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",

@@ -5,7 +5,7 @@
 --
 -- Scope: The single-slot, user-action-driven viewer system that overlays
 --        or sits beside a conversation's chat column. Governs which
---        viewer is open (prose / diff / browser / inspect / message / commission review), the data each viewer
+--        viewer is open (prose / diff / browser / inspect / message), the data each viewer
 --        carries, and the mutex rules between them.
 -- Includes: Open / close transitions, browser-session edge auto-open
 --           and auto-close, conversation-change reset, the URL contract
@@ -31,7 +31,7 @@
 --     state is component-local UI affordance, out of scope here.
 --
 -- Architecture: the slot is a discriminated union -- `kind` selects
---   exactly one of {none, prose, diff, browser, inspect, message, commission_review}, and the data each
+--   exactly one of {none, prose, diff, browser, inspect, message}, and the data each
 --   variant carries lives only in the variant that needs it. This
 --   makes "prose open without a file path" or "diff open without a
 --   comparator" structurally unrepresentable.
@@ -42,8 +42,7 @@
 --     ?viewer=browser
 --     ?viewer=inspect&handle=<opaque-handle-id>
 --     ?viewer=message&presentation=<pane|fullscreen>&message=<sequence-id>
---     ?viewer=commission-review&presentation=<pane|fullscreen>&review=<request-sequence-id>
---   patchContext (modifiedLines: Set<Integer>) rides alongside in
+-- --   patchContext (modifiedLines: Set<Integer>) rides alongside in
 --   conversation-scoped state, not in the URL -- it is patch-
 --   provenance, not view identity. Loss on cold reload is acceptable.
 --
@@ -80,10 +79,6 @@ value InspectHandle {
 
 value MessageRef {
     sequence_id: Integer -- positive, conversation-local message sequence
-}
-
-value CommissionReviewRef {
-    request_sequence_id: Integer -- positive, conversation-local request message sequence
 }
 
 -- The diff viewer carries presentation data but no payload data. The
@@ -141,7 +136,7 @@ value ViewerUrlSnapshot {
 
 -- The slot state kinds. Encoded in URL as ?viewer=<kind>.
 -- `none` corresponds to "no ?viewer= param present."
-enum ViewerKind { none | prose | diff | browser | inspect | message | commission_review }
+enum ViewerKind { none | prose | diff | browser | inspect | message }
 
 enum ViewerPresentation { fullscreen | pane }
 
@@ -183,13 +178,11 @@ entity ViewerSlot {
     inspect_handle: InspectHandle when kind = inspect
     message_ref: MessageRef when kind = message
     message_presentation: ViewerPresentation when kind = message
-    commission_review_ref: CommissionReviewRef when kind = commission_review
-    commission_review_presentation: ViewerPresentation when kind = commission_review
 
     -- The diff variant carries no payload data: the diff is identified by the
     -- conversation (conversation-keyed endpoint), and the browser
     -- variant's liveness signal is conversation.browser_session_active. The
-    -- message and commission-review variants carry only identity; their content
+    -- message variant carries only identity; its content
     -- is resolved from the loaded conversation messages on viewer mount.
 
     -- patchContext is conversation-scoped, NOT slot-scoped: it
@@ -211,43 +204,31 @@ entity ViewerSlot {
         none    -> browser
         none    -> inspect
         none    -> message
-        none    -> commission_review
         prose   -> none
         prose   -> diff
         prose   -> browser
         prose   -> inspect
         prose   -> message
-        prose   -> commission_review
         diff    -> none
         diff    -> prose
         diff    -> browser
         diff    -> inspect
         diff    -> message
-        diff    -> commission_review
         browser -> none
         browser -> prose
         browser -> diff
         browser -> inspect
         browser -> message
-        browser -> commission_review
         inspect -> none
         inspect -> prose
         inspect -> diff
         inspect -> browser
         inspect -> message
-        inspect -> commission_review
         message -> none
         message -> prose
         message -> diff
         message -> browser
         message -> inspect
-        message -> commission_review
-        commission_review -> none
-        commission_review -> prose
-        commission_review -> diff
-        commission_review -> browser
-        commission_review -> inspect
-        commission_review -> message
     }
 }
 
@@ -278,7 +259,6 @@ entity ViewerSlot {
 --   UserOpensBrowser(slot)
 --   UserOpensInspect(slot, handle)
 --   UserOpensMessage(slot, message, presentation)
---   UserOpensCommissionReview(slot, review)
 --   UserClosesViewer(slot)
 --
 -- URL-driven event: the URL search params changed (back button,
@@ -288,7 +268,7 @@ entity ViewerSlot {
 -- restoration on mount, browser back, or another tab's pushState
 -- via storage events. Treating it as one event keeps the rule set
 -- tight; the implementation reads the URL once and dispatches.
---   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_presentation?, next_inspect_handle?, next_message_ref?, next_commission_review_ref?)
+--   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_presentation?, next_inspect_handle?, next_message_ref?)
 --
 -- Server-driven events: bedrock's Conversation.browser_session_active
 -- transitioned. The slot listens for the rising edge to auto-open
@@ -373,20 +353,11 @@ rule UserOpensMessageViewer {
     ensures: slot.message_presentation = presentation
 }
 
-rule UserOpensCommissionReviewViewer {
-    when: UserOpensCommissionReview(slot, review)
-    requires: not slot.conversation.is_terminal
-    ensures: slot.kind = commission_review
-    ensures: slot.commission_review_ref = review
-    ensures: slot.commission_review_presentation = pane
-}
-
 rule UserChangesContentViewerPresentation {
     when: UserChangesViewerPresentation(slot, presentation)
-    requires: slot.kind = prose or slot.kind = message or slot.kind = commission_review
+    requires: slot.kind = prose or slot.kind = message
     ensures: (slot.kind = prose) implies (slot.prose_presentation = presentation)
     ensures: (slot.kind = message) implies (slot.message_presentation = presentation)
-    ensures: (slot.kind = commission_review) implies (slot.commission_review_presentation = presentation)
 }
 
 -- Fullscreen prose and message review is bounded: returning to pane with pending
@@ -471,21 +442,13 @@ rule UrlHydratesMessage {
     ensures: slot.message_presentation = presentation
 }
 
-rule UrlHydratesCommissionReview {
-    when: UrlSlotChanged(slot, commission_review, _, presentation, _, _, review_ref)
-    requires: review_ref != null and presentation != null
-    ensures: slot.kind = commission_review
-    ensures: slot.commission_review_ref = review_ref
-    ensures: slot.commission_review_presentation = presentation
-}
-
 -- Defensive: the URL has a viewer kind without its required params, or an
 -- unknown ?viewer= value. The implementation normalizes this away (treat as
 -- ?viewer=none), and the spec asserts the rule for correctness. ?viewer=browser
 -- is always well-formed because it carries no required params.
 rule UrlMalformedNormalizesToNone {
-    when: UrlSlotChanged(slot, kind, file, presentation, handle, message_ref, review_ref)
-    requires: (kind = prose and file = null) or (kind = diff and presentation = null) or (kind = inspect and handle = null) or (kind = message and message_ref = null) or (kind = commission_review and review_ref = null)
+    when: UrlSlotChanged(slot, kind, file, presentation, handle, message_ref)
+    requires: (kind = prose and file = null) or (kind = diff and presentation = null) or (kind = inspect and handle = null) or (kind = message and message_ref = null)
     ensures: slot.kind = none
     ensures: UrlNormalizationRequested(slot)  -- triggers a setSearchParams clearing the bogus params
 }
@@ -629,11 +592,6 @@ rule UserOpensMessageWritesStorage {
     ensures: ViewerSnapshotPersisted(slot)
 }
 
-rule UserOpensCommissionReviewWritesStorage {
-    when: UserOpensCommissionReview(slot, review)
-    ensures: ViewerSnapshotPersisted(slot)
-}
-
 rule UrlHydratesProseWritesStorage {
     when: UrlSlotChanged(slot, prose, file, _, _, _, _)
     requires: file != null
@@ -661,12 +619,6 @@ rule UrlHydratesInspectWritesStorage {
 rule UrlHydratesMessageWritesStorage {
     when: UrlSlotChanged(slot, message, _, _, _, message_ref, _)
     requires: message_ref != null
-    ensures: ViewerSnapshotPersisted(slot)
-}
-
-rule UrlHydratesCommissionReviewWritesStorage {
-    when: UrlSlotChanged(slot, commission_review, _, _, _, _, review_ref)
-    requires: review_ref != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -771,8 +723,6 @@ surface ConversationViewer {
         slot.inspect_handle when slot.kind = inspect
         slot.message_ref when slot.kind = message
         slot.message_presentation when slot.kind = message
-        slot.commission_review_ref when slot.kind = commission_review
-        slot.commission_review_presentation when slot.kind = commission_review
 
     provides:
         UserOpensProse(slot, file, patch?)
@@ -785,10 +735,9 @@ surface ConversationViewer {
             when not slot.conversation.is_terminal
         UserOpensMessage(slot, message, presentation)
             when not slot.conversation.is_terminal
-        UserOpensCommissionReview(slot, review)
             when not slot.conversation.is_terminal
         UserChangesViewerPresentation(slot, presentation)
-            when slot.kind = prose or slot.kind = message or slot.kind = commission_review
+            when slot.kind = prose or slot.kind = message
         UserClosesViewer(slot)
             when slot.kind != none
 }
@@ -800,7 +749,7 @@ surface ConversationViewer {
 -- @invariant VariantDataPresence
 --   prose_file is set iff kind = prose. diff_presentation is set iff kind =
 --   diff. inspect_handle is set iff kind = inspect. message_ref is set iff
---   kind = message. commission_review_ref is set iff kind = commission_review.
+--   kind = message.
 --   Browser carries no slot data. The `when kind = ...` annotations on
 --   entity fields are the structural enforcement; this invariant restates
 --   the contract for spec consumers (and gives `allium analyse` a
@@ -845,16 +794,6 @@ invariant MessageRefAbsentWhenNotMessageKind {
         (s.kind != message) implies (s.message_ref = null)
 }
 
-invariant CommissionReviewRefPresentIffCommissionReviewKind {
-    for s in ViewerSlot:
-        (s.kind = commission_review) implies (s.commission_review_ref != null)
-}
-
-invariant CommissionReviewRefAbsentWhenNotCommissionReviewKind {
-    for s in ViewerSlot:
-        (s.kind != commission_review) implies (s.commission_review_ref = null)
-}
-
 -- @invariant PatchContextOnlyDuringProse
 --   patch_context can only be populated when kind = prose. Otherwise
 --   it is null. (The `when kind = prose` annotation enforces this
@@ -865,7 +804,7 @@ invariant PatchContextOnlyDuringProse {
 }
 
 -- SingleSlotKind is enforced structurally by the enum -- kind is
--- a single field with values in { none, prose, diff, browser, inspect, message, commission_review }.
+-- a single field with values in { none, prose, diff, browser, inspect, message }.
 -- An invariant restating this would be tautological.
 
 -- UrlIsSourceOfTruth is documented in the entity comment and the

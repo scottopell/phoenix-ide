@@ -11,7 +11,6 @@ import type { RenderUnit } from '../../conversation/renderUnits';
 import { buildSectionItems, lineTextAt as diffLineTextAt } from '../viewer/pierreDiffMapping';
 import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 import { formatToolInput, skillResultVisibleText } from '../toolInputDisplay';
-import { buildCommissionReviewInlineSearchFragments, parseCommissionReviewResult } from '../../features/commissionReview/model';
 import { buildBrowserProfileVisibleText } from '../BrowserProfileResponseView';
 
 export interface SearchableSourceMatch<TTarget> {
@@ -220,12 +219,6 @@ export interface BrowserProfileResultRevealTarget {
   fragmentId: string;
 }
 
-export interface CommissionReviewResultRevealTarget {
-  kind: 'tool-result-commission-review';
-  toolUseId: string;
-  fragmentId: string;
-}
-
 export interface ToolUseInputRevealTarget {
   kind: 'tool-use-input';
   toolUseId: string;
@@ -243,7 +236,6 @@ export type ConversationFragmentRevealTarget =
   | MessageAttachmentRevealTarget
   | ToolUseInputRevealTarget
   | BrowserProfileResultRevealTarget
-  | CommissionReviewResultRevealTarget
   | SearchResultRevealTarget
   | KeywordSearchRevealTarget
   | ReadFileRevealTarget
@@ -687,7 +679,6 @@ export interface ConversationProjectionOptions {
   streamingBuffer?: StreamingBuffer | null;
   systemPrompt?: string | null;
   systemPromptExpanded?: boolean;
-  commissionReviewCanOpenFullReview?: boolean;
   liveBashProgress?: Readonly<Record<string, { progress: BashToolProgress }>>;
 }
 
@@ -724,8 +715,7 @@ export function buildConversationSearchProjection(
           unit.toolResultsByUseId,
           density,
           unit.key === options.latestAgentKey,
-          options.commissionReviewCanOpenFullReview === true,
-          options.liveBashProgress ?? {},
+                    options.liveBashProgress ?? {},
         )) {
           addConversationSource(
             sources,
@@ -746,8 +736,7 @@ export function buildConversationSearchProjection(
             member.toolResultsByUseId,
             density,
             member.key === options.latestAgentKey,
-            options.commissionReviewCanOpenFullReview === true,
-            options.liveBashProgress ?? {},
+                        options.liveBashProgress ?? {},
           )) {
             addConversationSource(
               sources,
@@ -1616,7 +1605,6 @@ function agentTurnSources(
   toolResultsByUseId: ReadonlyMap<string, Message>,
   density: 'full' | 'compact',
   isLatestAgentMessage: boolean,
-  commissionReviewCanOpenFullReview: boolean,
   liveBashProgress: Readonly<Record<string, { progress: BashToolProgress }>>,
 ): Array<{ role: string; text: string; fragmentId?: string; revealTarget?: ConversationFragmentRevealTarget }> {
   const forceExpandedText = isLatestAgentMessage
@@ -1705,19 +1693,6 @@ function agentTurnSources(
           });
         }
         return;
-      }
-      if (block.name === 'commission_review') {
-        const data = parseCommissionReviewResult(toolResult.display_data, resultText);
-        if (data) {
-          const renderAllDetails = !(commissionReviewCanOpenFullReview && message.sequence_id !== undefined);
-          buildCommissionReviewInlineSearchFragments(data, { renderAllDetails }).forEach((fragment, fragmentIndex) => out.push({
-            role: `commission-review-${index}-${fragmentIndex}`,
-            text: fragment.text,
-            fragmentId: fragment.fragmentId,
-            revealTarget: { kind: 'tool-result-commission-review', toolUseId, fragmentId: fragment.fragmentId },
-          }));
-          return;
-        }
       }
       const subAgentFragments = buildSubAgentCardFragments(toolResult?.display_data, block.id ?? '');
       if (subAgentFragments.length > 0) {

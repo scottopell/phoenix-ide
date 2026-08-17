@@ -70,7 +70,6 @@ const FOCUSED_REVIEW = [
   '| --- | --- | --- |',
   '| File | Pane / fullscreen | Annotatable |',
   '| Message | Pane / fullscreen | Annotatable |',
-  '| Commission review | Pane / fullscreen | Read-only |',
   '',
   '```mermaid',
   'flowchart LR',
@@ -290,7 +289,6 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
     }),
     seedNotes: [
       { lineNumber: 3, lineContent: 'A long Markdown document for sustained reading and annotation.', body: 'Confirm the reading measure remains comfortable.' },
-      { lineNumber: 15, lineContent: '| Commission review | Pane / fullscreen | Read-only |', body: 'Keep this surface read-only.' },
     ],
   },
   'annotation-dialog-dark': {

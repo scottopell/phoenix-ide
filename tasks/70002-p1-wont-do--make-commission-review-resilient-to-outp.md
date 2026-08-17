@@ -1,3 +1,5 @@
+> **Superseded:** Commission review is retired by task 17004 and ADR-037, so resilience or replacement work is intentionally not pursued.
+
 # Make `commission_review` resilient to reviewer output-budget exhaustion
 
 ## Problem
