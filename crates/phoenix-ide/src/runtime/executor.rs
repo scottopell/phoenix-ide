@@ -15,7 +15,7 @@
 
 use super::traits::{
     ActiveDirectTurnSettlement, LlmClient, StateStore, Storage, TerminalEvidenceEstablishment,
-    ToolExecutor,
+    TerminalMutationEstablishment, TerminalSubAgentEvidence, ToolExecutor,
 };
 use super::{
     AcknowledgedEventOutcome, AcknowledgedEventRequest, SseBroadcaster, SseEvent,
@@ -5938,7 +5938,11 @@ where
             Effect::PersistSubAgentResults {
                 results,
                 spawn_tool_id,
-            } => self.persist_sub_agent_results(results, spawn_tool_id).await,
+                summary_message_id,
+            } => {
+                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id)
+                    .await
+            }
 
             Effect::RequestContinuation { request } => {
                 if matches!(
@@ -7041,12 +7045,22 @@ where
                 }
             })
             .collect();
-        self.storage
+        match self
+            .storage
             .persist_tool_round_with_terminal_obligation(
                 &conv_id, &agent_msg, &tool_msgs, settlement,
             )
-            .await?;
-        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            .await
+        {
+            TerminalMutationEstablishment::Established { .. } => {
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            }
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        }
         let _ = self.broadcast_tx.send_message(agent_msg);
         for message in tool_msgs {
             let _ = self.broadcast_tx.send_message(message);
@@ -7248,6 +7262,7 @@ where
         &mut self,
         results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
+        summary_message_id: String,
     ) -> Result<Option<Event>, String> {
         // Build the display_data for subagent results
         let display_data = serde_json::json!({
@@ -7259,6 +7274,27 @@ where
         // feed the model the same text; only the carrier differs (tool_result vs
         // assistant text).
         let llm_content = render_sub_agent_summary(&results);
+
+        if let (Some(turn), Some(terminal)) = (
+            self.active_direct_turn.as_deref(),
+            self.pending_direct_turn_terminal.as_deref(),
+        ) {
+            let settlement = ActiveDirectTurnSettlement {
+                turn: turn.clone(),
+                terminal: terminal.clone(),
+                state: self.state.clone(),
+                state_updated_at: self.state_updated_at,
+            };
+            return self
+                .persist_terminal_sub_agent_results(
+                    spawn_tool_id,
+                    summary_message_id,
+                    llm_content,
+                    display_data,
+                    &settlement,
+                )
+                .await;
+        }
 
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
@@ -7325,12 +7361,11 @@ where
             // keeps the UI distinguishing it from real user input.
             let content =
                 crate::db::MessageContent::User(crate::db::UserContent::meta(&llm_content));
-            let msg_id = uuid::Uuid::new_v4().to_string();
             let seq = self.broadcast_tx.next_seq();
             let message = self
                 .storage
                 .add_message_with_seq(
-                    &msg_id,
+                    &summary_message_id,
                     &self.context.conversation_id,
                     seq,
                     &content,
@@ -7343,6 +7378,72 @@ where
             let _ = self.broadcast_tx.send_message(message);
         }
 
+        Ok(None)
+    }
+
+    async fn persist_terminal_sub_agent_results(
+        &mut self,
+        spawn_tool_id: Option<String>,
+        summary_message_id: String,
+        llm_content: String,
+        display_data: serde_json::Value,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Option<Event>, String> {
+        let evidence = if let Some(tool_id) = spawn_tool_id {
+            TerminalSubAgentEvidence::Update {
+                conversation_id: self.context.conversation_id.clone(),
+                message_id: tool_result_message_id(&tool_id),
+                content: MessageContent::tool(&tool_id, &llm_content, false),
+                display_data: display_data.clone(),
+            }
+        } else {
+            let content = MessageContent::User(crate::db::UserContent::meta(&llm_content));
+            TerminalSubAgentEvidence::Insert(crate::db::Message {
+                message_id: summary_message_id,
+                conversation_id: self.context.conversation_id.clone(),
+                sequence_id: self.broadcast_tx.next_seq(),
+                message_type: content.message_type(),
+                content,
+                display_data: Some(display_data.clone()),
+                usage_data: None,
+                created_at: Utc::now(),
+            })
+        };
+        let establishment = self
+            .storage
+            .persist_sub_agent_results_with_terminal_obligation(&evidence, settlement)
+            .await;
+        let transcript_generation = match establishment {
+            TerminalMutationEstablishment::Established {
+                transcript_generation,
+            } => transcript_generation,
+            TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
+            TerminalMutationEstablishment::Unclassifiable(error) => {
+                self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                return Err(error);
+            }
+        };
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        match evidence {
+            TerminalSubAgentEvidence::Update {
+                message_id,
+                content,
+                display_data,
+                ..
+            } => {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+                    sequence_id: seq,
+                    message_id,
+                    transcript_generation,
+                    display_data: Some(display_data),
+                    content: Some(content),
+                    duration_ms: None,
+                });
+            }
+            TerminalSubAgentEvidence::Insert(message) => {
+                let _ = self.broadcast_tx.send_message(message);
+            }
+        }
         Ok(None)
     }
 
@@ -12115,6 +12216,7 @@ mod authoritative_user_message_effect_tests {
                     outcome: SubAgentOutcome::TimedOut,
                 }],
                 spawn_tool_id: None,
+                summary_message_id: "terminal-subagent-summary".to_string(),
             })
             .with_effect(Effect::PersistState);
 
@@ -14394,7 +14496,7 @@ mod steer_drain_detector_tests {
             task: "investigate".to_string(),
             outcome: SubAgentOutcome::TimedOut,
         }];
-        rt.persist_sub_agent_results(results, None)
+        rt.persist_sub_agent_results(results, None, "subagent-summary".to_string())
             .await
             .expect("persist must succeed");
 

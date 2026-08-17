@@ -69,6 +69,13 @@ pub struct ClaimAuthoritativeTurnResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimAuthoritativeTurnEstablishment {
+    Established(Box<ClaimAuthoritativeTurnResult>),
+    KnownNotCommitted(String),
+    Unclassifiable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAuthoritativeTurnInput {
     pub authority: super::LocalAttemptAuthority,
     pub now: Timestamp,
@@ -198,6 +205,17 @@ pub enum TerminalEvidenceProbe {
     Established,
     KnownNotCommitted,
     Incomplete,
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminalEvidenceExpectation {
+    Messages(Vec<Message>),
+    MessageMutation {
+        conversation_id: String,
+        message_id: String,
+        content: MessageContent,
+        display_data: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,16 +449,137 @@ impl WorkflowRepository {
             .transpose()
     }
 
+    #[cfg(test)]
+    async fn establish_authoritative_turn_claim_at_cut(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+        cut: TransactionCut,
+    ) -> ClaimAuthoritativeTurnEstablishment {
+        self.establish_authoritative_turn_claim_with_cut(input, cut)
+            .await
+    }
+
+    pub async fn establish_authoritative_turn_claim(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+    ) -> ClaimAuthoritativeTurnEstablishment {
+        self.establish_authoritative_turn_claim_with_cut(input, TransactionCut::None)
+            .await
+    }
+
+    async fn establish_authoritative_turn_claim_with_cut(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+        cut: TransactionCut,
+    ) -> ClaimAuthoritativeTurnEstablishment {
+        let mut tx = match self.begin_tx().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error.to_string());
+            }
+        };
+        let result = match self.claim_authoritative_turn_in_tx(&mut tx, input).await {
+            Ok(result) => result,
+            Err(error) => {
+                return ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error.to_string());
+            }
+        };
+        if result.outcome != ClaimOutcome::Started {
+            return match tx.rollback().await {
+                Ok(()) => ClaimAuthoritativeTurnEstablishment::Established(Box::new(result)),
+                Err(error) => {
+                    ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error.to_string())
+                }
+            };
+        }
+        if cut == TransactionCut::BeforeCommit {
+            let _ = tx.rollback().await;
+            return ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(
+                "injected claim before-commit cut".to_string(),
+            );
+        }
+        let commit = tx.commit().await;
+        let commit = if cut == TransactionCut::AfterCommit {
+            Err(DbError::Serialization(
+                "injected claim after-commit acknowledgement loss".to_string(),
+            ))
+        } else {
+            commit
+        };
+        match commit {
+            Ok(()) => ClaimAuthoritativeTurnEstablishment::Established(Box::new(result)),
+            Err(error) => match self.probe_authoritative_turn_claim(input).await {
+                Ok(Some(result)) => {
+                    ClaimAuthoritativeTurnEstablishment::Established(Box::new(result))
+                }
+                Ok(None) => {
+                    ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error.to_string())
+                }
+                Err(probe_error) => ClaimAuthoritativeTurnEstablishment::Unclassifiable(format!(
+                    "direct-turn claim commit acknowledgement failed: {error}; exact claim probe failed: {probe_error}"
+                )),
+            },
+        }
+    }
+
+    async fn probe_authoritative_turn_claim(
+        &self,
+        input: &ClaimAuthoritativeTurnInput,
+    ) -> DbResult<Option<ClaimAuthoritativeTurnResult>> {
+        let mut tx = self.pool.begin().await?;
+        let canonical_turn =
+            load_turn_for_workflow_tx(&self.pool, &mut tx, input.turn_id, input.workflow_id)
+                .await?;
+        let attempt =
+            load_live_attempt_tx(&mut tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?;
+        tx.commit().await?;
+        let Some(attempt) = attempt else {
+            return Ok(None);
+        };
+        let exact = attempt.authority.process_incarnation == input.process_incarnation
+            && attempt
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.lease_until == input.lease_until);
+        if !exact {
+            return Ok(None);
+        }
+        let Some(canonical_turn) = canonical_turn else {
+            return Err(DbError::Serialization(
+                "established direct-turn claim is missing its canonical turn".to_string(),
+            ));
+        };
+        Ok(Some(ClaimAuthoritativeTurnResult {
+            outcome: ClaimOutcome::Started,
+            authority: Some(attempt.authority.clone()),
+            attempt: Some(attempt),
+            canonical_turn: Some(canonical_turn),
+        }))
+    }
+
     pub async fn claim_authoritative_turn(
         &self,
         input: &ClaimAuthoritativeTurnInput,
     ) -> DbResult<ClaimAuthoritativeTurnResult> {
         let mut tx = self.begin_tx().await?;
+        let result = self.claim_authoritative_turn_in_tx(&mut tx, input).await?;
+        if result.outcome == ClaimOutcome::Started {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(result)
+    }
+
+    async fn claim_authoritative_turn_in_tx(
+        &self,
+        tx: &mut super::WorkflowTx<'_>,
+        input: &ClaimAuthoritativeTurnInput,
+    ) -> DbResult<ClaimAuthoritativeTurnResult> {
         let Some(canonical_turn) =
             load_turn_for_workflow_tx(&self.pool, &mut tx.tx, input.turn_id, input.workflow_id)
                 .await?
         else {
-            tx.rollback().await?;
             return Ok(ClaimAuthoritativeTurnResult {
                 outcome: ClaimOutcome::Ineligible,
                 authority: None,
@@ -451,7 +590,7 @@ impl WorkflowRepository {
         let Some(existing_live_attempt) =
             load_live_attempt_tx(&mut tx.tx, input.workflow_id, DIRECT_TURN_EFFECT_ID).await?
         else {
-            let attempt_id = next_attempt_id_tx(&mut tx).await?;
+            let attempt_id = next_attempt_id_tx(tx).await?;
             let result = tx
                 .begin_attempt(&super::BeginAttemptInput {
                     workflow_id: input.workflow_id,
@@ -462,11 +601,6 @@ impl WorkflowRepository {
                     lease_until: Some(input.lease_until),
                 })
                 .await?;
-            if result.outcome == ClaimOutcome::Started {
-                tx.commit().await?;
-            } else {
-                tx.rollback().await?;
-            }
             return Ok(ClaimAuthoritativeTurnResult {
                 outcome: result.outcome,
                 authority: result.authority,
@@ -480,7 +614,6 @@ impl WorkflowRepository {
             .map(|lease| lease.lease_until)
         {
             if lease_until.is_live_at(input.now) {
-                tx.rollback().await?;
                 return Ok(ClaimAuthoritativeTurnResult {
                     outcome: ClaimOutcome::AuthorityConflict,
                     authority: None,
@@ -490,7 +623,7 @@ impl WorkflowRepository {
             }
         }
         let expired = expire_direct_turn_lease_in_tx(
-            &mut tx,
+            tx,
             &super::ExpireLeaseInput {
                 workflow_id: input.workflow_id,
                 effect_id: EffectId(DIRECT_TURN_EFFECT_ID),
@@ -500,7 +633,6 @@ impl WorkflowRepository {
         )
         .await?;
         if expired != AuthorityOutcome::Authorized {
-            tx.rollback().await?;
             return Ok(ClaimAuthoritativeTurnResult {
                 outcome: ClaimOutcome::Ineligible,
                 authority: None,
@@ -508,7 +640,7 @@ impl WorkflowRepository {
                 canonical_turn: Some(canonical_turn),
             });
         }
-        let attempt_id = next_attempt_id_tx(&mut tx).await?;
+        let attempt_id = next_attempt_id_tx(tx).await?;
         let result = tx
             .begin_attempt(&super::BeginAttemptInput {
                 workflow_id: input.workflow_id,
@@ -519,11 +651,6 @@ impl WorkflowRepository {
                 lease_until: Some(input.lease_until),
             })
             .await?;
-        if result.outcome == ClaimOutcome::Started {
-            tx.commit().await?;
-        } else {
-            tx.rollback().await?;
-        }
         Ok(ClaimAuthoritativeTurnResult {
             outcome: result.outcome,
             authority: result.authority,
@@ -1298,14 +1425,72 @@ impl WorkflowRepository {
         message_id: &str,
         expected: &DirectTurnTerminalObligationInput,
     ) -> DbResult<TerminalEvidenceProbe> {
-        let mut tx = self.pool.begin().await?;
-        let message_exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1 AND conversation_id = ?2)",
+        self.probe_terminal_evidence_expectation(
+            &TerminalEvidenceExpectation::Messages(vec![Message {
+                message_id: message_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                sequence_id: 0,
+                message_type: phoenix_core::domain::db_schema::MessageType::System,
+                content: MessageContent::system("probe-by-identity"),
+                display_data: None,
+                usage_data: None,
+                created_at: DateTime::<Utc>::UNIX_EPOCH,
+            }]),
+            expected,
+            true,
         )
-        .bind(message_id)
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .await
+    }
+
+    pub async fn probe_exact_terminal_evidence(
+        &self,
+        evidence: &TerminalEvidenceExpectation,
+        expected: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<TerminalEvidenceProbe> {
+        self.probe_terminal_evidence_expectation(evidence, expected, false)
+            .await
+    }
+
+    async fn probe_terminal_evidence_expectation(
+        &self,
+        evidence: &TerminalEvidenceExpectation,
+        expected: &DirectTurnTerminalObligationInput,
+        identity_only: bool,
+    ) -> DbResult<TerminalEvidenceProbe> {
+        let mut tx = self.pool.begin().await?;
+        let evidence_matches = match evidence {
+            TerminalEvidenceExpectation::Messages(messages) => {
+                let mut matches = true;
+                for expected_message in messages {
+                    let actual =
+                        load_optional_message_by_id_tx(&mut tx, &expected_message.message_id)
+                            .await?;
+                    matches &= actual.as_ref().is_some_and(|actual| {
+                        actual.conversation_id == expected_message.conversation_id
+                            && (identity_only
+                                || (actual.sequence_id == expected_message.sequence_id
+                                    && actual.message_type == expected_message.message_type
+                                    && actual.content == expected_message.content
+                                    && actual.display_data == expected_message.display_data
+                                    && actual.usage_data == expected_message.usage_data
+                                    && actual.created_at == expected_message.created_at))
+                    });
+                }
+                matches
+            }
+            TerminalEvidenceExpectation::MessageMutation {
+                conversation_id,
+                message_id,
+                content,
+                display_data,
+            } => load_optional_message_by_id_tx(&mut tx, message_id)
+                .await?
+                .is_some_and(|message| {
+                    message.conversation_id == *conversation_id
+                        && message.content == *content
+                        && message.display_data.as_ref() == Some(display_data)
+                }),
+        };
         let row = sqlx::query(
             "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
                     target_state, target_state_updated_at, response_message_id
@@ -1326,11 +1511,7 @@ impl WorkflowRepository {
                 && obligation.response_message_id == expected.response_message_id
         });
         Ok(
-            match (
-                message_exists != 0,
-                obligation_matches,
-                obligation.is_some(),
-            ) {
+            match (evidence_matches, obligation_matches, obligation.is_some()) {
                 (true, true, _) => TerminalEvidenceProbe::Established,
                 (false, false, false) => TerminalEvidenceProbe::KnownNotCommitted,
                 _ => TerminalEvidenceProbe::Incomplete,
@@ -2127,6 +2308,21 @@ async fn insert_canonical_message_tx(
             created_at: created_at_dt,
         })
     }
+}
+
+async fn load_optional_message_by_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+) -> DbResult<Option<Message>> {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1)")
+            .bind(message_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    load_message_by_id_tx(tx, message_id).await.map(Some)
 }
 
 async fn load_message_by_id_tx(
@@ -4351,6 +4547,45 @@ mod tests {
 
         assert_eq!(created, 1);
         assert_eq!(replay, 1);
+    }
+
+    #[tokio::test]
+    async fn claim_establishment_classifies_before_and_after_commit_cuts() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "claim-cuts", 7))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = claim_input(workflow_id, turn_id, 20);
+
+        assert!(matches!(
+            repo.establish_authoritative_turn_claim_at_cut(&claim, TransactionCut::BeforeCommit)
+                .await,
+            ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(_)
+        ));
+        assert!(repo
+            .list_attempts(workflow_id, EffectId(DIRECT_TURN_EFFECT_ID))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let established = repo
+            .establish_authoritative_turn_claim_at_cut(&claim, TransactionCut::AfterCommit)
+            .await;
+        let ClaimAuthoritativeTurnEstablishment::Established(established) = established else {
+            panic!("after-commit acknowledgement loss must adopt exact claim")
+        };
+        assert_eq!(established.outcome, ClaimOutcome::Started);
+        let attempts = repo
+            .list_attempts(workflow_id, EffectId(DIRECT_TURN_EFFECT_ID))
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].authority, established.authority.unwrap());
     }
 
     #[tokio::test]

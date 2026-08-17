@@ -1422,11 +1422,70 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
-    ) -> Result<(), String> {
-        self.persist_tool_round(conv_id, assistant, tool_results)
-            .await?;
-        self.persist_active_direct_turn_terminal_obligation(settlement, None)
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if let Err(error) = self
+            .persist_active_direct_turn_terminal_obligation(settlement, None)
             .await
+        {
+            return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(error);
+        }
+        if let Err(error) = self
+            .persist_tool_round(conv_id, assistant, tool_results)
+            .await
+        {
+            return crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(error);
+        }
+        crate::runtime::traits::TerminalMutationEstablishment::Established {
+            transcript_generation: None,
+        }
+    }
+
+    async fn persist_sub_agent_results_with_terminal_obligation(
+        &self,
+        evidence: &crate::runtime::traits::TerminalSubAgentEvidence,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if let Err(error) = self
+            .persist_active_direct_turn_terminal_obligation(settlement, None)
+            .await
+        {
+            return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(error);
+        }
+        match evidence {
+            crate::runtime::traits::TerminalSubAgentEvidence::Insert(message) => {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .entry(message.conversation_id.clone())
+                    .or_default()
+                    .push(message.clone());
+                crate::runtime::traits::TerminalMutationEstablishment::Established {
+                    transcript_generation: None,
+                }
+            }
+            crate::runtime::traits::TerminalSubAgentEvidence::Update {
+                message_id,
+                content,
+                display_data,
+                ..
+            } => {
+                let mut messages = self.messages.lock().unwrap();
+                let Some(message) = messages
+                    .values_mut()
+                    .flatten()
+                    .find(|message| message.message_id == *message_id)
+                else {
+                    return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(
+                        format!("Message not found: {message_id}"),
+                    );
+                };
+                message.content = content.clone();
+                message.display_data = Some(display_data.clone());
+                crate::runtime::traits::TerminalMutationEstablishment::Established {
+                    transcript_generation: Some(1),
+                }
+            }
+        }
     }
 }
 

@@ -1267,6 +1267,13 @@ enum ExpectedParentScope<'a> {
     Snapshot(Option<&'a WorkScopeId>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalEvidenceTransactionCut {
+    None,
+    BeforeCommit,
+    AfterCommit,
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -7621,12 +7628,13 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error if any message or obligation write fails or the transaction cannot commit.
-    pub async fn persist_tool_round_with_terminal_obligation(
+    async fn persist_tool_round_with_terminal_obligation_at_cut(
         &self,
         conversation_id: &str,
         assistant: &Message,
         tool_results: &[Message],
         obligation: &workflow::DirectTurnTerminalObligationInput,
+        cut: TerminalEvidenceTransactionCut,
     ) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
         insert_message_tx(&mut tx, assistant).await?;
@@ -7639,8 +7647,135 @@ impl Database {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        if cut == TerminalEvidenceTransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected before-commit cut".to_string(),
+            ));
+        }
         tx.commit().await?;
+        if cut == TerminalEvidenceTransactionCut::AfterCommit {
+            return Err(DbError::Serialization(
+                "injected after-commit cut".to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Persist a terminal tool round and its obligation in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any exact evidence write or the commit fails.
+    pub async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+    ) -> DbResult<()> {
+        self.persist_tool_round_with_terminal_obligation_at_cut(
+            conversation_id,
+            assistant,
+            tool_results,
+            obligation,
+            TerminalEvidenceTransactionCut::None,
+        )
+        .await
+    }
+
+    /// Persist one sub-agent terminal transcript carrier and its obligation atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exact carrier cannot be written or the commit fails.
+    pub async fn persist_sub_agent_terminal_evidence(
+        &self,
+        evidence: &workflow::TerminalEvidenceExpectation,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+    ) -> DbResult<Option<i64>> {
+        self.persist_sub_agent_terminal_evidence_at_cut(
+            evidence,
+            obligation,
+            TerminalEvidenceTransactionCut::None,
+        )
+        .await
+    }
+
+    async fn persist_sub_agent_terminal_evidence_at_cut(
+        &self,
+        evidence: &workflow::TerminalEvidenceExpectation,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+        cut: TerminalEvidenceTransactionCut,
+    ) -> DbResult<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let transcript_generation = match evidence {
+            workflow::TerminalEvidenceExpectation::Messages(messages) => {
+                for message in messages {
+                    insert_message_tx(&mut tx, message).await?;
+                }
+                None
+            }
+            workflow::TerminalEvidenceExpectation::MessageMutation {
+                conversation_id,
+                message_id,
+                content,
+                display_data,
+            } => {
+                let content = serde_json::to_string(content)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+                let display_data = serde_json::to_string(display_data)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+                let updated: Option<String> = sqlx::query_scalar(
+                    "UPDATE messages SET content = ?1, display_data = ?2
+                     WHERE message_id = ?3 AND conversation_id = ?4
+                     RETURNING message_id",
+                )
+                .bind(content)
+                .bind(display_data)
+                .bind(message_id)
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if updated.is_none() {
+                    tx.rollback().await?;
+                    return Err(DbError::MessageNotFound(message_id.clone()));
+                }
+                let updated_message = sqlx::query(
+                    "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+                     FROM messages WHERE message_id = ?1",
+                )
+                .bind(message_id)
+                .try_map(parse_message_row)
+                .fetch_one(&mut *tx)
+                .await?;
+                retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+                Some(
+                    sqlx::query_scalar(
+                        "UPDATE conversations
+                         SET transcript_generation = transcript_generation + 1
+                         WHERE id = ?1 RETURNING transcript_generation",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            }
+        };
+        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
+        if cut == TerminalEvidenceTransactionCut::BeforeCommit {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(
+                "injected before-commit cut".to_string(),
+            ));
+        }
+        tx.commit().await?;
+        if cut == TerminalEvidenceTransactionCut::AfterCommit {
+            return Err(DbError::Serialization(
+                "injected after-commit cut".to_string(),
+            ));
+        }
+        Ok(transcript_generation)
     }
 
     /// Fetch a fork proposal by id.
@@ -19337,6 +19472,313 @@ mod tests {
         assert!(
             ids.contains(&"tool-b-result"),
             "second tool result must be durable"
+        );
+    }
+
+    async fn create_runtime_turn_for_terminal_test(
+        repo: &workflow::WorkflowRepository,
+        conversation_id: &str,
+        key: &str,
+    ) -> phoenix_workflow::TurnAuthorityId {
+        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: key.to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: key.to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy:
+                    phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: key.to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let accepted = repo
+            .accept_authoritative_turn(&workflow::AcceptAuthoritativeTurn {
+                client_key: phoenix_workflow::ClientTurnKey::new(key).unwrap(),
+                prepared: phoenix_workflow::PreparedTurn::from_exact_payload(
+                    &phoenix_workflow::ConversationAuthority(conversation_id.to_string()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                accepted_at: phoenix_workflow::Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected created turn")
+        };
+        turn_id
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn terminal_checkpoint_probe_classifies_commit_acknowledgement_cuts() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-checkpoint-cuts", "ccc", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = workflow::WorkflowRepository::new(db.pool().clone());
+        let payload = phoenix_core::domain::sm_event::PreparedDirectTurnPayload::from_parts(
+            phoenix_core::domain::sm_event::SubmittedDirectTurnIdentity {
+                text: "checkpoint".to_string(),
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id: "checkpoint-cuts".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+                expansion_policy:
+                    phoenix_core::domain::sm_event::SubmittedDirectTurnExpansionPolicy::LiteralText,
+            },
+            phoenix_core::domain::sm_event::PreparedDirectTurnDelivery {
+                text: "checkpoint".to_string(),
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        );
+        let accepted = repo
+            .accept_authoritative_turn(&workflow::AcceptAuthoritativeTurn {
+                client_key: phoenix_workflow::ClientTurnKey::new("checkpoint-cuts").unwrap(),
+                prepared: phoenix_workflow::PreparedTurn::from_exact_payload(
+                    &phoenix_workflow::ConversationAuthority("conv-checkpoint-cuts".to_string()),
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                accepted_at: phoenix_workflow::Timestamp(1),
+            })
+            .await
+            .unwrap();
+        let phoenix_workflow::TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+            panic!("expected created turn")
+        };
+        let assistant = Message {
+            message_id: "checkpoint-assistant".to_string(),
+            conversation_id: "conv-checkpoint-cuts".to_string(),
+            sequence_id: 20,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![
+                phoenix_core::domain::llm_types::ContentBlock::text("checkpoint"),
+            ]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let tool = Message {
+            message_id: "checkpoint-tool".to_string(),
+            conversation_id: "conv-checkpoint-cuts".to_string(),
+            sequence_id: 21,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool", "cancelled", true),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Cancelled,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+        let evidence =
+            workflow::TerminalEvidenceExpectation::Messages(vec![assistant.clone(), tool.clone()]);
+
+        assert!(db
+            .persist_tool_round_with_terminal_obligation_at_cut(
+                "conv-checkpoint-cuts",
+                &assistant,
+                std::slice::from_ref(&tool),
+                &obligation,
+                TerminalEvidenceTransactionCut::BeforeCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::KnownNotCommitted
+        );
+
+        assert!(db
+            .persist_tool_round_with_terminal_obligation_at_cut(
+                "conv-checkpoint-cuts",
+                &assistant,
+                std::slice::from_ref(&tool),
+                &obligation,
+                TerminalEvidenceTransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::Established
+        );
+
+        sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
+            .bind(i64::try_from(turn_id.0).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::Incomplete
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_update_crash_cuts_never_split_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-subagent-update", "csu", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let original = MessageContent::tool("spawn", "running", false);
+        db.add_message_with_seq(
+            "tool-spawn",
+            "conv-subagent-update",
+            30,
+            &original,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let repo = workflow::WorkflowRepository::new(db.pool().clone());
+        let turn_id = create_runtime_turn_for_terminal_test(
+            &repo,
+            "conv-subagent-update",
+            "subagent-update-cuts",
+        )
+        .await;
+        let evidence = workflow::TerminalEvidenceExpectation::MessageMutation {
+            conversation_id: "conv-subagent-update".to_string(),
+            message_id: "tool-spawn".to_string(),
+            content: MessageContent::tool("spawn", "cancelled result", false),
+            display_data: serde_json::json!({"type":"subagent_results","results":[]}),
+        };
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Cancelled,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+
+        assert!(db
+            .persist_sub_agent_terminal_evidence_at_cut(
+                &evidence,
+                &obligation,
+                TerminalEvidenceTransactionCut::BeforeCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::KnownNotCommitted
+        );
+        assert_eq!(
+            db.get_message_by_id("tool-spawn").await.unwrap().content,
+            original
+        );
+
+        assert!(db
+            .persist_sub_agent_terminal_evidence_at_cut(
+                &evidence,
+                &obligation,
+                TerminalEvidenceTransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::Established
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_insert_crash_cuts_never_split_evidence() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-subagent-cuts", "csc", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = workflow::WorkflowRepository::new(db.pool().clone());
+        let turn_id =
+            create_runtime_turn_for_terminal_test(&repo, "conv-subagent-cuts", "subagent-cuts")
+                .await;
+        let content = MessageContent::User(UserContent::meta("sub-agent result"));
+        let message = Message {
+            message_id: "subagent-summary-cut".to_string(),
+            conversation_id: "conv-subagent-cuts".to_string(),
+            sequence_id: 30,
+            message_type: content.message_type(),
+            content,
+            display_data: Some(serde_json::json!({"type":"subagent_summary","results":[]})),
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let evidence = workflow::TerminalEvidenceExpectation::Messages(vec![message]);
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Cancelled,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+
+        assert!(db
+            .persist_sub_agent_terminal_evidence_at_cut(
+                &evidence,
+                &obligation,
+                TerminalEvidenceTransactionCut::BeforeCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::KnownNotCommitted
+        );
+        assert!(db
+            .persist_sub_agent_terminal_evidence_at_cut(
+                &evidence,
+                &obligation,
+                TerminalEvidenceTransactionCut::AfterCommit,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            repo.probe_exact_terminal_evidence(&evidence, &obligation)
+                .await
+                .unwrap(),
+            workflow::TerminalEvidenceProbe::Established
         );
     }
 

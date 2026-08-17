@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use phoenix_core::domain::sm_event::{DirectTurnAttemptAuthority, PreparedDirectTurnPayload};
 use phoenix_db::workflow::{
-    ClaimAuthoritativeTurnInput, DirectTurnMaterializationEligibility, DiscoverableAcceptedTurn,
+    ClaimAuthoritativeTurnEstablishment, ClaimAuthoritativeTurnInput,
+    DirectTurnMaterializationEligibility, DiscoverableAcceptedTurn,
     PreflightDirectTurnMaterializationInput, ReleaseAuthoritativeTurnInput, WorkflowRepository,
 };
 use phoenix_db::LocalAttemptAuthority;
@@ -250,19 +251,28 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         now: Timestamp,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
-        let claim = self
+        let claim_input = ClaimAuthoritativeTurnInput {
+            turn_id: candidate.turn_id,
+            workflow_id: candidate.workflow_id,
+            process_incarnation: self.process_incarnation,
+            now,
+            lease_until,
+        };
+        let claim = match self
             .repo
-            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
-                turn_id: candidate.turn_id,
-                workflow_id: candidate.workflow_id,
-                process_incarnation: self.process_incarnation,
-                now,
-                lease_until,
-            })
+            .establish_authoritative_turn_claim(&claim_input)
             .await
-            .map_err(|error| {
-                crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error.to_string())
-            })?;
+        {
+            ClaimAuthoritativeTurnEstablishment::Established(claim) => *claim,
+            ClaimAuthoritativeTurnEstablishment::KnownNotCommitted(error) => {
+                return Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(
+                    error,
+                ));
+            }
+            ClaimAuthoritativeTurnEstablishment::Unclassifiable(error) => {
+                return Err(crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error));
+            }
+        };
         if claim.outcome != ClaimOutcome::Started {
             return Ok(());
         }
@@ -1161,6 +1171,57 @@ mod tests {
                 .await
                 .unwrap();
         assert!(terminal_kind.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prewrite_claim_read_failure_retries_without_dispatch_or_duplicate_attempt() {
+        let (repo, dispatcher) = fixture().await;
+        let turn_id = accept(&repo, "claim-read-retry").await;
+        let page = repo
+            .list_discoverable_accepted_runtime_direct_turns(None, 10)
+            .await
+            .unwrap();
+        let candidate = page
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.turn_id == turn_id)
+            .unwrap();
+        let mut invalid = candidate.clone();
+        invalid.workflow_id = phoenix_workflow::WorkflowId(u64::MAX);
+        let worker = DirectTurnWorker::new(
+            repo.clone(),
+            dispatcher.clone(),
+            Arc::new(TestClock {
+                now: Timestamp(1),
+                sleeps: None,
+            }),
+            ProcessIncarnation(1),
+        );
+
+        assert!(matches!(
+            worker.dispatch_candidate(invalid, Timestamp(1)).await,
+            Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(_))
+        ));
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        assert!(repo
+            .list_attempts(workflow_id, EffectId(1))
+            .await
+            .unwrap()
+            .is_empty());
+
+        worker
+            .dispatch_candidate(candidate, Timestamp(1))
+            .await
+            .unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            repo.list_attempts(workflow_id, EffectId(1))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
