@@ -3400,9 +3400,20 @@ impl RuntimeManager {
         };
 
         let recovery_started = std::time::Instant::now();
+        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+            &storage,
+            conversation_id,
+        )
+        .await?;
         let recovered_terminal_obligation = self
             .load_active_direct_turn_terminal_obligation(conversation_id)
-            .await?;
+            .await?
+            .filter(|obligation| {
+                active_direct_turn.as_ref().is_some_and(|loaded| {
+                    loaded.active().turn_id == obligation.turn_id
+                        && loaded.active().generation == obligation.expected_generation
+                })
+            });
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
@@ -3435,17 +3446,9 @@ impl RuntimeManager {
                 None
             };
 
-        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
-            &storage,
-            conversation_id,
-        )
-        .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
             let active = loaded.into_active();
-            if let Some(obligation) = recovered_terminal_obligation.filter(|obligation| {
-                obligation.turn_id == active.turn_id
-                    && obligation.expected_generation == active.generation
-            }) {
+            if let Some(obligation) = recovered_terminal_obligation {
                 let terminal = match obligation.terminal {
                     phoenix_workflow::TurnTerminal::Completed => {
                         crate::runtime::traits::ActiveDirectTurnTerminal::Completed
