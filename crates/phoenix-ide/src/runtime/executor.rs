@@ -2371,12 +2371,12 @@ where
         //   deadline          — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery          — credential helper settlement (REQ-BED-030)
         loop {
-            if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
+            if let Some(disposition) = self.recovery_exit_disposition() {
                 tracing::warn!(
                     conversation_id = %self.context.conversation_id,
                     "Exiting runtime to reconstruct an uncommitted operation from database truth"
                 );
-                return RuntimeExitDisposition::Interrupted;
+                return disposition;
             }
             let terminal_retry_at = self
                 .terminal_transition_retry
@@ -2720,6 +2720,11 @@ where
         }
     }
 
+    fn recovery_exit_disposition(&self) -> Option<RuntimeExitDisposition> {
+        (self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase)
+            .then_some(RuntimeExitDisposition::RecreateFromDatabase)
+    }
+
     async fn retry_terminal_transition(&mut self) {
         if let Some(retry) = self.terminal_transition_retry.take() {
             self.terminal_settlement_attempt = TerminalSettlementAttempt::Retry {
@@ -2747,10 +2752,14 @@ where
             None
         } else if terminal_direct_turn_transition {
             match self.terminal_settlement_attempt {
-                TerminalSettlementAttempt::Initial => Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES),
+                TerminalSettlementAttempt::Initial
+                | TerminalSettlementAttempt::Retry {
+                    fact_durability: TerminalFactDurability::ProcessOnly,
+                    ..
+                } => Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES),
                 TerminalSettlementAttempt::Retry {
                     remaining_after_attempt,
-                    ..
+                    fact_durability: TerminalFactDurability::Durable,
                 } => remaining_after_attempt.map(|remaining| remaining.saturating_sub(1)),
             }
         } else {
@@ -3395,7 +3404,7 @@ where
             .await?;
         } else {
             let mut state_committed = false;
-            for effect in result.effects {
+            for (effect_index, effect) in result.effects.into_iter().enumerate() {
                 let is_authoritative_persist =
                     matches!(effect, Effect::PersistAuthoritativeUserMessage { .. });
                 let is_state_persist = matches!(
@@ -3538,7 +3547,13 @@ where
                                 terminal_subagent_transition,
                                 terminal_direct_turn_transition,
                                 terminal_retry_transition
-                                    .clone()
+                                    .as_ref()
+                                    .map(|transition| {
+                                        crate::state_machine::transition::TransitionResult {
+                                            new_state: transition.new_state.clone(),
+                                            effects: transition.effects[effect_index..].to_vec(),
+                                        }
+                                    })
                                     .expect("terminal transition captured before effects"),
                             );
                         }
@@ -11867,6 +11882,86 @@ mod authoritative_user_message_effect_tests {
         assert!(rt.terminal_transition_retry.is_some());
         assert!(!rt.direct_turn_terminal_fact.is_durable());
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
+    }
+
+    #[test]
+    fn exhausted_recovery_guard_returns_rematerialization_disposition() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+        assert_eq!(
+            rt.recovery_exit_disposition(),
+            Some(RuntimeExitDisposition::RecreateFromDatabase)
+        );
+    }
+
+    #[test]
+    fn durable_establishment_initializes_bounded_retry_budget() {
+        let (mut rt, _storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        rt.terminal_settlement_attempt = TerminalSettlementAttempt::Retry {
+            remaining_after_attempt: None,
+            fact_durability: TerminalFactDurability::ProcessOnly,
+        };
+        rt.schedule_terminal_transition_retry(
+            false,
+            true,
+            crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
+                .with_effect(Effect::PersistState),
+        );
+        assert_eq!(
+            rt.terminal_transition_retry
+                .as_ref()
+                .and_then(|retry| retry.remaining_after_attempt),
+            Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_resumes_at_failed_settlement_without_replaying_prior_effects() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(26),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_settle_active_direct_turn_failures(1);
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+        ));
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let result = crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
+            .with_effect(Effect::PersistSubAgentResults {
+                results: vec![SubAgentResult {
+                    agent_id: "a".to_string(),
+                    task: "investigate".to_string(),
+                    outcome: SubAgentOutcome::TimedOut,
+                }],
+                spawn_tool_id: None,
+            })
+            .with_effect(Effect::PersistState);
+
+        assert!(rt.apply_transition_result(result).await.is_err());
+        assert_eq!(storage.recorded_messages().len(), 1);
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        rt.retry_terminal_transition().await;
+
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(
+            storage.recorded_messages().len(),
+            1,
+            "settlement retry must not replay the successful sub-agent summary effect"
+        );
     }
 
     #[tokio::test]
