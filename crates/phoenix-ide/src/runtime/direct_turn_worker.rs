@@ -1204,6 +1204,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_exact_obligation_read_failure_retries_before_ready_then_settles() {
+        let (repo, dispatcher) = fixture().await;
+        seed_terminal_obligation(&repo, "startup-exact-read").await;
+        *dispatcher.terminal_results.lock().unwrap() = vec![
+            Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(
+                "injected exact obligation read failure".to_string(),
+            )),
+            Ok(TerminalObligationSettlement::Committed),
+        ];
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .terminal_settled
+            .lock()
+            .unwrap()
+            .replace(settled_tx);
+        let worker = DirectTurnWorker::new(repo, dispatcher.clone(), clock, ProcessIncarnation(1));
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        retry_started_rx.await.unwrap();
+        assert!(ready_rx.try_recv().is_err());
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        retry_release_tx.send(()).unwrap();
+        settled_rx.await.unwrap();
+        ready_rx.await.unwrap();
+        assert_eq!(
+            dispatcher.terminal_attempts.lock().unwrap().as_slice(),
+            &["conv-a".to_string(), "conv-a".to_string()]
+        );
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
+        );
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn steady_state_exact_obligation_read_failure_retries_then_settles_once() {
+        let (repo, dispatcher) = fixture().await;
+        seed_terminal_obligation(&repo, "steady-exact-read").await;
+        *dispatcher.terminal_results.lock().unwrap() = vec![
+            Ok(TerminalObligationSettlement::NoObligation),
+            Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(
+                "injected exact obligation read failure".to_string(),
+            )),
+            Ok(TerminalObligationSettlement::Committed),
+        ];
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker = DirectTurnWorker::new(repo, dispatcher.clone(), clock, ProcessIncarnation(1));
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        ready_rx.await.unwrap();
+        kick_tx.send_replace(1);
+        retry_started_rx.await.unwrap();
+        assert_eq!(dispatcher.terminal_attempts.lock().unwrap().len(), 2);
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .terminal_settled
+            .lock()
+            .unwrap()
+            .replace(settled_tx);
+        retry_release_tx.send(()).unwrap();
+        settled_rx.await.unwrap();
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            dispatcher.terminal_attempts.lock().unwrap().as_slice(),
+            &[
+                "conv-a".to_string(),
+                "conv-a".to_string(),
+                "conv-a".to_string(),
+            ]
+        );
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[
+                EMPTY_RESCAN_INTERVAL,
+                ERROR_RETRY_INTERVAL,
+                EMPTY_RESCAN_INTERVAL,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn startup_still_owed_retries_before_signalling_ready() {
         let (repo, dispatcher) = fixture().await;
         let turn_id = accept(&repo, "startup-terminal-retry").await;

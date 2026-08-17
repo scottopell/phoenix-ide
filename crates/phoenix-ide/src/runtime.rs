@@ -3182,7 +3182,7 @@ impl RuntimeManager {
                 conversation_id.to_string(),
             ))
             .await
-            .map_err(|error| DatabaseTerminalRecoveryError::Unclassifiable(error.to_string()))?
+            .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
         else {
             return Ok(DatabaseTerminalRecovery::NoObligation);
         };
@@ -3195,8 +3195,8 @@ impl RuntimeManager {
             .get_conversation(conversation_id)
             .await
             .map_err(|error| {
-                DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                    "terminal obligation exists but conversation authority is unreadable ({error})"
+                DatabaseTerminalRecoveryError::Retryable(format!(
+                    "terminal obligation exists but conversation metadata is unreadable ({error})"
                 ))
             })?;
         let is_sub_agent = conversation.parent_conversation_id.is_some();
