@@ -235,9 +235,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
             for candidate in page.candidates {
-                self.dispatch_candidate(candidate, self.clock.now())
-                    .await
-                    .map_err(crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable)?;
+                self.dispatch_candidate(candidate, self.clock.now()).await?;
             }
             if exhausted {
                 break;
@@ -250,7 +248,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         &self,
         candidate: DiscoverableAcceptedTurn,
         now: Timestamp,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         let lease_until = LeaseExpiry(now.0.saturating_add(LEASE_DURATION.as_secs()));
         let claim = self
             .repo
@@ -262,7 +260,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 lease_until,
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error.to_string())
+            })?;
         if claim.outcome != ClaimOutcome::Started {
             return Ok(());
         }
@@ -291,22 +291,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         if let Some(hook) = &self.pre_dispatch_hook {
             hook().await;
         }
-        let eligibility = match self
-            .repo
-            .preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
-                turn_id: candidate.turn_id,
-                authority: authority.clone(),
-                prepared: prepared.clone(),
-                now,
-            })
-            .await
-        {
-            Ok(eligibility) => eligibility,
-            Err(error) => {
-                self.release(authority, now).await?;
-                return Err(error.to_string());
-            }
-        };
+        let eligibility = self
+            .preflight_candidate(&candidate, &authority, &prepared, now)
+            .await?;
         match eligibility {
             DirectTurnMaterializationEligibility::Fresh => {}
             DirectTurnMaterializationEligibility::ExactReplay => {
@@ -333,10 +320,50 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             .dispatch(&candidate.conversation.0, event)
             .await
         {
-            self.release(authority, now).await?;
+            self.release(authority, now)
+                .await
+                .map_err(|release_error| {
+                    crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                    "direct-turn dispatch failed: {error}; claim release failed: {release_error}"
+                ))
+                })?;
             tracing::warn!(conversation_id = %candidate.conversation.0, turn_id = candidate.turn_id.0, error = %error, "direct-turn dispatch failed; released claim");
         }
         Ok(())
+    }
+
+    async fn preflight_candidate(
+        &self,
+        candidate: &DiscoverableAcceptedTurn,
+        authority: &LocalAttemptAuthority,
+        prepared: &PreparedDirectTurnPayload,
+        now: Timestamp,
+    ) -> Result<DirectTurnMaterializationEligibility, crate::runtime::DatabaseTerminalRecoveryError>
+    {
+        let result = self
+            .repo
+            .preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
+                turn_id: candidate.turn_id,
+                authority: authority.clone(),
+                prepared: prepared.clone(),
+                now,
+            })
+            .await;
+        match result {
+            Ok(eligibility) => Ok(eligibility),
+            Err(error) => {
+                if let Err(release_error) = self.release(authority.clone(), now).await {
+                    return Err(
+                        crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "direct-turn preflight failed: {error}; claim release failed: {release_error}"
+                        )),
+                    );
+                }
+                Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(
+                    error.to_string(),
+                ))
+            }
+        }
     }
 
     async fn release(
@@ -1134,6 +1161,86 @@ mod tests {
                 .await
                 .unwrap();
         assert!(terminal_kind.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_released_preflight_failure_backs_off_then_dispatches() {
+        let (repo, dispatcher) = fixture().await;
+        let turn_id = accept(&repo, "startup-preflight-read").await;
+        let hook_repo = repo.clone();
+        let first_preflight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_first_preflight = first_preflight.clone();
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let worker = DirectTurnWorker::new(
+            repo.clone(),
+            dispatcher.clone(),
+            clock,
+            ProcessIncarnation(1),
+        )
+        .with_pre_dispatch_hook(Arc::new(move || {
+            let repo = hook_repo.clone();
+            let first_preflight = hook_first_preflight.clone();
+            Box::pin(async move {
+                if first_preflight.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let replacement = prepared_payload("message-startup-preflight-retry");
+                    sqlx::query(
+                        "UPDATE durable_turns
+                             SET prepared_payload = ?1, prepared_fingerprint = ?2
+                             WHERE turn_id = ?3",
+                    )
+                    .bind(replacement.to_exact_bytes().unwrap())
+                    .bind(
+                        PreparedTurn::from_exact_payload(
+                            &ConversationAuthority("conv-a".to_string()),
+                            replacement.to_exact_bytes().unwrap(),
+                        )
+                        .fingerprint(),
+                    )
+                    .bind(i64::try_from(turn_id.0).unwrap())
+                    .execute(repo.pool())
+                    .await
+                    .unwrap();
+                }
+            })
+        }));
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .event_dispatched
+            .lock()
+            .unwrap()
+            .replace(dispatched_tx);
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        retry_started_rx.await.unwrap();
+        assert!(ready_rx.try_recv().is_err());
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let attempts = repo.list_attempts(workflow_id, EffectId(1)).await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].status,
+            phoenix_workflow::AttemptStatus::AuthorityLost
+        );
+
+        retry_release_tx.send(()).unwrap();
+        dispatched_rx.await.unwrap();
+        ready_rx.await.unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
+        );
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]

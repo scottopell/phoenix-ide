@@ -3160,14 +3160,10 @@ where
         let terminal_retry_transition = (terminal_subagent_transition
             || terminal_direct_turn_transition)
             .then(|| result.clone());
-        let terminal_response_message_id = terminal_direct_turn_transition
+        let terminal_evidence_message_id = terminal_direct_turn_transition
             .then(|| {
                 result.effects.iter().find_map(|effect| match effect {
-                    Effect::PersistMessage {
-                        content: MessageContent::Agent(_),
-                        message_id,
-                        ..
-                    } => Some(message_id.clone()),
+                    Effect::PersistMessage { message_id, .. } => Some(message_id.clone()),
                     _ => None,
                 })
             })
@@ -3361,12 +3357,9 @@ where
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let terminal_message_settlement = if terminal_direct_turn_transition {
                     match &effect {
-                        Effect::PersistMessage {
-                            content: MessageContent::Agent(_),
-                            message_id,
-                            ..
-                        } if terminal_response_message_id.as_deref()
-                            == Some(message_id.as_str()) =>
+                        Effect::PersistMessage { message_id, .. }
+                            if terminal_evidence_message_id.as_deref()
+                                == Some(message_id.as_str()) =>
                         {
                             Some(crate::runtime::traits::ActiveDirectTurnSettlement {
                                 turn: self
@@ -3466,7 +3459,7 @@ where
                         .storage
                         .persist_active_direct_turn_terminal_obligation(
                             &obligation,
-                            terminal_response_message_id.as_deref(),
+                            terminal_evidence_message_id.as_deref(),
                         )
                         .await
                     {
@@ -11825,6 +11818,55 @@ mod authoritative_user_message_effect_tests {
             assert_eq!(settlements[0].terminal, expected);
             assert_eq!(settlements[0].state, new_state);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_task_message_establishes_terminal_obligation_atomically() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(27),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_terminal_obligation_establishment_failures(1);
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/terminal-settlement.md".to_string(),
+            title: "Terminal settlement".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Preserve exact terminal evidence".to_string(),
+        };
+
+        assert!(rt
+            .process_event(Event::TaskApprovalDecided {
+                outcome: crate::state_machine::state::TaskApprovalOutcome::Rejected,
+            })
+            .await
+            .is_err());
+
+        assert!(matches!(rt.state, ConvState::AwaitingTaskApproval { .. }));
+        assert!(rt.terminal_transition_retry.is_some());
+        assert!(storage.recorded_messages().is_empty());
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
+
+        tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+        rt.retry_terminal_transition().await;
+
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.terminal_transition_retry.is_none());
+        let messages = storage.recorded_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            MessageContent::system("Task rejected.")
+        );
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

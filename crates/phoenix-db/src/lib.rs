@@ -8800,8 +8800,8 @@ impl Database {
         .await
     }
 
-    /// Persist one agent response and its exact direct-turn terminal obligation
-    /// atomically before either can be observed independently after restart.
+    /// Persist one terminal transcript message and its exact direct-turn terminal
+    /// obligation atomically before either can be observed independently after restart.
     ///
     /// # Errors
     ///
@@ -19338,6 +19338,42 @@ mod tests {
             ids.contains(&"tool-b-result"),
             "second tool result must be durable"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_system_message_rolls_back_when_obligation_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-terminal-system", "cts", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id: phoenix_workflow::TurnAuthorityId(u64::MAX),
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Completed,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: Some("terminal-system".to_string()),
+        };
+
+        assert!(db
+            .add_message_with_seq_and_terminal_obligation(
+                "terminal-system",
+                "conv-terminal-system",
+                20,
+                &MessageContent::system("Task rejected."),
+                None,
+                None,
+                &obligation,
+            )
+            .await
+            .is_err());
+        assert!(db
+            .get_messages("conv-terminal-system")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
