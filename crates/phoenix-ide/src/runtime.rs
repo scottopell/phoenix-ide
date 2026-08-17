@@ -338,7 +338,33 @@ pub struct RuntimeManager {
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    fatal_local_authority_tx: tokio::sync::watch::Sender<Option<&'static str>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum DatabaseTerminalRecovery {
+    NoObligation,
+    AlreadyCommitted,
+    Committed {
+        projection: Box<phoenix_db::workflow::PersistedConversationProjection>,
+        is_sub_agent: bool,
+        worktree_path: Option<std::path::PathBuf>,
+    },
+}
+
+impl DatabaseTerminalRecovery {
+    fn committed(&self) -> bool {
+        matches!(self, Self::Committed { .. } | Self::AlreadyCommitted)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub(crate) enum DatabaseTerminalRecoveryError {
+    #[error("terminal settlement remains owed: {0}")]
+    StillOwed(String),
+    #[error("fatal local terminal authority is unclassifiable: {0}")]
+    Unclassifiable(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1560,6 +1586,7 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
+        let (fatal_local_authority_tx, _) = watch::channel(None);
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1613,6 +1640,7 @@ impl RuntimeManager {
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
+            fatal_local_authority_tx,
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -1621,6 +1649,16 @@ impl RuntimeManager {
     #[allow(dead_code)]
     pub fn platform(&self) -> PlatformCapability {
         self.platform.clone()
+    }
+
+    pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
+        self.fatal_local_authority_tx.send_replace(Some(boundary));
+    }
+
+    pub fn fatal_local_authority_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
+        self.fatal_local_authority_tx.subscribe()
     }
 
     /// Get the browser session manager
@@ -3106,20 +3144,64 @@ impl RuntimeManager {
         Ok(())
     }
 
+    pub(crate) async fn complete_database_terminal_recovery(
+        &self,
+        conversation_id: &str,
+        recovery: DatabaseTerminalRecovery,
+    ) {
+        let DatabaseTerminalRecovery::Committed {
+            projection,
+            is_sub_agent,
+            worktree_path,
+        } = recovery
+        else {
+            return;
+        };
+        let broadcaster = self.conversation_broadcaster(conversation_id).await;
+        executor::emit_terminal_lifecycle_event(
+            conversation_id,
+            is_sub_agent,
+            &projection.state,
+            worktree_path.as_deref(),
+            Some(&self.fork_cmd_tx),
+            &broadcaster,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn settle_database_terminal_obligation(
         &self,
         conversation_id: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<DatabaseTerminalRecovery, DatabaseTerminalRecoveryError> {
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         let Some(obligation) = repo
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| DatabaseTerminalRecoveryError::Unclassifiable(error.to_string()))?
         else {
-            return Ok(false);
+            return Ok(DatabaseTerminalRecovery::NoObligation);
         };
+        let turn_id = obligation.turn_id;
+        let expected_generation = obligation.expected_generation;
+        let expected_terminal = obligation.terminal.clone();
+        let projection = obligation.projection.clone();
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| {
+                DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                    "terminal obligation exists but conversation authority is unreadable ({error})"
+                ))
+            })?;
+        let is_sub_agent = conversation.parent_conversation_id.is_some();
+        let worktree_path = conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::PathBuf::from);
         let command = match obligation.terminal {
             phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
                 turn_id: obligation.turn_id,
@@ -3137,15 +3219,66 @@ impl RuntimeManager {
                 }
             }
         };
-        repo.terminalize_authoritative_turn(
-            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
-                command,
-                projection: Some(obligation.projection),
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        Ok(true)
+        match repo
+            .terminalize_authoritative_turn(
+                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                    command,
+                    projection: Some(obligation.projection),
+                },
+            )
+            .await
+        {
+            Ok(step)
+                if matches!(
+                    step.outcome,
+                    phoenix_workflow::TurnOutcome::TerminalReplay { .. }
+                ) =>
+            {
+                Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+            }
+            Ok(_) => Ok(DatabaseTerminalRecovery::Committed {
+                projection: Box::new(projection),
+                is_sub_agent,
+                worktree_path,
+            }),
+            Err(settlement_error) => {
+                let turn = repo
+                    .load_authoritative_turn(turn_id)
+                    .await
+                    .map_err(|probe_error| {
+                        DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); authoritative turn probe failed ({probe_error})"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared"
+                        ))
+                    })?;
+                match turn.lifecycle {
+                    phoenix_workflow::TurnLifecycle::Terminal { terminal, .. }
+                        if turn.generation == expected_generation.saturating_add(1)
+                            && terminal == expected_terminal =>
+                    {
+                        Ok(DatabaseTerminalRecovery::Committed {
+                            projection: Box::new(projection),
+                            is_sub_agent,
+                            worktree_path,
+                        })
+                    }
+                    phoenix_workflow::TurnLifecycle::Accepted {
+                        disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                    } if turn.generation == expected_generation => {
+                        Err(DatabaseTerminalRecoveryError::StillOwed(
+                            settlement_error.to_string(),
+                        ))
+                    }
+                    _ => Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                        "terminal settlement failed ({settlement_error}); authoritative turn no longer matches the exact obligation"
+                    ))),
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3188,10 +3321,14 @@ impl RuntimeManager {
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        if self
+        let terminal_recovery = self
             .settle_database_terminal_obligation(conversation_id)
-            .await?
-        {
+            .await
+            .map_err(|error| error.to_string())?;
+        let terminal_committed = terminal_recovery.committed();
+        self.complete_database_terminal_recovery(conversation_id, terminal_recovery)
+            .await;
+        if terminal_committed {
             conv = self
                 .db
                 .get_conversation(conversation_id)
@@ -6885,11 +7022,25 @@ mod scope_liveness_tests {
         assert_eq!(recovered.turn_id, turn_id);
         assert_eq!(recovered.expected_generation, 0);
 
+        let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
+        let mut terminal_events = broadcaster.subscribe();
         let mgr = Arc::new(mgr);
-        assert!(mgr
+        mgr.start_sub_agent_handler().await;
+        let recovery = mgr
             .settle_database_terminal_obligation(conversation_id)
             .await
-            .expect("settle database-only terminal obligation"));
+            .expect("settle database-only terminal obligation");
+        assert!(recovery.committed());
+        assert!(terminal_events.try_recv().is_err());
+        mgr.complete_database_terminal_recovery(conversation_id, recovery)
+            .await;
+        assert!(matches!(
+            terminal_events
+                .try_recv()
+                .expect("terminal lifecycle event"),
+            SseEvent::ConversationBecameTerminal { .. }
+        ));
+        assert!(terminal_events.try_recv().is_err());
 
         let durable_turn = repo
             .load_authoritative_turn(turn_id)

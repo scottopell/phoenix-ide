@@ -2609,88 +2609,15 @@ where
     ///
     /// Send errors (no active receivers) are intentionally ignored.
     async fn emit_terminal_lifecycle_event(&self) {
-        self.cleanup_worktree_if_present();
-        self.retire_fork_proposals_on_terminal().await;
-        let _ = self
-            .broadcast_tx
-            .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
-    }
-
-    /// `ForkProposalsRetiredOnOriginTerminal` (REQ-PROJ-035): when this origin
-    /// conversation becomes terminal, dismiss its still-pending fork proposals
-    /// and clean any deterministic spawn/promote orphan a crashed approve/promote
-    /// left behind. Enqueues a `RetireForOrigin` command on the single serialized
-    /// fork-resolution consumer and awaits its best-effort completion. No-op when
-    /// this runtime has no fork-resolution sender (sub-agents).
-    async fn retire_fork_proposals_on_terminal(&self) {
-        let Some(tx) = self.fork_cmd_tx.as_ref() else {
-            return;
-        };
-        let (reply, reply_rx) = oneshot::channel();
-        if tx
-            .send(super::fork_resolve::ForkCommand::RetireForOrigin {
-                origin_id: self.context.conversation_id.clone(),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                conv_id = %self.context.conversation_id,
-                "fork retirement on terminal: consumer gone; skipped"
-            );
-            return;
-        }
-        let _ = reply_rx.await;
-    }
-
-    /// Remove the conversation's worktree if its canonical [`WorkScope`] owns
-    /// one and it still exists on disk.
-    fn cleanup_worktree_if_present(&self) {
-        if self.context.is_sub_agent {
-            return;
-        }
-
-        if matches!(
-            self.state,
-            ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. }
-        ) {
-            tracing::debug!(
-                conv_id = %self.context.conversation_id,
-                "skipping terminal worktree cleanup for preserved/transferred scope"
-            );
-            return;
-        }
-
-        let Some(worktree_path) = self.context.work_scope_worktree.clone() else {
-            return;
-        };
-        if !worktree_path.exists() {
-            return;
-        }
-        let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(&worktree_path)
-        else {
-            tracing::warn!(
-                conv_id = %self.context.conversation_id,
-                worktree = %worktree_path.display(),
-                "refusing terminal worktree cleanup for non-Phoenix WorkScope path"
-            );
-            return;
-        };
-
-        let worktree_str = worktree_path.to_string_lossy().into_owned();
-        tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
-        if let Err(error) = crate::git_ops::run_git(
-            &repo_root,
-            &["worktree", "remove", &worktree_str, "--force"],
-        ) {
-            tracing::warn!(
-                conv_id = %self.context.conversation_id,
-                worktree = %worktree_str,
-                %error,
-                "terminal worktree cleanup failed; worktree may remain on disk"
-            );
-        }
+        emit_terminal_lifecycle_event(
+            &self.context.conversation_id,
+            self.context.is_sub_agent,
+            &self.state,
+            self.context.work_scope_worktree.as_deref(),
+            self.fork_cmd_tx.as_ref(),
+            &self.broadcast_tx,
+        )
+        .await;
     }
 
     /// Accept a forwarded LLM outcome only when its generation is current.
@@ -10035,6 +9962,95 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
         LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
             message: error.message,
         },
+    }
+}
+
+pub(crate) async fn emit_terminal_lifecycle_event(
+    conversation_id: &str,
+    is_sub_agent: bool,
+    state: &ConvState,
+    worktree_path: Option<&std::path::Path>,
+    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
+    broadcast_tx: &SseBroadcaster,
+) {
+    cleanup_worktree_if_present(conversation_id, is_sub_agent, state, worktree_path);
+    retire_fork_proposals_on_terminal(conversation_id, fork_cmd_tx).await;
+    let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
+}
+
+async fn retire_fork_proposals_on_terminal(
+    conversation_id: &str,
+    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
+) {
+    let Some(tx) = fork_cmd_tx else {
+        return;
+    };
+    let (reply, reply_rx) = oneshot::channel();
+    if tx
+        .send(super::fork_resolve::ForkCommand::RetireForOrigin {
+            origin_id: conversation_id.to_string(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            conv_id = %conversation_id,
+            "fork retirement on terminal: consumer gone; skipped"
+        );
+        return;
+    }
+    let _ = reply_rx.await;
+}
+
+fn cleanup_worktree_if_present(
+    conversation_id: &str,
+    is_sub_agent: bool,
+    state: &ConvState,
+    worktree_path: Option<&std::path::Path>,
+) {
+    if is_sub_agent {
+        return;
+    }
+
+    if matches!(
+        state,
+        ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. }
+    ) {
+        tracing::debug!(
+            conv_id = %conversation_id,
+            "skipping terminal worktree cleanup for preserved/transferred scope"
+        );
+        return;
+    }
+
+    let Some(worktree_path) = worktree_path else {
+        return;
+    };
+    if !worktree_path.exists() {
+        return;
+    }
+    let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(worktree_path) else {
+        tracing::warn!(
+            conv_id = %conversation_id,
+            worktree = %worktree_path.display(),
+            "refusing terminal worktree cleanup for non-Phoenix WorkScope path"
+        );
+        return;
+    };
+
+    let worktree_str = worktree_path.to_string_lossy().into_owned();
+    tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
+    if let Err(error) = crate::git_ops::run_git(
+        &repo_root,
+        &["worktree", "remove", &worktree_str, "--force"],
+    ) {
+        tracing::warn!(
+            conv_id = %conversation_id,
+            worktree = %worktree_str,
+            %error,
+            "terminal worktree cleanup failed; worktree may remain on disk"
+        );
     }
 }
 

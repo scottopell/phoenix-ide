@@ -981,6 +981,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Hold an Arc to the bash handle registry so the shutdown kill-tree
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
+    let mut fatal_local_authority_rx = state.runtime.fatal_local_authority_receiver();
 
     let app = create_router(state).layer(cors).layer(compression);
 
@@ -994,7 +995,14 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(listener, app, loaded_tls.server, socket_activated).await?;
+        tls::serve_https(
+            listener,
+            app,
+            loaded_tls.server,
+            socket_activated,
+            fatal_local_authority_rx,
+        )
+        .await?;
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,
@@ -1035,6 +1043,12 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     Some(joined) => joined??,
                     None => server_abort.abort(),
                 }
+            }
+            boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+                tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
+                server_abort.abort();
+                tracing_handles.shutdown_tracer();
+                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }
         }
     }
