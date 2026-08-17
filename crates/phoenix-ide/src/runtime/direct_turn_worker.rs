@@ -29,15 +29,16 @@ pub(crate) enum TerminalObligationSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupReconciliationError {
-    StillOwed(String),
+    Retryable(String),
     Unclassifiable(String),
 }
 
 impl From<crate::runtime::DatabaseTerminalRecoveryError> for StartupReconciliationError {
     fn from(error: crate::runtime::DatabaseTerminalRecoveryError) -> Self {
         match error {
-            crate::runtime::DatabaseTerminalRecoveryError::StillOwed(error) => {
-                Self::StillOwed(error)
+            crate::runtime::DatabaseTerminalRecoveryError::StillOwed(error)
+            | crate::runtime::DatabaseTerminalRecoveryError::Retryable(error) => {
+                Self::Retryable(error)
             }
             crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error) => {
                 Self::Unclassifiable(error)
@@ -66,7 +67,7 @@ pub(crate) async fn run(
     );
     if let Err(error) = worker.run_loop(kick_rx, ready_tx).await {
         match error {
-            StartupReconciliationError::StillOwed(error) => {
+            StartupReconciliationError::Retryable(error) => {
                 tracing::warn!(%error, "direct-turn worker stopped with settlement still owed");
             }
             StartupReconciliationError::Unclassifiable(error) => {
@@ -77,9 +78,30 @@ pub(crate) async fn run(
     }
 }
 
+#[async_trait]
+trait TerminalObligationDiscovery: Send + Sync + 'static {
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String>;
+}
+
+#[async_trait]
+impl TerminalObligationDiscovery for WorkflowRepository {
+    async fn list(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String> {
+        self.list_discoverable_terminal_obligations(limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> {
     repo: WorkflowRepository,
+    terminal_discovery: Arc<dyn TerminalObligationDiscovery>,
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
@@ -101,6 +123,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         process_incarnation: ProcessIncarnation,
     ) -> Self {
         Self {
+            terminal_discovery: Arc::new(repo.clone()),
             repo,
             dispatcher,
             clock,
@@ -108,6 +131,15 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_terminal_discovery(
+        mut self,
+        terminal_discovery: Arc<dyn TerminalObligationDiscovery>,
+    ) -> Self {
+        self.terminal_discovery = terminal_discovery;
+        self
     }
 
     #[cfg(test)]
@@ -125,7 +157,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             match self.run_once().await {
                 Ok(wait) => break wait,
                 Err(error) => match StartupReconciliationError::from(error) {
-                    StartupReconciliationError::StillOwed(error) => {
+                    StartupReconciliationError::Retryable(error) => {
                         tracing::warn!(
                             %error,
                             "direct-turn startup reconciliation remains owed; retrying"
@@ -151,7 +183,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             wait = match self.run_once().await {
                 Ok(wait) => wait,
                 Err(error) => match StartupReconciliationError::from(error) {
-                    StartupReconciliationError::StillOwed(error) => {
+                    StartupReconciliationError::Retryable(error) => {
                         tracing::warn!(%error, "direct-turn worker pass remains owed; retrying");
                         ERROR_RETRY_INTERVAL
                     }
@@ -165,12 +197,10 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         &self,
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
         for obligation in self
-            .repo
-            .list_discoverable_terminal_obligations(DISCOVERY_BATCH_LIMIT)
+            .terminal_discovery
+            .list(DISCOVERY_BATCH_LIMIT)
             .await
-            .map_err(|error| {
-                crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error.to_string())
-            })?
+            .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?
         {
             self.dispatcher
                 .settle_terminal_obligation(&obligation.conversation.0)
@@ -449,10 +479,80 @@ mod tests {
         fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             if let Some(sleeps) = &self.sleeps {
                 sleeps.lock().unwrap().push(duration);
-                Box::pin(std::future::ready(()))
+                if duration == ERROR_RETRY_INTERVAL {
+                    Box::pin(std::future::ready(()))
+                } else {
+                    Box::pin(std::future::pending())
+                }
             } else {
                 Box::pin(std::future::pending())
             }
+        }
+    }
+
+    struct GatedRetryClock {
+        sleeps: Arc<Mutex<Vec<Duration>>>,
+        retry_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        retry_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl DirectTurnClock for GatedRetryClock {
+        fn now(&self) -> Timestamp {
+            Timestamp(10)
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.sleeps.lock().unwrap().push(duration);
+            if duration == ERROR_RETRY_INTERVAL {
+                if let Some(started) = self.retry_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                let release = self.retry_release.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                })
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    struct FailingTerminalDiscovery {
+        repo: WorkflowRepository,
+        failures_remaining: std::sync::atomic::AtomicUsize,
+        attempts: std::sync::atomic::AtomicUsize,
+        initial_empty: bool,
+    }
+
+    #[async_trait]
+    impl TerminalObligationDiscovery for FailingTerminalDiscovery {
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.initial_empty && attempt == 0 {
+                return Ok(Vec::new());
+            }
+            if self
+                .failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err("injected discovery read failure".to_string());
+            }
+            self.repo
+                .list_discoverable_terminal_obligations(limit)
+                .await
+                .map_err(|error| error.to_string())
         }
     }
 
@@ -465,6 +565,7 @@ mod tests {
         >,
         events: Mutex<Vec<(String, Event)>>,
         terminal_attempts: Mutex<Vec<String>>,
+        terminal_settled: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
     impl Default for RecordingDispatcher {
@@ -474,6 +575,7 @@ mod tests {
                 terminal_results: Mutex::new(vec![Ok(TerminalObligationSettlement::Committed)]),
                 events: Mutex::new(Vec::new()),
                 terminal_attempts: Mutex::new(Vec::new()),
+                terminal_settled: Mutex::new(None),
             }
         }
     }
@@ -489,6 +591,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(conversation_id.to_string());
+            if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
+                let _ = settled.send(());
+            }
             let mut results = self.terminal_results.lock().unwrap();
             if results.len() == 1 {
                 results[0].clone()
@@ -561,6 +666,52 @@ mod tests {
             panic!("expected created turn")
         };
         turn_id
+    }
+
+    async fn seed_terminal_obligation(repo: &WorkflowRepository, key: &str) {
+        let turn_id = accept(repo, key).await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(10),
+                lease_until: LeaseExpiry(40),
+            })
+            .await
+            .unwrap();
+        let authority = claim.authority.unwrap();
+        repo.materialize_authoritative_turn(
+            &phoenix_db::workflow::MaterializeAuthoritativeTurnInput {
+                turn_id,
+                authority,
+                prepared: prepared_payload(&format!("message-{key}")),
+                sequence_id: 199,
+                created_at: Timestamp(199),
+                accepted_state: phoenix_core::domain::db_schema::ConvState::LlmRequesting {
+                    attempt: 1,
+                },
+                state_updated_at: chrono::DateTime::from_timestamp(199, 0).unwrap(),
+                now: Timestamp(10),
+            },
+        )
+        .await
+        .unwrap();
+        repo.persist_terminal_obligation(
+            &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: 0,
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: phoenix_core::domain::sm_state::ConvState::Idle,
+                    state_updated_at: chrono::Utc::now(),
+                },
+                response_message_id: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     async fn latest_authority(
@@ -942,6 +1093,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_discovery_read_failure_backs_off_before_ready_then_settles() {
+        let (repo, dispatcher) = fixture().await;
+        seed_terminal_obligation(&repo, "startup-discovery-read").await;
+        let discovery = Arc::new(FailingTerminalDiscovery {
+            repo: repo.clone(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            initial_empty: false,
+        });
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .terminal_settled
+            .lock()
+            .unwrap()
+            .replace(settled_tx);
+        let worker = DirectTurnWorker::new(repo, dispatcher.clone(), clock, ProcessIncarnation(1))
+            .with_terminal_discovery(discovery.clone());
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        retry_started_rx.await.unwrap();
+        assert!(ready_rx.try_recv().is_err());
+        retry_release_tx.send(()).unwrap();
+        settled_rx.await.unwrap();
+        ready_rx.await.unwrap();
+        assert_eq!(
+            dispatcher.terminal_attempts.lock().unwrap().as_slice(),
+            &["conv-a".to_string()]
+        );
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
+        );
+        assert_eq!(
+            discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn steady_state_discovery_read_failure_backs_off_without_fatal_then_settles() {
+        let (repo, dispatcher) = fixture().await;
+        seed_terminal_obligation(&repo, "steady-discovery-read").await;
+        let discovery = Arc::new(FailingTerminalDiscovery {
+            repo: repo.clone(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            initial_empty: true,
+        });
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker = DirectTurnWorker::new(repo, dispatcher.clone(), clock, ProcessIncarnation(1))
+            .with_terminal_discovery(discovery.clone());
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        ready_rx.await.unwrap();
+        kick_tx.send_replace(1);
+        retry_started_rx.await.unwrap();
+        assert!(dispatcher.terminal_attempts.lock().unwrap().is_empty());
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .terminal_settled
+            .lock()
+            .unwrap()
+            .replace(settled_tx);
+        retry_release_tx.send(()).unwrap();
+        settled_rx.await.unwrap();
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            dispatcher.terminal_attempts.lock().unwrap().as_slice(),
+            &["conv-a".to_string()]
+        );
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert_eq!(
+            discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[
+                EMPTY_RESCAN_INTERVAL,
+                ERROR_RETRY_INTERVAL,
+                EMPTY_RESCAN_INTERVAL,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn startup_still_owed_retries_before_signalling_ready() {
         let (repo, dispatcher) = fixture().await;
         let turn_id = accept(&repo, "startup-terminal-retry").await;
@@ -1079,17 +1341,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_failure_does_not_signal_ready() {
+    async fn closed_database_discovery_failure_is_retryable() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         pool.close().await;
         let repo = WorkflowRepository::new(pool);
         let dispatcher = Arc::new(RecordingDispatcher::default());
-        let (_kick_tx, kick_rx) = watch::channel(0);
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let worker = worker(repo, dispatcher, 10, 1);
 
-        assert!(worker.run_loop(kick_rx, ready_tx).await.is_err());
-        assert!(ready_rx.await.is_err());
+        assert!(matches!(
+            worker(repo, dispatcher, 10, 1).run_once().await,
+            Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(_))
+        ));
     }
 
     #[tokio::test]

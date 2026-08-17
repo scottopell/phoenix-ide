@@ -363,6 +363,8 @@ impl DatabaseTerminalRecovery {
 pub(crate) enum DatabaseTerminalRecoveryError {
     #[error("terminal settlement remains owed: {0}")]
     StillOwed(String),
+    #[error("terminal recovery discovery is retryable: {0}")]
+    Retryable(String),
     #[error("fatal local terminal authority is unclassifiable: {0}")]
     Unclassifiable(String),
 }
