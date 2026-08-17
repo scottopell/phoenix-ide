@@ -343,6 +343,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_git_repository_shadow_tables",
         sql: MIGRATION_065,
     },
+    Migration {
+        version: 66,
+        name: "create_direct_turn_terminal_obligations",
+        sql: MIGRATION_066,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -422,6 +427,28 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_066: &str = r"
+CREATE TABLE direct_turn_terminal_obligations (
+    turn_id INTEGER NOT NULL PRIMARY KEY
+        REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    expected_generation INTEGER NOT NULL
+        CHECK (typeof(expected_generation) = 'integer' AND expected_generation >= 0),
+    terminal_kind TEXT NOT NULL
+        CHECK (typeof(terminal_kind) = 'text')
+        CHECK (terminal_kind IN ('Completed', 'Cancelled', 'Failed')),
+    terminal_reason TEXT,
+    target_state TEXT NOT NULL
+        CHECK (typeof(target_state) = 'text' AND json_valid(target_state)),
+    target_state_updated_at TEXT NOT NULL
+        CHECK (typeof(target_state_updated_at) = 'text' AND target_state_updated_at <> ''),
+    response_message_id TEXT,
+    CHECK (
+        (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
+        OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
+    )
+);
+";
 
 const MIGRATION_065: &str = r"
 CREATE TABLE git_repositories (

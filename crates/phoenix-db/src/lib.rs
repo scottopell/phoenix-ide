@@ -8773,6 +8773,77 @@ impl Database {
         .await
     }
 
+    /// Persist one agent response and its exact direct-turn terminal obligation
+    /// atomically before either can be observed independently after restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when message serialization, attachment persistence,
+    /// authority validation, or transaction commit fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if typed message, display, or usage data cannot serialize.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&UsageData>,
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+    ) -> DbResult<Message> {
+        let now = Utc::now();
+        let msg_type = content.message_type();
+        let content_str = serde_json::to_string(&content.to_stored_json()).unwrap();
+        let display_str = display_data.map(|value| serde_json::to_string(value).unwrap());
+        let usage_str = usage_data.map(|usage| serde_json::to_string(usage).unwrap());
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type,
+             content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(sequence_id)
+        .bind(msg_type.to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(&usage_str)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        insert_message_attachments(&mut tx, message_id, content).await?;
+        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let message = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: msg_type,
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at: now,
+        };
+        if let Err(error) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id,
+                error = %error,
+                "failed to index terminal message for retrieval; startup reconcile will repair"
+            );
+        }
+        Ok(message)
+    }
+
     /// Persist a message with an externally-allocated `sequence_id`.
     ///
     /// Used by the runtime executor and lifecycle handlers: the sequence
@@ -9024,48 +9095,6 @@ impl Database {
             rows.dedup_by_key(|message| message.sequence_id);
         }
 
-        Ok(rows)
-    }
-
-    /// Load only the messages belonging to one exact materialized direct turn.
-    /// The canonical message is the aggregate-owned user/skill boundary; using
-    /// its identity prevents recovery from classifying an unrelated transcript
-    /// tail as evidence for the active turn.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the canonical message is absent, belongs to another
-    /// conversation, or the message query/attachment hydration fails.
-    pub async fn get_recovery_messages_for_materialized_turn(
-        &self,
-        conversation_id: &str,
-        canonical_message_id: &str,
-    ) -> DbResult<Vec<Message>> {
-        let mut rows = sqlx::query(
-            "SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type,
-                    m.content, m.display_data, m.usage_data, m.created_at
-             FROM messages AS m
-             JOIN messages AS anchor
-               ON anchor.message_id = ?2
-              AND anchor.conversation_id = ?1
-             WHERE m.conversation_id = ?1
-               AND m.sequence_id >= anchor.sequence_id
-             ORDER BY m.sequence_id ASC",
-        )
-        .bind(conversation_id)
-        .bind(canonical_message_id)
-        .try_map(parse_message_row)
-        .fetch_all(&self.pool)
-        .await?;
-        hydrate_attachments(&self.pool, &mut rows).await?;
-        if rows
-            .first()
-            .is_none_or(|message| message.message_id != canonical_message_id)
-        {
-            return Err(DbError::MessageNotFound(format!(
-                "canonical direct-turn message {canonical_message_id} in conversation {conversation_id}"
-            )));
-        }
         Ok(rows)
     }
 

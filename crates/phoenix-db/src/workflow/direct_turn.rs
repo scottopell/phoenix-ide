@@ -178,6 +178,24 @@ pub struct TerminalizeAuthoritativeTurnInput {
     pub projection: Option<PersistedConversationProjection>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectTurnTerminalObligationInput {
+    pub turn_id: TurnAuthorityId,
+    pub expected_generation: u64,
+    pub terminal: TurnTerminal,
+    pub projection: PersistedConversationProjection,
+    pub response_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectTurnTerminalObligation {
+    pub turn_id: TurnAuthorityId,
+    pub expected_generation: u64,
+    pub terminal: TurnTerminal,
+    pub projection: PersistedConversationProjection,
+    pub response_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AtomicContinuationSettlementInput {
     pub conversation_id: String,
@@ -1194,6 +1212,43 @@ impl WorkflowRepository {
         .await
     }
 
+    pub async fn persist_terminal_obligation(
+        &self,
+        input: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        persist_terminal_obligation_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn persist_terminal_obligation_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<()> {
+        persist_terminal_obligation_tx(tx, input).await
+    }
+
+    pub async fn load_active_terminal_obligation(
+        &self,
+        conversation: &ConversationAuthority,
+    ) -> DbResult<Option<DirectTurnTerminalObligation>> {
+        let row = sqlx::query(
+            "SELECT o.turn_id, o.expected_generation, o.terminal_kind, o.terminal_reason,
+                    o.target_state, o.target_state_updated_at, o.response_message_id
+             FROM direct_turn_terminal_obligations AS o
+             JOIN durable_turns AS t ON t.turn_id = o.turn_id
+             WHERE t.conversation_id = ?1 AND t.disposition = 'Runtime'
+               AND t.terminal_kind IS NULL AND t.owns_conversation = 1
+               AND t.generation = o.expected_generation",
+        )
+        .bind(&conversation.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| parse_terminal_obligation_row(&row))
+            .transpose()
+    }
+
     async fn terminalize_authoritative_turn_at_cut(
         &self,
         input: &TerminalizeAuthoritativeTurnInput,
@@ -1238,32 +1293,7 @@ impl WorkflowRepository {
         input: &TerminalizeAuthoritativeTurnInput,
     ) -> DbResult<TurnStep> {
         let command = input.command.clone();
-        let (turn_id, expected_generation, terminal) = match &command {
-            TurnCommand::Complete {
-                turn_id,
-                expected_generation,
-            } => (*turn_id, *expected_generation, TurnTerminal::Completed),
-            TurnCommand::Cancel {
-                turn_id,
-                expected_generation,
-            } => (*turn_id, *expected_generation, TurnTerminal::Cancelled),
-            TurnCommand::Fail {
-                turn_id,
-                expected_generation,
-                reason,
-            } => (
-                *turn_id,
-                *expected_generation,
-                TurnTerminal::Failed {
-                    reason: reason.clone(),
-                },
-            ),
-            TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => {
-                return Err(DbError::Serialization(
-                    "terminal repository command required".to_string(),
-                ));
-            }
-        };
+        let (turn_id, expected_generation, terminal) = terminal_command_parts(&command)?;
         let row = sqlx::query("SELECT * FROM durable_turns WHERE turn_id = ?1")
             .bind(to_i64(turn_id.0, "turn_id")?)
             .fetch_optional(&mut *tx.tx)
@@ -1335,6 +1365,10 @@ impl WorkflowRepository {
         if let Some(projection) = &input.projection {
             update_conversation_projection_tx(tx, &turn.conversation, projection).await?;
         }
+        sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .execute(&mut *tx.tx)
+            .await?;
         mark_active_attempts_authority_lost_tx(tx, workflow_id).await?;
         delete_reclaimable_leases_tx(tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
@@ -1462,6 +1496,118 @@ fn canonical_message_id_for_turn(
     prepared: &PreparedDirectTurnPayload,
 ) -> CanonicalMessageId {
     CanonicalMessageId(format!("{}:{}", turn.conversation.0, prepared.message_id()))
+}
+
+async fn persist_terminal_obligation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &DirectTurnTerminalObligationInput,
+) -> DbResult<()> {
+    let (terminal_kind, terminal_reason) = terminal_sql(&input.terminal);
+    let target_state = serde_json::to_string(&input.projection.state).map_err(|error| {
+        DbError::Serialization(format!("encode direct-turn terminal target state: {error}"))
+    })?;
+    let updated = sqlx::query(
+        "INSERT INTO direct_turn_terminal_obligations
+         (turn_id, expected_generation, terminal_kind, terminal_reason, target_state,
+          target_state_updated_at, response_message_id)
+         SELECT turn_id, generation, ?3, ?4, ?5, ?6, ?7
+         FROM durable_turns
+         WHERE turn_id = ?1 AND generation = ?2 AND terminal_kind IS NULL
+           AND owns_conversation = 1
+         ON CONFLICT(turn_id) DO UPDATE SET
+           expected_generation = excluded.expected_generation,
+           terminal_kind = excluded.terminal_kind,
+           terminal_reason = excluded.terminal_reason,
+           target_state = excluded.target_state,
+           target_state_updated_at = excluded.target_state_updated_at,
+           response_message_id = excluded.response_message_id
+         WHERE direct_turn_terminal_obligations.expected_generation = excluded.expected_generation",
+    )
+    .bind(to_i64(input.turn_id.0, "turn_id")?)
+    .bind(to_i64(input.expected_generation, "generation")?)
+    .bind(terminal_kind)
+    .bind(terminal_reason)
+    .bind(target_state)
+    .bind(input.projection.state_updated_at.to_rfc3339())
+    .bind(&input.response_message_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(conflict(TurnConflict::StaleGeneration {
+            actual: input.expected_generation,
+        }));
+    }
+    Ok(())
+}
+
+fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
+    match command {
+        TurnCommand::Complete {
+            turn_id,
+            expected_generation,
+        } => Ok((*turn_id, *expected_generation, TurnTerminal::Completed)),
+        TurnCommand::Cancel {
+            turn_id,
+            expected_generation,
+        } => Ok((*turn_id, *expected_generation, TurnTerminal::Cancelled)),
+        TurnCommand::Fail {
+            turn_id,
+            expected_generation,
+            reason,
+        } => Ok((
+            *turn_id,
+            *expected_generation,
+            TurnTerminal::Failed {
+                reason: reason.clone(),
+            },
+        )),
+        TurnCommand::Accept { .. } | TurnCommand::Materialize { .. } => Err(
+            DbError::Serialization("terminal repository command required".to_string()),
+        ),
+    }
+}
+
+fn parse_terminal_obligation_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> DbResult<DirectTurnTerminalObligation> {
+    let terminal_kind: String = row.try_get("terminal_kind")?;
+    let terminal_reason: Option<String> = row.try_get("terminal_reason")?;
+    let terminal = match terminal_kind.as_str() {
+        "Completed" => TurnTerminal::Completed,
+        "Cancelled" => TurnTerminal::Cancelled,
+        "Failed" => TurnTerminal::Failed {
+            reason: terminal_reason.ok_or_else(|| {
+                DbError::Serialization("failed terminal obligation missing reason".to_string())
+            })?,
+        },
+        other => {
+            return Err(DbError::Serialization(format!(
+                "unknown direct-turn terminal obligation kind: {other}"
+            )))
+        }
+    };
+    let target_state_json: String = row.try_get("target_state")?;
+    let state = serde_json::from_str(&target_state_json).map_err(|error| {
+        DbError::Serialization(format!("decode direct-turn terminal target state: {error}"))
+    })?;
+    let state_updated_at =
+        DateTime::parse_from_rfc3339(&row.try_get::<String, _>("target_state_updated_at")?)
+            .map_err(|error| {
+                DbError::Serialization(format!(
+                    "decode direct-turn terminal target timestamp: {error}"
+                ))
+            })?
+            .with_timezone(&Utc);
+    Ok(DirectTurnTerminalObligation {
+        turn_id: TurnAuthorityId(to_u64(row.try_get("turn_id")?, "turn_id")?),
+        expected_generation: to_u64(row.try_get("expected_generation")?, "expected_generation")?,
+        terminal,
+        projection: PersistedConversationProjection {
+            state,
+            state_updated_at,
+        },
+        response_message_id: row.try_get("response_message_id")?,
+    })
 }
 
 fn terminal_commit_timestamp() -> Timestamp {

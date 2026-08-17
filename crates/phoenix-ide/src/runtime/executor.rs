@@ -2709,6 +2709,40 @@ where
         }
     }
 
+    fn schedule_terminal_transition_retry(
+        &mut self,
+        terminal_subagent_transition: bool,
+        terminal_direct_turn_transition: bool,
+        transition: crate::state_machine::transition::TransitionResult,
+    ) {
+        let remaining_after_attempt = if terminal_subagent_transition {
+            None
+        } else if terminal_direct_turn_transition {
+            match self.terminal_settlement_attempt {
+                TerminalSettlementAttempt::Initial => Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES),
+                TerminalSettlementAttempt::Retry {
+                    remaining_after_attempt,
+                } => remaining_after_attempt.map(|remaining| remaining.saturating_sub(1)),
+            }
+        } else {
+            return;
+        };
+        if remaining_after_attempt == Some(0) {
+            self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
+            tracing::error!(
+                conv_id = %self.context.conversation_id,
+                "Direct-turn terminal settlement retry budget exhausted; reconstructing from durable evidence"
+            );
+        } else {
+            self.recovery_disposition = RuntimeRecoveryDisposition::Continue;
+            self.terminal_transition_retry = Some(TerminalTransitionRetry {
+                transition,
+                retry_at: tokio::time::Instant::now() + TERMINAL_SETTLEMENT_RETRY_DELAY,
+                remaining_after_attempt,
+            });
+        }
+    }
+
     fn llm_outcome_is_stale(&self, generation: u64) -> bool {
         generation != self.llm_request_generation
     }
@@ -3142,6 +3176,18 @@ where
         let terminal_retry_transition = (terminal_subagent_transition
             || terminal_direct_turn_transition)
             .then(|| result.clone());
+        let terminal_response_message_id = terminal_direct_turn_transition
+            .then(|| {
+                result.effects.iter().find_map(|effect| match effect {
+                    Effect::PersistMessage {
+                        content: MessageContent::Agent(_),
+                        message_id,
+                        ..
+                    } => Some(message_id.clone()),
+                    _ => None,
+                })
+            })
+            .flatten();
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -3326,7 +3372,102 @@ where
                         | Effect::MaterializeCreation { .. }
                 );
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
-                let effect_result = Box::pin(self.execute_effect(effect)).await;
+                let terminal_message_settlement = if terminal_direct_turn_transition {
+                    match &effect {
+                        Effect::PersistMessage {
+                            content: MessageContent::Agent(_),
+                            message_id,
+                            ..
+                        } if terminal_response_message_id.as_deref()
+                            == Some(message_id.as_str()) =>
+                        {
+                            Some(crate::runtime::traits::ActiveDirectTurnSettlement {
+                                turn: self
+                                    .active_direct_turn
+                                    .as_deref()
+                                    .expect("terminal direct-turn transition retains authority")
+                                    .clone(),
+                                terminal: self
+                                    .pending_direct_turn_terminal
+                                    .as_deref()
+                                    .expect(
+                                        "terminal direct-turn transition retains classification",
+                                    )
+                                    .clone(),
+                                state: self.state.clone(),
+                                state_updated_at: self.state_updated_at,
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let effect_result = if let Some(settlement) = terminal_message_settlement {
+                    match effect {
+                        Effect::PersistMessage {
+                            content,
+                            display_data,
+                            usage_data,
+                            message_id,
+                            ..
+                        } => {
+                            if matches!(
+                                self.terminal_settlement_attempt,
+                                TerminalSettlementAttempt::Retry { .. }
+                            ) && self.storage.message_exists(&message_id).await?
+                            {
+                                Ok(None)
+                            } else {
+                                let sequence_id = self.broadcast_tx.next_seq();
+                                self.storage
+                                    .add_message_with_seq_and_terminal_obligation(
+                                        &message_id,
+                                        &self.context.conversation_id,
+                                        sequence_id,
+                                        &content,
+                                        display_data.as_ref(),
+                                        usage_data.as_ref(),
+                                        &settlement,
+                                    )
+                                    .await
+                                    .map(|message| {
+                                        let _ = self.broadcast_tx.send_message(message);
+                                        None
+                                    })
+                            }
+                        }
+                        _ => unreachable!("terminal message settlement matched persist message"),
+                    }
+                } else if is_state_persist && terminal_direct_turn_transition {
+                    let obligation = crate::runtime::traits::ActiveDirectTurnSettlement {
+                        turn: self
+                            .active_direct_turn
+                            .as_deref()
+                            .expect("terminal direct-turn transition retains authority")
+                            .clone(),
+                        terminal: self
+                            .pending_direct_turn_terminal
+                            .as_deref()
+                            .expect("terminal direct-turn transition retains classification")
+                            .clone(),
+                        state: self.state.clone(),
+                        state_updated_at: self.state_updated_at,
+                    };
+                    match self
+                        .storage
+                        .persist_active_direct_turn_terminal_obligation(
+                            &obligation,
+                            terminal_response_message_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(()) => Box::pin(self.execute_effect(effect)).await,
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Box::pin(self.execute_effect(effect)).await
+                };
                 let effect_result = match effect_result {
                     Ok(effect_result) => {
                         state_committed |= is_state_persist;
@@ -3335,7 +3476,9 @@ where
                     Err(error)
                         if is_state_persist
                             || is_steering_drain
-                            || (terminal_subagent_transition && !state_committed) =>
+                            || ((terminal_subagent_transition
+                                || terminal_direct_turn_transition)
+                                && !state_committed) =>
                     {
                         let failed_state = std::mem::replace(&mut self.state, old_state.clone());
                         self.state_updated_at = old_state_updated_at;
@@ -3346,36 +3489,13 @@ where
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
                             && !state_committed
                         {
-                            let remaining_after_attempt = if terminal_subagent_transition {
-                                None
-                            } else {
-                                match self.terminal_settlement_attempt {
-                                    TerminalSettlementAttempt::Initial => {
-                                        Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES)
-                                    }
-                                    TerminalSettlementAttempt::Retry {
-                                        remaining_after_attempt,
-                                    } => remaining_after_attempt
-                                        .map(|remaining| remaining.saturating_sub(1)),
-                                }
-                            };
-                            if remaining_after_attempt == Some(0) {
-                                self.recovery_disposition =
-                                    RuntimeRecoveryDisposition::RecreateFromDatabase;
-                                tracing::error!(
-                                    conv_id = %self.context.conversation_id,
-                                    "Direct-turn terminal settlement retry budget exhausted; reconstructing from durable evidence"
-                                );
-                            } else {
-                                self.recovery_disposition = RuntimeRecoveryDisposition::Continue;
-                                self.terminal_transition_retry = Some(TerminalTransitionRetry {
-                                    transition: terminal_retry_transition
-                                        .expect("terminal transition captured before effects"),
-                                    retry_at: tokio::time::Instant::now()
-                                        + TERMINAL_SETTLEMENT_RETRY_DELAY,
-                                    remaining_after_attempt,
-                                });
-                            }
+                            self.schedule_terminal_transition_retry(
+                                terminal_subagent_transition,
+                                terminal_direct_turn_transition,
+                                terminal_retry_transition
+                                    .clone()
+                                    .expect("terminal transition captured before effects"),
+                            );
                         }
                         return Err(error);
                     }
@@ -3539,9 +3659,10 @@ where
     async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
         if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
-            self.pending_direct_turn_terminal.take(),
+            self.pending_direct_turn_terminal.as_deref().cloned(),
         ) {
-            self.settle_pending_direct_turn(turn, terminal).await?;
+            self.settle_pending_direct_turn(turn, Box::new(terminal))
+                .await?;
         } else {
             self.storage
                 .update_state(
@@ -3725,6 +3846,7 @@ where
                 span.record("outcome", "committed");
                 span.record("commit_probe", "not_needed");
                 self.active_direct_turn = None;
+                self.pending_direct_turn_terminal = None;
                 self.direct_turn_cancellation_initiated = false;
                 Ok(())
             }
@@ -3890,6 +4012,7 @@ where
             self.state = snapshot.state;
             self.state_updated_at = snapshot.state_updated_at;
             self.active_direct_turn = None;
+            self.pending_direct_turn_terminal = None;
             self.direct_turn_cancellation_initiated = false;
             return Ok(());
         }
@@ -11648,6 +11771,48 @@ mod authoritative_user_message_effect_tests {
         assert!(rt.terminal_transition_retry.is_none());
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert_eq!(storage.recorded_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settlement_probe_read_failure_retains_typed_terminal() {
+        for fail_state_snapshot in [true, false] {
+            let (mut rt, storage, _rx) = runtime(
+                DirectTurnMaterializationEligibility::StaleAuthority,
+                AuthoritativeUserMessageMaterialization::StaleAuthority,
+            );
+            let turn = crate::runtime::traits::ActiveDirectTurn {
+                turn_id: phoenix_workflow::TurnAuthorityId(if fail_state_snapshot {
+                    23
+                } else {
+                    24
+                }),
+                generation: 0,
+            };
+            storage
+                .update_state(
+                    &rt.context.conversation_id,
+                    &ConvState::LlmRequesting { attempt: 1 },
+                    rt.state_updated_at,
+                )
+                .await
+                .unwrap();
+            storage.set_active_direct_turn(Some(turn.clone()));
+            storage.set_settle_active_direct_turn_commit_error_once();
+            storage.set_fail_state_snapshot(fail_state_snapshot);
+            storage.set_fail_load_active_direct_turn(!fail_state_snapshot);
+            rt.active_direct_turn = Some(Box::new(turn));
+            rt.pending_direct_turn_terminal = Some(Box::new(
+                crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+            ));
+            rt.state = ConvState::Idle;
+
+            assert!(rt.persist_state_effect(true).await.is_err());
+
+            assert!(matches!(
+                rt.pending_direct_turn_terminal.as_deref(),
+                Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
+            ));
+        }
     }
 
     #[tokio::test]

@@ -550,6 +550,8 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
+    fail_state_snapshot: Mutex<bool>,
+    fail_load_active_direct_turn: Mutex<bool>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
@@ -591,6 +593,8 @@ impl InMemoryStorage {
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
+            fail_state_snapshot: Mutex::new(false),
+            fail_load_active_direct_turn: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
@@ -644,6 +648,14 @@ impl InMemoryStorage {
 
     pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
         *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
+    }
+
+    pub fn set_fail_state_snapshot(&self, fail: bool) {
+        *self.fail_state_snapshot.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_load_active_direct_turn(&self, fail: bool) {
+        *self.fail_load_active_direct_turn.lock().unwrap() = fail;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -931,6 +943,27 @@ impl MessageStore for InMemoryStorage {
         Ok(msg)
     }
 
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> Result<Message, String> {
+        self.add_message_with_seq(
+            message_id,
+            conv_id,
+            sequence_id,
+            content,
+            display_data,
+            usage_data,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
@@ -1139,7 +1172,18 @@ impl MessageStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
     ) -> Result<Option<crate::runtime::traits::LoadedActiveDirectTurn>, String> {
+        if *self.fail_load_active_direct_turn.lock().unwrap() {
+            return Err("injected active direct-turn read failure".to_string());
+        }
         Ok(self.active_direct_turn.lock().unwrap().clone())
+    }
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+        _response_message_id: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     async fn settle_active_direct_turn(
@@ -1379,6 +1423,9 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
     ) -> Result<crate::runtime::traits::PersistedStateSnapshot, String> {
+        if *self.fail_state_snapshot.lock().unwrap() {
+            return Err("injected state snapshot failure".to_string());
+        }
         Ok(crate::runtime::traits::PersistedStateSnapshot {
             state: self
                 .states

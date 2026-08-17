@@ -66,32 +66,6 @@ impl RecoveryDecision {
     }
 }
 
-/// Return true only when an exact materialized direct-turn slice contains a
-/// canonical boundary followed by an agent response with no tool request.
-pub fn materialized_direct_turn_has_final_response(
-    messages: &[Message],
-    canonical_message_id: &str,
-) -> bool {
-    if messages.len() < 2
-        || messages
-            .first()
-            .is_none_or(|message| message.message_id != canonical_message_id)
-    {
-        return false;
-    }
-    let Some(Message {
-        message_type: MessageType::Agent,
-        content: MessageContent::Agent(blocks),
-        ..
-    }) = messages.last()
-    else {
-        return false;
-    };
-    !blocks
-        .iter()
-        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-}
-
 /// Analyze messages to determine if a conversation needs auto-continuation.
 ///
 /// A conversation needs auto-continuation when:
@@ -225,36 +199,6 @@ mod tests {
     use crate::db::{SystemContent, ToolContent, UserContent};
     use chrono::Utc;
     use serde_json::json;
-
-    #[test]
-    fn exact_materialized_turn_final_response_requires_canonical_boundary_without_tool_request() {
-        let completed = vec![user_msg(1, "question"), agent_with_text(2, "done")];
-        assert!(materialized_direct_turn_has_final_response(
-            &completed, "user-1"
-        ));
-        assert!(!materialized_direct_turn_has_final_response(
-            &completed,
-            "another-turn"
-        ));
-
-        let mixed = vec![
-            user_msg(1, "question"),
-            agent_with_text_and_tools(2, "working", &["bash"]),
-        ];
-        assert!(!materialized_direct_turn_has_final_response(
-            &mixed, "user-1"
-        ));
-        let empty_final = vec![user_msg(1, "question"), agent_tool_use_only(2, &[])];
-        assert!(materialized_direct_turn_has_final_response(
-            &empty_final,
-            "user-1"
-        ));
-        let incomplete = vec![user_msg(1, "question")];
-        assert!(!materialized_direct_turn_has_final_response(
-            &incomplete,
-            "user-1"
-        ));
-    }
 
     // Helper to create a user message
     fn user_msg(seq: i64, text: &str) -> Message {

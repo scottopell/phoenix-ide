@@ -3399,11 +3399,22 @@ impl RuntimeManager {
             }
         };
 
+        let recovery_started = std::time::Instant::now();
+        let recovered_terminal_obligation = self
+            .load_active_direct_turn_terminal_obligation(conversation_id)
+            .await?;
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let recovery_started = std::time::Instant::now();
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
-            self.determine_resume_state(conversation_id).await?;
+            if let Some(obligation) = &recovered_terminal_obligation {
+                (
+                    obligation.projection.state.clone(),
+                    obligation.projection.state_updated_at,
+                    false,
+                )
+            } else {
+                self.determine_resume_state(conversation_id).await?
+            };
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3430,43 +3441,35 @@ impl RuntimeManager {
         )
         .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
-            let recovered_terminal = if matches!(
-                loaded,
-                crate::runtime::traits::LoadedActiveDirectTurn::Materialized { .. }
-            ) {
-                match &initial_state {
-                    ConvState::Idle | ConvState::HandedOff { .. } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
+            let active = loaded.into_active();
+            if let Some(obligation) = recovered_terminal_obligation.filter(|obligation| {
+                obligation.turn_id == active.turn_id
+                    && obligation.expected_generation == active.generation
+            }) {
+                let terminal = match obligation.terminal {
+                    phoenix_workflow::TurnTerminal::Completed => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Completed
                     }
-                    ConvState::Error { message, .. } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                            reason: message.clone(),
-                        })
+                    phoenix_workflow::TurnTerminal::Cancelled => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
                     }
-                    ConvState::ContextExhausted { summary } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                            reason: summary.clone(),
-                        })
+                    phoenix_workflow::TurnTerminal::Failed { reason } => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason }
                     }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(terminal) = recovered_terminal {
+                };
                 crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
                     &crate::runtime::traits::ActiveDirectTurnSettlement {
-                        turn: loaded.into_active(),
+                        turn: active,
                         terminal,
-                        state: initial_state.clone(),
-                        state_updated_at: initial_state_updated_at,
+                        state: obligation.projection.state,
+                        state_updated_at: obligation.projection.state_updated_at,
                     },
                 )
                 .await?;
                 None
             } else {
-                Some(loaded.into_active())
+                Some(active)
             }
         } else {
             None
@@ -4227,19 +4230,12 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
-        if matches!(conv.state, ConvState::LlmRequesting { .. }) {
-            if self
-                .has_completed_materialized_direct_turn(conversation_id)
-                .await?
-            {
-                return Ok((ConvState::Idle, Utc::now(), false));
-            }
-            if self
+        if matches!(conv.state, ConvState::LlmRequesting { .. })
+            && self
                 .has_persisted_llm_request_owner(conversation_id)
                 .await?
-            {
-                return Ok((conv.state, row_state_updated_at, false));
-            }
+        {
+            return Ok((conv.state, row_state_updated_at, false));
         }
 
         if conv.state.is_terminal() {
@@ -4332,38 +4328,25 @@ impl RuntimeManager {
         ))
     }
 
-    async fn has_completed_materialized_direct_turn(
+    async fn load_active_direct_turn_terminal_obligation(
         &self,
         conversation_id: &str,
-    ) -> Result<bool, String> {
-        let active_turn = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
-            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+    ) -> Result<Option<phoenix_db::workflow::DirectTurnTerminalObligation>, String> {
+        let obligation = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
             .await
             .map_err(|error| error.to_string())?;
-        let Some(phoenix_workflow::DurableTurn {
-            materialization: phoenix_workflow::Materialization::Materialized { message_id },
-            ..
-        }) = active_turn
-        else {
-            return Ok(false);
-        };
-        let messages = self
-            .db
-            .get_recovery_messages_for_materialized_turn(conversation_id, &message_id.0)
-            .await
-            .map_err(|error| error.to_string())?;
-        let completed =
-            recovery::materialized_direct_turn_has_final_response(&messages, &message_id.0);
-        if completed {
+        if let Some(obligation) = &obligation {
             tracing::warn!(
                 conv_id = %conversation_id,
-                canonical_message_id = %message_id.0,
-                "Recovering completed materialized direct turn whose terminal settlement remained owed"
+                turn_id = obligation.turn_id.0,
+                generation = obligation.expected_generation,
+                "Recovering exact direct-turn terminal obligation"
             );
         }
-        Ok(completed)
+        Ok(obligation)
     }
 
     async fn has_persisted_llm_request_owner(&self, conversation_id: &str) -> Result<bool, String> {
@@ -6821,24 +6804,28 @@ mod scope_liveness_tests {
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
 
-        mgr.db()
-            .add_message(
-                "direct-final-response",
-                conversation_id,
-                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
-                    phoenix_core::domain::llm_types::ContentBlock::text("final response"),
-                ]),
-                None,
-                None,
-            )
+        repo.persist_terminal_obligation(
+            &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: 0,
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: ConvState::Idle,
+                    state_updated_at: Utc::now(),
+                },
+                response_message_id: Some("direct-final-response".to_string()),
+            },
+        )
+        .await
+        .expect("persist exact terminal obligation before settlement failure");
+        let recovered = mgr
+            .load_active_direct_turn_terminal_obligation(conversation_id)
             .await
-            .expect("persist final response before settlement failure");
-        let (recovered, _, needs_auto_continue) = mgr
-            .determine_resume_state(conversation_id)
-            .await
-            .expect("recover owed terminal settlement");
-        assert_eq!(recovered, ConvState::Idle);
-        assert!(!needs_auto_continue);
+            .expect("load owed terminal settlement")
+            .expect("terminal obligation exists");
+        assert_eq!(recovered.projection.state, ConvState::Idle);
+        assert_eq!(recovered.turn_id, turn_id);
+        assert_eq!(recovered.expected_generation, 0);
     }
 
     #[tokio::test]

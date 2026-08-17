@@ -149,6 +149,18 @@ pub trait MessageStore: Send + Sync {
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Message, String>;
+
     /// Like `add_message_with_seq`, but writes a caller-supplied
     /// `created_at` instead of `Utc::now()`. Used by `persist_checkpoint`
     /// to align the durable DB row's timestamp with the eager-broadcast
@@ -235,6 +247,12 @@ pub trait MessageStore: Send + Sync {
     async fn settle_active_direct_turn(
         &self,
         settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<(), String>;
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
     ) -> Result<(), String>;
 
     async fn settle_continuation_direct_turn(
@@ -530,6 +548,30 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_with_seq_and_terminal_obligation(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                settlement,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
         message_id: &str,
@@ -630,6 +672,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         conversation_id: &str,
     ) -> Result<Option<LoadedActiveDirectTurn>, String> {
         (**self).load_active_direct_turn(conversation_id).await
+    }
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_active_direct_turn_terminal_obligation(settlement, response_message_id)
+            .await
     }
 
     async fn settle_active_direct_turn(
@@ -985,6 +1037,47 @@ impl MessageStore for DatabaseStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Message, String> {
+        let terminal = match &settlement.terminal {
+            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
+            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
+                reason: reason.clone(),
+            },
+        };
+        self.db
+            .add_message_with_seq_and_terminal_obligation(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                    turn_id: settlement.turn.turn_id,
+                    expected_generation: settlement.turn.generation,
+                    terminal,
+                    projection: phoenix_db::workflow::PersistedConversationProjection {
+                        state: settlement.state.clone(),
+                        state_updated_at: settlement.state_updated_at,
+                    },
+                    response_message_id: Some(message_id.to_string()),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
         message_id: &str,
@@ -1174,6 +1267,33 @@ impl MessageStore for DatabaseStorage {
             })
         })
         .map_err(|error| error.to_string())
+    }
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
+    ) -> Result<(), String> {
+        let terminal = match &settlement.terminal {
+            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
+            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
+                reason: reason.clone(),
+            },
+        };
+        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .persist_terminal_obligation(&phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id: settlement.turn.turn_id,
+                expected_generation: settlement.turn.generation,
+                terminal,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: settlement.state.clone(),
+                    state_updated_at: settlement.state_updated_at,
+                },
+                response_message_id: response_message_id.map(ToString::to_string),
+            })
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn settle_active_direct_turn(
