@@ -1405,7 +1405,7 @@ impl WorkflowRepository {
     ) -> DbResult<Option<DirectTurnTerminalObligation>> {
         let row = sqlx::query(
             "SELECT o.turn_id, o.expected_generation, o.terminal_kind, o.terminal_reason,
-                    o.target_state, o.target_state_updated_at, o.response_message_id
+                    o.target_state, o.target_state_updated_at_us, o.response_message_id
              FROM direct_turn_terminal_obligations AS o
              JOIN durable_turns AS t ON t.turn_id = o.turn_id
              WHERE t.conversation_id = ?1 AND t.disposition = 'Runtime'
@@ -1493,7 +1493,7 @@ impl WorkflowRepository {
         };
         let row = sqlx::query(
             "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
-                    target_state, target_state_updated_at, response_message_id
+                    target_state, target_state_updated_at_us, response_message_id
              FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
         )
         .bind(to_i64(expected.turn_id.0, "turn_id")?)
@@ -1502,18 +1502,63 @@ impl WorkflowRepository {
         let obligation = row
             .map(|row| parse_terminal_obligation_row(&row))
             .transpose()?;
+        let settled_row = sqlx::query(
+            "SELECT t.generation, t.terminal_kind, t.terminal_reason, t.owns_conversation,
+                    c.state, c.state_updated_at
+             FROM durable_turns AS t
+             JOIN conversations AS c ON c.id = t.conversation_id
+             WHERE t.turn_id = ?1",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
         let obligation_matches = obligation.as_ref().is_some_and(|obligation| {
             obligation.turn_id == expected.turn_id
                 && obligation.expected_generation == expected.expected_generation
                 && obligation.terminal == expected.terminal
-                && obligation.projection == expected.projection
+                && projections_match(&obligation.projection, &expected.projection)
                 && obligation.response_message_id == expected.response_message_id
         });
+        let settled_terminal_kind: Option<String> = settled_row.try_get("terminal_kind")?;
+        let settled_terminal = terminal_from_sql(
+            settled_terminal_kind.as_deref(),
+            settled_row.try_get("terminal_reason")?,
+        )?;
+        let settled_state_json: String = settled_row.try_get("state")?;
+        let settled_state = serde_json::from_str(&settled_state_json).map_err(|error| {
+            DbError::Serialization(format!(
+                "decode settled direct-turn conversation state: {error}"
+            ))
+        })?;
+        let settled_state_updated_at =
+            DateTime::parse_from_rfc3339(&settled_row.try_get::<String, _>("state_updated_at")?)
+                .map_err(|error| {
+                    DbError::Serialization(format!(
+                        "decode settled direct-turn conversation timestamp: {error}"
+                    ))
+                })?
+                .with_timezone(&Utc);
+        let settled_matches = to_u64(settled_row.try_get("generation")?, "generation")?
+            == expected.expected_generation.saturating_add(1)
+            && settled_terminal.as_ref() == Some(&expected.terminal)
+            && settled_row.try_get::<i64, _>("owns_conversation")? == 0
+            && projections_match(
+                &PersistedConversationProjection {
+                    state: settled_state,
+                    state_updated_at: settled_state_updated_at,
+                },
+                &expected.projection,
+            );
         Ok(
-            match (evidence_matches, obligation_matches, obligation.is_some()) {
-                (true, true, _) => TerminalEvidenceProbe::Established,
-                (false, false, false) => TerminalEvidenceProbe::KnownNotCommitted,
+            match (
+                evidence_matches,
+                obligation_matches || settled_matches,
+                obligation.is_some(),
+                settled_matches,
+            ) {
+                (true, true, _, _) => TerminalEvidenceProbe::Established,
+                (false, false, false, false) => TerminalEvidenceProbe::KnownNotCommitted,
                 _ => TerminalEvidenceProbe::Incomplete,
             },
         )
@@ -1779,7 +1824,7 @@ async fn persist_terminal_obligation_tx(
     let updated = sqlx::query(
         "INSERT INTO direct_turn_terminal_obligations
          (turn_id, expected_generation, terminal_kind, terminal_reason, target_state,
-          target_state_updated_at, response_message_id)
+          target_state_updated_at_us, response_message_id)
          SELECT turn_id, generation, ?3, ?4, ?5, ?6, ?7
          FROM durable_turns
          WHERE turn_id = ?1 AND generation = ?2 AND terminal_kind IS NULL
@@ -1789,7 +1834,7 @@ async fn persist_terminal_obligation_tx(
            terminal_kind = excluded.terminal_kind,
            terminal_reason = excluded.terminal_reason,
            target_state = excluded.target_state,
-           target_state_updated_at = excluded.target_state_updated_at,
+           target_state_updated_at_us = excluded.target_state_updated_at_us,
            response_message_id = excluded.response_message_id
          WHERE direct_turn_terminal_obligations.expected_generation = excluded.expected_generation",
     )
@@ -1798,7 +1843,7 @@ async fn persist_terminal_obligation_tx(
     .bind(terminal_kind)
     .bind(terminal_reason)
     .bind(target_state)
-    .bind(input.projection.state_updated_at.to_rfc3339())
+    .bind(input.projection.state_updated_at.timestamp_micros())
     .bind(&input.response_message_id)
     .execute(&mut **tx)
     .await?;
@@ -1808,6 +1853,34 @@ async fn persist_terminal_obligation_tx(
         }));
     }
     Ok(())
+}
+
+fn projections_match(
+    actual: &PersistedConversationProjection,
+    expected: &PersistedConversationProjection,
+) -> bool {
+    actual.state == expected.state
+        && actual.state_updated_at.timestamp_micros()
+            == expected.state_updated_at.timestamp_micros()
+}
+
+fn terminal_from_sql(
+    terminal_kind: Option<&str>,
+    terminal_reason: Option<String>,
+) -> DbResult<Option<TurnTerminal>> {
+    match terminal_kind {
+        None => Ok(None),
+        Some("Completed") => Ok(Some(TurnTerminal::Completed)),
+        Some("Cancelled") => Ok(Some(TurnTerminal::Cancelled)),
+        Some("Failed") => Ok(Some(TurnTerminal::Failed {
+            reason: terminal_reason.ok_or_else(|| {
+                DbError::Serialization("failed terminal turn missing reason".to_string())
+            })?,
+        })),
+        Some(other) => Err(DbError::Serialization(format!(
+            "unknown direct-turn terminal kind: {other}"
+        ))),
+    }
 }
 
 fn terminal_command_parts(command: &TurnCommand) -> DbResult<(TurnAuthorityId, u64, TurnTerminal)> {
@@ -1841,33 +1914,21 @@ fn parse_terminal_obligation_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> DbResult<DirectTurnTerminalObligation> {
     let terminal_kind: String = row.try_get("terminal_kind")?;
-    let terminal_reason: Option<String> = row.try_get("terminal_reason")?;
-    let terminal = match terminal_kind.as_str() {
-        "Completed" => TurnTerminal::Completed,
-        "Cancelled" => TurnTerminal::Cancelled,
-        "Failed" => TurnTerminal::Failed {
-            reason: terminal_reason.ok_or_else(|| {
-                DbError::Serialization("failed terminal obligation missing reason".to_string())
-            })?,
-        },
-        other => {
-            return Err(DbError::Serialization(format!(
-                "unknown direct-turn terminal obligation kind: {other}"
-            )))
-        }
-    };
+    let terminal = terminal_from_sql(Some(&terminal_kind), row.try_get("terminal_reason")?)?
+        .ok_or_else(|| {
+            DbError::Serialization("terminal obligation is missing terminal kind".to_string())
+        })?;
     let target_state_json: String = row.try_get("target_state")?;
     let state = serde_json::from_str(&target_state_json).map_err(|error| {
         DbError::Serialization(format!("decode direct-turn terminal target state: {error}"))
     })?;
+    let timestamp_us: i64 = row.try_get("target_state_updated_at_us")?;
     let state_updated_at =
-        DateTime::parse_from_rfc3339(&row.try_get::<String, _>("target_state_updated_at")?)
-            .map_err(|error| {
-                DbError::Serialization(format!(
-                    "decode direct-turn terminal target timestamp: {error}"
-                ))
-            })?
-            .with_timezone(&Utc);
+        DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| {
+            DbError::Serialization(format!(
+                "direct-turn terminal target timestamp is out of range: {timestamp_us}"
+            ))
+        })?;
     Ok(DirectTurnTerminalObligation {
         turn_id: TurnAuthorityId(to_u64(row.try_get("turn_id")?, "turn_id")?),
         expected_generation: to_u64(row.try_get("expected_generation")?, "expected_generation")?,
@@ -3044,6 +3105,52 @@ mod tests {
         .unwrap();
         assert_eq!(
             repo.probe_terminal_evidence("conv-a", "response-terminal-evidence", &expected)
+                .await
+                .unwrap(),
+            TerminalEvidenceProbe::Established
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_evidence_probe_recognizes_concurrently_settled_exact_turn() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "terminal-evidence-settled", 72).await;
+        let expected = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Cancelled,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: chrono::Utc::now(),
+            },
+            response_message_id: Some("response-terminal-settled".to_string()),
+        };
+        let mut tx = repo.pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES (?1, 'conv-a', 9002, 'agent', '[]', '2025-01-01')",
+        )
+        .bind("response-terminal-settled")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        WorkflowRepository::persist_terminal_obligation_tx(&mut tx, &expected)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Cancel {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(expected.projection.clone()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.probe_terminal_evidence("conv-a", "response-terminal-settled", &expected)
                 .await
                 .unwrap(),
             TerminalEvidenceProbe::Established

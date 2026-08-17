@@ -440,8 +440,8 @@ CREATE TABLE direct_turn_terminal_obligations (
     terminal_reason TEXT,
     target_state TEXT NOT NULL
         CHECK (typeof(target_state) = 'text' AND json_valid(target_state)),
-    target_state_updated_at TEXT NOT NULL
-        CHECK (typeof(target_state_updated_at) = 'text' AND target_state_updated_at <> ''),
+    target_state_updated_at_us INTEGER NOT NULL
+        CHECK (typeof(target_state_updated_at_us) = 'integer'),
     response_message_id TEXT,
     CHECK (
         (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
@@ -455,7 +455,7 @@ INSERT INTO direct_turn_terminal_obligations (
     terminal_kind,
     terminal_reason,
     target_state,
-    target_state_updated_at,
+    target_state_updated_at_us,
     response_message_id
 )
 SELECT
@@ -468,7 +468,10 @@ SELECT
         'message', 'Phoenix restarted before this direct turn recorded an exact terminal result',
         'error_kind', 'server_error'
     ),
-    COALESCE(NULLIF(c.state_updated_at, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CAST(strftime(
+        '%s',
+        COALESCE(NULLIF(c.state_updated_at, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    ) AS INTEGER) * 1000000,
     NULL
 FROM durable_turns AS t
 JOIN conversations AS c ON c.id = t.conversation_id
@@ -8973,7 +8976,7 @@ mod tests {
                  owns_conversation INTEGER NOT NULL
              );
              INSERT INTO conversations VALUES (
-                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', ''
+                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', '2025-05-03T04:09:11Z'
              );
              INSERT INTO durable_turns VALUES (
                  661, 'legacy', 3, 'Runtime', 'canonical-user', NULL, 1
@@ -8999,13 +9002,21 @@ mod tests {
             "error"
         );
         assert_eq!(row.3, 3);
-        let timestamp: String = sqlx::query_scalar(
-            "SELECT target_state_updated_at FROM direct_turn_terminal_obligations WHERE turn_id = 661",
+        let timestamp_us: i64 = sqlx::query_scalar(
+            "SELECT target_state_updated_at_us FROM direct_turn_terminal_obligations WHERE turn_id = 661",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        chrono::DateTime::parse_from_rfc3339(&timestamp).expect("fallback timestamp is RFC3339");
+        assert_eq!(timestamp_us, 1_746_245_351_000_000);
+        let column: (String, i64) = sqlx::query_as(
+            "SELECT type, \"notnull\" FROM pragma_table_info('direct_turn_terminal_obligations')
+             WHERE name = 'target_state_updated_at_us'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(column, ("INTEGER".to_string(), 1));
     }
 
     #[tokio::test]
