@@ -550,6 +550,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
+    terminal_obligation_establishment_failures: Mutex<usize>,
     fail_state_snapshot: Mutex<bool>,
     fail_load_active_direct_turn: Mutex<bool>,
     settle_continuation_direct_turn_calls:
@@ -593,6 +594,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
+            terminal_obligation_establishment_failures: Mutex::new(0),
             fail_state_snapshot: Mutex::new(false),
             fail_load_active_direct_turn: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
@@ -648,6 +650,13 @@ impl InMemoryStorage {
 
     pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
         *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
+    }
+
+    pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
+        *self
+            .terminal_obligation_establishment_failures
+            .lock()
+            .unwrap() = failures;
     }
 
     pub fn set_fail_state_snapshot(&self, fail: bool) {
@@ -953,6 +962,16 @@ impl MessageStore for InMemoryStorage {
         usage_data: Option<&UsageData>,
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> Result<Message, String> {
+        {
+            let mut failures = self
+                .terminal_obligation_establishment_failures
+                .lock()
+                .unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err("terminal obligation establishment failed before commit".to_string());
+            }
+        }
         self.add_message_with_seq(
             message_id,
             conv_id,

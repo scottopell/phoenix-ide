@@ -60,18 +60,35 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum RuntimeExitDisposition {
     Terminal,
     Interrupted,
+    RecreateFromDatabase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalFactDurability {
+    ProcessOnly,
+    Durable,
+}
+
+impl TerminalFactDurability {
+    const fn is_durable(self) -> bool {
+        matches!(self, Self::Durable)
+    }
 }
 
 struct TerminalTransitionRetry {
     transition: crate::state_machine::transition::TransitionResult,
     retry_at: tokio::time::Instant,
     remaining_after_attempt: Option<u8>,
+    fact_durability: TerminalFactDurability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalSettlementAttempt {
     Initial,
-    Retry { remaining_after_attempt: Option<u8> },
+    Retry {
+        remaining_after_attempt: Option<u8>,
+        fact_durability: TerminalFactDurability,
+    },
 }
 
 impl Drop for AbortTaskOnDrop {
@@ -1924,6 +1941,7 @@ where
     parent_tool_cycle_count: u32,
     active_direct_turn: Option<Box<crate::runtime::traits::ActiveDirectTurn>>,
     pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
+    direct_turn_terminal_fact: TerminalFactDurability,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     continuation_effect_disposition: ContinuationEffectDisposition,
@@ -2065,6 +2083,7 @@ where
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
+            direct_turn_terminal_fact: TerminalFactDurability::ProcessOnly,
             direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
@@ -2553,7 +2572,11 @@ where
         }
 
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
-        RuntimeExitDisposition::Interrupted
+        if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
+            RuntimeExitDisposition::RecreateFromDatabase
+        } else {
+            RuntimeExitDisposition::Interrupted
+        }
     }
 
     /// REQ-BED-030: credential helper settled while in `AwaitingRecovery`.
@@ -2701,7 +2724,9 @@ where
         if let Some(retry) = self.terminal_transition_retry.take() {
             self.terminal_settlement_attempt = TerminalSettlementAttempt::Retry {
                 remaining_after_attempt: retry.remaining_after_attempt,
+                fact_durability: retry.fact_durability,
             };
+            self.direct_turn_terminal_fact = retry.fact_durability;
             if let Err(error) = self.apply_transition_result(retry.transition).await {
                 tracing::warn!(%error, "Terminal settlement retry failed");
             }
@@ -2715,13 +2740,17 @@ where
         terminal_direct_turn_transition: bool,
         transition: crate::state_machine::transition::TransitionResult,
     ) {
-        let remaining_after_attempt = if terminal_subagent_transition {
+        let fact_durability = self.direct_turn_terminal_fact;
+        let remaining_after_attempt = if terminal_subagent_transition
+            || (terminal_direct_turn_transition && !fact_durability.is_durable())
+        {
             None
         } else if terminal_direct_turn_transition {
             match self.terminal_settlement_attempt {
                 TerminalSettlementAttempt::Initial => Some(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES),
                 TerminalSettlementAttempt::Retry {
                     remaining_after_attempt,
+                    ..
                 } => remaining_after_attempt.map(|remaining| remaining.saturating_sub(1)),
             }
         } else {
@@ -2739,6 +2768,7 @@ where
                 transition,
                 retry_at: tokio::time::Instant::now() + TERMINAL_SETTLEMENT_RETRY_DELAY,
                 remaining_after_attempt,
+                fact_durability,
             });
         }
     }
@@ -3350,9 +3380,12 @@ where
                     if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
             )
         });
-        if let Some((drain_event, projection_guard)) =
+        let steering_drain = if terminal_direct_turn_transition {
+            None
+        } else {
             Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
-        {
+        };
+        if let Some((drain_event, projection_guard)) = steering_drain {
             Box::pin(self.run_effects_with_inline_drain(
                 result.effects,
                 drain_event,
@@ -3412,15 +3445,19 @@ where
                             message_id,
                             ..
                         } => {
-                            if matches!(
+                            let retry_has_durable_fact = matches!(
                                 self.terminal_settlement_attempt,
-                                TerminalSettlementAttempt::Retry { .. }
-                            ) && self.storage.message_exists(&message_id).await?
-                            {
+                                TerminalSettlementAttempt::Retry {
+                                    fact_durability: TerminalFactDurability::Durable,
+                                    ..
+                                }
+                            );
+                            if retry_has_durable_fact {
                                 Ok(None)
                             } else {
                                 let sequence_id = self.broadcast_tx.next_seq();
-                                self.storage
+                                match self
+                                    .storage
                                     .add_message_with_seq_and_terminal_obligation(
                                         &message_id,
                                         &self.context.conversation_id,
@@ -3431,10 +3468,15 @@ where
                                         &settlement,
                                     )
                                     .await
-                                    .map(|message| {
+                                {
+                                    Ok(message) => {
+                                        self.direct_turn_terminal_fact =
+                                            TerminalFactDurability::Durable;
                                         let _ = self.broadcast_tx.send_message(message);
-                                        None
-                                    })
+                                        Ok(None)
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                         }
                         _ => unreachable!("terminal message settlement matched persist message"),
@@ -3462,7 +3504,10 @@ where
                         )
                         .await
                     {
-                        Ok(()) => Box::pin(self.execute_effect(effect)).await,
+                        Ok(()) => {
+                            self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                            Box::pin(self.execute_effect(effect)).await
+                        }
                         Err(error) => Err(error),
                     }
                 } else {
@@ -3534,6 +3579,15 @@ where
                 drop(projection_guard);
             }
             return Ok(Vec::new());
+        }
+
+        if terminal_direct_turn_transition {
+            if let Some((drain_event, projection_guard)) =
+                Box::pin(self.prepare_steering_drain(&old_state, false)).await?
+            {
+                Box::pin(self.process_event(drain_event)).await?;
+                drop(projection_guard);
+            }
         }
 
         if self.pending_direct_turn_terminal.is_some() {
@@ -3847,6 +3901,7 @@ where
                 span.record("commit_probe", "not_needed");
                 self.active_direct_turn = None;
                 self.pending_direct_turn_terminal = None;
+                self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
                 self.direct_turn_cancellation_initiated = false;
                 Ok(())
             }
@@ -4013,6 +4068,7 @@ where
             self.state_updated_at = snapshot.state_updated_at;
             self.active_direct_turn = None;
             self.pending_direct_turn_terminal = None;
+            self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
             self.direct_turn_cancellation_initiated = false;
             return Ok(());
         }
@@ -4871,6 +4927,7 @@ where
         if self.active_direct_turn.is_none() {
             return;
         }
+        self.direct_turn_terminal_fact = TerminalFactDurability::ProcessOnly;
         if matches!(new_state, ConvState::Idle) {
             if self.direct_turn_cancellation_initiated {
                 self.pending_direct_turn_terminal = Some(Box::new(
@@ -11701,6 +11758,7 @@ mod authoritative_user_message_effect_tests {
                 .with_effect(Effect::PersistState),
             retry_at: tokio::time::Instant::now(),
             remaining_after_attempt: Some(2),
+            fact_durability: TerminalFactDurability::Durable,
         });
 
         rt.process_event(Event::UserCancel {
@@ -11748,6 +11806,7 @@ mod authoritative_user_message_effect_tests {
             crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
         ));
         rt.state = ConvState::LlmRequesting { attempt: 1 };
+        rt.direct_turn_terminal_fact = TerminalFactDurability::Durable;
         let result = crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
             .with_effect(Effect::PersistMessage {
                 content: MessageContent::agent(vec![ContentBlock::text("final answer")]),
@@ -11771,6 +11830,43 @@ mod authoritative_user_message_effect_tests {
         assert!(rt.terminal_transition_retry.is_none());
         assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
         assert_eq!(storage.recorded_messages().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_establishment_failure_never_exhausts_into_database_reconstruction() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(25),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        storage.set_terminal_obligation_establishment_failures(32);
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let outcome = LlmOutcome::Response {
+            content: vec![ContentBlock::text("exact response retained")],
+            tool_calls: vec![],
+            end_turn: true,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "pre-establishment-retry".to_string(),
+        };
+
+        rt.process_generation_tagged_llm_outcome(0, outcome).await;
+        for _ in 0..(DIRECT_TURN_TERMINAL_SETTLEMENT_RETRIES + 2) {
+            tokio::time::advance(TERMINAL_SETTLEMENT_RETRY_DELAY).await;
+            rt.retry_terminal_transition().await;
+        }
+
+        assert_eq!(
+            rt.recovery_disposition,
+            RuntimeRecoveryDisposition::Continue
+        );
+        assert!(rt.terminal_transition_retry.is_some());
+        assert!(!rt.direct_turn_terminal_fact.is_durable());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 1 }));
     }
 
     #[tokio::test]
@@ -13525,6 +13621,7 @@ mod steer_drain_detector_tests {
             .with_effect(Effect::PersistState),
             retry_at: tokio::time::Instant::now(),
             remaining_after_attempt: None,
+            fact_durability: TerminalFactDurability::ProcessOnly,
         });
 
         rt.process_event(Event::UserCancel {
@@ -13797,6 +13894,47 @@ mod steer_drain_detector_tests {
             "drain must still broadcast the authoritative LlmRequesting StateChange"
         );
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_with_queued_steer_establishes_obligation_before_drain() {
+        let queue = vec![mk_entry("queued", "next turn")];
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-terminal-queued-steer",
+            ConvState::LlmRequesting { attempt: 1 },
+            queue,
+        );
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(77),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+        ));
+        let result = TransitionResult::new(ConvState::Idle)
+            .with_effect(Effect::PersistMessage {
+                content: MessageContent::agent(vec![ContentBlock::text("first turn done")]),
+                display_data: None,
+                usage_data: None,
+                message_id: "terminal-before-drain".to_string(),
+                idempotent: false,
+            })
+            .with_effect(Effect::PersistState);
+
+        rt.apply_transition_result(result)
+            .await
+            .expect("terminal settlement and queued drain succeed");
+
+        assert_eq!(storage.recorded_messages().len(), 2);
+        assert!(rt.active_direct_turn.is_none());
+        assert!(rt.pending_direct_turn_terminal.is_none());
+        assert!(!rt.direct_turn_terminal_fact.is_durable());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+        assert!(storage
+            .get_steering_queue("conv-terminal-queued-steer")
+            .is_empty());
     }
 
     #[tokio::test]

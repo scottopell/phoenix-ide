@@ -1054,7 +1054,18 @@ impl MessageStore for DatabaseStorage {
                 reason: reason.clone(),
             },
         };
-        self.db
+        let obligation = phoenix_db::workflow::DirectTurnTerminalObligationInput {
+            turn_id: settlement.turn.turn_id,
+            expected_generation: settlement.turn.generation,
+            terminal,
+            projection: phoenix_db::workflow::PersistedConversationProjection {
+                state: settlement.state.clone(),
+                state_updated_at: settlement.state_updated_at,
+            },
+            response_message_id: Some(message_id.to_string()),
+        };
+        match self
+            .db
             .add_message_with_seq_and_terminal_obligation(
                 message_id,
                 conv_id,
@@ -1062,19 +1073,45 @@ impl MessageStore for DatabaseStorage {
                 content,
                 display_data,
                 usage_data,
-                &phoenix_db::workflow::DirectTurnTerminalObligationInput {
-                    turn_id: settlement.turn.turn_id,
-                    expected_generation: settlement.turn.generation,
-                    terminal,
-                    projection: phoenix_db::workflow::PersistedConversationProjection {
-                        state: settlement.state.clone(),
-                        state_updated_at: settlement.state_updated_at,
-                    },
-                    response_message_id: Some(message_id.to_string()),
-                },
+                &obligation,
             )
             .await
-            .map_err(|error| error.to_string())
+        {
+            Ok(message) => Ok(message),
+            Err(write_error) => {
+                let recovered = phoenix_db::workflow::WorkflowRepository::new(
+                    self.db.pool().clone(),
+                )
+                .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                    conv_id.to_string(),
+                ))
+                .await
+                .map_err(|probe_error| {
+                    format!(
+                        "{write_error}; exact terminal-obligation classification failed: {probe_error}"
+                    )
+                })?;
+                let exact_obligation_committed = recovered.as_ref().is_some_and(|recovered| {
+                    recovered.turn_id == settlement.turn.turn_id
+                        && recovered.expected_generation == settlement.turn.generation
+                        && recovered.response_message_id.as_deref() == Some(message_id)
+                        && recovered.projection.state == settlement.state
+                        && recovered.terminal == obligation.terminal
+                });
+                if exact_obligation_committed {
+                    self.db
+                        .get_message_by_id_in_conversation(conv_id, message_id)
+                        .await
+                        .map_err(|probe_error| {
+                            format!(
+                                "{write_error}; terminal obligation committed but response retrieval failed: {probe_error}"
+                            )
+                        })
+                } else {
+                    Err(write_error.to_string())
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

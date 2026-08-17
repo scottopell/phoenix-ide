@@ -1487,6 +1487,25 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
     deterministic_explore_branch_for_worktree(worktree_path)
 }
 
+fn rematerialize_runtime_after_exit(
+    manager: Arc<RuntimeManager>,
+    conversation_id: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        match manager.get_or_create(&conversation_id).await {
+            Ok(_) => tracing::info!(
+                conv_id = %conversation_id,
+                "Runtime rematerialized from durable terminal obligation"
+            ),
+            Err(error) => tracing::error!(
+                conv_id = %conversation_id,
+                %error,
+                "Runtime rematerialization from durable terminal obligation failed"
+            ),
+        }
+    })
+}
+
 impl RuntimeManager {
     pub fn new(
         db: Database,
@@ -3655,6 +3674,12 @@ impl RuntimeManager {
                     conv_id = %conv_id,
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
+            }
+            if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
+                tokio::spawn(rematerialize_runtime_after_exit(
+                    Arc::clone(&manager_for_cleanup),
+                    conv_id,
+                ));
             }
         });
 
@@ -6829,6 +6854,31 @@ mod scope_liveness_tests {
         assert_eq!(recovered.projection.state, ConvState::Idle);
         assert_eq!(recovered.turn_id, turn_id);
         assert_eq!(recovered.expected_generation, 0);
+
+        let mgr = Arc::new(mgr);
+        rematerialize_runtime_after_exit(Arc::clone(&mgr), conversation_id.to_string()).await;
+
+        let durable_turn = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .expect("load settled turn")
+            .expect("turn exists");
+        assert!(matches!(
+            durable_turn.lifecycle,
+            phoenix_workflow::TurnLifecycle::Terminal {
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                ..
+            }
+        ));
+        assert!(!durable_turn.owns_conversation());
+        assert_eq!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load settled conversation")
+                .state,
+            ConvState::Idle
+        );
     }
 
     #[tokio::test]

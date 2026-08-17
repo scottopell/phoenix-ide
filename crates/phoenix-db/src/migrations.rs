@@ -448,6 +448,34 @@ CREATE TABLE direct_turn_terminal_obligations (
         OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
     )
 );
+
+INSERT INTO direct_turn_terminal_obligations (
+    turn_id,
+    expected_generation,
+    terminal_kind,
+    terminal_reason,
+    target_state,
+    target_state_updated_at,
+    response_message_id
+)
+SELECT
+    t.turn_id,
+    t.generation,
+    'Failed',
+    'Phoenix restarted before this direct turn recorded an exact terminal result',
+    json_object(
+        'type', 'error',
+        'message', 'Phoenix restarted before this direct turn recorded an exact terminal result',
+        'error_kind', 'server_error'
+    ),
+    COALESCE(NULLIF(c.state_updated_at, ''), CURRENT_TIMESTAMP),
+    NULL
+FROM durable_turns AS t
+JOIN conversations AS c ON c.id = t.conversation_id
+WHERE t.disposition = 'Runtime'
+  AND t.terminal_kind IS NULL
+  AND t.owns_conversation = 1
+  AND t.canonical_message_id IS NOT NULL;
 ";
 
 const MIGRATION_065: &str = r"
@@ -8924,6 +8952,53 @@ mod tests {
                 "hash-1".into()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn migration_066_quarantines_legacy_materialized_owners_without_fabricating_completion() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 state TEXT NOT NULL,
+                 state_updated_at TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY,
+                 conversation_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 disposition TEXT NOT NULL,
+                 canonical_message_id TEXT,
+                 terminal_kind TEXT,
+                 owns_conversation INTEGER NOT NULL
+             );
+             INSERT INTO conversations VALUES (
+                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', '2026-01-01T00:00:00Z'
+             );
+             INSERT INTO durable_turns VALUES (
+                 661, 'legacy', 3, 'Runtime', 'canonical-user', NULL, 1
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_066).execute(&pool).await.unwrap();
+
+        let row: (String, String, String, i64) = sqlx::query_as(
+            "SELECT terminal_kind, terminal_reason, target_state, expected_generation
+             FROM direct_turn_terminal_obligations WHERE turn_id = 661",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "Failed");
+        assert!(row.1.contains("exact terminal result"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.2).unwrap()["type"],
+            "error"
+        );
+        assert_eq!(row.3, 3);
     }
 
     #[tokio::test]
