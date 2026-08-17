@@ -7057,9 +7057,12 @@ where
             )
             .await
         {
-            TerminalMutationEstablishment::Established { .. }
-            | TerminalMutationEstablishment::Retired => {
+            TerminalMutationEstablishment::Established { .. } => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+            }
+            TerminalMutationEstablishment::Retired => {
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                return Ok(None);
             }
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
             TerminalMutationEstablishment::Unclassifiable(error) => {
@@ -15474,6 +15477,48 @@ mod steer_drain_detector_tests {
             }],
             "typed images must not be dropped at checkpoint persistence"
         );
+    }
+
+    #[tokio::test]
+    async fn retired_terminal_checkpoint_does_not_publish_deleted_rows() {
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-retired-checkpoint", ConvState::Idle, vec![]);
+        storage.set_terminal_mutation_retired(true);
+        rt.active_direct_turn = Some(Box::new(crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(88),
+            generation: 0,
+        }));
+        let settlement = ActiveDirectTurnSettlement {
+            turn: rt.active_direct_turn.as_deref().unwrap().clone(),
+            terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        let mut rx = rt.broadcast_tx.subscribe();
+        let data = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "retired-checkpoint".to_string(),
+                vec![ContentBlock::text("deleted checkpoint")],
+                None,
+                None,
+            ),
+            vec![],
+        )
+        .unwrap();
+
+        rt.persist_checkpoint_with_terminal_obligation(data, &settlement)
+            .await
+            .expect("retired checkpoint is resolved");
+
+        assert!(storage
+            .get_all_messages("conv-retired-checkpoint")
+            .is_empty());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(rt.direct_turn_terminal_fact.is_durable());
     }
 
     #[tokio::test]

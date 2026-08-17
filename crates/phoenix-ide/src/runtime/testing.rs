@@ -551,6 +551,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
     terminal_obligation_establishment_failures: Mutex<usize>,
+    terminal_mutation_retired: Mutex<bool>,
     fail_state_snapshot: Mutex<bool>,
     fail_load_active_direct_turn: Mutex<bool>,
     settle_continuation_direct_turn_calls:
@@ -595,6 +596,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
             terminal_obligation_establishment_failures: Mutex::new(0),
+            terminal_mutation_retired: Mutex::new(false),
             fail_state_snapshot: Mutex::new(false),
             fail_load_active_direct_turn: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
@@ -657,6 +659,10 @@ impl InMemoryStorage {
             .terminal_obligation_establishment_failures
             .lock()
             .unwrap() = failures;
+    }
+
+    pub fn set_terminal_mutation_retired(&self, retired: bool) {
+        *self.terminal_mutation_retired.lock().unwrap() = retired;
     }
 
     pub fn set_fail_state_snapshot(&self, fail: bool) {
@@ -1423,6 +1429,9 @@ impl MessageStore for InMemoryStorage {
         tool_results: &[Message],
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if *self.terminal_mutation_retired.lock().unwrap() {
+            return crate::runtime::traits::TerminalMutationEstablishment::Retired;
+        }
         if let Err(error) = self
             .persist_active_direct_turn_terminal_obligation(settlement, None)
             .await
