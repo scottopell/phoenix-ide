@@ -17,7 +17,7 @@ use phoenix_workflow::{
     TurnCommand, TurnConflict, TurnLifecycle, TurnOutcome, TurnStep, TurnTerminal, Version,
     WorkflowId, WorkflowStatus,
 };
-use sqlx::{Acquire, Row};
+use sqlx::{Acquire, Connection, Row};
 
 use super::{
     CommitTransitionPlanCas, CreateWorkflowWithExternalAcceptance, DeliveryResolutionDecision,
@@ -1205,7 +1205,9 @@ impl WorkflowRepository {
             .await?;
         let mut tx = telemetry
             .observe_db(SqlitePhase::TransactionAcquisition, async {
-                Ok(super::WorkflowTx::new(connection.begin().await?))
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
             })
             .await?;
         let transaction_timing = pool_timing.transaction_started();
@@ -2518,6 +2520,105 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_settlement_snapshot_fails_at_first_write_after_competing_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy-snapshot.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(1));
+        let mut settlement = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let mut competitor = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE workflow_heads (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
+        )
+        .execute(&mut settlement)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO workflow_heads (id, version) VALUES (1, 0)")
+            .execute(&mut settlement)
+            .await
+            .unwrap();
+
+        let mut stale_settlement = sqlx::Connection::begin(&mut settlement).await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT version FROM workflow_heads WHERE id = 1")
+            .fetch_one(&mut *stale_settlement)
+            .await
+            .unwrap();
+        assert_eq!(version, 0);
+        sqlx::query("UPDATE workflow_heads SET version = version + 1 WHERE id = 1")
+            .execute(&mut competitor)
+            .await
+            .unwrap();
+
+        let error = sqlx::query(
+            "UPDATE workflow_heads SET version = version + 1 WHERE id = 1 AND version = 0",
+        )
+        .execute(&mut *stale_settlement)
+        .await
+        .unwrap_err();
+        let database_error = error.as_database_error().unwrap();
+        assert_eq!(database_error.code().as_deref(), Some("517"));
+    }
+
+    #[tokio::test]
+    async fn immediate_settlement_transaction_prevents_snapshot_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("immediate-settlement.db");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut settlement = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let mut competitor = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE workflow_heads (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
+        )
+        .execute(&mut settlement)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO workflow_heads (id, version) VALUES (1, 0)")
+            .execute(&mut settlement)
+            .await
+            .unwrap();
+
+        let mut reserved_settlement = settlement.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT version FROM workflow_heads WHERE id = 1")
+            .fetch_one(&mut *reserved_settlement)
+            .await
+            .unwrap();
+        assert_eq!(version, 0);
+        let competitor_error =
+            sqlx::query("UPDATE workflow_heads SET version = version + 1 WHERE id = 1")
+                .execute(&mut competitor)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            competitor_error
+                .as_database_error()
+                .unwrap()
+                .code()
+                .as_deref(),
+            Some("5")
+        );
+        sqlx::query("UPDATE workflow_heads SET version = version + 1 WHERE id = 1")
+            .execute(&mut *reserved_settlement)
+            .await
+            .unwrap();
+        reserved_settlement.commit().await.unwrap();
     }
 
     async fn open_workflow_repo_pair() -> (tempfile::TempDir, WorkflowRepository, WorkflowRepository)

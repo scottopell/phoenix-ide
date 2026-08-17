@@ -3430,7 +3430,10 @@ impl RuntimeManager {
         )
         .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
-            let recovered_terminal = if loaded.materialized {
+            let recovered_terminal = if matches!(
+                loaded,
+                crate::runtime::traits::LoadedActiveDirectTurn::Materialized { .. }
+            ) {
                 match &initial_state {
                     ConvState::Idle | ConvState::HandedOff { .. } => {
                         Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
@@ -3454,7 +3457,7 @@ impl RuntimeManager {
                 crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
                     &crate::runtime::traits::ActiveDirectTurnSettlement {
-                        turn: loaded.active,
+                        turn: loaded.into_active(),
                         terminal,
                         state: initial_state.clone(),
                         state_updated_at: initial_state_updated_at,
@@ -3463,7 +3466,7 @@ impl RuntimeManager {
                 .await?;
                 None
             } else {
-                Some(loaded.active)
+                Some(loaded.into_active())
             }
         } else {
             None
@@ -4224,12 +4227,19 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
-        if matches!(conv.state, ConvState::LlmRequesting { .. })
-            && self
+        if matches!(conv.state, ConvState::LlmRequesting { .. }) {
+            if self
+                .has_completed_materialized_direct_turn(conversation_id)
+                .await?
+            {
+                return Ok((ConvState::Idle, Utc::now(), false));
+            }
+            if self
                 .has_persisted_llm_request_owner(conversation_id)
                 .await?
-        {
-            return Ok((conv.state, row_state_updated_at, false));
+            {
+                return Ok((conv.state, row_state_updated_at, false));
+            }
         }
 
         if conv.state.is_terminal() {
@@ -4320,6 +4330,40 @@ impl RuntimeManager {
             resume_state_updated_at,
             decision.needs_auto_continue,
         ))
+    }
+
+    async fn has_completed_materialized_direct_turn(
+        &self,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        let active_turn = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(phoenix_workflow::DurableTurn {
+            materialization: phoenix_workflow::Materialization::Materialized { message_id },
+            ..
+        }) = active_turn
+        else {
+            return Ok(false);
+        };
+        let messages = self
+            .db
+            .get_recovery_messages_for_materialized_turn(conversation_id, &message_id.0)
+            .await
+            .map_err(|error| error.to_string())?;
+        let completed =
+            recovery::materialized_direct_turn_has_final_response(&messages, &message_id.0);
+        if completed {
+            tracing::warn!(
+                conv_id = %conversation_id,
+                canonical_message_id = %message_id.0,
+                "Recovering completed materialized direct turn whose terminal settlement remained owed"
+            );
+        }
+        Ok(completed)
     }
 
     async fn has_persisted_llm_request_owner(&self, conversation_id: &str) -> Result<bool, String> {
@@ -6670,6 +6714,7 @@ mod scope_liveness_tests {
         assert!(!needs_auto_continue);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn determine_resume_state_preserves_materialized_active_direct_turn() {
         use phoenix_core::domain::sm_event::{
@@ -6774,6 +6819,25 @@ mod scope_liveness_tests {
             .await
             .expect("reconstruct runtime state");
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
+        assert!(!needs_auto_continue);
+
+        mgr.db()
+            .add_message(
+                "direct-final-response",
+                conversation_id,
+                &phoenix_core::domain::db_schema::MessageContent::agent(vec![
+                    phoenix_core::domain::llm_types::ContentBlock::text("final response"),
+                ]),
+                None,
+                None,
+            )
+            .await
+            .expect("persist final response before settlement failure");
+        let (recovered, _, needs_auto_continue) = mgr
+            .determine_resume_state(conversation_id)
+            .await
+            .expect("recover owed terminal settlement");
+        assert_eq!(recovered, ConvState::Idle);
         assert!(!needs_auto_continue);
     }
 

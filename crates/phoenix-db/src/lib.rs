@@ -9027,6 +9027,48 @@ impl Database {
         Ok(rows)
     }
 
+    /// Load only the messages belonging to one exact materialized direct turn.
+    /// The canonical message is the aggregate-owned user/skill boundary; using
+    /// its identity prevents recovery from classifying an unrelated transcript
+    /// tail as evidence for the active turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the canonical message is absent, belongs to another
+    /// conversation, or the message query/attachment hydration fails.
+    pub async fn get_recovery_messages_for_materialized_turn(
+        &self,
+        conversation_id: &str,
+        canonical_message_id: &str,
+    ) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT m.message_id, m.conversation_id, m.sequence_id, m.message_type,
+                    m.content, m.display_data, m.usage_data, m.created_at
+             FROM messages AS m
+             JOIN messages AS anchor
+               ON anchor.message_id = ?2
+              AND anchor.conversation_id = ?1
+             WHERE m.conversation_id = ?1
+               AND m.sequence_id >= anchor.sequence_id
+             ORDER BY m.sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .bind(canonical_message_id)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+        hydrate_attachments(&self.pool, &mut rows).await?;
+        if rows
+            .first()
+            .is_none_or(|message| message.message_id != canonical_message_id)
+        {
+            return Err(DbError::MessageNotFound(format!(
+                "canonical direct-turn message {canonical_message_id} in conversation {conversation_id}"
+            )));
+        }
+        Ok(rows)
+    }
+
     /// Get messages after a sequence ID
     ///
     /// # Errors

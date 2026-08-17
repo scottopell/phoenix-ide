@@ -17,9 +17,28 @@ pub struct ActiveDirectTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedActiveDirectTurn {
-    pub active: ActiveDirectTurn,
-    pub materialized: bool,
+pub enum LoadedActiveDirectTurn {
+    Unmaterialized {
+        active: ActiveDirectTurn,
+    },
+    Materialized {
+        active: ActiveDirectTurn,
+        canonical_message_id: String,
+    },
+}
+
+impl LoadedActiveDirectTurn {
+    pub const fn active(&self) -> &ActiveDirectTurn {
+        match self {
+            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+        }
+    }
+
+    pub fn into_active(self) -> ActiveDirectTurn {
+        match self {
+            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1136,15 +1155,22 @@ impl MessageStore for DatabaseStorage {
         ))
         .await
         .map(|turn| {
-            turn.map(|turn| LoadedActiveDirectTurn {
-                materialized: matches!(
-                    turn.materialization,
-                    phoenix_workflow::Materialization::Materialized { .. }
-                ),
-                active: ActiveDirectTurn {
+            turn.map(|turn| {
+                let active = ActiveDirectTurn {
                     turn_id: turn.id,
                     generation: turn.generation,
-                },
+                };
+                match turn.materialization {
+                    phoenix_workflow::Materialization::Unmaterialized => {
+                        LoadedActiveDirectTurn::Unmaterialized { active }
+                    }
+                    phoenix_workflow::Materialization::Materialized { message_id } => {
+                        LoadedActiveDirectTurn::Materialized {
+                            active,
+                            canonical_message_id: message_id.0,
+                        }
+                    }
+                }
             })
         })
         .map_err(|error| error.to_string())

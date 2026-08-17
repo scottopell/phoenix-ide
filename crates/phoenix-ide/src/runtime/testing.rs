@@ -549,6 +549,7 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
+    settle_active_direct_turn_failures: Mutex<usize>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
@@ -589,6 +590,7 @@ impl InMemoryStorage {
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
+            settle_active_direct_turn_failures: Mutex::new(0),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
@@ -638,6 +640,10 @@ impl InMemoryStorage {
             .settle_active_direct_turn_commit_error_once
             .lock()
             .unwrap() = true;
+    }
+
+    pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
+        *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -783,10 +789,12 @@ impl InMemoryStorage {
 
     pub fn set_active_direct_turn(&self, active: Option<crate::runtime::traits::ActiveDirectTurn>) {
         *self.active_direct_turn.lock().unwrap() =
-            active.map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
-                active,
-                materialized: true,
-            });
+            active.map(
+                |active| crate::runtime::traits::LoadedActiveDirectTurn::Materialized {
+                    canonical_message_id: "test-canonical-message".to_string(),
+                    active,
+                },
+            );
     }
 
     pub fn set_unmaterialized_active_direct_turn(
@@ -794,10 +802,7 @@ impl InMemoryStorage {
         active: crate::runtime::traits::ActiveDirectTurn,
     ) {
         *self.active_direct_turn.lock().unwrap() =
-            Some(crate::runtime::traits::LoadedActiveDirectTurn {
-                active,
-                materialized: false,
-            });
+            Some(crate::runtime::traits::LoadedActiveDirectTurn::Unmaterialized { active });
     }
 
     pub fn recorded_settle_active_direct_turn_calls(
@@ -1160,6 +1165,13 @@ impl MessageStore for InMemoryStorage {
             .take();
         if let Some(release) = release {
             let _ = release.await;
+        }
+        {
+            let mut failures = self.settle_active_direct_turn_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err("active direct turn settlement failed before commit".to_string());
+            }
         }
         if std::mem::take(
             &mut *self
