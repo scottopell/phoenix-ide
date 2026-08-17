@@ -58,11 +58,12 @@ Use one record per semantic defect:
 | `confidence` | Evidence strength |
 | `disposition` | validated, disproved, unresolved, or superseded-by-drift |
 | `evidence_tier` | exact-target, near-match with distance/direction, corpus trend, or unpaired |
-| `comparison_outcome` | overlap, local-only, Codex-only, or disputed |
+| `comparison_outcome` | overlap, local-only, or Codex-only |
 | `independence` | isolated or anchored |
 | `review_move` | Reusable action that would expose the defect |
 
 Two differently worded comments overlap when they identify the same trigger and violated postcondition. Several comments sharing one root cause count as one defect unless they require independent fixes.
+Evidence tier, comparison outcome, disposition, and independence are orthogonal. Store one semantic defect with all four values; do not use one axis as a substitute for another or count combinations as additional defects.
 
 Disposition is evidence, not a vote:
 

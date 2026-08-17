@@ -98,10 +98,18 @@ Normalize findings by semantic defect rather than wording or line number. Record
 
 - **overlap:** both found the same violated postcondition;
 - **local-only:** local review alone found it;
-- **Codex-only:** Codex alone found it;
-- **disputed:** concrete counterevidence defeats or materially changes one review.
+- **Codex-only:** Codex alone found it.
 
-A finding can be both `near-match` and `Codex-only`; count it once in each axis, never twice as two defects. Use broader Codex review trends only to propose probes. Deduplicate repeated rounds and root causes, validate representative patch context, and never describe a corpus-only trend as a local-review miss.
+**Disposition** describes what subsequent falsification established:
+
+- **validated:** evidence supports the trigger, mechanism, and impact;
+- **disproved:** concrete counterevidence defeats the claim;
+- **unresolved:** available evidence cannot yet decide it;
+- **superseded-by-drift:** target changes removed the basis for deciding the original claim.
+
+**Independence** records whether the local pass was **isolated** or **anchored** by prior findings.
+
+A finding can simultaneously be `near-match`, `Codex-only`, `disproved`, and `isolated`; record it once with all four dimensions, never as several defects. Use broader Codex review trends only to propose probes. Deduplicate repeated rounds and root causes, validate representative patch context, and never describe a corpus-only trend as a local-review miss.
 
 For every Codex-only valid finding, name the missing **review move**, not just the defect category—for example, “compare emitted and parsed marker literals” or “trace generation rotation on respawn.” Add that move to the current review and use it as held-out validation later. Do not claim that accepted comments are correct solely because they were fixed, or that rejected comments are false solely because they were closed.
 
@@ -135,9 +143,11 @@ Then include, only when useful:
 - Tests/reproductions run and material limitations.
 
 ## Review delta
-- Evidence tier: exact-target N; near-match N; unpaired N; anchored N.
-- Comparison outcome: overlap N; local-only N; Codex-only N; disputed N.
-- Missing review moves learned from valid Codex-only findings.
+- Evidence tier: exact-target N; near-match N; unpaired N.
+- Comparison outcome: overlap N; local-only N; Codex-only N.
+- Disposition: validated N; disproved N; unresolved N; superseded-by-drift N.
+- Independence: isolated N; anchored N.
+- Missing review moves learned from validated Codex-only findings.
 ```
 
 If nothing survives falsification, say **“No actionable findings.”** Still report the frozen target, inspected boundaries, tests run, and limitations. Never manufacture a finding to make the review look productive.

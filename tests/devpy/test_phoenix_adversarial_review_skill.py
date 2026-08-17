@@ -67,10 +67,23 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
         self.assertIn("Task/PR intent supplies scope and non-goal context", self.text)
         self.assertIn("Do not apply this rule to genuine external ambiguity", self.text)
 
-    def test_evidence_tier_and_comparison_outcome_are_separate_axes(self):
-        self.assertIn("**Evidence tier**", self.text)
-        self.assertIn("**Comparison outcome**", self.text)
-        self.assertIn("both `near-match` and `Codex-only`", self.text)
+    def test_review_delta_keeps_all_four_dimensions_independent(self):
+        for dimension in (
+            "**Evidence tier**",
+            "**Comparison outcome**",
+            "**Disposition**",
+            "**Independence**",
+        ):
+            self.assertIn(dimension, self.text)
+        self.assertIn(
+            "simultaneously be `near-match`, `Codex-only`, `disproved`, and `isolated`",
+            self.text,
+        )
+        delta = self.text.split("## Review delta", 1)[1].split("```", 1)[0]
+        self.assertNotIn("anchored N", delta.split("Comparison outcome:", 1)[0])
+        self.assertNotIn("disputed", delta)
+        self.assertIn("Disposition: validated N; disproved N", delta)
+        self.assertIn("Independence: isolated N; anchored N", delta)
 
     def test_corpus_candidate_probes_link_sanitized_evidence_report(self):
         probes = (SKILL_DIR / "references" / "probes.md").read_text()
