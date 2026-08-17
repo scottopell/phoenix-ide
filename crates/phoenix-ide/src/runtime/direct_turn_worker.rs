@@ -84,6 +84,12 @@ trait TerminalObligationDiscovery: Send + Sync + 'static {
         &self,
         limit: usize,
     ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String>;
+
+    async fn list_accepted(
+        &self,
+        cursor: Option<phoenix_db::workflow::DirectTurnDiscoveryCursor>,
+        limit: usize,
+    ) -> Result<phoenix_db::workflow::DiscoverableAcceptedTurnPage, String>;
 }
 
 #[async_trait]
@@ -93,6 +99,16 @@ impl TerminalObligationDiscovery for WorkflowRepository {
         limit: usize,
     ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String> {
         self.list_discoverable_terminal_obligations(limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn list_accepted(
+        &self,
+        cursor: Option<phoenix_db::workflow::DirectTurnDiscoveryCursor>,
+        limit: usize,
+    ) -> Result<phoenix_db::workflow::DiscoverableAcceptedTurnPage, String> {
+        self.list_discoverable_accepted_runtime_direct_turns(cursor, limit)
             .await
             .map_err(|error| error.to_string())
     }
@@ -210,11 +226,11 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let mut cursor = None;
         loop {
             let page = self
-                .repo
-                .list_discoverable_accepted_runtime_direct_turns(cursor, DISCOVERY_BATCH_LIMIT)
+                .terminal_discovery
+                .list_accepted(cursor, DISCOVERY_BATCH_LIMIT)
                 .await
                 .map_err(|error| {
-                    crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(error.to_string())
+                    crate::runtime::DatabaseTerminalRecoveryError::Retryable(error.clone())
                 })?;
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
@@ -524,10 +540,33 @@ mod tests {
         failures_remaining: std::sync::atomic::AtomicUsize,
         attempts: std::sync::atomic::AtomicUsize,
         initial_empty: bool,
+        accepted_failures_remaining: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
     impl TerminalObligationDiscovery for FailingTerminalDiscovery {
+        async fn list_accepted(
+            &self,
+            cursor: Option<phoenix_db::workflow::DirectTurnDiscoveryCursor>,
+            limit: usize,
+        ) -> Result<phoenix_db::workflow::DiscoverableAcceptedTurnPage, String> {
+            if self
+                .accepted_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err("injected accepted-turn discovery read failure".to_string());
+            }
+            self.repo
+                .list_discoverable_accepted_runtime_direct_turns(cursor, limit)
+                .await
+                .map_err(|error| error.to_string())
+        }
+
         async fn list(
             &self,
             limit: usize,
@@ -566,6 +605,7 @@ mod tests {
         events: Mutex<Vec<(String, Event)>>,
         terminal_attempts: Mutex<Vec<String>>,
         terminal_settled: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        event_dispatched: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
     impl Default for RecordingDispatcher {
@@ -576,6 +616,7 @@ mod tests {
                 events: Mutex::new(Vec::new()),
                 terminal_attempts: Mutex::new(Vec::new()),
                 terminal_settled: Mutex::new(None),
+                event_dispatched: Mutex::new(None),
             }
         }
     }
@@ -610,6 +651,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((conversation_id.to_string(), event));
+            if let Some(dispatched) = self.event_dispatched.lock().unwrap().take() {
+                let _ = dispatched.send(());
+            }
             self.result.lock().unwrap().clone()
         }
     }
@@ -1093,6 +1137,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_accepted_discovery_read_failure_backs_off_before_ready_then_dispatches() {
+        let (repo, dispatcher) = fixture().await;
+        accept(&repo, "startup-accepted-read").await;
+        let discovery = Arc::new(FailingTerminalDiscovery {
+            repo: repo.clone(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            initial_empty: false,
+            accepted_failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .event_dispatched
+            .lock()
+            .unwrap()
+            .replace(dispatched_tx);
+        let worker = DirectTurnWorker::new(repo, dispatcher.clone(), clock, ProcessIncarnation(1))
+            .with_terminal_discovery(discovery);
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        retry_started_rx.await.unwrap();
+        assert!(ready_rx.try_recv().is_err());
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        retry_release_tx.send(()).unwrap();
+        dispatched_rx.await.unwrap();
+        ready_rx.await.unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
+        );
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn steady_accepted_discovery_read_failure_backs_off_then_dispatches() {
+        let (repo, dispatcher) = fixture().await;
+        let discovery = Arc::new(FailingTerminalDiscovery {
+            repo: repo.clone(),
+            failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            initial_empty: false,
+            accepted_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: sleeps.clone(),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let worker = DirectTurnWorker::new(
+            repo.clone(),
+            dispatcher.clone(),
+            clock,
+            ProcessIncarnation(1),
+        )
+        .with_terminal_discovery(discovery.clone());
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        ready_rx.await.unwrap();
+        accept(&repo, "steady-accepted-read").await;
+        discovery
+            .accepted_failures_remaining
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        kick_tx.send_replace(1);
+        retry_started_rx.await.unwrap();
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .event_dispatched
+            .lock()
+            .unwrap()
+            .replace(dispatched_tx);
+        retry_release_tx.send(()).unwrap();
+        dispatched_rx.await.unwrap();
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            sleeps.lock().unwrap().as_slice(),
+            &[
+                EMPTY_RESCAN_INTERVAL,
+                ERROR_RETRY_INTERVAL,
+                EMPTY_RESCAN_INTERVAL,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn startup_discovery_read_failure_backs_off_before_ready_then_settles() {
         let (repo, dispatcher) = fixture().await;
         seed_terminal_obligation(&repo, "startup-discovery-read").await;
@@ -1101,6 +1249,7 @@ mod tests {
             failures_remaining: std::sync::atomic::AtomicUsize::new(1),
             attempts: std::sync::atomic::AtomicUsize::new(0),
             initial_empty: false,
+            accepted_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
         });
         let sleeps = Arc::new(Mutex::new(Vec::new()));
         let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
@@ -1153,6 +1302,7 @@ mod tests {
             failures_remaining: std::sync::atomic::AtomicUsize::new(1),
             attempts: std::sync::atomic::AtomicUsize::new(0),
             initial_empty: true,
+            accepted_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
         });
         let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
         let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();

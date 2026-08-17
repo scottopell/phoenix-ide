@@ -7616,6 +7616,33 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a terminal tool checkpoint and its direct-turn obligation atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any message or obligation write fails or the transaction cannot commit.
+    pub async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        obligation: &workflow::DirectTurnTerminalObligationInput,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        insert_message_tx(&mut tx, assistant).await?;
+        for message in tool_results {
+            insert_message_tx(&mut tx, message).await?;
+        }
+        workflow::WorkflowRepository::persist_terminal_obligation_tx(&mut tx, obligation).await?;
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Fetch a fork proposal by id.
     ///
     /// # Errors
@@ -19311,6 +19338,59 @@ mod tests {
             ids.contains(&"tool-b-result"),
             "second tool result must be durable"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_round_rolls_back_messages_when_obligation_fails() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-terminal-round", "ctr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let assistant = Message {
+            message_id: "asst-terminal-round".to_string(),
+            conversation_id: "conv-terminal-round".to_string(),
+            sequence_id: 20,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let result = Message {
+            message_id: "tool-terminal-result".to_string(),
+            conversation_id: "conv-terminal-round".to_string(),
+            sequence_id: 21,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-terminal", "cancelled", true),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id: phoenix_workflow::TurnAuthorityId(u64::MAX),
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Cancelled,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            },
+            response_message_id: None,
+        };
+
+        assert!(db
+            .persist_tool_round_with_terminal_obligation(
+                "conv-terminal-round",
+                &assistant,
+                &[result],
+                &obligation,
+            )
+            .await
+            .is_err());
+        assert!(db
+            .get_messages("conv-terminal-round")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -193,6 +193,13 @@ pub struct DirectTurnTerminalObligationInput {
     pub response_message_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalEvidenceProbe {
+    Established,
+    KnownNotCommitted,
+    Incomplete,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectTurnTerminalObligation {
     pub turn_id: TurnAuthorityId,
@@ -1283,6 +1290,52 @@ impl WorkflowRepository {
         .await?;
         row.map(|row| parse_terminal_obligation_row(&row))
             .transpose()
+    }
+
+    pub async fn probe_terminal_evidence(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        expected: &DirectTurnTerminalObligationInput,
+    ) -> DbResult<TerminalEvidenceProbe> {
+        let mut tx = self.pool.begin().await?;
+        let message_exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1 AND conversation_id = ?2)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
+                    target_state, target_state_updated_at, response_message_id
+             FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let obligation = row
+            .map(|row| parse_terminal_obligation_row(&row))
+            .transpose()?;
+        tx.commit().await?;
+        let obligation_matches = obligation.as_ref().is_some_and(|obligation| {
+            obligation.turn_id == expected.turn_id
+                && obligation.expected_generation == expected.expected_generation
+                && obligation.terminal == expected.terminal
+                && obligation.projection == expected.projection
+                && obligation.response_message_id == expected.response_message_id
+        });
+        Ok(
+            match (
+                message_exists != 0,
+                obligation_matches,
+                obligation.is_some(),
+            ) {
+                (true, true, _) => TerminalEvidenceProbe::Established,
+                (false, false, false) => TerminalEvidenceProbe::KnownNotCommitted,
+                _ => TerminalEvidenceProbe::Incomplete,
+            },
+        )
     }
 
     async fn terminalize_authoritative_turn_at_cut(
@@ -2749,6 +2802,56 @@ mod tests {
         .unwrap_err();
         let database_error = error.as_database_error().unwrap();
         assert_eq!(database_error.code().as_deref(), Some("517"));
+    }
+
+    #[tokio::test]
+    async fn terminal_evidence_probe_classifies_absent_established_and_incomplete() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "terminal-evidence-probe", 71).await;
+        let expected = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: chrono::Utc::now(),
+            },
+            response_message_id: Some("response-terminal-evidence".to_string()),
+        };
+        assert_eq!(
+            repo.probe_terminal_evidence("conv-a", "response-terminal-evidence", &expected)
+                .await
+                .unwrap(),
+            TerminalEvidenceProbe::KnownNotCommitted
+        );
+
+        let mut tx = repo.pool.begin().await.unwrap();
+        WorkflowRepository::persist_terminal_obligation_tx(&mut tx, &expected)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            repo.probe_terminal_evidence("conv-a", "response-terminal-evidence", &expected)
+                .await
+                .unwrap(),
+            TerminalEvidenceProbe::Incomplete
+        );
+
+        sqlx::query(
+            "INSERT INTO messages
+             (message_id, conversation_id, sequence_id, message_type, content, created_at)
+             VALUES (?1, 'conv-a', 9001, 'agent', '[]', '2025-01-01')",
+        )
+        .bind("response-terminal-evidence")
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.probe_terminal_evidence("conv-a", "response-terminal-evidence", &expected)
+                .await
+                .unwrap(),
+            TerminalEvidenceProbe::Established
+        );
     }
 
     #[tokio::test]

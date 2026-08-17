@@ -13,7 +13,10 @@
 //! forwarder stamps the dispatch generation and wraps each received outcome in
 //! `EffectOutcome` for `process_outcome()`.
 
-use super::traits::{LlmClient, StateStore, Storage, ToolExecutor};
+use super::traits::{
+    ActiveDirectTurnSettlement, LlmClient, StateStore, Storage, TerminalEvidenceEstablishment,
+    ToolExecutor,
+};
 use super::{
     AcknowledgedEventOutcome, AcknowledgedEventRequest, SseBroadcaster, SseEvent,
     SteeringWakeOutcome, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
@@ -58,6 +61,7 @@ enum StartupSteeringDrainOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeExitDisposition {
+    FatalLocalAuthorityLoss,
     Terminal,
     Interrupted,
     RecreateFromDatabase,
@@ -67,6 +71,12 @@ pub(crate) enum RuntimeExitDisposition {
 enum TerminalFactDurability {
     ProcessOnly,
     Durable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalTerminalAuthority {
+    Classified,
+    Fatal,
 }
 
 impl TerminalFactDurability {
@@ -1942,6 +1952,7 @@ where
     active_direct_turn: Option<Box<crate::runtime::traits::ActiveDirectTurn>>,
     pending_direct_turn_terminal: Option<Box<crate::runtime::traits::ActiveDirectTurnTerminal>>,
     direct_turn_terminal_fact: TerminalFactDurability,
+    local_terminal_authority: LocalTerminalAuthority,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     continuation_effect_disposition: ContinuationEffectDisposition,
@@ -2084,6 +2095,7 @@ where
             active_direct_turn: None,
             pending_direct_turn_terminal: None,
             direct_turn_terminal_fact: TerminalFactDurability::ProcessOnly,
+            local_terminal_authority: LocalTerminalAuthority::Classified,
             direct_turn_cancellation_initiated: false,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
@@ -2378,6 +2390,9 @@ where
                 );
                 return disposition;
             }
+            if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
+                return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+            }
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
@@ -2418,6 +2433,9 @@ where
                         // SseEvent::Error at the source if appropriate
                         // (task 24682). No double-broadcast here.
                         tracing::error!(error = %e, "Error handling event");
+                    }
+                    if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
+                        return RuntimeExitDisposition::FatalLocalAuthorityLoss;
                     }
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         return RuntimeExitDisposition::Interrupted;
@@ -3405,13 +3423,25 @@ where
                                     )
                                     .await
                                 {
-                                    Ok(message) => {
+                                    TerminalEvidenceEstablishment::Established(message) => {
                                         self.direct_turn_terminal_fact =
                                             TerminalFactDurability::Durable;
-                                        let _ = self.broadcast_tx.send_message(message);
+                                        let _ = self.broadcast_tx.send_message(*message);
                                         Ok(None)
                                     }
-                                    Err(error) => Err(error),
+                                    TerminalEvidenceEstablishment::KnownNotCommitted(error) => {
+                                        Err(error)
+                                    }
+                                    TerminalEvidenceEstablishment::Unclassifiable(error) => {
+                                        tracing::error!(
+                                            conv_id = %self.context.conversation_id,
+                                            %error,
+                                            "fatal local terminal evidence is unclassifiable"
+                                        );
+                                        self.local_terminal_authority =
+                                            LocalTerminalAuthority::Fatal;
+                                        Err(error)
+                                    }
                                 }
                             }
                         }
@@ -5732,7 +5762,23 @@ where
                 Ok(None)
             }
 
-            Effect::PersistCheckpoint { data } => self.persist_checkpoint(data).await,
+            Effect::PersistCheckpoint { data } => {
+                if let (Some(turn), Some(terminal)) = (
+                    self.active_direct_turn.as_deref(),
+                    self.pending_direct_turn_terminal.as_deref(),
+                ) {
+                    let settlement = ActiveDirectTurnSettlement {
+                        turn: turn.clone(),
+                        terminal: terminal.clone(),
+                        state: self.state.clone(),
+                        state_updated_at: self.state_updated_at,
+                    };
+                    self.persist_checkpoint_with_terminal_obligation(data, &settlement)
+                        .await
+                } else {
+                    self.persist_checkpoint(data).await
+                }
+            }
 
             Effect::BroadcastAssistantMessage { message } => {
                 // Broadcast-only: no DB write here. The atomic
@@ -6949,6 +6995,69 @@ where
             tool_outcome_tx,
         ));
 
+        Ok(None)
+    }
+
+    async fn persist_checkpoint_with_terminal_obligation(
+        &mut self,
+        data: CheckpointData,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> Result<Option<Event>, String> {
+        let CheckpointData::ToolRound {
+            assistant_message,
+            tool_results,
+        } = data;
+        let conv_id = self.context.conversation_id.clone();
+        let (reserved_broadcast_range, reserved_seqs) = self
+            .broadcast_tx
+            .reserve_next_persisted_message_range(1 + tool_results.len());
+        let _reserved_broadcast_range = reserved_broadcast_range;
+        let agent_content = MessageContent::agent(assistant_message.content);
+        let agent_msg = crate::db::Message {
+            message_id: assistant_message.message_id,
+            conversation_id: conv_id.clone(),
+            sequence_id: reserved_seqs[0],
+            message_type: agent_content.message_type(),
+            content: agent_content,
+            display_data: assistant_message.display_data,
+            usage_data: assistant_message.usage,
+            created_at: assistant_message.created_at,
+        };
+        let tool_msgs: Vec<crate::db::Message> = tool_results
+            .into_iter()
+            .zip(reserved_seqs.into_iter().skip(1))
+            .map(|(result, sequence_id)| {
+                let content = MessageContent::tool_with_images(
+                    &result.tool_use_id,
+                    result.output(),
+                    result.is_error(),
+                    result.images().to_vec(),
+                );
+                crate::db::Message {
+                    message_id: tool_result_message_id(&result.tool_use_id),
+                    conversation_id: conv_id.clone(),
+                    sequence_id,
+                    message_type: content.message_type(),
+                    content,
+                    display_data: merge_duration_into_display_data(
+                        result.display_data(),
+                        result.duration_ms,
+                    ),
+                    usage_data: None,
+                    created_at: Utc::now(),
+                }
+            })
+            .collect();
+        self.storage
+            .persist_tool_round_with_terminal_obligation(
+                &conv_id, &agent_msg, &tool_msgs, settlement,
+            )
+            .await?;
+        self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+        let _ = self.broadcast_tx.send_message(agent_msg);
+        for message in tool_msgs {
+            let _ = self.broadcast_tx.send_message(message);
+        }
         Ok(None)
     }
 

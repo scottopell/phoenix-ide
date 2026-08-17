@@ -3847,6 +3847,9 @@ impl RuntimeManager {
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
             }
+            if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+                manager_for_cleanup.signal_fatal_local_authority("direct_turn_terminal_evidence");
+            }
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
                 manager_for_cleanup.kick_direct_turn_worker();
             }

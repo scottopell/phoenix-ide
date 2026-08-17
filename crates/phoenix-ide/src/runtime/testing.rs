@@ -961,7 +961,7 @@ impl MessageStore for InMemoryStorage {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
-    ) -> Result<Message, String> {
+    ) -> crate::runtime::traits::TerminalEvidenceEstablishment {
         {
             let mut failures = self
                 .terminal_obligation_establishment_failures
@@ -969,18 +969,29 @@ impl MessageStore for InMemoryStorage {
                 .unwrap();
             if *failures > 0 {
                 *failures -= 1;
-                return Err("terminal obligation establishment failed before commit".to_string());
+                return crate::runtime::traits::TerminalEvidenceEstablishment::KnownNotCommitted(
+                    "terminal obligation establishment failed before commit".to_string(),
+                );
             }
         }
-        self.add_message_with_seq(
-            message_id,
-            conv_id,
-            sequence_id,
-            content,
-            display_data,
-            usage_data,
-        )
-        .await
+        match self
+            .add_message_with_seq(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+            )
+            .await
+        {
+            Ok(message) => crate::runtime::traits::TerminalEvidenceEstablishment::Established(
+                Box::new(message),
+            ),
+            Err(error) => {
+                crate::runtime::traits::TerminalEvidenceEstablishment::KnownNotCommitted(error)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1403,6 +1414,19 @@ impl MessageStore for InMemoryStorage {
             bucket.push(msg.clone());
         }
         Ok(())
+    }
+
+    async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> Result<(), String> {
+        self.persist_tool_round(conv_id, assistant, tool_results)
+            .await?;
+        self.persist_active_direct_turn_terminal_obligation(settlement, None)
+            .await
     }
 }
 
