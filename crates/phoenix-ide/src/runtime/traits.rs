@@ -324,6 +324,7 @@ pub trait MessageStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub enum TerminalEvidenceEstablishment {
     Established(Box<Message>),
+    Retired,
     KnownNotCommitted(String),
     Unclassifiable(String),
 }
@@ -331,6 +332,7 @@ pub enum TerminalEvidenceEstablishment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalMutationEstablishment {
     Established { transcript_generation: Option<i64> },
+    Retired,
     KnownNotCommitted(String),
     Unclassifiable(String),
 }
@@ -1160,6 +1162,9 @@ impl MessageStore for DatabaseStorage {
                             )),
                             |message| TerminalEvidenceEstablishment::Established(Box::new(message)),
                         ),
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
+                        TerminalEvidenceEstablishment::Retired
+                    }
                     Ok(phoenix_db::workflow::TerminalEvidenceProbe::KnownNotCommitted) => {
                         TerminalEvidenceEstablishment::KnownNotCommitted(write_error.to_string())
                     }
@@ -1612,6 +1617,9 @@ async fn classify_terminal_mutation(
             TerminalMutationEstablishment::Established {
                 transcript_generation,
             }
+        }
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
+            TerminalMutationEstablishment::Retired
         }
         Ok(phoenix_db::workflow::TerminalEvidenceProbe::KnownNotCommitted) => {
             TerminalMutationEstablishment::KnownNotCommitted(command_error)

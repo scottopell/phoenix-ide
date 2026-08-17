@@ -441,12 +441,17 @@ CREATE TABLE direct_turn_terminal_obligations (
     target_state TEXT NOT NULL
         CHECK (typeof(target_state) = 'text' AND json_valid(target_state)),
     target_state_updated_at_us INTEGER NOT NULL
-        CHECK (typeof(target_state_updated_at_us) = 'integer'),
+        CHECK (typeof(target_state_updated_at_us) = 'integer' AND target_state_updated_at_us >= 0),
     response_message_id TEXT,
     CHECK (
         (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
         OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
     )
+);
+
+CREATE TABLE direct_turn_retirements (
+    turn_id INTEGER NOT NULL PRIMARY KEY,
+    conversation_id TEXT NOT NULL
 );
 
 INSERT INTO direct_turn_terminal_obligations (

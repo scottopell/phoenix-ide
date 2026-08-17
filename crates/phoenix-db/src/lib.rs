@@ -8412,6 +8412,18 @@ impl Database {
                 .execute(&mut *tx),
             )
             .await?;
+        fts_telemetry
+            .observe_sqlx(
+                SqlitePhase::Statement,
+                sqlx::query(
+                    "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
+                     SELECT turn_id, conversation_id FROM durable_turns
+                     WHERE conversation_id = ?1 AND disposition = 'Runtime'",
+                )
+                .bind(id)
+                .execute(&mut *tx),
+            )
+            .await?;
         let result = fts_telemetry
             .observe_sqlx(
                 SqlitePhase::Statement,

@@ -3422,6 +3422,11 @@ where
                                         let _ = self.broadcast_tx.send_message(*message);
                                         Ok(None)
                                     }
+                                    TerminalEvidenceEstablishment::Retired => {
+                                        self.direct_turn_terminal_fact =
+                                            TerminalFactDurability::Durable;
+                                        Ok(None)
+                                    }
                                     TerminalEvidenceEstablishment::KnownNotCommitted(error) => {
                                         Err(error)
                                     }
@@ -7052,7 +7057,8 @@ where
             )
             .await
         {
-            TerminalMutationEstablishment::Established { .. } => {
+            TerminalMutationEstablishment::Established { .. }
+            | TerminalMutationEstablishment::Retired => {
                 self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
             }
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
@@ -7417,6 +7423,10 @@ where
             TerminalMutationEstablishment::Established {
                 transcript_generation,
             } => transcript_generation,
+            TerminalMutationEstablishment::Retired => {
+                self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
+                return Ok(None);
+            }
             TerminalMutationEstablishment::KnownNotCommitted(error) => return Err(error),
             TerminalMutationEstablishment::Unclassifiable(error) => {
                 self.local_terminal_authority = LocalTerminalAuthority::Fatal;

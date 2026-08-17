@@ -205,6 +205,7 @@ pub enum TerminalEvidenceProbe {
     Established,
     KnownNotCommitted,
     Incomplete,
+    Retired,
 }
 
 #[derive(Debug, Clone)]
@@ -1491,6 +1492,11 @@ impl WorkflowRepository {
                         && message.display_data.as_ref() == Some(display_data)
                 }),
         };
+        let conversation_exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
+                .bind(expected_conversation_id(evidence))
+                .fetch_one(&mut *tx)
+                .await?;
         let row = sqlx::query(
             "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
                     target_state, target_state_updated_at_us, response_message_id
@@ -1510,8 +1516,29 @@ impl WorkflowRepository {
              WHERE t.turn_id = ?1",
         )
         .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let exact_retirement_exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM direct_turn_retirements
+                WHERE turn_id = ?1 AND conversation_id = ?2
+             )",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .bind(expected_conversation_id(evidence))
         .fetch_one(&mut *tx)
         .await?;
+        if conversation_exists == 0
+            && settled_row.is_none()
+            && obligation.is_none()
+            && exact_retirement_exists != 0
+        {
+            tx.commit().await?;
+            return Ok(TerminalEvidenceProbe::Retired);
+        }
+        let settled_row = settled_row.ok_or_else(|| {
+            DbError::Serialization("terminal evidence lost its authoritative turn".to_string())
+        })?;
         tx.commit().await?;
         let obligation_matches = obligation.as_ref().is_some_and(|obligation| {
             obligation.turn_id == expected.turn_id
@@ -1817,6 +1844,11 @@ async fn persist_terminal_obligation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     input: &DirectTurnTerminalObligationInput,
 ) -> DbResult<()> {
+    if input.projection.state_updated_at.timestamp_micros() < 0 {
+        return Err(DbError::Serialization(
+            "direct-turn terminal target timestamp must be nonnegative".to_string(),
+        ));
+    }
     let (terminal_kind, terminal_reason) = terminal_sql(&input.terminal);
     let target_state = serde_json::to_string(&input.projection.state).map_err(|error| {
         DbError::Serialization(format!("encode direct-turn terminal target state: {error}"))
@@ -1853,6 +1885,17 @@ async fn persist_terminal_obligation_tx(
         }));
     }
     Ok(())
+}
+
+fn expected_conversation_id(evidence: &TerminalEvidenceExpectation) -> &str {
+    match evidence {
+        TerminalEvidenceExpectation::Messages(messages) => messages
+            .first()
+            .map_or("", |message| message.conversation_id.as_str()),
+        TerminalEvidenceExpectation::MessageMutation {
+            conversation_id, ..
+        } => conversation_id,
+    }
 }
 
 fn projections_match(
@@ -3109,6 +3152,76 @@ mod tests {
                 .unwrap(),
             TerminalEvidenceProbe::Established
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_evidence_probe_classifies_exact_hard_delete_as_retired() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "terminal-evidence-retired", 73).await;
+        let expected = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Cancelled,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: chrono::Utc::now(),
+            },
+            response_message_id: Some("response-terminal-retired".to_string()),
+        };
+        sqlx::query(
+            "INSERT INTO direct_turn_retirements (turn_id, conversation_id)
+             VALUES (?1, 'conv-a')",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = 'conv-a'")
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.probe_terminal_evidence("conv-a", "response-terminal-retired", &expected)
+                .await
+                .unwrap(),
+            TerminalEvidenceProbe::Retired
+        );
+
+        let unrelated = DirectTurnTerminalObligationInput {
+            turn_id: TurnAuthorityId(turn_id.0 + 999),
+            ..expected
+        };
+        assert!(repo
+            .probe_terminal_evidence("conv-a", "response-terminal-retired", &unrelated)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn negative_terminal_obligation_timestamp_is_rejected() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "negative-terminal-time", 74).await;
+        let input = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: DateTime::<Utc>::from_timestamp_micros(-1).unwrap(),
+            },
+            response_message_id: None,
+        };
+        let error = repo.persist_terminal_obligation(&input).await.unwrap_err();
+        assert!(error.to_string().contains("must be nonnegative"));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
