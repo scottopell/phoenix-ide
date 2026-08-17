@@ -722,6 +722,27 @@ mod tests {
     }
 
     #[test]
+    fn project_phoenix_adversarial_review_skill_is_discoverable() {
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("phoenix-skills crate should be nested under the project root");
+        let skills = discover_skills_with_options(project_root, Some(project_root), None);
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "phoenix-adversarial-review")
+            .expect("project adversarial review skill should be discovered");
+
+        assert!(skill.description.contains("exact-HEAD review"));
+        assert!(skill.description.contains("Codex findings"));
+        assert_eq!(skill.argument_hint.as_deref(), Some("<diff-or-pr-scope>"));
+        assert!(matches!(
+            &skill.source,
+            SkillSource::Filesystem { source_dir, .. } if source_dir == ".agents/skills"
+        ));
+    }
+
+    #[test]
     fn test_discover_skills_found_agents_dir() {
         let temp = TempDir::new().unwrap();
         write_skill_meta(
