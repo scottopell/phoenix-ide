@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
@@ -29,8 +29,6 @@ import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 
-const SCROLL_KEY = 'phoenix:conversation-list-scroll';
-
 export function ConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
@@ -44,11 +42,6 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
-
-  const [refreshing, setRefreshing] = useState(false);
-  const scrollRestoredRef = useRef(false);
-  const pullStartY = useRef<number | null>(null);
-  const mainRef = useRef<HTMLElement>(null);
 
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
@@ -135,64 +128,7 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
-  // Restore scroll position after data loads. Uses localStorage rather
-  // than sessionStorage so the position survives an iOS PWA cold kill
-  // (the OS clears sessionStorage when it terminates the JS context).
-  useEffect(() => {
-    if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
-      let savedPosition: string | null = null;
-      try {
-        savedPosition = localStorage.getItem(SCROLL_KEY);
-      } catch {
-        // Safari private mode / storage disabled — treat as no saved position.
-      }
-      if (savedPosition && mainRef.current) {
-        const target = parseInt(savedPosition, 10);
-        // Use rAF to ensure the list items are painted before scrolling
-        requestAnimationFrame(() => {
-          if (mainRef.current) {
-            mainRef.current.scrollTop = target;
-          }
-        });
-      }
-      scrollRestoredRef.current = true;
-    }
-  }, [loading, conversations]);
-
-  // Save scroll position on backgrounding (iOS PWA suspend) and on every
-  // navigation away from the list. Saving on visibility-hidden catches
-  // the case where iOS kills the tab without firing pagehide.
-  useEffect(() => {
-    const save = () => {
-      if (mainRef.current) {
-        try {
-          localStorage.setItem(SCROLL_KEY, mainRef.current.scrollTop.toString());
-        } catch {
-          // storage full — degrade gracefully
-        }
-      }
-    };
-    const onVis = () => {
-      if (document.visibilityState === 'hidden') save();
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => {
-      document.removeEventListener('visibilitychange', onVis);
-      save();
-    };
-  }, []);
-
-  // Save scroll position before navigating away (handles the in-app
-  // navigation case; the visibility-change listener above handles the
-  // iOS-kill case).
   const handleConversationClick = useCallback((conv: Conversation) => {
-    if (mainRef.current) {
-      try {
-        localStorage.setItem(SCROLL_KEY, mainRef.current.scrollTop.toString());
-      } catch {
-        // ignore
-      }
-    }
     navigate(`/c/${conv.slug}`);
   }, [navigate]);
 
@@ -321,30 +257,6 @@ export function ConversationListPage() {
     }
   };
 
-  // Pull-to-refresh handlers
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    if (window.scrollY === 0 && touch) {
-      pullStartY.current = touch.clientY;
-    }
-  }, []);
-
-  const handleTouchMove = useCallback((e: React.TouchEvent) => {
-    if (pullStartY.current === null || refreshing) return;
-    const touch = e.touches[0];
-    if (!touch) return;
-    const pullDistance = touch.clientY - pullStartY.current;
-    if (pullDistance > 80 && window.scrollY === 0) {
-      pullStartY.current = null;
-      setRefreshing(true);
-      void refresh().finally(() => setRefreshing(false));
-    }
-  }, [refreshing, refresh]);
-
-  const handleTouchEnd = useCallback(() => {
-    pullStartY.current = null;
-  }, []);
-
   const handleToggleArchived = useCallback(() => {
     setShowArchived((prev) => !prev);
   }, []);
@@ -418,16 +330,7 @@ export function ConversationListPage() {
           {pendingOpsCount > 0 && ` · ${pendingOpsCount} pending`}
         </div>
       )}
-      {refreshing && (
-        <div className="pull-refresh-indicator">Refreshing...</div>
-      )}
-      <main 
-        id="main-area" 
-        ref={mainRef}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      >
+      <main id="main-area" data-app-scroll-owner>
         {loading ? (
           <section id="conversation-list" className="view active">
             <div className="view-header">
