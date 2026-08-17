@@ -32,15 +32,20 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
         for trigger in ("adversarial", "exact-head", "self-review", "codex"):
             self.assertIn(trigger, description.lower())
 
-    def test_same_head_identity_is_required_before_review_delta(self):
+    def test_exact_target_requires_base_and_head_without_worktree_conflation(self):
         freeze = self.text.index("## 1. Freeze the review target")
-        independent = self.text.index("Do not read Codex findings before the independent pass")
         delta = self.text.index("## 5. Compare local review with Codex")
         self.assertLess(freeze, delta)
-        self.assertLess(delta, independent)
-        self.assertIn("external review `commit_id` are identical", self.text)
+        self.assertIn("identical base and head SHAs", self.text)
+        self.assertIn("unrelated worktree state does not affect", self.text)
         self.assertIn("Label that weaker evidence **near-match**", self.text)
         self.assertIn("otherwise label it **unpaired**", self.text)
+
+    def test_independent_pass_requires_fresh_context_and_sealed_output(self):
+        evidence = (SKILL_DIR / "references" / "evidence-method.md").read_text()
+        self.assertIn("fresh context", self.text)
+        self.assertIn("seal its output", self.text)
+        self.assertIn("mark the review anchored", evidence)
 
     def test_near_match_requires_lineage_and_defect_continuity(self):
         evidence = (SKILL_DIR / "references" / "evidence-method.md").read_text()
@@ -61,6 +66,21 @@ class PhoenixAdversarialReviewSkillTests(unittest.TestCase):
             self.assertIn(concept, probes)
         self.assertIn("Task/PR intent supplies scope and non-goal context", self.text)
         self.assertIn("Do not apply this rule to genuine external ambiguity", self.text)
+
+    def test_evidence_tier_and_comparison_outcome_are_separate_axes(self):
+        self.assertIn("**Evidence tier**", self.text)
+        self.assertIn("**Comparison outcome**", self.text)
+        self.assertIn("both `near-match` and `Codex-only`", self.text)
+
+    def test_corpus_candidate_probes_link_sanitized_evidence_report(self):
+        probes = (SKILL_DIR / "references" / "probes.md").read_text()
+        report = SKILL_DIR / "references" / "evidence-report.md"
+        self.assertIn("[evidence-report.md](evidence-report.md)", probes)
+        self.assertTrue(report.is_file())
+        report_text = report.read_text()
+        for section in ("Sources and sample sizes", "Held-out outcomes", "Limitations"):
+            self.assertIn(section, report_text)
+        self.assertIn("no verified exact-target", report_text)
 
     def test_finding_contract_requires_reachable_failure_and_counterevidence(self):
         for field in ("**Anchor:**", "**Trigger:**", "**Mechanism:**", "**Impact:**"):

@@ -14,12 +14,13 @@ Repository `requirements.md` files and `.allium` specs are normative behavior au
 
 Before reading conclusions from any prior review:
 
-1. Record the repository, base commit, reviewed head commit, and working-tree cleanliness.
-2. Refuse an **exact-HEAD** claim unless the local tree SHA and external review `commit_id` are identical. A branch name, green CI run, request timestamp, or later summary does not prove identity.
-3. If the tree is dirty, either review the dirty snapshot explicitly or stop and request a committed target. Never silently mix committed and uncommitted code.
-4. Fetch the complete diff and changed-file list. Detect truncation, generated files, renames, migrations, and changes outside the apparent feature directory.
+1. Select the target kind: an immutable commit/range, or a working-tree snapshot.
+2. Record the repository plus the target's full base and head SHAs. For a working-tree target, also capture the staged and unstaged patch and cleanliness; unrelated worktree state does not affect an immutable commit/range target.
+3. Refuse an **exact-target** comparison unless both reviews used identical base and head SHAs. Equal heads with different or unknown bases are not exact: retargeting or base advancement changes the reviewed diff. A branch name, green CI run, request timestamp, or later summary does not prove identity.
+4. If the selected target includes a dirty worktree, capture that exact snapshot or stop and request a committed target. Never silently mix committed and uncommitted code.
+5. Fetch the complete diff and changed-file list. Detect truncation, generated files, renames, migrations, and changes outside the apparent feature directory.
 
-When comparing reviews, prefer the same frozen tree. If SHAs differ, do not infer a reviewer blind spot until ancestry and the intervening diff prove the specific defect already existed in the locally reviewed snapshot. Label that weaker evidence **near-match** with direction and commit distance; otherwise label it **unpaired**.
+When targets differ, do not infer a reviewer blind spot until ancestry and the intervening diff prove the specific defect already existed in the locally reviewed snapshot. Label that weaker evidence **near-match** with direction and commit distance; otherwise label it **unpaired**.
 
 ## 2. Build the authority and blast-radius map
 
@@ -81,20 +82,26 @@ Severity reflects impact and reachability, not reviewer confidence:
 
 Report confidence separately as high, medium, or low. Findings below medium confidence require reproduction evidence or should remain questions.
 
-## 5. Compare local review with Codex only after independent review
+## 5. Compare local review with Codex only after an isolated review
 
-Do not read Codex findings before the independent pass; they anchor the search and hide genuine local blind spots.
+Run the independent pass in a fresh context that has not received external findings. Give it only the frozen target, authorities, and review instructions, then seal its output before loading Codex feedback. If findings already appeared in the current context and fresh isolation is unavailable, label the pass **anchored** and do not use it to measure overlap or reviewer blind spots.
 
-For each comparison, normalize findings by semantic defect rather than wording or line number and classify:
+Normalize findings by semantic defect rather than wording or line number. Record two independent axes:
 
-- **overlap:** both found the same violated postcondition;
-- **local-only:** local finding not raised by Codex;
-- **Codex-only:** Codex finding missed locally;
-- **disputed:** concrete counterevidence defeats one review;
-- **near-match:** different commits in one proven lineage, with the intervening diff showing the specific defect already existed locally;
+**Evidence tier** describes target comparability:
+
+- **exact-target:** identical full base and head SHAs;
+- **near-match:** different targets in one proven lineage, with the intervening diff showing the specific defect already existed locally;
 - **unpaired:** target identity, ancestry, or defect continuity is not proven.
 
-Use broader Codex review trends only to propose probes. Deduplicate repeated rounds and root causes, validate representative patch context, and never describe a corpus-only trend as a local-review miss.
+**Comparison outcome** describes who found the semantic defect:
+
+- **overlap:** both found the same violated postcondition;
+- **local-only:** local review alone found it;
+- **Codex-only:** Codex alone found it;
+- **disputed:** concrete counterevidence defeats or materially changes one review.
+
+A finding can be both `near-match` and `Codex-only`; count it once in each axis, never twice as two defects. Use broader Codex review trends only to propose probes. Deduplicate repeated rounds and root causes, validate representative patch context, and never describe a corpus-only trend as a local-review miss.
 
 For every Codex-only valid finding, name the missing **review move**, not just the defect category—for example, “compare emitted and parsed marker literals” or “trace generation rotation on respawn.” Add that move to the current review and use it as held-out validation later. Do not claim that accepted comments are correct solely because they were fixed, or that rejected comments are false solely because they were closed.
 
@@ -123,12 +130,13 @@ Then include, only when useful:
 - A decision-blocking ambiguity with its competing interpretations.
 
 ## Review coverage
-- Frozen target: `<base>..<head>`; clean/dirty; exact-HEAD status.
+- Frozen target: immutable range or captured working snapshot; full `<base>..<head>`; exact-target status.
 - Authorities and boundaries inspected.
 - Tests/reproductions run and material limitations.
 
 ## Review delta
-- overlap: N; local-only: N; Codex-only: N; disputed: N; near-match: N; unpaired: N
+- Evidence tier: exact-target N; near-match N; unpaired N; anchored N.
+- Comparison outcome: overlap N; local-only N; Codex-only N; disputed N.
 - Missing review moves learned from valid Codex-only findings.
 ```
 
@@ -138,8 +146,9 @@ If nothing survives falsification, say **“No actionable findings.”** Still r
 
 - Summarizing the PR instead of challenging it.
 - Trusting the author’s tests, description, or prior self-review as proof.
-- Reading Codex first and merely rediscovering its comments.
-- Calling different commits an exact-HEAD comparison.
+- Claiming independence when external findings were already visible in the review context.
+- Calling equal heads with different or unknown base SHAs an exact-target comparison.
+- Rejecting an immutable commit target because the unrelated current worktree is dirty.
 - Reporting raw inline-comment count as defect count.
 - Calling a same-PR review a near-match without inspecting ancestry and the intervening diff.
 - Treating Codex-wide trends as evidence that local reviewers missed those defects.

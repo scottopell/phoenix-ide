@@ -6,16 +6,16 @@ This skill was distilled from two empirical sources: internal Phoenix agent-revi
 
 Keep three tiers separate in analysis and reporting.
 
-### Tier 1: exact-HEAD review pair
+### Tier 1: exact-target review pair
 
 The strongest unit is:
 
 ```text
-(local independent review, repository, base SHA, head SHA)
-(Codex review, repository, commit_id = the same head SHA)
+(isolated local review, repository, full base SHA, full head SHA)
+(Codex review, repository, the same full base SHA, the same full head SHA)
 ```
 
-Use this tier to attribute a finding to a local or Codex review gap.
+Both identities matter: equal heads can represent different reviewed diffs after retargeting or base advancement. Use this tier to attribute a finding to a local or Codex review gap.
 
 ### Tier 2: lineage-confirmed near match
 
@@ -49,7 +49,7 @@ Use one record per semantic defect:
 
 | Field | Meaning |
 |---|---|
-| `target` | Repository, base SHA, head SHA, clean/dirty state |
+| `target` | Repository, full base SHA, full head SHA, immutable range or captured working snapshot |
 | `source` | local or Codex |
 | `anchor` | File/symbol or contract; not identity by itself |
 | `trigger` | Reachable preconditions |
@@ -57,7 +57,9 @@ Use one record per semantic defect:
 | `severity` | Impact/reachability |
 | `confidence` | Evidence strength |
 | `disposition` | validated, disproved, unresolved, or superseded-by-drift |
-| `evidence_tier` | exact-HEAD, near-match with distance/direction, corpus trend, or unpaired |
+| `evidence_tier` | exact-target, near-match with distance/direction, corpus trend, or unpaired |
+| `comparison_outcome` | overlap, local-only, Codex-only, or disputed |
+| `independence` | isolated or anchored |
 | `review_move` | Reusable action that would expose the defect |
 
 Two differently worded comments overlap when they identify the same trigger and violated postcondition. Several comments sharing one root cause count as one defect unless they require independent fixes.
@@ -70,14 +72,14 @@ Disposition is evidence, not a vote:
 - A later clean review does not retroactively validate every earlier fix.
 - Task text, PR descriptions, review dispositions, and landed patches supply context or evidence; they do not override normative `requirements.md`, `.allium`, or accepted ADR doctrine.
 
-## Avoid anchoring during review
+## Isolate before external findings enter context
 
-Use prior findings in two phases:
+Use prior findings in two contexts:
 
-1. **Independent pass:** freeze target, read authorities/diff, generate and falsify candidates without Codex text.
-2. **Delta pass:** reveal exact-HEAD or lineage-confirmed Codex findings, normalize overlap, validate Codex-only candidates, and extract missing review moves.
+1. **Isolated pass:** start a fresh context with only the frozen target, authorities, and review instructions; seal its findings before retrieving or injecting external feedback.
+2. **Delta pass:** in a separate synthesis context, reveal exact-target or lineage-confirmed Codex findings, normalize overlap, validate Codex-only candidates, and extract missing review moves.
 
-This separation tests review capability rather than prompt recall.
+Instructions cannot erase conclusions already present earlier in a conversation. If isolation is unavailable, mark the review anchored and do not use its overlap as capability evidence.
 
 ## Confidentiality
 
@@ -100,7 +102,7 @@ Keep raw query output outside the worktree and delete it when no longer needed.
 
 ## Held-out validation
 
-Do not validate only on cases used to write the probes. Reserve exact-HEAD pairs, lineage-confirmed near matches, and clean patches for later checks:
+Do not validate only on cases used to write the probes. Reserve exact-target pairs, lineage-confirmed near matches, and clean patches for later checks:
 
 - recover known valid defects without revealing them first;
 - reject known false or superseded findings;

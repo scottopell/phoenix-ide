@@ -22,19 +22,19 @@ Choose probes that can change the verdict. Do not mechanically execute every row
 | Tests | Does the test observe the owning postcondition? Would a no-op implementation pass? Are error details, old-row behavior, restart, duplicate, and negative paths covered? |
 | Complexity / YAGNI | Which named invariant or capability pays for each abstraction, selector, cache, compatibility path, or dependency? Can one authority or direct path replace parallel machinery? |
 
-## Corpus-informed concentration areas
+## Corpus-derived candidate probes
 
-A bounded review-history sample showed repeated findings clustering around these moves. Treat this as search-order guidance, not frequency or quality claims:
+A bounded review-history sample suggested the moves below. They are unordered hypothesis generators, not measured reviewer priorities or evidence of local-review misses. See [evidence-report.md](evidence-report.md) for source counts, sanitization, validation outcomes, and limitations.
 
-1. **Preserve facts across transitions.** Trace values, evidence, compensation, and ownership through success, failure, cancellation, retry, terminalization, and projection. Keep privately proposed state distinct from committed authority until the owning transaction commits.
-2. **Challenge ordering and atomicity.** Look for work admitted before registration, semantic state published before commit, cleanup after authority deletion, stale race winners, and ambiguous external commits. Do not turn same-process SQLite authority loss into a reconciliation workflow.
-3. **Bind identity to scope and generation.** Verify that replay, respawn, migration, and selection carry the exact repository, worktree, conversation, attempt, generation, or incarnation—not a nearby surrogate.
-4. **Test recovery from committed facts and durable time alone.** Remove every process-local identity, then test restart, old rows, partial migrations, surviving external resources, and retries. If local SQLite cannot classify the needed fact, test fail-stop rather than in-process repair.
-5. **Inspect rejected and empty states.** Exercise `NULL`, absent, empty, duplicate, stale, retired, terminal, overflow, and bounded-capacity cases at the real authority boundary.
-6. **Compare projections with their source.** Follow authoritative state into database views, SSE, caches, UI selectors, summaries, and specs; verify filtering and naming stay equivalent.
-7. **Keep cleanup evidence until cleanup succeeds.** Failure compensation must remain discoverable and replayable rather than being erased by the failed transition it is meant to repair.
+- **Preserve facts across transitions.** Trace values, evidence, compensation, and ownership through success, failure, cancellation, retry, terminalization, and projection. Keep privately proposed state distinct from committed authority until the owning transaction commits.
+- **Challenge ordering and atomicity.** Look for work admitted before registration, semantic state published before commit, cleanup after authority deletion, stale race winners, and ambiguous external commits. Do not turn same-process SQLite authority loss into a reconciliation workflow.
+- **Bind identity to scope and generation.** Verify that replay, respawn, migration, and selection carry the exact repository, worktree, conversation, attempt, generation, or incarnation—not a nearby surrogate.
+- **Test recovery from committed facts and durable time alone.** Remove every process-local identity, then test restart, old rows, partial migrations, surviving external resources, and retries. If local SQLite cannot classify the needed fact, test fail-stop rather than in-process repair.
+- **Inspect rejected and empty states.** Exercise `NULL`, absent, empty, duplicate, stale, retired, terminal, overflow, and bounded-capacity cases at the real authority boundary.
+- **Compare projections with their source.** Follow authoritative state into database views, SSE, caches, UI selectors, summaries, and specs; verify filtering and naming stay equivalent.
+- **Keep cleanup evidence until cleanup succeeds.** Failure compensation must remain discoverable and replayable rather than being erased by the failed transition it is meant to repair.
 
-These themes may originate from Codex-only corpus evidence. They become claims about local-review blind spots only in exact-HEAD or lineage-confirmed near-match comparisons.
+These themes become claims about local-review blind spots only in exact-target or lineage-confirmed near-match comparisons.
 
 ## Cross-boundary trace template
 
