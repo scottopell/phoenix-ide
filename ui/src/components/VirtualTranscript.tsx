@@ -102,6 +102,16 @@ interface PhysicalStore<T> {
   } | null;
   pinned: boolean;
   revision: number;
+  /** Physical-minus-layout offset of the rendered block. While a scroll is in
+   *  flight, anchor compensation is absorbed here (rendered via the top
+   *  spacer) instead of written to scrollTop — a programmatic scrollTop write
+   *  kills scroll momentum on iOS Safari. Reconciled to 0 once scrolling
+   *  settles. */
+  drift: number;
+  lastScrollAtMs: number;
+  /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
+   *  effect so the spacer change and the scrollTop write land in one paint. */
+  pendingScrollDelta: number | null;
 }
 
 interface StorePublisher<T> {
@@ -111,6 +121,11 @@ interface StorePublisher<T> {
 
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
+export const SCROLL_SETTLE_MS = 150;
+
+function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
+  return Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
+}
 
 function clampNonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
@@ -121,12 +136,12 @@ function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange |
 }
 
 function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
-  const viewportStart = Math.max(store.viewportTop, store.headerExtent);
+  const viewportStart = Math.max(store.viewportTop, store.headerExtent + store.drift);
   const viewportEnd = Math.min(store.viewportTop + store.viewportExtent, totalPhysicalExtent(store));
   const clippedExtent = viewportEnd - viewportStart;
   if (clippedExtent <= 0) return null;
   return store.layout.rangeForViewport({
-    viewportOffset: viewportStart - store.headerExtent,
+    viewportOffset: viewportStart - store.headerExtent - store.drift,
     viewportExtent: clippedExtent,
     overscanExtent: 0,
   });
@@ -235,21 +250,21 @@ function buildStoreLayout<T>(store: PhysicalStore<T>): TranscriptLayout {
 }
 
 function totalPhysicalExtent<T>(store: PhysicalStore<T>): number {
-  return store.headerExtent + store.layout.totalExtent;
+  return store.headerExtent + store.layout.totalExtent + store.drift;
 }
 
 function rowViewportOffset<T>(store: PhysicalStore<T>): number {
-  return Math.max(0, store.viewportTop - store.headerExtent);
+  return Math.max(0, store.viewportTop - store.headerExtent - store.drift);
 }
 
 function itemPhysicalOffset<T>(store: PhysicalStore<T>, index: number): number | undefined {
   const item = store.layout.itemAt(index);
-  return item ? store.headerExtent + item.offset : undefined;
+  return item ? store.headerExtent + item.offset + store.drift : undefined;
 }
 
 function itemPhysicalEnd<T>(store: PhysicalStore<T>, index: number): number | undefined {
   const item = store.layout.itemAt(index);
-  return item ? store.headerExtent + item.end : undefined;
+  return item ? store.headerExtent + item.end + store.drift : undefined;
 }
 
 function computePinned<T>(store: PhysicalStore<T>): boolean {
@@ -283,7 +298,7 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor |
   return {
     index,
     key: unit.key,
-    offset: store.headerExtent + unit.offset - store.viewportTop,
+    offset: store.headerExtent + unit.offset + store.drift - store.viewportTop,
   };
 }
 
@@ -297,7 +312,20 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor
     setScrollerScrollTop(store, store.viewportTop);
     return;
   }
-  setScrollerScrollTop(store, store.headerExtent + nextOffset - anchor.offset);
+  const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
+  const delta = target - store.viewportTop;
+  if (delta !== 0 && scrollIsActive(store)) {
+    // Mid-scroll: absorb the correction into drift (rendered via the top
+    // spacer) so the anchor stays put without a momentum-killing scrollTop
+    // write. Requires spacer room for the shifted rendered block.
+    const driftNext = store.drift - delta;
+    const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
+    if (firstOffset + driftNext >= 0) {
+      store.drift = driftNext;
+      return;
+    }
+  }
+  setScrollerScrollTop(store, target);
 }
 
 function recompute<T>(store: PhysicalStore<T>): void {
@@ -421,6 +449,9 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     pendingTarget: null,
     pinned: true,
     revision: 0,
+    drift: 0,
+    lastScrollAtMs: Number.NEGATIVE_INFINITY,
+    pendingScrollDelta: null,
   };
   recompute(store);
   return store;
@@ -521,8 +552,8 @@ function VirtualTranscriptInner<T>(
         if (targetElement && unit) {
           current.pendingTarget = null;
           const intraRowOffset = targetElement.getBoundingClientRect().top - element.getBoundingClientRect().top;
-          const physicalOffset = current.headerExtent + unit.offset;
-          const physicalEnd = current.headerExtent + unit.end;
+          const physicalOffset = current.headerExtent + unit.offset + current.drift;
+          const physicalEnd = current.headerExtent + unit.end + current.drift;
           const target = pending.align === 'end'
             ? physicalEnd - current.viewportExtent + pending.viewportStartOffset
             : physicalOffset + intraRowOffset - pending.viewportStartOffset;
@@ -607,6 +638,10 @@ function VirtualTranscriptInner<T>(
   useLayoutEffect(() => {
     const current = storeRef.current;
     return () => {
+      if (reconcileTimerRef.current !== 0) {
+        clearTimeout(reconcileTimerRef.current);
+        reconcileTimerRef.current = 0;
+      }
       current?.resizeObserver?.disconnect();
       current?.rowElements.clear();
       if (current) {
@@ -646,8 +681,8 @@ function VirtualTranscriptInner<T>(
       current.pendingTarget = targetSelector && !targetElement
         ? { index, key: unit.key, align, viewportStartOffset, selector: targetSelector }
         : null;
-      const physicalOffset = current.headerExtent + unit.offset;
-      const physicalEnd = current.headerExtent + unit.end;
+      const physicalOffset = current.headerExtent + unit.offset + current.drift;
+      const physicalEnd = current.headerExtent + unit.end + current.drift;
       const target = align === 'end'
         ? physicalEnd - current.viewportExtent + viewportStartOffset
         : physicalOffset + intraRowOffset - viewportStartOffset;
@@ -712,6 +747,7 @@ function VirtualTranscriptInner<T>(
   const handleScroll = useCallback(() => {
     const current = storeRef.current;
     if (!current?.scroller) return;
+    current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
     current.viewportExtent = current.scroller.clientHeight;
@@ -720,11 +756,50 @@ function VirtualTranscriptInner<T>(
     publish();
   }, [publish]);
 
+  const reconcileTimerRef = useRef(0);
+
+  // Drift reconciliation: once scrolling has settled, fold accumulated drift
+  // back into true layout coordinates. pendingScrollDelta applies in a layout
+  // effect so the spacer change (this commit) and the scrollTop write land in
+  // the same paint.
+  useLayoutEffect(() => {
+    const current = storeRef.current;
+    if (!current) return;
+    if (current.pendingScrollDelta !== null) {
+      const delta = current.pendingScrollDelta;
+      current.pendingScrollDelta = null;
+      setScrollerScrollTop(current, current.viewportTop + delta);
+      recompute(current);
+      publish();
+      return;
+    }
+    if (current.drift === 0 || reconcileTimerRef.current !== 0) return;
+    const arm = () => {
+      reconcileTimerRef.current = window.setTimeout(() => {
+        reconcileTimerRef.current = 0;
+        const store = storeRef.current;
+        if (!store || store.drift === 0) return;
+        if (scrollIsActive(store)) {
+          arm();
+          return;
+        }
+        const drift = store.drift;
+        store.drift = 0;
+        store.pendingScrollDelta = -drift;
+        recompute(store);
+        publish();
+      }, SCROLL_SETTLE_MS);
+    };
+    arm();
+  });
+
   const range = store.range;
   const visibleItems = range
     ? items.slice(range.startIndex, range.endIndex + 1)
     : [];
-  const topSpacer = range ? store.layout.itemAt(range.startIndex)?.offset ?? 0 : 0;
+  const topSpacer = range
+    ? Math.max(0, (store.layout.itemAt(range.startIndex)?.offset ?? 0) + store.drift)
+    : 0;
   const rangePhysicalEnd = range ? itemPhysicalEnd(store, range.endIndex) ?? store.headerExtent : store.headerExtent;
   const bottomSpacer = range
     ? Math.max(0, totalPhysicalExtent(store) - rangePhysicalEnd)

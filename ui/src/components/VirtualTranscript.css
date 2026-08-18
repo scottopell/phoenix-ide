@@ -1,6 +1,10 @@
 .virtual-transcript {
   overflow-y: auto;
   overflow-anchor: none;
+
+  /* Hitting the transcript's top edge must not chain the gesture into the
+     page rubber-band on iOS Safari. */
+  overscroll-behavior: contain;
   contain: size layout style;
 }
 

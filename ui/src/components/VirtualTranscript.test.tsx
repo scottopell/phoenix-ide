@@ -317,6 +317,63 @@ describe('VirtualTranscript', () => {
     });
   });
 
+  it('absorbs above-anchor resize into the top spacer mid-scroll and reconciles scrollTop once settled', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const items = makeItems(30, 20);
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={items}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      expect(scrollTopOf(scroller)).toBe(400);
+
+      // A scroll event marks scrolling as in-flight; a resize of a mounted
+      // row above the anchor must then keep scrollTop untouched
+      // (momentum-preserving) while the top spacer absorbs the delta.
+      act(() => {
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(400);
+
+      const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      expect(spacer.style.height).toBe('190px');
+
+      let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 20, key: 'item-20', offset: 0 });
+
+      // Once scrolling settles, drift reconciles into true layout coordinates
+      // with a single scrollTop adjustment.
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(430);
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 20, key: 'item-20', offset: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not republish unchanged height or pinned state when a callback scrolls to the tail', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     const totals: number[] = [];

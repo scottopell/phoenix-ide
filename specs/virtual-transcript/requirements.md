@@ -33,7 +33,14 @@ THE SYSTEM SHALL update the authoritative layout model from that measurement
 AND, if the changed extent precedes an active physical anchor, SHALL preserve that anchor's viewport-start offset
 AND SHALL NOT infer user intent from the measurement change.
 
-Reconciliation is triggered by layout measurements. It shall not poll or use elapsed time as evidence of positioning success.
+WHILE a user scroll is in flight
+WHEN preserving an anchor's viewport-start offset requires a position correction
+THE SYSTEM SHALL apply the correction by shifting the rendered block's leading spacer rather than writing the scroll position
+SO THAT native scroll momentum is never cancelled by a compensation write
+AND SHALL reconcile the accumulated shift back into authoritative layout coordinates, with a single equivalent scroll-position write, once scrolling settles
+AND SHALL fall back to a direct scroll-position write when the leading spacer lacks room to absorb the shift.
+
+Reconciliation is triggered by layout measurements. It shall not poll or use elapsed time as evidence of positioning success; the scroll-settle wait governs only when an already-computed spacer shift is folded back into layout coordinates.
 
 ## REQ-VT-005: Geometric Prefix Continuity
 
