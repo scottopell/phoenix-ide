@@ -411,7 +411,7 @@ rule LifecycleEventFannedOut {
     ensures: for c in bedrock/Conversation
              where resolve_work_scope(c) = scope
              and live_runtime_exists(c):
-        SseEvent.BrowserSessionState.delivered(
+        BrowserSessionLifecycleEvent.delivered(
             c,
             kind = active or kind = teardown_pending
         )
