@@ -109,7 +109,7 @@ function isReady(state: ScrollMachineState): state is ReadySession {
   return state.kind === 'mount-rescue' || state.kind === 'live';
 }
 
-function snapshotIsPinned(snapshot: ScrollSnapshot): boolean {
+export function snapshotIsPinned(snapshot: ScrollSnapshot): boolean {
   return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD;
 }
 
@@ -135,6 +135,14 @@ function updateGeometry(
     previousScrollHeight: snapshot?.scrollHeight ?? geometry.previousScrollHeight,
     previousClientHeight: snapshot?.clientHeight ?? geometry.previousClientHeight,
   };
+}
+
+function trackGeometry(
+  geometry: ScrollGeometry,
+  snapshot: ScrollSnapshot | null,
+): ScrollGeometry {
+  const updated = updateGeometry(geometry, snapshot);
+  return snapshot ? { ...updated, atBottom: snapshotIsPinned(snapshot) } : updated;
 }
 
 export function initialScrollMachineState(
@@ -179,7 +187,7 @@ function takeUserOwnership(
 ): Reduction {
   const session: MeasuredSession = {
     conversationId: state.conversationId,
-    geometry: snapshot ? updateGeometry(state.geometry, snapshot) : state.geometry,
+    geometry: snapshot ? trackGeometry(state.geometry, snapshot) : state.geometry,
     gesture: state.gesture,
     unread: state.unread,
   };
@@ -258,6 +266,12 @@ function resolveTouch(
     gesture: IDLE,
     unread: state.unread,
   };
+  // A gesture ending inside the pin-to-bottom zone is an arrival at the tail.
+  // The bottom-confirmation callback is edge-triggered and may have fired (and
+  // been blocked) mid-gesture, so it cannot be relied on to re-deliver here.
+  if (follow.kind === 'reading' && state.geometry.atBottom) {
+    return confirmTailReturn({ ...session, kind: 'live', follow });
+  }
   return { state: liveFrom(session, follow), effects: [] };
 }
 
@@ -430,7 +444,7 @@ export function reduceScrollMachine(
         return {
           state: {
             ...state,
-            geometry: event.snapshot ? updateGeometry(state.geometry, event.snapshot) : state.geometry,
+            geometry: trackGeometry(state.geometry, event.snapshot ?? null),
             follow: state.follow,
           },
           effects: [],
@@ -443,12 +457,24 @@ export function reduceScrollMachine(
       if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode());
       return { state: { ...state, follow: navigationMode() }, effects: [] };
 
-    case 'downwardMovement':
+    case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
-      return {
-        state: { ...state, geometry: updateGeometry(state.geometry, event.snapshot) },
-        effects: [],
-      };
+      const next: ReadySession = { ...state, geometry: trackGeometry(state.geometry, event.snapshot) };
+      // Level-triggered tail return: arriving in the pin-to-bottom zone by
+      // downward movement restores following without waiting for the physical
+      // layer's exact-bottom pinned edge, which the viewport may never cross.
+      if (
+        next.kind === 'live' &&
+        next.gesture.kind === 'idle' &&
+        snapshotIsPinned(event.snapshot) &&
+        (next.follow.kind === 'reading' ||
+          next.follow.kind === 'returning-to-tail' ||
+          (next.follow.kind === 'navigating' && next.follow.phase === 'user-returning'))
+      ) {
+        return confirmTailReturn(next);
+      }
+      return { state: next, effects: [] };
+    }
 
     case 'tailContentAdvanced':
       if (!isReady(state)) return { state, effects: [] };

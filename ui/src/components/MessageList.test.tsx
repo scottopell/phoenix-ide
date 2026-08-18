@@ -2529,6 +2529,9 @@ describe('handleTotalListHeightChanged', () => {
       void rerender;
       fireEvent.touchStart(scroller, { touches: [{}] });
       fireEvent.touchMove(scroller, { touches: [{}] });
+      // The gesture leaves the pin zone before cancelling — a cancel inside
+      // the zone would legitimately confirm tail return instead.
+      act(() => virtualTranscriptMock.pinnedChanged?.(false));
       fireEvent.touchCancel(scroller, { touches: [] });
     }],
     ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
@@ -2731,16 +2734,18 @@ describe('handleTotalListHeightChanged', () => {
       act(() => virtualTranscriptMock.totalExtentChanged?.(500));
       virtualTranscriptMock.scrollToTail.mockClear();
 
-      // Finger goes down and starts dragging up — still within the pin
-      // threshold (oldFromBottom = 500 - 80 - 400 = 20) when a
-      // measurement-driven height delta lands.
+      // Finger goes down and drags up out of the pin zone (the drag's scroll
+      // event refreshes geometry: 600 - 80 - 400 = 120 above the bottom)
+      // when a measurement-driven height delta lands.
       fireEvent.touchStart(scroller, { touches: [{}] });
       fireEvent.touchMove(scroller, { touches: [{}] });
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
+      fireEvent.scroll(scroller);
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
       expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
-      // Finger lift and elapsed time do not release durable reading ownership.
+      // A finger lift outside the pin zone and elapsed time do not release
+      // durable reading ownership.
       fireEvent.touchEnd(scroller, { touches: [] });
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
@@ -3009,7 +3014,7 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
-  it('does NOT re-snap when at-bottom fires during a moved touch before touch end', () => {
+  it('honors an at-bottom arrival blocked during a moved touch once the touch ends', () => {
     vi.useFakeTimers();
     try {
       const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
@@ -3043,14 +3048,24 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchStart(scroller, { touches: [{}] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
+      // The at-bottom confirmation is blocked while the moved touch owns the
+      // viewport…
       act(() => virtualTranscriptMock.pinnedChanged?.(true));
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
+
+      // …but the gesture ending inside the pin zone confirms the tail
+      // return: this edge is never re-delivered, so deferring it past the
+      // touch would strand the user in reading with a permanent unread chip.
       vi.setSystemTime(1070);
       fireEvent.touchEnd(scroller, { touches: [] });
       vi.setSystemTime(1100);
-      setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
-      expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
+      expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
+      expect(container.querySelector('.jump-to-newest')).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -3080,6 +3095,9 @@ describe('handleTotalListHeightChanged', () => {
 
     fireEvent.touchStart(scroller, { touches: [{}] });
     fireEvent.touchMove(scroller, { touches: [{}] });
+    // The gesture leaves the pin zone before cancelling — a cancel inside
+    // the zone confirms tail return instead of holding reading ownership.
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
     fireEvent.touchCancel(scroller, { touches: [] });
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
     act(() => virtualTranscriptMock.totalExtentChanged?.(600));

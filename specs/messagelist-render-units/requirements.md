@@ -374,8 +374,15 @@ WHEN unrelated layout height changes while viewport ownership belongs
 to the user
 THE SYSTEM SHALL neither move the viewport nor create unread state
 
-WHEN an idle viewport is confirmed at the bottom
+WHEN an idle viewport is confirmed at the bottom — by the physical
+pinned-state notification, by downward movement whose geometry lands
+inside the pin-to-bottom threshold, or by a touch gesture ending while
+geometry is inside that threshold
 THE SYSTEM SHALL restore tail-follow intent and clear unread state
+SO THAT the return to the tail is level-triggered on observed geometry:
+an exact-bottom pinned edge that fires once mid-gesture (and is never
+re-delivered) cannot strand the session in user ownership with a
+permanent unread affordance
 
 WHEN the user requests jump-to-newest
 THE SYSTEM SHALL enter a returning-to-tail mode and issue exactly one
@@ -391,8 +398,16 @@ WHEN a touch moves
 THE SYSTEM SHALL transfer viewport ownership to the user even if no
 scroll event is emitted
 AND a bottom callback received during that moved touch SHALL NOT release
-user ownership
-AND touch end or cancellation SHALL preserve user ownership
+user ownership while the gesture is active
+AND touch end or cancellation SHALL preserve user ownership when geometry
+is outside the pin-to-bottom threshold, and SHALL confirm the tail return
+when geometry is inside it
+
+WHEN scroll movement is classified as upward or downward intent
+THE SYSTEM SHALL clamp the observed scroll position into the scrollable
+range before comparing against the previous position
+SO THAT overscroll rubber-band bounce-back at either edge is never
+classified as user reading intent
 
 THE SYSTEM SHALL use VirtualTranscript pinned-state notification only as
 bottom geometry and explicit return-to-tail confirmation

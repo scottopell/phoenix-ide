@@ -65,7 +65,6 @@ import {
   type Chapter,
 } from '../conversation/conversationChapters';
 import {
-  PIN_TO_BOTTOM_THRESHOLD,
   SETTLE_WATCH_INTERVAL_MS,
   initialScrollMachineState,
   reduceScrollMachine,
@@ -782,13 +781,15 @@ function MessageListImpl({
     return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
   }, []);
 
+  // Report the physical edge honestly. Widening a pinned=false edge back to
+  // "at bottom" via the policy threshold would re-enter following the moment
+  // the user starts scrolling up, letting the next streamed height change
+  // yank the viewport back down. Zone semantics (within
+  // PIN_TO_BOTTOM_THRESHOLD counts as bottom) are applied by the machine on
+  // direction-carrying events: downwardMovement snapshots and touch ends.
   const handlePinnedStateChange = useCallback((pinned: boolean) => {
-    const snapshot = readScrollSnapshot();
-    const domAtBottom = snapshot
-      ? snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD
-      : pinned;
-    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned || domAtBottom });
-  }, [readScrollSnapshot]);
+    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned });
+  }, []);
 
   const scheduleDomBottomWrite = useCallback(() => {
     if (settleSnapRafRef.current !== 0) return;
@@ -899,9 +900,11 @@ function MessageListImpl({
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
       };
+      // Reads the last published range instead of taking a synchronized
+      // physical snapshot: this runs on every upward scroll and touchmove
+      // event, and a snapshot forces a full layout rebuild each call.
       const requestFromUpwardIntent = () => {
-        const visibleRange = transcriptRef.current?.physicalSnapshot().visibleRange;
-        if (!visibleRange || visibleRange.startIndex <= 2) requestEarlierHistoryRef.current('upward-intent');
+        if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
       const onTouchStart = (e: TouchEvent) => {
         touchStartYRef.current = e.touches[0]?.clientY ?? null;
@@ -944,17 +947,23 @@ function MessageListImpl({
           }
           return;
         }
-        const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
+        // Clamp into the scrollable range before classifying direction: iOS
+        // rubber-band overscroll produces decreasing scrollTop frames while
+        // the user is visually pinned, and treating that bounce-back as
+        // upward intent silently flips following into reading.
+        const maxScrollTop = Math.max(0, ref.scrollHeight - ref.clientHeight);
+        const clampedTop = Math.min(Math.max(ref.scrollTop, 0), maxScrollTop);
+        const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: clampedTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
-          ? machine.geometry.lastSnapshot?.scrollTop ?? snapshot.scrollTop
-          : snapshot.scrollTop;
+          ? Math.min(machine.geometry.lastSnapshot?.scrollTop ?? clampedTop, maxScrollTop)
+          : clampedTop;
         dispatchScrollEvent(
-          snapshot.scrollTop < previousTop
+          clampedTop < previousTop
             ? { type: 'upwardIntent', snapshot }
             : { type: 'downwardMovement', snapshot },
         );
-        if (snapshot.scrollTop < previousTop) requestFromUpwardIntent();
+        if (clampedTop < previousTop) requestFromUpwardIntent();
         updateEarlierHistoryRestoreRef.current();
       };
       const onKeyDown = (e: KeyboardEvent) => {
