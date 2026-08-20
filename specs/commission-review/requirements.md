@@ -32,6 +32,12 @@ AND SHALL NOT dispatch an LLM or tool execution.
 
 THE migration SHALL be idempotent so that retry cannot duplicate transcript messages or dispatch work.
 
+THE SYSTEM SHALL represent the migrated unavailable result as a typed settled tool call
+AND SHALL NOT auto-continue or dispatch a provider while that result remains the transcript tail.
+
+WHEN later transcript content follows the settled result
+THE SYSTEM SHALL NOT use the earlier settlement to suppress recovery of the later content.
+
 **Rationale:** An unavailable approval endpoint must not leave a conversation stuck. Preserving the request and recording an explicit error keeps the transcript structurally valid without fabricating review findings or success.
 
 ---
@@ -42,6 +48,10 @@ WHEN a transcript contains a historical `commission_review` tool-use or tool-res
 THE SYSTEM SHALL preserve the stored message content
 AND SHALL render it through the generic read-only historical tool surface
 AND SHALL NOT provide specialized execution, approval, result parsing, navigation, or viewer authority.
+
+WHEN a historical Close attempt captured the unsupported approval state
+THE SYSTEM SHALL preserve that snapshot through a typed historical metadata sink
+AND SHALL NOT make the captured value valid as live conversation state.
 
 THE SYSTEM SHALL NOT guarantee that specialized viewer URLs, approval endpoints, older binaries, or downgrade paths are usable.
 

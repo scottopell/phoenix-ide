@@ -136,7 +136,43 @@ fn recovery_result_id(conversation_id: &str, tool_use_id: &str) -> String {
     format!("commission-review-retired-{hex}")
 }
 
+const RECOVERY_SETTLEMENT_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_recovery_settlements (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    terminal_message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK (reason IN ('retired_tool_call')),
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_insert
+BEFORE INSERT ON conversation_recovery_settlements
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM messages
+    WHERE message_id = NEW.terminal_message_id
+      AND conversation_id = NEW.conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_update
+BEFORE UPDATE ON conversation_recovery_settlements
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM messages
+    WHERE message_id = NEW.terminal_message_id
+      AND conversation_id = NEW.conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
+END;
+";
+
 async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    sqlx::raw_sql(RECOVERY_SETTLEMENT_SCHEMA)
+        .execute(&mut **tx)
+        .await?;
     let rows = sqlx::query(
         "SELECT id, state FROM conversations
          WHERE state_kind = 'awaiting_commission_review_approval'
@@ -188,10 +224,11 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
             },
         )
         .await?;
+        let result_message_id = recovery_result_id(&conversation_id, &tool_use_id);
         insert_message(
             tx,
             &Message {
-                message_id: recovery_result_id(&conversation_id, &tool_use_id),
+                message_id: result_message_id.clone(),
                 conversation_id: conversation_id.clone(),
                 sequence_id: next_sequence + 1,
                 message_type: MessageType::Tool,
@@ -205,6 +242,16 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
                 created_at: chrono::Utc::now(),
             },
         )
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO conversation_recovery_settlements (
+                 conversation_id, terminal_message_id, reason, created_at
+             ) VALUES (?1, ?2, 'retired_tool_call', STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(&conversation_id)
+        .bind(result_message_id)
+        .execute(&mut **tx)
         .await?;
 
         let idle_state = serde_json::to_string(&ConvState::Idle)
@@ -674,6 +721,16 @@ mod tests {
         assert_eq!(result["tool_use_id"], "tool-review");
         assert_eq!(result["is_error"], true);
         assert!(result["content"].as_str().unwrap().contains("retired"));
+        let settlement: (String, String) = sqlx::query_as(
+            "SELECT terminal_message_id, reason
+             FROM conversation_recovery_settlements
+             WHERE conversation_id = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(settlement.0, recovery_result_id("pending", "tool-review"));
+        assert_eq!(settlement.1, "retired_tool_call");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migrations WHERE version = 68")
                 .fetch_one(&pool)
@@ -793,6 +850,33 @@ mod tests {
         let result: serde_json::Value = serde_json::from_str(&rows[2].2).unwrap();
         assert_eq!(result["is_error"], true);
         assert_ne!(result["content"], "looks good");
+    }
+
+    #[tokio::test]
+    async fn migration_069_backfills_tail_settlement_for_already_migrated_database() {
+        let pool = legacy_pool().await;
+        insert_pending(&pool, PENDING_STATE).await;
+        run_migration(&pool).await.unwrap();
+        sqlx::raw_sql("DROP TABLE conversation_recovery_settlements;")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(super::super::MIGRATION_069)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let settlement: (String, String) = sqlx::query_as(
+            "SELECT terminal_message_id, reason
+             FROM conversation_recovery_settlements
+             WHERE conversation_id = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(settlement.0, recovery_result_id("pending", "tool-review"));
+        assert_eq!(settlement.1, "retired_tool_call");
     }
 
     #[tokio::test]

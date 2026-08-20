@@ -3039,6 +3039,38 @@ mod tests {
         assert_eq!(members[0].role, CloseMemberRole::RootLatest);
     }
 
+    #[tokio::test]
+    async fn historical_commission_review_approval_member_snapshot_loads() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "historical-root").await;
+        db.begin_close_foundation("historical-root", "historical-attempt")
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TRIGGER close_attempt_members_snapshot_is_immutable")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE close_attempt_members
+             SET captured_state_kind = 'awaiting_commission_review_approval'
+             WHERE attempt_id = 'historical-attempt'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let members = db
+            .list_close_attempt_members("historical-attempt")
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(
+            members[0].captured_state_kind,
+            CapturedConversationStateKind::HistoricalAwaitingCommissionReviewApproval
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn unresolved_allocated_worktree_admits_close_and_routes_inventory_to_repair() {

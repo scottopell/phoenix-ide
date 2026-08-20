@@ -1442,6 +1442,22 @@ impl Serialize for MessageContent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoverySettlementReason {
+    RetiredToolCall,
+}
+
+impl RecoverySettlementReason {
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "retired_tool_call" => Some(Self::RetiredToolCall),
+            _ => None,
+        }
+    }
+}
+
 /// Message record
 #[derive(Debug, Clone, Serialize)]
 #[allow(clippy::struct_field_names)]

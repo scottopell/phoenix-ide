@@ -3,7 +3,7 @@
 //!
 //! Handles detection of interrupted conversations that need auto-continuation.
 
-use crate::db::{Message, MessageContent, MessageType};
+use crate::db::{Message, MessageContent, MessageType, RecoverySettlementReason};
 use crate::state_machine::ConvState;
 use phoenix_llm::ContentBlock;
 
@@ -33,6 +33,8 @@ pub enum RecoveryReason {
     UserQuestionDismissed,
     /// Last message marks a deliberate error-banner dismissal
     ErrorDismissed,
+    /// A typed persisted fact marks the terminal tool result as settled.
+    RetiredToolCallSettled,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
     /// Too many consecutive auto-continue restarts (liveness bound)
@@ -74,10 +76,17 @@ impl RecoveryDecision {
 ///
 /// This indicates the conversation was interrupted after tools completed
 /// but before the LLM could provide a text response.
-pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
+pub fn should_auto_continue(
+    messages: &[Message],
+    settlement: Option<RecoverySettlementReason>,
+) -> RecoveryDecision {
     // Empty conversation -> idle
     if messages.is_empty() {
         return RecoveryDecision::idle(RecoveryReason::EmptyConversation);
+    }
+
+    if settlement == Some(RecoverySettlementReason::RetiredToolCall) {
+        return RecoveryDecision::idle(RecoveryReason::RetiredToolCallSettled);
     }
 
     // Last message must be a tool result
@@ -325,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_empty_conversation() {
-        let decision = should_auto_continue(&[]);
+        let decision = should_auto_continue(&[], None);
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::EmptyConversation);
@@ -334,7 +343,7 @@ mod tests {
     #[test]
     fn test_only_user_message() {
         let messages = vec![user_msg(1, "Hello")];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
@@ -344,7 +353,7 @@ mod tests {
     fn test_user_then_agent_text() {
         // Normal completion: user asks, agent responds with text
         let messages = vec![user_msg(1, "Hello"), agent_with_text(2, "Hi there!")];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
@@ -363,10 +372,26 @@ mod tests {
             agent_tool_use_only(2, &["bash"]),
             tool_result(3, "tool-2-0", "file1.txt\nfile2.txt"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert_eq!(decision.state, ConvState::LlmRequesting { attempt: 1 });
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
+    }
+
+    #[test]
+    fn settled_retired_tool_call_does_not_auto_continue() {
+        let messages = vec![
+            user_msg(1, "Review this"),
+            agent_tool_use_only(2, &["commission_review"]),
+            tool_result(3, "tool-2-0", "capability retired"),
+        ];
+
+        let decision =
+            should_auto_continue(&messages, Some(RecoverySettlementReason::RetiredToolCall));
+
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::RetiredToolCallSettled);
     }
 
     #[test]
@@ -378,7 +403,7 @@ mod tests {
             tool_result(3, "tool-2-0", "output1"),
             tool_result(4, "tool-2-1", "output2"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
     }
@@ -393,7 +418,7 @@ mod tests {
             agent_tool_use_only(4, &["bash"]),
             tool_result(5, "tool-4-0", "file1.txt"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
     }
@@ -410,7 +435,7 @@ mod tests {
             adopted_wake_msg(3, true),
         ];
 
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
 
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
@@ -420,7 +445,7 @@ mod tests {
     fn cancellation_only_adopted_wake_tail_stays_idle() {
         let messages = vec![user_msg(1, "start"), adopted_wake_msg(2, true)];
 
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
 
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
@@ -435,7 +460,7 @@ mod tests {
             tool_result(3, "tool-2-0", "file1.txt"),
             agent_with_text(4, "I found file1.txt"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         // Last message is agent text, not tool
@@ -451,7 +476,7 @@ mod tests {
             tool_result(3, "tool-2-0", "done"),
             agent_with_text(4, "All done!"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
     }
 
@@ -464,7 +489,7 @@ mod tests {
             tool_result(3, "tool-2-0", "output"),
             user_msg(4, "Actually, cancel that"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::LastMessageNotTool);
     }
@@ -481,7 +506,7 @@ mod tests {
             user_msg(1, "Hello"),
             tool_result(2, "orphan-tool", "output"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::NoAgentMessage);
     }
@@ -503,7 +528,7 @@ mod tests {
             },
             tool_result(3, "some-tool", "output"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         // Empty blocks = no text, should auto-continue
         assert!(decision.needs_auto_continue);
     }
@@ -518,7 +543,7 @@ mod tests {
             agent_tool_use_only(4, &["bash"]), // This is the last agent msg
             tool_result(5, "tool-4-0", "done"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(decision.needs_auto_continue);
     }
 
@@ -534,7 +559,7 @@ mod tests {
             agent_with_text(6, "You're welcome!"),
             tool_result(7, "orphan", "???"), // Orphan tool result
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         // Last agent msg (6) has text, so even though last msg is tool, don't auto-continue
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::AgentHasTextResponse);
@@ -549,7 +574,7 @@ mod tests {
             agent_with_text_and_tools(2, "Let me check...", &["bash"]),
             tool_result(3, "tool-2-0", "files"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         // The agent DID provide text, so this is normal - don't auto-continue
         // The agent will see the tool result and provide more text
         // Wait - actually this IS an interrupted case! The tool completed but LLM didn't respond.
@@ -597,7 +622,7 @@ mod tests {
             system_question_dismissed_msg(4),
         ];
 
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::UserQuestionDismissed);
         assert!(matches!(decision.state, ConvState::Idle));
@@ -630,7 +655,7 @@ mod tests {
             system_error_dismissed_msg(4),
         ];
 
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::ErrorDismissed);
         assert!(matches!(decision.state, ConvState::Idle));
@@ -670,7 +695,7 @@ mod tests {
             agent_tool_use_only(5, &["bash"]),
             tool_result(6, "tool-5-0", "deploying again..."),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         // 1 restart since last user msg → auto-continue
         assert!(decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::InterruptedMidTurn);
@@ -690,7 +715,7 @@ mod tests {
             agent_tool_use_only(8, &["bash"]),
             tool_result(9, "tool-8-0", "deploying yet again..."),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::RestartLoopDetected);
     }
@@ -711,7 +736,7 @@ mod tests {
             agent_tool_use_only(10, &["bash"]),
             tool_result(11, "tool-10-0", "output"),
         ];
-        let decision = should_auto_continue(&messages);
+        let decision = should_auto_continue(&messages, None);
         // Only 1 restart since last user msg → auto-continue
         assert!(decision.needs_auto_continue);
     }
@@ -805,7 +830,7 @@ mod proptests {
                 })
                 .collect();
 
-            let decision = should_auto_continue(&messages);
+            let decision = should_auto_continue(&messages, None);
 
             // State must be either Idle or LlmRequesting
             prop_assert!(
@@ -857,7 +882,7 @@ mod proptests {
             let last_seq = messages.len() as i64 + 1;
             messages.push(make_message(last_seq, last_type, true));
 
-            let decision = should_auto_continue(&messages);
+            let decision = should_auto_continue(&messages, None);
 
             // If last message is NOT tool, cannot auto-continue
             if !matches!(last_type, MessageType::Tool) {
@@ -883,7 +908,7 @@ mod proptests {
                 make_message(3, MessageType::Tool, true),
             ];
 
-            let decision = should_auto_continue(&messages);
+            let decision = should_auto_continue(&messages, None);
 
             if agent_has_text {
                 // Agent has text -> should NOT auto-continue
@@ -907,7 +932,7 @@ mod proptests {
 
     #[test]
     fn prop_empty_never_auto_continues() {
-        let decision = should_auto_continue(&[]);
+        let decision = should_auto_continue(&[], None);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::EmptyConversation);
     }
@@ -932,7 +957,7 @@ mod proptests {
                 })
                 .collect();
 
-            let decision = should_auto_continue(&messages);
+            let decision = should_auto_continue(&messages, None);
 
             // Verify reason matches actual state
             match decision.reason {
@@ -965,7 +990,9 @@ mod proptests {
                         }
                     }
                 }
-                RecoveryReason::UserQuestionDismissed | RecoveryReason::ErrorDismissed => {
+                RecoveryReason::UserQuestionDismissed
+                | RecoveryReason::ErrorDismissed
+                | RecoveryReason::RetiredToolCallSettled => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::InterruptedMidTurn => {

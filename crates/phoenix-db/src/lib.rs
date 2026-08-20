@@ -9929,6 +9929,44 @@ impl Database {
         Ok(rows)
     }
 
+    /// Return the typed recovery settlement only while its referenced message
+    /// remains the latest transcript row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence contains an unknown settlement reason.
+    pub async fn get_current_recovery_settlement(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<phoenix_core::domain::db_schema::RecoverySettlementReason>> {
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT settlement.reason
+             FROM conversation_recovery_settlements settlement
+             JOIN messages terminal
+               ON terminal.message_id = settlement.terminal_message_id
+              AND terminal.conversation_id = settlement.conversation_id
+             WHERE settlement.conversation_id = ?1
+               AND terminal.sequence_id = (
+                   SELECT MAX(tail.sequence_id)
+                   FROM messages tail
+                   WHERE tail.conversation_id = settlement.conversation_id
+               )",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        reason
+            .map(|value| {
+                phoenix_core::domain::db_schema::RecoverySettlementReason::from_db_str(&value)
+                    .ok_or_else(|| {
+                        DbError::Serialization(format!(
+                            "unknown recovery settlement reason: {value}"
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
     /// Get messages after a sequence ID
     ///
     /// # Errors
@@ -12446,6 +12484,50 @@ mod tests {
         .await
         .unwrap()
         .expect("cleanup claim")
+    }
+
+    #[tokio::test]
+    async fn recovery_settlement_applies_only_while_terminal_message_is_tail() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("settled", "settled", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "terminal-result",
+            "settled",
+            &MessageContent::tool("tool-use", "retired", true),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_recovery_settlements (
+                 conversation_id, terminal_message_id, reason, created_at
+             ) VALUES ('settled', 'terminal-result', 'retired_tool_call', '2026-01-01')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_current_recovery_settlement("settled").await.unwrap(),
+            Some(phoenix_core::domain::db_schema::RecoverySettlementReason::RetiredToolCall)
+        );
+
+        db.add_message(
+            "later-user",
+            "settled",
+            &MessageContent::user("continue"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_current_recovery_settlement("settled").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
