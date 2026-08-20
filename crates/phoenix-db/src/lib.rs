@@ -8677,8 +8677,14 @@ impl Database {
         // un-persisted assistant turn (the cancel snapshots the in-flight round
         // until abort/complete persists the checkpoint).
         let conv_rows: Vec<(String, String)> = sqlx::query(
-            "SELECT id, state FROM conversations
-             WHERE state_kind IN ('tool_executing', 'cancelling_tool')",
+            "SELECT c.id, c.state FROM conversations AS c
+             WHERE c.state_kind IN ('tool_executing', 'cancelling_tool')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM durable_turns AS t
+                   JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
+                   WHERE t.conversation_id = c.id AND t.disposition = 'Runtime'
+               )",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
         .fetch_all(&self.pool)

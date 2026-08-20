@@ -3159,7 +3159,12 @@ impl RuntimeManager {
         else {
             return;
         };
-        let broadcaster = self.conversation_broadcaster(conversation_id).await;
+        let Some(broadcaster) = self
+            .existing_conversation_broadcaster(conversation_id)
+            .await
+        else {
+            return;
+        };
         executor::emit_terminal_lifecycle_event(
             conversation_id,
             is_sub_agent,
@@ -4377,6 +4382,20 @@ impl RuntimeManager {
             .entry(conversation_id.to_string())
             .or_insert(candidate)
             .clone()
+    }
+
+    async fn existing_conversation_broadcaster(
+        &self,
+        conversation_id: &str,
+    ) -> Option<SseBroadcaster> {
+        if let Some(handle) = self.try_get_handle(conversation_id).await {
+            return Some(handle.broadcast_tx);
+        }
+        self.evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
     }
 
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
@@ -6895,6 +6914,33 @@ mod scope_liveness_tests {
             ConvState::CreationCancelled { ref job_id } if job_id == "job"
         ));
         assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn offline_terminal_recovery_does_not_reserve_broadcaster() {
+        let mgr = test_manager().await;
+        let conversation_id = "offline-terminal-recovery";
+        assert!(mgr
+            .existing_conversation_broadcaster(conversation_id)
+            .await
+            .is_none());
+        mgr.complete_database_terminal_recovery(
+            conversation_id,
+            DatabaseTerminalRecovery::Committed {
+                projection: Box::new(phoenix_db::workflow::PersistedConversationProjection {
+                    state: ConvState::Idle,
+                    state_updated_at: Utc::now(),
+                }),
+                is_sub_agent: false,
+                worktree_path: None,
+            },
+        )
+        .await;
+        assert!(!mgr
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
     }
 
     #[allow(clippy::too_many_lines)]

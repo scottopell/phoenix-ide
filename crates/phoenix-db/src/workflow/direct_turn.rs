@@ -1861,14 +1861,7 @@ async fn persist_terminal_obligation_tx(
          FROM durable_turns
          WHERE turn_id = ?1 AND generation = ?2 AND terminal_kind IS NULL
            AND owns_conversation = 1
-         ON CONFLICT(turn_id) DO UPDATE SET
-           expected_generation = excluded.expected_generation,
-           terminal_kind = excluded.terminal_kind,
-           terminal_reason = excluded.terminal_reason,
-           target_state = excluded.target_state,
-           target_state_updated_at_us = excluded.target_state_updated_at_us,
-           response_message_id = excluded.response_message_id
-         WHERE direct_turn_terminal_obligations.expected_generation = excluded.expected_generation",
+         ON CONFLICT(turn_id) DO NOTHING",
     )
     .bind(to_i64(input.turn_id.0, "turn_id")?)
     .bind(to_i64(input.expected_generation, "generation")?)
@@ -1880,9 +1873,29 @@ async fn persist_terminal_obligation_tx(
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(conflict(TurnConflict::StaleGeneration {
-            actual: input.expected_generation,
-        }));
+        let row = sqlx::query(
+            "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
+                    target_state, target_state_updated_at_us, response_message_id
+             FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+        )
+        .bind(to_i64(input.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(existing) = row else {
+            return Err(conflict(TurnConflict::StaleGeneration {
+                actual: input.expected_generation,
+            }));
+        };
+        let existing = parse_terminal_obligation_row(&existing)?;
+        if existing.expected_generation != input.expected_generation
+            || existing.terminal != input.terminal
+            || !projections_match(&existing.projection, &input.projection)
+            || existing.response_message_id != input.response_message_id
+        {
+            return Err(DbError::Serialization(
+                "direct-turn terminal obligation conflicts with first durable payload".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3196,6 +3209,51 @@ mod tests {
             .probe_terminal_evidence("conv-a", "response-terminal-retired", &unrelated)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_obligation_replay_cannot_mutate_first_payload() {
+        let repo = repo().await;
+        let (turn_id, _) = created_turn(&repo, "obligation-immutable", 75).await;
+        let original = DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Failed {
+                reason: "first".to_string(),
+            },
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: DateTime::<Utc>::from_timestamp_micros(1).unwrap(),
+            },
+            response_message_id: Some("first-response".to_string()),
+        };
+        repo.persist_terminal_obligation(&original).await.unwrap();
+        repo.persist_terminal_obligation(&original).await.unwrap();
+        let differing = DirectTurnTerminalObligationInput {
+            terminal: TurnTerminal::Failed {
+                reason: "second".to_string(),
+            },
+            projection: PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: DateTime::<Utc>::from_timestamp_micros(2).unwrap(),
+            },
+            response_message_id: Some("second-response".to_string()),
+            ..original.clone()
+        };
+        assert!(repo.persist_terminal_obligation(&differing).await.is_err());
+        let row = sqlx::query(
+            "SELECT turn_id, expected_generation, terminal_kind, terminal_reason,
+                    target_state, target_state_updated_at_us, response_message_id
+             FROM direct_turn_terminal_obligations WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id.0).unwrap())
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let stored = parse_terminal_obligation_row(&row).unwrap();
+        assert_eq!(stored.terminal, original.terminal);
+        assert!(projections_match(&stored.projection, &original.projection));
+        assert_eq!(stored.response_message_id, original.response_message_id);
     }
 
     #[tokio::test]
