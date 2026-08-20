@@ -7710,6 +7710,7 @@ impl Database {
     ) -> DbResult<Option<i64>> {
         let mut tx = self.pool.begin().await?;
         let transcript_generation = match evidence {
+            workflow::TerminalEvidenceExpectation::ObligationOnly { .. } => None,
             workflow::TerminalEvidenceExpectation::Messages(messages) => {
                 for message in messages {
                     insert_message_tx(&mut tx, message).await?;
@@ -8478,6 +8479,25 @@ impl Database {
         Ok(())
     }
 
+    /// List conversations with terminal obligations owed at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub async fn terminal_obligated_conversation_ids(
+        &self,
+    ) -> DbResult<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT t.conversation_id
+             FROM durable_turns AS t
+             JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
     /// Remove process-scoped hard-delete retirement evidence at process start.
     ///
     /// # Errors
@@ -8835,11 +8855,17 @@ impl Database {
         // Skip conversations whose state is preserved across restarts; their
         // history is frozen and shouldn't be amended with synthetic results.
         let conv_rows: Vec<String> = sqlx::query(
-            "SELECT id FROM conversations
-             WHERE state_kind NOT IN
+            "SELECT c.id FROM conversations AS c
+             WHERE c.state_kind NOT IN
                  ('context_exhausted', 'handed_off', 'terminal',
                   'awaiting_continuation', 'recoverable_continuation_failure',
-                  'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response')",
+                  'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM durable_turns AS t
+                   JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
+                   WHERE t.conversation_id = c.id AND t.disposition = 'Runtime'
+               )",
         )
         .try_map(|row: SqliteRow| row.try_get("id"))
         .fetch_all(&self.pool)
@@ -19657,7 +19683,9 @@ mod tests {
             repo.probe_exact_terminal_evidence(&evidence, &obligation)
                 .await
                 .unwrap(),
-            workflow::TerminalEvidenceProbe::Established
+            workflow::TerminalEvidenceProbe::Established {
+                transcript_generation: None
+            }
         );
 
         sqlx::query("DELETE FROM direct_turn_terminal_obligations WHERE turn_id = ?1")
@@ -19745,7 +19773,9 @@ mod tests {
             repo.probe_exact_terminal_evidence(&evidence, &obligation)
                 .await
                 .unwrap(),
-            workflow::TerminalEvidenceProbe::Established
+            workflow::TerminalEvidenceProbe::Established {
+                transcript_generation: Some(2)
+            }
         );
     }
 
@@ -19808,7 +19838,9 @@ mod tests {
             repo.probe_exact_terminal_evidence(&evidence, &obligation)
                 .await
                 .unwrap(),
-            workflow::TerminalEvidenceProbe::Established
+            workflow::TerminalEvidenceProbe::Established {
+                transcript_generation: None
+            }
         );
     }
 

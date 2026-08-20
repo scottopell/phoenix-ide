@@ -708,12 +708,14 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(path = %db_path, "Opening database");
     let db = open_database_with_migrations(&runtime_env).await?;
     db.clear_direct_turn_retirements().await?;
+    let terminal_obligated_conversations = db.terminal_obligated_conversation_ids().await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
-    // Reconcile worktrees: revert Work conversations whose worktree is missing
-    reconcile_worktrees(&db).await;
+    // Reconcile worktrees after excluding conversations whose exact terminal
+    // projection is still owned by startup obligation settlement.
+    reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
 
     // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
     // rows whose main_ref was defaulted to a literal `main` are corrected before
@@ -1089,7 +1091,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// `continued_in_conv_id` is set. Their worktree is intentionally preserved
 /// pending a user action (Continue / Abandon / `MarkAsMerged`) or already
 /// transferred to a continuation — not a genuine orphan.
+#[cfg(test)]
 async fn reconcile_worktrees(db: &Database) {
+    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+}
+
+async fn reconcile_worktrees_excluding(
+    db: &Database,
+    excluded_conversations: &std::collections::HashSet<String>,
+) {
     let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
         Err(e) => {
@@ -1102,6 +1112,9 @@ async fn reconcile_worktrees(db: &Database) {
     let mut terminated = 0usize;
 
     for conv in &work_convs {
+        if excluded_conversations.contains(&conv.id) {
+            continue;
+        }
         if conv.archived || conv.state.is_terminal() {
             continue;
         }

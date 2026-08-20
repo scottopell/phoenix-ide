@@ -1152,7 +1152,7 @@ impl MessageStore for DatabaseStorage {
                     .probe_terminal_evidence(conv_id, message_id, &obligation)
                     .await
                 {
-                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established) => self
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established { .. }) => self
                         .db
                         .get_message_by_id_in_conversation(conv_id, message_id)
                         .await
@@ -1378,26 +1378,28 @@ impl MessageStore for DatabaseStorage {
         settlement: &ActiveDirectTurnSettlement,
         response_message_id: Option<&str>,
     ) -> Result<(), String> {
-        let terminal = match &settlement.terminal {
-            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
-            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
-            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
-                reason: reason.clone(),
-            },
-        };
-        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
-            .persist_terminal_obligation(&phoenix_db::workflow::DirectTurnTerminalObligationInput {
-                turn_id: settlement.turn.turn_id,
-                expected_generation: settlement.turn.generation,
-                terminal,
-                projection: phoenix_db::workflow::PersistedConversationProjection {
-                    state: settlement.state.clone(),
-                    state_updated_at: settlement.state_updated_at,
+        let obligation =
+            terminal_obligation(settlement, response_message_id.map(ToString::to_string));
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        match repo.persist_terminal_obligation(&obligation).await {
+            Ok(()) => Ok(()),
+            Err(error) => match classify_terminal_mutation(
+                &self.db,
+                &phoenix_db::workflow::TerminalEvidenceExpectation::ObligationOnly {
+                    conversation_id: String::new(),
                 },
-                response_message_id: response_message_id.map(ToString::to_string),
-            })
+                &obligation,
+                error.to_string(),
+                None,
+            )
             .await
-            .map_err(|error| error.to_string())
+            {
+                TerminalMutationEstablishment::Established { .. }
+                | TerminalMutationEstablishment::Retired => Ok(()),
+                TerminalMutationEstablishment::KnownNotCommitted(error)
+                | TerminalMutationEstablishment::Unclassifiable(error) => Err(error),
+            },
+        }
     }
 
     async fn settle_active_direct_turn(
@@ -1618,18 +1620,18 @@ async fn classify_terminal_mutation(
     evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
     obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
     command_error: String,
-    transcript_generation: Option<i64>,
+    _transcript_generation: Option<i64>,
 ) -> TerminalMutationEstablishment {
     let repo = phoenix_db::workflow::WorkflowRepository::new(db.pool().clone());
     match repo
         .probe_exact_terminal_evidence(evidence, obligation)
         .await
     {
-        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established) => {
-            TerminalMutationEstablishment::Established {
-                transcript_generation,
-            }
-        }
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established {
+            transcript_generation,
+        }) => TerminalMutationEstablishment::Established {
+            transcript_generation,
+        },
         Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
             TerminalMutationEstablishment::Retired
         }

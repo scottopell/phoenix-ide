@@ -202,7 +202,7 @@ pub struct DirectTurnTerminalObligationInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalEvidenceProbe {
-    Established,
+    Established { transcript_generation: Option<i64> },
     KnownNotCommitted,
     Incomplete,
     Retired,
@@ -210,6 +210,9 @@ pub enum TerminalEvidenceProbe {
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvidenceExpectation {
+    ObligationOnly {
+        conversation_id: String,
+    },
     Messages(Vec<Message>),
     MessageMutation {
         conversation_id: String,
@@ -1472,6 +1475,7 @@ impl WorkflowRepository {
     ) -> DbResult<TerminalEvidenceProbe> {
         let mut tx = self.pool.begin().await?;
         let evidence_matches = match evidence {
+            TerminalEvidenceExpectation::ObligationOnly { .. } => true,
             TerminalEvidenceExpectation::Messages(messages) => {
                 let mut matches = true;
                 for expected_message in messages {
@@ -1522,7 +1526,7 @@ impl WorkflowRepository {
             .transpose()?;
         let settled_row = sqlx::query(
             "SELECT t.generation, t.terminal_kind, t.terminal_reason, t.owns_conversation,
-                    c.state, c.state_updated_at
+                    c.state, c.state_updated_at, c.transcript_generation
              FROM durable_turns AS t
              JOIN conversations AS c ON c.id = t.conversation_id
              WHERE t.turn_id = ?1",
@@ -1596,8 +1600,18 @@ impl WorkflowRepository {
                 obligation.is_some(),
                 settled_matches,
             ) {
-                (true, true, _, _) => TerminalEvidenceProbe::Established,
+                (true, true, _, _) => TerminalEvidenceProbe::Established {
+                    transcript_generation: evidence
+                        .is_message_mutation()
+                        .then(|| settled_row.try_get("transcript_generation"))
+                        .transpose()?,
+                },
                 (false, false, false, false) => TerminalEvidenceProbe::KnownNotCommitted,
+                (true, false, false, false)
+                    if matches!(evidence, TerminalEvidenceExpectation::ObligationOnly { .. }) =>
+                {
+                    TerminalEvidenceProbe::KnownNotCommitted
+                }
                 _ => TerminalEvidenceProbe::Incomplete,
             },
         )
@@ -1917,7 +1931,8 @@ fn expected_conversation_id(evidence: &TerminalEvidenceExpectation) -> &str {
         TerminalEvidenceExpectation::Messages(messages) => messages
             .first()
             .map_or("", |message| message.conversation_id.as_str()),
-        TerminalEvidenceExpectation::MessageMutation {
+        TerminalEvidenceExpectation::ObligationOnly { conversation_id }
+        | TerminalEvidenceExpectation::MessageMutation {
             conversation_id, ..
         } => conversation_id,
     }
@@ -3175,7 +3190,9 @@ mod tests {
             repo.probe_terminal_evidence("conv-a", "response-terminal-evidence", &expected)
                 .await
                 .unwrap(),
-            TerminalEvidenceProbe::Established
+            TerminalEvidenceProbe::Established {
+                transcript_generation: None
+            }
         );
     }
 
@@ -3336,7 +3353,9 @@ mod tests {
             repo.probe_terminal_evidence("conv-a", "response-terminal-settled", &expected)
                 .await
                 .unwrap(),
-            TerminalEvidenceProbe::Established
+            TerminalEvidenceProbe::Established {
+                transcript_generation: None
+            }
         );
     }
 
