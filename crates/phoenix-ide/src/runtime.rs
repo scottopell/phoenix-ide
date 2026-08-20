@@ -278,7 +278,7 @@ pub struct RuntimeManager {
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
-    consumed_startup_parent_actions: RwLock<HashSet<(String, i64)>>,
+    consumed_startup_parent_actions: RwLock<HashSet<(String, String)>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -3301,7 +3301,7 @@ impl RuntimeManager {
                         .consumed_startup_parent_actions
                         .read()
                         .await
-                        .contains(&(conversation_id.clone(), action_record.transcript_generation))
+                        .contains(&(conversation_id.clone(), action_record.created_at.clone()))
                     {
                         continue;
                     }
@@ -3342,7 +3342,7 @@ impl RuntimeManager {
                                     },
                                     projection: Some(
                                         phoenix_db::workflow::PersistedConversationProjection {
-                                            state: projection.state,
+                                            state: projection.state.clone(),
                                             state_updated_at: projection.state_updated_at,
                                         },
                                     ),
@@ -3353,6 +3353,14 @@ impl RuntimeManager {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
                             })?;
                         }
+                        executor::complete_terminal_lifecycle_without_broadcast(
+                            &conversation_id,
+                            false,
+                            &projection.state,
+                            Some(std::path::Path::new(&projection.cwd)),
+                            Some(&self.fork_cmd_tx),
+                        )
+                        .await;
                         self.db
                             .delete_startup_parent_action(&conversation_id)
                             .await
@@ -3373,7 +3381,7 @@ impl RuntimeManager {
                     self.consumed_startup_parent_actions
                         .write()
                         .await
-                        .insert((conversation_id.clone(), action_record.transcript_generation));
+                        .insert((conversation_id.clone(), action_record.created_at.clone()));
                 }
                 phoenix_db::StartupParentAction::Cancel => {
                     let authority =
