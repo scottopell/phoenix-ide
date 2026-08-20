@@ -71,6 +71,7 @@ impl ActiveDirectTurnTerminal {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveDirectTurnSettlement {
     pub turn: ActiveDirectTurn,
+    pub conversation_id: String,
     pub terminal: ActiveDirectTurnTerminal,
     pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
@@ -1386,7 +1387,7 @@ impl MessageStore for DatabaseStorage {
             Err(error) => match classify_terminal_mutation(
                 &self.db,
                 &phoenix_db::workflow::TerminalEvidenceExpectation::ObligationOnly {
-                    conversation_id: String::new(),
+                    conversation_id: settlement.conversation_id.clone(),
                 },
                 &obligation,
                 error.to_string(),

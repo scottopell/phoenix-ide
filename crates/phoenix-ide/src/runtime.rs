@@ -3687,6 +3687,7 @@ impl RuntimeManager {
                 crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
                     &crate::runtime::traits::ActiveDirectTurnSettlement {
+                        conversation_id: conversation_id.to_string(),
                         turn: active,
                         terminal,
                         state: obligation.projection.state,

@@ -1050,7 +1050,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             }
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
-                server_abort.abort();
+                let _ = drain_tx.send(());
+                if tls::bounded_post_shutdown_drain(&mut server, "HTTP fatal authority").await.is_none() {
+                    server_abort.abort();
+                }
                 crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
                 tracing_handles.shutdown_tracer();
                 return Err(std::io::Error::other("fatal local SQLite authority loss").into());

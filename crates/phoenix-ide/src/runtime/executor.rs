@@ -3371,6 +3371,7 @@ where
                                 == Some(message_id.as_str()) =>
                         {
                             Some(crate::runtime::traits::ActiveDirectTurnSettlement {
+                                conversation_id: self.context.conversation_id.clone(),
                                 turn: self
                                     .active_direct_turn
                                     .as_deref()
@@ -3456,6 +3457,7 @@ where
                     }
                 } else if is_state_persist && terminal_direct_turn_transition {
                     let obligation = crate::runtime::traits::ActiveDirectTurnSettlement {
+                        conversation_id: self.context.conversation_id.clone(),
                         turn: self
                             .active_direct_turn
                             .as_deref()
@@ -3852,6 +3854,7 @@ where
         terminal: Box<crate::runtime::traits::ActiveDirectTurnTerminal>,
     ) -> Result<(), String> {
         let settlement = crate::runtime::traits::ActiveDirectTurnSettlement {
+            conversation_id: self.context.conversation_id.clone(),
             turn,
             terminal: terminal.as_ref().clone(),
             state: self.state.clone(),
@@ -5461,6 +5464,7 @@ where
                                 let recovery_result = self.storage
                                     .settle_active_direct_turn(
                                         &crate::runtime::traits::ActiveDirectTurnSettlement {
+                conversation_id: self.context.conversation_id.clone(),
                                             turn: turn.clone(),
                                             terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
                                                 reason: error.clone(),
@@ -5775,6 +5779,7 @@ where
                     self.pending_direct_turn_terminal.as_deref(),
                 ) {
                     let settlement = ActiveDirectTurnSettlement {
+                        conversation_id: self.context.conversation_id.clone(),
                         turn: turn.clone(),
                         terminal: terminal.clone(),
                         state: self.state.clone(),
@@ -7298,6 +7303,7 @@ where
             self.pending_direct_turn_terminal.as_deref(),
         ) {
             let settlement = ActiveDirectTurnSettlement {
+                conversation_id: self.context.conversation_id.clone(),
                 turn: turn.clone(),
                 terminal: terminal.clone(),
                 state: self.state.clone(),
@@ -15519,6 +15525,7 @@ mod steer_drain_detector_tests {
             generation: 0,
         }));
         let settlement = ActiveDirectTurnSettlement {
+            conversation_id: "conv-retired-checkpoint".to_string(),
             turn: rt.active_direct_turn.as_deref().unwrap().clone(),
             terminal: crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
             state: ConvState::Idle,
