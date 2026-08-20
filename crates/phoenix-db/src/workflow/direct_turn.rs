@@ -432,6 +432,26 @@ impl WorkflowRepository {
             != 0)
     }
 
+    pub async fn load_owning_authoritative_turn(
+        &self,
+        conversation: &ConversationAuthority,
+    ) -> DbResult<Option<DurableTurn>> {
+        let turn_id: Option<i64> = sqlx::query_scalar(
+            "SELECT turn_id FROM durable_turns
+             WHERE conversation_id = ?1 AND owns_conversation = 1
+               AND terminal_kind IS NULL
+             ORDER BY turn_id DESC LIMIT 1",
+        )
+        .bind(&conversation.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(turn_id) = turn_id else {
+            return Ok(None);
+        };
+        self.load_authoritative_turn(TurnAuthorityId(to_u64(turn_id, "turn_id")?))
+            .await
+    }
+
     pub async fn load_authoritative_turn(
         &self,
         turn_id: TurnAuthorityId,

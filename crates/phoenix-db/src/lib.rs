@@ -46,11 +46,13 @@ use phoenix_core::domain::llm_types::{
     ProviderStreamTelemetry, ServiceTier, StreamTelemetryOutputKind,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Connection, Row, Sqlite, SqlitePool, Transaction};
+use std::fmt::Write as _;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -1178,10 +1180,15 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupParentAction {
+    Resume,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupParentReconciliation {
     pub conversation_id: String,
-    pub resume_runtime: bool,
 }
 
 pub struct Database {
@@ -8689,13 +8696,14 @@ impl Database {
     /// its child conversation row (created with `id == agent_id`). A sub-agent
     /// that reached `Completed`/`Failed` before the restart is returned with its
     /// real `Success`/`Failure` outcome; one still running (or whose row is
-    /// missing/corrupt/non-terminal) is omitted, so the caller falls back to the
-    /// "interrupted by server restart" synthetic outcome. Best-effort: a query
-    /// or parse error for one agent simply omits it (never fails the sweep).
+    /// missing or non-terminal) is omitted, so the caller falls back to the
+    /// "interrupted by server restart" synthetic outcome. Query and decode
+    /// failures remain errors because they cannot prove the child nonterminal.
     async fn resolve_pending_sub_agent_outcomes(
         &self,
         pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
-    ) -> std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome> {
+    ) -> DbResult<std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome>>
+    {
         use phoenix_core::domain::sm_state::{ConvState, SubAgentOutcome};
         use std::collections::HashMap;
 
@@ -8705,13 +8713,14 @@ impl Database {
                 sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
                     .bind(&agent.agent_id)
                     .fetch_optional(&self.pool)
-                    .await
-                    .ok()
-                    .flatten();
+                    .await?;
             let Some(state_json) = row else { continue };
-            let Ok(state) = serde_json::from_str::<ConvState>(&state_json) else {
-                continue;
-            };
+            let state = serde_json::from_str::<ConvState>(&state_json).map_err(|error| {
+                DbError::Serialization(format!(
+                    "decode pending sub-agent {} state: {error}",
+                    agent.agent_id
+                ))
+            })?;
             // Only the two terminal sub-agent states carry a real outcome; any
             // other (still running) state leaves the agent absent so the caller
             // uses the interrupted fallback. `if let` chain rather than a match
@@ -8725,7 +8734,7 @@ impl Database {
                 );
             }
         }
-        outcomes
+        Ok(outcomes)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8804,7 +8813,7 @@ impl Database {
             // is fanned in as success/failure rather than "interrupted".
             let sub_agent_outcomes = self
                 .resolve_pending_sub_agent_outcomes(&pending_sub_agents)
-                .await;
+                .await?;
 
             let materialized_at = parse_datetime(&state_updated_at);
             let persisted_start: Option<i64> =
@@ -8883,12 +8892,14 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn persist_startup_sub_agent_fan_in(
         &self,
         conversation_id: &str,
         results: &[phoenix_core::domain::sm_state::SubAgentResult],
         spawn_tool_id: Option<&str>,
         destination: &ConvState,
+        action: StartupParentAction,
         now: DateTime<Utc>,
     ) -> DbResult<()> {
         let (content, display_data) = build_sub_agent_fan_in(results);
@@ -8935,8 +8946,21 @@ impl Database {
             .bind(conversation_id)
             .fetch_one(&mut *tx)
             .await?;
+            let mut identity = sha2::Sha256::new();
+            for result in results {
+                identity.update(result.agent_id.as_bytes());
+                identity.update([0]);
+            }
+            let round_id =
+                identity
+                    .finalize()
+                    .iter()
+                    .fold(String::with_capacity(64), |mut encoded, byte| {
+                        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+                        encoded
+                    });
             let message = Message {
-                message_id: format!("startup-sub-agent-summary:{conversation_id}"),
+                message_id: format!("startup-sub-agent-summary:{conversation_id}:{round_id}"),
                 conversation_id: conversation_id.to_string(),
                 sequence_id,
                 message_type: MessageType::User,
@@ -8962,7 +8986,83 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation, created_at)
+             SELECT ?1, ?2, transcript_generation, ?3
+             FROM conversations WHERE id = ?1
+             ON CONFLICT(conversation_id) DO UPDATE SET action = excluded.action,
+                 transcript_generation = excluded.transcript_generation,
+                 created_at = excluded.created_at",
+        )
+        .bind(conversation_id)
+        .bind(match action {
+            StartupParentAction::Resume => "Resume",
+            StartupParentAction::Cancel => "Cancel",
+        })
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Load durable parent actions that remain executable at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stale-action cleanup or action decoding fails.
+    pub async fn list_startup_parent_actions(
+        &self,
+    ) -> DbResult<Vec<(String, StartupParentAction)>> {
+        sqlx::query(
+            "DELETE FROM startup_parent_actions
+             WHERE action = 'Resume' AND EXISTS (
+                 SELECT 1 FROM conversations AS c
+                 WHERE c.id = startup_parent_actions.conversation_id
+                   AND c.transcript_generation != startup_parent_actions.transcript_generation
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        let rows = sqlx::query(
+            "SELECT a.conversation_id, a.action
+             FROM startup_parent_actions AS a
+             JOIN conversations AS c ON c.id = a.conversation_id
+             WHERE a.action = 'Cancel'
+                OR (a.action = 'Resume'
+                    AND c.transcript_generation = a.transcript_generation)
+             ORDER BY a.conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let action: String = row.try_get("action")?;
+                let action = match action.as_str() {
+                    "Resume" => StartupParentAction::Resume,
+                    "Cancel" => StartupParentAction::Cancel,
+                    value => {
+                        return Err(DbError::Serialization(format!(
+                            "unknown startup parent action {value}"
+                        )))
+                    }
+                };
+                Ok((row.try_get("conversation_id")?, action))
+            })
+            .collect()
+    }
+
+    /// Retire a durably completed parent action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action cannot be deleted.
+    pub async fn delete_startup_parent_action(&self, conversation_id: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM startup_parent_actions WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -9050,7 +9150,7 @@ impl Database {
                 destination,
             )) = pending_fan_in
             {
-                let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await;
+                let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await?;
                 for agent in pending {
                     let outcome = if let Some(outcome) = outcomes.get(&agent.agent_id).cloned() {
                         outcome
@@ -9067,10 +9167,9 @@ impl Database {
                         }
                     };
                     let outcome = match (cancel_cause, outcome) {
-                        (
-                            Some(phoenix_core::domain::sm_event::CancelCause::Timeout),
-                            phoenix_core::domain::sm_state::SubAgentOutcome::Failure { .. },
-                        ) => phoenix_core::domain::sm_state::SubAgentOutcome::TimedOut,
+                        (Some(phoenix_core::domain::sm_event::CancelCause::Timeout), _) => {
+                            phoenix_core::domain::sm_state::SubAgentOutcome::TimedOut
+                        }
                         (_, outcome) => outcome,
                     };
                     completed_results.push(phoenix_core::domain::sm_state::SubAgentResult {
@@ -9084,15 +9183,19 @@ impl Database {
                     &completed_results,
                     spawn_tool_id.as_deref(),
                     &destination,
+                    if matches!(
+                        cancel_cause,
+                        Some(phoenix_core::domain::sm_event::CancelCause::UserRequested)
+                    ) {
+                        StartupParentAction::Cancel
+                    } else {
+                        StartupParentAction::Resume
+                    },
                     now,
                 )
                 .await?;
                 reconciled.push(StartupParentReconciliation {
                     conversation_id: conversation_id.clone(),
-                    resume_runtime: !matches!(
-                        cancel_cause,
-                        Some(phoenix_core::domain::sm_event::CancelCause::UserRequested)
-                    ),
                 });
                 continue;
             }
@@ -9112,11 +9215,11 @@ impl Database {
                 if is_parent == 1 {
                     reconciled.push(StartupParentReconciliation {
                         conversation_id: conversation_id.clone(),
-                        resume_runtime: true,
                     });
                     continue;
                 }
             }
+            let mut tx = self.pool.begin().await?;
             let updated = sqlx::query(
                 "UPDATE conversations
                  SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
@@ -9132,14 +9235,27 @@ impl Database {
             .bind(conv_state_kind(&ConvState::Idle))
             .bind(now.to_rfc3339())
             .bind(conversation_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
+                sqlx::query(
+                    "INSERT INTO startup_parent_actions
+                         (conversation_id, action, transcript_generation, created_at)
+                     SELECT ?1, 'Resume', transcript_generation, ?2
+                     FROM conversations WHERE id = ?1
+                     ON CONFLICT(conversation_id) DO UPDATE SET action = 'Resume',
+                         transcript_generation = excluded.transcript_generation,
+                         created_at = excluded.created_at",
+                )
+                .bind(conversation_id)
+                .bind(now.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
                 reconciled.push(StartupParentReconciliation {
                     conversation_id: conversation_id.clone(),
-                    resume_runtime: true,
                 });
             }
+            tx.commit().await?;
         }
         Ok(reconciled)
     }
@@ -17688,6 +17804,7 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn startup_parent_reconciliation_materializes_exact_child_result_once() {
         use phoenix_core::domain::db_schema::ToolResult;
@@ -17766,7 +17883,10 @@ mod tests {
         let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
-        assert!(reconciled[0].resume_runtime);
+        assert_eq!(
+            db.list_startup_parent_actions().await.unwrap(),
+            vec![(parent_id.to_string(), StartupParentAction::Resume)]
+        );
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::Idle
@@ -17790,7 +17910,10 @@ mod tests {
         let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
-        assert!(reconciled[0].resume_runtime);
+        assert_eq!(
+            db.list_startup_parent_actions().await.unwrap(),
+            vec![(parent_id.to_string(), StartupParentAction::Resume)]
+        );
         assert_eq!(db.get_messages(parent_id).await.unwrap().len(), 3);
     }
 
@@ -17945,6 +18068,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_summary_identity_is_stable_per_round_and_unique_across_rounds() {
+        use phoenix_core::domain::sm_state::{SubAgentOutcome, SubAgentResult};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "multi-round-summary-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let destination = ConvState::LlmRequesting { attempt: 1 };
+        for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
+            db.persist_startup_sub_agent_fan_in(
+                parent_id,
+                &[SubAgentResult {
+                    agent_id: agent_id.to_string(),
+                    task: agent_id.to_string(),
+                    outcome: SubAgentOutcome::Success {
+                        result: result.to_string(),
+                    },
+                }],
+                None,
+                &destination,
+                StartupParentAction::Resume,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let summaries: Vec<_> = db
+            .get_messages(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message
+                    .message_id
+                    .starts_with(&format!("startup-sub-agent-summary:{parent_id}:"))
+            })
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        assert_ne!(summaries[0].message_id, summaries[1].message_id);
+    }
+
+    #[tokio::test]
+    async fn startup_fan_in_retries_unreadable_child_state_without_overwrite() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "unreadable-parent";
+        let child_id = "unreadable-child";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            parent_id,
+            &ConvState::AwaitingSubAgents {
+                pending: vec![PendingSubAgent {
+                    agent_id: child_id.to_string(),
+                    task: "unreadable".to_string(),
+                    mode: SubAgentMode::Explore,
+                }],
+                completed_results: Vec::new(),
+                spawn_tool_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            child_id,
+            &ConvState::Completed {
+                result: "exact result".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET state = json_remove(state, '$.result') WHERE id = ?1",
+        )
+        .bind(child_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let ids = std::collections::HashSet::from([parent_id.to_string()]);
+
+        let error = db
+            .reconcile_startup_obligated_parents(&ids)
+            .await
+            .expect_err("unreadable terminal evidence must remain retryable");
+        assert!(error.to_string().contains("decode pending sub-agent"));
+        let raw: String = sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+            .bind(child_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!raw.contains("result"));
+        assert!(db.list_startup_parent_actions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn startup_cancelling_sub_agents_reaches_cause_destination() {
         use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
@@ -17962,6 +18187,16 @@ mod tests {
             db.create_conversation(&child_id, &child_id, "/tmp", false, Some(&parent_id), None)
                 .await
                 .unwrap();
+            if expects_request {
+                db.update_conversation_state(
+                    &child_id,
+                    &ConvState::Completed {
+                        result: "late success after timeout".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
             db.update_conversation_state(
                 &parent_id,
                 &ConvState::CancellingSubAgents {
@@ -17981,7 +18216,19 @@ mod tests {
 
             let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
             assert_eq!(reconciled.len(), 1);
-            assert_eq!(reconciled[0].resume_runtime, expects_request);
+            let actions = db.list_startup_parent_actions().await.unwrap();
+            assert_eq!(actions.len(), 1);
+            assert_eq!(
+                actions[0],
+                (
+                    parent_id.clone(),
+                    if expects_request {
+                        StartupParentAction::Resume
+                    } else {
+                        StartupParentAction::Cancel
+                    }
+                )
+            );
             let state = db.get_conversation(&parent_id).await.unwrap().state;
             assert_eq!(
                 matches!(state, ConvState::LlmRequesting { attempt: 1 }),
@@ -17996,7 +18243,9 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .find(|message| {
-                    message.message_id == format!("startup-sub-agent-summary:{parent_id}")
+                    message
+                        .message_id
+                        .starts_with(&format!("startup-sub-agent-summary:{parent_id}:"))
                 })
                 .unwrap();
             let MessageContent::User(content) = summary.content else {

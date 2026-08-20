@@ -348,6 +348,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_direct_turn_terminal_obligations",
         sql: MIGRATION_066,
     },
+    Migration {
+        version: 67,
+        name: "create_startup_parent_actions",
+        sql: MIGRATION_067,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -427,6 +432,17 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_067: &str = r"
+CREATE TABLE startup_parent_actions (
+    conversation_id TEXT NOT NULL PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    action TEXT NOT NULL
+        CHECK (action IN ('Resume', 'Cancel')),
+    transcript_generation INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+";
 
 const MIGRATION_066: &str = r"
 CREATE TABLE direct_turn_terminal_obligations (
