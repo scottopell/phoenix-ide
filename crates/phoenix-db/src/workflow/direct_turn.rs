@@ -1882,12 +1882,16 @@ impl WorkflowRepository {
         {
             sqlx::query(
                 "INSERT INTO startup_parent_actions
-                     (conversation_id, action, transcript_generation, created_at)
-                 SELECT id, 'Reconcile', transcript_generation, ?2
-                 FROM conversations WHERE id = ?1
+                     (conversation_id, action, transcript_generation,
+                      turn_id, turn_generation, created_at)
+                 SELECT c.id, 'Reconcile', c.transcript_generation,
+                        t.turn_id, t.generation, ?2
+                 FROM conversations AS c
+                 LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+                     AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                 WHERE c.id = ?1
                  ON CONFLICT(conversation_id) DO UPDATE SET action = 'Reconcile',
                      transcript_generation = excluded.transcript_generation,
-                     turn_id = NULL, turn_generation = NULL,
                      created_at = excluded.created_at",
             )
             .bind(parent_id)
