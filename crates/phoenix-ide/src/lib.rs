@@ -707,6 +707,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(path = %db_path, "Opening database");
     let db = open_database_with_migrations(&runtime_env).await?;
+    db.clear_direct_turn_retirements().await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;

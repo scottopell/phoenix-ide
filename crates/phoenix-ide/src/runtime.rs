@@ -3159,21 +3159,29 @@ impl RuntimeManager {
         else {
             return;
         };
-        let Some(broadcaster) = self
+        if let Some(broadcaster) = self
             .existing_conversation_broadcaster(conversation_id)
             .await
-        else {
-            return;
-        };
-        executor::emit_terminal_lifecycle_event(
-            conversation_id,
-            is_sub_agent,
-            &projection.state,
-            worktree_path.as_deref(),
-            Some(&self.fork_cmd_tx),
-            &broadcaster,
-        )
-        .await;
+        {
+            executor::emit_terminal_lifecycle_event(
+                conversation_id,
+                is_sub_agent,
+                &projection.state,
+                worktree_path.as_deref(),
+                Some(&self.fork_cmd_tx),
+                &broadcaster,
+            )
+            .await;
+        } else {
+            executor::complete_terminal_lifecycle_without_broadcast(
+                conversation_id,
+                is_sub_agent,
+                &projection.state,
+                worktree_path.as_deref(),
+                Some(&self.fork_cmd_tx),
+            )
+            .await;
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6918,7 +6926,8 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn offline_terminal_recovery_does_not_reserve_broadcaster() {
-        let mgr = test_manager().await;
+        let mgr = Arc::new(test_manager().await);
+        mgr.start_sub_agent_handler().await;
         let conversation_id = "offline-terminal-recovery";
         assert!(mgr
             .existing_conversation_broadcaster(conversation_id)

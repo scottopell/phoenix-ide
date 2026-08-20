@@ -219,6 +219,18 @@ pub enum TerminalEvidenceExpectation {
     },
 }
 
+impl TerminalEvidenceExpectation {
+    #[must_use]
+    pub fn conversation_id(&self) -> &str {
+        expected_conversation_id(self)
+    }
+
+    #[must_use]
+    pub fn is_message_mutation(&self) -> bool {
+        matches!(self, Self::MessageMutation { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectTurnTerminalObligation {
     pub turn_id: TurnAuthorityId,

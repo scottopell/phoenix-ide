@@ -1565,12 +1565,24 @@ impl MessageStore for DatabaseStorage {
                 transcript_generation,
             },
             Err(error) => {
+                let transcript_generation = if evidence.is_message_mutation() {
+                    sqlx::query_scalar(
+                        "SELECT transcript_generation FROM conversations WHERE id = ?1",
+                    )
+                    .bind(evidence.conversation_id())
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
                 classify_terminal_mutation(
                     &self.db,
                     &evidence,
                     &obligation,
                     error.to_string(),
-                    None,
+                    transcript_generation,
                 )
                 .await
             }

@@ -3187,7 +3187,16 @@ where
         // No-op transitions emit no PersistState effect, so the DB row keeps
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
-            self.state_updated_at = Utc::now();
+            let retry_has_durable_fact = matches!(
+                self.terminal_settlement_attempt,
+                TerminalSettlementAttempt::Retry {
+                    fact_durability: TerminalFactDurability::Durable,
+                    ..
+                }
+            );
+            if !retry_has_durable_fact {
+                self.state_updated_at = Utc::now();
+            }
             // Publish early for most transitions so effective_conversation_state
             // reflects the new state before long-running effects (e.g. ApproveTask
             // git work) complete. Exception: suppress when entering Idle with
@@ -10181,6 +10190,17 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
     }
 }
 
+pub(crate) async fn complete_terminal_lifecycle_without_broadcast(
+    conversation_id: &str,
+    is_sub_agent: bool,
+    state: &ConvState,
+    worktree_path: Option<&std::path::Path>,
+    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
+) {
+    cleanup_worktree_if_present(conversation_id, is_sub_agent, state, worktree_path);
+    retire_fork_proposals_on_terminal(conversation_id, fork_cmd_tx).await;
+}
+
 pub(crate) async fn emit_terminal_lifecycle_event(
     conversation_id: &str,
     is_sub_agent: bool,
@@ -10189,8 +10209,14 @@ pub(crate) async fn emit_terminal_lifecycle_event(
     fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
     broadcast_tx: &SseBroadcaster,
 ) {
-    cleanup_worktree_if_present(conversation_id, is_sub_agent, state, worktree_path);
-    retire_fork_proposals_on_terminal(conversation_id, fork_cmd_tx).await;
+    complete_terminal_lifecycle_without_broadcast(
+        conversation_id,
+        is_sub_agent,
+        state,
+        worktree_path,
+        fork_cmd_tx,
+    )
+    .await;
     let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
 }
 

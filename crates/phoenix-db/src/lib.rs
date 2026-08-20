@@ -8478,6 +8478,18 @@ impl Database {
         Ok(())
     }
 
+    /// Remove process-scoped hard-delete retirement evidence at process start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot clear the retirement table.
+    pub async fn clear_direct_turn_retirements(&self) -> DbResult<()> {
+        sqlx::query("DELETE FROM direct_turn_retirements")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Reset all conversations to idle on server restart.
     /// Also repairs any orphaned `tool_use` by injecting synthetic `tool_result`.
     ///
