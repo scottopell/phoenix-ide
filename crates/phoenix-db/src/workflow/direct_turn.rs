@@ -405,6 +405,24 @@ impl WorkflowRepository {
             .map_err(conflict)
     }
 
+    pub async fn exact_turn_retired(
+        &self,
+        turn_id: TurnAuthorityId,
+        conversation_id: &str,
+    ) -> DbResult<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM direct_turn_retirements
+                WHERE turn_id = ?1 AND conversation_id = ?2
+             )",
+        )
+        .bind(to_i64(turn_id.0, "turn_id")?)
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
     pub async fn load_authoritative_turn(
         &self,
         turn_id: TurnAuthorityId,

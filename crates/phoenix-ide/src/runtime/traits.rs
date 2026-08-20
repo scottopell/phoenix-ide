@@ -254,7 +254,7 @@ pub trait MessageStore: Send + Sync {
         &self,
         settlement: &ActiveDirectTurnSettlement,
         response_message_id: Option<&str>,
-    ) -> Result<(), String>;
+    ) -> TerminalMutationEstablishment;
 
     async fn settle_continuation_direct_turn(
         &self,
@@ -720,7 +720,7 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         &self,
         settlement: &ActiveDirectTurnSettlement,
         response_message_id: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> TerminalMutationEstablishment {
         (**self)
             .persist_active_direct_turn_terminal_obligation(settlement, response_message_id)
             .await
@@ -1378,28 +1378,26 @@ impl MessageStore for DatabaseStorage {
         &self,
         settlement: &ActiveDirectTurnSettlement,
         response_message_id: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> TerminalMutationEstablishment {
         let obligation =
             terminal_obligation(settlement, response_message_id.map(ToString::to_string));
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         match repo.persist_terminal_obligation(&obligation).await {
-            Ok(()) => Ok(()),
-            Err(error) => match classify_terminal_mutation(
-                &self.db,
-                &phoenix_db::workflow::TerminalEvidenceExpectation::ObligationOnly {
-                    conversation_id: settlement.conversation_id.clone(),
-                },
-                &obligation,
-                error.to_string(),
-                None,
-            )
-            .await
-            {
-                TerminalMutationEstablishment::Established { .. }
-                | TerminalMutationEstablishment::Retired => Ok(()),
-                TerminalMutationEstablishment::KnownNotCommitted(error)
-                | TerminalMutationEstablishment::Unclassifiable(error) => Err(error),
+            Ok(()) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
             },
+            Err(error) => {
+                classify_terminal_mutation(
+                    &self.db,
+                    &phoenix_db::workflow::TerminalEvidenceExpectation::ObligationOnly {
+                        conversation_id: settlement.conversation_id.clone(),
+                    },
+                    &obligation,
+                    error.to_string(),
+                    None,
+                )
+                .await
+            }
         }
     }
 

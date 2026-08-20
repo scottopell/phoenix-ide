@@ -3183,6 +3183,12 @@ impl RuntimeManager {
             .existing_conversation_broadcaster(conversation_id)
             .await
         {
+            let _ = broadcaster.send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                presentation_mode: projection.state.presentation_mode().to_string(),
+                state: projection.state.clone(),
+                state_updated_at: projection.state_updated_at,
+            });
             executor::emit_terminal_lifecycle_event(
                 conversation_id,
                 is_sub_agent,
@@ -3232,7 +3238,8 @@ impl RuntimeManager {
                     "terminal obligation exists but conversation metadata is unreadable ({error})"
                 ))
             })?;
-        let is_sub_agent = conversation.parent_conversation_id.is_some();
+        let parent_conversation_id = conversation.parent_conversation_id.clone();
+        let is_sub_agent = parent_conversation_id.is_some();
         let worktree_path = conversation
             .conv_mode
             .worktree_path()
@@ -3271,11 +3278,19 @@ impl RuntimeManager {
             {
                 Ok(DatabaseTerminalRecovery::AlreadyCommitted)
             }
-            Ok(_) => Ok(DatabaseTerminalRecovery::Committed {
-                projection: Box::new(projection),
-                is_sub_agent,
-                worktree_path,
-            }),
+            Ok(_) => {
+                if let Some(parent_id) = parent_conversation_id {
+                    self.startup_obligated_conversations
+                        .write()
+                        .await
+                        .insert(parent_id);
+                }
+                Ok(DatabaseTerminalRecovery::Committed {
+                    projection: Box::new(projection),
+                    is_sub_agent,
+                    worktree_path,
+                })
+            }
             Err(settlement_error) => {
                 let turn = repo
                     .load_authoritative_turn(turn_id)
@@ -3284,12 +3299,24 @@ impl RuntimeManager {
                         DatabaseTerminalRecoveryError::Unclassifiable(format!(
                             "terminal settlement failed ({settlement_error}); authoritative turn probe failed ({probe_error})"
                         ))
-                    })?
-                    .ok_or_else(|| {
-                        DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                            "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared"
-                        ))
                     })?;
+                let Some(turn) = turn else {
+                    return if repo
+                        .exact_turn_retired(turn_id, conversation_id)
+                        .await
+                        .map_err(|probe_error| {
+                            DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                "terminal settlement failed ({settlement_error}); retirement probe failed ({probe_error})"
+                            ))
+                        })?
+                    {
+                        Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+                    } else {
+                        Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared without exact retirement"
+                        )))
+                    };
+                };
                 match turn.lifecycle {
                     phoenix_workflow::TurnLifecycle::Terminal { terminal, .. }
                         if turn.generation == expected_generation.saturating_add(1)

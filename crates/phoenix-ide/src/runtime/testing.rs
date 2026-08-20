@@ -1218,8 +1218,10 @@ impl MessageStore for InMemoryStorage {
         &self,
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
         _response_message_id: Option<&str>,
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        crate::runtime::traits::TerminalMutationEstablishment::Established {
+            transcript_generation: None,
+        }
     }
 
     async fn settle_active_direct_turn(
@@ -1432,11 +1434,12 @@ impl MessageStore for InMemoryStorage {
         if *self.terminal_mutation_retired.lock().unwrap() {
             return crate::runtime::traits::TerminalMutationEstablishment::Retired;
         }
-        if let Err(error) = self
+        match self
             .persist_active_direct_turn_terminal_obligation(settlement, None)
             .await
         {
-            return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(error);
+            crate::runtime::traits::TerminalMutationEstablishment::Established { .. } => {}
+            establishment => return establishment,
         }
         if let Err(error) = self
             .persist_tool_round(conv_id, assistant, tool_results)
@@ -1454,11 +1457,12 @@ impl MessageStore for InMemoryStorage {
         evidence: &crate::runtime::traits::TerminalSubAgentEvidence,
         settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
-        if let Err(error) = self
+        match self
             .persist_active_direct_turn_terminal_obligation(settlement, None)
             .await
         {
-            return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(error);
+            crate::runtime::traits::TerminalMutationEstablishment::Established { .. } => {}
+            establishment => return establishment,
         }
         match evidence {
             crate::runtime::traits::TerminalSubAgentEvidence::Insert(message) => {

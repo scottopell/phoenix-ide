@@ -3479,11 +3479,16 @@ where
                         )
                         .await
                     {
-                        Ok(()) => {
+                        TerminalMutationEstablishment::Established { .. }
+                        | TerminalMutationEstablishment::Retired => {
                             self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
                             Box::pin(self.execute_effect(effect)).await
                         }
-                        Err(error) => Err(error),
+                        TerminalMutationEstablishment::KnownNotCommitted(error) => Err(error),
+                        TerminalMutationEstablishment::Unclassifiable(error) => {
+                            self.local_terminal_authority = LocalTerminalAuthority::Fatal;
+                            Err(error)
+                        }
                     }
                 } else {
                     Box::pin(self.execute_effect(effect)).await
