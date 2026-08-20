@@ -1182,6 +1182,7 @@ pub enum ContinuationCommitOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupParentAction {
+    Reconcile,
     Resume,
     Cancel,
 }
@@ -9016,6 +9017,7 @@ impl Database {
         )
         .bind(conversation_id)
         .bind(match action {
+            StartupParentAction::Reconcile => "Reconcile",
             StartupParentAction::Resume => "Resume",
             StartupParentAction::Cancel => "Cancel",
         })
@@ -9051,7 +9053,7 @@ impl Database {
             "SELECT a.conversation_id, a.action, a.turn_id, a.turn_generation
              FROM startup_parent_actions AS a
              JOIN conversations AS c ON c.id = a.conversation_id
-             WHERE a.action = 'Cancel'
+             WHERE a.action IN ('Reconcile', 'Cancel')
                 OR (a.action = 'Resume'
                     AND c.transcript_generation = a.transcript_generation)
              ORDER BY a.conversation_id",
@@ -9062,6 +9064,7 @@ impl Database {
             .map(|row| {
                 let action: String = row.try_get("action")?;
                 let action = match action.as_str() {
+                    "Reconcile" => StartupParentAction::Reconcile,
                     "Resume" => StartupParentAction::Resume,
                     "Cancel" => StartupParentAction::Cancel,
                     value => {

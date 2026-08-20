@@ -241,8 +241,12 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
 
         let startup = self
             .startup_reconciliation
-            .swap(false, std::sync::atomic::Ordering::AcqRel);
+            .load(std::sync::atomic::Ordering::Acquire);
         self.dispatcher.reconcile_startup_parents(startup).await?;
+        if startup {
+            self.startup_reconciliation
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
 
         let mut cursor = None;
         loop {
@@ -265,6 +269,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         Ok(EMPTY_RESCAN_INTERVAL)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_candidate(
         &self,
         candidate: DiscoverableAcceptedTurn,
@@ -311,7 +316,44 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 };
                 if let Err(terminal_error) = self.repo.terminate_authoritative_turn(terminal).await
                 {
-                    tracing::error!(turn_id = candidate.turn_id.0, error = %terminal_error, "failed to quarantine corrupt direct-turn payload");
+                    let turn = self
+                        .repo
+                        .load_authoritative_turn(candidate.turn_id)
+                        .await
+                        .map_err(|probe_error| {
+                            crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                "corrupt payload quarantine failed ({terminal_error}); exact probe failed ({probe_error})"
+                            ))
+                        })?;
+                    match turn.map(|turn| (turn.generation, turn.lifecycle)) {
+                        Some((
+                            generation,
+                            phoenix_workflow::TurnLifecycle::Terminal {
+                                terminal: phoenix_workflow::TurnTerminal::Failed { ref reason },
+                                ..
+                            },
+                        )) if generation == authority.generation.0.saturating_add(1)
+                            && reason == &format!("prepared payload decode failed: {error}") => {}
+                        Some((
+                            generation,
+                            phoenix_workflow::TurnLifecycle::Accepted {
+                                disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                            },
+                        )) if generation == authority.generation.0 => {
+                            return Err(crate::runtime::DatabaseTerminalRecoveryError::Retryable(
+                                terminal_error.to_string(),
+                            ));
+                        }
+                        _ => {
+                            return Err(
+                                crate::runtime::DatabaseTerminalRecoveryError::Unclassifiable(
+                                    format!(
+                                        "corrupt payload quarantine failed ({terminal_error}); exact terminal state is unclassifiable"
+                                    ),
+                                ),
+                            );
+                        }
+                    }
                 }
                 tracing::warn!(turn_id = candidate.turn_id.0, error = %error, "direct-turn payload decode failed; terminally quarantined turn");
                 return Ok(());

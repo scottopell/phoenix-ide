@@ -1096,8 +1096,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// `continued_in_conv_id` is set. Their worktree is intentionally preserved
 /// pending a user action (Continue / Abandon / `MarkAsMerged`) or already
 /// transferred to a continuation — not a genuine orphan.
-#[cfg(test)]
-async fn reconcile_worktrees(db: &Database) {
+pub(crate) async fn reconcile_worktrees(db: &Database) {
     reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
 }
 

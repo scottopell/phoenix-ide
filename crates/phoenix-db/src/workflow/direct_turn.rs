@@ -1872,6 +1872,29 @@ impl WorkflowRepository {
             .bind(to_i64(turn_id.0, "turn_id")?)
             .execute(&mut *tx.tx)
             .await?;
+        if let Some(parent_id) = sqlx::query_scalar::<_, String>(
+            "SELECT parent_conversation_id FROM conversations
+             WHERE id = ?1 AND parent_conversation_id IS NOT NULL",
+        )
+        .bind(&turn.conversation.0)
+        .fetch_optional(&mut *tx.tx)
+        .await?
+        {
+            sqlx::query(
+                "INSERT INTO startup_parent_actions
+                     (conversation_id, action, transcript_generation, created_at)
+                 SELECT id, 'Reconcile', transcript_generation, ?2
+                 FROM conversations WHERE id = ?1
+                 ON CONFLICT(conversation_id) DO UPDATE SET action = 'Reconcile',
+                     transcript_generation = excluded.transcript_generation,
+                     turn_id = NULL, turn_generation = NULL,
+                     created_at = excluded.created_at",
+            )
+            .bind(parent_id)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx.tx)
+            .await?;
+        }
         mark_active_attempts_authority_lost_tx(tx, workflow_id).await?;
         delete_reclaimable_leases_tx(tx, workflow_id).await?;
         tx.invalidate_nonterminal_effects(workflow_id).await?;
