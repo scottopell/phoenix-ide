@@ -8909,12 +8909,13 @@ impl Database {
         Ok(materialized)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn persist_startup_sub_agent_fan_in(
         &self,
         conversation_id: &str,
         results: &[phoenix_core::domain::sm_state::SubAgentResult],
         spawn_tool_id: Option<&str>,
+        expected_state: &ConvState,
         destination: &ConvState,
         action: StartupParentAction,
         now: DateTime<Utc>,
@@ -8988,11 +8989,11 @@ impl Database {
             };
             insert_message_tx(&mut tx, &message).await?;
         }
-        sqlx::query(
+        let projection_update = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3,
                  updated_at = ?3, transcript_generation = transcript_generation + 1
-             WHERE id = ?4",
+             WHERE id = ?4 AND state = ?5",
         )
         .bind(
             serde_json::to_string(destination)
@@ -9001,8 +9002,18 @@ impl Database {
         .bind(conv_state_kind(destination))
         .bind(now.to_rfc3339())
         .bind(conversation_id)
+        .bind(
+            serde_json::to_string(expected_state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
         .execute(&mut *tx)
         .await?;
+        if projection_update.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::Serialization(format!(
+                "parent {conversation_id} changed during recovered fan-in"
+            )));
+        }
         sqlx::query(
             "INSERT INTO startup_parent_actions
                  (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
@@ -9027,6 +9038,31 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Establish the exact parent authority before a child can outlive it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable action cannot be persisted.
+    pub async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation,
+                  turn_id, turn_generation, created_at)
+             SELECT c.id, 'Reconcile', c.transcript_generation,
+                    t.turn_id, t.generation, ?2
+             FROM conversations AS c
+             LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE c.id = ?1
+             ON CONFLICT(conversation_id) DO NOTHING",
+        )
+        .bind(conversation_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -9096,11 +9132,19 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when the action cannot be deleted.
-    pub async fn delete_startup_parent_action(&self, conversation_id: &str) -> DbResult<()> {
-        sqlx::query("DELETE FROM startup_parent_actions WHERE conversation_id = ?1")
-            .bind(conversation_id)
-            .execute(&self.pool)
-            .await?;
+    pub async fn delete_startup_parent_action(
+        &self,
+        conversation_id: &str,
+        created_at: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM startup_parent_actions
+             WHERE conversation_id = ?1 AND created_at = ?2",
+        )
+        .bind(conversation_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -9229,6 +9273,7 @@ impl Database {
                     conversation_id,
                     &completed_results,
                     spawn_tool_id.as_deref(),
+                    &conversation.state,
                     &destination,
                     if matches!(
                         cancel_cause,
@@ -9260,7 +9305,9 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
                 if is_parent == 1 {
-                    if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
+                    if synthesize_startup_interruptions
+                        && matches!(conversation.state, ConvState::LlmRequesting { .. })
+                    {
                         sqlx::query(
                             "UPDATE startup_parent_actions SET action = 'Resume',
                                  transcript_generation = ?2, created_at = ?3
@@ -18163,6 +18210,7 @@ mod tests {
             .unwrap();
         let destination = ConvState::LlmRequesting { attempt: 1 };
         for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
+            let expected_state = db.get_conversation(parent_id).await.unwrap().state;
             db.persist_startup_sub_agent_fan_in(
                 parent_id,
                 &[SubAgentResult {
@@ -18173,6 +18221,7 @@ mod tests {
                     },
                 }],
                 None,
+                &expected_state,
                 &destination,
                 StartupParentAction::Resume,
                 Utc::now(),

@@ -868,6 +868,13 @@ impl SseBroadcaster {
         self.send_with_ring_unlocked(event, seq, op)
     }
 
+    pub fn close_publication(&self) {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        gate.queued.clear();
+        gate.reserved_until = None;
+        gate.hard_deleted = true;
+    }
+
     pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
@@ -1697,6 +1704,20 @@ impl RuntimeManager {
     ) {
         if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
             self.signal_fatal_local_authority(boundary);
+        }
+    }
+
+    pub(crate) async fn fence_fatal_local_authority(&self) {
+        let handles: Vec<_> = self
+            .runtimes
+            .write()
+            .await
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.broadcast_tx.close_publication();
+            let _ = handle.event_tx.send(Event::Shutdown).await;
         }
     }
 
@@ -2560,8 +2581,21 @@ impl RuntimeManager {
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let supervisor = Arc::clone(self);
         tokio::spawn(async move {
-            crate::runtime::direct_turn_worker::run(manager, rx, ready_tx).await;
+            let task = tokio::spawn(crate::runtime::direct_turn_worker::run(
+                manager, rx, ready_tx,
+            ));
+            match task.await {
+                Ok(()) => {
+                    tracing::error!("direct-turn authority worker exited unexpectedly");
+                    supervisor.signal_fatal_local_authority("direct_turn_worker_exit");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "direct-turn authority worker panicked or was cancelled");
+                    supervisor.signal_fatal_local_authority("direct_turn_worker_join");
+                }
+            }
         });
         ready_rx
             .await
@@ -2683,6 +2717,23 @@ impl RuntimeManager {
             parent_event_tx,
             parent_turn_link,
         } = req;
+        if let Err(error) = self
+            .db
+            .establish_parent_reconcile_action(&parent_conversation_id)
+            .await
+        {
+            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                        error: format!("failed to persist parent recovery authority: {error}"),
+                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         tracing::info!(
             agent_id = %spec.agent_id,
@@ -3318,7 +3369,10 @@ impl RuntimeManager {
                             != action_record.turn_generation
                     {
                         self.db
-                            .delete_startup_parent_action(&conversation_id)
+                            .delete_startup_parent_action(
+                                &conversation_id,
+                                &action_record.created_at,
+                            )
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3362,7 +3416,10 @@ impl RuntimeManager {
                         )
                         .await;
                         self.db
-                            .delete_startup_parent_action(&conversation_id)
+                            .delete_startup_parent_action(
+                                &conversation_id,
+                                &action_record.created_at,
+                            )
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3397,7 +3454,10 @@ impl RuntimeManager {
                             || action_record.turn_generation != Some(turn.generation)
                         {
                             self.db
-                                .delete_startup_parent_action(&conversation_id)
+                                .delete_startup_parent_action(
+                                    &conversation_id,
+                                    &action_record.created_at,
+                                )
                                 .await
                                 .map_err(|error| {
                                     DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3433,7 +3493,7 @@ impl RuntimeManager {
                     self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
                         .await;
                     self.db
-                        .delete_startup_parent_action(&conversation_id)
+                        .delete_startup_parent_action(&conversation_id, &action_record.created_at)
                         .await
                         .map_err(|error| {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())

@@ -985,6 +985,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
     let mut fatal_local_authority_rx = state.runtime.fatal_local_authority_receiver();
+    let runtime_for_fatal = state.runtime.clone();
 
     let app = create_router(state).layer(cors).layer(compression);
 
@@ -1004,6 +1005,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             loaded_tls.server,
             socket_activated,
             fatal_local_authority_rx,
+            &runtime_for_fatal,
             &bash_handles_for_shutdown,
         )
         .await?;
@@ -1050,6 +1052,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             }
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
+                runtime_for_fatal.fence_fatal_local_authority().await;
                 let _ = drain_tx.send(());
                 if tls::bounded_post_shutdown_drain(&mut server, "HTTP fatal authority").await.is_none() {
                     server_abort.abort();
