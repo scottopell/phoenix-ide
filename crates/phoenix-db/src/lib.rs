@@ -1189,6 +1189,7 @@ pub enum StartupParentAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupParentActionRecord {
+    pub action_id: i64,
     pub conversation_id: String,
     pub action: StartupParentAction,
     pub transcript_generation: i64,
@@ -9088,7 +9089,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
         let rows = sqlx::query(
-            "SELECT a.conversation_id, a.action, a.transcript_generation, a.created_at, a.turn_id, a.turn_generation
+            "SELECT a.action_id, a.conversation_id, a.action, a.transcript_generation, a.created_at, a.turn_id, a.turn_generation
              FROM startup_parent_actions AS a
              JOIN conversations AS c ON c.id = a.conversation_id
              WHERE a.action IN ('Reconcile', 'Cancel')
@@ -9112,6 +9113,7 @@ impl Database {
                     }
                 };
                 Ok(StartupParentActionRecord {
+                    action_id: row.try_get("action_id")?,
                     conversation_id: row.try_get("conversation_id")?,
                     action,
                     transcript_generation: row.try_get("transcript_generation")?,
@@ -9135,14 +9137,14 @@ impl Database {
     pub async fn delete_startup_parent_action(
         &self,
         conversation_id: &str,
-        created_at: &str,
+        action_id: i64,
     ) -> DbResult<()> {
         sqlx::query(
             "DELETE FROM startup_parent_actions
-             WHERE conversation_id = ?1 AND created_at = ?2",
+             WHERE conversation_id = ?1 AND action_id = ?2",
         )
         .bind(conversation_id)
-        .bind(created_at)
+        .bind(action_id)
         .execute(&self.pool)
         .await?;
         Ok(())

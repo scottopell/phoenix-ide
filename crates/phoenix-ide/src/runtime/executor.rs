@@ -4848,10 +4848,20 @@ where
             }));
         };
 
-        self.storage
+        if let Err(error) = self
+            .storage
             .establish_parent_reconcile_action(&self.context.conversation_id)
             .await
-            .map_err(|error| format!("persist parent recovery authority: {error}"))?;
+        {
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                format!("failed to persist parent recovery authority: {error}"),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
+        }
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
             spawned.push(PendingSubAgent {

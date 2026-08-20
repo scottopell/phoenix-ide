@@ -278,7 +278,7 @@ pub struct RuntimeManager {
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
-    consumed_startup_parent_actions: RwLock<HashSet<(String, String)>>,
+    consumed_startup_parent_actions: RwLock<HashSet<i64>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -3352,7 +3352,7 @@ impl RuntimeManager {
                         .consumed_startup_parent_actions
                         .read()
                         .await
-                        .contains(&(conversation_id.clone(), action_record.created_at.clone()))
+                        .contains(&action_record.action_id)
                     {
                         continue;
                     }
@@ -3369,10 +3369,7 @@ impl RuntimeManager {
                             != action_record.turn_generation
                     {
                         self.db
-                            .delete_startup_parent_action(
-                                &conversation_id,
-                                &action_record.created_at,
-                            )
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3416,10 +3413,7 @@ impl RuntimeManager {
                         )
                         .await;
                         self.db
-                            .delete_startup_parent_action(
-                                &conversation_id,
-                                &action_record.created_at,
-                            )
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3438,7 +3432,7 @@ impl RuntimeManager {
                     self.consumed_startup_parent_actions
                         .write()
                         .await
-                        .insert((conversation_id.clone(), action_record.created_at.clone()));
+                        .insert(action_record.action_id);
                 }
                 phoenix_db::StartupParentAction::Cancel => {
                     let authority =
@@ -3456,7 +3450,7 @@ impl RuntimeManager {
                             self.db
                                 .delete_startup_parent_action(
                                     &conversation_id,
-                                    &action_record.created_at,
+                                    action_record.action_id,
                                 )
                                 .await
                                 .map_err(|error| {
@@ -3493,7 +3487,7 @@ impl RuntimeManager {
                     self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
                         .await;
                     self.db
-                        .delete_startup_parent_action(&conversation_id, &action_record.created_at)
+                        .delete_startup_parent_action(&conversation_id, action_record.action_id)
                         .await
                         .map_err(|error| {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -3611,7 +3605,11 @@ impl RuntimeManager {
                         }
                     }
                     phoenix_db::workflow::TerminalProjectionProbe::Current => {
-                        Ok(DatabaseTerminalRecovery::Committed {
+                    self.startup_obligated_conversations
+                    .write()
+                    .await
+                    .remove(conversation_id);
+                    Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
                             is_sub_agent,
                             worktree_path,

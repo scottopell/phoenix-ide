@@ -435,7 +435,8 @@ pub(crate) fn normalize_sql(sql: &str) -> String {
 
 const MIGRATION_067: &str = r"
 CREATE TABLE startup_parent_actions (
-    conversation_id TEXT NOT NULL PRIMARY KEY
+    action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL UNIQUE
         REFERENCES conversations(id) ON DELETE CASCADE,
     action TEXT NOT NULL
         CHECK (action IN ('Reconcile', 'Resume', 'Cancel')),
