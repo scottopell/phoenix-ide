@@ -3,7 +3,9 @@
 //!
 //! Handles detection of interrupted conversations that need auto-continuation.
 
-use crate::db::{Message, MessageContent, MessageType, RecoverySettlementReason};
+use crate::db::{
+    Message, MessageContent, MessageType, RecoverySettlementReason, RecoveryTailStatus,
+};
 use crate::state_machine::ConvState;
 use phoenix_llm::ContentBlock;
 
@@ -35,6 +37,8 @@ pub enum RecoveryReason {
     ErrorDismissed,
     /// A typed persisted fact marks the terminal tool result as settled.
     RetiredToolCallSettled,
+    /// Transcript changed while recovery was reading its projection.
+    TranscriptChanged,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
     /// Too many consecutive auto-continue restarts (liveness bound)
@@ -66,6 +70,16 @@ impl RecoveryDecision {
             reason: RecoveryReason::InterruptedMidTurn,
         }
     }
+}
+
+#[must_use]
+pub fn decide_recovery(messages: &[Message], tail_status: &RecoveryTailStatus) -> RecoveryDecision {
+    let projected_tail = messages.last().map(|message| message.message_id.as_str());
+    let persisted_tail = tail_status.terminal_message_id.as_deref();
+    if projected_tail != persisted_tail {
+        return RecoveryDecision::idle(RecoveryReason::TranscriptChanged);
+    }
+    should_auto_continue(messages, tail_status.settlement)
 }
 
 /// Analyze messages to determine if a conversation needs auto-continuation.
@@ -392,6 +406,27 @@ mod tests {
         assert_eq!(decision.state, ConvState::Idle);
         assert!(!decision.needs_auto_continue);
         assert_eq!(decision.reason, RecoveryReason::RetiredToolCallSettled);
+    }
+
+    #[test]
+    fn transcript_tail_change_does_not_dispatch_from_stale_projection() {
+        let messages = vec![
+            user_msg(1, "Run it"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "done"),
+        ];
+
+        let decision = decide_recovery(
+            &messages,
+            &RecoveryTailStatus {
+                terminal_message_id: Some("later-message".to_string()),
+                settlement: None,
+            },
+        );
+
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::TranscriptChanged);
     }
 
     #[test]
@@ -992,7 +1027,8 @@ mod proptests {
                 }
                 RecoveryReason::UserQuestionDismissed
                 | RecoveryReason::ErrorDismissed
-                | RecoveryReason::RetiredToolCallSettled => {
+                | RecoveryReason::RetiredToolCallSettled
+                | RecoveryReason::TranscriptChanged => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::InterruptedMidTurn => {

@@ -1448,6 +1448,12 @@ pub enum RecoverySettlementReason {
     RetiredToolCall,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryTailStatus {
+    pub terminal_message_id: Option<String>,
+    pub settlement: Option<RecoverySettlementReason>,
+}
+
 impl RecoverySettlementReason {
     #[must_use]
     pub fn from_db_str(value: &str) -> Option<Self> {

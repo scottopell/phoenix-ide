@@ -9929,33 +9929,38 @@ impl Database {
         Ok(rows)
     }
 
-    /// Return the typed recovery settlement only while its referenced message
-    /// remains the latest transcript row.
+    /// Return the current transcript tail and its typed settlement, if any.
     ///
     /// # Errors
     ///
     /// Returns an error if persistence contains an unknown settlement reason.
-    pub async fn get_current_recovery_settlement(
+    pub async fn get_recovery_tail_status(
         &self,
         conversation_id: &str,
-    ) -> DbResult<Option<phoenix_core::domain::db_schema::RecoverySettlementReason>> {
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT settlement.reason
-             FROM conversation_recovery_settlements settlement
-             JOIN messages terminal
-               ON terminal.message_id = settlement.terminal_message_id
-              AND terminal.conversation_id = settlement.conversation_id
-             WHERE settlement.conversation_id = ?1
-               AND terminal.sequence_id = (
-                   SELECT MAX(tail.sequence_id)
-                   FROM messages tail
-                   WHERE tail.conversation_id = settlement.conversation_id
+    ) -> DbResult<phoenix_core::domain::db_schema::RecoveryTailStatus> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT tail.message_id, settlement.reason
+             FROM messages tail
+             LEFT JOIN conversation_recovery_settlements settlement
+               ON settlement.conversation_id = tail.conversation_id
+              AND settlement.terminal_message_id = tail.message_id
+             WHERE tail.conversation_id = ?1
+               AND tail.sequence_id = (
+                   SELECT MAX(candidate.sequence_id)
+                   FROM messages candidate
+                   WHERE candidate.conversation_id = tail.conversation_id
                )",
         )
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
-        reason
+        let Some((terminal_message_id, reason)) = row else {
+            return Ok(phoenix_core::domain::db_schema::RecoveryTailStatus {
+                terminal_message_id: None,
+                settlement: None,
+            });
+        };
+        let settlement = reason
             .map(|value| {
                 phoenix_core::domain::db_schema::RecoverySettlementReason::from_db_str(&value)
                     .ok_or_else(|| {
@@ -9964,7 +9969,11 @@ impl Database {
                         ))
                     })
             })
-            .transpose()
+            .transpose()?;
+        Ok(phoenix_core::domain::db_schema::RecoveryTailStatus {
+            terminal_message_id: Some(terminal_message_id),
+            settlement,
+        })
     }
 
     /// Get messages after a sequence ID
@@ -12503,15 +12512,18 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO conversation_recovery_settlements (
-                 conversation_id, terminal_message_id, reason, created_at
-             ) VALUES ('settled', 'terminal-result', 'retired_tool_call', '2026-01-01')",
+                 conversation_id, terminal_message_id, reason
+             ) VALUES ('settled', 'terminal-result', 'retired_tool_call')",
         )
         .execute(db.pool())
         .await
         .unwrap();
 
         assert_eq!(
-            db.get_current_recovery_settlement("settled").await.unwrap(),
+            db.get_recovery_tail_status("settled")
+                .await
+                .unwrap()
+                .settlement,
             Some(phoenix_core::domain::db_schema::RecoverySettlementReason::RetiredToolCall)
         );
 
@@ -12525,7 +12537,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.get_current_recovery_settlement("settled").await.unwrap(),
+            db.get_recovery_tail_status("settled")
+                .await
+                .unwrap()
+                .settlement,
             None
         );
     }

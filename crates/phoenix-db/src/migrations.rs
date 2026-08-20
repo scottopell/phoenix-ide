@@ -445,52 +445,7 @@ pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-const MIGRATION_069: &str = r"
-CREATE TABLE IF NOT EXISTS conversation_recovery_settlements (
-    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-    terminal_message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-    reason TEXT NOT NULL CHECK (reason IN ('retired_tool_call')),
-    created_at TEXT NOT NULL
-);
-
-CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_insert
-BEFORE INSERT ON conversation_recovery_settlements
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE message_id = NEW.terminal_message_id
-      AND conversation_id = NEW.conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
-END;
-
-CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_update
-BEFORE UPDATE ON conversation_recovery_settlements
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE message_id = NEW.terminal_message_id
-      AND conversation_id = NEW.conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
-END;
-
-INSERT OR IGNORE INTO conversation_recovery_settlements (
-    conversation_id, terminal_message_id, reason, created_at
-)
-SELECT m.conversation_id, m.message_id, 'retired_tool_call', m.created_at
-FROM messages m
-WHERE m.message_id GLOB 'commission-review-retired-[0-9a-f]*'
-  AND LENGTH(m.message_id) = 90
-  AND m.sequence_id = (
-      SELECT MAX(tail.sequence_id)
-      FROM messages tail
-      WHERE tail.conversation_id = m.conversation_id
-  );
-";
-
+const MIGRATION_069: &str = "";
 
 const MIGRATION_068: &str = "";
 
@@ -5638,6 +5593,17 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
 
         if migration.version == 68 {
             retire_commission_review::run(pool, migration.version, migration.name).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 69 {
+            retire_commission_review::backfill_settlements(
+                pool,
+                migration.version,
+                migration.name,
+            )
+            .await?;
             applied += 1;
             continue;
         }

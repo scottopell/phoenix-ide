@@ -139,34 +139,11 @@ fn recovery_result_id(conversation_id: &str, tool_use_id: &str) -> String {
 const RECOVERY_SETTLEMENT_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS conversation_recovery_settlements (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-    terminal_message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    terminal_message_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK (reason IN ('retired_tool_call')),
-    created_at TEXT NOT NULL
+    FOREIGN KEY (conversation_id, terminal_message_id)
+        REFERENCES messages(conversation_id, message_id) ON DELETE CASCADE
 );
-
-CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_insert
-BEFORE INSERT ON conversation_recovery_settlements
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE message_id = NEW.terminal_message_id
-      AND conversation_id = NEW.conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
-END;
-
-CREATE TRIGGER IF NOT EXISTS conversation_recovery_settlements_message_owner_update
-BEFORE UPDATE ON conversation_recovery_settlements
-FOR EACH ROW
-WHEN NOT EXISTS (
-    SELECT 1 FROM messages
-    WHERE message_id = NEW.terminal_message_id
-      AND conversation_id = NEW.conversation_id
-)
-BEGIN
-    SELECT RAISE(ABORT, 'recovery settlement message must belong to conversation');
-END;
 ";
 
 async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
@@ -246,8 +223,8 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
 
         sqlx::query(
             "INSERT INTO conversation_recovery_settlements (
-                 conversation_id, terminal_message_id, reason, created_at
-             ) VALUES (?1, ?2, 'retired_tool_call', STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                 conversation_id, terminal_message_id, reason
+             ) VALUES (?1, ?2, 'retired_tool_call')",
         )
         .bind(&conversation_id)
         .bind(result_message_id)
@@ -459,6 +436,116 @@ async fn rebuild_conversations(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()>
     Ok(())
 }
 
+fn retired_tail_identity(
+    conversation_id: &str,
+    result_message_id: &str,
+    result: MessageContent,
+    assistant: MessageContent,
+) -> Option<String> {
+    let MessageContent::Tool(result) = result else {
+        return None;
+    };
+    if !result.is_error
+        || result.content != "commission_review is unavailable because the capability was retired"
+    {
+        return None;
+    }
+    let MessageContent::Agent(assistant) = assistant else {
+        return None;
+    };
+    let matching_calls = assistant
+        .iter()
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { id, name, .. }
+                    if id.as_str() == result.tool_use_id && name == "commission_review"
+            )
+        })
+        .count();
+    (matching_calls == 1
+        && result_message_id == recovery_result_id(conversation_id, &result.tool_use_id))
+    .then_some(result.tool_use_id)
+}
+
+async fn backfill_current_retired_tails(tx: &mut Transaction<'_, Sqlite>) -> DbResult<()> {
+    let rows = sqlx::query(
+        "SELECT tail.conversation_id,
+                tail.message_id AS result_message_id,
+                tail.content AS result_content,
+                assistant.message_type AS assistant_type,
+                assistant.content AS assistant_content
+         FROM messages tail
+         JOIN messages assistant
+           ON assistant.conversation_id = tail.conversation_id
+          AND assistant.sequence_id = tail.sequence_id - 1
+         WHERE tail.message_type = 'tool'
+           AND tail.sequence_id = (
+               SELECT MAX(candidate.sequence_id)
+               FROM messages candidate
+               WHERE candidate.conversation_id = tail.conversation_id
+           )",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let conversation_id: String = row.get("conversation_id");
+        let result_message_id: String = row.get("result_message_id");
+        let Ok(result_value) = serde_json::from_str(&row.get::<String, _>("result_content")) else {
+            continue;
+        };
+        let Ok(result) = MessageContent::from_stored_json(MessageType::Tool, result_value) else {
+            continue;
+        };
+        let assistant_type: String = row.get("assistant_type");
+        let Ok(assistant_type) =
+            serde_json::from_value::<MessageType>(serde_json::Value::String(assistant_type))
+        else {
+            continue;
+        };
+        let Ok(assistant_value) = serde_json::from_str(&row.get::<String, _>("assistant_content"))
+        else {
+            continue;
+        };
+        let Ok(assistant) = MessageContent::from_stored_json(assistant_type, assistant_value)
+        else {
+            continue;
+        };
+        if retired_tail_identity(&conversation_id, &result_message_id, result, assistant).is_some()
+        {
+            sqlx::query(
+                "INSERT OR IGNORE INTO conversation_recovery_settlements (
+                     conversation_id, terminal_message_id, reason
+                 ) VALUES (?1, ?2, 'retired_tool_call')",
+            )
+            .bind(conversation_id)
+            .bind(result_message_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn backfill_settlements(
+    pool: &SqlitePool,
+    version: u32,
+    name: &str,
+) -> DbResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(RECOVERY_SETTLEMENT_SCHEMA)
+        .execute(&mut *tx)
+        .await?;
+    backfill_current_retired_tails(&mut tx).await?;
+    sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+        .bind(version)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub(super) async fn run(pool: &SqlitePool, version: u32, name: &str) -> DbResult<()> {
     let mut connection = pool.acquire().await?;
     sqlx::query("PRAGMA foreign_keys = OFF")
@@ -638,6 +725,8 @@ mod tests {
             );
             CREATE UNIQUE INDEX messages_conversation_sequence
                 ON messages(conversation_id, sequence_id);
+            CREATE UNIQUE INDEX idx_messages_conversation_message
+                ON messages(conversation_id, message_id);
             ",
         )
         .execute(&pool)
@@ -853,6 +942,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_068_preserves_preexisting_historical_close_snapshot() {
+        let pool = legacy_pool().await;
+        insert_pending(&pool, PENDING_STATE).await;
+        sqlx::raw_sql(
+            r"
+            CREATE TABLE close_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                root_conversation_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE close_attempt_members (
+                attempt_id TEXT NOT NULL REFERENCES close_attempts(attempt_id) ON DELETE CASCADE,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                member_ordinal INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                captured_state_kind TEXT NOT NULL CHECK (captured_state_kind IN (
+                    'idle', 'llm_requesting', 'tool_executing', 'cancelling_tool',
+                    'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
+                    'awaiting_continuation', 'recoverable_continuation_failure',
+                    'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
+                    'awaiting_commission_review_approval', 'context_exhausted', 'handed_off',
+                    'terminal', 'completed', 'failed', 'provisioning', 'creation_failed',
+                    'creation_cancelled', 'seeded_llm_requesting'
+                )),
+                PRIMARY KEY (attempt_id, conversation_id)
+            );
+            INSERT INTO close_attempts VALUES ('historical-attempt', 'pending', 'active');
+            INSERT INTO close_attempt_members VALUES (
+                'historical-attempt', 'pending', 0, 'root_latest',
+                'awaiting_commission_review_approval'
+            );
+            ",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migration(&pool).await.unwrap();
+
+        let captured: String = sqlx::query_scalar(
+            "SELECT captured_state_kind FROM close_attempt_members
+             WHERE attempt_id = 'historical-attempt' AND conversation_id = 'pending'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(captured, "awaiting_commission_review_approval");
+        assert_eq!(
+            phoenix_core::domain::close::CapturedConversationStateKind::from_db_str(&captured),
+            Some(
+                phoenix_core::domain::close::CapturedConversationStateKind::HistoricalAwaitingCommissionReviewApproval
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn migration_069_backfills_tail_settlement_for_already_migrated_database() {
         let pool = legacy_pool().await;
         insert_pending(&pool, PENDING_STATE).await;
@@ -862,8 +1007,7 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::raw_sql(super::super::MIGRATION_069)
-            .execute(&pool)
+        backfill_settlements(&pool, 69, "settle_retired_tool_recovery")
             .await
             .unwrap();
 
@@ -877,6 +1021,62 @@ mod tests {
         .unwrap();
         assert_eq!(settlement.0, recovery_result_id("pending", "tool-review"));
         assert_eq!(settlement.1, "retired_tool_call");
+    }
+
+    #[tokio::test]
+    async fn migration_069_ignores_malformed_and_lookalike_unrelated_tails() {
+        let pool = legacy_pool().await;
+        for id in ["other", "malformed"] {
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, slug, user_initiated, state, state_kind, state_updated_at,
+                     created_at, updated_at
+                 ) VALUES (?1, ?1, 1, '{\"type\":\"idle\"}', 'idle',
+                           '2026-01-01', '2026-01-01', '2026-01-01')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO messages VALUES (
+                'assistant-other', 'other', 1, 'agent',
+                '[{"type":"tool_use","id":"other-tool","name":"commission_review","input":{}}]',
+                NULL, NULL, '2026-01-01'
+            );
+            INSERT INTO messages VALUES (
+                'lookalike-result', 'other', 2, 'tool',
+                '{"tool_use_id":"other-tool","content":"commission_review is unavailable because the capability was retired","is_error":true}',
+                NULL, NULL, '2026-01-01'
+            );
+            INSERT INTO messages VALUES (
+                'assistant-malformed', 'malformed', 1, 'agent',
+                '[{"type":"tool_use","id":"bad-tool","name":"think","input":{}}]',
+                NULL, NULL, '2026-01-01'
+            );
+            INSERT INTO messages VALUES (
+                'result-malformed', 'malformed', 2, 'tool',
+                'not-json', NULL, NULL, '2026-01-01'
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        backfill_settlements(&pool, 69, "settle_retired_tool_recovery")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_recovery_settlements")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

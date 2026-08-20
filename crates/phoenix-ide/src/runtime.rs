@@ -5766,12 +5766,12 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let settlement = self
+        let tail_status = self
             .db
-            .get_current_recovery_settlement(conversation_id)
+            .get_recovery_tail_status(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let decision = recovery::should_auto_continue(&messages, settlement);
+        let decision = recovery::decide_recovery(&messages, &tail_status);
 
         tracing::debug!(
             conv_id = %conversation_id,
