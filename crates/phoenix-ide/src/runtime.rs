@@ -3430,6 +3430,8 @@ impl RuntimeManager {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())
                         })?;
                     }
+                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
+                        .await;
                     self.db
                         .delete_startup_parent_action(&conversation_id)
                         .await

@@ -9262,8 +9262,18 @@ impl Database {
                 if is_parent == 1 {
                     if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
                         sqlx::query(
-                            "UPDATE startup_parent_actions SET action = 'Resume',
-                                 transcript_generation = ?2, created_at = ?3
+                            "UPDATE startup_parent_actions AS a SET action = 'Resume',
+                                 transcript_generation = ?2, created_at = ?3,
+                                 turn_id = (
+                                     SELECT turn_id FROM durable_turns
+                                     WHERE conversation_id = ?1 AND owns_conversation = 1
+                                       AND terminal_kind IS NULL LIMIT 1
+                                 ),
+                                 turn_generation = (
+                                     SELECT generation FROM durable_turns
+                                     WHERE conversation_id = ?1 AND owns_conversation = 1
+                                       AND terminal_kind IS NULL LIMIT 1
+                                 )
                              WHERE conversation_id = ?1 AND action = 'Reconcile'",
                         )
                         .bind(conversation_id)
