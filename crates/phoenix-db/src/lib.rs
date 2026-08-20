@@ -8579,6 +8579,20 @@ impl Database {
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM durable_turns AS obligated_turn
+                   JOIN direct_turn_terminal_obligations AS obligation
+                     ON obligation.turn_id = obligated_turn.turn_id
+                   WHERE obligated_turn.disposition = 'Runtime'
+                     AND (
+                         obligated_turn.conversation_id = conversations.id
+                         OR obligated_turn.conversation_id IN (
+                             SELECT child.id FROM conversations AS child
+                             WHERE child.parent_conversation_id = conversations.id
+                         )
+                     )
+               )
                AND NOT (
                    state_kind = 'llm_requesting'
                    AND (
