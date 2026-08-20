@@ -3675,10 +3675,19 @@ impl RuntimeManager {
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
-        let terminal_recovery = self
+        let terminal_recovery = match self
             .settle_database_terminal_obligation(conversation_id)
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(recovery) => recovery,
+            Err(DatabaseTerminalRecoveryError::Unclassifiable(error)) => {
+                self.signal_fatal_local_authority("runtime_materialization_terminal_recovery");
+                return Err(format!(
+                    "fatal local terminal authority is unclassifiable: {error}"
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let terminal_committed = terminal_recovery.committed();
         self.complete_database_terminal_recovery(conversation_id, terminal_recovery)
             .await;

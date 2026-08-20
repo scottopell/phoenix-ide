@@ -4848,6 +4848,10 @@ where
             }));
         };
 
+        self.storage
+            .establish_parent_reconcile_action(&self.context.conversation_id)
+            .await
+            .map_err(|error| format!("persist parent recovery authority: {error}"))?;
         let mut spawned = Vec::with_capacity(specs.len());
         for spec in specs {
             spawned.push(PendingSubAgent {

@@ -358,6 +358,13 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn establish_parent_reconcile_action(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Update the conversation state (full state as JSON). `state_updated_at`
     /// is the runtime's authoritative phase-entry timestamp; persisting it
     /// (rather than a fresh `now()` at the storage layer) keeps the DB row and
@@ -1667,6 +1674,13 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> Result<(), String> {
+        self.db
+            .establish_parent_reconcile_action(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,
