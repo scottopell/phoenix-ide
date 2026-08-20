@@ -203,6 +203,7 @@ pub async fn serve_https(
     tls_config: ServerConfig,
     socket_activated: bool,
     mut fatal_local_authority_rx: tokio::sync::watch::Receiver<Option<&'static str>>,
+    bash_handles: &crate::tools::bash::BashHandleRegistry,
 ) -> Result<(), Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
     tracing::info!(
@@ -228,6 +229,7 @@ pub async fn serve_https(
             boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 drop(listener);
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping HTTPS without database cleanup");
+                crate::tools::bash::shutdown_kill_tree(bash_handles).await;
                 return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }
             accepted = listener.accept() => {

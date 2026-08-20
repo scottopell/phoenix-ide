@@ -8490,7 +8490,13 @@ impl Database {
         Ok(sqlx::query_scalar(
             "SELECT DISTINCT t.conversation_id
              FROM durable_turns AS t
-             JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id",
+             JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
+             UNION
+             SELECT DISTINCT child.parent_conversation_id
+             FROM durable_turns AS t
+             JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
+             JOIN conversations AS child ON child.id = t.conversation_id
+             WHERE child.parent_conversation_id IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?

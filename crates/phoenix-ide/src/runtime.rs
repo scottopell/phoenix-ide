@@ -3159,6 +3159,9 @@ impl RuntimeManager {
         else {
             return;
         };
+        if !projection.state.is_terminal() {
+            return;
+        }
         if let Some(broadcaster) = self
             .existing_conversation_broadcaster(conversation_id)
             .await
@@ -4475,6 +4478,16 @@ impl RuntimeManager {
         }
 
         match &conv.state {
+            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. }
+                if self
+                    .db
+                    .terminal_obligated_conversation_ids()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .contains(conversation_id) =>
+            {
+                return Ok((conv.state, row_state_updated_at, false));
+            }
             ConvState::Provisioning { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::RecoverableContinuationFailure { .. }
@@ -7094,12 +7107,6 @@ mod scope_liveness_tests {
         assert!(terminal_events.try_recv().is_err());
         mgr.complete_database_terminal_recovery(conversation_id, recovery)
             .await;
-        assert!(matches!(
-            terminal_events
-                .try_recv()
-                .expect("terminal lifecycle event"),
-            SseEvent::ConversationBecameTerminal { .. }
-        ));
         assert!(terminal_events.try_recv().is_err());
 
         let durable_turn = repo
