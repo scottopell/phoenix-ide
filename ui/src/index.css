@@ -169,8 +169,9 @@ body.app-viewport-active #root {
     padding-left: env(safe-area-inset-left, 0);
   }
 
-  #conversation-list.mobile-list-density {
-    padding-top: calc(16px + env(safe-area-inset-top, 0));
+  .list-page #main-area {
+    padding-top: env(safe-area-inset-top, 0);
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
   #conversation-nav {

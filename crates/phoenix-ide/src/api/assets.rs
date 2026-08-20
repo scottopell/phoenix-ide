@@ -150,6 +150,23 @@ mod tests {
     }
 
     #[test]
+    fn home_screen_assets_are_embedded() {
+        for path in [
+            "manifest.webmanifest",
+            "apple-touch-icon.png",
+            "icon-192.png",
+            "icon-512.png",
+        ] {
+            assert!(Assets::get(path).is_some(), "missing embedded asset: {path}");
+        }
+
+        let index = Assets::get("index.html").expect("embedded index.html");
+        let html = String::from_utf8(index.data.to_vec()).expect("index.html is UTF-8");
+        assert!(html.contains("/manifest.webmanifest"));
+        assert!(html.contains("/apple-touch-icon.png"));
+    }
+
+    #[test]
     fn content_addressed_assets_are_immutable() {
         let response = asset_response(b"body {}".to_vec(), "text/css");
 
