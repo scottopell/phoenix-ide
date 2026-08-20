@@ -1191,6 +1191,7 @@ pub enum StartupParentAction {
 pub struct StartupParentActionRecord {
     pub conversation_id: String,
     pub action: StartupParentAction,
+    pub transcript_generation: i64,
     pub turn_id: Option<phoenix_workflow::TurnAuthorityId>,
     pub turn_generation: Option<u64>,
 }
@@ -9050,7 +9051,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
         let rows = sqlx::query(
-            "SELECT a.conversation_id, a.action, a.turn_id, a.turn_generation
+            "SELECT a.conversation_id, a.action, a.transcript_generation, a.turn_id, a.turn_generation
              FROM startup_parent_actions AS a
              JOIN conversations AS c ON c.id = a.conversation_id
              WHERE a.action IN ('Reconcile', 'Cancel')
@@ -9076,6 +9077,7 @@ impl Database {
                 Ok(StartupParentActionRecord {
                     conversation_id: row.try_get("conversation_id")?,
                     action,
+                    transcript_generation: row.try_get("transcript_generation")?,
                     turn_id: row.try_get::<Option<i64>, _>("turn_id")?.map(|id| {
                         phoenix_workflow::TurnAuthorityId(u64::try_from(id).unwrap_or(0))
                     }),

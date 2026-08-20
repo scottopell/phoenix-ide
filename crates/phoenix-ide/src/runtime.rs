@@ -278,7 +278,7 @@ pub struct RuntimeManager {
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
-    consumed_startup_parent_actions: RwLock<HashSet<String>>,
+    consumed_startup_parent_actions: RwLock<HashSet<(String, i64)>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -3273,6 +3273,9 @@ impl RuntimeManager {
                 .await
                 .remove(&reconciliation.conversation_id);
         }
+        if startup {
+            crate::reconcile_worktrees(&self.db).await;
+        }
         let actions = self
             .db
             .list_startup_parent_actions()
@@ -3284,25 +3287,21 @@ impl RuntimeManager {
             match action_record.action {
                 phoenix_db::StartupParentAction::Reconcile => {
                     let ids = HashSet::from([conversation_id.clone()]);
-                    self.db
+                    let reconciled = self
+                        .db
                         .reconcile_startup_obligated_parents(&ids, startup)
                         .await
                         .map_err(|error| {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())
                         })?;
-                    self.db
-                        .delete_startup_parent_action(&conversation_id)
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?;
+                    let _ = reconciled;
                 }
                 phoenix_db::StartupParentAction::Resume => {
                     if self
                         .consumed_startup_parent_actions
                         .read()
                         .await
-                        .contains(&conversation_id)
+                        .contains(&(conversation_id.clone(), action_record.transcript_generation))
                     {
                         continue;
                     }
@@ -3326,6 +3325,42 @@ impl RuntimeManager {
                             })?;
                         continue;
                     }
+                    let projection =
+                        self.db
+                            .get_conversation(&conversation_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                    if projection.state.is_terminal() {
+                        if let Some(turn) = current {
+                            repo.terminalize_authoritative_turn(
+                                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                                    command: phoenix_workflow::TurnCommand::Cancel {
+                                        turn_id: turn.id,
+                                        expected_generation: turn.generation,
+                                    },
+                                    projection: Some(
+                                        phoenix_db::workflow::PersistedConversationProjection {
+                                            state: projection.state,
+                                            state_updated_at: projection.state_updated_at,
+                                        },
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        }
+                        self.db
+                            .delete_startup_parent_action(&conversation_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        continue;
+                    }
                     self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
                         .await;
                     self.get_or_create(&conversation_id)
@@ -3338,7 +3373,7 @@ impl RuntimeManager {
                     self.consumed_startup_parent_actions
                         .write()
                         .await
-                        .insert(conversation_id.clone());
+                        .insert((conversation_id.clone(), action_record.transcript_generation));
                 }
                 phoenix_db::StartupParentAction::Cancel => {
                     let authority =
@@ -3395,9 +3430,6 @@ impl RuntimeManager {
                         })?;
                 }
             }
-        }
-        if startup {
-            crate::reconcile_worktrees(&self.db).await;
         }
         Ok(())
     }
