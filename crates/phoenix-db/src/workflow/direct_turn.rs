@@ -1713,6 +1713,22 @@ impl WorkflowRepository {
                 actual: turn.generation,
             }));
         }
+        if input.projection.is_none() {
+            let obligation_exists: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM direct_turn_terminal_obligations WHERE turn_id = ?1
+                 )",
+            )
+            .bind(to_i64(turn_id.0, "turn_id")?)
+            .fetch_one(&mut *tx.tx)
+            .await?;
+            if obligation_exists != 0 {
+                return Err(DbError::Serialization(
+                    "projection-less terminalization cannot consume an established obligation"
+                        .to_string(),
+                ));
+            }
+        }
         let updated = sqlx::query(
             "UPDATE durable_turns
              SET generation = generation + 1, terminal_kind = ?3,

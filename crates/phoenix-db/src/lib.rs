@@ -8702,6 +8702,7 @@ impl Database {
         outcomes
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn materialize_in_flight_tool_rounds(&self, now: &DateTime<Utc>) -> DbResult<()> {
         use phoenix_core::domain::sm_state::ConvState;
 
@@ -8715,7 +8716,14 @@ impl Database {
                    SELECT 1
                    FROM durable_turns AS t
                    JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
-                   WHERE t.conversation_id = c.id AND t.disposition = 'Runtime'
+                   WHERE t.disposition = 'Runtime'
+                     AND (
+                         t.conversation_id = c.id
+                         OR t.conversation_id IN (
+                             SELECT child.id FROM conversations AS child
+                             WHERE child.parent_conversation_id = c.id
+                         )
+                     )
                )",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
@@ -8864,7 +8872,14 @@ impl Database {
                    SELECT 1
                    FROM durable_turns AS t
                    JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
-                   WHERE t.conversation_id = c.id AND t.disposition = 'Runtime'
+                   WHERE t.disposition = 'Runtime'
+                     AND (
+                         t.conversation_id = c.id
+                         OR t.conversation_id IN (
+                             SELECT child.id FROM conversations AS child
+                             WHERE child.parent_conversation_id = c.id
+                         )
+                     )
                )",
         )
         .try_map(|row: SqliteRow| row.try_get("id"))
