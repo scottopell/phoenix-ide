@@ -275,6 +275,7 @@ pub struct RuntimeManager {
     /// it. Without inheritance the clients would sit on a dead channel until
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
+    startup_obligated_conversations: RwLock<HashSet<String>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -1621,6 +1622,7 @@ impl RuntimeManager {
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
+            startup_obligated_conversations: RwLock::new(HashSet::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
@@ -2505,6 +2507,10 @@ impl RuntimeManager {
         let _ = self.direct_turn_kick_tx.send(next);
     }
 
+    pub async fn set_startup_obligated_conversations(&self, conversation_ids: HashSet<String>) {
+        *self.startup_obligated_conversations.write().await = conversation_ids;
+    }
+
     pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
         let rx = self.direct_turn_kick_rx.write().await.take();
         let Some(rx) = rx else {
@@ -3160,6 +3166,17 @@ impl RuntimeManager {
             return;
         };
         if !projection.state.is_terminal() {
+            if let Some(broadcaster) = self
+                .existing_conversation_broadcaster(conversation_id)
+                .await
+            {
+                let _ = broadcaster.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
+                    presentation_mode: projection.state.presentation_mode().to_string(),
+                    state: projection.state.clone(),
+                    state_updated_at: projection.state_updated_at,
+                });
+            }
             return;
         }
         if let Some(broadcaster) = self
@@ -4480,10 +4497,9 @@ impl RuntimeManager {
         match &conv.state {
             ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. }
                 if self
-                    .db
-                    .terminal_obligated_conversation_ids()
+                    .startup_obligated_conversations
+                    .read()
                     .await
-                    .map_err(|error| error.to_string())?
                     .contains(conversation_id) =>
             {
                 return Ok((conv.state, row_state_updated_at, false));
@@ -7107,6 +7123,13 @@ mod scope_liveness_tests {
         assert!(terminal_events.try_recv().is_err());
         mgr.complete_database_terminal_recovery(conversation_id, recovery)
             .await;
+        assert!(matches!(
+            terminal_events.try_recv(),
+            Ok(SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            })
+        ));
         assert!(terminal_events.try_recv().is_err());
 
         let durable_turn = repo

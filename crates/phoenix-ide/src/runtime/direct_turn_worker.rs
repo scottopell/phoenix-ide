@@ -213,15 +213,28 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
     pub(crate) async fn run_once(
         &self,
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
-        for obligation in self
-            .terminal_discovery
-            .list(DISCOVERY_BATCH_LIMIT)
-            .await
-            .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?
-        {
-            self.dispatcher
-                .settle_terminal_obligation(&obligation.conversation.0)
-                .await?;
+        let mut settled_obligations = std::collections::HashSet::new();
+        loop {
+            let obligations = self
+                .terminal_discovery
+                .list(DISCOVERY_BATCH_LIMIT)
+                .await
+                .map_err(crate::runtime::DatabaseTerminalRecoveryError::Retryable)?;
+            if obligations.is_empty() {
+                break;
+            }
+            let mut made_progress = false;
+            for obligation in obligations {
+                if settled_obligations.insert(obligation.turn_id) {
+                    made_progress = true;
+                    self.dispatcher
+                        .settle_terminal_obligation(&obligation.conversation.0)
+                        .await?;
+                }
+            }
+            if !made_progress {
+                break;
+            }
         }
 
         let mut cursor = None;
@@ -1455,7 +1468,7 @@ mod tests {
         );
         assert_eq!(
             discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            2
+            3
         );
         drop(kick_tx);
         handle.await.unwrap().unwrap();
@@ -1509,7 +1522,7 @@ mod tests {
         assert!(dispatcher.events.lock().unwrap().is_empty());
         assert_eq!(
             discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            3
+            4
         );
         assert_eq!(
             sleeps.lock().unwrap().as_slice(),
