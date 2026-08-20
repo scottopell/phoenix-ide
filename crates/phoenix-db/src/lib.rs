@@ -1187,6 +1187,14 @@ pub enum StartupParentAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupParentActionRecord {
+    pub conversation_id: String,
+    pub action: StartupParentAction,
+    pub turn_id: Option<phoenix_workflow::TurnAuthorityId>,
+    pub turn_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupParentReconciliation {
     pub conversation_id: String,
 }
@@ -8551,7 +8559,11 @@ impl Database {
         // persistence happens at end-of-round). Without this, a deploy/crash
         // mid-round silently drops them and rewinds the conversation to the
         // prior user turn (REQ-BED-007, F1).
-        self.materialize_in_flight_tool_rounds(&now, None).await?;
+        let materialized = self.materialize_in_flight_tool_rounds(&now, None).await?;
+        if !materialized.is_empty() {
+            self.reconcile_startup_obligated_parents(&materialized, true)
+                .await?;
+        }
 
         // Then repair any orphaned tool_use blocks. After materialization the
         // round above is fully paired, so this is a no-op for it; it remains the
@@ -8742,7 +8754,7 @@ impl Database {
         &self,
         now: &DateTime<Utc>,
         only_conversations: Option<&std::collections::HashSet<String>>,
-    ) -> DbResult<()> {
+    ) -> DbResult<std::collections::HashSet<String>> {
         use phoenix_core::domain::sm_state::ConvState;
 
         // Both `tool_executing` and `cancelling_tool` rows carry an
@@ -8775,6 +8787,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        let mut materialized = std::collections::HashSet::new();
         for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
@@ -8852,6 +8865,7 @@ impl Database {
 
             self.persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
                 .await?;
+            materialized.insert(conv_id.clone());
 
             let interrupted_state = serde_json::to_string(&ConvState::Failed {
                 error: "Sub-agent interrupted by server restart".to_string(),
@@ -8889,7 +8903,7 @@ impl Database {
             );
         }
 
-        Ok(())
+        Ok(materialized)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8988,11 +9002,16 @@ impl Database {
         .await?;
         sqlx::query(
             "INSERT INTO startup_parent_actions
-                 (conversation_id, action, transcript_generation, created_at)
-             SELECT ?1, ?2, transcript_generation, ?3
-             FROM conversations WHERE id = ?1
+                 (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
+             SELECT c.id, ?2, c.transcript_generation, t.turn_id, t.generation, ?3
+             FROM conversations AS c
+             LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE c.id = ?1
              ON CONFLICT(conversation_id) DO UPDATE SET action = excluded.action,
                  transcript_generation = excluded.transcript_generation,
+                 turn_id = excluded.turn_id,
+                 turn_generation = excluded.turn_generation,
                  created_at = excluded.created_at",
         )
         .bind(conversation_id)
@@ -9012,21 +9031,24 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when stale-action cleanup or action decoding fails.
-    pub async fn list_startup_parent_actions(
-        &self,
-    ) -> DbResult<Vec<(String, StartupParentAction)>> {
+    pub async fn list_startup_parent_actions(&self) -> DbResult<Vec<StartupParentActionRecord>> {
         sqlx::query(
             "DELETE FROM startup_parent_actions
              WHERE action = 'Resume' AND EXISTS (
                  SELECT 1 FROM conversations AS c
                  WHERE c.id = startup_parent_actions.conversation_id
-                   AND c.transcript_generation != startup_parent_actions.transcript_generation
+                   AND (c.transcript_generation != startup_parent_actions.transcript_generation
+                       OR EXISTS (
+                           SELECT 1 FROM durable_turns AS t
+                           WHERE t.turn_id = startup_parent_actions.turn_id
+                             AND t.terminal_kind IS NOT NULL
+                       ))
              )",
         )
         .execute(&self.pool)
         .await?;
         let rows = sqlx::query(
-            "SELECT a.conversation_id, a.action
+            "SELECT a.conversation_id, a.action, a.turn_id, a.turn_generation
              FROM startup_parent_actions AS a
              JOIN conversations AS c ON c.id = a.conversation_id
              WHERE a.action = 'Cancel'
@@ -9048,7 +9070,16 @@ impl Database {
                         )))
                     }
                 };
-                Ok((row.try_get("conversation_id")?, action))
+                Ok(StartupParentActionRecord {
+                    conversation_id: row.try_get("conversation_id")?,
+                    action,
+                    turn_id: row.try_get::<Option<i64>, _>("turn_id")?.map(|id| {
+                        phoenix_workflow::TurnAuthorityId(u64::try_from(id).unwrap_or(0))
+                    }),
+                    turn_generation: row
+                        .try_get::<Option<i64>, _>("turn_generation")?
+                        .map(|generation| u64::try_from(generation).unwrap_or(0)),
+                })
             })
             .collect()
     }
@@ -9077,9 +9108,11 @@ impl Database {
     pub async fn reconcile_startup_obligated_parents(
         &self,
         conversation_ids: &std::collections::HashSet<String>,
+        synthesize_startup_interruptions: bool,
     ) -> DbResult<Vec<StartupParentReconciliation>> {
         let now = Utc::now();
-        self.materialize_in_flight_tool_rounds(&now, Some(conversation_ids))
+        let _ = self
+            .materialize_in_flight_tool_rounds(&now, Some(conversation_ids))
             .await?;
         let idle_json = serde_json::to_string(&ConvState::Idle)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -9151,6 +9184,13 @@ impl Database {
             )) = pending_fan_in
             {
                 let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await?;
+                if !synthesize_startup_interruptions
+                    && pending
+                        .iter()
+                        .any(|agent| !outcomes.contains_key(&agent.agent_id))
+                {
+                    continue;
+                }
                 for agent in pending {
                     let outcome = if let Some(outcome) = outcomes.get(&agent.agent_id).cloned() {
                         outcome
@@ -9240,11 +9280,16 @@ impl Database {
             if updated.rows_affected() == 1 {
                 sqlx::query(
                     "INSERT INTO startup_parent_actions
-                         (conversation_id, action, transcript_generation, created_at)
-                     SELECT ?1, 'Resume', transcript_generation, ?2
-                     FROM conversations WHERE id = ?1
+                         (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
+                     SELECT c.id, 'Resume', c.transcript_generation, t.turn_id, t.generation, ?2
+                     FROM conversations AS c
+                     LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
+                         AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+                     WHERE c.id = ?1
                      ON CONFLICT(conversation_id) DO UPDATE SET action = 'Resume',
                          transcript_generation = excluded.transcript_generation,
+                         turn_id = excluded.turn_id,
+                         turn_generation = excluded.turn_generation,
                          created_at = excluded.created_at",
                 )
                 .bind(conversation_id)
@@ -17880,13 +17925,16 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        let reconciled = db
+            .reconcile_startup_obligated_parents(&ids, true)
+            .await
+            .unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
-        assert_eq!(
-            db.list_startup_parent_actions().await.unwrap(),
-            vec![(parent_id.to_string(), StartupParentAction::Resume)]
-        );
+        let actions = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].conversation_id, parent_id);
+        assert_eq!(actions[0].action, StartupParentAction::Resume);
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::Idle
@@ -17907,13 +17955,16 @@ mod tests {
         assert!(content.content.contains("exact recovered result"));
         assert!(!content.content.contains("interrupted by server restart"));
 
-        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        let reconciled = db
+            .reconcile_startup_obligated_parents(&ids, true)
+            .await
+            .unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
-        assert_eq!(
-            db.list_startup_parent_actions().await.unwrap(),
-            vec![(parent_id.to_string(), StartupParentAction::Resume)]
-        );
+        let actions = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].conversation_id, parent_id);
+        assert_eq!(actions[0].action, StartupParentAction::Resume);
         assert_eq!(db.get_messages(parent_id).await.unwrap().len(), 3);
     }
 
@@ -18041,7 +18092,9 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        db.reconcile_startup_obligated_parents(&ids, true)
+            .await
+            .unwrap();
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -18156,7 +18209,7 @@ mod tests {
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
         let error = db
-            .reconcile_startup_obligated_parents(&ids)
+            .reconcile_startup_obligated_parents(&ids, true)
             .await
             .expect_err("unreadable terminal evidence must remain retryable");
         assert!(error.to_string().contains("decode pending sub-agent"));
@@ -18214,20 +18267,21 @@ mod tests {
             .unwrap();
             let ids = std::collections::HashSet::from([parent_id.clone()]);
 
-            let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+            let reconciled = db
+                .reconcile_startup_obligated_parents(&ids, true)
+                .await
+                .unwrap();
             assert_eq!(reconciled.len(), 1);
             let actions = db.list_startup_parent_actions().await.unwrap();
             assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].conversation_id, parent_id);
             assert_eq!(
-                actions[0],
-                (
-                    parent_id.clone(),
-                    if expects_request {
-                        StartupParentAction::Resume
-                    } else {
-                        StartupParentAction::Cancel
-                    }
-                )
+                actions[0].action,
+                if expects_request {
+                    StartupParentAction::Resume
+                } else {
+                    StartupParentAction::Cancel
+                }
             );
             let state = db.get_conversation(&parent_id).await.unwrap().state;
             assert_eq!(

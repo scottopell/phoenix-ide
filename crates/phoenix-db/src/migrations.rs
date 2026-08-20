@@ -440,6 +440,8 @@ CREATE TABLE startup_parent_actions (
     action TEXT NOT NULL
         CHECK (action IN ('Resume', 'Cancel')),
     transcript_generation INTEGER NOT NULL,
+    turn_id INTEGER REFERENCES durable_turns(turn_id) ON DELETE SET NULL,
+    turn_generation INTEGER,
     created_at TEXT NOT NULL
 );
 ";

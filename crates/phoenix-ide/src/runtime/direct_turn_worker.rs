@@ -122,6 +122,7 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
+    startup_reconciliation: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -145,6 +146,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
+            startup_reconciliation: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -237,7 +239,10 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             }
         }
 
-        self.dispatcher.reconcile_startup_parents().await?;
+        let startup = self
+            .startup_reconciliation
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        self.dispatcher.reconcile_startup_parents(startup).await?;
 
         let mut cursor = None;
         loop {
@@ -445,6 +450,7 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
 
     async fn reconcile_startup_parents(
         &self,
+        _startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         Ok(())
     }
@@ -482,8 +488,11 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
 
     async fn reconcile_startup_parents(
         &self,
+        startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
-        self.manager.reconcile_startup_obligated_parents().await
+        self.manager
+            .reconcile_startup_obligated_parents(startup)
+            .await
     }
 
     async fn settle_terminal_obligation(

@@ -132,6 +132,8 @@ pub enum EvictionReason {
     CreationProvisioned,
     /// A one-shot steering wake found no durable work and its idle runtime can retire.
     SteeringReconciliation,
+    /// Durable recovery replaced an in-memory state with its exact DB projection.
+    RecoveryReconciliation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3251,13 +3253,14 @@ impl RuntimeManager {
 
     pub(crate) async fn reconcile_startup_obligated_parents(
         self: &Arc<Self>,
+        startup: bool,
     ) -> Result<(), DatabaseTerminalRecoveryError> {
         let conversation_ids = self.startup_obligated_conversations.read().await.clone();
         let reconciled = if conversation_ids.is_empty() {
             Vec::new()
         } else {
             self.db
-                .reconcile_startup_obligated_parents(&conversation_ids)
+                .reconcile_startup_obligated_parents(&conversation_ids, startup)
                 .await
                 .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
         };
@@ -3273,9 +3276,12 @@ impl RuntimeManager {
             .await
             .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        for (conversation_id, action) in actions {
-            match action {
+        for action_record in actions {
+            let conversation_id = action_record.conversation_id.clone();
+            match action_record.action {
                 phoenix_db::StartupParentAction::Resume => {
+                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
+                        .await;
                     self.get_or_create(&conversation_id)
                         .await
                         .map_err(|error| {
@@ -3294,6 +3300,17 @@ impl RuntimeManager {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())
                         })?
                     {
+                        if action_record.turn_id != Some(turn.id)
+                            || action_record.turn_generation != Some(turn.generation)
+                        {
+                            self.db
+                                .delete_startup_parent_action(&conversation_id)
+                                .await
+                                .map_err(|error| {
+                                    DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                })?;
+                            continue;
+                        }
                         let conversation = self
                             .db
                             .get_conversation(&conversation_id)
@@ -4122,7 +4139,9 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
-            EvictionReason::CreationProvisioned | EvictionReason::SteeringReconciliation => {}
+            EvictionReason::CreationProvisioned
+            | EvictionReason::SteeringReconciliation
+            | EvictionReason::RecoveryReconciliation => {}
         }
 
         if let Some(handle) = old {
@@ -5962,15 +5981,15 @@ mod scope_liveness_tests {
             .await
             .is_empty());
 
-        manager.reconcile_startup_obligated_parents().await.unwrap();
+        manager
+            .reconcile_startup_obligated_parents(true)
+            .await
+            .unwrap();
         assert!(manager.try_get_handle(conversation_id).await.is_some());
-        assert_eq!(
-            manager.db().list_startup_parent_actions().await.unwrap(),
-            vec![(
-                conversation_id.to_string(),
-                phoenix_db::StartupParentAction::Resume
-            )]
-        );
+        let actions = manager.db().list_startup_parent_actions().await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].conversation_id, conversation_id);
+        assert_eq!(actions[0].action, phoenix_db::StartupParentAction::Resume);
     }
 
     #[tokio::test]
