@@ -398,12 +398,12 @@ rule UserClosesActiveViewer {
 --   identity (file path), drop ephemeral provenance (which lines
 --   were modified by the message that opened it).
 rule UrlHydratesNone {
-    when: UrlSlotChanged(slot, none, _, _, _, _, _)
+    when: UrlSlotChanged(slot, none, _, _, _, _)
     ensures: slot.kind = none
 }
 
 rule UrlHydratesProse {
-    when: UrlSlotChanged(slot, prose, file, presentation, _, _, _)
+    when: UrlSlotChanged(slot, prose, file, presentation, _, _)
     requires: file != null and presentation != null
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
@@ -412,14 +412,14 @@ rule UrlHydratesProse {
 }
 
 rule UrlHydratesDiff {
-    when: UrlSlotChanged(slot, diff, _, presentation, _, _, _)
+    when: UrlSlotChanged(slot, diff, _, presentation, _, _)
     requires: presentation != null
     ensures: slot.kind = diff
     ensures: slot.diff_presentation = presentation
 }
 
 rule UrlHydratesBrowser {
-    when: UrlSlotChanged(slot, browser, _, _, _, _, _)
+    when: UrlSlotChanged(slot, browser, _, _, _, _)
     -- Explicit URL truth is independent of browser_session_active: a cold
     -- reload or shared link may name the browser viewer after its session has
     -- died. Lifecycle-aware convenience storage is handled separately and
@@ -428,14 +428,14 @@ rule UrlHydratesBrowser {
 }
 
 rule UrlHydratesInspect {
-    when: UrlSlotChanged(slot, inspect, _, _, handle, _, _)
+    when: UrlSlotChanged(slot, inspect, _, _, handle, _)
     requires: handle != null
     ensures: slot.kind = inspect
     ensures: slot.inspect_handle = handle
 }
 
 rule UrlHydratesMessage {
-    when: UrlSlotChanged(slot, message, _, presentation, _, message_ref, _)
+    when: UrlSlotChanged(slot, message, _, presentation, _, message_ref)
     requires: message_ref != null and presentation != null
     ensures: slot.kind = message
     ensures: slot.message_ref = message_ref
@@ -593,31 +593,31 @@ rule UserOpensMessageWritesStorage {
 }
 
 rule UrlHydratesProseWritesStorage {
-    when: UrlSlotChanged(slot, prose, file, _, _, _, _)
+    when: UrlSlotChanged(slot, prose, file, _, _, _)
     requires: file != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesDiffWritesStorage {
-    when: UrlSlotChanged(slot, diff, _, presentation, _, _, _)
+    when: UrlSlotChanged(slot, diff, _, presentation, _, _)
     requires: presentation != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesBrowserWritesStorage {
-    when: UrlSlotChanged(slot, browser, _, _, _, _, _)
+    when: UrlSlotChanged(slot, browser, _, _, _, _)
     requires: slot.conversation.browser_session_active
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesInspectWritesStorage {
-    when: UrlSlotChanged(slot, inspect, _, _, handle, _, _)
+    when: UrlSlotChanged(slot, inspect, _, _, handle, _)
     requires: handle != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesMessageWritesStorage {
-    when: UrlSlotChanged(slot, message, _, _, _, message_ref, _)
+    when: UrlSlotChanged(slot, message, _, _, _, message_ref)
     requires: message_ref != null
     ensures: ViewerSnapshotPersisted(slot)
 }

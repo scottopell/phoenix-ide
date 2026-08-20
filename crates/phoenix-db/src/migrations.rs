@@ -11,6 +11,8 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod retire_commission_review;
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -438,54 +440,7 @@ pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-const MIGRATION_068: &str = r#"
-INSERT OR IGNORE INTO messages (
-    message_id, conversation_id, sequence_id, message_type,
-    content, display_data, usage_data, created_at
-)
-SELECT
-    json_extract(c.state, '$.assistant_message.message_id'),
-    c.id,
-    COALESCE((SELECT MAX(m.sequence_id) FROM messages m WHERE m.conversation_id = c.id), 0) + 1,
-    'agent',
-    json_extract(c.state, '$.assistant_message.content'),
-    json_extract(c.state, '$.assistant_message.display_data'),
-    json_extract(c.state, '$.assistant_message.usage'),
-    COALESCE(json_extract(c.state, '$.assistant_message.created_at'), c.state_updated_at)
-FROM conversations c
-WHERE c.state_kind = 'awaiting_commission_review_approval';
-
-INSERT INTO messages (
-    message_id, conversation_id, sequence_id, message_type, content, created_at
-)
-SELECT
-    lower(hex(randomblob(16))),
-    c.id,
-    COALESCE((SELECT MAX(m.sequence_id) FROM messages m WHERE m.conversation_id = c.id), 0) + 1,
-    'tool',
-    json_object(
-        'tool_use_id', json_extract(c.state, '$.tool_use_id'),
-        'content', 'commission_review is unavailable because the capability was retired',
-        'is_error', json('true')
-    ),
-    STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-FROM conversations c
-WHERE c.state_kind = 'awaiting_commission_review_approval'
-  AND NOT EXISTS (
-      SELECT 1
-      FROM messages m
-      WHERE m.conversation_id = c.id
-        AND m.message_type = 'tool'
-        AND json_extract(m.content, '$.tool_use_id') = json_extract(c.state, '$.tool_use_id')
-  );
-
-UPDATE conversations
-SET state = '{"type":"idle"}',
-    state_kind = 'idle',
-    state_updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now'),
-    updated_at = STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE state_kind = 'awaiting_commission_review_approval';
-"#;
+const MIGRATION_068: &str = "";
 
 const MIGRATION_067: &str = r"
 CREATE TABLE startup_parent_actions (
@@ -5628,6 +5583,12 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             name = migration.name,
             "Applying database migration"
         );
+
+        if migration.version == 68 {
+            retire_commission_review::run(pool, migration.version, migration.name).await?;
+            applied += 1;
+            continue;
+        }
 
         // Apply the migration body and its version record in one transaction so
         // a crash mid-migration leaves the database all-or-nothing: a partially

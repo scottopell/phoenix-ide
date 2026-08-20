@@ -19,7 +19,7 @@ Ordinary GitHub pull-request review, task approval, message/prose review, and di
 
 ## Verification
 
-- `migration_066_retires_pending_commission_review_without_dispatch_or_success` covers idempotent pending-state recovery.
+- Typed migration regressions cover representative recovery, malformed-state rollback, stale success/error reconciliation, assistant/result ordering, fresh/upgraded schema parity, and CHECK rejection of the unsupported state.
 - Tool registry and stale-input tests cover absence from discovery and bounded unknown-tool handling.
 - `historical retired tool rendering` covers generic read-only transcript display without a specialized viewer action.
 - Viewer-slot, task approval, message viewer, diff viewer, route-focus, and iOS checks guard unrelated review and viewing behavior.
