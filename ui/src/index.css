@@ -163,6 +163,22 @@ body.app-viewport-active #root {
   height: 100dvh; /* dynamic viewport height - accounts for iOS Safari URL bar */
 }
 
+@media (display-mode: standalone) {
+  #app {
+    padding-right: env(safe-area-inset-right, 0);
+    padding-left: env(safe-area-inset-left, 0);
+  }
+
+  #conversation-list.mobile-list-density {
+    padding-top: calc(16px + env(safe-area-inset-top, 0));
+  }
+
+  #conversation-nav {
+    height: calc(var(--breadcrumb-height) + env(safe-area-inset-top, 0));
+    padding-top: env(safe-area-inset-top, 0);
+  }
+}
+
 .app-viewport #app {
   height: 100%;
   min-height: 0;
