@@ -8538,7 +8538,7 @@ impl Database {
         // persistence happens at end-of-round). Without this, a deploy/crash
         // mid-round silently drops them and rewinds the conversation to the
         // prior user turn (REQ-BED-007, F1).
-        self.materialize_in_flight_tool_rounds(&now).await?;
+        self.materialize_in_flight_tool_rounds(&now, None).await?;
 
         // Then repair any orphaned tool_use blocks. After materialization the
         // round above is fully paired, so this is a no-op for it; it remains the
@@ -8723,7 +8723,11 @@ impl Database {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn materialize_in_flight_tool_rounds(&self, now: &DateTime<Utc>) -> DbResult<()> {
+    async fn materialize_in_flight_tool_rounds(
+        &self,
+        now: &DateTime<Utc>,
+        only_conversations: Option<&std::collections::HashSet<String>>,
+    ) -> DbResult<()> {
         use phoenix_core::domain::sm_state::ConvState;
 
         // Both `tool_executing` and `cancelling_tool` rows carry an
@@ -8751,6 +8755,9 @@ impl Database {
         .await?;
 
         for (conv_id, state_json) in conv_rows {
+            if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
+                continue;
+            }
             let state: ConvState = match serde_json::from_str(&state_json) {
                 Ok(s) => s,
                 Err(e) => {
@@ -8853,6 +8860,166 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Materialize parent progress that was deliberately preserved while a
+    /// child terminal obligation still owned the exact outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any parent transcript or state cannot be read or
+    /// atomically persisted.
+    #[allow(clippy::too_many_lines)]
+    pub async fn reconcile_startup_obligated_parents(
+        &self,
+        conversation_ids: &std::collections::HashSet<String>,
+    ) -> DbResult<Vec<String>> {
+        let now = Utc::now();
+        self.materialize_in_flight_tool_rounds(&now, Some(conversation_ids))
+            .await?;
+        let idle_json = serde_json::to_string(&ConvState::Idle)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let mut reconciled = Vec::new();
+        for conversation_id in conversation_ids {
+            let conversation = match self.get_conversation(conversation_id).await {
+                Ok(conversation) => conversation,
+                Err(DbError::ConversationNotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if let ConvState::AwaitingSubAgents {
+                pending,
+                mut completed_results,
+                spawn_tool_id,
+            } = conversation.state.clone()
+            {
+                let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await;
+                if outcomes.len() == pending.len() {
+                    completed_results.extend(pending.into_iter().filter_map(|agent| {
+                        outcomes.get(&agent.agent_id).cloned().map(|outcome| {
+                            phoenix_core::domain::sm_state::SubAgentResult {
+                                agent_id: agent.agent_id,
+                                task: agent.task,
+                                outcome,
+                            }
+                        })
+                    }));
+                    let (content, display_data) = build_sub_agent_fan_in(&completed_results);
+                    let mut tx = self.pool.begin().await?;
+                    if let Some(tool_id) = spawn_tool_id {
+                        let message_id = tool_result_message_id(&tool_id);
+                        let stored_content = serde_json::to_string(
+                            &MessageContent::tool(&tool_id, content, false).to_stored_json(),
+                        )
+                        .map_err(|error| DbError::Serialization(error.to_string()))?;
+                        let updated = sqlx::query(
+                            "UPDATE messages SET content = ?1, display_data = ?2
+                             WHERE message_id = ?3 AND conversation_id = ?4",
+                        )
+                        .bind(stored_content)
+                        .bind(
+                            serde_json::to_string(&display_data)
+                                .map_err(|error| DbError::Serialization(error.to_string()))?,
+                        )
+                        .bind(message_id)
+                        .bind(conversation_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        if updated.rows_affected() != 1 {
+                            return Err(DbError::Serialization(format!(
+                                "startup sub-agent fan-in message missing for {conversation_id}"
+                            )));
+                        }
+                        let updated_message = sqlx::query(
+                            "SELECT message_id, conversation_id, sequence_id, message_type,
+                                    content, display_data, usage_data, created_at
+                             FROM messages WHERE message_id = ?1",
+                        )
+                        .bind(tool_result_message_id(&tool_id))
+                        .try_map(parse_message_row)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+                    } else {
+                        let sequence_id: i64 = sqlx::query_scalar(
+                            "SELECT COALESCE(MAX(sequence_id), 0) + 1
+                             FROM messages WHERE conversation_id = ?1",
+                        )
+                        .bind(conversation_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        let message = Message {
+                            message_id: format!("startup-sub-agent-summary:{conversation_id}"),
+                            conversation_id: conversation_id.clone(),
+                            sequence_id,
+                            message_type: MessageType::User,
+                            content: MessageContent::User(UserContent::meta(&content)),
+                            display_data: Some(display_data),
+                            usage_data: None,
+                            created_at: now,
+                        };
+                        insert_message_tx(&mut tx, &message).await?;
+                    }
+                    let requesting = ConvState::LlmRequesting { attempt: 1 };
+                    sqlx::query(
+                        "UPDATE conversations
+                         SET state = ?1, state_kind = ?2, state_updated_at = ?3,
+                             updated_at = ?3, transcript_generation = transcript_generation + 1
+                         WHERE id = ?4",
+                    )
+                    .bind(
+                        serde_json::to_string(&requesting)
+                            .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    )
+                    .bind(conv_state_kind(&requesting))
+                    .bind(now.to_rfc3339())
+                    .bind(conversation_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    reconciled.push(conversation_id.clone());
+                    continue;
+                }
+            }
+            if matches!(
+                conversation.state,
+                ConvState::Idle | ConvState::LlmRequesting { .. }
+            ) {
+                let is_parent: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM conversations AS child
+                         WHERE child.parent_conversation_id = ?1
+                     )",
+                )
+                .bind(conversation_id)
+                .fetch_one(&self.pool)
+                .await?;
+                if is_parent == 1 {
+                    reconciled.push(conversation_id.clone());
+                    continue;
+                }
+            }
+            let updated = sqlx::query(
+                "UPDATE conversations
+                 SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+                 WHERE id = ?4 AND state_kind IN ('tool_executing', 'cancelling_tool')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations AS child
+                       JOIN durable_turns AS t ON t.conversation_id = child.id
+                       JOIN direct_turn_terminal_obligations AS o ON o.turn_id = t.turn_id
+                       WHERE child.parent_conversation_id = ?4
+                   )",
+            )
+            .bind(&idle_json)
+            .bind(conv_state_kind(&ConvState::Idle))
+            .bind(now.to_rfc3339())
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await?;
+            if updated.rows_affected() == 1 {
+                reconciled.push(conversation_id.clone());
+            }
+        }
+        Ok(reconciled)
     }
 
     /// Allocate the next `sequence_id` for a conversation from the message
@@ -11230,7 +11397,7 @@ async fn insert_message_tx(
         .transpose()
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
@@ -11244,6 +11411,33 @@ async fn insert_message_tx(
     .bind(msg.created_at.to_rfc3339())
     .execute(&mut **tx)
     .await?;
+    if inserted.rows_affected() == 0 {
+        let mut existing = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
+        )
+        .bind(&msg.message_id)
+        .try_map(parse_message_row)
+        .fetch_one(&mut **tx)
+        .await?;
+        hydrate_message_attachments_tx(tx, &mut existing).await?;
+        let exact = existing.message_id == msg.message_id
+            && existing.conversation_id == msg.conversation_id
+            && existing.sequence_id == msg.sequence_id
+            && existing.message_type == msg.message_type
+            && existing.content == msg.content
+            && existing.display_data == msg.display_data
+            && existing.usage_data == msg.usage_data
+            && existing.created_at == msg.created_at;
+        if !exact {
+            return Err(DbError::Serialization(format!(
+                "message {} conflicts with first durable payload",
+                msg.message_id
+            )));
+        }
+        retrieval::fts_upsert_conn(tx, msg).await?;
+        return Ok(());
+    }
     insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
     // Index for retrieval atomically with the message insert, so tx-based
     // persists (fork-resolution seed messages, checkpoint replays) get the
@@ -11424,6 +11618,42 @@ async fn clear_creation_job_attachments(
 /// `message_images` child tables. `INSERT OR IGNORE` keyed on
 /// `(message_id, ordinal)` makes this idempotent under retry, matching the
 /// `INSERT OR IGNORE` on the parent message row.
+async fn hydrate_message_attachments_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &mut Message,
+) -> DbResult<()> {
+    let files = sqlx::query(
+        "SELECT original_name, media_type, size_bytes, stored_path
+         FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
+    )
+    .bind(&message.message_id)
+    .map(|row: SqliteRow| FileAttachment {
+        original_name: row.get("original_name"),
+        media_type: row.get("media_type"),
+        size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+        stored_path: row.get("stored_path"),
+    })
+    .fetch_all(&mut **tx)
+    .await?;
+    let images = if message.message_type == MessageType::User {
+        sqlx::query(
+            "SELECT media_type, data
+             FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
+        )
+        .bind(&message.message_id)
+        .map(|row: SqliteRow| ImageData {
+            media_type: row.get("media_type"),
+            data: row.get("data"),
+        })
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    message.content.set_attachments(images, files);
+    Ok(())
+}
+
 async fn insert_message_attachments(
     conn: &mut sqlx::SqliteConnection,
     message_id: &str,
@@ -17337,6 +17567,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_parent_reconciliation_materializes_exact_child_result_once() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, PendingSubAgent, SubAgentMode, ThinkInput, ToolCall, ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "startup-parent";
+        let child_id = "startup-child";
+        db.create_conversation(parent_id, "startup-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            child_id,
+            "startup-child",
+            "/tmp",
+            false,
+            Some(parent_id),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            child_id,
+            &ConvState::Completed {
+                result: "exact recovered result".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let assistant = AssistantMessage::new(
+            "startup-assistant".to_string(),
+            vec![
+                ContentBlock::tool_use(
+                    "spawn-tool",
+                    "spawn_agents",
+                    serde_json::json!({"tasks": [{"task": "audit"}]}),
+                ),
+                ContentBlock::tool_use(
+                    "think-tool",
+                    "think",
+                    serde_json::json!({"thoughts": "finish"}),
+                ),
+            ],
+            None,
+            None,
+        );
+        db.update_conversation_state(
+            parent_id,
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "think-tool",
+                    ToolInput::Think(ThinkInput {
+                        thoughts: "finish".to_string(),
+                    }),
+                ),
+                remaining_tools: Vec::new(),
+                completed_results: vec![ToolResult::success(
+                    "spawn-tool".to_string(),
+                    format!("Spawning 1 sub-agent(s): {child_id}"),
+                )],
+                pending_sub_agents: vec![PendingSubAgent {
+                    agent_id: child_id.to_string(),
+                    task: "audit".to_string(),
+                    mode: SubAgentMode::Explore,
+                }],
+                assistant_message: assistant,
+            },
+        )
+        .await
+        .unwrap();
+        let ids = std::collections::HashSet::from([parent_id.to_string()]);
+
+        assert_eq!(
+            db.reconcile_startup_obligated_parents(&ids).await.unwrap(),
+            vec![parent_id.to_string()]
+        );
+        assert!(matches!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            ConvState::Idle
+        ));
+        let messages = db.get_messages(parent_id).await.unwrap();
+        let spawn_result = messages
+            .iter()
+            .find(|message| {
+                matches!(
+                    &message.content,
+                    MessageContent::Tool(content) if content.tool_use_id == "spawn-tool"
+                )
+            })
+            .expect("spawn result was materialized");
+        let MessageContent::Tool(content) = &spawn_result.content else {
+            unreachable!()
+        };
+        assert!(content.content.contains("exact recovered result"));
+        assert!(!content.content.contains("interrupted by server restart"));
+
+        assert_eq!(
+            db.reconcile_startup_obligated_parents(&ids).await.unwrap(),
+            vec![parent_id.to_string()]
+        );
+        assert_eq!(db.get_messages(parent_id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn reset_all_to_idle_preserves_completed_and_failed_states() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("completed", "completed", "/tmp", false, None, None)
@@ -19913,6 +20249,92 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_round_accepts_only_exact_message_replays() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "conv-terminal-exact-replay";
+        db.create_conversation(conversation_id, "cter", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let repo = workflow::WorkflowRepository::new(db.pool().clone());
+        let turn_id =
+            create_runtime_turn_for_terminal_test(&repo, conversation_id, "terminal-exact-replay")
+                .await;
+        let created_at = Utc::now();
+        let assistant = Message {
+            message_id: "assistant-terminal-exact".to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 20,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at,
+        };
+        let result = Message {
+            message_id: "tool-terminal-exact".to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: 21,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-terminal", "first durable result", false),
+            display_data: Some(serde_json::json!({"kind": "first"})),
+            usage_data: None,
+            created_at,
+        };
+        let obligation = workflow::DirectTurnTerminalObligationInput {
+            turn_id,
+            expected_generation: 0,
+            terminal: phoenix_workflow::TurnTerminal::Completed,
+            projection: workflow::PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: created_at,
+            },
+            response_message_id: None,
+        };
+
+        db.persist_tool_round_with_terminal_obligation(
+            conversation_id,
+            &assistant,
+            std::slice::from_ref(&result),
+            &obligation,
+        )
+        .await
+        .unwrap();
+        db.persist_tool_round_with_terminal_obligation(
+            conversation_id,
+            &assistant,
+            std::slice::from_ref(&result),
+            &obligation,
+        )
+        .await
+        .expect("an exact replay is idempotent");
+
+        let mut conflicting = result.clone();
+        conflicting.content = MessageContent::tool("tool-terminal", "conflicting replay", true);
+        let error = db
+            .persist_tool_round_with_terminal_obligation(
+                conversation_id,
+                &assistant,
+                &[conflicting],
+                &obligation,
+            )
+            .await
+            .expect_err("a conflicting replay must not consume the obligation");
+        assert!(error
+            .to_string()
+            .contains("conflicts with first durable payload"));
+        let persisted = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].content, result.content);
+        assert!(repo
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

@@ -208,6 +208,15 @@ pub enum TerminalEvidenceProbe {
     Retired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalProjectionProbe {
+    Missing,
+    Current,
+    Superseded,
+    StillOwed,
+    Unclassifiable,
+}
+
 #[derive(Debug, Clone)]
 pub enum TerminalEvidenceExpectation {
     ObligationOnly {
@@ -1633,6 +1642,78 @@ impl WorkflowRepository {
                 _ => TerminalEvidenceProbe::Incomplete,
             },
         )
+    }
+
+    pub async fn probe_terminal_projection(
+        &self,
+        expected: &DirectTurnTerminalObligation,
+    ) -> DbResult<TerminalProjectionProbe> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT t.generation, t.disposition, t.terminal_kind, t.terminal_reason,
+                    t.owns_conversation, t.conversation_id,
+                    c.state, c.state_updated_at,
+                    EXISTS(
+                        SELECT 1 FROM durable_turns AS current
+                        WHERE current.conversation_id = t.conversation_id
+                          AND current.owns_conversation = 1
+                          AND current.terminal_kind IS NULL
+                    ) AS has_current_owner
+             FROM durable_turns AS t
+             JOIN conversations AS c ON c.id = t.conversation_id
+             WHERE t.turn_id = ?1",
+        )
+        .bind(to_i64(expected.turn_id.0, "turn_id")?)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let Some(row) = row else {
+            return Ok(TerminalProjectionProbe::Missing);
+        };
+        let generation = to_u64(row.try_get("generation")?, "generation")?;
+        let disposition: String = row.try_get("disposition")?;
+        let owns_conversation: i64 = row.try_get("owns_conversation")?;
+        let terminal = terminal_from_sql(
+            row.try_get::<Option<String>, _>("terminal_kind")?
+                .as_deref(),
+            row.try_get("terminal_reason")?,
+        )?;
+        if generation == expected.expected_generation
+            && disposition == "Runtime"
+            && owns_conversation == 1
+            && terminal.is_none()
+        {
+            return Ok(TerminalProjectionProbe::StillOwed);
+        }
+        if generation != expected.expected_generation.saturating_add(1)
+            || owns_conversation != 0
+            || terminal.as_ref() != Some(&expected.terminal)
+        {
+            return Ok(TerminalProjectionProbe::Unclassifiable);
+        }
+        let state_json: String = row.try_get("state")?;
+        let state: ConvState = serde_json::from_str(&state_json).map_err(|error| {
+            DbError::Serialization(format!("decode terminal projection state: {error}"))
+        })?;
+        let state_updated_at =
+            DateTime::parse_from_rfc3339(&row.try_get::<String, _>("state_updated_at")?)
+                .map_err(|error| {
+                    DbError::Serialization(format!("decode terminal projection timestamp: {error}"))
+                })?
+                .with_timezone(&Utc);
+        let current = row.try_get::<i64, _>("has_current_owner")? == 0
+            && projections_match(
+                &PersistedConversationProjection {
+                    state,
+                    state_updated_at,
+                },
+                &expected.projection,
+            );
+        Ok(if current {
+            TerminalProjectionProbe::Current
+        } else {
+            TerminalProjectionProbe::Superseded
+        })
     }
 
     async fn terminalize_authoritative_turn_at_cut(
@@ -3965,6 +4046,50 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
             projection.state
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_probe_suppresses_a_superseded_projection() {
+        let repo = repo().await;
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "terminal-probe-old", 9))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let projection = PersistedConversationProjection {
+            state: ConvState::Idle,
+            state_updated_at: Utc::now(),
+        };
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(projection.clone()),
+        })
+        .await
+        .unwrap();
+        let expected = DirectTurnTerminalObligation {
+            turn_id,
+            expected_generation: 0,
+            terminal: TurnTerminal::Completed,
+            projection,
+            response_message_id: None,
+        };
+        assert_eq!(
+            repo.probe_terminal_projection(&expected).await.unwrap(),
+            TerminalProjectionProbe::Current
+        );
+
+        repo.accept_authoritative_turn(&input("conv-a", "terminal-probe-new", 10))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.probe_terminal_projection(&expected).await.unwrap(),
+            TerminalProjectionProbe::Superseded
         );
     }
 

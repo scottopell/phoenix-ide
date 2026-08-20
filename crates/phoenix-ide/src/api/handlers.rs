@@ -5753,20 +5753,12 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
 
 async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
-        let conv_id = id.to_string();
         let _ = handle
             .broadcast_tx
-            .send_live_projection(|seq| SseEvent::ConversationHardDeleted {
-                sequence_id: seq,
-                conversation_id: conv_id,
-            });
+            .send_hard_deleted_and_close(id.to_string());
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
-        let conv_id = id.to_string();
-        let _ = tx.send_live_projection(|seq| SseEvent::ConversationHardDeleted {
-            sequence_id: seq,
-            conversation_id: conv_id,
-        });
+        let _ = tx.send_hard_deleted_and_close(id.to_string());
     }
 }
 

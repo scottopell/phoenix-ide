@@ -237,6 +237,8 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             }
         }
 
+        self.dispatcher.reconcile_startup_parents().await?;
+
         let mut cursor = None;
         loop {
             let page = self
@@ -440,6 +442,12 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
     ) -> Result<TerminalObligationSettlement, crate::runtime::DatabaseTerminalRecoveryError>;
 
     fn signal_fatal_local_authority(&self) {}
+
+    async fn reconcile_startup_parents(
+        &self,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        Ok(())
+    }
 }
 
 struct ProductionDirectTurnDispatcher {
@@ -470,6 +478,12 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
     fn signal_fatal_local_authority(&self) {
         self.manager
             .signal_fatal_local_authority("direct_turn_terminal_recovery");
+    }
+
+    async fn reconcile_startup_parents(
+        &self,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        self.manager.reconcile_startup_obligated_parents().await
     }
 
     async fn settle_terminal_obligation(

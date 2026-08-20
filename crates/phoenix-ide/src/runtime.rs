@@ -665,6 +665,7 @@ struct QueuedBroadcast {
 struct BroadcastGate {
     reserved_until: Option<i64>,
     queued: Vec<QueuedBroadcast>,
+    hard_deleted: bool,
 }
 
 pub struct ReservedBroadcastRange {
@@ -830,7 +831,7 @@ impl SseBroadcaster {
     /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
-    fn send_with_ring_raw(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+    fn send_with_ring_unlocked(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
         match op {
             RingOp::Anchor => {
                 self.ring.lock().expect("ReplayRing mutex").reset(seq);
@@ -850,17 +851,38 @@ impl SseBroadcaster {
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
-        {
-            let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-            if gate
-                .reserved_until
-                .is_some_and(|reserved_until| seq > reserved_until)
-            {
-                gate.queued.push(QueuedBroadcast { event, seq, op });
-                return Ok(self.tx.receiver_count());
-            }
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
         }
-        self.send_with_ring_raw(event, seq, op)
+        if gate
+            .reserved_until
+            .is_some_and(|reserved_until| seq > reserved_until)
+        {
+            gate.queued.push(QueuedBroadcast { event, seq, op });
+            return Ok(self.tx.receiver_count());
+        }
+        self.send_with_ring_unlocked(event, seq, op)
+    }
+
+    pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
+        gate.queued.clear();
+        gate.reserved_until = None;
+        let sequence_id = self.last_seq.load(Ordering::Acquire);
+        let result = self.send_with_ring_unlocked(
+            SseEvent::ConversationHardDeleted {
+                sequence_id,
+                conversation_id,
+            },
+            sequence_id,
+            RingOp::BroadcastOnly,
+        );
+        gate.hard_deleted = true;
+        result
     }
 
     pub fn reserve_next_persisted_message_range(
@@ -915,8 +937,10 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
-        for QueuedBroadcast { event, seq, op } in queued {
-            let _ = self.send_with_ring_raw(event, seq, op);
+        if !gate.hard_deleted {
+            for QueuedBroadcast { event, seq, op } in queued {
+                let _ = self.send_with_ring_unlocked(event, seq, op);
+            }
         }
         gate.reserved_until = None;
     }
@@ -961,10 +985,13 @@ impl SseBroadcaster {
     /// sequenced allocation. A later sequenced event therefore cannot allocate
     /// and reach the channel before this event carrying the earlier witness.
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        let gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
         let witnessed_seq = self.last_seq.load(Ordering::Acquire);
         let event = build(witnessed_seq);
-        self.send_with_ring_raw(event, witnessed_seq, RingOp::BroadcastOnly)
+        self.send_with_ring_unlocked(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -1657,6 +1684,16 @@ impl RuntimeManager {
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
         self.fatal_local_authority_tx.send_replace(Some(boundary));
+    }
+
+    fn propagate_fatal_runtime_exit(
+        &self,
+        disposition: executor::RuntimeExitDisposition,
+        boundary: &'static str,
+    ) {
+        if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+            self.signal_fatal_local_authority(boundary);
+        }
     }
 
     pub fn fatal_local_authority_receiver(
@@ -2958,6 +2995,8 @@ impl RuntimeManager {
                 .await;
 
             let disposition = runtime.run().await;
+            manager_for_cleanup
+                .propagate_fatal_runtime_exit(disposition, "spawned conversation runtime");
 
             // Its sender targets this exited runtime's event channel.
             timeout_task.abort();
@@ -3210,6 +3249,34 @@ impl RuntimeManager {
         }
     }
 
+    pub(crate) async fn reconcile_startup_obligated_parents(
+        self: &Arc<Self>,
+    ) -> Result<(), DatabaseTerminalRecoveryError> {
+        let conversation_ids = self.startup_obligated_conversations.read().await.clone();
+        if conversation_ids.is_empty() {
+            return Ok(());
+        }
+        let reconciled = self
+            .db
+            .reconcile_startup_obligated_parents(&conversation_ids)
+            .await
+            .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
+        for conversation_id in reconciled {
+            self.get_or_create(&conversation_id)
+                .await
+                .map_err(|error| {
+                    DatabaseTerminalRecoveryError::Retryable(format!(
+                        "failed to resume reconciled parent {conversation_id}: {error}"
+                    ))
+                })?;
+            self.startup_obligated_conversations
+                .write()
+                .await
+                .remove(&conversation_id);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn settle_database_terminal_obligation(
         &self,
@@ -3226,8 +3293,6 @@ impl RuntimeManager {
             return Ok(DatabaseTerminalRecovery::NoObligation);
         };
         let turn_id = obligation.turn_id;
-        let expected_generation = obligation.expected_generation;
-        let expected_terminal = obligation.terminal.clone();
         let projection = obligation.projection.clone();
         let conversation = self
             .db
@@ -3253,11 +3318,11 @@ impl RuntimeManager {
                 turn_id: obligation.turn_id,
                 expected_generation: obligation.expected_generation,
             },
-            phoenix_workflow::TurnTerminal::Failed { reason } => {
+            phoenix_workflow::TurnTerminal::Failed { ref reason } => {
                 phoenix_workflow::TurnCommand::Fail {
                     turn_id: obligation.turn_id,
                     expected_generation: obligation.expected_generation,
-                    reason,
+                    reason: reason.clone(),
                 }
             }
         };
@@ -3265,7 +3330,7 @@ impl RuntimeManager {
             .terminalize_authoritative_turn(
                 &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                     command,
-                    projection: Some(obligation.projection),
+                    projection: Some(obligation.projection.clone()),
                 },
             )
             .await
@@ -3292,52 +3357,52 @@ impl RuntimeManager {
                 })
             }
             Err(settlement_error) => {
-                let turn = repo
-                    .load_authoritative_turn(turn_id)
+                match repo
+                    .probe_terminal_projection(&obligation)
                     .await
                     .map_err(|probe_error| {
                         DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                            "terminal settlement failed ({settlement_error}); authoritative turn probe failed ({probe_error})"
+                            "terminal settlement failed ({settlement_error}); exact projection probe failed ({probe_error})"
                         ))
-                    })?;
-                let Some(turn) = turn else {
-                    return if repo
-                        .exact_turn_retired(turn_id, conversation_id)
-                        .await
-                        .map_err(|probe_error| {
-                            DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                                "terminal settlement failed ({settlement_error}); retirement probe failed ({probe_error})"
-                            ))
-                        })?
-                    {
-                        Ok(DatabaseTerminalRecovery::AlreadyCommitted)
-                    } else {
-                        Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                            "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared without exact retirement"
-                        )))
-                    };
-                };
-                match turn.lifecycle {
-                    phoenix_workflow::TurnLifecycle::Terminal { terminal, .. }
-                        if turn.generation == expected_generation.saturating_add(1)
-                            && terminal == expected_terminal =>
-                    {
+                    })?
+                {
+                    phoenix_db::workflow::TerminalProjectionProbe::Missing => {
+                        if repo
+                            .exact_turn_retired(turn_id, conversation_id)
+                            .await
+                            .map_err(|probe_error| {
+                                DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                    "terminal settlement failed ({settlement_error}); retirement probe failed ({probe_error})"
+                                ))
+                            })?
+                        {
+                            Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+                        } else {
+                            Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared without exact retirement"
+                            )))
+                        }
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::Current => {
                         Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
                             is_sub_agent,
                             worktree_path,
                         })
                     }
-                    phoenix_workflow::TurnLifecycle::Accepted {
-                        disposition: phoenix_workflow::AcceptedDisposition::Runtime,
-                    } if turn.generation == expected_generation => {
+                    phoenix_db::workflow::TerminalProjectionProbe::Superseded => {
+                        Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::StillOwed => {
                         Err(DatabaseTerminalRecoveryError::StillOwed(
                             settlement_error.to_string(),
                         ))
                     }
-                    _ => Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
-                        "terminal settlement failed ({settlement_error}); authoritative turn no longer matches the exact obligation"
-                    ))),
+                    phoenix_db::workflow::TerminalProjectionProbe::Unclassifiable => {
+                        Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); authoritative turn no longer matches the exact obligation"
+                        )))
+                    }
                 }
             }
         }
@@ -3908,9 +3973,8 @@ impl RuntimeManager {
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
             }
-            if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
-                manager_for_cleanup.signal_fatal_local_authority("direct_turn_terminal_evidence");
-            }
+            manager_for_cleanup
+                .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");
             if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
                 manager_for_cleanup.kick_direct_turn_worker();
             }
@@ -4902,6 +4966,74 @@ mod sub_agent_registry_resume_tests {
 mod broadcaster_tests {
     use super::*;
 
+    #[test]
+    fn hard_delete_is_the_final_publication() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "before".to_string(),
+                request_id: "before-request".to_string(),
+            })
+            .unwrap();
+        broadcaster
+            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .unwrap();
+
+        assert!(matches!(events.try_recv(), Ok(SseEvent::Token { .. })));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::ConversationHardDeleted { ref conversation_id, .. })
+                if conversation_id == "deleted-conversation"
+        ));
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after".to_string(),
+                request_id: "after-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        let (reserved, reserved_sequence) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "queued".to_string(),
+                request_id: "queued-request".to_string(),
+            })
+            .unwrap();
+        broadcaster
+            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .unwrap();
+        drop(reserved);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::ConversationHardDeleted { .. })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(broadcaster
+            .send_reserved_seq(reserved_sequence, |sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "late-reserved".to_string(),
+                request_id: "late-reserved-request".to_string(),
+            })
+            .is_err());
+    }
+
     /// Regression for task 02679: when a caller pre-allocates a message's
     /// `sequence_id` from the broadcaster *before* writing to the DB, the
     /// message's seq is strictly greater than any ephemeral event emitted
@@ -5742,6 +5874,25 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn spawned_runtime_fatal_authority_loss_reaches_process_fail_stop() {
+        let manager = test_manager().await;
+        let mut fatal = manager.fatal_local_authority_receiver();
+
+        manager.propagate_fatal_runtime_exit(
+            executor::RuntimeExitDisposition::Interrupted,
+            "spawned conversation runtime",
+        );
+        assert_eq!(*fatal.borrow(), None);
+
+        manager.propagate_fatal_runtime_exit(
+            executor::RuntimeExitDisposition::FatalLocalAuthorityLoss,
+            "spawned conversation runtime",
+        );
+        fatal.changed().await.unwrap();
+        assert_eq!(*fatal.borrow(), Some("spawned conversation runtime"));
     }
 
     #[tokio::test]
