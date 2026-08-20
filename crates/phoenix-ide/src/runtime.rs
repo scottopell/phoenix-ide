@@ -3261,18 +3261,21 @@ impl RuntimeManager {
             .reconcile_startup_obligated_parents(&conversation_ids)
             .await
             .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
-        for conversation_id in reconciled {
-            self.get_or_create(&conversation_id)
-                .await
-                .map_err(|error| {
-                    DatabaseTerminalRecoveryError::Retryable(format!(
-                        "failed to resume reconciled parent {conversation_id}: {error}"
-                    ))
-                })?;
+        for reconciliation in reconciled {
+            if reconciliation.resume_runtime {
+                self.get_or_create(&reconciliation.conversation_id)
+                    .await
+                    .map_err(|error| {
+                        DatabaseTerminalRecoveryError::Retryable(format!(
+                            "failed to resume reconciled parent {}: {error}",
+                            reconciliation.conversation_id
+                        ))
+                    })?;
+            }
             self.startup_obligated_conversations
                 .write()
                 .await
-                .remove(&conversation_id);
+                .remove(&reconciliation.conversation_id);
         }
         Ok(())
     }

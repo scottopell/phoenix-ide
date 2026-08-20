@@ -1178,6 +1178,12 @@ pub enum ContinuationCommitOutcome {
     Stale,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupParentReconciliation {
+    pub conversation_id: String,
+    pub resume_runtime: bool,
+}
+
 pub struct Database {
     pool: SqlitePool,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
@@ -8733,8 +8739,8 @@ impl Database {
         // Both `tool_executing` and `cancelling_tool` rows carry an
         // un-persisted assistant turn (the cancel snapshots the in-flight round
         // until abort/complete persists the checkpoint).
-        let conv_rows: Vec<(String, String)> = sqlx::query(
-            "SELECT c.id, c.state FROM conversations AS c
+        let conv_rows: Vec<(String, String, String)> = sqlx::query(
+            "SELECT c.id, c.state, c.state_updated_at FROM conversations AS c
              WHERE c.state_kind IN ('tool_executing', 'cancelling_tool')
                AND NOT EXISTS (
                    SELECT 1
@@ -8750,11 +8756,17 @@ impl Database {
                      )
                )",
         )
-        .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
+        .try_map(|row: SqliteRow| {
+            Ok((
+                row.try_get("id")?,
+                row.try_get("state")?,
+                row.try_get("state_updated_at")?,
+            ))
+        })
         .fetch_all(&self.pool)
         .await?;
 
-        for (conv_id, state_json) in conv_rows {
+        for (conv_id, state_json, state_updated_at) in conv_rows {
             if only_conversations.is_some_and(|ids| !ids.contains(&conv_id)) {
                 continue;
             }
@@ -8794,11 +8806,20 @@ impl Database {
                 .resolve_pending_sub_agent_outcomes(&pending_sub_agents)
                 .await;
 
-            let start_seq = self.next_sequence_id(&conv_id).await?;
+            let materialized_at = parse_datetime(&state_updated_at);
+            let persisted_start: Option<i64> =
+                sqlx::query_scalar("SELECT sequence_id FROM messages WHERE message_id = ?1")
+                    .bind(&assistant_message.message_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            let start_seq = match persisted_start {
+                Some(sequence_id) => sequence_id,
+                None => self.next_sequence_id(&conv_id).await?,
+            };
             let (agent_msg, tool_msgs) = build_materialized_tool_round(
                 &conv_id,
                 start_seq,
-                now,
+                &materialized_at,
                 &assistant_message,
                 &completed_results,
                 &interrupted_tool_ids,
@@ -8862,6 +8883,89 @@ impl Database {
         Ok(())
     }
 
+    async fn persist_startup_sub_agent_fan_in(
+        &self,
+        conversation_id: &str,
+        results: &[phoenix_core::domain::sm_state::SubAgentResult],
+        spawn_tool_id: Option<&str>,
+        destination: &ConvState,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let (content, display_data) = build_sub_agent_fan_in(results);
+        let mut tx = self.pool.begin().await?;
+        if let Some(tool_id) = spawn_tool_id {
+            let message_id = tool_result_message_id(tool_id);
+            let stored_content = serde_json::to_string(
+                &MessageContent::tool(tool_id, content, false).to_stored_json(),
+            )
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let updated = sqlx::query(
+                "UPDATE messages SET content = ?1, display_data = ?2
+                 WHERE message_id = ?3 AND conversation_id = ?4",
+            )
+            .bind(stored_content)
+            .bind(
+                serde_json::to_string(&display_data)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+            )
+            .bind(&message_id)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "startup sub-agent fan-in message missing for {conversation_id}"
+                )));
+            }
+            let updated_message = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type,
+                        content, display_data, usage_data, created_at
+                 FROM messages WHERE message_id = ?1",
+            )
+            .bind(message_id)
+            .try_map(parse_message_row)
+            .fetch_one(&mut *tx)
+            .await?;
+            retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+        } else {
+            let sequence_id: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(sequence_id), 0) + 1
+                 FROM messages WHERE conversation_id = ?1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let message = Message {
+                message_id: format!("startup-sub-agent-summary:{conversation_id}"),
+                conversation_id: conversation_id.to_string(),
+                sequence_id,
+                message_type: MessageType::User,
+                content: MessageContent::User(UserContent::meta(&content)),
+                display_data: Some(display_data),
+                usage_data: None,
+                created_at: now,
+            };
+            insert_message_tx(&mut tx, &message).await?;
+        }
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3,
+                 updated_at = ?3, transcript_generation = transcript_generation + 1
+             WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(destination)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(destination))
+        .bind(now.to_rfc3339())
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Materialize parent progress that was deliberately preserved while a
     /// child terminal obligation still owned the exact outcome.
     ///
@@ -8873,7 +8977,7 @@ impl Database {
     pub async fn reconcile_startup_obligated_parents(
         &self,
         conversation_ids: &std::collections::HashSet<String>,
-    ) -> DbResult<Vec<String>> {
+    ) -> DbResult<Vec<StartupParentReconciliation>> {
         let now = Utc::now();
         self.materialize_in_flight_tool_rounds(&now, Some(conversation_ids))
             .await?;
@@ -8886,99 +8990,111 @@ impl Database {
                 Err(DbError::ConversationNotFound(_)) => continue,
                 Err(error) => return Err(error),
             };
-            if let ConvState::AwaitingSubAgents {
+            let pending_fan_in = match conversation.state.clone() {
+                ConvState::AwaitingSubAgents {
+                    pending,
+                    completed_results,
+                    spawn_tool_id,
+                } => Some((
+                    pending,
+                    completed_results,
+                    spawn_tool_id,
+                    None,
+                    ConvState::LlmRequesting { attempt: 1 },
+                )),
+                ConvState::CancellingSubAgents {
+                    pending,
+                    completed_results,
+                    cause,
+                    spawn_tool_id,
+                } => Some((
+                    pending,
+                    completed_results,
+                    spawn_tool_id,
+                    Some(cause),
+                    match cause {
+                        phoenix_core::domain::sm_event::CancelCause::Timeout => {
+                            ConvState::LlmRequesting { attempt: 1 }
+                        }
+                        phoenix_core::domain::sm_event::CancelCause::UserRequested => {
+                            ConvState::Idle
+                        }
+                    },
+                )),
+                ConvState::Idle
+                | ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::Provisioning { .. }
+                | ConvState::CreationCancelled { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+                | ConvState::CreationFailed { .. }
+                | ConvState::Error { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::RecoverableContinuationFailure { .. }
+                | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingUserResponse { .. }
+                | ConvState::AwaitingCommissionReviewApproval { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::HandedOff { .. }
+                | ConvState::Terminal => None,
+            };
+            if let Some((
                 pending,
                 mut completed_results,
                 spawn_tool_id,
-            } = conversation.state.clone()
+                cancel_cause,
+                destination,
+            )) = pending_fan_in
             {
                 let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await;
-                if outcomes.len() == pending.len() {
-                    completed_results.extend(pending.into_iter().filter_map(|agent| {
-                        outcomes.get(&agent.agent_id).cloned().map(|outcome| {
-                            phoenix_core::domain::sm_state::SubAgentResult {
-                                agent_id: agent.agent_id,
-                                task: agent.task,
-                                outcome,
-                            }
-                        })
-                    }));
-                    let (content, display_data) = build_sub_agent_fan_in(&completed_results);
-                    let mut tx = self.pool.begin().await?;
-                    if let Some(tool_id) = spawn_tool_id {
-                        let message_id = tool_result_message_id(&tool_id);
-                        let stored_content = serde_json::to_string(
-                            &MessageContent::tool(&tool_id, content, false).to_stored_json(),
-                        )
-                        .map_err(|error| DbError::Serialization(error.to_string()))?;
-                        let updated = sqlx::query(
-                            "UPDATE messages SET content = ?1, display_data = ?2
-                             WHERE message_id = ?3 AND conversation_id = ?4",
-                        )
-                        .bind(stored_content)
-                        .bind(
-                            serde_json::to_string(&display_data)
-                                .map_err(|error| DbError::Serialization(error.to_string()))?,
-                        )
-                        .bind(message_id)
-                        .bind(conversation_id)
-                        .execute(&mut *tx)
-                        .await?;
-                        if updated.rows_affected() != 1 {
-                            return Err(DbError::Serialization(format!(
-                                "startup sub-agent fan-in message missing for {conversation_id}"
-                            )));
-                        }
-                        let updated_message = sqlx::query(
-                            "SELECT message_id, conversation_id, sequence_id, message_type,
-                                    content, display_data, usage_data, created_at
-                             FROM messages WHERE message_id = ?1",
-                        )
-                        .bind(tool_result_message_id(&tool_id))
-                        .try_map(parse_message_row)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                        retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+                for agent in pending {
+                    let outcome = if let Some(outcome) = outcomes.get(&agent.agent_id).cloned() {
+                        outcome
                     } else {
-                        let sequence_id: i64 = sqlx::query_scalar(
-                            "SELECT COALESCE(MAX(sequence_id), 0) + 1
-                             FROM messages WHERE conversation_id = ?1",
-                        )
-                        .bind(conversation_id)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                        let message = Message {
-                            message_id: format!("startup-sub-agent-summary:{conversation_id}"),
-                            conversation_id: conversation_id.clone(),
-                            sequence_id,
-                            message_type: MessageType::User,
-                            content: MessageContent::User(UserContent::meta(&content)),
-                            display_data: Some(display_data),
-                            usage_data: None,
-                            created_at: now,
+                        let interrupted = ConvState::Failed {
+                            error: "Sub-agent interrupted by server restart".to_string(),
+                            error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
                         };
-                        insert_message_tx(&mut tx, &message).await?;
-                    }
-                    let requesting = ConvState::LlmRequesting { attempt: 1 };
-                    sqlx::query(
-                        "UPDATE conversations
-                         SET state = ?1, state_kind = ?2, state_updated_at = ?3,
-                             updated_at = ?3, transcript_generation = transcript_generation + 1
-                         WHERE id = ?4",
-                    )
-                    .bind(
-                        serde_json::to_string(&requesting)
-                            .map_err(|error| DbError::Serialization(error.to_string()))?,
-                    )
-                    .bind(conv_state_kind(&requesting))
-                    .bind(now.to_rfc3339())
-                    .bind(conversation_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    reconciled.push(conversation_id.clone());
-                    continue;
+                        self.update_conversation_state(&agent.agent_id, &interrupted)
+                            .await?;
+                        phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                            error: "Sub-agent interrupted by server restart".to_string(),
+                            error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                        }
+                    };
+                    let outcome = match (cancel_cause, outcome) {
+                        (
+                            Some(phoenix_core::domain::sm_event::CancelCause::Timeout),
+                            phoenix_core::domain::sm_state::SubAgentOutcome::Failure { .. },
+                        ) => phoenix_core::domain::sm_state::SubAgentOutcome::TimedOut,
+                        (_, outcome) => outcome,
+                    };
+                    completed_results.push(phoenix_core::domain::sm_state::SubAgentResult {
+                        agent_id: agent.agent_id,
+                        task: agent.task,
+                        outcome,
+                    });
                 }
+                self.persist_startup_sub_agent_fan_in(
+                    conversation_id,
+                    &completed_results,
+                    spawn_tool_id.as_deref(),
+                    &destination,
+                    now,
+                )
+                .await?;
+                reconciled.push(StartupParentReconciliation {
+                    conversation_id: conversation_id.clone(),
+                    resume_runtime: !matches!(
+                        cancel_cause,
+                        Some(phoenix_core::domain::sm_event::CancelCause::UserRequested)
+                    ),
+                });
+                continue;
             }
             if matches!(
                 conversation.state,
@@ -8994,7 +9110,10 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
                 if is_parent == 1 {
-                    reconciled.push(conversation_id.clone());
+                    reconciled.push(StartupParentReconciliation {
+                        conversation_id: conversation_id.clone(),
+                        resume_runtime: true,
+                    });
                     continue;
                 }
             }
@@ -9016,7 +9135,10 @@ impl Database {
             .execute(&self.pool)
             .await?;
             if updated.rows_affected() == 1 {
-                reconciled.push(conversation_id.clone());
+                reconciled.push(StartupParentReconciliation {
+                    conversation_id: conversation_id.clone(),
+                    resume_runtime: true,
+                });
             }
         }
         Ok(reconciled)
@@ -17641,10 +17763,10 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        assert_eq!(
-            db.reconcile_startup_obligated_parents(&ids).await.unwrap(),
-            vec![parent_id.to_string()]
-        );
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].conversation_id, parent_id);
+        assert!(reconciled[0].resume_runtime);
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::Idle
@@ -17665,11 +17787,227 @@ mod tests {
         assert!(content.content.contains("exact recovered result"));
         assert!(!content.content.contains("interrupted by server restart"));
 
-        assert_eq!(
-            db.reconcile_startup_obligated_parents(&ids).await.unwrap(),
-            vec![parent_id.to_string()]
-        );
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].conversation_id, parent_id);
+        assert!(reconciled[0].resume_runtime);
         assert_eq!(db.get_messages(parent_id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn restart_tool_round_materialization_replays_with_persisted_timestamp() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "stable-materialization-time";
+        db.create_conversation(conversation_id, "stable", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let entered_at = Utc::now() - chrono::Duration::hours(1);
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "think-stable",
+                ToolInput::Think(ThinkInput {
+                    thoughts: "stable".to_string(),
+                }),
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::<ToolResult>::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                "stable-assistant".to_string(),
+                vec![ContentBlock::tool_use(
+                    "think-stable",
+                    "think",
+                    serde_json::json!({"thoughts": "stable"}),
+                )],
+                None,
+                None,
+            ),
+        };
+        db.update_conversation_state(conversation_id, &state)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET state_updated_at = ?1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(entered_at.to_rfc3339())
+        .bind(conversation_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let only = std::collections::HashSet::from([conversation_id.to_string()]);
+
+        db.materialize_in_flight_tool_rounds(&Utc::now(), Some(&only))
+            .await
+            .unwrap();
+        db.materialize_in_flight_tool_rounds(
+            &(Utc::now() + chrono::Duration::minutes(5)),
+            Some(&only),
+        )
+        .await
+        .expect("replay uses the persisted state timestamp");
+        let messages = db.get_messages(conversation_id).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        let tool_result = messages
+            .iter()
+            .find(|message| message.message_id == tool_result_message_id("think-stable"))
+            .unwrap();
+        assert_eq!(tool_result.created_at, entered_at);
+    }
+
+    #[tokio::test]
+    async fn startup_fan_in_preserves_terminal_child_and_interrupts_live_sibling() {
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "startup-fan-in-parent";
+        let done_id = "startup-fan-in-done";
+        let live_id = "startup-fan-in-live";
+        db.create_conversation(parent_id, "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for child_id in [done_id, live_id] {
+            db.create_conversation(child_id, child_id, "/tmp", false, Some(parent_id), None)
+                .await
+                .unwrap();
+        }
+        db.update_conversation_state(
+            done_id,
+            &ConvState::Completed {
+                result: "exact sibling result".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(live_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            &tool_result_message_id("spawn-fan-in"),
+            parent_id,
+            1,
+            &MessageContent::tool("spawn-fan-in", "Spawning 2 sub-agents", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(
+            parent_id,
+            &ConvState::AwaitingSubAgents {
+                pending: vec![
+                    PendingSubAgent {
+                        agent_id: done_id.to_string(),
+                        task: "done".to_string(),
+                        mode: SubAgentMode::Explore,
+                    },
+                    PendingSubAgent {
+                        agent_id: live_id.to_string(),
+                        task: "live".to_string(),
+                        mode: SubAgentMode::Explore,
+                    },
+                ],
+                completed_results: Vec::new(),
+                spawn_tool_id: Some("spawn-fan-in".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let ids = std::collections::HashSet::from([parent_id.to_string()]);
+
+        db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+        assert!(matches!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        let message = db
+            .get_messages(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.message_id == tool_result_message_id("spawn-fan-in"))
+            .unwrap();
+        let MessageContent::Tool(content) = message.content else {
+            unreachable!()
+        };
+        assert!(content.content.contains("exact sibling result"));
+        assert!(content.content.contains("interrupted by server restart"));
+        assert!(matches!(
+            db.get_conversation(live_id).await.unwrap().state,
+            ConvState::Failed {
+                error_kind: ErrorKind::SubAgentError,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_cancelling_sub_agents_reaches_cause_destination() {
+        use phoenix_core::domain::sm_event::CancelCause;
+        use phoenix_core::domain::sm_state::{PendingSubAgent, SubAgentMode};
+
+        for (suffix, cause, expects_request) in [
+            ("user", CancelCause::UserRequested, false),
+            ("timeout", CancelCause::Timeout, true),
+        ] {
+            let db = Database::open_in_memory().await.unwrap();
+            let parent_id = format!("cancelling-parent-{suffix}");
+            let child_id = format!("cancelling-child-{suffix}");
+            db.create_conversation(&parent_id, &parent_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.create_conversation(&child_id, &child_id, "/tmp", false, Some(&parent_id), None)
+                .await
+                .unwrap();
+            db.update_conversation_state(
+                &parent_id,
+                &ConvState::CancellingSubAgents {
+                    pending: vec![PendingSubAgent {
+                        agent_id: child_id,
+                        task: "cancel".to_string(),
+                        mode: SubAgentMode::Explore,
+                    }],
+                    completed_results: Vec::new(),
+                    cause,
+                    spawn_tool_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            let ids = std::collections::HashSet::from([parent_id.clone()]);
+
+            let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
+            assert_eq!(reconciled.len(), 1);
+            assert_eq!(reconciled[0].resume_runtime, expects_request);
+            let state = db.get_conversation(&parent_id).await.unwrap().state;
+            assert_eq!(
+                matches!(state, ConvState::LlmRequesting { attempt: 1 }),
+                expects_request
+            );
+            if !expects_request {
+                assert!(matches!(state, ConvState::Idle));
+            }
+            let summary = db
+                .get_messages(&parent_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message.message_id == format!("startup-sub-agent-summary:{parent_id}")
+                })
+                .unwrap();
+            let MessageContent::User(content) = summary.content else {
+                unreachable!()
+            };
+            if expects_request {
+                assert!(content.text.to_ascii_lowercase().contains("timed out"));
+            } else {
+                assert!(content.text.to_ascii_lowercase().contains("interrupted"));
+            }
+        }
     }
 
     #[tokio::test]
