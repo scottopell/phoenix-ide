@@ -144,17 +144,21 @@ pub async fn complete(
 /// `parse_codex_error` uses on the HTTP-status path. SSE-side has no headers,
 /// so `QuotaDetails` is empty — the plan-aware formatter handles `plan_type:
 /// None` by falling back to generic wording (see PR #77 tests).
-fn classify_responses_error(code: &str, message: &str) -> LlmError {
-    let detail = if code.is_empty() {
+fn responses_error_detail(code: &str, message: &str) -> String {
+    if code.is_empty() {
         message.to_string()
     } else {
         format!("{code}: {message}")
-    };
+    }
+}
+
+fn classify_known_responses_error(code: &str, message: &str) -> Option<LlmError> {
+    let detail = responses_error_detail(code, message);
     let lower = code.to_ascii_lowercase();
 
     // Codex-specific terminal signals — match PR 77's HTTP-path semantics.
     if lower == "usage_limit_reached" {
-        return LlmError::usage_limit_reached(QuotaDetails {
+        return Some(LlmError::usage_limit_reached(QuotaDetails {
             plan_type: None,
             resets_at: None,
             limit_id: None,
@@ -166,50 +170,65 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             individual_limit: None,
             promo_message: None,
             rate_limit_reached_type: None,
-        });
+        }));
     }
     if lower == "usage_not_included" {
-        return LlmError::auth(
+        return Some(LlmError::auth(
             "Upgrade required: this plan does not include Codex usage. \
              Visit https://chatgpt.com/codex/settings/usage to upgrade.",
-        );
+        ));
     }
     if lower == "server_is_overloaded" || lower == "slow_down" {
-        return LlmError::server_overloaded(
+        return Some(LlmError::server_overloaded(
             "Selected model is at capacity. Try a different model.",
-        );
+        ));
     }
     if lower == "invalid_prompt" {
-        return LlmError::prompt_rejected(detail);
+        return Some(LlmError::prompt_rejected(detail));
     }
 
     if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
-        LlmError::rate_limit(detail)
+        Some(LlmError::rate_limit(detail))
     } else if lower.contains("auth")
         || lower.contains("invalid_api_key")
         || lower.contains("permission")
     {
-        LlmError::auth(detail)
+        Some(LlmError::auth(detail))
     } else if lower.contains("context_length")
         || lower.contains("token_limit")
         || lower.contains("max_tokens")
     {
-        LlmError::new(super::LlmErrorKind::ContextWindowExceeded, detail)
+        Some(LlmError::new(
+            super::LlmErrorKind::ContextWindowExceeded,
+            detail,
+        ))
     } else if lower.contains("content_filter") || lower.contains("safety") {
-        LlmError::new(super::LlmErrorKind::ContentFilter, detail)
+        Some(LlmError::new(super::LlmErrorKind::ContentFilter, detail))
     } else if lower.contains("invalid") || lower.contains("bad_request") {
-        LlmError::invalid_request(detail)
+        Some(LlmError::invalid_request(detail))
     } else {
-        // Default: retryable server error so the executor's retry loop kicks in.
-        LlmError::server_error(detail)
+        None
     }
+}
+
+fn classify_responses_error(code: &str, message: &str) -> LlmError {
+    classify_known_responses_error(code, message).unwrap_or_else(|| {
+        // A streaming error has no HTTP status to fall back to. Unknown codes
+        // remain retryable so the executor can recover from provider failures.
+        LlmError::server_error(responses_error_detail(code, message))
+    })
 }
 
 fn responses_http_error(status: u16, body: &str) -> LlmError {
     if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
         let message = error_resp.error.message;
-        if let Some(code) = error_resp.error.code.as_deref() {
-            return classify_responses_error(code, &message);
+        if let Some(error) = error_resp
+            .error
+            .code
+            .as_deref()
+            .and_then(|code| classify_known_responses_error(code, &message))
+        {
+            return error;
         }
         return match status {
             401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
@@ -856,18 +875,26 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
         }
     }
     parse_codex_error(status, &headers, &body).or_else(|| {
-        let code = error
-            .get("code")
-            .or_else(|| error.get("type"))
-            .and_then(serde_json::Value::as_str);
+        let code = error.get("code").and_then(serde_json::Value::as_str);
         let message = error
             .get("message")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_else(|| code.unwrap_or("unknown error"));
-        Some(code.map_or_else(
-            || responses_http_error(status, &body),
-            |code| classify_responses_error(code, message),
-        ))
+        if let Some(classified) =
+            code.and_then(|code| classify_known_responses_error(code, message))
+        {
+            return Some(classified);
+        }
+        if code.is_none() {
+            if let Some(classified) = error
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|error_type| classify_known_responses_error(error_type, message))
+            {
+                return Some(classified);
+            }
+        }
+        Some(responses_http_error(status, &body))
     })
 }
 
@@ -4710,6 +4737,13 @@ mod tests {
         );
         assert_eq!(generic_invalid.kind, LlmErrorKind::InvalidRequest);
         assert!(!generic_invalid.kind.is_user_resumable());
+
+        let unknown_client_code = responses_http_error(
+            404,
+            r#"{"error":{"message":"model does not exist","type":"invalid_request_error","code":"model_not_found"}}"#,
+        );
+        assert_eq!(unknown_client_code.kind, LlmErrorKind::InvalidRequest);
+        assert!(!unknown_client_code.kind.is_auto_retryable());
     }
 
     #[tokio::test]

@@ -1070,6 +1070,7 @@ rule ConversationTurnRecoveryFailed {
     ensures: conversation.core_status = error
     ensures: conversation.error_message = message
     ensures: conversation.error_class = non_retryable
+    ensures: conversation.error_kind = auth
 }
 
 rule ContinuationRecoveryFailed {

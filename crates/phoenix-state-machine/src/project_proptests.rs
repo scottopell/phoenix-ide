@@ -558,6 +558,14 @@ mod random_walk {
         }
     }
 
+    fn random_walk_should_stop(state: &ConvState) -> bool {
+        state.is_terminal()
+            || matches!(
+                state,
+                ConvState::Error { error_kind, .. } if !error_kind.is_user_resumable()
+            )
+    }
+
     /// Generate an event that the transition function will accept for the current state.
     /// This reads the transition match arms to produce events that won't hit the catch-all.
     #[allow(clippy::too_many_lines)]
@@ -730,15 +738,21 @@ mod random_walk {
                 }
             }
 
-            ConvState::Error { .. } => Event::UserMessage {
-                text: random_string(rng, 10),
-                llm_text: None,
-                images: vec![],
-                files: vec![],
-                message_id: uuid::Uuid::new_v4().to_string(),
-                user_agent: None,
-                skill_invocation: None,
-            },
+            ConvState::Error { error_kind, .. } => {
+                assert!(
+                    error_kind.is_user_resumable(),
+                    "random walk must stop at non-resumable errors"
+                );
+                Event::UserMessage {
+                    text: random_string(rng, 10),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                }
+            }
 
             ConvState::AwaitingRecovery { .. } => match rng.random_range(0..3) {
                 0 => Event::CredentialBecameAvailable,
@@ -984,7 +998,7 @@ mod random_walk {
             let mut state = ConvState::Idle;
 
             for _step in 0..200 {
-                if state.is_terminal() {
+                if random_walk_should_stop(&state) {
                     break;
                 }
 
@@ -1014,7 +1028,7 @@ mod random_walk {
             let mut state = ConvState::Idle;
 
             for _step in 0..200 {
-                if state.is_terminal() {
+                if random_walk_should_stop(&state) {
                     break;
                 }
 
@@ -1046,7 +1060,7 @@ mod random_walk {
             let mut state = ConvState::Idle;
 
             for _step in 0..200 {
-                if state.is_terminal() {
+                if random_walk_should_stop(&state) {
                     break;
                 }
 
