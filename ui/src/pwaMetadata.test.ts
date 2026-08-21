@@ -44,7 +44,7 @@ describe('Home Screen web app metadata', () => {
   it('links standards-based and Apple standalone metadata', () => {
     const html = readFileSync(resolve(uiRoot, 'index.html'), 'utf8');
     expect(html).toContain('name="apple-mobile-web-app-capable" content="yes"');
-    expect(html).toContain('name="apple-mobile-web-app-status-bar-style" content="black-translucent"');
+    expect(html).toContain('name="apple-mobile-web-app-status-bar-style" content="default"');
     expect(html).toContain('rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png"');
     expect(html).toContain('rel="manifest" href="/manifest.webmanifest"');
     expect(html).toContain('viewport-fit=cover');
