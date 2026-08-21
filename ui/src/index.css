@@ -205,23 +205,38 @@ body.app-viewport-active #root {
 
   .file-browser-overlay,
   .viewer-shell--overlay,
-  .task-approval-reader {
+  .task-approval-reader,
+  .commission-review-approval-backdrop {
     padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
       env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
   }
 
   .terminal-page {
-    padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
-      env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
   .desktop-main .terminal-page {
     height: 100%;
   }
 
+  .terminal-page:not(.desktop-main .terminal-page) {
+    padding-top: env(safe-area-inset-top, 0);
+    padding-right: env(safe-area-inset-right, 0);
+    padding-left: env(safe-area-inset-left, 0);
+  }
+
   #app #state-bar {
     height: calc(var(--state-bar-height) + env(safe-area-inset-bottom, 0));
     padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
+  #app #state-bar:has(+ .offline-banner) {
+    height: var(--state-bar-height);
+    padding-bottom: 0;
+  }
+
+  #app #state-bar + .offline-banner {
+    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0));
   }
 
   #state-bar.statebar-mobile {
