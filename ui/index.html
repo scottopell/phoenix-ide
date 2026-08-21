@@ -9,6 +9,17 @@
     <meta name="apple-mobile-web-app-title" content="Phoenix" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      try {
+        if (localStorage.getItem('phoenix-theme') === 'light') {
+          document.querySelector('meta[name="theme-color"]').content = '#f8fafc';
+          document.querySelector('link[rel="manifest"]').href = '/manifest-light.webmanifest';
+          document.documentElement.dataset.theme = 'light';
+        }
+      } catch (_) {
+        // Storage can be unavailable in private browsing; dark is the safe default.
+      }
+    </script>
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <title>Phoenix</title>
   </head>
