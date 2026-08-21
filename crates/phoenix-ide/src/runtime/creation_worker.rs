@@ -35,6 +35,32 @@ pub(crate) fn resolve_creation_model(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationDrainControl {
+    Continue,
+    StopDrain,
+}
+
+async fn drain_claimed_jobs<Job, Claim, ClaimFuture, Process, ProcessFuture>(
+    mut claim: Claim,
+    mut process: Process,
+) -> Result<(), String>
+where
+    Claim: FnMut() -> ClaimFuture,
+    ClaimFuture: std::future::Future<Output = Result<Option<Job>, String>>,
+    Process: FnMut(Job) -> ProcessFuture,
+    ProcessFuture: std::future::Future<Output = CreationDrainControl>,
+{
+    loop {
+        let Some(job) = claim().await? else {
+            return Ok(());
+        };
+        if matches!(process(job).await, CreationDrainControl::StopDrain) {
+            return Ok(());
+        }
+    }
+}
+
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
     while let Some(cleanup) = manager
@@ -60,25 +86,42 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
                 .map_err(|db_error| db_error.to_string())?;
         }
     }
-    loop {
-        let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
-        let outcome = manager
-            .db()
-            .claim_next_conversation_creation_job(
-                &worker_id,
-                &token,
-                chrono::Utc::now(),
-                chrono::Duration::seconds(30),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let CreationClaimOutcome::Claimed(job) = outcome else {
-            return Ok(());
-        };
-        if let Err(error) = process_claimed_job(manager, *job).await {
-            tracing::error!(error = %error, "conversation creation job processing failed");
-        }
-    }
+    drain_claimed_jobs(
+        || {
+            let manager = Arc::clone(manager);
+            let worker_id = worker_id.clone();
+            async move {
+                let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
+                match manager
+                    .db()
+                    .claim_next_conversation_creation_job(
+                        &worker_id,
+                        &token,
+                        chrono::Utc::now(),
+                        chrono::Duration::seconds(30),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    CreationClaimOutcome::Claimed(job) => Ok(Some(*job)),
+                    CreationClaimOutcome::NoEligibleJob => Ok(None),
+                }
+            }
+        },
+        |job| {
+            let manager = Arc::clone(manager);
+            async move {
+                match process_claimed_job(&manager, job).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        tracing::error!(error = %error, "conversation creation job processing failed");
+                        CreationDrainControl::Continue
+                    }
+                }
+            }
+        },
+    )
+    .await
 }
 
 fn missing_repository_and_resource(repo: &Path, resource: &Path) -> bool {
@@ -148,7 +191,7 @@ async fn reconcile_creation_cleanup(
 async fn process_claimed_job(
     manager: &Arc<RuntimeManager>,
     job: crate::db::ConversationCreationJob,
-) -> Result<(), String> {
+) -> Result<CreationDrainControl, String> {
     let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
         return Err("claimed creation job lacked claim authority".to_string());
     };
@@ -182,7 +225,7 @@ async fn process_claimed_job(
                         return processing.await;
                     }
                     tracing::debug!(job_id = %job_id, generation = claim.generation, "stopping creation worker after lease authority was lost");
-                    return Ok(());
+                    return Ok(CreationDrainControl::StopDrain);
                 }
             }
         }
@@ -193,7 +236,7 @@ async fn process_claimed_job(
 async fn process_job(
     manager: &Arc<RuntimeManager>,
     mut job: crate::db::ConversationCreationJob,
-) -> Result<(), String> {
+) -> Result<CreationDrainControl, String> {
     let conv_id = job.conversation_id.clone();
     let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
         return Err("claimed creation job lacked claim authority".to_string());
@@ -222,21 +265,23 @@ async fn process_job(
             if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation completion rejected after claim loss");
             }
-            return Ok(());
+            return Ok(CreationDrainControl::Continue);
         }
         if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
             tracing::info!(job_id = %job.id, message_id = ?job.message_id, "starting creation runtime to resume the persisted LLM request");
             let _ = manager.get_or_create(&conv_id).await?;
-            return Ok(());
+            return Ok(CreationDrainControl::Continue);
         }
         tracing::info!(job_id = %job.id, message_id = ?job.message_id, "replaying creation bootstrap after message persisted without state advancement");
     }
 
     match provision_conversation(manager, &mut job).await {
-        Ok(ProvisionOutcome::SeededEmpty | ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
+        Ok(ProvisionOutcome::SeededEmpty | ProvisionOutcome::InitialMessageSubmitted) => {
+            Ok(CreationDrainControl::Continue)
+        }
         Err(CreationProvisionError::FatalAuthorityDeferred) => {
             tracing::info!(job_id = %job.id, "leaving admitted creation job recoverable after fatal authority closure");
-            Ok(())
+            Ok(CreationDrainControl::StopDrain)
         }
         Err(CreationProvisionError::Failed(message, kind)) => {
             if creation_error_is_retryable(&kind) && job.protocol.attempt < 4 {
@@ -263,7 +308,7 @@ async fn process_job(
                 if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
                     tracing::warn!(job_id = %job.id, attempt = job.protocol.attempt, retry_at = %(now + delay), error = %message, "conversation creation retry scheduled");
                 }
-                return Ok(());
+                return Ok(CreationDrainControl::Continue);
             }
             let failed = ConvState::CreationFailed {
                 job_id: job.id.clone(),
@@ -283,7 +328,7 @@ async fn process_job(
                 .map_err(|e| e.to_string())?;
             if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation failure rejected after claim loss");
-                return Ok(());
+                return Ok(CreationDrainControl::Continue);
             }
             let broadcast_tx = manager.conversation_broadcaster(&conv_id).await;
             let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
@@ -1353,6 +1398,37 @@ mod runtime_bootstrap_settlement_tests {
             ),
             Err(CreationProvisionError::FatalAuthorityDeferred)
         ));
+    }
+
+    #[tokio::test]
+    async fn fatal_deferral_stops_drain_before_second_job_claim() {
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let processed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_processed = Arc::clone(&processed);
+
+        drain_claimed_jobs(
+            move || {
+                let claim_number =
+                    observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async move {
+                    match claim_number {
+                        0 => Ok(Some("first-job")),
+                        1 => Ok(Some("second-job")),
+                        _ => Ok(None),
+                    }
+                }
+            },
+            move |job| {
+                observed_processed.lock().unwrap().push(job);
+                async move { CreationDrainControl::StopDrain }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(*processed.lock().unwrap(), vec!["first-job"]);
     }
 }
 
