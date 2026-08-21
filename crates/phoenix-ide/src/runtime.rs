@@ -51,7 +51,7 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tracing::Instrument;
@@ -343,6 +343,8 @@ pub struct RuntimeManager {
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     fatal_local_authority_tx: tokio::sync::watch::Sender<Option<&'static str>>,
+    fatal_local_authority_latched: Arc<AtomicBool>,
+    fatal_local_authority_admission_gate: Arc<Mutex<()>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -1627,6 +1629,8 @@ impl RuntimeManager {
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
         let (fatal_local_authority_tx, _) = watch::channel(None);
+        let fatal_local_authority_latched = Arc::new(AtomicBool::new(false));
+        let fatal_local_authority_admission_gate = Arc::new(Mutex::new(()));
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1683,6 +1687,8 @@ impl RuntimeManager {
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             fatal_local_authority_tx,
+            fatal_local_authority_latched,
+            fatal_local_authority_admission_gate,
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -1694,7 +1700,25 @@ impl RuntimeManager {
     }
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
+        let _admission = self
+            .fatal_local_authority_admission_gate
+            .lock()
+            .expect("fatal authority admission gate poisoned");
+        self.fatal_local_authority_latched
+            .store(true, Ordering::Release);
         self.fatal_local_authority_tx.send_replace(Some(boundary));
+    }
+
+    fn fatal_local_authority_is_latched(&self) -> bool {
+        self.fatal_local_authority_latched.load(Ordering::Acquire)
+    }
+
+    fn require_local_authority_admission(&self) -> Result<(), String> {
+        if self.fatal_local_authority_is_latched() {
+            Err("runtime admission closed after fatal local authority loss".to_string())
+        } else {
+            Ok(())
+        }
     }
 
     fn propagate_fatal_runtime_exit(
@@ -1708,6 +1732,14 @@ impl RuntimeManager {
     }
 
     pub(crate) async fn fence_fatal_local_authority(&self) {
+        {
+            let _admission = self
+                .fatal_local_authority_admission_gate
+                .lock()
+                .expect("fatal authority admission gate poisoned");
+            self.fatal_local_authority_latched
+                .store(true, Ordering::Release);
+        }
         let handles: Vec<_> = self
             .runtimes
             .write()
@@ -2710,6 +2742,19 @@ impl RuntimeManager {
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
+        if let Err(error) = self.require_local_authority_admission() {
+            let _ = req
+                .parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: req.spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error,
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
         let SubAgentSpawnRequest {
             spec,
             parent_conversation_id,
@@ -2986,7 +3031,11 @@ impl RuntimeManager {
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
         let runtime = runtime
             .with_state_watcher(sub_state_tx)
-            .with_fatal_local_authority_signal(self.fatal_local_authority_tx.clone());
+            .with_fatal_local_authority_signal(
+                self.fatal_local_authority_tx.clone(),
+                Arc::clone(&self.fatal_local_authority_latched),
+                Arc::clone(&self.fatal_local_authority_admission_gate),
+            );
 
         // Seed the sub-agent's trigger slot with the parent's turn context. A
         // sub-agent's whole life is one turn (it never leaves "working"
@@ -3001,17 +3050,28 @@ impl RuntimeManager {
 
         // 7. Store handle
         let sub_agent_identity = Arc::new(());
-        self.runtimes.write().await.insert(
-            conv.id.clone(),
-            ConversationHandle {
-                event_tx: event_tx.clone(),
-                acknowledged_event_tx,
-                turn_trigger,
-                broadcast_tx: broadcaster.clone(),
-                identity: sub_agent_identity.clone(),
-                state_rx: sub_state_rx,
-            },
-        );
+        {
+            let mut runtimes = self.runtimes.write().await;
+            let _admission = self
+                .fatal_local_authority_admission_gate
+                .lock()
+                .expect("fatal authority admission gate poisoned");
+            if self.fatal_local_authority_is_latched() {
+                broadcaster.close_publication();
+                return;
+            }
+            runtimes.insert(
+                conv.id.clone(),
+                ConversationHandle {
+                    event_tx: event_tx.clone(),
+                    acknowledged_event_tx,
+                    turn_trigger,
+                    broadcast_tx: broadcaster.clone(),
+                    identity: sub_agent_identity.clone(),
+                    state_rx: sub_state_rx,
+                },
+            );
+        }
 
         // 8. Set up per-agent timeout — sends UserCancel if sub-agent exceeds its limit.
         // This is a safety net; the parent's AwaitingSubAgents deadline is the primary
@@ -3133,6 +3193,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
+        self.require_local_authority_admission()?;
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
         }
@@ -3652,6 +3713,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
+        self.require_local_authority_admission()?;
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
         }
@@ -4097,7 +4159,11 @@ impl RuntimeManager {
         let (state_tx, state_rx) = watch::channel(initial_state);
         let runtime = runtime
             .with_state_watcher(state_tx)
-            .with_fatal_local_authority_signal(self.fatal_local_authority_tx.clone());
+            .with_fatal_local_authority_signal(
+                self.fatal_local_authority_tx.clone(),
+                Arc::clone(&self.fatal_local_authority_latched),
+                Arc::clone(&self.fatal_local_authority_admission_gate),
+            );
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -4173,6 +4239,15 @@ impl RuntimeManager {
         {
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
+            let _admission = self
+                .fatal_local_authority_admission_gate
+                .lock()
+                .expect("fatal authority admission gate poisoned");
+            if self.fatal_local_authority_is_latched() {
+                broadcaster.close_publication();
+                reservations.remove(conversation_id);
+                return Err("runtime admission closed after fatal local authority loss".to_string());
+            }
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
                 reservations.remove(conversation_id);
@@ -6496,6 +6571,51 @@ mod scope_liveness_tests {
                 .unwrap(),
             Err("runtime stopped before event settled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn fatal_authority_latch_blocks_runtime_racing_drain_snapshot() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "fatal-authority-admission-race";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let materialization = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.get_or_create(conversation_id).await })
+        };
+
+        barrier.wait().await;
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut events = broadcaster.subscribe();
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        manager.fence_fatal_local_authority().await;
+        barrier.wait().await;
+
+        let Err(error) = materialization.await.expect("materialization task joins") else {
+            panic!("fatal latch must reject runtime insertion");
+        };
+        assert!(error.contains("runtime admission closed"));
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

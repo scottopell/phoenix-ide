@@ -40,6 +40,7 @@ use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1741,17 +1742,29 @@ struct ProposedDirectTurnState {
 
 struct AuthorityBoundaryOwnerGuard {
     fatal_tx: Option<watch::Sender<Option<&'static str>>>,
+    fatal_latched: Option<Arc<AtomicBool>>,
+    admission_gate: Option<Arc<std::sync::Mutex<()>>>,
 }
 
 impl AuthorityBoundaryOwnerGuard {
     fn disarm(&mut self) {
         self.fatal_tx = None;
+        self.fatal_latched = None;
+        self.admission_gate = None;
     }
 }
 
 impl Drop for AuthorityBoundaryOwnerGuard {
     fn drop(&mut self) {
-        if let Some(fatal_tx) = self.fatal_tx.take() {
+        if let (Some(fatal_tx), Some(fatal_latched), Some(admission_gate)) = (
+            self.fatal_tx.take(),
+            self.fatal_latched.take(),
+            self.admission_gate.take(),
+        ) {
+            let _admission = admission_gate
+                .lock()
+                .expect("fatal authority admission gate poisoned");
+            fatal_latched.store(true, Ordering::Release);
             fatal_tx.send_replace(Some("direct_turn_boundary_owner_disappeared"));
         }
     }
@@ -1982,6 +1995,8 @@ where
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     fatal_local_authority_tx: Option<watch::Sender<Option<&'static str>>>,
+    fatal_local_authority_latched: Option<Arc<AtomicBool>>,
+    fatal_local_authority_admission_gate: Option<Arc<std::sync::Mutex<()>>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2119,6 +2134,8 @@ where
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
             fatal_local_authority_tx: None,
+            fatal_local_authority_latched: None,
+            fatal_local_authority_admission_gate: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2175,8 +2192,12 @@ where
     pub fn with_fatal_local_authority_signal(
         mut self,
         tx: watch::Sender<Option<&'static str>>,
+        latched: Arc<AtomicBool>,
+        admission_gate: Arc<std::sync::Mutex<()>>,
     ) -> Self {
         self.fatal_local_authority_tx = Some(tx);
+        self.fatal_local_authority_latched = Some(latched);
+        self.fatal_local_authority_admission_gate = Some(admission_gate);
         self
     }
 
@@ -5082,6 +5103,8 @@ where
                 });
                 let mut owner_guard = AuthorityBoundaryOwnerGuard {
                     fatal_tx: self.fatal_local_authority_tx.clone(),
+                    fatal_latched: self.fatal_local_authority_latched.clone(),
+                    admission_gate: self.fatal_local_authority_admission_gate.clone(),
                 };
                 let materialization = boundary_owner.await.map_err(|error| {
                     tracing::error!(?error, "direct-turn authority boundary owner disappeared");
@@ -12612,7 +12635,11 @@ mod authoritative_user_message_effect_tests {
             },
         );
         let (fatal_tx, mut fatal_rx) = tokio::sync::watch::channel(None);
-        rt = rt.with_fatal_local_authority_signal(fatal_tx);
+        rt = rt.with_fatal_local_authority_signal(
+            fatal_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(())),
+        );
         let (materialization_started, release_materialization) =
             storage.gate_authoritative_user_message_materialization();
         let result =
