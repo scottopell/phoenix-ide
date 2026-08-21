@@ -6687,6 +6687,40 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn closure_before_direct_turn_acceptance_prevents_persistence() {
+        let manager = test_manager().await;
+        let conversation = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create acceptance conversation");
+        manager.signal_fatal_local_authority("test_acceptance_boundary");
+        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let prepared = phoenix_workflow::PreparedTurn::from_exact_payload(
+            &phoenix_workflow::ConversationAuthority(conversation.id),
+            b"closed acceptance".to_vec(),
+        );
+
+        let result = manager
+            .run_local_authority_pass(repository.accept_authoritative_turn(
+                &phoenix_db::workflow::AcceptAuthoritativeTurn {
+                    client_key: phoenix_workflow::ClientTurnKey::new("closed-acceptance").unwrap(),
+                    prepared,
+                    disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                    accepted_at: phoenix_workflow::Timestamp(1),
+                },
+            ))
+            .await;
+
+        assert!(result.is_err());
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflows")
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn admitted_workflow_pass_holds_owner_until_completion() {
         let manager = Arc::new(test_manager().await);
         let (entered_tx, entered_rx) = oneshot::channel();

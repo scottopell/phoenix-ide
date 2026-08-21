@@ -242,8 +242,9 @@ impl SendChatApplicationService {
             .map_err(|error| SendChatServiceError::Internal(error.to_string()))?;
         let client_key = ClientTurnKey::new(req.message_id.clone())
             .ok_or(SendChatServiceError::IdempotencyConflict)?;
-        let step = match repo
-            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+        let acceptance = self
+            .runtime
+            .run_local_authority_pass(repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 client_key: client_key.clone(),
                 prepared: PreparedTurn::from_exact_payload(
                     &ConversationAuthority(conversation.id.clone()),
@@ -251,9 +252,14 @@ impl SendChatApplicationService {
                 ),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: now_timestamp(),
-            })
+            }))
             .await
-        {
+            .map_err(|()| {
+                SendChatServiceError::Internal(
+                    "runtime admission closed after fatal local authority loss".to_string(),
+                )
+            })?;
+        let step = match acceptance {
             Ok(step) => step,
             Err(crate::db::DbError::DirectTurnConflict(
                 TurnConflict::PreparedSemanticsChanged { .. },

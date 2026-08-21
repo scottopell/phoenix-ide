@@ -2458,6 +2458,72 @@ impl WakeRepository {
         Ok(predecessors)
     }
 
+    pub async fn list_continuation_transfer_units(
+        &self,
+    ) -> DbResult<Vec<(String, String, WorkflowId)>> {
+        let predecessors = self.list_continuation_transfer_predecessors().await?;
+        let mut units = Vec::new();
+        for predecessor in predecessors {
+            let mut tx = self.workflow_repo.begin_tx().await?;
+            let continuation = sqlx::query_scalar::<_, String>(
+                "WITH RECURSIVE continuation_chain(id, continued_in_conv_id, work_scope_id, depth) AS (
+                     SELECT id, continued_in_conv_id, work_scope_id, 0 FROM conversations WHERE id = ?1
+                     UNION ALL
+                     SELECT c.id, c.continued_in_conv_id, c.work_scope_id, chain.depth + 1
+                     FROM conversations c JOIN continuation_chain chain ON c.id = chain.continued_in_conv_id
+                     WHERE chain.depth < 100 AND c.work_scope_id = chain.work_scope_id
+                 ) SELECT id FROM continuation_chain WHERE continued_in_conv_id IS NULL AND depth > 0
+                   ORDER BY depth DESC LIMIT 1",
+            )
+            .bind(&predecessor)
+            .fetch_optional(&mut *tx.tx)
+            .await?;
+            tx.commit().await?;
+            if let Some(continuation) = continuation {
+                for workflow_id in self
+                    .list_workflows_owed_to_conversation(&predecessor)
+                    .await?
+                {
+                    units.push((predecessor.clone(), continuation.clone(), workflow_id));
+                }
+            }
+        }
+        Ok(units)
+    }
+
+    pub async fn transfer_workflow_for_continuation(
+        &self,
+        from_conversation_id: &str,
+        to_conversation_id: &str,
+        workflow_id: WorkflowId,
+        timestamp: Timestamp,
+    ) -> DbResult<()> {
+        for _ in 0..20 {
+            let mut tx = self.workflow_repo.begin_tx().await?;
+            let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
+                tx.rollback().await?;
+                break;
+            };
+            let pending_delivery_ids =
+                fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+            tx.rollback().await?;
+            let input = WakeTransferInput {
+                workflow_id,
+                from_conversation_id: from_conversation_id.to_string(),
+                to_conversation_id: to_conversation_id.to_string(),
+                expected_version: head.version,
+                exact_pending_delivery_ids: pending_delivery_ids,
+                transition_id: TransitionId(head.version.next().0),
+                timestamp,
+            };
+            match self.transfer(&input).await? {
+                WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
+                WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
+            }
+        }
+        Ok(())
+    }
+
     pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
         let mut repaired = 0;
         for predecessor in self.list_continuation_transfer_predecessors().await? {
@@ -2513,29 +2579,13 @@ impl WakeRepository {
             .list_workflows_owed_to_conversation(from_conversation_id)
             .await?;
         for workflow_id in owed {
-            for _ in 0..20 {
-                let mut tx = self.workflow_repo.begin_tx().await?;
-                let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
-                    tx.rollback().await?;
-                    break;
-                };
-                let pending_delivery_ids =
-                    fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
-                tx.rollback().await?;
-                let input = WakeTransferInput {
-                    workflow_id,
-                    from_conversation_id: from_conversation_id.to_string(),
-                    to_conversation_id: to_conversation_id.to_string(),
-                    expected_version: head.version,
-                    exact_pending_delivery_ids: pending_delivery_ids,
-                    transition_id: TransitionId(head.version.next().0),
-                    timestamp,
-                };
-                match self.transfer(&input).await? {
-                    WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
-                    WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
-                }
-            }
+            self.transfer_workflow_for_continuation(
+                from_conversation_id,
+                to_conversation_id,
+                workflow_id,
+                timestamp,
+            )
+            .await?;
         }
         Ok(())
     }
