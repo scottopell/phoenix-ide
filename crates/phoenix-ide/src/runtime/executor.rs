@@ -40,7 +40,6 @@ use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1740,32 +1739,20 @@ struct ProposedDirectTurnState {
     updated_at: DateTime<Utc>,
 }
 
-struct AuthorityBoundaryOwnerGuard {
-    fatal_tx: Option<watch::Sender<Option<&'static str>>>,
-    fatal_latched: Option<Arc<AtomicBool>>,
-    admission_gate: Option<Arc<std::sync::Mutex<()>>>,
+struct AuthorityBoundaryConsumerGuard {
+    fence: Option<Arc<crate::runtime::FatalLocalAuthorityFence>>,
 }
 
-impl AuthorityBoundaryOwnerGuard {
+impl AuthorityBoundaryConsumerGuard {
     fn disarm(&mut self) {
-        self.fatal_tx = None;
-        self.fatal_latched = None;
-        self.admission_gate = None;
+        self.fence = None;
     }
 }
 
-impl Drop for AuthorityBoundaryOwnerGuard {
+impl Drop for AuthorityBoundaryConsumerGuard {
     fn drop(&mut self) {
-        if let (Some(fatal_tx), Some(fatal_latched), Some(admission_gate)) = (
-            self.fatal_tx.take(),
-            self.fatal_latched.take(),
-            self.admission_gate.take(),
-        ) {
-            let _admission = admission_gate
-                .lock()
-                .expect("fatal authority admission gate poisoned");
-            fatal_latched.store(true, Ordering::Release);
-            fatal_tx.send_replace(Some("direct_turn_boundary_owner_disappeared"));
+        if let Some(fence) = self.fence.take() {
+            fence.close("direct_turn_boundary_owner_disappeared");
         }
     }
 }
@@ -1994,9 +1981,7 @@ where
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
-    fatal_local_authority_tx: Option<watch::Sender<Option<&'static str>>>,
-    fatal_local_authority_latched: Option<Arc<AtomicBool>>,
-    fatal_local_authority_admission_gate: Option<Arc<std::sync::Mutex<()>>>,
+    fatal_local_authority_fence: Option<Arc<crate::runtime::FatalLocalAuthorityFence>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2133,9 +2118,7 @@ where
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
-            fatal_local_authority_tx: None,
-            fatal_local_authority_latched: None,
-            fatal_local_authority_admission_gate: None,
+            fatal_local_authority_fence: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2189,15 +2172,11 @@ where
         self
     }
 
-    pub fn with_fatal_local_authority_signal(
+    pub fn with_fatal_local_authority_fence(
         mut self,
-        tx: watch::Sender<Option<&'static str>>,
-        latched: Arc<AtomicBool>,
-        admission_gate: Arc<std::sync::Mutex<()>>,
+        fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     ) -> Self {
-        self.fatal_local_authority_tx = Some(tx);
-        self.fatal_local_authority_latched = Some(latched);
-        self.fatal_local_authority_admission_gate = Some(admission_gate);
+        self.fatal_local_authority_fence = Some(fence);
         self
     }
 
@@ -2960,9 +2939,9 @@ where
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
         if self
-            .fatal_local_authority_latched
+            .fatal_local_authority_fence
             .as_ref()
-            .is_some_and(|latched| latched.load(Ordering::Acquire))
+            .is_some_and(|fence| fence.is_closed())
             && !matches!(event, Event::Shutdown)
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
@@ -5055,15 +5034,49 @@ where
         }
     }
 
+    fn effect_mutates_durable_authority(effect: &Effect) -> bool {
+        matches!(
+            effect,
+            Effect::PersistMessage { .. }
+                | Effect::PersistAuthoritativeUserMessage { .. }
+                | Effect::PersistState
+                | Effect::CompleteCreation { .. }
+                | Effect::MaterializeCreation { .. }
+                | Effect::ScheduleRetry { .. }
+                | Effect::PersistCheckpoint { .. }
+                | Effect::PersistToolResults { .. }
+                | Effect::PersistHiddenSystemMarker { .. }
+                | Effect::PersistSubAgentResults { .. }
+                | Effect::BeginContinuation { .. }
+                | Effect::ContinuationCommit { .. }
+                | Effect::ApproveTask { .. }
+                | Effect::ApproveTaskFreshHandoff { .. }
+                | Effect::PersistForkProposal { .. }
+                | Effect::ResolveTask { .. }
+                | Effect::CommitSteeringDrain { .. }
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
-        if self
-            .fatal_local_authority_latched
-            .as_ref()
-            .is_some_and(|latched| latched.load(Ordering::Acquire))
-        {
-            return Err("runtime effects closed after fatal local authority loss".to_string());
-        }
+        let effect_owner = if Self::effect_mutates_durable_authority(&effect) {
+            self.fatal_local_authority_fence
+                .as_ref()
+                .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
+                .transpose()
+                .map_err(|()| {
+                    "runtime persistence closed after fatal local authority loss".to_string()
+                })?
+        } else {
+            if self
+                .fatal_local_authority_fence
+                .as_ref()
+                .is_some_and(|fence| fence.is_closed())
+            {
+                return Err("runtime effects closed after fatal local authority loss".to_string());
+            }
+            None
+        };
         match effect {
             Effect::PersistAuthoritativeUserMessage {
                 payload, authority, ..
@@ -5114,12 +5127,11 @@ where
                 };
                 let storage = self.storage.clone();
                 let boundary_owner = tokio::spawn(async move {
+                    let _effect_owner = effect_owner;
                     storage.materialize_authoritative_user_message(&input).await
                 });
-                let mut owner_guard = AuthorityBoundaryOwnerGuard {
-                    fatal_tx: self.fatal_local_authority_tx.clone(),
-                    fatal_latched: self.fatal_local_authority_latched.clone(),
-                    admission_gate: self.fatal_local_authority_admission_gate.clone(),
+                let mut owner_guard = AuthorityBoundaryConsumerGuard {
+                    fence: self.fatal_local_authority_fence.clone(),
                 };
                 let materialization = boundary_owner.await.map_err(|error| {
                     tracing::error!(?error, "direct-turn authority boundary owner disappeared");
@@ -12638,6 +12650,65 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
+    async fn fatal_signal_waits_for_admitted_persistence_owner_to_finish() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = fence.subscribe();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+        let transition = tokio::spawn(async move { rt.apply_transition_result(result).await });
+
+        materialization_started
+            .await
+            .expect("persistence owner entered materialization");
+        while broadcast_rx.try_recv().is_ok() {}
+        fence.close("test_authority_boundary");
+        assert!(fatal_rx.has_changed().is_ok_and(|changed| !changed));
+
+        release_materialization
+            .send(())
+            .expect("release persistence owner");
+        transition
+            .await
+            .expect("transition joins")
+            .expect("admitted persistence finishes before fatal signal");
+        fatal_rx.changed().await.expect("fatal signal published");
+        assert_eq!(*fatal_rx.borrow(), Some("test_authority_boundary"));
+        let post_close = broadcast_rx.try_recv();
+        assert!(
+            matches!(
+                post_close,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed)
+            ),
+            "unexpected post-close publication: {post_close:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_runtime_owner_signals_fatal_authority_loss() {
         let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
@@ -12649,12 +12720,9 @@ mod authoritative_user_message_effect_tests {
                 },
             },
         );
-        let (fatal_tx, mut fatal_rx) = tokio::sync::watch::channel(None);
-        rt = rt.with_fatal_local_authority_signal(
-            fatal_tx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(())),
-        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = fence.subscribe();
+        rt = rt.with_fatal_local_authority_fence(fence);
         let (materialization_started, release_materialization) =
             storage.gate_authoritative_user_message_materialization();
         let result =
@@ -12674,15 +12742,16 @@ mod authoritative_user_message_effect_tests {
         }
         drop(transition);
 
+        assert!(fatal_rx.has_changed().is_ok_and(|changed| !changed));
+        assert_no_broadcast(&mut broadcast_rx);
+        release_materialization
+            .send(())
+            .expect("release supervised boundary task");
         fatal_rx.changed().await.expect("fatal signal published");
         assert_eq!(
             *fatal_rx.borrow(),
             Some("direct_turn_boundary_owner_disappeared")
         );
-        assert_no_broadcast(&mut broadcast_rx);
-        release_materialization
-            .send(())
-            .expect("release supervised boundary task");
     }
 
     #[tokio::test]

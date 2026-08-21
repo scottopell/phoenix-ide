@@ -51,7 +51,7 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tracing::Instrument;
@@ -229,6 +229,82 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 }
 
 /// Manager for all conversation runtimes
+struct FatalLocalAuthorityFenceState {
+    closed: bool,
+    boundary: Option<&'static str>,
+    owners: usize,
+}
+
+pub(crate) struct FatalLocalAuthorityFence {
+    state: Mutex<FatalLocalAuthorityFenceState>,
+    tx: watch::Sender<Option<&'static str>>,
+}
+
+pub(crate) struct FatalLocalAuthorityOwner {
+    fence: Arc<FatalLocalAuthorityFence>,
+}
+
+impl FatalLocalAuthorityFence {
+    fn new() -> Arc<Self> {
+        let (tx, _) = watch::channel(None);
+        Arc::new(Self {
+            state: Mutex::new(FatalLocalAuthorityFenceState {
+                closed: false,
+                boundary: None,
+                owners: 0,
+            }),
+            tx,
+        })
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<FatalLocalAuthorityOwner, ()> {
+        let mut state = self.state.lock().expect("fatal authority fence poisoned");
+        if state.closed {
+            return Err(());
+        }
+        state.owners += 1;
+        Ok(FatalLocalAuthorityOwner {
+            fence: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn close(&self, boundary: &'static str) {
+        let mut state = self.state.lock().expect("fatal authority fence poisoned");
+        state.closed = true;
+        let boundary = *state.boundary.get_or_insert(boundary);
+        if state.owners == 0 {
+            self.tx.send_replace(Some(boundary));
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .closed
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<&'static str>> {
+        self.tx.subscribe()
+    }
+}
+
+impl Drop for FatalLocalAuthorityOwner {
+    fn drop(&mut self) {
+        let mut state = self
+            .fence
+            .state
+            .lock()
+            .expect("fatal authority fence poisoned");
+        state.owners -= 1;
+        if state.closed && state.owners == 0 {
+            if let Some(boundary) = state.boundary {
+                self.fence.tx.send_replace(Some(boundary));
+            }
+        }
+    }
+}
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -342,9 +418,7 @@ pub struct RuntimeManager {
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
-    fatal_local_authority_tx: tokio::sync::watch::Sender<Option<&'static str>>,
-    fatal_local_authority_latched: Arc<AtomicBool>,
-    fatal_local_authority_admission_gate: Arc<Mutex<()>>,
+    fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -739,8 +813,7 @@ pub struct SseBroadcaster {
     /// Queues higher-sequence broadcasts while checkpoint persistence holds a
     /// reserved persisted-message sequence range.
     gate: Arc<Mutex<BroadcastGate>>,
-    fatal_local_authority_latched: Option<Arc<AtomicBool>>,
-    fatal_local_authority_admission_gate: Option<Arc<Mutex<()>>>,
+    fatal_local_authority_fence: Option<Arc<FatalLocalAuthorityFence>>,
 }
 
 impl SseBroadcaster {
@@ -762,8 +835,7 @@ impl SseBroadcaster {
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
-            fatal_local_authority_latched: None,
-            fatal_local_authority_admission_gate: None,
+            fatal_local_authority_fence: None,
         }
     }
 
@@ -775,33 +847,16 @@ impl SseBroadcaster {
         Self::from_sender(tx, initial_last_seq)
     }
 
-    fn with_fatal_local_authority_latch(
-        mut self,
-        latched: Arc<AtomicBool>,
-        admission_gate: Arc<Mutex<()>>,
-    ) -> Self {
-        self.fatal_local_authority_latched = Some(latched);
-        self.fatal_local_authority_admission_gate = Some(admission_gate);
+    fn with_fatal_local_authority_fence(mut self, fence: Arc<FatalLocalAuthorityFence>) -> Self {
+        self.fatal_local_authority_fence = Some(fence);
         self
     }
 
-    fn fatal_publication_guard(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>, ()> {
-        let guard = self
-            .fatal_local_authority_admission_gate
+    fn fatal_publication_guard(&self) -> Result<Option<FatalLocalAuthorityOwner>, ()> {
+        self.fatal_local_authority_fence
             .as_ref()
-            .map(|gate| {
-                gate.lock()
-                    .expect("fatal authority admission gate poisoned")
-            });
-        if self
-            .fatal_local_authority_latched
-            .as_ref()
-            .is_some_and(|latched| latched.load(Ordering::Acquire))
-        {
-            Err(())
-        } else {
-            Ok(guard)
-        }
+            .map(FatalLocalAuthorityFence::try_acquire)
+            .transpose()
     }
 
     fn same_channel(&self, other: &Self) -> bool {
@@ -909,12 +964,6 @@ impl SseBroadcaster {
         gate.queued.clear();
         gate.reserved_until = None;
         gate.hard_deleted = true;
-    }
-
-    fn close_publication_if_fatal(&self, fatal_latched: &AtomicBool) {
-        if fatal_latched.load(Ordering::Acquire) {
-            self.close_publication();
-        }
     }
 
     pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
@@ -1670,9 +1719,7 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
-        let (fatal_local_authority_tx, _) = watch::channel(None);
-        let fatal_local_authority_latched = Arc::new(AtomicBool::new(false));
-        let fatal_local_authority_admission_gate = Arc::new(Mutex::new(()));
+        let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1728,9 +1775,7 @@ impl RuntimeManager {
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
-            fatal_local_authority_tx,
-            fatal_local_authority_latched,
-            fatal_local_authority_admission_gate,
+            fatal_local_authority_fence,
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -1742,17 +1787,11 @@ impl RuntimeManager {
     }
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
-        let _admission = self
-            .fatal_local_authority_admission_gate
-            .lock()
-            .expect("fatal authority admission gate poisoned");
-        self.fatal_local_authority_latched
-            .store(true, Ordering::Release);
-        self.fatal_local_authority_tx.send_replace(Some(boundary));
+        self.fatal_local_authority_fence.close(boundary);
     }
 
     fn fatal_local_authority_is_latched(&self) -> bool {
-        self.fatal_local_authority_latched.load(Ordering::Acquire)
+        self.fatal_local_authority_fence.is_closed()
     }
 
     fn require_local_authority_admission(&self) -> Result<(), String> {
@@ -1774,14 +1813,8 @@ impl RuntimeManager {
     }
 
     pub(crate) async fn fence_fatal_local_authority(&self) {
-        {
-            let _admission = self
-                .fatal_local_authority_admission_gate
-                .lock()
-                .expect("fatal authority admission gate poisoned");
-            self.fatal_local_authority_latched
-                .store(true, Ordering::Release);
-        }
+        self.fatal_local_authority_fence
+            .close("fatal_local_authority_fence");
         let reserved: Vec<_> = self
             .evicted_broadcasters
             .read()
@@ -1790,7 +1823,9 @@ impl RuntimeManager {
             .cloned()
             .collect();
         for broadcaster in reserved {
-            broadcaster.close_publication_if_fatal(&self.fatal_local_authority_latched);
+            if self.fatal_local_authority_fence.is_closed() {
+                broadcaster.close_publication();
+            }
         }
         let handles: Vec<_> = self
             .runtimes
@@ -1808,7 +1843,7 @@ impl RuntimeManager {
     pub fn fatal_local_authority_receiver(
         &self,
     ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
-        self.fatal_local_authority_tx.subscribe()
+        self.fatal_local_authority_fence.subscribe()
     }
 
     /// Get the browser session manager
@@ -3036,10 +3071,7 @@ impl RuntimeManager {
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1)
-            .with_fatal_local_authority_latch(
-                Arc::clone(&self.fatal_local_authority_latched),
-                Arc::clone(&self.fatal_local_authority_admission_gate),
-            );
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         // 5. Create production adapters
@@ -3087,11 +3119,7 @@ impl RuntimeManager {
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
         let runtime = runtime
             .with_state_watcher(sub_state_tx)
-            .with_fatal_local_authority_signal(
-                self.fatal_local_authority_tx.clone(),
-                Arc::clone(&self.fatal_local_authority_latched),
-                Arc::clone(&self.fatal_local_authority_admission_gate),
-            );
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
 
         // Seed the sub-agent's trigger slot with the parent's turn context. A
         // sub-agent's whole life is one turn (it never leaves "working"
@@ -3108,14 +3136,10 @@ impl RuntimeManager {
         let sub_agent_identity = Arc::new(());
         {
             let mut runtimes = self.runtimes.write().await;
-            let _admission = self
-                .fatal_local_authority_admission_gate
-                .lock()
-                .expect("fatal authority admission gate poisoned");
-            if self.fatal_local_authority_is_latched() {
+            let Ok(_admission) = self.fatal_local_authority_fence.try_acquire() else {
                 broadcaster.close_publication();
                 return;
-            }
+            };
             runtimes.insert(
                 conv.id.clone(),
                 ConversationHandle {
@@ -4215,11 +4239,7 @@ impl RuntimeManager {
         let (state_tx, state_rx) = watch::channel(initial_state);
         let runtime = runtime
             .with_state_watcher(state_tx)
-            .with_fatal_local_authority_signal(
-                self.fatal_local_authority_tx.clone(),
-                Arc::clone(&self.fatal_local_authority_latched),
-                Arc::clone(&self.fatal_local_authority_admission_gate),
-            );
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -4296,14 +4316,13 @@ impl RuntimeManager {
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
             let _admission = self
-                .fatal_local_authority_admission_gate
-                .lock()
-                .expect("fatal authority admission gate poisoned");
-            if self.fatal_local_authority_is_latched() {
-                broadcaster.close_publication();
-                reservations.remove(conversation_id);
-                return Err("runtime admission closed after fatal local authority loss".to_string());
-            }
+                .fatal_local_authority_fence
+                .try_acquire()
+                .map_err(|()| {
+                    broadcaster.close_publication();
+                    reservations.remove(conversation_id);
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?;
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
                 reservations.remove(conversation_id);
@@ -4872,11 +4891,10 @@ impl RuntimeManager {
             .await
             .unwrap_or(0);
         let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
-            .with_fatal_local_authority_latch(
-                Arc::clone(&self.fatal_local_authority_latched),
-                Arc::clone(&self.fatal_local_authority_admission_gate),
-            );
-        candidate.close_publication_if_fatal(&self.fatal_local_authority_latched);
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
+        if self.fatal_local_authority_fence.is_closed() {
+            candidate.close_publication();
+        }
         // Keep the live-handle check and reservation insertion atomic with
         // runtime publication. Otherwise a caller can reserve a new orphan
         // channel in the narrow gap between handle publication and reservation
@@ -5360,10 +5378,9 @@ mod broadcaster_tests {
 
     #[test]
     fn fatal_authority_latch_atomically_discards_queued_and_future_publication() {
-        let latched = Arc::new(AtomicBool::new(false));
-        let admission_gate = Arc::new(Mutex::new(()));
-        let broadcaster = SseBroadcaster::new(16, 0)
-            .with_fatal_local_authority_latch(Arc::clone(&latched), Arc::clone(&admission_gate));
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
         let mut events = broadcaster.subscribe();
         let (reserved, _) = broadcaster.reserve_next_persisted_message_after(0);
         broadcaster
@@ -5374,10 +5391,7 @@ mod broadcaster_tests {
             })
             .unwrap();
 
-        {
-            let _admission = admission_gate.lock().unwrap();
-            latched.store(true, Ordering::Release);
-        }
+        fence.close("test_authority_boundary");
         drop(reserved);
 
         assert!(broadcaster
