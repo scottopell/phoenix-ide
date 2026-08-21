@@ -3703,6 +3703,13 @@ impl RuntimeManager {
                     let result = worker.await.unwrap_or_else(|error| {
                         Err(format!("runtime materialization task failed: {error}"))
                     });
+                    slot.seal_authority_transfers();
+                    #[cfg(test)]
+                    if let Some(barrier) = manager.runtime_result_fixed_barrier.lock().await.take()
+                    {
+                        barrier.wait().await;
+                        barrier.wait().await;
+                    }
 
                     if let Err(error) = &result {
                         if is_invalid_runtime_cwd_error(error) {
@@ -3718,12 +3725,6 @@ impl RuntimeManager {
                         }
                     }
 
-                    #[cfg(test)]
-                    if let Some(barrier) = manager.runtime_result_fixed_barrier.lock().await.take()
-                    {
-                        barrier.wait().await;
-                        barrier.wait().await;
-                    }
                     let removed_slot = {
                         let mut creations = manager.runtime_creations.lock().await;
                         let slot = creations.get(&conversation_id).expect(
@@ -8685,7 +8686,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn panicked_runtime_materialization_retires_slot_and_allows_retry() {
+    async fn panicked_runtime_materialization_seals_before_authority_retry() {
         let mgr = Arc::new(test_manager().await);
         let conversation_id = "single-flight-panic-retry";
         mgr.db()
@@ -8696,16 +8697,30 @@ mod scope_liveness_tests {
             .lock()
             .await
             .insert(conversation_id.to_string());
-
-        let Err(first_error) = mgr.get_or_create(conversation_id).await else {
-            panic!("injected panic unexpectedly materialized runtime");
+        let inherited_owner = mgr.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_result_fixed_barrier.lock().await = Some(Arc::clone(&barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
         };
-        assert!(first_error.contains("runtime materialization task failed"));
-        assert!(mgr.runtime_creations.lock().await.is_empty());
+        barrier.wait().await;
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, inherited_owner)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
 
-        mgr.get_or_create(conversation_id)
-            .await
-            .expect("subsequent caller can retry materialization");
+        let Err(error) = ordinary.await.unwrap() else {
+            panic!("panicked ordinary materialization unexpectedly succeeded");
+        };
+        assert!(error.contains("runtime materialization task failed"));
+        inherited.await.unwrap().unwrap();
+        assert!(mgr.runtime_creations.lock().await.is_empty());
     }
 
     #[tokio::test]
