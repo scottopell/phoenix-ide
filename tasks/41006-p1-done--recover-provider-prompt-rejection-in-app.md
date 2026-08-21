@@ -65,21 +65,21 @@ The quick retry may send the existing `continue` message, but it must be describ
 
 ## Acceptance criteria
 
-- [ ] OpenAI Responses error code `invalid_prompt` maps to a dedicated provider-neutral prompt-rejection kind, not `InvalidRequest` via substring fallback.
-- [ ] Prompt rejection is exhaustively `NoAutoRetry` and `UserResumable` in both LLM-domain and persisted error policy.
-- [ ] A prompt rejection does not trigger an automatic replay of the same request.
-- [ ] A persisted prompt-rejection state exposes `can_user_resume: true` over init and live SSE.
-- [ ] The error banner explains that the accumulated prompt was rejected and that a revised message can continue the same conversation.
-- [ ] The composer remains available in that error state and can submit revised text.
-- [ ] The in-app retry/continue action submits a new durable user message and transitions the existing conversation back to `LlmRequesting`.
-- [ ] Work-mode identity, worktree attachment, transcript, and uncommitted files remain unchanged across recovery.
-- [ ] Genuine non-resumable request-shape failures do not expose the composer or accept chat messages through a hidden API path.
-- [ ] Backend tests exhaustively cover every error kind's auto-retry and user-resume policies, including prompt rejection, invalid request, content filter, context exhaustion, auth, overload, and usage-limit reset.
-- [ ] Provider-classifier tests cover explicit `invalid_prompt` routing and prove generic invalid-request routing remains distinct.
-- [ ] State-machine/API tests prove UI policy and chat admission cannot disagree for resumable versus terminal error states.
-- [ ] UI tests cover prompt-rejection copy, visible composer, quick retry, revised-message submission, and the terminal invalid-request counterexample.
-- [ ] Normative LLM, conversation UI, and bedrock specs agree on the policy matrix and pass their validation.
-- [ ] `./dev.py codegen` is run if generated wire types change, and `./dev.py check` passes.
+- [x] OpenAI Responses error code `invalid_prompt` maps to a dedicated provider-neutral prompt-rejection kind, not `InvalidRequest` via substring fallback.
+- [x] Prompt rejection is exhaustively `NoAutoRetry` and `UserResumable` in both LLM-domain and persisted error policy.
+- [x] A prompt rejection does not trigger an automatic replay of the same request.
+- [x] A persisted prompt-rejection state exposes `can_user_resume: true` over init and live SSE.
+- [x] The error banner explains that the accumulated prompt was rejected and that a revised message can continue the same conversation.
+- [x] The composer remains available in that error state and can submit revised text.
+- [x] The in-app retry/continue action submits a new durable user message and transitions the existing conversation back to `LlmRequesting`.
+- [x] Work-mode identity, worktree attachment, transcript, and uncommitted files remain unchanged across recovery.
+- [x] Genuine non-resumable request-shape failures do not expose the composer or accept chat messages through a hidden API path.
+- [x] Backend tests exhaustively cover every error kind's auto-retry and user-resume policies, including prompt rejection, invalid request, content filter, context exhaustion, auth, overload, and usage-limit reset.
+- [x] Provider-classifier tests cover explicit `invalid_prompt` routing and prove generic invalid-request routing remains distinct.
+- [x] State-machine/API tests prove UI policy and chat admission cannot disagree for resumable versus terminal error states.
+- [x] UI tests cover prompt-rejection copy, visible composer, quick retry, revised-message submission, and the terminal invalid-request counterexample.
+- [x] Normative LLM, conversation UI, and bedrock specs agree on the policy matrix and pass their validation.
+- [x] `./dev.py codegen` is run if generated wire types change, and `./dev.py check` passes.
 
 ## Validation journey
 

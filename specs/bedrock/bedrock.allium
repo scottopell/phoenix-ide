@@ -119,6 +119,23 @@ value ApprovedTaskWriteAuthority {
 ------------------------------------------------------------
 
 enum ErrorClass { retryable | non_retryable }
+enum ConversationErrorKind {
+    auth
+    | rate_limit
+    | usage_limit_reached
+    | network
+    | invalid_request
+    | prompt_rejected
+    | invalid_response
+    | server_error
+    | server_overloaded
+    | timed_out
+    | cancelled
+    | sub_agent_error
+    | context_exhausted
+    | turn_limit_exhausted
+    | content_filter
+}
 enum ToolOutcome { success | error | cancelled }
 enum SubAgentOutcome { success | failure | timed_out }
 enum RecoveryKind { credential }
@@ -277,6 +294,7 @@ entity Conversation {
     continuation_error_class: ErrorClass when core_status = recoverable_continuation_failure
     error_message: String when core_status = error
     error_class: ErrorClass when core_status = error
+    error_kind: ConversationErrorKind when core_status = error
 
     -- Worktree fields (shared across modes with worktrees)
     branch_name: String when mode in { explore, work, branch }
@@ -460,11 +478,19 @@ config {
 
 rule UserSendsMessage {
     when: UserSendsMessage(conversation, text, images?)
-    requires: conversation.core_status in { idle, error }
+    requires: conversation.core_status = idle or (conversation.core_status = error and user_resumable(conversation.error_kind))
     requires: conversation.row_accepts_user_messages
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: LlmRequestDispatched(conversation)
+}
+
+rule RejectMessageFromNonResumableError {
+    when: UserSendsMessage(conversation, text, images?)
+    requires: conversation.core_status = error
+    requires: conversation.row_accepts_user_messages
+    requires: not user_resumable(conversation.error_kind)
+    ensures: MessageRejected(conversation, reason: non_resumable_error)
 }
 
 rule RejectMessageWhileBusy {
@@ -729,7 +755,7 @@ rule RetryTimeoutFires {
 -- Restricted to user-resumable errors. The user-resume policy is defined in
 -- specs/llm/ (LlmError.user_resumable, derived from LlmErrorKind: auth,
 -- network, rate_limit, server_error, server_overloaded,
--- usage_limit_reached). It is a distinct
+-- usage_limit_reached, prompt_rejected). It is a distinct
 -- axis from error_class (retryable | non_retryable), which governs automatic
 -- runtime retry, not user resumption. error_kind is the persisted error's
 -- LlmErrorKind discriminator, the same payload fact guarded by error_kind in
@@ -744,7 +770,7 @@ rule RetryTimeoutFires {
 rule UserDismissesError {
     when: UserDismissesError(conversation)
     requires: conversation.core_status = error
-    requires: user_resumable(error_kind)
+    requires: user_resumable(conversation.error_kind)
     ensures: conversation.core_status = idle
     ensures: ErrorDismissed(conversation)
 
@@ -984,6 +1010,7 @@ rule ParentLlmErrorNonRecoverable {
     ensures: conversation.core_status = error
     ensures: conversation.error_message = message
     ensures: conversation.error_class = error_class
+    ensures: conversation.error_kind = error_kind
 }
 
 -- ===========================================================

@@ -155,6 +155,10 @@ pub fn from_transition_error(err: &TransitionError) -> UserFacingError {
             "This conversation has been completed or abandoned. Start a new one to \
              continue.",
         ),
+        TransitionError::NonResumableError => UserFacingError::fatal(
+            "Conversation cannot resume from this error",
+            "Start a new conversation to continue.",
+        ),
         // Catch-all for (state, event) pairs the state machine doesn't
         // have an arm for. The variant payload is now structured
         // (`&'static str` discriminators, never `Debug`-formatted payloads

@@ -62,6 +62,6 @@ React 18 SPA with React Router, Vite build tooling, and CSS variables for themin
 | **REQ-CONV-018:** Desktop New Conversation - Inline Sidebar Mode | ✅ Complete | Task 563 |
 | **REQ-CONV-019:** Streaming Text Display | ✅ Complete | Task 582. `StreamingMessage` component, atomic swap in reducer |
 | **REQ-CONV-020:** Navigation Persistence | ✅ Complete | Task 581. Router-level `ConversationProvider`, `lastSequenceId` in atom |
-| **REQ-CONV-021:** Error Resume Affordance | ✅ Complete | User-resumable typed errors surface a resume affordance |
+| **REQ-CONV-021:** Error Resume Affordance | ✅ Complete | User-resumable typed errors keep in-conversation recovery available, including tailored provider prompt-rejection guidance |
 | **REQ-CONV-022:** Conversation View Density | ✅ Complete | `full`/`compact` via `DensityProvider`; compact collapses tools + text previews without data loss, and compact bash cards retain identity, status, duration, and bounded output tail rather than a generic done summary |
 | **REQ-CONV-023:** Conversation Navigation | ✅ Complete | `ConversationNav` chapter strip; top slot remains navigation-only, with human-meaningful chapter labels and no opaque display IDs |

@@ -432,6 +432,31 @@ describe('parseEvent', () => {
       expect(res.ok).toBe(true);
     });
 
+    it('accepts the typed prompt-rejection recovery policy', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseStateChangeDataSchema,
+        makeEvent({
+          sequence_id: 13,
+          state: {
+            type: 'error',
+            message: 'invalid_prompt: rejected',
+            error_kind: 'prompt_rejected',
+          },
+          presentation_mode: 'error',
+          state_updated_at: '2026-08-21T00:00:00.000Z',
+          error: {
+            kind: 'prompt_rejected',
+            can_auto_retry: false,
+            can_user_resume: true,
+          },
+        }),
+        'state_change',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
     it('rejects state_change missing the state envelope key', () => {
       inProdMode(() => {
         const { dispatch, actions } = mockDispatch();

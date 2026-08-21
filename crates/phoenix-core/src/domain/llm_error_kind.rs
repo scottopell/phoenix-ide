@@ -29,6 +29,11 @@ pub enum LlmErrorKind {
     Auth,
     /// Bad request (400) - not retryable
     InvalidRequest,
+    /// The provider rejected the assembled prompt under its prompt policy.
+    /// Retrying the identical in-flight request is unsafe, but the user may
+    /// recover in the same conversation with a revised message or an explicit
+    /// continuation turn.
+    PromptRejected,
     /// Provider returned bytes we could not parse or understand (malformed SSE
     /// event, unparseable body, unexpected content-block shape). The request
     /// was accepted; the *response* is at fault — a transient server/transport
@@ -95,6 +100,7 @@ impl LlmAttemptReason {
             | LlmErrorKind::ServerOverloaded
             | LlmErrorKind::Auth
             | LlmErrorKind::InvalidRequest
+            | LlmErrorKind::PromptRejected
             | LlmErrorKind::ContentFilter
             | LlmErrorKind::ContextWindowExceeded => None,
         }
@@ -112,6 +118,7 @@ impl LlmErrorKind {
             | Self::ServerOverloaded
             | Self::Auth
             | Self::InvalidRequest
+            | Self::PromptRejected
             | Self::ContentFilter
             | Self::ContextWindowExceeded => AutoRetryPolicy::NoAutoRetry,
         }
@@ -135,7 +142,8 @@ impl LlmErrorKind {
             | Self::ServerError
             | Self::InvalidResponse
             | Self::ServerOverloaded
-            | Self::UsageLimitReached => UserResumePolicy::Resumable,
+            | Self::UsageLimitReached
+            | Self::PromptRejected => UserResumePolicy::Resumable,
             Self::InvalidRequest | Self::ContentFilter | Self::ContextWindowExceeded => {
                 UserResumePolicy::NotResumable
             }
@@ -145,5 +153,92 @@ impl LlmErrorKind {
     #[must_use]
     pub fn is_user_resumable(self) -> bool {
         self.user_resume_policy().allows_user_resume()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+
+    #[test]
+    fn all_llm_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
+        use LlmErrorKind::{
+            Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
+            PromptRejected, RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
+        };
+
+        let cases = [
+            (
+                Network,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                RateLimit,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                UsageLimitReached,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                ServerError,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                ServerOverloaded,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                Auth,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                InvalidRequest,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                PromptRejected,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                InvalidResponse,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                ContentFilter,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ContextWindowExceeded,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+        ];
+
+        for (kind, auto_retry, user_resume) in cases {
+            assert_eq!(
+                kind.auto_retry_policy(),
+                auto_retry,
+                "auto retry for {kind:?}"
+            );
+            assert_eq!(
+                kind.user_resume_policy(),
+                user_resume,
+                "user resume for {kind:?}"
+            );
+        }
+
+        assert_eq!(LlmAttemptReason::from_kind(PromptRejected), None);
     }
 }

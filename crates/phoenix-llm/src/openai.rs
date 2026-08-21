@@ -191,6 +191,9 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             "Selected model is at capacity. Try a different model.",
         );
     }
+    if lower == "invalid_prompt" {
+        return LlmError::prompt_rejected(detail);
+    }
 
     if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
         LlmError::rate_limit(detail)
@@ -4637,6 +4640,10 @@ mod tests {
         assert_eq!(
             classify_responses_error("content_filter", "x").kind,
             LlmErrorKind::ContentFilter
+        );
+        assert_eq!(
+            classify_responses_error("invalid_prompt", "x").kind,
+            LlmErrorKind::PromptRejected
         );
         assert_eq!(
             classify_responses_error("invalid_request_error", "x").kind,

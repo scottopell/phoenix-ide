@@ -682,6 +682,10 @@ pub enum ErrorKind {
     Network,
     /// Bad request (400) - not retryable
     InvalidRequest,
+    /// Provider rejected the assembled prompt under its prompt policy. The
+    /// same request is not auto-retried, but the conversation accepts a fresh
+    /// user turn so the user can revise or explicitly continue.
+    PromptRejected,
     /// Provider returned bytes we could not parse or understand (malformed SSE
     /// event, unparseable body, unexpected content-block shape) - retryable
     InvalidResponse,
@@ -717,6 +721,7 @@ impl ErrorKind {
             | Self::UsageLimitReached
             | Self::ServerOverloaded
             | Self::InvalidRequest
+            | Self::PromptRejected
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
@@ -745,7 +750,8 @@ impl ErrorKind {
             | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached
-            | Self::TimedOut => UserResumePolicy::Resumable,
+            | Self::TimedOut
+            | Self::PromptRejected => UserResumePolicy::Resumable,
             Self::InvalidRequest
             | Self::Cancelled
             | Self::SubAgentError
@@ -1830,8 +1836,8 @@ mod error_kind_tests {
         use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
         use ErrorKind::{
             Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
-            Network, RateLimit, ServerError, ServerOverloaded, SubAgentError, TimedOut,
-            TurnLimitExhausted, UsageLimitReached,
+            Network, PromptRejected, RateLimit, ServerError, ServerOverloaded, SubAgentError,
+            TimedOut, TurnLimitExhausted, UsageLimitReached,
         };
 
         let cases = [
@@ -1879,6 +1885,11 @@ mod error_kind_tests {
                 InvalidRequest,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::NotResumable,
+            ),
+            (
+                PromptRejected,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
             ),
             (
                 Cancelled,

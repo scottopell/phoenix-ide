@@ -103,6 +103,7 @@ enum LlmErrorKind {
     | server_overloaded
     | auth
     | invalid_request
+    | prompt_rejected
     | invalid_response
     | content_filter
     | context_window_exceeded
@@ -235,7 +236,7 @@ entity LlmError {
     -- auto-retryable, but is resumable after credentials are fixed.
     -- usage_limit_reached is never auto-retried, but its quota window resets
     -- on a clock boundary, so the user can resume once the window clears.
-    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached
+    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached or kind = prompt_rejected
 }
 
 ------------------------------------------------------------
@@ -267,7 +268,7 @@ invariant AutoRetryablePartition {
 
 invariant UserResumablePartition {
     for e in LlmErrors:
-        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached)
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached or e.kind = prompt_rejected)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity

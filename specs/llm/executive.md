@@ -23,7 +23,7 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-004a–004f:** Reasoning Effort Lifecycle | ✅ Complete | Native omission, explicit overrides, atomic switches, subagent inheritance, provider translation, and output reservation |
 | **REQ-LLM-004g:** Codex Fast Service Tier | ✅ Complete | Capability-gated per-conversation Standard/Fast selection; Fast maps to Codex `priority`, discloses increased usage, persists through continuations, and defaults subagents to Standard |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
-| **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, user-resumable quota exhaustion, model overload, and explicit Codex depletion states are classified separately |
+| **REQ-LLM-006:** Error Classification | ✅ Complete | Transient throttles, user-resumable quota exhaustion, model overload, provider prompt rejection, and explicit Codex depletion states are classified separately |
 | **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | ✅ Complete | Structured Codex quota normalization, plan-aware resumable messages, and authoritative account quota UI with reset timestamps formatted in the browser's local timezone |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-007a:** Reasoning Token and Effort Observability | ✅ Complete | Provider-reported reasoning tokens and effective effort are tracked without exposing reasoning content |
