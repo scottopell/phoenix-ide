@@ -180,6 +180,12 @@ body.app-viewport-active #root {
     height: 100%;
   }
 
+  .desktop-layout > .sidebar-expanded,
+  .desktop-layout > .sidebar-collapsed,
+  .desktop-layout > .fe-panel {
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
   .list-page #main-area {
     padding-top: env(safe-area-inset-top, 0);
     padding-bottom: env(safe-area-inset-bottom, 0);
@@ -193,7 +199,14 @@ body.app-viewport-active #root {
     padding-top: 0;
   }
 
-  .file-browser-overlay {
+  .file-browser-overlay,
+  .viewer-shell--overlay {
+    padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
+      env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
+  }
+
+  .terminal-page {
+    height: 100%;
     padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
       env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
   }
