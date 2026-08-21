@@ -391,6 +391,8 @@ pub struct RuntimeManager {
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     subagent_persistence_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1806,6 +1808,8 @@ impl RuntimeManager {
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             subagent_persistence_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -1871,6 +1875,24 @@ impl RuntimeManager {
         if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
             self.signal_fatal_local_authority(boundary);
         }
+    }
+
+    async fn handle_primary_runtime_exit(
+        &self,
+        conversation: &crate::db::Conversation,
+        disposition: executor::RuntimeExitDisposition,
+    ) {
+        self.propagate_fatal_runtime_exit(disposition, "primary conversation runtime");
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .runtime_exit_barriers
+            .lock()
+            .await
+            .remove(&conversation.id)
+        {
+            barrier.wait().await;
+        }
+        self.handle_runtime_exit(conversation, disposition).await;
     }
 
     pub(crate) async fn fence_fatal_local_authority(&self) {
@@ -3980,6 +4002,9 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
+        let recovery_owner = self.acquire_local_authority_pass().map_err(|()| {
+            "runtime admission closed after fatal local authority loss".to_string()
+        })?;
         let mut conv = self
             .db
             .get_conversation(conversation_id)
@@ -4008,6 +4033,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        drop(recovery_owner);
 
         let cleanup_conversation = conv.clone();
 
@@ -4503,7 +4529,7 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let disposition = runtime.run().await;
             manager_for_cleanup
-                .handle_runtime_exit(&cleanup_conversation, disposition)
+                .handle_primary_runtime_exit(&cleanup_conversation, disposition)
                 .await;
 
             // Only remove this runtime's HashMap entry. After evict_runtime()
@@ -6652,6 +6678,41 @@ mod scope_liveness_tests {
         );
         fatal.changed().await.unwrap();
         assert_eq!(*fatal.borrow(), Some("spawned conversation runtime"));
+    }
+
+    #[tokio::test]
+    async fn primary_runtime_fatal_exit_signals_before_exit_cleanup() {
+        let manager = Arc::new(test_manager().await);
+        let conversation = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_exit_barriers
+            .lock()
+            .await
+            .insert(conversation.id.clone(), Arc::clone(&barrier));
+        let mut fatal = manager.fatal_local_authority_receiver();
+        let exit = {
+            let manager = Arc::clone(&manager);
+            let conversation = conversation.clone();
+            tokio::spawn(async move {
+                manager
+                    .handle_primary_runtime_exit(
+                        &conversation,
+                        executor::RuntimeExitDisposition::FatalLocalAuthorityLoss,
+                    )
+                    .await;
+            })
+        };
+
+        fatal.changed().await.unwrap();
+        assert_eq!(*fatal.borrow(), Some("primary conversation runtime"));
+        assert!(!exit.is_finished());
+        barrier.wait().await;
+        exit.await.unwrap();
     }
 
     #[tokio::test]

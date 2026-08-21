@@ -2224,11 +2224,15 @@ where
         Ok(())
     }
 
-    fn publish_live_state(&self) -> Result<(), String> {
-        let _owner = self.live_state_owner()?;
+    fn publish_live_state_admitted(&self) {
         if let Some(tx) = &self.state_watcher {
             let _ = tx.send(self.state.clone());
         }
+    }
+
+    fn publish_live_state(&self) -> Result<(), String> {
+        let _owner = self.live_state_owner()?;
+        self.publish_live_state_admitted();
         Ok(())
     }
 
@@ -5207,16 +5211,17 @@ where
                             owner.close("direct_turn_materialization");
                         }
                     }
-                    materialization
+                    (materialization, effect_owner)
                 });
                 let mut owner_guard = AuthorityBoundaryConsumerGuard {
                     fence: self.fatal_local_authority_fence.clone(),
                 };
-                let materialization = boundary_owner.await.map_err(|error| {
-                    tracing::error!(?error, "direct-turn authority boundary owner disappeared");
-                    "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
-                        .to_string()
-                })?;
+                let (materialization, materialization_owner) =
+                    boundary_owner.await.map_err(|error| {
+                        tracing::error!(?error, "direct-turn authority boundary owner disappeared");
+                        "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
+                            .to_string()
+                    })?;
                 owner_guard.disarm();
                 let materialization = match materialization {
                     Ok(materialization) => materialization,
@@ -5242,6 +5247,8 @@ where
                         self.state = proposed.state;
                         self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
+                        self.publish_live_state_admitted();
+                        drop(materialization_owner);
                         let _ = self.broadcast_tx.send_message(*message);
                         Ok(None)
                     }
@@ -12878,6 +12885,38 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(*watch_rx.borrow(), ConvState::Idle);
         assert_no_broadcast(&mut broadcast_rx);
+    }
+
+    #[tokio::test]
+    async fn committed_direct_turn_publishes_watcher_before_later_effect_failure() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            })
+            .with_effect(Effect::RequestLlm);
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert!(error.contains("Persisted effort"));
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
     }
 
     #[tokio::test]
