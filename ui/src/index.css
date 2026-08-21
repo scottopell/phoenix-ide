@@ -189,9 +189,7 @@ body.app-viewport-active #root {
   }
 
   .desktop-main {
-    --new-conv-right-inset: env(safe-area-inset-right, 0);
     --new-conv-bottom-inset: env(safe-area-inset-bottom, 0);
-    --new-conv-left-inset: env(safe-area-inset-left, 0);
   }
 
   .list-page #main-area {
@@ -240,21 +238,21 @@ body.app-viewport-active #root {
     padding-left: calc(10px + env(safe-area-inset-left, 0));
   }
 
-  #input-area {
-    padding-right: calc(12px + env(safe-area-inset-right, 0));
-    padding-bottom: 6px;
-    padding-left: calc(12px + env(safe-area-inset-left, 0));
+  .chain-page {
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
   @media (width <= 1024px) {
+    #input-area {
+      padding-right: calc(12px + env(safe-area-inset-right, 0));
+      padding-bottom: 6px;
+      padding-left: calc(12px + env(safe-area-inset-left, 0));
+    }
+
     .chain-page-header {
       padding-top: calc(12px + env(safe-area-inset-top, 0));
       padding-right: calc(20px + env(safe-area-inset-right, 0));
       padding-left: calc(20px + env(safe-area-inset-left, 0));
-    }
-
-    .chain-page {
-      padding-bottom: env(safe-area-inset-bottom, 0);
     }
 
     #conversation-nav {
