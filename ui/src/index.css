@@ -297,18 +297,22 @@ body.app-viewport-active #root {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
-  #app #state-bar:not(.statebar-mobile):has(+ .offline-banner) {
+  #app #state-bar:has(+ .offline-banner) {
     height: var(--state-bar-height);
     padding-bottom: 0;
-  }
-
-  #app #state-bar + .offline-banner {
-    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0));
   }
 
   #state-bar.statebar-mobile {
     height: auto;
     padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
+  #app #state-bar.statebar-mobile:has(+ .offline-banner) {
+    height: auto;
+  }
+
+  #app #state-bar + .offline-banner {
+    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0));
   }
 }
 

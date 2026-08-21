@@ -36,10 +36,10 @@ describe('ThemeProvider render isolation', () => {
     }
 
     const { getByRole, unmount } = render(<ThemeProvider><Toggle /></ThemeProvider>);
-    expect(meta.content).toBe('#0f1115');
+    expect(meta.content).toBe('#0d1117');
     expect(manifest.getAttribute('href')).toBe('/manifest.webmanifest');
     act(() => getByRole('button', { name: 'toggle' }).click());
-    expect(meta.content).toBe('#f8fafc');
+    expect(meta.content).toBe('#ffffff');
     expect(manifest.getAttribute('href')).toBe('/manifest-light.webmanifest');
 
     unmount();
