@@ -136,7 +136,11 @@ fn next_poll_delay() -> Duration {
 pub(crate) async fn run(manager: Arc<RuntimeManager>) {
     loop {
         tokio::time::sleep(next_poll_delay()).await;
-        if let Err(err) = poll_once(&manager).await {
+        let pass = manager.run_local_authority_pass(poll_once(&manager)).await;
+        let Ok(result) = pass else {
+            return;
+        };
+        if let Err(err) = result {
             tracing::debug!(error = %err, "background PR status poll failed");
         }
     }

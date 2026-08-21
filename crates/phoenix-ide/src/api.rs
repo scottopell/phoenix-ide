@@ -132,7 +132,7 @@ impl AppState {
     // platform, mcp, credentials, password, deployment facts, runtime env);
     // bundling them into a struct would only move the same fields behind one
     // more name.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn new(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -178,23 +178,45 @@ impl AppState {
             .start_direct_turn_worker()
             .await
             .map_err(std::io::Error::other)?;
+        runtime
+            .require_startup_local_authority()
+            .map_err(std::io::Error::other)?;
         if AGENT_FACING_WAKE_REGISTRATION.0 {
             runtime
                 .start_wake_worker()
                 .await
                 .map_err(std::io::Error::other)?;
+            runtime
+                .require_startup_local_authority()
+                .map_err(std::io::Error::other)?;
         }
+        runtime
+            .require_startup_local_authority()
+            .map_err(std::io::Error::other)?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         runtime.start_creation_worker().await;
+        runtime
+            .require_startup_local_authority()
+            .map_err(std::io::Error::other)?;
         reconcile_startup_continuations(&runtime).await?;
-        handlers::start_attachment_cleanup_task(db.clone());
+        runtime
+            .require_startup_local_authority()
+            .map_err(std::io::Error::other)?;
+        handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and
         // reports `index_reconciled()` when complete.
         {
             let retriever = retriever.clone();
+            let runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
-                match retriever.reconcile().await {
+                let pass = runtime
+                    .run_local_authority_pass(retriever.reconcile())
+                    .await;
+                let Ok(result) = pass else {
+                    return;
+                };
+                match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,
                         reindexed = stats.reindexed,

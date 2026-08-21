@@ -228,6 +228,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             let mut made_progress = false;
             for obligation in obligations {
                 if settled_obligations.insert(obligation.turn_id) {
+                    let Ok(_owner) = self.dispatcher.acquire_local_authority() else {
+                        return Ok(EMPTY_RESCAN_INTERVAL);
+                    };
                     made_progress = true;
                     self.dispatcher
                         .settle_terminal_obligation(&obligation.conversation.0)
@@ -242,7 +245,11 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let startup = self
             .startup_reconciliation
             .load(std::sync::atomic::Ordering::Acquire);
+        let Ok(startup_owner) = self.dispatcher.acquire_local_authority() else {
+            return Ok(EMPTY_RESCAN_INTERVAL);
+        };
         self.dispatcher.reconcile_startup_parents(startup).await?;
+        drop(startup_owner);
         if startup {
             self.startup_reconciliation
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -260,6 +267,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
             for candidate in page.candidates {
+                let Ok(_owner) = self.dispatcher.acquire_local_authority() else {
+                    return Ok(EMPTY_RESCAN_INTERVAL);
+                };
                 self.dispatch_candidate(candidate, self.clock.now()).await?;
             }
             if exhausted {
@@ -489,6 +499,9 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
     ) -> Result<TerminalObligationSettlement, crate::runtime::DatabaseTerminalRecoveryError>;
 
     fn signal_fatal_local_authority(&self) {}
+    fn acquire_local_authority(&self) -> Result<Box<dyn Send>, ()> {
+        Ok(Box::new(()))
+    }
 
     async fn reconcile_startup_parents(
         &self,
@@ -523,6 +536,12 @@ impl DirectTurnDispatcher for ProductionDirectTurnDispatcher {
 
 #[async_trait]
 impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
+    fn acquire_local_authority(&self) -> Result<Box<dyn Send>, ()> {
+        self.manager
+            .acquire_local_authority_pass()
+            .map(|owner| Box::new(owner) as Box<dyn Send>)
+    }
+
     fn signal_fatal_local_authority(&self) {
         self.manager
             .signal_fatal_local_authority("direct_turn_terminal_recovery");
@@ -721,6 +740,10 @@ mod tests {
         terminal_attempts: Mutex<Vec<String>>,
         terminal_settled: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         event_dispatched: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        admission_open: std::sync::atomic::AtomicBool,
+        admission_attempts: std::sync::atomic::AtomicUsize,
+        close_after_terminal_settlement: std::sync::atomic::AtomicBool,
+        close_after_dispatch: std::sync::atomic::AtomicBool,
     }
 
     impl Default for RecordingDispatcher {
@@ -732,12 +755,25 @@ mod tests {
                 terminal_attempts: Mutex::new(Vec::new()),
                 terminal_settled: Mutex::new(None),
                 event_dispatched: Mutex::new(None),
+                admission_open: std::sync::atomic::AtomicBool::new(true),
+                admission_attempts: std::sync::atomic::AtomicUsize::new(0),
+                close_after_terminal_settlement: std::sync::atomic::AtomicBool::new(false),
+                close_after_dispatch: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
 
     #[async_trait]
     impl TerminalObligationDispatcher for RecordingDispatcher {
+        fn acquire_local_authority(&self) -> Result<Box<dyn Send>, ()> {
+            self.admission_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.admission_open
+                .load(std::sync::atomic::Ordering::Acquire)
+                .then(|| Box::new(()) as Box<dyn Send>)
+                .ok_or(())
+        }
+
         async fn settle_terminal_obligation(
             &self,
             conversation_id: &str,
@@ -749,6 +785,13 @@ mod tests {
                 .push(conversation_id.to_string());
             if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
                 let _ = settled.send(());
+            }
+            if self
+                .close_after_terminal_settlement
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.admission_open
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
             let mut results = self.terminal_results.lock().unwrap();
             if results.len() == 1 {
@@ -769,6 +812,13 @@ mod tests {
             if let Some(dispatched) = self.event_dispatched.lock().unwrap().take() {
                 let _ = dispatched.send(());
             }
+            if self
+                .close_after_dispatch
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.admission_open
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             self.result.lock().unwrap().clone()
         }
     }
@@ -776,6 +826,9 @@ mod tests {
     async fn fixture() -> (WorkflowRepository, Arc<RecordingDispatcher>) {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("conv-a", "A", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-b", "B", "/tmp", true, None, None)
             .await
             .unwrap();
         let repo = WorkflowRepository::new(db.pool().clone());
@@ -804,18 +857,26 @@ mod tests {
         )
     }
 
-    fn prepared_turn(message_id: &str) -> PreparedTurn {
+    fn prepared_turn_for(conversation_id: &str, message_id: &str) -> PreparedTurn {
         PreparedTurn::from_exact_payload(
-            &ConversationAuthority("conv-a".to_string()),
+            &ConversationAuthority(conversation_id.to_string()),
             prepared_payload(message_id).to_exact_bytes().unwrap(),
         )
     }
 
-    async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
+    fn prepared_turn(message_id: &str) -> PreparedTurn {
+        prepared_turn_for("conv-a", message_id)
+    }
+
+    async fn accept_for_conversation(
+        repo: &WorkflowRepository,
+        key: &str,
+        conversation_id: &str,
+    ) -> phoenix_workflow::TurnAuthorityId {
         let step = repo
             .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
                 client_key: ClientTurnKey::new(key).unwrap(),
-                prepared: prepared_turn(&format!("message-{key}")),
+                prepared: prepared_turn_for(conversation_id, &format!("message-{key}")),
                 disposition: AcceptedDisposition::Runtime,
                 accepted_at: Timestamp(1),
             })
@@ -827,8 +888,16 @@ mod tests {
         turn_id
     }
 
-    async fn seed_terminal_obligation(repo: &WorkflowRepository, key: &str) {
-        let turn_id = accept(repo, key).await;
+    async fn accept(repo: &WorkflowRepository, key: &str) -> phoenix_workflow::TurnAuthorityId {
+        accept_for_conversation(repo, key, "conv-a").await
+    }
+
+    async fn seed_terminal_obligation_for(
+        repo: &WorkflowRepository,
+        key: &str,
+        conversation_id: &str,
+    ) {
+        let turn_id = accept_for_conversation(repo, key, conversation_id).await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         let claim = repo
             .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
@@ -872,6 +941,10 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn seed_terminal_obligation(repo: &WorkflowRepository, key: &str) {
+        seed_terminal_obligation_for(repo, key, "conv-a").await;
     }
 
     async fn latest_authority(
@@ -935,6 +1008,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wait, EMPTY_RESCAN_INTERVAL);
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closure_between_terminal_units_prevents_next_settlement_and_claim() {
+        let (repo, dispatcher) = fixture().await;
+        seed_terminal_obligation_for(&repo, "fatal-first", "conv-a").await;
+        seed_terminal_obligation_for(&repo, "fatal-second", "conv-b").await;
+        dispatcher
+            .close_after_terminal_settlement
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        worker(repo, dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.terminal_attempts.lock().unwrap().len(), 1);
+        assert_eq!(
+            dispatcher
+                .admission_attempts
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
         assert!(dispatcher.events.lock().unwrap().is_empty());
     }
 
@@ -1006,6 +1103,28 @@ mod tests {
             dispatcher.terminal_attempts.lock().unwrap().as_slice(),
             &["conv-a".to_string(), "conv-a".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn closure_between_candidates_prevents_next_claim() {
+        let (repo, dispatcher) = fixture().await;
+        let _first_turn = accept_for_conversation(&repo, "fatal-candidate-first", "conv-a").await;
+        let _second_turn = accept_for_conversation(&repo, "fatal-candidate-second", "conv-b").await;
+        dispatcher
+            .close_after_dispatch
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        worker(repo.clone(), dispatcher.clone(), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        let attempts = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflow_attempts")
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test]

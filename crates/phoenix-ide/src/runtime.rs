@@ -1851,6 +1851,10 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.is_closed()
     }
 
+    pub(crate) fn require_startup_local_authority(&self) -> Result<(), String> {
+        self.require_local_authority_admission()
+    }
+
     fn require_local_authority_admission(&self) -> Result<(), String> {
         if self.fatal_local_authority_is_latched() {
             Err("runtime admission closed after fatal local authority loss".to_string())
@@ -2639,6 +2643,27 @@ impl RuntimeManager {
         Ok(false)
     }
 
+    async fn run_startup_authority_units<T, F, Fut>(
+        self: &Arc<Self>,
+        units: impl IntoIterator<Item = T>,
+        mut run: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(T) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, String>>,
+    {
+        let mut completed = 0;
+        for unit in units {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                break;
+            };
+            if run(unit).await? {
+                completed += 1;
+            }
+        }
+        Ok(completed)
+    }
+
     /// Materialize persisted continuation operations so restart recovery does
     /// not depend on a browser reconnecting to each conversation.
     pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {
@@ -2647,20 +2672,24 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let mut resumed = 0;
-        for conversation_id in &conversation_ids {
-            match self.get_or_create(conversation_id).await {
-                Ok(_) => resumed += 1,
-                Err(error) => {
-                    tracing::warn!(
-                        %conversation_id,
-                        %error,
-                        "failed to materialize persisted continuation operation"
-                    );
+        let manager = Arc::clone(self);
+        self.run_startup_authority_units(conversation_ids, move |conversation_id| {
+            let manager = Arc::clone(&manager);
+            async move {
+                match manager.get_or_create(&conversation_id).await {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(
+                            %conversation_id,
+                            %error,
+                            "failed to materialize persisted continuation operation"
+                        );
+                        Ok(false)
+                    }
                 }
             }
-        }
-        Ok(resumed)
+        })
+        .await
     }
 
     /// Reconcile legacy half-committed continuation rows left behind by older
@@ -2674,23 +2703,25 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let mut reconciled = 0;
-        for conversation_id in &conversation_ids {
-            let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-            let Some(_summary) = repository
-                .reconcile_legacy_continuation_atomically(conversation_id, Utc::now())
-                .await
-                .map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
-            tracing::info!(
-                %conversation_id,
-                "reconciled legacy half-committed continuation to context exhausted"
-            );
-            reconciled += 1;
-        }
-        Ok(reconciled)
+        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        self.run_startup_authority_units(conversation_ids, move |conversation_id| {
+            let repository = repository.clone();
+            async move {
+                let Some(_summary) = repository
+                    .reconcile_legacy_continuation_atomically(&conversation_id, Utc::now())
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(false);
+                };
+                tracing::info!(
+                    %conversation_id,
+                    "reconciled legacy half-committed continuation to context exhausted"
+                );
+                Ok(true)
+            }
+        })
+        .await
     }
 
     pub(crate) fn local_authority_is_closed(&self) -> bool {
@@ -6667,6 +6698,30 @@ mod scope_liveness_tests {
         pass.await
             .expect("workflow pass joins")
             .expect("admitted pass completes");
+    }
+
+    #[tokio::test]
+    async fn startup_closure_between_rows_prevents_next_row_commit() {
+        let manager = Arc::new(test_manager().await);
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_commits = Arc::clone(&commits);
+        let close_manager = Arc::clone(&manager);
+
+        let completed = manager
+            .run_startup_authority_units(["first", "second"], move |_| {
+                let observed_commits = Arc::clone(&observed_commits);
+                let close_manager = Arc::clone(&close_manager);
+                async move {
+                    observed_commits.fetch_add(1, Ordering::AcqRel);
+                    close_manager.signal_fatal_local_authority("test_startup_boundary");
+                    Ok(true)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(completed, 1);
+        assert_eq!(commits.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]

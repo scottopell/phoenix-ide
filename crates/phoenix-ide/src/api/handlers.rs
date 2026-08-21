@@ -1500,13 +1500,17 @@ async fn cleanup_expired_attachments(db: &crate::db::Database) {
     }
 }
 
-pub(super) fn start_attachment_cleanup_task(db: crate::db::Database) {
+pub(super) fn start_attachment_cleanup_task(
+    db: crate::db::Database,
+    runtime: Arc<crate::runtime::RuntimeManager>,
+) {
     tokio::spawn(async move {
-        cleanup_expired_attachments(&db).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
         loop {
-            interval.tick().await;
-            cleanup_expired_attachments(&db).await;
+            let pass = runtime.run_local_authority_pass(cleanup_expired_attachments(&db));
+            if pass.await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
         }
     });
 }
