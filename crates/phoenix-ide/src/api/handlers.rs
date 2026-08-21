@@ -1864,6 +1864,9 @@ async fn create_conversation_with_id(
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
     let id = match req.conversation_id.as_deref() {
         Some(conversation_id) => {
             uuid::Uuid::parse_str(conversation_id).map_err(|_| {
@@ -8183,6 +8186,25 @@ mod conversation_cwd_validation_tests {
             response.conversation["state"]["type"].as_str(),
             Some("provisioning")
         );
+    }
+
+    #[tokio::test]
+    async fn create_conversation_is_rejected_after_fatal_closure() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        state
+            .runtime
+            .signal_fatal_local_authority("test_conversation_creation");
+
+        let result =
+            create_conversation_with_id(state.clone(), create_request("/".to_string()), Vec::new())
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+        assert!(state.db.list_conversations().await.unwrap().is_empty());
     }
 
     #[tokio::test]

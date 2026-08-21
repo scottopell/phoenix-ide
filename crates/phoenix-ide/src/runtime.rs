@@ -2004,24 +2004,19 @@ impl RuntimeManager {
     pub(crate) async fn fence_fatal_local_authority(&self) {
         self.fatal_local_authority_fence
             .close("fatal_local_authority_fence");
-        let _ = crate::tls::bounded_post_shutdown_drain(
-            self.fatal_local_authority_fence.wait_for_owners(),
-            "fatal authority owners",
-        )
-        .await;
-        let reserved: Vec<_> = self
-            .evicted_broadcasters
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect();
-        for broadcaster in reserved {
-            if self.fatal_local_authority_fence.is_closed() {
+        let shutdown = async {
+            self.fatal_local_authority_fence.wait_for_owners().await;
+            let reserved: Vec<_> = self
+                .evicted_broadcasters
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect();
+            for broadcaster in reserved {
                 broadcaster.close_publication();
             }
-        }
-        let shutdown_runtimes = async {
+
             #[cfg(test)]
             if let Some(barrier) = self.fatal_runtime_map_barrier.lock().await.take() {
                 barrier.wait().await;
@@ -2041,11 +2036,7 @@ impl RuntimeManager {
                 }
             }
         };
-        let _ = crate::tls::bounded_post_shutdown_drain(
-            shutdown_runtimes,
-            "fatal runtime shutdown delivery",
-        )
-        .await;
+        let _ = crate::tls::bounded_post_shutdown_drain(shutdown, "fatal authority fence").await;
     }
 
     pub fn fatal_local_authority_receiver(
@@ -7625,18 +7616,22 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn fatal_fence_bounds_runtime_map_acquisition() {
+    async fn fatal_fence_shares_one_deadline_across_owner_and_runtime_map_drains() {
         let manager = Arc::new(test_manager().await);
         tokio::time::pause();
+        let owner = manager.acquire_local_authority_pass().unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         *manager.fatal_runtime_map_barrier.lock().await = Some(Arc::clone(&barrier));
         let fence = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move { manager.fence_fatal_local_authority().await })
         };
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        drop(owner);
         barrier.wait().await;
 
-        tokio::time::advance(crate::tls::SHUTDOWN_GRACE + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
         for _ in 0..3 {
             tokio::task::yield_now().await;
         }

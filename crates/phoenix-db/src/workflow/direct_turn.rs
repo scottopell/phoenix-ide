@@ -1215,10 +1215,8 @@ impl WorkflowRepository {
                 || message.content != expected_content.0
                 || message.display_data != expected_content.1
             {
-                return Ok(MaterializeAuthoritativeTurnOutcome::CommandRejected(
-                    TurnConflict::PreparedSemanticsChanged {
-                        authoritative_fingerprint: expected_prepared.fingerprint().to_string(),
-                    },
+                return Err(DbError::Serialization(
+                    "materialized direct-turn canonical message payload mismatch".to_string(),
                 ));
             }
             return Ok(MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(
@@ -4082,6 +4080,47 @@ mod tests {
             ))
             .await,
             crate::workflow::LocalAuthorityResult::DurableFactUnclassified
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_canonical_payload_mismatch_is_classification_error() {
+        let repo = repo().await;
+        let (turn_id, workflow_id) = created_turn(&repo, "payload-drift", 28).await;
+        let authority = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let input = materialize_input(
+            turn_id,
+            authority.clone(),
+            1,
+            1,
+            "message-conv-a-payload-drift",
+            10,
+        );
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&input).await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(_)
+            )
+        ));
+        sqlx::query("UPDATE messages SET content = ?1 WHERE message_id = ?2")
+            .bind(serde_json::to_string(&MessageContent::user("drifted payload")).unwrap())
+            .bind(canonical_message_id(
+                "conv-a",
+                "message-conv-a-payload-drift",
+            ))
+            .execute(repo.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.classify_authoritative_turn_materialization(&input).await,
+            Err(DbError::Serialization(message))
+                if message.contains("canonical message payload mismatch")
         ));
     }
 
