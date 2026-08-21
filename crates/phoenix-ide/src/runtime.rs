@@ -739,6 +739,8 @@ pub struct SseBroadcaster {
     /// Queues higher-sequence broadcasts while checkpoint persistence holds a
     /// reserved persisted-message sequence range.
     gate: Arc<Mutex<BroadcastGate>>,
+    fatal_local_authority_latched: Option<Arc<AtomicBool>>,
+    fatal_local_authority_admission_gate: Option<Arc<Mutex<()>>>,
 }
 
 impl SseBroadcaster {
@@ -760,6 +762,8 @@ impl SseBroadcaster {
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
+            fatal_local_authority_latched: None,
+            fatal_local_authority_admission_gate: None,
         }
     }
 
@@ -769,6 +773,35 @@ impl SseBroadcaster {
     pub fn new(channel_capacity: usize, initial_last_seq: i64) -> Self {
         let (tx, _rx) = broadcast::channel(channel_capacity);
         Self::from_sender(tx, initial_last_seq)
+    }
+
+    fn with_fatal_local_authority_latch(
+        mut self,
+        latched: Arc<AtomicBool>,
+        admission_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        self.fatal_local_authority_latched = Some(latched);
+        self.fatal_local_authority_admission_gate = Some(admission_gate);
+        self
+    }
+
+    fn fatal_publication_guard(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>, ()> {
+        let guard = self
+            .fatal_local_authority_admission_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .expect("fatal authority admission gate poisoned")
+            });
+        if self
+            .fatal_local_authority_latched
+            .as_ref()
+            .is_some_and(|latched| latched.load(Ordering::Acquire))
+        {
+            Err(())
+        } else {
+            Ok(guard)
+        }
     }
 
     fn same_channel(&self, other: &Self) -> bool {
@@ -856,6 +889,7 @@ impl SseBroadcaster {
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        let _fatal_guard = self.fatal_publication_guard()?;
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -877,7 +911,14 @@ impl SseBroadcaster {
         gate.hard_deleted = true;
     }
 
+    fn close_publication_if_fatal(&self, fatal_latched: &AtomicBool) {
+        if fatal_latched.load(Ordering::Acquire) {
+            self.close_publication();
+        }
+    }
+
     pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
+        let _fatal_guard = self.fatal_publication_guard()?;
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -946,10 +987,11 @@ impl SseBroadcaster {
     }
 
     fn release_reserved_range(&self) {
+        let fatal_guard = self.fatal_publication_guard();
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
-        if !gate.hard_deleted {
+        if fatal_guard.is_ok() && !gate.hard_deleted {
             for QueuedBroadcast { event, seq, op } in queued {
                 let _ = self.send_with_ring_unlocked(event, seq, op);
             }
@@ -1739,6 +1781,16 @@ impl RuntimeManager {
                 .expect("fatal authority admission gate poisoned");
             self.fatal_local_authority_latched
                 .store(true, Ordering::Release);
+        }
+        let reserved: Vec<_> = self
+            .evicted_broadcasters
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for broadcaster in reserved {
+            broadcaster.close_publication_if_fatal(&self.fatal_local_authority_latched);
         }
         let handles: Vec<_> = self
             .runtimes
@@ -2983,7 +3035,11 @@ impl RuntimeManager {
         // seeds its counter from the message we just inserted (sequence_id=1)
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1);
+        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1)
+            .with_fatal_local_authority_latch(
+                Arc::clone(&self.fatal_local_authority_latched),
+                Arc::clone(&self.fatal_local_authority_admission_gate),
+            );
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         // 5. Create production adapters
@@ -4815,7 +4871,12 @@ impl RuntimeManager {
             .get_last_sequence_id(conversation_id)
             .await
             .unwrap_or(0);
-        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
+        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
+            .with_fatal_local_authority_latch(
+                Arc::clone(&self.fatal_local_authority_latched),
+                Arc::clone(&self.fatal_local_authority_admission_gate),
+            );
+        candidate.close_publication_if_fatal(&self.fatal_local_authority_latched);
         // Keep the live-handle check and reservation insertion atomic with
         // runtime publication. Otherwise a caller can reserve a new orphan
         // channel in the narrow gap between handle publication and reservation
@@ -4825,6 +4886,10 @@ impl RuntimeManager {
             return handle.broadcast_tx.clone();
         }
         let mut reservations = self.evicted_broadcasters.write().await;
+        if self.fatal_local_authority_is_latched() {
+            candidate.close_publication();
+            return candidate;
+        }
         reservations
             .entry(conversation_id.to_string())
             .or_insert(candidate)
@@ -5292,6 +5357,41 @@ mod sub_agent_registry_resume_tests {
 #[cfg(test)]
 mod broadcaster_tests {
     use super::*;
+
+    #[test]
+    fn fatal_authority_latch_atomically_discards_queued_and_future_publication() {
+        let latched = Arc::new(AtomicBool::new(false));
+        let admission_gate = Arc::new(Mutex::new(()));
+        let broadcaster = SseBroadcaster::new(16, 0)
+            .with_fatal_local_authority_latch(Arc::clone(&latched), Arc::clone(&admission_gate));
+        let mut events = broadcaster.subscribe();
+        let (reserved, _) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "queued".to_string(),
+                request_id: "queued-request".to_string(),
+            })
+            .unwrap();
+
+        {
+            let _admission = admission_gate.lock().unwrap();
+            latched.store(true, Ordering::Release);
+        }
+        drop(reserved);
+
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn fatal_authority_close_discards_queued_and_future_publication() {

@@ -2959,6 +2959,14 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if self
+            .fatal_local_authority_latched
+            .as_ref()
+            .is_some_and(|latched| latched.load(Ordering::Acquire))
+            && !matches!(event, Event::Shutdown)
+        {
+            return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
             && self.terminal_transition_retry.is_some()
@@ -5049,6 +5057,13 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
+        if self
+            .fatal_local_authority_latched
+            .as_ref()
+            .is_some_and(|latched| latched.load(Ordering::Acquire))
+        {
+            return Err("runtime effects closed after fatal local authority loss".to_string());
+        }
         match effect {
             Effect::PersistAuthoritativeUserMessage {
                 payload, authority, ..
