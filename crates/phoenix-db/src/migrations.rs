@@ -5598,12 +5598,8 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
         }
 
         if migration.version == 69 {
-            retire_commission_review::backfill_settlements(
-                pool,
-                migration.version,
-                migration.name,
-            )
-            .await?;
+            retire_commission_review::backfill_settlements(pool, migration.version, migration.name)
+                .await?;
             applied += 1;
             continue;
         }
