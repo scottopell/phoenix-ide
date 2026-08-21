@@ -20,5 +20,13 @@ Single Python file with PEP 723 inline dependencies (httpx, click), runnable via
 | **REQ-CLI-006:** Configuration | ✅ Complete | PHOENIX_API_URL, --api-url, -c, -d |
 | **REQ-CLI-007:** Single File Distribution | ✅ Complete | PEP 723 inline deps, uv run |
 | **REQ-CLI-008:** Model Selection | ✅ Complete | --model for create, --list-models for discovery |
+| **REQ-CLI-009:** Interaction | ✅ Complete | --respond, --dismiss-question, --dismiss-error, --cancel-steer |
+| **REQ-CLI-010:** Introspection | ✅ Complete | --diff, --git-status, --usage, --system-prompt, --tasks, --proposals |
+| **REQ-CLI-011:** Discovery | ✅ Complete | --list-conversations, --search-conversations |
+| **REQ-CLI-012:** Platform & Config | ✅ Complete | --version, --deployment, --env, --mcp-status, --usage-overview, --trajectory-export |
 
-**Progress:** 8 of 8 complete
+**Progress:** 12 of 12 complete
+
+## Deferred: lifecycle operations
+
+The following operations are deliberately **not** exposed by the client because they are being reworked around the transcript/compaction refactor: archive, delete, rename, cancel (conversation), continue, upgrade-model, regenerate-name, mark-merged, and the "continued conversation" concept. Task and fork-proposal approval flows (`approve-task`, `reject-task`, `approve-commission-review`, `reject-commission-review`, `task-feedback`, `abandon-task`, and the `proposals/:id/approve|dismiss|request-changes` endpoints) are likewise deferred until the lifecycle model settles. They can be added once that refactor lands.

@@ -17,6 +17,10 @@ REQ-CLI-005: SSE Streaming (--poll for fallback)
 REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution (uv run)
 REQ-CLI-008: Model Selection (--model, --list-models)
+REQ-CLI-009: Interaction (--respond, --dismiss-question, --dismiss-error, --cancel-steer)
+REQ-CLI-010: Introspection (--diff, --git-status, --usage, --system-prompt, --tasks, --proposals)
+REQ-CLI-011: Discovery (--list-conversations, --search-conversations)
+REQ-CLI-012: Platform & Config (--version, --deployment, --env, --mcp-status, --usage-overview, --trajectory-export)
 """
 
 import base64
@@ -205,6 +209,152 @@ class PhoenixClient:
             f"{self.base_url}/api/conversations/{conv_id}/wake/{encoded_contract_id}/cancel"
         )
         resp.raise_for_status()
+
+    # ------------------------------------------------------------------
+    # Discovery (REQ-CLI-011)
+    # ------------------------------------------------------------------
+
+    def list_conversations(self) -> list[dict]:
+        """List all non-archived conversations."""
+        resp = self.http.get(f"{self.base_url}/api/conversations")
+        resp.raise_for_status()
+        return resp.json().get('conversations', [])
+
+    def search_conversations(self, query: str, limit: int | None = None) -> list[dict]:
+        """Search conversation contents; returns hits with slug, snippet, score."""
+        params: dict = {"q": query}
+        if limit is not None:
+            params["limit"] = limit
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/search", params=params
+        )
+        resp.raise_for_status()
+        return resp.json().get('hits', [])
+
+    # ------------------------------------------------------------------
+    # Interaction (REQ-CLI-009)
+    # ------------------------------------------------------------------
+
+    def respond_to_question(self, conv_id: str, answers: dict[str, str]) -> dict:
+        """Answer a pending user question (AwaitingUserResponse state)."""
+        resp = self.http.post(
+            f"{self.base_url}/api/conversations/{conv_id}/respond",
+            json={"answers": answers},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def dismiss_question(self, conv_id: str) -> dict:
+        """Dismiss a pending user question without answering."""
+        resp = self.http.post(
+            f"{self.base_url}/api/conversations/{conv_id}/dismiss-question"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def dismiss_error(self, conv_id: str) -> dict:
+        """Dismiss a user-resumable error, returning the conversation to Idle."""
+        resp = self.http.post(
+            f"{self.base_url}/api/conversations/{conv_id}/dismiss-error"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def cancel_steering(self, conv_id: str, message_id: str) -> None:
+        """Cancel a queued steering message."""
+        encoded = quote(message_id, safe='')
+        resp = self.http.delete(
+            f"{self.base_url}/api/conversations/{conv_id}/steering-queue/{encoded}"
+        )
+        resp.raise_for_status()
+
+    # ------------------------------------------------------------------
+    # Introspection (REQ-CLI-010)
+    # ------------------------------------------------------------------
+
+    def get_diff(self, conv_id: str) -> dict:
+        """Worktree diff against the conversation's base branch."""
+        resp = self.http.get(f"{self.base_url}/api/conversations/{conv_id}/diff")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_git_status(self, conv_id: str) -> dict:
+        """Git status snapshot for the conversation's worktree."""
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/{conv_id}/git-status"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_usage(self, conv_id: str) -> dict:
+        """Token usage totals for a conversation (own + root rollup)."""
+        resp = self.http.get(f"{self.base_url}/api/conversations/{conv_id}/usage")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_system_prompt(self, conv_id: str) -> dict:
+        """Resolved system prompt for the conversation."""
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/{conv_id}/system-prompt"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_tasks(self, conv_id: str) -> dict:
+        """Task files in the conversation's working directory."""
+        resp = self.http.get(f"{self.base_url}/api/conversations/{conv_id}/tasks")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_proposals(self, conv_id: str) -> dict:
+        """Fork proposals for the conversation."""
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/{conv_id}/proposals"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Platform & config (REQ-CLI-012)
+    # ------------------------------------------------------------------
+
+    def get_version(self) -> dict:
+        """Server build version and git SHA."""
+        resp = self.http.get(f"{self.base_url}/api/version")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_deployment(self) -> dict:
+        """Deployment info: build, network, TLS, resources, disk layout."""
+        resp = self.http.get(f"{self.base_url}/api/deployment")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_env(self) -> dict:
+        """Server environment info (home dir)."""
+        resp = self.http.get(f"{self.base_url}/api/env")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_mcp_status(self) -> dict:
+        """Status of all connected MCP servers."""
+        resp = self.http.get(f"{self.base_url}/api/mcp/status")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_usage_overview(self) -> dict:
+        """Aggregate token usage across all conversations."""
+        resp = self.http.get(f"{self.base_url}/api/usage")
+        resp.raise_for_status()
+        return resp.json()
+
+    def trajectory_export(self, conv_id: str) -> dict:
+        """Full trajectory export for a conversation (messages + tool calls)."""
+        resp = self.http.get(
+            f"{self.base_url}/api/analytics/conversation/{conv_id}/trajectory-export"
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
@@ -496,6 +646,146 @@ def format_response(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _is_stdout_tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def _print_json(data: object) -> None:
+    """Pretty-print JSON for humans (tty) or compact for pipes/agents."""
+    if _is_stdout_tty():
+        print(json.dumps(data, indent=2, sort_keys=False))
+    else:
+        print(json.dumps(data, sort_keys=False, separators=(',', ':')))
+
+
+def _state_str(state: object) -> str:
+    """Render a conversation state (string or {type: ...} dict) as a token."""
+    if isinstance(state, dict):
+        return str(state.get('type') or state.get('kind') or 'unknown')
+    return str(state) if state else 'unknown'
+
+
+def print_conversations_table(conversations: list[dict]) -> None:
+    """Compact one-line-per-conversation listing."""
+    if not conversations:
+        click.echo("No conversations found.")
+        return
+    for c in conversations:
+        slug = c.get('slug') or c['id']
+        title = c.get('title') or slug
+        state = _state_str(c.get('state'))
+        model = c.get('model') or ''
+        archived = ' (archived)' if c.get('archived') else ''
+        click.echo(f"  {slug:32s} [{state:18s}] {model:20s} {title}{archived}")
+
+
+def print_search_hits(hits: list[dict]) -> None:
+    """Compact search result listing: slug, score, snippet."""
+    if not hits:
+        click.echo("No matches found.")
+        return
+    for h in hits:
+        slug = h.get('slug') or h.get('conversation_id')
+        score = h.get('score', 0.0)
+        snippet = (h.get('snippet') or '').replace('\n', ' ')
+        if len(snippet) > 120:
+            snippet = snippet[:117] + '...'
+        archived = ' (archived)' if h.get('archived') else ''
+        click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{archived}")
+
+
+def print_diff(diff: dict) -> None:
+    """Delimited worktree diff: committed + uncommitted sections."""
+    click.echo(f"=== DIFF (comparator: {diff.get('comparator', '?')}) ===")
+    click.echo(f"Label: {diff.get('label', '')}  Kind: {diff.get('kind', '')}")
+    if diff.get('pr_number') is not None:
+        click.echo(f"PR: #{diff['pr_number']}")
+    committed = diff.get('committed_diff') or ''
+    if committed:
+        click.echo("--- COMMITTED DIFF ---")
+        click.echo(committed)
+    uncommitted = diff.get('uncommitted_diff') or ''
+    if uncommitted:
+        click.echo("--- UNCOMMITTED DIFF ---")
+        click.echo(uncommitted)
+    # Truncation flags so an agent knows the diff was capped.
+    if diff.get('committed_truncated_kib') is not None:
+        sat = ' (saturated, >=lower bound)' if diff.get('committed_saturated') else ''
+        click.echo(
+            f"[committed diff truncated: {diff['committed_truncated_kib']} KiB total{sat}]"
+        )
+    if diff.get('uncommitted_truncated_kib') is not None:
+        sat = ' (saturated, >=lower bound)' if diff.get('uncommitted_saturated') else ''
+        click.echo(
+            f"[uncommitted diff truncated: {diff['uncommitted_truncated_kib']} KiB total{sat}]"
+        )
+
+
+def print_git_status(gs: dict) -> None:
+    """Delimited git status snapshot."""
+    kind = gs.get('kind', 'snapshot')
+    click.echo(f"=== GIT STATUS ({kind}) ===")
+    if kind == 'non_git':
+        click.echo("Not a git repository.")
+        return
+    if kind == 'unavailable':
+        click.echo(f"Unavailable: {gs.get('reason', 'unknown')}")
+        return
+    # snapshot
+    counts = gs.get('counts') or {}
+    click.echo(
+        f"Changed: {counts.get('changed_paths', 0)}  "
+        f"Staged: {counts.get('staged_paths', 0)}  "
+        f"Unstaged: {counts.get('unstaged_paths', 0)}  "
+        f"Untracked: {counts.get('untracked_paths', 0)}  "
+        f"Conflicted: {counts.get('conflicted_paths', 0)}"
+    )
+    for p in gs.get('changed_paths') or []:
+        click.echo(f"  {p.get('path', '')}  [{p.get('status', '')}]")
+
+
+def print_proposals(proposals: list[dict]) -> None:
+    """Compact fork-proposal listing."""
+    if not proposals:
+        click.echo("No fork proposals found.")
+        return
+    for p in proposals:
+        click.echo(
+            f"  {p.get('id', ''):36s} [{p.get('status', ''):10s}] "
+            f"pri={p.get('priority', ''):4s} {p.get('title', '')}"
+        )
+        if p.get('task_file'):
+            click.echo(f"    task: {p['task_file']}")
+
+
+def print_tasks(tasks: list[dict]) -> None:
+    """Compact task-file listing."""
+    if not tasks:
+        click.echo("No tasks found.")
+        return
+    for t in tasks:
+        click.echo(
+            f"  {t.get('id', ''):6s} [{t.get('status', ''):12s}] "
+            f"pri={t.get('priority', ''):4s} {t.get('slug', '')}"
+        )
+        if t.get('conversation_slug'):
+            click.echo(f"    owner: {t['conversation_slug']}")
+
+
+def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
+    """Parse repeated --flag KEY=VALUE options into a dict."""
+    out: dict[str, str] = {}
+    for pair in pairs:
+        if '=' not in pair:
+            raise click.UsageError(f"Expected KEY=VALUE, got: {pair!r}")
+        key, _, value = pair.partition('=')
+        key = key.strip()
+        if not key:
+            raise click.UsageError(f"Empty key in: {pair!r}")
+        out[key] = value
+    return out
+
+
 @click.command()
 @click.argument('message', required=False)
 @click.option('-c', '--conversation', envvar='PHOENIX_CONVERSATION',
@@ -515,6 +805,48 @@ def format_response(data: dict) -> str:
 @click.option('--suggest', 'suggest', is_flag=True,
               help='One-shot shell-command suggestion (stateless). MESSAGE may be piped on stdin. '
                    'Emits clickable run-links for the Phoenix terminal.')
+# Discovery (REQ-CLI-011)
+@click.option('--list-conversations', is_flag=True,
+              help='List all conversations and exit')
+@click.option('--search-conversations', 'search_conversations', metavar='QUERY', default=None,
+              help='Search conversation contents by QUERY and exit')
+@click.option('--search-limit', type=int, default=None,
+              help='Max hits for --search-conversations (server caps 1-20, default 10)')
+# Interaction (REQ-CLI-009) -- require --conversation
+@click.option('--respond', 'respond', multiple=True, metavar='KEY=VALUE',
+              help='Answer a pending user question (repeatable). Requires --conversation')
+@click.option('--dismiss-question', is_flag=True,
+              help='Dismiss a pending user question. Requires --conversation')
+@click.option('--dismiss-error', is_flag=True,
+              help='Dismiss a user-resumable error. Requires --conversation')
+@click.option('--cancel-steer', 'cancel_steer', metavar='MSG_ID', default=None,
+              help='Cancel a queued steering message by id. Requires --conversation')
+# Introspection (REQ-CLI-010) -- require --conversation
+@click.option('--diff', is_flag=True,
+              help='Print the worktree diff for --conversation and exit')
+@click.option('--git-status', is_flag=True,
+              help='Print the git status for --conversation and exit')
+@click.option('--usage', is_flag=True,
+              help='Print token usage for --conversation and exit')
+@click.option('--system-prompt', is_flag=True,
+              help='Print the resolved system prompt for --conversation and exit')
+@click.option('--tasks', is_flag=True,
+              help='Print task files for --conversation and exit')
+@click.option('--proposals', is_flag=True,
+              help='Print fork proposals for --conversation and exit')
+# Platform & config (REQ-CLI-012)
+@click.option('--version', 'show_version', is_flag=True,
+              help='Print server version and exit')
+@click.option('--deployment', is_flag=True,
+              help='Print deployment info and exit')
+@click.option('--env', 'show_env', is_flag=True,
+              help='Print server environment info and exit')
+@click.option('--mcp-status', is_flag=True,
+              help='Print MCP server status and exit')
+@click.option('--usage-overview', is_flag=True,
+              help='Print aggregate token usage across all conversations and exit')
+@click.option('--trajectory-export', is_flag=True,
+              help='Print full trajectory export for --conversation and exit')
 @click.option('--api-url', default=None,
               help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
 @click.option('--timeout', default=600, help='Timeout in seconds')
@@ -522,7 +854,7 @@ def format_response(data: dict) -> str:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, list_conversations, search_conversations, search_limit, respond, dismiss_question, dismiss_error, cancel_steer, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -608,8 +940,110 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             print(osc8_run_link(command))
         return
 
+    # ------------------------------------------------------------------
+    # Discovery (REQ-CLI-011)
+    # ------------------------------------------------------------------
+    if list_conversations:
+        print_conversations_table(client.list_conversations())
+        return
+
+    if search_conversations is not None:
+        hits = client.search_conversations(search_conversations, limit=search_limit)
+        print_search_hits(hits)
+        return
+
+    # ------------------------------------------------------------------
+    # Platform & config (REQ-CLI-012) -- no conversation required
+    # ------------------------------------------------------------------
+    if show_version:
+        _print_json(client.get_version())
+        return
+    if deployment:
+        _print_json(client.get_deployment())
+        return
+    if show_env:
+        _print_json(client.get_env())
+        return
+    if mcp_status:
+        _print_json(client.get_mcp_status())
+        return
+    if usage_overview:
+        _print_json(client.get_usage_overview())
+        return
+
+    # ------------------------------------------------------------------
+    # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
+    # ------------------------------------------------------------------
+    needs_conv = (
+        respond
+        or dismiss_question
+        or dismiss_error
+        or cancel_steer
+        or diff
+        or git_status
+        or usage
+        or system_prompt
+        or tasks
+        or proposals
+        or trajectory_export
+    )
+    if needs_conv and not conversation:
+        raise click.UsageError("this option requires --conversation.")
+
+    if respond or dismiss_question or dismiss_error or cancel_steer:
+        conv = client.get_conversation(conversation)
+        if respond:
+            answers = parse_kv_pairs(respond)
+            client.respond_to_question(conv['id'], answers)
+            click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
+            return
+        if dismiss_question:
+            client.dismiss_question(conv['id'])
+            click.echo(f"Dismissed question for {conv.get('slug', conv['id'])}.")
+            return
+        if dismiss_error:
+            client.dismiss_error(conv['id'])
+            click.echo(f"Dismissed error for {conv.get('slug', conv['id'])}.")
+            return
+        if cancel_steer:
+            client.cancel_steering(conv['id'], cancel_steer)
+            click.echo(f"Cancelled steering message {cancel_steer}.")
+            return
+
+    if diff:
+        conv = client.get_conversation(conversation)
+        print_diff(client.get_diff(conv['id']))
+        return
+    if git_status:
+        conv = client.get_conversation(conversation)
+        print_git_status(client.get_git_status(conv['id']))
+        return
+    if usage:
+        conv = client.get_conversation(conversation)
+        _print_json(client.get_usage(conv['id']))
+        return
+    if system_prompt:
+        conv = client.get_conversation(conversation)
+        _print_json(client.get_system_prompt(conv['id']))
+        return
+    if tasks:
+        conv = client.get_conversation(conversation)
+        print_tasks(client.get_tasks(conv['id']).get('tasks', []))
+        return
+    if proposals:
+        conv = client.get_conversation(conversation)
+        print_proposals(client.get_proposals(conv['id']).get('proposals', []))
+        return
+    if trajectory_export:
+        conv = client.get_conversation(conversation)
+        _print_json(client.trajectory_export(conv['id']))
+        return
+
     if not message:
-        raise click.UsageError("Missing argument 'MESSAGE' (required unless using --list-models).")
+        raise click.UsageError(
+            "Missing argument 'MESSAGE' (required unless using an info flag "
+            "like --list-models, --list-conversations, --version, --diff, ...)."
+        )
 
     # Prepare images
     image_data = [encode_image(path) for path in images]

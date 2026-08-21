@@ -124,3 +124,71 @@ AND use PEP 723 inline script metadata for dependencies
 AND be runnable via `uv run client.py`
 
 **Rationale:** Single file with inline deps maximizes portability and simplifies distribution.
+
+---
+
+### REQ-CLI-009: Interaction
+
+WHEN a conversation is paused awaiting a user response
+THE SYSTEM SHALL let the agent answer via `--respond KEY=VALUE` (repeatable)
+AND let the agent dismiss the question via `--dismiss-question`
+
+WHEN a conversation is in a user-resumable error state
+THE SYSTEM SHALL let the agent dismiss the error via `--dismiss-error`
+
+WHEN a steering message is queued
+THE SYSTEM SHALL let the agent cancel it via `--cancel-steer MSG_ID`
+
+WHEN any interaction flag is used without `--conversation`
+THE SYSTEM SHALL exit with a usage error before contacting the server
+
+WHEN the conversation is not in the required state
+THE SYSTEM SHALL surface the server's conflict message and exit non-zero
+
+**Rationale:** An agent driving Phoenix needs to resolve the states that pause a conversation — questions, resumable errors, and queued steering messages — not just send messages. Task and fork-proposal approval flows are deferred pending the transcript/compaction refactor.
+
+---
+
+### REQ-CLI-010: Introspection
+
+WHEN the agent passes `--conversation <conv>` with a read-only introspection flag
+THE SYSTEM SHALL fetch and print the corresponding server projection:
+- `--diff`: worktree diff against the base branch
+- `--git-status`: git status snapshot
+- `--usage`: token usage totals
+- `--system-prompt`: resolved system prompt
+- `--tasks`: task files in the conversation's working directory
+- `--proposals`: fork proposals for the conversation
+
+WHEN an introspection flag is used without `--conversation`
+THE SYSTEM SHALL exit with a usage error before contacting the server
+
+**Rationale:** An agent that just sent a message often needs to inspect what changed (diff, git status) or the conversation's configuration (system prompt, model usage) before deciding what to do next. Surfacing these as structured output avoids shelling out to `git` in the worktree, which the client never exposes.
+
+---
+
+### REQ-CLI-011: Discovery
+
+WHEN the agent runs `--list-conversations`
+THE SYSTEM SHALL list all non-archived conversations and exit
+
+WHEN the agent runs `--search-conversations QUERY`
+THE SYSTEM SHALL search conversation contents and print matching hits
+AND accept `--search-limit N` to cap the number of hits
+
+**Rationale:** An agent that wants to continue a prior conversation by topic rather than by memorized slug has no way to find it today. Listing and search let the agent discover conversations by content.
+
+---
+
+### REQ-CLI-012: Platform & Config
+
+WHEN the agent runs a platform/config flag
+THE SYSTEM SHALL fetch and print the corresponding read-only server state and exit:
+- `--version`: server build version and git SHA
+- `--deployment`: deployment info (build, network, TLS, resources, disk)
+- `--env`: server environment info
+- `--mcp-status`: status of all connected MCP servers
+- `--usage-overview`: aggregate token usage across all conversations
+- `--trajectory-export` (requires `--conversation`): full trajectory export
+
+**Rationale:** Diagnostics for an agent debugging a connection, checking MCP server health, or inspecting aggregate usage. These are plain `GET`s with no request body, cheap to add, and let the agent observe the running system without the web UI.
