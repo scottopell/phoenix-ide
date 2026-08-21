@@ -236,7 +236,9 @@ body.app-viewport-active #root {
   }
 
   #input-area {
+    padding-right: calc(12px + env(safe-area-inset-right, 0));
     padding-bottom: 6px;
+    padding-left: calc(12px + env(safe-area-inset-left, 0));
   }
 
   .chain-page-header {
@@ -264,6 +266,18 @@ body.app-viewport-active #root {
     left: max(16px, env(safe-area-inset-left, 0));
   }
 
+  .share-banner {
+    padding-top: calc(8px + env(safe-area-inset-top, 0));
+    padding-right: calc(16px + env(safe-area-inset-right, 0));
+    padding-left: calc(16px + env(safe-area-inset-left, 0));
+  }
+
+  .share-messages {
+    padding-right: calc(16px + env(safe-area-inset-right, 0));
+    padding-bottom: calc(16px + env(safe-area-inset-bottom, 0));
+    padding-left: calc(16px + env(safe-area-inset-left, 0));
+  }
+
   .terminal-page {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
@@ -283,7 +297,7 @@ body.app-viewport-active #root {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
-  #app #state-bar:has(+ .offline-banner) {
+  #app #state-bar:not(.statebar-mobile):has(+ .offline-banner) {
     height: var(--state-bar-height);
     padding-bottom: 0;
   }
