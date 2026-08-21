@@ -2438,7 +2438,7 @@ impl WakeRepository {
             .collect()
     }
 
-    pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
+    pub async fn list_continuation_transfer_predecessors(&self) -> DbResult<Vec<String>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let predecessors = sqlx::query_scalar::<_, String>(
             "SELECT c.id
@@ -2455,9 +2455,12 @@ impl WakeRepository {
         .fetch_all(&mut *tx.tx)
         .await?;
         tx.commit().await?;
+        Ok(predecessors)
+    }
 
+    pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
         let mut repaired = 0;
-        for predecessor in predecessors {
+        for predecessor in self.list_continuation_transfer_predecessors().await? {
             if self
                 .recover_continuation_transfer(&predecessor, timestamp)
                 .await?

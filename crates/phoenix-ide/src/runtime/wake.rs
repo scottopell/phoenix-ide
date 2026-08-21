@@ -162,13 +162,19 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Arc<RuntimeManager>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), String> {
-        let reconciliation = manager
-            .run_local_authority_pass(self.repo.reconcile_continuation_transfers(self.clock.now()));
-        match reconciliation.await {
-            Ok(result) => {
-                result.map_err(|error| error.to_string())?;
-            }
-            Err(()) => return Ok(()),
+        let predecessors = self
+            .repo
+            .list_continuation_transfer_predecessors()
+            .await
+            .map_err(|error| error.to_string())?;
+        for predecessor in predecessors {
+            let Ok(_owner) = manager.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            self.repo
+                .recover_continuation_transfer(&predecessor, self.clock.now())
+                .await
+                .map_err(|error| error.to_string())?;
         }
         self.run_once_with_manager(Some(&manager)).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
@@ -834,6 +840,24 @@ mod tests {
             },
         );
         assert_eq!(*observed.lock().unwrap(), vec!["delivery-1"]);
+    }
+
+    #[tokio::test]
+    async fn closure_between_continuation_transfers_prevents_next_transfer() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&open);
+        let close = Arc::clone(&open);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::clone(&observed);
+        run_test_units_with_admission(
+            ["predecessor-1", "predecessor-2"],
+            move || admission.load(Ordering::Acquire).then_some(()).ok_or(()),
+            move |unit| {
+                results.lock().unwrap().push(unit);
+                close.store(false, Ordering::Release);
+            },
+        );
+        assert_eq!(*observed.lock().unwrap(), vec!["predecessor-1"]);
     }
 
     #[derive(Clone)]
