@@ -2686,23 +2686,11 @@ impl RuntimeManager {
         })
     }
 
-    pub fn fatal_local_authority_receiver(
-        &self,
-    ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
-        self.fatal_local_authority_tx.subscribe()
-    }
-
     async fn handle_runtime_exit(
         &self,
         conv: &crate::db::Conversation,
         disposition: executor::RuntimeExitDisposition,
     ) {
-        if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
-            let _ = self
-                .fatal_local_authority_tx
-                .send(Some("direct_turn_materialization"));
-            return;
-        }
         if disposition != executor::RuntimeExitDisposition::Terminal
             || conv.runtime_role != crate::work_scope::RuntimeRole::SubAgent
         {
@@ -5232,6 +5220,35 @@ mod sub_agent_registry_resume_tests {
 #[cfg(test)]
 mod broadcaster_tests {
     use super::*;
+
+    #[test]
+    fn fatal_authority_close_discards_queued_and_future_publication() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        let (reserved, _) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "queued".to_string(),
+                request_id: "queued-request".to_string(),
+            })
+            .unwrap();
+
+        broadcaster.close_publication();
+        drop(reserved);
+
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn hard_delete_is_the_final_publication() {

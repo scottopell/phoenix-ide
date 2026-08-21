@@ -856,7 +856,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .established()
+        .expect("classified direct-turn materialization");
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,
@@ -969,7 +970,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .established()
+        .expect("classified direct-turn materialization");
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,
@@ -1736,7 +1738,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .established()
+        .expect("classified direct-turn materialization");
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,
@@ -1806,7 +1809,8 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .established()
+        .expect("classified direct-turn materialization");
         repo.persist_terminal_obligation(
             &phoenix_db::workflow::DirectTurnTerminalObligationInput {
                 turn_id,

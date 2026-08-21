@@ -64,7 +64,6 @@ pub(crate) enum RuntimeExitDisposition {
     FatalLocalAuthorityLoss,
     Terminal,
     CoordinatedShutdown,
-    FatalLocalAuthorityLoss,
     Interrupted,
     RecreateFromDatabase,
 }
