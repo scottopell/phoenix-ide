@@ -161,7 +161,10 @@ export function ConversationListPage() {
       if (document.visibilityState === 'hidden') saveScrollPosition();
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      saveScrollPosition();
+    };
   }, [saveScrollPosition]);
 
   const handleConversationClick = useCallback((conv: Conversation) => {
@@ -411,7 +414,7 @@ export function ConversationListPage() {
                 <>
                   <button
                     type="button"
-                    className="btn-secondary"
+                    className="btn-secondary mobile-list-refresh"
                     onClick={() => void refresh()}
                     title="Refresh conversations"
                   >

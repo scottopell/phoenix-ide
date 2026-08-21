@@ -175,9 +175,27 @@ body.app-viewport-active #root {
     padding-left: env(safe-area-inset-left, 0);
   }
 
+  .desktop-layout > .sidebar-expanded,
+  .desktop-layout > .sidebar-collapsed {
+    height: 100%;
+  }
+
   .list-page #main-area {
     padding-top: env(safe-area-inset-top, 0);
     padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+
+  .list-page > .offline-banner {
+    padding-top: calc(6px + env(safe-area-inset-top, 0));
+  }
+
+  .list-page > .offline-banner + #main-area {
+    padding-top: 0;
+  }
+
+  .file-browser-overlay {
+    padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
+      env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
   }
 
   #state-bar {
@@ -12972,6 +12990,10 @@ button.keyword-search-filepath:hover {
 .mobile-list-density .conv-item {
   padding: 8px 48px 8px 10px;
   min-height: 48px;
+}
+
+.mobile-list-density .mobile-list-refresh {
+  min-height: 44px;
 }
 
 .mobile-list-density .conv-item-main {
