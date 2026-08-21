@@ -549,6 +549,11 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     settle_active_direct_turn_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
+    settle_active_direct_turn_failures: Mutex<usize>,
+    terminal_obligation_establishment_failures: Mutex<usize>,
+    terminal_mutation_retired: Mutex<bool>,
+    fail_state_snapshot: Mutex<bool>,
+    fail_load_active_direct_turn: Mutex<bool>,
     settle_continuation_direct_turn_calls:
         Mutex<Vec<crate::runtime::traits::ContinuationDirectTurnSettlement>>,
     fail_continuation_commit: Mutex<bool>,
@@ -589,6 +594,11 @@ impl InMemoryStorage {
             settle_active_direct_turn_started: Mutex::new(None),
             settle_active_direct_turn_release: Mutex::new(None),
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
+            settle_active_direct_turn_failures: Mutex::new(0),
+            terminal_obligation_establishment_failures: Mutex::new(0),
+            terminal_mutation_retired: Mutex::new(false),
+            fail_state_snapshot: Mutex::new(false),
+            fail_load_active_direct_turn: Mutex::new(false),
             settle_continuation_direct_turn_calls: Mutex::new(Vec::new()),
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
@@ -638,6 +648,29 @@ impl InMemoryStorage {
             .settle_active_direct_turn_commit_error_once
             .lock()
             .unwrap() = true;
+    }
+
+    pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
+        *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
+    }
+
+    pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
+        *self
+            .terminal_obligation_establishment_failures
+            .lock()
+            .unwrap() = failures;
+    }
+
+    pub fn set_terminal_mutation_retired(&self, retired: bool) {
+        *self.terminal_mutation_retired.lock().unwrap() = retired;
+    }
+
+    pub fn set_fail_state_snapshot(&self, fail: bool) {
+        *self.fail_state_snapshot.lock().unwrap() = fail;
+    }
+
+    pub fn set_fail_load_active_direct_turn(&self, fail: bool) {
+        *self.fail_load_active_direct_turn.lock().unwrap() = fail;
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -783,10 +816,12 @@ impl InMemoryStorage {
 
     pub fn set_active_direct_turn(&self, active: Option<crate::runtime::traits::ActiveDirectTurn>) {
         *self.active_direct_turn.lock().unwrap() =
-            active.map(|active| crate::runtime::traits::LoadedActiveDirectTurn {
-                active,
-                materialized: true,
-            });
+            active.map(
+                |active| crate::runtime::traits::LoadedActiveDirectTurn::Materialized {
+                    canonical_message_id: "test-canonical-message".to_string(),
+                    active,
+                },
+            );
     }
 
     pub fn set_unmaterialized_active_direct_turn(
@@ -794,10 +829,7 @@ impl InMemoryStorage {
         active: crate::runtime::traits::ActiveDirectTurn,
     ) {
         *self.active_direct_turn.lock().unwrap() =
-            Some(crate::runtime::traits::LoadedActiveDirectTurn {
-                active,
-                materialized: false,
-            });
+            Some(crate::runtime::traits::LoadedActiveDirectTurn::Unmaterialized { active });
     }
 
     pub fn recorded_settle_active_direct_turn_calls(
@@ -924,6 +956,48 @@ impl MessageStore for InMemoryStorage {
             .push(msg.clone());
 
         Ok(msg)
+    }
+
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> crate::runtime::traits::TerminalEvidenceEstablishment {
+        {
+            let mut failures = self
+                .terminal_obligation_establishment_failures
+                .lock()
+                .unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return crate::runtime::traits::TerminalEvidenceEstablishment::KnownNotCommitted(
+                    "terminal obligation establishment failed before commit".to_string(),
+                );
+            }
+        }
+        match self
+            .add_message_with_seq(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+            )
+            .await
+        {
+            Ok(message) => crate::runtime::traits::TerminalEvidenceEstablishment::Established(
+                Box::new(message),
+            ),
+            Err(error) => {
+                crate::runtime::traits::TerminalEvidenceEstablishment::KnownNotCommitted(error)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1134,7 +1208,20 @@ impl MessageStore for InMemoryStorage {
         &self,
         _conversation_id: &str,
     ) -> Result<Option<crate::runtime::traits::LoadedActiveDirectTurn>, String> {
+        if *self.fail_load_active_direct_turn.lock().unwrap() {
+            return Err("injected active direct-turn read failure".to_string());
+        }
         Ok(self.active_direct_turn.lock().unwrap().clone())
+    }
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+        _response_message_id: Option<&str>,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        crate::runtime::traits::TerminalMutationEstablishment::Established {
+            transcript_generation: None,
+        }
     }
 
     async fn settle_active_direct_turn(
@@ -1160,6 +1247,13 @@ impl MessageStore for InMemoryStorage {
             .take();
         if let Some(release) = release {
             let _ = release.await;
+        }
+        {
+            let mut failures = self.settle_active_direct_turn_failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err("active direct turn settlement failed before commit".to_string());
+            }
         }
         if std::mem::take(
             &mut *self
@@ -1329,6 +1423,83 @@ impl MessageStore for InMemoryStorage {
         }
         Ok(())
     }
+
+    async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if *self.terminal_mutation_retired.lock().unwrap() {
+            return crate::runtime::traits::TerminalMutationEstablishment::Retired;
+        }
+        match self
+            .persist_active_direct_turn_terminal_obligation(settlement, None)
+            .await
+        {
+            crate::runtime::traits::TerminalMutationEstablishment::Established { .. } => {}
+            establishment => return establishment,
+        }
+        if let Err(error) = self
+            .persist_tool_round(conv_id, assistant, tool_results)
+            .await
+        {
+            return crate::runtime::traits::TerminalMutationEstablishment::Unclassifiable(error);
+        }
+        crate::runtime::traits::TerminalMutationEstablishment::Established {
+            transcript_generation: None,
+        }
+    }
+
+    async fn persist_sub_agent_results_with_terminal_obligation(
+        &self,
+        evidence: &crate::runtime::traits::TerminalSubAgentEvidence,
+        settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
+    ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        match self
+            .persist_active_direct_turn_terminal_obligation(settlement, None)
+            .await
+        {
+            crate::runtime::traits::TerminalMutationEstablishment::Established { .. } => {}
+            establishment => return establishment,
+        }
+        match evidence {
+            crate::runtime::traits::TerminalSubAgentEvidence::Insert(message) => {
+                self.messages
+                    .lock()
+                    .unwrap()
+                    .entry(message.conversation_id.clone())
+                    .or_default()
+                    .push(message.clone());
+                crate::runtime::traits::TerminalMutationEstablishment::Established {
+                    transcript_generation: None,
+                }
+            }
+            crate::runtime::traits::TerminalSubAgentEvidence::Update {
+                message_id,
+                content,
+                display_data,
+                ..
+            } => {
+                let mut messages = self.messages.lock().unwrap();
+                let Some(message) = messages
+                    .values_mut()
+                    .flatten()
+                    .find(|message| message.message_id == *message_id)
+                else {
+                    return crate::runtime::traits::TerminalMutationEstablishment::KnownNotCommitted(
+                        format!("Message not found: {message_id}"),
+                    );
+                };
+                message.content = content.clone();
+                message.display_data = Some(display_data.clone());
+                crate::runtime::traits::TerminalMutationEstablishment::Established {
+                    transcript_generation: Some(1),
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1367,6 +1538,9 @@ impl StateStore for InMemoryStorage {
         &self,
         conv_id: &str,
     ) -> Result<crate::runtime::traits::PersistedStateSnapshot, String> {
+        if *self.fail_state_snapshot.lock().unwrap() {
+            return Err("injected state snapshot failure".to_string());
+        }
         Ok(crate::runtime::traits::PersistedStateSnapshot {
             state: self
                 .states

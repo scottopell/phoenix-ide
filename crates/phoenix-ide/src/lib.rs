@@ -70,7 +70,7 @@ use phoenix_tools as tools;
 use phoenix_db as db;
 
 use api::{create_router, AppState};
-use db::Database;
+use db::{Conversation, Database};
 use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
@@ -707,12 +707,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(path = %db_path, "Opening database");
     let db = open_database_with_migrations(&runtime_env).await?;
+    db.clear_direct_turn_retirements().await?;
+    let terminal_obligated_conversations = db.terminal_obligated_conversation_ids().await?;
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;
 
-    // Reconcile worktrees: revert Work conversations whose worktree is missing
-    reconcile_worktrees(&db).await;
+    // Reconcile worktrees after excluding conversations whose exact terminal
+    // projection is still owned by startup obligation settlement.
+    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
 
     // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
     // rows whose main_ref was defaulted to a literal `main` are corrected before
@@ -981,6 +984,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Hold an Arc to the bash handle registry so the shutdown kill-tree
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
+    let mut fatal_local_authority_rx = state.runtime.fatal_local_authority_receiver();
+    let runtime_for_fatal = state.runtime.clone();
 
     let app = create_router(state).layer(cors).layer(compression);
 
@@ -994,7 +999,16 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(listener, app, loaded_tls.server, socket_activated).await?;
+        tls::serve_https(
+            listener,
+            app,
+            loaded_tls.server,
+            socket_activated,
+            fatal_local_authority_rx,
+            &runtime_for_fatal,
+            &bash_handles_for_shutdown,
+        )
+        .await?;
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,
@@ -1036,6 +1050,17 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                     None => server_abort.abort(),
                 }
             }
+            boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+                tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
+                runtime_for_fatal.fence_fatal_local_authority().await;
+                let _ = drain_tx.send(());
+                if tls::bounded_post_shutdown_drain(&mut server, "HTTP fatal authority").await.is_none() {
+                    server_abort.abort();
+                }
+                crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
+                tracing_handles.shutdown_tracer();
+                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
+            }
         }
     }
 
@@ -1074,12 +1099,25 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// `continued_in_conv_id` is set. Their worktree is intentionally preserved
 /// pending a user action (Continue / Abandon / `MarkAsMerged`) or already
 /// transferred to a continuation — not a genuine orphan.
-async fn reconcile_worktrees(db: &Database) {
+#[cfg(test)]
+pub(crate) async fn reconcile_worktrees(db: &Database) {
+    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+}
+
+pub(crate) async fn reconcile_worktrees_with_terminalized(db: &Database) -> Vec<Conversation> {
+    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await
+}
+
+async fn reconcile_worktrees_excluding(
+    db: &Database,
+    excluded_conversations: &std::collections::HashSet<String>,
+) -> Vec<Conversation> {
+    let mut terminalized = Vec::new();
     let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to query worktree conversations for reconciliation");
-            return;
+            return terminalized;
         }
     };
 
@@ -1087,6 +1125,9 @@ async fn reconcile_worktrees(db: &Database) {
     let mut terminated = 0usize;
 
     for conv in &work_convs {
+        if excluded_conversations.contains(&conv.id) {
+            continue;
+        }
         if conv.archived || conv.state.is_terminal() {
             continue;
         }
@@ -1125,6 +1166,9 @@ async fn reconcile_worktrees(db: &Database) {
             continue;
         }
         terminated += 1;
+        let mut terminal = conv.clone();
+        terminal.state = db::ConvState::Terminal;
+        terminalized.push(terminal);
 
         // wt_path is always {root}/.phoenix/worktrees/{id} for a real Phoenix
         // worktree. If the strict predicate fails the row is malformed; skip
@@ -1158,6 +1202,7 @@ async fn reconcile_worktrees(db: &Database) {
     }
 
     reclaim_unowned_worktrees(db).await;
+    terminalized
 }
 
 fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<bool, String> {

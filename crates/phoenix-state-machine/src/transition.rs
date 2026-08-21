@@ -1418,6 +1418,7 @@ fn handle_core_sub_agents(
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
                         spawn_tool_id: spawn_tool_id.clone(),
+                        summary_message_id: uuid::Uuid::new_v4().to_string(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_state_change())
@@ -1500,6 +1501,7 @@ fn handle_core_sub_agents(
                             .with_effect(Effect::PersistSubAgentResults {
                                 results: new_results,
                                 spawn_tool_id: spawn_tool_id.clone(),
+                                summary_message_id: uuid::Uuid::new_v4().to_string(),
                             })
                             .with_effect(Effect::PersistState)
                             .with_effect(Effect::notify_state_change())
@@ -1510,6 +1512,7 @@ fn handle_core_sub_agents(
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
                         spawn_tool_id: spawn_tool_id.clone(),
+                        summary_message_id: uuid::Uuid::new_v4().to_string(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done())),
@@ -8113,6 +8116,7 @@ mod teardown_tests {
                 if let Effect::PersistSubAgentResults {
                     results,
                     spawn_tool_id,
+                    ..
                 } = e
                 {
                     Some((results.clone(), spawn_tool_id.clone()))

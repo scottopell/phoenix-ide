@@ -179,11 +179,32 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, Box<dyn Error>> {
         .map_err(|e| format!("failed to load private key from {}: {e}", path.display()).into())
 }
 
+pub(crate) async fn wait_for_fatal_local_authority(
+    receiver: &mut tokio::sync::watch::Receiver<Option<&'static str>>,
+) -> &'static str {
+    loop {
+        if let Some(boundary) = *receiver.borrow() {
+            return boundary;
+        }
+        match receiver.changed().await {
+            Ok(()) => {
+                if let Some(boundary) = *receiver.borrow() {
+                    return boundary;
+                }
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 pub async fn serve_https(
     listener: TcpListener,
     app: Router,
     tls_config: ServerConfig,
     socket_activated: bool,
+    mut fatal_local_authority_rx: tokio::sync::watch::Receiver<Option<&'static str>>,
+    runtime: &crate::runtime::RuntimeManager,
+    bash_handles: &crate::tools::bash::BashHandleRegistry,
 ) -> Result<(), Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
     tracing::info!(
@@ -205,6 +226,14 @@ pub async fn serve_https(
                 drop(listener);
                 tracing::info!("HTTPS listener stopped accepting new connections");
                 break;
+            }
+            boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
+                drop(listener);
+                tracing::error!(?boundary, "fatal local SQLite authority loss; stopping HTTPS without database cleanup");
+                runtime.fence_fatal_local_authority().await;
+                let _ = bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS fatal authority").await;
+                crate::tools::bash::shutdown_kill_tree(bash_handles).await;
+                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }
             accepted = listener.accept() => {
                 let (stream, peer_addr) = match accepted {
@@ -360,7 +389,7 @@ mod external_host_tests {
 
 #[cfg(test)]
 mod bounded_drain_tests {
-    use super::bounded_post_shutdown_drain;
+    use super::{bounded_post_shutdown_drain, wait_for_fatal_local_authority};
 
     /// A drain future that completes before the deadline forwards its
     /// inner value verbatim. The contract `Some(F::Output) iff fast
@@ -379,6 +408,17 @@ mod bounded_drain_tests {
     /// future under `tokio::time::pause()` and an explicit
     /// `advance()` past the grace period.
     ///
+    #[tokio::test]
+    async fn fatal_local_authority_signal_is_retained_for_late_receiver() {
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some("direct_turn_terminal_recovery"));
+
+        assert_eq!(
+            wait_for_fatal_local_authority(&mut rx).await,
+            "direct_turn_terminal_recovery"
+        );
+    }
+
     /// The bug class this guards: the regression caught on PR #117 was
     /// that the timeout had been started at *server startup* rather
     /// than at the shutdown signal, causing the non-stuck server to be
