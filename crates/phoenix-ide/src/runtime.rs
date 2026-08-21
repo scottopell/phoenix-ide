@@ -475,6 +475,8 @@ pub struct RuntimeManager {
     runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_result_fixed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fatal_runtime_map_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1912,6 +1914,8 @@ impl RuntimeManager {
             runtime_authority_sealed_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_result_fixed_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -2017,19 +2021,31 @@ impl RuntimeManager {
                 broadcaster.close_publication();
             }
         }
-        let handles: Vec<_> = self
-            .runtimes
-            .write()
-            .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in handles {
-            handle.broadcast_tx.close_publication();
-            if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
-                tracing::debug!(?error, "fatal shutdown event delivery skipped");
+        let shutdown_runtimes = async {
+            #[cfg(test)]
+            if let Some(barrier) = self.fatal_runtime_map_barrier.lock().await.take() {
+                barrier.wait().await;
+                barrier.wait().await;
             }
-        }
+            let handles: Vec<_> = self
+                .runtimes
+                .write()
+                .await
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect();
+            for handle in handles {
+                handle.broadcast_tx.close_publication();
+                if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
+                    tracing::debug!(?error, "fatal shutdown event delivery skipped");
+                }
+            }
+        };
+        let _ = crate::tls::bounded_post_shutdown_drain(
+            shutdown_runtimes,
+            "fatal runtime shutdown delivery",
+        )
+        .await;
     }
 
     pub fn fatal_local_authority_receiver(
@@ -3668,12 +3684,13 @@ impl RuntimeManager {
                             "otel.status_code" = tracing::field::Empty,
                         );
                         let started = std::time::Instant::now();
-                        let result = Box::pin(
-                            worker_manager
-                                .materialize_runtime(&worker_conversation_id, worker_slot),
-                        )
+                        let result = Box::pin(worker_manager.materialize_runtime(
+                            &worker_conversation_id,
+                            Arc::clone(&worker_slot),
+                        ))
                         .instrument(span.clone())
                         .await;
+                        worker_slot.seal_authority_transfers();
                         span.record(
                             "runtime.materialization_ms",
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3701,7 +3718,6 @@ impl RuntimeManager {
                         }
                     }
 
-                    slot.seal_authority_transfers();
                     #[cfg(test)]
                     if let Some(barrier) = manager.runtime_result_fixed_barrier.lock().await.take()
                     {
@@ -7605,6 +7621,27 @@ mod scope_liveness_tests {
                 .unwrap(),
             Err("runtime stopped before event settled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_bounds_runtime_map_acquisition() {
+        let manager = Arc::new(test_manager().await);
+        tokio::time::pause();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.fatal_runtime_map_barrier.lock().await = Some(Arc::clone(&barrier));
+        let fence = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.fence_fatal_local_authority().await })
+        };
+        barrier.wait().await;
+
+        tokio::time::advance(crate::tls::SHUTDOWN_GRACE + std::time::Duration::from_secs(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(fence.is_finished());
+        fence.await.unwrap();
     }
 
     #[tokio::test]
