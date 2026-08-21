@@ -5584,9 +5584,9 @@ async fn delete_conversation(
 
 /// Body of the [`delete_conversation`] handler, factored out so tests can
 /// drive it directly without going through axum routing. Returns `Ok(())`
-/// on success; the only fatal-to-the-request error is the DB row delete
-/// (see `Internal` variant) — bash / tmux / projects cleanup failures
-/// log WARN and continue per REQ-BED-032.
+/// on success. Loss of fatal-authority admission or DB row deletion fails the
+/// request; bash / tmux / projects cleanup failures log WARN and continue per
+/// REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "delete").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
@@ -5673,12 +5673,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    cleanup_pending_fork_orphans_on_delete(state, &conv).await;
+    cleanup_pending_fork_orphans_on_delete(state, &conv).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
-    // session. Cleanup-step failures log WARN and continue; the only
-    // fatal error from this call is a continuation-row DB lookup failure
-    // (returned as 500 so the user can retry). Shared with archive /
+    // session. Cleanup-step failures log WARN and continue; a
+    // continuation-row DB lookup failure is returned as 500 so the user can
+    // retry. Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
     let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
@@ -6003,11 +6003,15 @@ async fn cascade_projects_on_delete(
 /// makes a fork-from-a-deleted-origin structurally impossible: any
 /// approve/request-changes queued behind this command runs after it, finds the
 /// proposal non-`pending`, and aborts before creating a worktree.
-async fn cleanup_pending_fork_orphans_on_delete(state: &AppState, conv: &crate::db::Conversation) {
+async fn cleanup_pending_fork_orphans_on_delete(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> Result<(), AppError> {
     state
         .runtime
         .cleanup_pending_fork_orphans_on_delete(&conv.id)
-        .await;
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 async fn rename_conversation(
@@ -13589,6 +13593,62 @@ pub(crate) mod hard_delete_cascade_tests {
             matches!(result, Err(AppError::Internal(_))),
             "an unreadable DB during the sibling-liveness lookup must fail the \
              cascade, not silently preserve-and-archive; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_stops_when_fork_cleanup_loses_fatal_admission() {
+        use crate::db::{ForkProposal, ForkProposalStatus};
+
+        let state = make_test_state().await;
+        state.runtime.start_sub_agent_handler().await;
+        let origin = "fatal-fork-cleanup-origin";
+        state
+            .db
+            .create_conversation(origin, origin, "/tmp", false, None, None)
+            .await
+            .expect("create origin");
+        state
+            .db
+            .insert_fork_proposal(&ForkProposal {
+                id: "fatal-fork-cleanup-proposal".to_string(),
+                origin_conversation_id: origin.to_string(),
+                task_file: "tasks/12345-p1-ready--fatal-cleanup.md".to_string(),
+                title: "fatal cleanup".to_string(),
+                priority: "p1".to_string(),
+                body: "# Fatal cleanup\n".to_string(),
+                status: ForkProposalStatus::Pending,
+                fork_conversation_id: None,
+                refinement_conversation_id: None,
+                created_at: chrono::Utc::now(),
+                resolved_at: None,
+            })
+            .await
+            .expect("insert proposal");
+        state
+            .runtime
+            .signal_fatal_local_authority("test_hard_delete_fork_cleanup");
+
+        let result = run_hard_delete_cascade(&state, origin).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+        assert!(
+            state.db.get_conversation(origin).await.is_ok(),
+            "fatal fork-cleanup rejection must stop before deleting the conversation row"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_fork_proposal("fatal-fork-cleanup-proposal")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Pending
         );
     }
 
