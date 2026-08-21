@@ -51,9 +51,11 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, RwLock};
 use tracing::Instrument;
 
 /// Shared slot carrying the trace identity of whatever triggered a
@@ -237,7 +239,10 @@ struct FatalLocalAuthorityFenceState {
 
 pub(crate) struct FatalLocalAuthorityFence {
     state: Mutex<FatalLocalAuthorityFenceState>,
+    owners_drained: Notify,
     tx: watch::Sender<Option<&'static str>>,
+    #[cfg(test)]
+    owners_at_first_close: AtomicUsize,
 }
 
 pub(crate) struct FatalLocalAuthorityOwner {
@@ -253,7 +258,10 @@ impl FatalLocalAuthorityFence {
                 boundary: None,
                 owners: 0,
             }),
+            owners_drained: Notify::new(),
             tx,
+            #[cfg(test)]
+            owners_at_first_close: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -272,8 +280,31 @@ impl FatalLocalAuthorityFence {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
         let boundary = *state.boundary.get_or_insert(boundary);
-        if state.owners == 0 {
-            self.tx.send_replace(Some(boundary));
+        #[cfg(test)]
+        let _ = self.owners_at_first_close.compare_exchange(
+            usize::MAX,
+            state.owners,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.tx.send_replace(Some(boundary));
+    }
+
+    async fn wait_for_owners(&self) {
+        loop {
+            let notified = self.owners_drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .expect("fatal authority fence poisoned")
+                .owners
+                == 0
+            {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -284,8 +315,22 @@ impl FatalLocalAuthorityFence {
             .closed
     }
 
+    #[cfg(test)]
+    fn owners_at_first_close(&self) -> Option<usize> {
+        match self.owners_at_first_close.load(Ordering::Acquire) {
+            usize::MAX => None,
+            owners => Some(owners),
+        }
+    }
+
     fn subscribe(&self) -> watch::Receiver<Option<&'static str>> {
         self.tx.subscribe()
+    }
+}
+
+impl FatalLocalAuthorityOwner {
+    pub(crate) fn close(&self, boundary: &'static str) {
+        self.fence.close(boundary);
     }
 }
 
@@ -297,10 +342,9 @@ impl Drop for FatalLocalAuthorityOwner {
             .lock()
             .expect("fatal authority fence poisoned");
         state.owners -= 1;
-        if state.closed && state.owners == 0 {
-            if let Some(boundary) = state.boundary {
-                self.fence.tx.send_replace(Some(boundary));
-            }
+        if state.owners == 0 {
+            drop(state);
+            self.fence.owners_drained.notify_waiters();
         }
     }
 }
@@ -337,6 +381,8 @@ pub struct RuntimeManager {
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    subagent_persistence_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1749,6 +1795,8 @@ impl RuntimeManager {
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            subagent_persistence_barriers: AsyncMutex::new(HashMap::new()),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -1815,6 +1863,11 @@ impl RuntimeManager {
     pub(crate) async fn fence_fatal_local_authority(&self) {
         self.fatal_local_authority_fence
             .close("fatal_local_authority_fence");
+        let _ = crate::tls::bounded_post_shutdown_drain(
+            self.fatal_local_authority_fence.wait_for_owners(),
+            "fatal authority owners",
+        )
+        .await;
         let reserved: Vec<_> = self
             .evicted_broadcasters
             .read()
@@ -2829,19 +2882,6 @@ impl RuntimeManager {
     /// Handle a sub-agent spawn request
     #[allow(clippy::too_many_lines)]
     async fn handle_spawn_request(self: &Arc<Self>, req: SubAgentSpawnRequest) {
-        if let Err(error) = self.require_local_authority_admission() {
-            let _ = req
-                .parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: req.spec.agent_id,
-                    outcome: SubAgentOutcome::Failure {
-                        error,
-                        error_kind: crate::db::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
         let SubAgentSpawnRequest {
             spec,
             parent_conversation_id,
@@ -2849,23 +2889,6 @@ impl RuntimeManager {
             parent_event_tx,
             parent_turn_link,
         } = req;
-        if let Err(error) = self
-            .db
-            .establish_parent_reconcile_action(&parent_conversation_id)
-            .await
-        {
-            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
-                        error: format!("failed to persist parent recovery authority: {error}"),
-                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
 
         tracing::info!(
             agent_id = %spec.agent_id,
@@ -2952,6 +2975,49 @@ impl RuntimeManager {
             }
         };
 
+        let Ok(persistence_owner) = self.fatal_local_authority_fence.try_acquire() else {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "runtime admission closed after fatal local authority loss"
+                            .to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .subagent_persistence_barriers
+            .lock()
+            .await
+            .get(&spec.agent_id)
+            .cloned()
+        {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        if let Err(error) = self
+            .db
+            .establish_parent_reconcile_action(&parent_conversation_id)
+            .await
+        {
+            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
+            drop(persistence_owner);
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                        error: format!("failed to persist parent recovery authority: {error}"),
+                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
@@ -2971,6 +3037,7 @@ impl RuntimeManager {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create sub-agent conversation");
+                drop(persistence_owner);
                 // Notify parent of failure
                 let _ = parent_event_tx
                     .send(Event::SubAgentResult {
@@ -3009,6 +3076,7 @@ impl RuntimeManager {
             .await
         {
             tracing::error!(error = %e, "Failed to add initial message");
+            drop(persistence_owner);
             let _ = parent_event_tx
                 .send(Event::SubAgentResult {
                     agent_id: spec.agent_id,
@@ -3020,6 +3088,8 @@ impl RuntimeManager {
                 .await;
             return;
         }
+
+        drop(persistence_owner);
 
         // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
         let root_conversation_id =
@@ -6458,6 +6528,120 @@ mod scope_liveness_tests {
         );
         fatal.changed().await.unwrap();
         assert_eq!(*fatal.borrow(), Some("spawned conversation runtime"));
+    }
+
+    #[tokio::test]
+    async fn fatal_signal_is_immediate_while_existing_owners_drain() {
+        let fence = FatalLocalAuthorityFence::new();
+        let owner = fence.try_acquire().expect("owner admitted before close");
+        let mut fatal = fence.subscribe();
+
+        fence.close("test_authority_boundary");
+
+        assert_eq!(*fatal.borrow_and_update(), Some("test_authority_boundary"));
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert!(fence.try_acquire().is_err());
+        drop(owner);
+        fence.wait_for_owners().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_fatal_authority_owner_has_bounded_drain() {
+        let fence = FatalLocalAuthorityFence::new();
+        let _stuck_owner = fence.try_acquire().expect("owner admitted before close");
+        fence.close("test_authority_boundary");
+        let drain = tokio::spawn({
+            let fence = Arc::clone(&fence);
+            async move {
+                crate::tls::bounded_post_shutdown_drain(
+                    fence.wait_for_owners(),
+                    "test fatal authority owners",
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        tokio::time::advance(crate::tls::SHUTDOWN_GRACE).await;
+        assert!(drain.await.expect("bounded drain task joins").is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_persistence_keeps_one_owner_across_all_semantic_writes() {
+        let manager = Arc::new(test_manager().await);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create parent");
+        let agent_id = "fenced-subagent";
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_persistence_barriers
+            .lock()
+            .await
+            .insert(agent_id.to_string(), Arc::clone(&barrier));
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(1);
+        let spawn = {
+            let manager = Arc::clone(&manager);
+            let parent_id = parent.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .handle_spawn_request(SubAgentSpawnRequest {
+                        spec: SubAgentSpec {
+                            agent_id: agent_id.to_string(),
+                            task: "persist all child semantics".to_string(),
+                            cwd: "/tmp".to_string(),
+                            timeout: std::time::Duration::from_secs(60),
+                            mode: SubAgentMode::Explore,
+                            model_id: "gpt-5.4".to_string(),
+                            max_turns: 1,
+                            agent_name: Some("fence-test".to_string()),
+                            persona: Some("test persona".to_string()),
+                        },
+                        parent_conversation_id: parent_id,
+                        parent_scope: None,
+                        parent_event_tx,
+                        parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                    })
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        assert!(manager.fatal_local_authority_fence.try_acquire().is_err());
+        barrier.wait().await;
+        spawn.await.expect("spawn handler joins");
+
+        let child = manager
+            .db()
+            .get_conversation(agent_id)
+            .await
+            .expect("child conversation persisted under admitted owner");
+        assert_eq!(
+            manager
+                .db()
+                .get_sub_agent_persona(&child.id)
+                .await
+                .expect("persona lookup")
+                .as_deref(),
+            Some("test persona")
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(&child.id)
+                .await
+                .expect("initial message lookup")
+                .len(),
+            1
+        );
+        assert!(manager.try_get_handle(agent_id).await.is_none());
     }
 
     #[tokio::test]

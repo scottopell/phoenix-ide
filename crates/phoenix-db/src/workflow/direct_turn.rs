@@ -1133,7 +1133,7 @@ impl WorkflowRepository {
                           AND r.generation = ?6 AND r.process_incarnation = ?7
                           AND d.status = 'Accepted'
                           AND d.runtime_acceptance_status = 'Accepted'
-                          AND t.transition_id = 2
+                          AND t.transition_id = ?9
                     ) AS materialization_committed,
                     m.message_id, m.sequence_id, m.message_type, m.content,
                     m.display_data, m.usage_data, m.created_at
@@ -1156,6 +1156,10 @@ impl WorkflowRepository {
             "process_incarnation",
         )?)
         .bind(to_i64(input.now.0, "now")?)
+        .bind(to_i64(
+            DIRECT_TURN_MATERIALIZED_TRANSITION_ID,
+            "direct_turn_materialized_transition_id",
+        )?)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {

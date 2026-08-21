@@ -2180,6 +2180,41 @@ where
         self
     }
 
+    fn live_state_owner(&self) -> Result<Option<crate::runtime::FatalLocalAuthorityOwner>, String> {
+        self.fatal_local_authority_fence
+            .as_ref()
+            .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
+            .transpose()
+            .map_err(|()| {
+                "runtime state publication closed after fatal local authority loss".to_string()
+            })
+    }
+
+    fn install_live_state(
+        &mut self,
+        state: ConvState,
+        state_updated_at: DateTime<Utc>,
+        publish: bool,
+    ) -> Result<(), String> {
+        let _owner = self.live_state_owner()?;
+        self.state = state;
+        self.state_updated_at = state_updated_at;
+        if publish {
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_live_state(&self) -> Result<(), String> {
+        let _owner = self.live_state_owner()?;
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+        Ok(())
+    }
+
     /// Set the credential helper for recovery settlement (REQ-BED-030).
     pub(crate) fn with_coordinator_read_service(
         mut self,
@@ -2877,11 +2912,7 @@ where
             );
             return Ok(());
         }
-        self.state = ConvState::LlmRequesting { attempt: 1 };
-        self.state_updated_at = Utc::now();
-        if let Some(state_watcher) = &self.state_watcher {
-            let _ = state_watcher.send(self.state.clone());
-        }
+        self.install_live_state(ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true)?;
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
             sequence_id: seq,
             state: self.state.clone(),
@@ -3231,24 +3262,15 @@ where
             .iter()
             .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
         let old_state = self.state.clone();
+        let will_settle_active_direct_turn =
+            self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
         if is_direct_turn_adoption {
             self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
                 state: result.new_state.clone(),
                 updated_at: Utc::now(),
             });
         } else {
-            self.state = result.new_state.clone();
-        }
-        let will_settle_active_direct_turn =
-            self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-        // Only stamp a fresh entry time when the phase actually changes.
-        // Several events absorb as no-ops (Terminal absorbs unknown events;
-        // an empty steering drain re-enters the same state) and reach here
-        // with new_state == old_state; bumping then would reset the client's
-        // elapsed counter (REQ-WPV-001) for a phase the agent never left.
-        // No-op transitions emit no PersistState effect, so the DB row keeps
-        // its prior value too — gating here keeps the in-memory stamp in sync.
-        if self.state != old_state {
+            let state_changed = result.new_state != old_state;
             let retry_has_durable_fact = matches!(
                 self.terminal_settlement_attempt,
                 TerminalSettlementAttempt::Retry {
@@ -3256,18 +3278,12 @@ where
                     ..
                 }
             );
-            if !retry_has_durable_fact {
-                self.state_updated_at = Utc::now();
-            }
-            // Publish early for most transitions so effective_conversation_state
-            // reflects the new state before long-running effects (e.g. ApproveTask
-            // git work) complete. Exception: suppress when entering Idle with
-            // queued steering messages — the inline drain will immediately advance
-            // the state to LlmRequesting, and exposing the transient Idle would let
-            // a concurrent POST /chat route a UserMessage before the drain finishes
-            // (FM-7 intermediate-Idle race). The end-of-function publish below
-            // covers that suppressed case once the drain completes.
-            let will_drain_from_idle = matches!(self.state, ConvState::Idle)
+            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
+                Utc::now()
+            } else {
+                self.state_updated_at
+            };
+            let will_drain_from_idle = matches!(result.new_state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
             let will_commit_steering_drain = result
@@ -3280,19 +3296,13 @@ where
                     Effect::CompleteCreation { .. } | Effect::MaterializeCreation { .. }
                 )
             });
-            if !will_drain_from_idle
+            let publish = state_changed
+                && !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
-                && !will_settle_active_direct_turn
-            {
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
-            }
-            // The turn's trace ends when the conversation stops working —
-            // including the transient Idle of a steering drain, where the
-            // queued message legitimately starts a new turn (and span).
-            if !will_settle_active_direct_turn {
+                && !will_settle_active_direct_turn;
+            self.install_live_state(result.new_state.clone(), next_state_updated_at, publish)?;
+            if state_changed && !will_settle_active_direct_turn {
                 self.settle_turn_span();
             }
         }
@@ -3567,12 +3577,9 @@ where
                                 || terminal_direct_turn_transition)
                                 && !state_committed) =>
                     {
-                        let failed_state = std::mem::replace(&mut self.state, old_state.clone());
-                        self.state_updated_at = old_state_updated_at;
+                        let failed_state = self.state.clone();
+                        self.install_live_state(old_state.clone(), old_state_updated_at, true)?;
                         self.manage_deadline(&failed_state);
-                        if let Some(tx) = &self.state_watcher {
-                            let _ = tx.send(self.state.clone());
-                        }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
                             && !state_committed
                         {
@@ -3600,8 +3607,8 @@ where
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
                 {
-                    let failed_state = std::mem::replace(&mut self.state, old_state.clone());
-                    self.state_updated_at = old_state_updated_at;
+                    let failed_state = self.state.clone();
+                    self.install_live_state(old_state.clone(), old_state_updated_at, false)?;
                     self.manage_deadline(&failed_state);
                     return Ok(generated_events);
                 }
@@ -3615,11 +3622,7 @@ where
         }
 
         if self.direct_turn_materialization_aborted {
-            self.state = old_state;
-            self.state_updated_at = old_state_updated_at;
-            if let Some(tx) = &self.state_watcher {
-                let _ = tx.send(self.state.clone());
-            }
+            self.install_live_state(old_state, old_state_updated_at, true)?;
             if let Some((drain_event, projection_guard)) =
                 Box::pin(self.prepare_steering_drain(&self.state.clone(), false)).await?
             {
@@ -3651,9 +3654,7 @@ where
         // the await inside `run_effects_with_inline_drain`, which would cause a
         // concurrent `POST /chat` to route a `UserMessage` before the drain has
         // advanced the state back to `LlmRequesting` (FM-7).
-        if let Some(tx) = &self.state_watcher {
-            let _ = tx.send(self.state.clone());
-        }
+        self.publish_live_state()?;
         Ok(generated_events)
     }
 
@@ -5127,8 +5128,17 @@ where
                 };
                 let storage = self.storage.clone();
                 let boundary_owner = tokio::spawn(async move {
-                    let _effect_owner = effect_owner;
-                    storage.materialize_authoritative_user_message(&input).await
+                    let materialization =
+                        storage.materialize_authoritative_user_message(&input).await;
+                    if matches!(
+                        materialization,
+                        Ok(crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified)
+                    ) {
+                        if let Some(owner) = effect_owner.as_ref() {
+                            owner.close("direct_turn_materialization");
+                        }
+                    }
+                    materialization
                 });
                 let mut owner_guard = AuthorityBoundaryConsumerGuard {
                     fence: self.fatal_local_authority_fence.clone(),
@@ -6310,9 +6320,7 @@ where
                         presentation_mode: self.state.presentation_mode().to_string(),
                         state_updated_at: self.state_updated_at,
                     });
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                self.publish_live_state()?;
                 match self.dispatch_llm_request().await {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
@@ -8129,19 +8137,16 @@ where
                 // Revert in-memory state to AwaitingTaskApproval so the user can retry.
                 // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
                 // new Idle state yet), so this keeps memory and DB consistent.
-                self.state = ConvState::AwaitingTaskApproval {
-                    task_file: task_file_backup,
-                    title: title_backup,
-                    priority: priority_backup,
-                    plan: plan_backup,
-                };
-                self.state_updated_at = Utc::now();
-                // Publish the revert so live-state observers (effective_conversation_state)
-                // see AwaitingTaskApproval, not the LlmRequesting this approval briefly
-                // advanced to before the failure.
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                self.install_live_state(
+                    ConvState::AwaitingTaskApproval {
+                        task_file: task_file_backup,
+                        title: title_backup,
+                        priority: priority_backup,
+                        plan: plan_backup,
+                    },
+                    Utc::now(),
+                    true,
+                )?;
                 // Direct state write bypasses apply_transition_result, so
                 // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
@@ -8203,17 +8208,16 @@ where
             Ok(result) => result,
             Err(e) => {
                 tracing::error!(error = %e, "Fresh task approval git operations failed");
-                self.state = ConvState::AwaitingTaskApproval {
-                    task_file: task_file_backup,
-                    title: title_backup,
-                    priority: priority_backup,
-                    plan: plan_backup,
-                };
-                self.state_updated_at = Utc::now();
-                // Publish the revert so live-state observers stay consistent.
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                self.install_live_state(
+                    ConvState::AwaitingTaskApproval {
+                        task_file: task_file_backup,
+                        title: title_backup,
+                        priority: priority_backup,
+                        plan: plan_backup,
+                    },
+                    Utc::now(),
+                    true,
+                )?;
                 // Direct state write bypasses apply_transition_result, so
                 // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
@@ -12650,7 +12654,7 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn fatal_signal_waits_for_admitted_persistence_owner_to_finish() {
+    async fn fatal_signal_is_immediate_but_admitted_persistence_finishes() {
         let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::Fresh,
             AuthoritativeUserMessageMaterialization::Materialized {
@@ -12686,17 +12690,18 @@ mod authoritative_user_message_effect_tests {
             .expect("persistence owner entered materialization");
         while broadcast_rx.try_recv().is_ok() {}
         fence.close("test_authority_boundary");
-        assert!(fatal_rx.has_changed().is_ok_and(|changed| !changed));
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("test_authority_boundary")
+        );
 
         release_materialization
             .send(())
             .expect("release persistence owner");
-        transition
-            .await
-            .expect("transition joins")
-            .expect("admitted persistence finishes before fatal signal");
-        fatal_rx.changed().await.expect("fatal signal published");
-        assert_eq!(*fatal_rx.borrow(), Some("test_authority_boundary"));
+        assert_eq!(
+            transition.await.expect("transition joins").unwrap_err(),
+            "runtime state publication closed after fatal local authority loss"
+        );
         let post_close = broadcast_rx.try_recv();
         assert!(
             matches!(
@@ -12742,16 +12747,14 @@ mod authoritative_user_message_effect_tests {
         }
         drop(transition);
 
-        assert!(fatal_rx.has_changed().is_ok_and(|changed| !changed));
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("direct_turn_boundary_owner_disappeared")
+        );
         assert_no_broadcast(&mut broadcast_rx);
         release_materialization
             .send(())
             .expect("release supervised boundary task");
-        fatal_rx.changed().await.expect("fatal signal published");
-        assert_eq!(
-            *fatal_rx.borrow(),
-            Some("direct_turn_boundary_owner_disappeared")
-        );
     }
 
     #[tokio::test]
@@ -12811,6 +12814,62 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(*watch_rx.borrow(), ConvState::Idle);
         assert_no_broadcast(&mut broadcast_rx);
+    }
+
+    #[tokio::test]
+    async fn unclassified_materialization_closes_fence_while_effect_owner_is_live() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::DurableFactUnclassified,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+        );
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert!(fence.try_acquire().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_fence_rejects_live_state_installation_and_watcher_publication() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt
+            .with_state_watcher(watch_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        fence.close("test_authority_boundary");
+
+        let error = rt
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::LlmRequesting { attempt: 1 },
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "runtime state publication closed after fatal local authority loss"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
     }
 
     #[tokio::test]
