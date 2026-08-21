@@ -164,7 +164,12 @@ body.app-viewport-active #root {
 }
 
 @media (display-mode: standalone) {
-  #app {
+  .list-page {
+    padding-right: env(safe-area-inset-right, 0);
+    padding-left: env(safe-area-inset-left, 0);
+  }
+
+  .desktop-layout {
     padding-right: env(safe-area-inset-right, 0);
     padding-left: env(safe-area-inset-left, 0);
   }
@@ -174,9 +179,13 @@ body.app-viewport-active #root {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
-  #conversation-nav {
-    height: calc(var(--breadcrumb-height) + env(safe-area-inset-top, 0));
+  .conversation-column {
     padding-top: env(safe-area-inset-top, 0);
+  }
+
+  #state-bar {
+    height: calc(var(--state-bar-height) + env(safe-area-inset-bottom, 0));
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
 }
 
@@ -6750,8 +6759,9 @@ html * {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 100vh;
-  padding: 24px;
+  min-height: 100%;
+  padding: calc(24px + env(safe-area-inset-top, 0)) 24px calc(24px + env(safe-area-inset-bottom, 0));
+  overflow-y: auto;
   text-align: center;
   color: var(--text-primary);
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
@@ -29,6 +29,8 @@ import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 
+const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
+
 export function ConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
@@ -42,6 +44,8 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
+  const mainRef = useRef<HTMLElement>(null);
+  const didRestoreScrollRef = useRef(false);
 
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
@@ -128,9 +132,42 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
+  const saveScrollPosition = useCallback(() => {
+    const scrollOwner = mainRef.current;
+    if (!scrollOwner) return;
+    try {
+      localStorage.setItem(MOBILE_LIST_SCROLL_KEY, String(scrollOwner.scrollTop));
+    } catch {
+      // Storage can be unavailable in private browsing; navigation still works.
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    if (loading || didRestoreScrollRef.current || conversations.length === 0) return;
+    didRestoreScrollRef.current = true;
+    try {
+      const saved = Number(localStorage.getItem(MOBILE_LIST_SCROLL_KEY));
+      if (Number.isFinite(saved) && mainRef.current) {
+        const maxScrollTop = Math.max(0, mainRef.current.scrollHeight - mainRef.current.clientHeight);
+        mainRef.current.scrollTop = Math.min(Math.max(0, saved), maxScrollTop);
+      }
+    } catch {
+      // Storage can be unavailable in private browsing.
+    }
+  }, [conversations.length, loading]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') saveScrollPosition();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [saveScrollPosition]);
+
   const handleConversationClick = useCallback((conv: Conversation) => {
+    saveScrollPosition();
     navigate(`/c/${conv.slug}`);
-  }, [navigate]);
+  }, [navigate, saveScrollPosition]);
 
   const handleNewConversation = () => {
     navigate('/new');
@@ -281,12 +318,12 @@ export function ConversationListPage() {
   if (initError) {
     return (
       <div id="app" className="list-page">
-        <div className="init-error">
+        <main className="init-error" data-app-scroll-owner>
           <h2><AlertTriangle />Storage Error</h2>
           <p>Failed to initialize local storage: {initError}</p>
           <p>Please try refreshing the page. If the problem persists, try clearing your browser data for this site.</p>
           <button onClick={() => window.location.reload()} title="Reload this page">Refresh Page</button>
-        </div>
+        </main>
       </div>
     );
   }
@@ -330,7 +367,7 @@ export function ConversationListPage() {
           {pendingOpsCount > 0 && ` · ${pendingOpsCount} pending`}
         </div>
       )}
-      <main id="main-area" data-app-scroll-owner>
+      <main id="main-area" ref={mainRef} data-app-scroll-owner>
         {loading ? (
           <section id="conversation-list" className="view active">
             <div className="view-header">
@@ -370,7 +407,19 @@ export function ConversationListPage() {
                   compact
                 />
               )}
-              footer={<StorageStatus conversationCount={totalConversations} />}
+              footer={(
+                <>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void refresh()}
+                    title="Refresh conversations"
+                  >
+                    Refresh
+                  </button>
+                  <StorageStatus conversationCount={totalConversations} />
+                </>
+              )}
             />
           </>
         )}

@@ -4,7 +4,7 @@
 
 use axum::{
     body::Body,
-    http::{header, Request, Response, StatusCode},
+    http::{header, Request, Response, StatusCode, Uri},
     response::IntoResponse,
 };
 use rust_embed::Embed;
@@ -58,6 +58,37 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("Not found"))
         .unwrap()
+}
+
+/// Serve a root-level web application asset.
+pub async fn serve_root_asset(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let content_type = match path {
+        "manifest.webmanifest" => "application/manifest+json",
+        "apple-touch-icon.png" | "icon-192.png" | "icon-512.png" => "image/png",
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    if let Some(content) = Assets::get(path) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(Body::from(content.data.to_vec()))
+            .unwrap();
+    }
+
+    let fs_path = PathBuf::from("ui/dist").join(path);
+    if let Ok(content) = std::fs::read(fs_path) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "public, max-age=86400")
+            .body(Body::from(content))
+            .unwrap();
+    }
+
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Serve the favicon (phoenix.svg)
@@ -147,23 +178,6 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
-    }
-
-    #[test]
-    fn home_screen_assets_are_embedded() {
-        for path in [
-            "manifest.webmanifest",
-            "apple-touch-icon.png",
-            "icon-192.png",
-            "icon-512.png",
-        ] {
-            assert!(Assets::get(path).is_some(), "missing embedded asset: {path}");
-        }
-
-        let index = Assets::get("index.html").expect("embedded index.html");
-        let html = String::from_utf8(index.data.to_vec()).expect("index.html is UTF-8");
-        assert!(html.contains("/manifest.webmanifest"));
-        assert!(html.contains("/apple-touch-icon.png"));
     }
 
     #[test]

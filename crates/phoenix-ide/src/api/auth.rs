@@ -352,6 +352,10 @@ fn is_exempt_path(path: &str) -> bool {
     if path.starts_with("/assets/")
         || path == "/service-worker.js"
         || path == "/phoenix.svg"
+        || path == "/manifest.webmanifest"
+        || path == "/apple-touch-icon.png"
+        || path == "/icon-192.png"
+        || path == "/icon-512.png"
         || path == "/version"
         || path == "/api/version"
     {
@@ -592,6 +596,10 @@ mod tests {
         assert!(is_exempt_path("/assets/index-abc.js"));
         assert!(is_exempt_path("/service-worker.js"));
         assert!(is_exempt_path("/phoenix.svg"));
+        assert!(is_exempt_path("/manifest.webmanifest"));
+        assert!(is_exempt_path("/apple-touch-icon.png"));
+        assert!(is_exempt_path("/icon-192.png"));
+        assert!(is_exempt_path("/icon-512.png"));
         assert!(is_exempt_path("/version"));
         assert!(is_exempt_path("/api/version"));
         assert!(is_exempt_path("/api/auth/status"));

@@ -3,7 +3,9 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_response, serve_favicon, serve_service_worker, serve_static};
+use super::assets::{
+    get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
+};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
@@ -114,6 +116,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
         .route("/phoenix.svg", get(serve_favicon))
+        .route("/manifest.webmanifest", get(serve_root_asset))
+        .route("/apple-touch-icon.png", get(serve_root_asset))
+        .route("/icon-192.png", get(serve_root_asset))
+        .route("/icon-512.png", get(serve_root_asset))
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
