@@ -1993,6 +1993,7 @@ where
     direct_turn_materialization_aborted: bool,
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     fatal_local_authority_fence: Option<Arc<crate::runtime::FatalLocalAuthorityFence>>,
+    handoff_completion_authority: Option<crate::runtime::FatalLocalAuthorityOwner>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2134,6 +2135,7 @@ where
             direct_turn_materialization_aborted: false,
             proposed_direct_turn_state: None,
             fatal_local_authority_fence: None,
+            handoff_completion_authority: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2198,6 +2200,9 @@ where
     }
 
     fn live_state_owner(&self) -> Result<Option<crate::runtime::FatalLocalAuthorityOwner>, String> {
+        if let Some(authority) = self.handoff_completion_authority.as_ref() {
+            return Ok(Some(authority.child()));
+        }
         self.fatal_local_authority_fence
             .as_ref()
             .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
@@ -2930,6 +2935,7 @@ where
 
         // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
         while let Some(event) = events_to_process.pop() {
+            let settles_handoff = matches!(event, Event::TaskHandoffComplete { .. });
             let chained_result = match transition(&self.state, &self.context, event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2937,8 +2943,11 @@ where
                     continue;
                 }
             };
-            let more_events = self.apply_transition_result(chained_result).await?;
-            events_to_process.extend(more_events);
+            let applied = self.apply_transition_result(chained_result).await;
+            if settles_handoff {
+                self.handoff_completion_authority = None;
+            }
+            events_to_process.extend(applied?);
         }
 
         Ok(())
@@ -3015,6 +3024,7 @@ where
             .fatal_local_authority_fence
             .as_ref()
             .is_some_and(|fence| fence.is_closed())
+            && self.handoff_completion_authority.is_none()
             && !matches!(event, Event::Shutdown)
         {
             return Err("runtime processing closed after fatal local authority loss".to_string());
@@ -3142,6 +3152,7 @@ where
         let mut events_to_process = vec![event];
 
         while let Some(current_event) = events_to_process.pop() {
+            let settles_handoff = matches!(current_event, Event::TaskHandoffComplete { .. });
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -3184,8 +3195,11 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            let generated_events = self.apply_transition_result(result).await?;
-            events_to_process.extend(generated_events);
+            let applied = self.apply_transition_result(result).await;
+            if settles_handoff {
+                self.handoff_completion_authority = None;
+            }
+            events_to_process.extend(applied?);
         }
 
         drop(immediate_drain_guard);
@@ -5127,18 +5141,23 @@ where
         let effect_owner = if Self::effect_mutates_durable_authority(&effect)
             || dispatches_external_work
         {
-            self.fatal_local_authority_fence
-                .as_ref()
-                .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
-                .transpose()
-                .map_err(|()| {
-                    "runtime persistence closed after fatal local authority loss".to_string()
-                })?
+            if let Some(authority) = self.handoff_completion_authority.as_ref() {
+                Some(authority.child())
+            } else {
+                self.fatal_local_authority_fence
+                    .as_ref()
+                    .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
+                    .transpose()
+                    .map_err(|()| {
+                        "runtime persistence closed after fatal local authority loss".to_string()
+                    })?
+            }
         } else {
             if self
                 .fatal_local_authority_fence
                 .as_ref()
                 .is_some_and(|fence| fence.is_closed())
+                && self.handoff_completion_authority.is_none()
             {
                 return Err("runtime effects closed after fatal local authority loss".to_string());
             }
@@ -6262,8 +6281,11 @@ where
                     .as_ref()
                     .expect("fresh handoff effect owns durable authority")
                     .child();
-                self.execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
-                    .await
+                let completion = self
+                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
+                    .await?;
+                self.handoff_completion_authority = effect_owner;
+                Ok(completion)
             }
 
             Effect::ResolveTask {
@@ -12239,6 +12261,41 @@ mod authoritative_user_message_effect_tests {
             assert_eq!(settlements[0].terminal, expected);
             assert_eq!(settlements[0].state, new_state);
         }
+    }
+
+    #[tokio::test]
+    async fn handoff_completion_retains_authority_through_state_publication() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--handoff-completion.md".to_string(),
+            title: "Handoff completion".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Complete the handoff".to_string(),
+        };
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt.state_watcher = Some(state_tx);
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let owner = fence.try_acquire().unwrap();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.handoff_completion_authority = Some(owner);
+        fence.close("test_handoff_completion");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+
+        rt.process_event(Event::TaskHandoffComplete {
+            successor_conv_id: "successor-conv".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &*state_rx.borrow(),
+            ConvState::HandedOff { successor_conv_id }
+                if successor_conv_id == "successor-conv"
+        ));
+        assert!(rt.handoff_completion_authority.is_none());
     }
 
     #[tokio::test(start_paused = true)]

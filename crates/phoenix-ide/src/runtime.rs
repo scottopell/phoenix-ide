@@ -221,7 +221,31 @@ mod conversation_mutex_gate_tests {
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
-type RuntimeMaterializationSender = watch::Sender<Option<RuntimeMaterializationResult>>;
+
+struct RuntimeMaterializationSlot {
+    result_tx: watch::Sender<Option<RuntimeMaterializationResult>>,
+    inherited_authority: std::sync::Mutex<Option<FatalLocalAuthorityOwner>>,
+}
+
+impl RuntimeMaterializationSlot {
+    fn transfer_authority(&self, authority: FatalLocalAuthorityOwner) {
+        let mut inherited = self
+            .inherited_authority
+            .lock()
+            .expect("runtime materialization authority poisoned");
+        if inherited.is_none() {
+            *inherited = Some(authority);
+        }
+    }
+
+    fn authority_child(&self) -> Option<FatalLocalAuthorityOwner> {
+        self.inherited_authority
+            .lock()
+            .expect("runtime materialization authority poisoned")
+            .as_ref()
+            .map(FatalLocalAuthorityOwner::child)
+    }
+}
 
 pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
     error.contains("has an invalid working directory")
@@ -393,7 +417,7 @@ pub struct RuntimeManager {
     /// The mutex protects only map admission/removal; unrelated conversations
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
-    runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
+    runtime_creations: AsyncMutex<HashMap<String, Arc<RuntimeMaterializationSlot>>>,
     conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
@@ -419,6 +443,8 @@ pub struct RuntimeManager {
     fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     handoff_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1850,6 +1876,8 @@ impl RuntimeManager {
             fork_runtime_start_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             handoff_runtime_start_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            runtime_authority_transfer_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -3549,14 +3577,26 @@ impl RuntimeManager {
             return Ok(handle);
         }
 
-        let (mut result_rx, is_owner) = {
+        let (slot, mut result_rx, is_owner) = {
             let mut creations = self.runtime_creations.lock().await;
-            if let Some(result_tx) = creations.get(conversation_id) {
-                (result_tx.subscribe(), false)
+            if let Some(slot) = creations.get(conversation_id) {
+                if let Some(authority) = inherited_authority {
+                    slot.transfer_authority(authority);
+                }
+                #[cfg(test)]
+                if let Some(barrier) = self.runtime_authority_transfer_barrier.lock().await.take() {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                (Arc::clone(slot), slot.result_tx.subscribe(), false)
             } else {
                 let (result_tx, result_rx) = watch::channel(None);
-                creations.insert(conversation_id.to_string(), result_tx);
-                (result_rx, true)
+                let slot = Arc::new(RuntimeMaterializationSlot {
+                    result_tx,
+                    inherited_authority: std::sync::Mutex::new(inherited_authority),
+                });
+                creations.insert(conversation_id.to_string(), Arc::clone(&slot));
+                (slot, result_rx, true)
             }
         };
 
@@ -3577,7 +3617,7 @@ impl RuntimeManager {
                     let started = std::time::Instant::now();
                     let result = Box::pin(
                         worker_manager
-                            .materialize_runtime(&worker_conversation_id, inherited_authority),
+                            .materialize_runtime(&worker_conversation_id, Arc::clone(&slot)),
                     )
                     .instrument(span.clone())
                     .await;
@@ -3607,18 +3647,17 @@ impl RuntimeManager {
                     }
                 }
 
-                let result_tx = {
+                let removed_slot = {
                     let mut creations = manager.runtime_creations.lock().await;
-                    let result_tx = creations
-                        .get(&conversation_id)
-                        .expect("runtime materialization supervisor retains its single-flight slot")
-                        .clone();
-                    result_tx.send_replace(Some(result));
+                    let slot = creations.get(&conversation_id).expect(
+                        "runtime materialization supervisor retains its single-flight slot",
+                    );
+                    slot.result_tx.send_replace(Some(result));
                     creations
                         .remove(&conversation_id)
                         .expect("published runtime materialization slot remains owned")
                 };
-                drop(result_tx);
+                drop(removed_slot);
             });
         }
 
@@ -4081,7 +4120,7 @@ impl RuntimeManager {
     async fn materialize_runtime(
         self: &Arc<Self>,
         conversation_id: &str,
-        inherited_authority: Option<FatalLocalAuthorityOwner>,
+        slot: Arc<RuntimeMaterializationSlot>,
     ) -> Result<ConversationHandle, String> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
@@ -4113,8 +4152,8 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let recovery_owner = match inherited_authority.as_ref() {
-            Some(owner) => owner.child(),
+        let recovery_owner = match slot.authority_child() {
+            Some(owner) => owner,
             None => self.acquire_local_authority_pass().map_err(|()| {
                 "runtime admission closed after fatal local authority loss".to_string()
             })?,
@@ -4612,8 +4651,8 @@ impl RuntimeManager {
         {
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
-            let _publication_owner = match inherited_authority.as_ref() {
-                Some(owner) => owner.child(),
+            let _publication_owner = match slot.authority_child() {
+                Some(owner) => owner,
                 None => self.acquire_local_authority_pass().map_err(|()| {
                     broadcaster.close_publication();
                     reservations.remove(conversation_id);
@@ -5091,8 +5130,8 @@ impl RuntimeManager {
         loop {
             let mut in_flight_result = {
                 let creations = self.runtime_creations.lock().await;
-                if let Some(result_tx) = creations.get(conversation_id) {
-                    Some(result_tx.subscribe())
+                if let Some(slot) = creations.get(conversation_id) {
+                    Some(slot.result_tx.subscribe())
                 } else {
                     let runtimes = self.runtimes.read().await;
                     if runtimes.contains_key(conversation_id) {
@@ -7867,11 +7906,13 @@ mod scope_liveness_tests {
         let stale_broadcaster = manager.conversation_broadcaster(conversation_id).await;
         let mut stale_events = stale_broadcaster.subscribe();
         let (result_tx, _result_rx) = watch::channel(None);
-        manager
-            .runtime_creations
-            .lock()
-            .await
-            .insert(conversation_id.to_string(), result_tx.clone());
+        manager.runtime_creations.lock().await.insert(
+            conversation_id.to_string(),
+            Arc::new(RuntimeMaterializationSlot {
+                result_tx: result_tx.clone(),
+                inherited_authority: std::sync::Mutex::new(None),
+            }),
+        );
 
         let release = {
             let manager = Arc::clone(&manager);
@@ -8590,6 +8631,54 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn late_inherited_authority_transfers_into_existing_materialization() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "late-inherited-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let authority = mgr.acquire_local_authority_pass().unwrap();
+        let transfer_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_authority_transfer_barrier.lock().await = Some(Arc::clone(&transfer_barrier));
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, authority)
+                    .await
+            })
+        };
+        transfer_barrier.wait().await;
+
+        mgr.signal_fatal_local_authority("test_late_inherited_materialization");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        transfer_barrier.wait().await;
+        barrier.wait().await;
+
+        ordinary.await.unwrap().unwrap();
+        inherited.await.unwrap().unwrap();
+        assert!(mgr.try_get_handle(conversation_id).await.is_some());
+        assert!(!mgr
+            .runtime_creations
+            .lock()
+            .await
+            .contains_key(conversation_id));
     }
 
     #[tokio::test]
