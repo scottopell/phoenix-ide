@@ -9023,7 +9023,9 @@ impl Database {
              LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                  AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
              WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO UPDATE SET action = excluded.action,
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
+                 action = excluded.action,
                  transcript_generation = excluded.transcript_generation,
                  turn_id = excluded.turn_id,
                  turn_generation = excluded.turn_generation,
@@ -9311,7 +9313,9 @@ impl Database {
                         && matches!(conversation.state, ConvState::LlmRequesting { .. })
                     {
                         sqlx::query(
-                            "UPDATE startup_parent_actions SET action = 'Resume',
+                            "UPDATE startup_parent_actions SET
+                                 action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
+                                 action = 'Resume',
                                  transcript_generation = ?2, created_at = ?3
                              WHERE conversation_id = ?1 AND action = 'Reconcile'
                                AND (
@@ -9367,7 +9371,9 @@ impl Database {
                      LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                          AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
                      WHERE c.id = ?1
-                     ON CONFLICT(conversation_id) DO UPDATE SET action = 'Resume',
+                     ON CONFLICT(conversation_id) DO UPDATE SET
+                         action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
+                         action = 'Resume',
                          transcript_generation = excluded.transcript_generation,
                          turn_id = excluded.turn_id,
                          turn_generation = excluded.turn_generation,
@@ -18050,6 +18056,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_reconcile_to_resume_rotates_action_id() {
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "reconcile-to-resume-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "reconcile-to-resume-child",
+            "child",
+            "/tmp",
+            false,
+            Some(parent_id),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_conversation_state(parent_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        db.establish_parent_reconcile_action(parent_id)
+            .await
+            .unwrap();
+        let original = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(original.len(), 1);
+
+        db.reconcile_startup_obligated_parents(
+            &std::collections::HashSet::from([parent_id.to_string()]),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let replacement = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].action, StartupParentAction::Resume);
+        assert_ne!(replacement[0].action_id, original[0].action_id);
+    }
+
+    #[tokio::test]
     async fn restart_tool_round_materialization_replays_with_persisted_timestamp() {
         use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
@@ -18111,6 +18156,60 @@ mod tests {
             .find(|message| message.message_id == tool_result_message_id("think-stable"))
             .unwrap();
         assert_eq!(tool_result.created_at, entered_at);
+    }
+
+    #[tokio::test]
+    async fn startup_tool_round_resume_rotates_action_id() {
+        use phoenix_core::domain::sm_state::{AssistantMessage, ThinkInput, ToolCall, ToolInput};
+
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "tool-round-action-version";
+        db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "think-action-version",
+                    ToolInput::Think(ThinkInput {
+                        thoughts: "rotate".to_string(),
+                    }),
+                ),
+                remaining_tools: Vec::new(),
+                completed_results: Vec::new(),
+                pending_sub_agents: Vec::new(),
+                assistant_message: AssistantMessage::new(
+                    "action-version-assistant".to_string(),
+                    vec![phoenix_core::domain::llm_types::ContentBlock::tool_use(
+                        "think-action-version",
+                        "think",
+                        serde_json::json!({"thoughts": "rotate"}),
+                    )],
+                    None,
+                    None,
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        db.establish_parent_reconcile_action(conversation_id)
+            .await
+            .unwrap();
+        let original = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(original.len(), 1);
+
+        db.reconcile_startup_obligated_parents(
+            &std::collections::HashSet::from([conversation_id.to_string()]),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let replacement = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].action, StartupParentAction::Resume);
+        assert_ne!(replacement[0].action_id, original[0].action_id);
     }
 
     #[tokio::test]
@@ -18211,6 +18310,7 @@ mod tests {
             .await
             .unwrap();
         let destination = ConvState::LlmRequesting { attempt: 1 };
+        let mut action_ids = Vec::new();
         for (agent_id, result) in [("round-one", "one"), ("round-two", "two")] {
             let expected_state = db.get_conversation(parent_id).await.unwrap().state;
             db.persist_startup_sub_agent_fan_in(
@@ -18230,7 +18330,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let actions = db.list_startup_parent_actions().await.unwrap();
+            assert_eq!(actions.len(), 1);
+            action_ids.push(actions[0].action_id);
         }
+        assert_ne!(action_ids[0], action_ids[1]);
 
         let summaries: Vec<_> = db
             .get_messages(parent_id)

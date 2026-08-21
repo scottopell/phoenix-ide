@@ -3547,7 +3547,7 @@ impl RuntimeManager {
                 }
             }
         };
-        match repo
+        let recovery = match repo
             .terminalize_authoritative_turn(
                 &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                     command,
@@ -3605,11 +3605,7 @@ impl RuntimeManager {
                         }
                     }
                     phoenix_db::workflow::TerminalProjectionProbe::Current => {
-                    self.startup_obligated_conversations
-                    .write()
-                    .await
-                    .remove(conversation_id);
-                    Ok(DatabaseTerminalRecovery::Committed {
+                        Ok(DatabaseTerminalRecovery::Committed {
                             projection: Box::new(projection),
                             is_sub_agent,
                             worktree_path,
@@ -3630,7 +3626,14 @@ impl RuntimeManager {
                     }
                 }
             }
+        }?;
+        if recovery.committed() {
+            self.startup_obligated_conversations
+                .write()
+                .await
+                .remove(conversation_id);
         }
+        Ok(recovery)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7568,6 +7571,8 @@ mod scope_liveness_tests {
         assert_eq!(recovered.turn_id, turn_id);
         assert_eq!(recovered.expected_generation, 0);
 
+        mgr.set_startup_obligated_conversations(HashSet::from([conversation_id.to_string()]))
+            .await;
         let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
         let mut terminal_events = broadcaster.subscribe();
         let mgr = Arc::new(mgr);
@@ -7577,6 +7582,11 @@ mod scope_liveness_tests {
             .await
             .expect("settle database-only terminal obligation");
         assert!(recovery.committed());
+        assert!(!mgr
+            .startup_obligated_conversations
+            .read()
+            .await
+            .contains(conversation_id));
         assert!(terminal_events.try_recv().is_err());
         mgr.complete_database_terminal_recovery(conversation_id, recovery)
             .await;

@@ -1890,7 +1890,9 @@ impl WorkflowRepository {
                  LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                      AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
                  WHERE c.id = ?1
-                 ON CONFLICT(conversation_id) DO UPDATE SET action = 'Reconcile',
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                     action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
+                     action = 'Reconcile',
                      transcript_generation = excluded.transcript_generation,
                      created_at = excluded.created_at",
             )
@@ -4094,6 +4096,62 @@ mod tests {
             serde_json::from_str::<ConvState>(&state_after_commit).unwrap(),
             projection.state
         );
+    }
+
+    #[tokio::test]
+    async fn child_terminal_reconcile_rotates_parent_action_id() {
+        let repo = repo().await;
+        sqlx::query(
+            "UPDATE conversations SET parent_conversation_id = 'conv-b' WHERE id = 'conv-a'",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation, created_at)
+             SELECT id, 'Resume', transcript_generation, '2025-01-01'
+             FROM conversations WHERE id = 'conv-b'",
+        )
+        .execute(&repo.pool)
+        .await
+        .unwrap();
+        let original_id: i64 = sqlx::query_scalar(
+            "SELECT action_id FROM startup_parent_actions WHERE conversation_id = 'conv-b'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let created = repo
+            .accept_authoritative_turn(&input("conv-a", "child-terminal-action", 8))
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let replacement: (i64, String) = sqlx::query_as(
+            "SELECT action_id, action FROM startup_parent_actions
+             WHERE conversation_id = 'conv-b'",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(replacement.1, "Reconcile");
+        assert_ne!(replacement.0, original_id);
     }
 
     #[tokio::test]
