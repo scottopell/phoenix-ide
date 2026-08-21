@@ -170,21 +170,12 @@ export function ConversationListPage() {
   }, [currentScrollKey, isDesktop, loading, visibleConversationCount]);
 
   useLayoutEffect(() => {
-    const scrollOwner = mainRef.current;
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') saveScrollPosition();
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      if (!scrollOwner) return;
-      try {
-        localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
-      } catch (error) {
-        console.warn('Unable to save the mobile conversation-list scroll position', error);
-      }
-    };
-  }, [currentScrollKey, isDesktop, saveScrollPosition]);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [isDesktop, saveScrollPosition]);
 
   const handleConversationClick = useCallback((conv: Conversation) => {
     saveScrollPosition();

@@ -11,7 +11,10 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <script>
       try {
-        if (localStorage.getItem('phoenix-theme') === 'light') {
+        const savedTheme = localStorage.getItem('phoenix-theme');
+        const useLightTheme = savedTheme === 'light'
+          || (savedTheme === null && matchMedia('(prefers-color-scheme: light)').matches);
+        if (useLightTheme) {
           document.querySelector('meta[name="theme-color"]').content = '#ffffff';
           document.querySelector('link[rel="manifest"]').href = '/manifest-light.webmanifest';
           document.documentElement.dataset.theme = 'light';

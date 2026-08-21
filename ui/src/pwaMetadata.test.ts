@@ -48,7 +48,7 @@ describe('Home Screen web app metadata', () => {
     expect(html).toContain('rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png"');
     expect(html).toContain('rel="manifest" href="/manifest.webmanifest"');
     expect(html).toContain('viewport-fit=cover');
-    expect(html).toContain("localStorage.getItem('phoenix-theme') === 'light'");
+    expect(html).toContain("savedTheme === null && matchMedia('(prefers-color-scheme: light)').matches");
     expect(html).toContain("'/manifest-light.webmanifest'");
   });
 });
