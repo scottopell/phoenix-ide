@@ -240,11 +240,15 @@ pub async fn serve_https(
             boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 drop(listener);
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping HTTPS without database cleanup");
-                let owner_drain = runtime.fence_fatal_local_authority();
-                let connection_drain =
-                    bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS fatal authority");
-                drain_concurrently(owner_drain, connection_drain).await;
-                crate::tools::bash::shutdown_kill_tree(bash_handles).await;
+                let fatal_tail = async {
+                    drain_concurrently(
+                        runtime.fence_fatal_local_authority(),
+                        graceful.shutdown(),
+                    )
+                    .await;
+                    crate::tools::bash::shutdown_kill_tree(bash_handles).await;
+                };
+                let _ = bounded_post_shutdown_drain(fatal_tail, "HTTPS fatal authority").await;
                 return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }
             accepted = listener.accept() => {

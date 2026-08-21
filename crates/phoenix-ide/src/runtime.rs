@@ -1957,10 +1957,6 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.close(boundary);
     }
 
-    fn fatal_local_authority_is_latched(&self) -> bool {
-        self.fatal_local_authority_fence.is_closed()
-    }
-
     pub(crate) fn require_startup_local_authority(&self) -> Result<(), String> {
         self.require_local_authority_admission()
     }
@@ -2882,6 +2878,15 @@ impl RuntimeManager {
 
     pub(crate) fn acquire_local_authority_pass(&self) -> Result<FatalLocalAuthorityOwner, ()> {
         self.fatal_local_authority_fence.try_acquire()
+    }
+
+    pub(crate) fn external_effect_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.fatal_local_authority_fence
+            .external_effect_cancellation()
+    }
+
+    pub(crate) fn fatal_local_authority_is_latched(&self) -> bool {
+        self.fatal_local_authority_fence.is_closed()
     }
 
     #[cfg(test)]
@@ -3838,26 +3843,23 @@ impl RuntimeManager {
         self: &Arc<Self>,
         startup: bool,
     ) -> Result<(), DatabaseTerminalRecoveryError> {
-        let startup_owner = self.acquire_local_authority_pass().map_err(|()| {
-            DatabaseTerminalRecoveryError::Unclassifiable(
-                "fatal local authority closed before startup reconciliation".to_string(),
-            )
-        })?;
         let conversation_ids = self.startup_obligated_conversations.read().await.clone();
-        let reconciled = if conversation_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.db
-                .reconcile_startup_obligated_parents(&conversation_ids, startup)
+        for conversation_id in conversation_ids {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            let ids = HashSet::from([conversation_id]);
+            let reconciled = self
+                .db
+                .reconcile_startup_obligated_parents(&ids, startup)
                 .await
-                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
-        };
-        drop(startup_owner);
-        for reconciliation in reconciled {
-            self.startup_obligated_conversations
-                .write()
-                .await
-                .remove(&reconciliation.conversation_id);
+                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
+            for reconciliation in reconciled {
+                self.startup_obligated_conversations
+                    .write()
+                    .await
+                    .remove(&reconciliation.conversation_id);
+            }
         }
         if startup {
             let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
@@ -4263,8 +4265,6 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-
-        drop(recovery_owner);
 
         let cleanup_conversation = conv.clone();
 
@@ -4724,6 +4724,8 @@ impl RuntimeManager {
         };
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
+        drop(recovery_owner);
+
         // losing, not-yet-spawned executor.
         {
             let mut runtimes = self.runtimes.write().await;

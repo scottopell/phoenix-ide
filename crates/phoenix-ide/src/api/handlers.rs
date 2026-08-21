@@ -1441,11 +1441,18 @@ fn sweep_expired_attachments_blocking(
     root: &std::path::Path,
     cutoff: SystemTime,
     referenced: &HashSet<PathBuf>,
+    cancelled: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     if !root.exists() {
         return Ok(());
     }
+    if cancelled.is_cancelled() {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(root)? {
+        if cancelled.is_cancelled() {
+            return Ok(());
+        }
         let entry = entry?;
         let path = entry.path();
         let metadata = match entry.metadata() {
@@ -1454,7 +1461,7 @@ fn sweep_expired_attachments_blocking(
             Err(e) => return Err(e),
         };
         if metadata.is_dir() {
-            sweep_expired_attachments_blocking(&path, cutoff, referenced)?;
+            sweep_expired_attachments_blocking(&path, cutoff, referenced, cancelled)?;
             match std::fs::remove_dir(&path) {
                 Ok(()) => {}
                 Err(e)
@@ -1477,7 +1484,10 @@ fn sweep_expired_attachments_blocking(
     Ok(())
 }
 
-async fn cleanup_expired_attachments(db: &crate::db::Database) {
+async fn cleanup_expired_attachments(
+    db: &crate::db::Database,
+    cancelled: tokio_util::sync::CancellationToken,
+) {
     let root = attachment_root();
     let referenced = match referenced_attachment_paths(db).await {
         Ok(paths) => paths,
@@ -1490,7 +1500,7 @@ async fn cleanup_expired_attachments(db: &crate::db::Database) {
         .checked_sub(ATTACHMENT_TTL)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let result = tokio::task::spawn_blocking(move || {
-        sweep_expired_attachments_blocking(&root, cutoff, &referenced)
+        sweep_expired_attachments_blocking(&root, cutoff, &referenced, &cancelled)
     })
     .await;
     match result {
@@ -1506,8 +1516,15 @@ pub(super) fn start_attachment_cleanup_task(
 ) {
     tokio::spawn(async move {
         loop {
-            let pass = runtime.run_local_authority_pass(cleanup_expired_attachments(&db));
-            if pass.await.is_err() {
+            if runtime
+                .acquire_local_authority_pass()
+                .map(|owner| drop(owner))
+                .is_err()
+            {
+                return;
+            }
+            cleanup_expired_attachments(&db, runtime.external_effect_cancellation()).await;
+            if runtime.fatal_local_authority_is_latched() {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
@@ -14872,6 +14889,26 @@ mod attachment_storage_tests {
     }
 
     #[test]
+    fn sweep_stops_before_deletion_when_cancelled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let expired = root.join("old.txt");
+        std::fs::write(&expired, b"old").expect("write old");
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+
+        sweep_expired_attachments_blocking(
+            root,
+            SystemTime::now() + Duration::from_secs(1),
+            &HashSet::new(),
+            &cancelled,
+        )
+        .expect("cancelled sweep");
+
+        assert!(expired.exists());
+    }
+
+    #[test]
     fn sweep_deletes_expired_files_and_empty_dirs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -14880,7 +14917,13 @@ mod attachment_storage_tests {
         let expired = conv.join("old.txt");
         std::fs::write(&expired, b"old").expect("write old");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
-        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
+        sweep_expired_attachments_blocking(
+            root,
+            cutoff,
+            &HashSet::new(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("sweep");
         assert!(!expired.exists());
         assert!(
             !conv.exists(),
@@ -14898,7 +14941,13 @@ mod attachment_storage_tests {
         std::fs::write(&referenced, b"keep").expect("write referenced");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
         let referenced_set = HashSet::from([referenced.clone()]);
-        sweep_expired_attachments_blocking(root, cutoff, &referenced_set).expect("sweep");
+        sweep_expired_attachments_blocking(
+            root,
+            cutoff,
+            &referenced_set,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("sweep");
         assert!(referenced.exists());
         assert!(conv.exists());
     }
@@ -15043,7 +15092,13 @@ mod attachment_storage_tests {
         let recent = conv.join("recent.txt");
         std::fs::write(&recent, b"recent").expect("write recent");
         let cutoff = SystemTime::UNIX_EPOCH;
-        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
+        sweep_expired_attachments_blocking(
+            root,
+            cutoff,
+            &HashSet::new(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("sweep");
         assert!(recent.exists());
         assert!(conv.exists());
     }

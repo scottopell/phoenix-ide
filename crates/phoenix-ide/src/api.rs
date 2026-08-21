@@ -210,12 +210,16 @@ impl AppState {
             let retriever = retriever.clone();
             let runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
-                let pass = runtime
-                    .run_local_authority_pass(retriever.reconcile())
+                let result = retriever
+                    .reconcile_with_admission(|| {
+                        runtime.acquire_local_authority_pass().map_err(|()| {
+                            phoenix_db::retrieval::RetrievalError::Db(sqlx::Error::Protocol(
+                                "fatal local authority closed during retrieval reconciliation"
+                                    .to_string(),
+                            ))
+                        })
+                    })
                     .await;
-                let Ok(result) = pass else {
-                    return;
-                };
                 match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,

@@ -256,6 +256,14 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
+        self.reconcile_with_admission(|| Ok(())).await
+    }
+
+    pub async fn reconcile_with_admission<G>(
+        &self,
+        mut admit: impl FnMut() -> Result<G, RetrievalError>,
+    ) -> Result<ReconcileStats, RetrievalError> {
+        let _owner = admit()?;
         let mut locator_tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM message_fts_rows
@@ -270,6 +278,7 @@ impl Fts5Retriever {
         .execute(&mut *locator_tx)
         .await?;
         locator_tx.commit().await?;
+        drop(_owner);
 
         // Physical index rows. We track a per-id row count alongside a sample
         // hash so a *duplicate* physical row for one message_id (which a plain
@@ -307,6 +316,7 @@ impl Fts5Retriever {
         for m in &messages {
             let fingerprint = content_fingerprint(&index_text(m));
             let count = counts.get(&m.message_id).copied().unwrap_or(0);
+            let _owner = admit()?;
             if count == 0 {
                 // Absent: insert (guarded so a concurrent add wins).
                 if fts_reconcile_upsert(&self.pool, m, None).await? {
@@ -336,6 +346,7 @@ impl Fts5Retriever {
         // snapshotted `messages`, and the upsert loop above would then
         // re-insert the deleted message from its stale snapshot. Re-deriving
         // orphans from the live table removes any such re-inserted row.
+        let _owner = admit()?;
         let mut prune_tx = self.pool.begin().await?;
         let orphan_rowids: Vec<i64> = sqlx::query_scalar(
             "SELECT fts_rowid FROM message_fts_rows
@@ -356,6 +367,7 @@ impl Fts5Retriever {
         .execute(&mut *prune_tx)
         .await?;
         prune_tx.commit().await?;
+        drop(_owner);
         stats.pruned = orphan_rowids.len();
 
         self.reconciled.store(true, Ordering::Release);
@@ -1421,6 +1433,39 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_admits_independent_write_units() {
+        let db = seed().await;
+        db.add_message(
+            "m1",
+            "c-a",
+            &MessageContent::user("admitted retrieval"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM message_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+        let admissions = std::sync::atomic::AtomicUsize::new(0);
+
+        r.reconcile_with_admission(|| {
+            admissions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(admissions.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

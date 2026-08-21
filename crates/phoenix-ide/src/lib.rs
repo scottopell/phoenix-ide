@@ -1058,14 +1058,17 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
                 let _ = drain_tx.send(());
-                let owner_drain = runtime_for_fatal.fence_fatal_local_authority();
-                let server_drain = async {
-                    if tls::bounded_post_shutdown_drain(&mut server, "HTTP fatal authority").await.is_none() {
-                        server_abort.abort();
-                    }
+                let fatal_tail = async {
+                    tls::drain_concurrently(
+                        runtime_for_fatal.fence_fatal_local_authority(),
+                        &mut server,
+                    )
+                    .await;
+                    crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
                 };
-                tls::drain_concurrently(owner_drain, server_drain).await;
-                crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
+                if tls::bounded_post_shutdown_drain(fatal_tail, "HTTP fatal authority").await.is_none() {
+                    server_abort.abort();
+                }
                 tracing_handles.shutdown_tracer();
                 return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }

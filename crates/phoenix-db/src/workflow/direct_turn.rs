@@ -1206,11 +1206,33 @@ impl WorkflowRepository {
                     "materialized direct-turn message identity mismatch".to_string(),
                 ));
             }
+            let files = sqlx::query(
+                "SELECT original_name, media_type, size_bytes, stored_path
+                 FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
+            )
+            .bind(&message_id)
+            .map(
+                |row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::FileAttachment {
+                    original_name: row.get("original_name"),
+                    media_type: row.get("media_type"),
+                    size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+                    stored_path: row.get("stored_path"),
+                },
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            let images = sqlx::query(
+                "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
+            )
+            .bind(&message_id)
+            .map(|row: sqlx::sqlite::SqliteRow| phoenix_core::domain::db_schema::ImageData {
+                data: row.get("data"),
+                media_type: row.get("media_type"),
+            })
+            .fetch_all(&self.pool)
+            .await?;
+            message.content.set_attachments(images, files);
             let expected_content = input.prepared.message_content_and_display_data();
-            let (images, files) = expected_content.0.attachments();
-            message
-                .content
-                .set_attachments(images.to_vec(), files.to_vec());
             if message.conversation_id != conversation.0
                 || message.content != expected_content.0
                 || message.display_data != expected_content.1
@@ -4113,6 +4135,63 @@ mod tests {
                 "conv-a",
                 "message-conv-a-payload-drift",
             ))
+            .execute(repo.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.classify_authoritative_turn_materialization(&input).await,
+            Err(DbError::Serialization(message))
+                if message.contains("canonical message payload mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_canonical_attachment_drift_is_classification_error() {
+        let repo = repo().await;
+        let conversation = ConversationAuthority("conv-a".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-a-attachment-drift");
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("attachment-drift").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(29),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let authority = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 30))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let input = MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority,
+            prepared: payload,
+            sequence_id: 30,
+            created_at: Timestamp(30),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: timestamp_to_datetime(Timestamp(30)),
+            now: Timestamp(30),
+        };
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&input).await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(_)
+            )
+        ));
+        let message_id = canonical_message_id("conv-a", "message-conv-a-attachment-drift");
+        sqlx::query("DELETE FROM message_files WHERE message_id = ?1")
+            .bind(message_id)
             .execute(repo.pool())
             .await
             .unwrap();
