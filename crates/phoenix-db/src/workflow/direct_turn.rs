@@ -1248,7 +1248,7 @@ impl WorkflowRepository {
         input: &MaterializeAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> DbResult<MaterializeAuthoritativeTurnOutcome> {
-        let mut tx = self.begin_tx().await?;
+        let mut tx = self.begin_immediate_tx().await?;
         let turn_id = input.turn_id;
         let turn =
             load_turn_for_workflow_tx(&self.pool, &mut tx.tx, turn_id, input.authority.workflow_id)
@@ -4156,6 +4156,40 @@ mod tests {
             delivery.get::<Option<i64>, _>("accepted_by_transition_id"),
             Some(i64::try_from(DIRECT_TURN_MATERIALIZED_TRANSITION_ID).unwrap())
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn materialization_acquires_write_intent_before_authority_reads() {
+        let (_dir, blocker, contender) = open_workflow_repo_pair().await;
+        let (turn_id, workflow_id) = created_turn(&blocker, "write-intent", 20).await;
+        let authority = blocker
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 10))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let input = materialize_input(turn_id, authority, 1, 1, "message-conv-a-write-intent", 10);
+        let mut write_lock = blocker.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *write_lock)
+            .await
+            .unwrap();
+
+        let materialization =
+            tokio::spawn(async move { contender.materialize_authoritative_turn(&input).await });
+        tokio::task::yield_now().await;
+        assert!(!materialization.is_finished());
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut *write_lock)
+            .await
+            .unwrap();
+        assert!(matches!(
+            materialization.await.unwrap(),
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(_)
+            )
+        ));
     }
 
     #[tokio::test]
