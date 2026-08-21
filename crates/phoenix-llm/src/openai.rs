@@ -121,19 +121,7 @@ pub async fn complete(
     // means we're on the platform Responses API path, which doesn't emit the
     // codex `x-codex-*` headers or `usage_limit_reached` envelopes.
     if !status.is_success() {
-        if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
-            let message = error_resp.error.message;
-            return Err(match status.as_u16() {
-                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-                429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400..=499 => {
-                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
-                }
-                500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
-            });
-        }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(responses_http_error(status.as_u16(), &body));
     }
 
     let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
@@ -215,6 +203,23 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
         // Default: retryable server error so the executor's retry loop kicks in.
         LlmError::server_error(detail)
     }
+}
+
+fn responses_http_error(status: u16, body: &str) -> LlmError {
+    if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
+        let message = error_resp.error.message;
+        if let Some(code) = error_resp.error.code.as_deref() {
+            return classify_responses_error(code, &message);
+        }
+        return match status {
+            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
+            429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+            400..=499 => LlmError::invalid_request(format!("Bad request ({status}): {message}")),
+            500..=599 => LlmError::server_error(format!("Server error: {message}")),
+            _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
+        };
+    }
+    LlmError::from_http_status(status, body)
 }
 
 /// Accumulates state across Responses API SSE stream events.
@@ -850,8 +855,20 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
             }
         }
     }
-    parse_codex_error(status, &headers, &body)
-        .or_else(|| Some(LlmError::from_http_status(status, &body)))
+    parse_codex_error(status, &headers, &body).or_else(|| {
+        let code = error
+            .get("code")
+            .or_else(|| error.get("type"))
+            .and_then(serde_json::Value::as_str);
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| code.unwrap_or("unknown error"));
+        Some(code.map_or_else(
+            || responses_http_error(status, &body),
+            |code| classify_responses_error(code, message),
+        ))
+    })
 }
 
 fn parse_codex_rate_limits(value: &serde_json::Value) -> Option<QuotaDetails> {
@@ -1321,7 +1338,7 @@ pub async fn complete_streaming(
                 return Err(err);
             }
         }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(responses_http_error(status.as_u16(), &body));
     }
 
     // Codex bridge emits a fresh quota snapshot in response headers on
@@ -3559,6 +3576,21 @@ mod tests {
         assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
     }
 
+    #[test]
+    fn wrapped_websocket_invalid_prompt_is_user_resumable() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_prompt",
+                "message": "prompt rejected by policy"
+            }
+        }))
+        .expect("wrapped error maps");
+        assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
+        assert!(error.kind.is_user_resumable());
+    }
+
     #[tokio::test]
     async fn websocket_reuses_connection_continues_resets_and_falls_back_safely() {
         // also covers HTTP fallback path: the mock HTTP SSE stream emits control + text + terminal.
@@ -4659,6 +4691,25 @@ mod tests {
             classify_responses_error("", "boom").kind,
             LlmErrorKind::ServerError
         );
+    }
+
+    #[test]
+    fn responses_http_error_routes_provider_code_through_classifier() {
+        use super::super::LlmErrorKind;
+
+        let prompt_rejected = responses_http_error(
+            400,
+            r#"{"error":{"message":"prompt rejected by policy","type":"invalid_request_error","code":"invalid_prompt"}}"#,
+        );
+        assert_eq!(prompt_rejected.kind, LlmErrorKind::PromptRejected);
+        assert!(prompt_rejected.kind.is_user_resumable());
+
+        let generic_invalid = responses_http_error(
+            400,
+            r#"{"error":{"message":"unsupported input","type":"invalid_request_error","code":"invalid_request_error"}}"#,
+        );
+        assert_eq!(generic_invalid.kind, LlmErrorKind::InvalidRequest);
+        assert!(!generic_invalid.kind.is_user_resumable());
     }
 
     #[tokio::test]
