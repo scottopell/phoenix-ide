@@ -2697,11 +2697,15 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.is_closed()
     }
 
+    pub(crate) fn acquire_local_authority_pass(&self) -> Result<FatalLocalAuthorityOwner, ()> {
+        self.fatal_local_authority_fence.try_acquire()
+    }
+
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,
     ) -> Result<T, ()> {
-        let _owner = self.fatal_local_authority_fence.try_acquire()?;
+        let _owner = self.acquire_local_authority_pass()?;
         Ok(pass.await)
     }
 
@@ -2715,23 +2719,20 @@ impl RuntimeManager {
         let mut fatal_local_authority_rx = self.fatal_local_authority_receiver();
         tokio::spawn(async move {
             loop {
-                let pass = Box::pin(manager.run_local_authority_pass(async {
-                        if let Err(error) =
-                            crate::runtime::creation_worker::drain_pending_jobs(&manager).await
-                        {
-                            tracing::error!(error = %error, "conversation creation worker drain failed");
-                        }
-                        match manager.db().next_conversation_creation_deadline().await {
-                            Ok(deadline) => deadline,
-                            Err(error) => {
-                                tracing::error!(error = %error, "failed to read conversation creation deadline");
-                                Some(chrono::Utc::now() + chrono::Duration::seconds(1))
-                            }
-                        }
-                    }))
-                    .await;
-                let Ok(next_deadline) = pass else {
+                if let Err(error) =
+                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                {
+                    tracing::error!(error = %error, "conversation creation worker drain failed");
+                }
+                if manager.local_authority_is_closed() {
                     break;
+                }
+                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to read conversation creation deadline");
+                        Some(chrono::Utc::now() + chrono::Duration::seconds(1))
+                    }
                 };
                 if let Some(deadline) = next_deadline {
                     let delay = (deadline - chrono::Utc::now())

@@ -41,17 +41,22 @@ enum CreationDrainControl {
     StopDrain,
 }
 
-async fn drain_claimed_jobs<Job, Claim, ClaimFuture, Process, ProcessFuture>(
+async fn drain_claimed_jobs<Admission, Guard, Job, Claim, ClaimFuture, Process, ProcessFuture>(
+    mut admit: Admission,
     mut claim: Claim,
     mut process: Process,
 ) -> Result<(), String>
 where
+    Admission: FnMut() -> Result<Guard, ()>,
     Claim: FnMut() -> ClaimFuture,
     ClaimFuture: std::future::Future<Output = Result<Option<Job>, String>>,
     Process: FnMut(Job) -> ProcessFuture,
     ProcessFuture: std::future::Future<Output = CreationDrainControl>,
 {
     loop {
+        let Ok(_owner) = admit() else {
+            return Ok(());
+        };
         let Some(job) = claim().await? else {
             return Ok(());
         };
@@ -63,17 +68,23 @@ where
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
-    while let Some(cleanup) = manager
-        .db()
-        .claim_next_conversation_creation_cleanup(
-            &worker_id.0,
-            &uuid::Uuid::new_v4().to_string(),
-            chrono::Utc::now(),
-            chrono::Duration::seconds(30),
-        )
-        .await
-        .map_err(|error| error.to_string())?
-    {
+    loop {
+        let Ok(_owner) = manager.acquire_local_authority_pass() else {
+            return Ok(());
+        };
+        let Some(cleanup) = manager
+            .db()
+            .claim_next_conversation_creation_cleanup(
+                &worker_id.0,
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
         if let Err(error) = reconcile_creation_cleanup(manager, &cleanup).await {
             tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
             manager
@@ -87,6 +98,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         }
     }
     drain_claimed_jobs(
+        || manager.acquire_local_authority_pass(),
         || {
             let manager = Arc::clone(manager);
             let worker_id = worker_id.clone();
@@ -1408,6 +1420,7 @@ mod runtime_bootstrap_settlement_tests {
         let observed_processed = Arc::clone(&processed);
 
         drain_claimed_jobs(
+            || Ok(()),
             move || {
                 let claim_number =
                     observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1429,6 +1442,36 @@ mod runtime_bootstrap_settlement_tests {
 
         assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 1);
         assert_eq!(*processed.lock().unwrap(), vec!["first-job"]);
+    }
+
+    #[tokio::test]
+    async fn closure_between_jobs_prevents_second_claim() {
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&admitted);
+        let claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_claims = Arc::clone(&claims);
+        let close_after_first = Arc::clone(&admitted);
+
+        drain_claimed_jobs(
+            move || {
+                admission
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+                    .ok_or(())
+            },
+            move || {
+                observed_claims.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async { Ok(Some("job")) }
+            },
+            move |_| {
+                close_after_first.store(false, std::sync::atomic::Ordering::Release);
+                async { CreationDrainControl::Continue }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(claims.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 }
 
