@@ -3163,13 +3163,10 @@ impl RuntimeManager {
                         "otel.status_code" = tracing::field::Empty,
                     );
                     let started = std::time::Instant::now();
-                    let result = async {
-                        worker_manager
-                            .materialize_runtime(&worker_conversation_id)
-                            .await
-                    }
-                    .instrument(span.clone())
-                    .await;
+                    let result =
+                        Box::pin(worker_manager.materialize_runtime(&worker_conversation_id))
+                            .instrument(span.clone())
+                            .await;
                     span.record(
                         "runtime.materialization_ms",
                         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
