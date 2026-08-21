@@ -1885,8 +1885,11 @@ impl WorkflowRepository {
                      (conversation_id, action, transcript_generation,
                       turn_id, turn_generation, created_at)
                  SELECT c.id, 'Reconcile', c.transcript_generation,
-                        t.turn_id, t.generation, ?2
+                        CASE WHEN a.conversation_id IS NULL THEN t.turn_id ELSE a.turn_id END,
+                        CASE WHEN a.conversation_id IS NULL THEN t.generation ELSE a.turn_generation END,
+                        ?2
                  FROM conversations AS c
+                 LEFT JOIN startup_parent_actions AS a ON a.conversation_id = c.id
                  LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                      AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
                  WHERE c.id = ?1",
@@ -4094,7 +4097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_terminal_reconcile_rotates_parent_action_id() {
+    async fn child_terminal_reconcile_rotates_id_and_preserves_originating_authority() {
         let repo = repo().await;
         sqlx::query(
             "UPDATE conversations SET parent_conversation_id = 'conv-b' WHERE id = 'conv-a'",
@@ -4102,11 +4105,27 @@ mod tests {
         .execute(&repo.pool)
         .await
         .unwrap();
+        let original_parent = repo
+            .accept_authoritative_turn(&input("conv-b", "original-parent-turn", 6))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: original_parent_turn_id,
+            ..
+        } = original_parent.outcome
+        else {
+            panic!("expected original parent turn")
+        };
         sqlx::query(
             "INSERT INTO startup_parent_actions
-                 (conversation_id, action, transcript_generation, created_at)
-             SELECT id, 'Resume', transcript_generation, '2025-01-01'
-             FROM conversations WHERE id = 'conv-b'",
+                 (conversation_id, action, transcript_generation,
+                  turn_id, turn_generation, created_at)
+             SELECT c.id, 'Resume', c.transcript_generation,
+                    t.turn_id, t.generation, '2025-01-01'
+             FROM conversations AS c
+             JOIN durable_turns AS t ON t.conversation_id = c.id
+                 AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
+             WHERE c.id = 'conv-b'",
         )
         .execute(&repo.pool)
         .await
@@ -4117,6 +4136,31 @@ mod tests {
         .fetch_one(&repo.pool)
         .await
         .unwrap();
+        repo.terminalize_authoritative_turn(&TerminalizeAuthoritativeTurnInput {
+            command: TurnCommand::Complete {
+                turn_id: original_parent_turn_id,
+                expected_generation: 0,
+            },
+            projection: Some(PersistedConversationProjection {
+                state: ConvState::Idle,
+                state_updated_at: Utc::now(),
+            }),
+        })
+        .await
+        .unwrap();
+        let later_parent = repo
+            .accept_authoritative_turn(&input("conv-b", "later-parent-turn", 7))
+            .await
+            .unwrap();
+        let TurnOutcome::Created {
+            turn_id: later_parent_turn_id,
+            ..
+        } = later_parent.outcome
+        else {
+            panic!("expected later parent turn")
+        };
+        assert_ne!(later_parent_turn_id, original_parent_turn_id);
+
         let created = repo
             .accept_authoritative_turn(&input("conv-a", "child-terminal-action", 8))
             .await
@@ -4138,15 +4182,24 @@ mod tests {
         .await
         .unwrap();
 
-        let replacement: (i64, String) = sqlx::query_as(
-            "SELECT action_id, action FROM startup_parent_actions
-             WHERE conversation_id = 'conv-b'",
+        let replacement: (i64, String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT action_id, action, turn_id, turn_generation
+             FROM startup_parent_actions WHERE conversation_id = 'conv-b'",
         )
         .fetch_one(&repo.pool)
         .await
         .unwrap();
         assert_eq!(replacement.1, "Reconcile");
         assert_ne!(replacement.0, original_id);
+        assert_eq!(
+            replacement.2,
+            Some(to_i64(original_parent_turn_id.0, "turn_id").unwrap())
+        );
+        assert_eq!(replacement.3, Some(0));
+        assert_ne!(
+            replacement.2,
+            Some(to_i64(later_parent_turn_id.0, "turn_id").unwrap())
+        );
     }
 
     #[tokio::test]
