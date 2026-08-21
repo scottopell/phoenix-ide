@@ -197,6 +197,16 @@ pub(crate) async fn wait_for_fatal_local_authority(
     }
 }
 
+async fn drain_concurrently<OwnerDrain, ConnectionDrain>(
+    owner_drain: OwnerDrain,
+    connection_drain: ConnectionDrain,
+) where
+    OwnerDrain: std::future::Future,
+    ConnectionDrain: std::future::Future,
+{
+    let (_, _) = tokio::join!(owner_drain, connection_drain);
+}
+
 pub async fn serve_https(
     listener: TcpListener,
     app: Router,
@@ -230,8 +240,10 @@ pub async fn serve_https(
             boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 drop(listener);
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping HTTPS without database cleanup");
-                runtime.fence_fatal_local_authority().await;
-                let _ = bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS fatal authority").await;
+                let owner_drain = runtime.fence_fatal_local_authority();
+                let connection_drain =
+                    bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS fatal authority");
+                drain_concurrently(owner_drain, connection_drain).await;
                 crate::tools::bash::shutdown_kill_tree(bash_handles).await;
                 return Err(std::io::Error::other("fatal local SQLite authority loss").into());
             }
@@ -357,6 +369,35 @@ fn ensure_managed_cert(dir: &Path, hosts: &[String]) -> Result<Paths, Box<dyn Er
 
 #[cfg(test)]
 mod external_host_tests {
+    #[tokio::test]
+    async fn fatal_https_starts_connection_drain_while_owner_drain_is_pending() {
+        let (owner_started_tx, owner_started_rx) = tokio::sync::oneshot::channel();
+        let (connection_started_tx, connection_started_rx) = tokio::sync::oneshot::channel();
+        let (release_owner_tx, release_owner_rx) = tokio::sync::oneshot::channel();
+        let (release_connection_tx, release_connection_rx) = tokio::sync::oneshot::channel();
+
+        let drain = tokio::spawn(super::drain_concurrently(
+            async move {
+                let _ = owner_started_tx.send(());
+                let _ = release_owner_rx.await;
+            },
+            async move {
+                let _ = connection_started_tx.send(());
+                let _ = release_connection_rx.await;
+            },
+        ));
+
+        owner_started_rx.await.expect("owner drain polled");
+        connection_started_rx
+            .await
+            .expect("connection drain polled before owner completion");
+        release_owner_tx.send(()).expect("release owner drain");
+        release_connection_tx
+            .send(())
+            .expect("release connection drain");
+        drain.await.expect("concurrent drains join");
+    }
+
     use super::ConfigSource;
     use std::path::PathBuf;
 

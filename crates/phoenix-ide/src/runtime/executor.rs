@@ -108,6 +108,13 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
+async fn wait_for_optional_cancellation(cancellation: Option<CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn refresh_commission_review_approval_for_outcome(
     context: &mut ConvContext,
     outcome: &EffectOutcome,
@@ -1957,6 +1964,10 @@ where
     /// the conversation has already left `CancellingTool` (id/state mismatch ->
     /// logged, harmless).
     tool_task_handle: Option<tokio::task::JoinHandle<()>>,
+    fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
+    fatal_external_effect_cancellation: Option<CancellationToken>,
+    #[cfg(test)]
+    external_effect_dispatch_barrier: Option<Arc<tokio::sync::Barrier>>,
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
@@ -2111,6 +2122,10 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
+            fatal_local_authority_rx: None,
+            fatal_external_effect_cancellation: None,
+            #[cfg(test)]
+            external_effect_dispatch_barrier: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
@@ -2176,6 +2191,8 @@ where
         mut self,
         fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
     ) -> Self {
+        self.fatal_local_authority_rx = Some(fence.subscribe());
+        self.fatal_external_effect_cancellation = Some(fence.external_effect_cancellation());
         self.fatal_local_authority_fence = Some(fence);
         self
     }
@@ -2410,7 +2427,15 @@ where
                 operation_id = %request.operation_id,
                 "resuming interrupted continuation summary"
             );
-            self.request_continuation(request.clone());
+            if let Err(error) = self
+                .execute_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                })
+                .await
+            {
+                tracing::error!(%error, "Failed to resume continuation request");
+                return RuntimeExitDisposition::Interrupted;
+            }
         }
 
         // If the credential helper is still running, the select loop will pick it up.
@@ -2474,6 +2499,17 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
+                biased;
+                boundary = async {
+                    match self.fatal_local_authority_rx.as_mut() {
+                        Some(receiver) => crate::tls::wait_for_fatal_local_authority(receiver).await,
+                        None => std::future::pending::<&'static str>().await,
+                    }
+                }, if self.fatal_local_authority_rx.is_some() => {
+                    tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
+                    self.abort_external_effects();
+                    return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
@@ -2496,8 +2532,9 @@ where
                     if matches!(event, Event::Shutdown) {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
-                            "Runtime shutdown signal received; exiting executor loop"
+                            "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
+                        self.abort_external_effects();
                         return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                     if let Err(e) = self.process_event(event).await {
@@ -2665,6 +2702,7 @@ where
             }
         }
 
+        self.abort_external_effects();
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
             RuntimeExitDisposition::RecreateFromDatabase
@@ -5035,6 +5073,27 @@ where
         }
     }
 
+    fn effect_dispatches_external_work(effect: &Effect) -> bool {
+        matches!(
+            effect,
+            Effect::RequestLlm | Effect::ExecuteTool { .. } | Effect::RequestContinuation { .. }
+        )
+    }
+
+    fn abort_external_effects(&mut self) {
+        self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
+        if let Some(handle) = self.llm_task_handle.take() {
+            handle.abort();
+        }
+        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
+        if let Some(token) = self.tool_cancel_token.take() {
+            token.cancel();
+        }
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+    }
+
     fn effect_mutates_durable_authority(effect: &Effect) -> bool {
         matches!(
             effect,
@@ -5060,7 +5119,10 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
-        let effect_owner = if Self::effect_mutates_durable_authority(&effect) {
+        let dispatches_external_work = Self::effect_dispatches_external_work(&effect);
+        let effect_owner = if Self::effect_mutates_durable_authority(&effect)
+            || dispatches_external_work
+        {
             self.fatal_local_authority_fence
                 .as_ref()
                 .map(crate::runtime::FatalLocalAuthorityFence::try_acquire)
@@ -5078,6 +5140,13 @@ where
             }
             None
         };
+        #[cfg(test)]
+        if dispatches_external_work {
+            if let Some(barrier) = self.external_effect_dispatch_barrier.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         match effect {
             Effect::PersistAuthoritativeUserMessage {
                 payload, authority, ..
@@ -6321,7 +6390,7 @@ where
                         state_updated_at: self.state_updated_at,
                     });
                 self.publish_live_state()?;
-                match self.dispatch_llm_request().await {
+                match Box::pin(self.execute_effect(Effect::RequestLlm)).await {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
                 }
@@ -6662,9 +6731,8 @@ where
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
-        let handle = tokio::spawn(async move {
-            // Tokio cancellation is not recursive. Aborting the request must
-            // also stop its forwarder before buffered chunks reach a later turn.
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let request_task = async move {
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
 
             if is_sub_agent {
@@ -6890,7 +6958,15 @@ where
             }
 
             let _ = llm_tx.send(llm_outcome);
-        }.instrument(turn_span));
+        }
+        .instrument(turn_span);
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = request_task => {}
+            }
+        });
         self.active_llm_attempt = Some(attempt_capture);
         self.llm_task_handle = Some(handle);
 
@@ -7039,7 +7115,11 @@ where
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
-        let cancel_token = CancellationToken::new();
+        let cancel_token = self
+            .fatal_external_effect_cancellation
+            .as_ref()
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
         self.tool_cancel_token = Some(cancel_token.clone());
         let cancel_token_check = cancel_token.clone();
 
@@ -7136,25 +7216,30 @@ where
         // Instrumenting the detached task with the turn span parents the
         // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.
         let turn_span = self.current_turn_span();
-        let tool_task = tokio::spawn(
-            async move {
-                let tool_outcome = execute_tool_to_outcome(
-                    storage,
-                    tool_executor,
-                    checked,
-                    tool_ctx,
-                    &cancel_token_check,
-                    conv_id,
-                    root_conv_id,
-                    tool_name,
-                    tool_use_id,
-                )
-                .await;
-                // Send typed outcome through oneshot channel
-                let _ = tool_tx.send(tool_outcome);
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let tool_execution = async move {
+            let tool_outcome = execute_tool_to_outcome(
+                storage,
+                tool_executor,
+                checked,
+                tool_ctx,
+                &cancel_token_check,
+                conv_id,
+                root_conv_id,
+                tool_name,
+                tool_use_id,
+            )
+            .await;
+            let _ = tool_tx.send(tool_outcome);
+        }
+        .instrument(turn_span);
+        let tool_task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = tool_execution => {}
             }
-            .instrument(turn_span),
-        );
+        });
         // Retain the handle so the cancellation backstop (REQ-BED-005a) can
         // abort an uncooperative tool task that never observes its token.
         // Replacing any prior handle is correct: only one tool executes at a
@@ -7724,7 +7809,8 @@ where
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
 
-        let handle = tokio::spawn(async move {
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let continuation_task = async move {
             // Build messages from history and add continuation request
             let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                 Ok(m) => m,
@@ -7887,6 +7973,13 @@ where
                     };
                     let _ = event_tx.send(event).await;
                 }
+            }
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = continuation_task => {}
             }
         });
         self.llm_task_handle = Some(handle);
@@ -12870,6 +12963,111 @@ mod authoritative_user_message_effect_tests {
         );
         assert_eq!(rt.state, ConvState::Idle);
         assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+    }
+
+    #[test]
+    fn provider_and_tool_dispatch_are_external_effects() {
+        assert!(ConversationRuntime::<
+            Arc<InMemoryStorage>,
+            Arc<MockLlmClient>,
+            Arc<MockToolExecutor>,
+        >::effect_dispatches_external_work(
+            &Effect::RequestLlm
+        ));
+        assert!(ConversationRuntime::<
+            Arc<InMemoryStorage>,
+            Arc<MockLlmClient>,
+            Arc<MockToolExecutor>,
+        >::effect_dispatches_external_work(
+            &Effect::ExecuteTool {
+                tool: ToolCall::new(
+                    "tool-1",
+                    crate::state_machine::state::ToolInput::Malformed {
+                        name: "test-tool".to_string(),
+                        input: serde_json::json!({}),
+                        error: "test input".to_string(),
+                    },
+                ),
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_effect_dispatch_holds_owner_until_task_is_registered() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.external_effect_dispatch_barrier = Some(Arc::clone(&barrier));
+        let dispatch = tokio::spawn(async move {
+            let result = rt.execute_effect(Effect::RequestLlm).await;
+            (rt, result)
+        });
+
+        barrier.wait().await;
+        fence.close("test_authority_boundary");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        barrier.wait().await;
+        let (mut rt, result) = dispatch.await.expect("dispatch joins");
+        result.expect("admitted external effect dispatches");
+        assert!(rt.llm_task_handle.is_some());
+        rt.abort_external_effects();
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn fatal_signal_aborts_registered_external_tasks() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (llm_started_tx, llm_started_rx) = oneshot::channel();
+        let (llm_dropped_tx, llm_dropped_rx) = oneshot::channel();
+        let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
+        let tool_cancel_token = CancellationToken::new();
+        rt.tool_cancel_token = Some(tool_cancel_token.clone());
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(llm_dropped_tx));
+            let _ = llm_started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        rt.tool_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
+            std::future::pending::<()>().await;
+        }));
+        let run = tokio::spawn(rt.run_inner());
+        llm_started_rx.await.expect("provider task started");
+
+        fence.close("test_authority_boundary");
+
+        assert_eq!(
+            run.await.expect("runtime joins"),
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        llm_dropped_rx.await.expect("provider task aborted");
+        tool_dropped_rx.await.expect("tool task aborted");
+        assert!(tool_cancel_token.is_cancelled());
     }
 
     #[tokio::test]

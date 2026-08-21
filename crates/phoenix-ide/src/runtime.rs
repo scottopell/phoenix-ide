@@ -240,6 +240,7 @@ struct FatalLocalAuthorityFenceState {
 pub(crate) struct FatalLocalAuthorityFence {
     state: Mutex<FatalLocalAuthorityFenceState>,
     owners_drained: Notify,
+    external_effect_cancellation: tokio_util::sync::CancellationToken,
     tx: watch::Sender<Option<&'static str>>,
     #[cfg(test)]
     owners_at_first_close: AtomicUsize,
@@ -259,6 +260,7 @@ impl FatalLocalAuthorityFence {
                 owners: 0,
             }),
             owners_drained: Notify::new(),
+            external_effect_cancellation: tokio_util::sync::CancellationToken::new(),
             tx,
             #[cfg(test)]
             owners_at_first_close: AtomicUsize::new(usize::MAX),
@@ -288,6 +290,8 @@ impl FatalLocalAuthorityFence {
             Ordering::Acquire,
         );
         self.tx.send_replace(Some(boundary));
+        self.external_effect_cancellation.cancel();
+        drop(state);
     }
 
     async fn wait_for_owners(&self) {
@@ -321,6 +325,10 @@ impl FatalLocalAuthorityFence {
             usize::MAX => None,
             owners => Some(owners),
         }
+    }
+
+    pub(crate) fn external_effect_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.external_effect_cancellation.clone()
     }
 
     fn subscribe(&self) -> watch::Receiver<Option<&'static str>> {
@@ -1134,6 +1142,7 @@ impl SseBroadcaster {
     /// sequenced allocation. A later sequenced event therefore cannot allocate
     /// and reach the channel before this event carrying the earlier witness.
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let _fatal_guard = self.fatal_publication_guard()?;
         let gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -4710,6 +4719,7 @@ impl RuntimeManager {
     /// reaches `Idle`. Persists the entry to DB **before** sending to the
     /// executor channel, so the entry survives a crash between acceptance
     /// and executor processing.
+    #[allow(clippy::too_many_lines)]
     pub async fn enqueue_steer_message(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -4743,6 +4753,12 @@ impl RuntimeManager {
             // Materialize before persistence so a newly-created executor loads
             // the old queue rather than the entry delivered below.
             let handle = self.get_or_create(conversation_id).await?;
+            let steering_owner = self
+                .fatal_local_authority_fence
+                .try_acquire()
+                .map_err(|()| {
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?;
             #[cfg(test)]
             if let Some(barrier) = self
                 .steering_enqueue_handle_barriers
@@ -4761,6 +4777,7 @@ impl RuntimeManager {
             if !handle_is_current {
                 drop(runtimes);
                 drop(projection_guard);
+                drop(steering_owner);
                 continue;
             }
 
@@ -4787,6 +4804,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| format!("Failed to send steer message: {e}"));
             drop(runtimes);
+            drop(steering_owner);
             if let Err(error) = send_result {
                 let stale_broadcaster = handle.broadcast_tx.clone();
                 tracing::warn!(
@@ -5475,6 +5493,35 @@ mod broadcaster_tests {
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn fatal_authority_latch_rejects_broadcast_only_publication() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 7).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut events = broadcaster.subscribe();
+        fence.close("test_authority_boundary");
+
+        assert!(broadcaster
+            .send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id: "tool-1".to_string(),
+                progress: BashToolProgress {
+                    handle: "bash-handle".to_string(),
+                    start_offset: 0,
+                    end_offset: 0,
+                    truncated_before: false,
+                    lines: Vec::new(),
+                    partial: None,
+                },
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(broadcaster.current_seq(), 7);
     }
 
     #[test]
@@ -6985,6 +7032,87 @@ mod scope_liveness_tests {
                 .expect("conversation")
                 .state,
             ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_enqueue_holds_owner_across_persistence_and_executor_handoff() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-fatal-owner";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0)
+                    .with_fatal_local_authority_fence(Arc::clone(
+                        &manager.fatal_local_authority_fence,
+                    )),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .steering_enqueue_handle_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let enqueue = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .enqueue_steer_message(
+                        conversation_id,
+                        Event::SteerMessage {
+                            text: "fenced steer".to_string(),
+                            llm_text: None,
+                            images: Vec::new(),
+                            files: Vec::new(),
+                            message_id: "fenced-steer".to_string(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "fenced-steer-fingerprint",
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        enqueue
+            .await
+            .expect("enqueue joins")
+            .expect("admitted steering persistence and handoff settle");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Event::SteerMessage { ref message_id, .. }) if message_id == "fenced-steer"
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("durable queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fenced-steer"]
         );
     }
 
