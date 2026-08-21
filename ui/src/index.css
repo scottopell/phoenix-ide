@@ -247,11 +247,13 @@ body.app-viewport-active #root {
     padding-left: calc(20px + env(safe-area-inset-left, 0));
   }
 
-  #conversation-nav {
-    min-height: calc(var(--breadcrumb-height) + env(safe-area-inset-top, 0));
-    padding-top: env(safe-area-inset-top, 0);
-    padding-right: env(safe-area-inset-right, 0);
-    padding-left: env(safe-area-inset-left, 0);
+  @media (width <= 1024px) {
+    #conversation-nav {
+      min-height: calc(var(--breadcrumb-height) + env(safe-area-inset-top, 0));
+      padding-top: env(safe-area-inset-top, 0);
+      padding-right: env(safe-area-inset-right, 0);
+      padding-left: env(safe-area-inset-left, 0);
+    }
   }
 
   .coordinator-page-status {
@@ -300,15 +302,6 @@ body.app-viewport-active #root {
   #app #state-bar:has(+ .offline-banner) {
     height: var(--state-bar-height);
     padding-bottom: 0;
-  }
-
-  #state-bar.statebar-mobile {
-    height: auto;
-    padding-bottom: env(safe-area-inset-bottom, 0);
-  }
-
-  #app #state-bar.statebar-mobile:has(+ .offline-banner) {
-    height: auto;
   }
 
   #app #state-bar + .offline-banner {
@@ -13100,10 +13093,6 @@ button.keyword-search-filepath:hover {
 .mobile-list-density .conv-item {
   padding: 8px 48px 8px 10px;
   min-height: 48px;
-}
-
-.mobile-list-density .mobile-list-refresh {
-  min-height: 44px;
 }
 
 .mobile-list-density .conv-item-main {

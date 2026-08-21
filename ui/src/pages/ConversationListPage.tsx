@@ -49,6 +49,8 @@ export function ConversationListPage() {
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
   const visibleConversationCount = showArchived ? archivedConversations.length : conversations.length;
+  const currentScrollKeyRef = useRef(currentScrollKey);
+  currentScrollKeyRef.current = currentScrollKey;
 
   useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;
@@ -139,22 +141,30 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
-  const saveScrollPosition = useCallback(() => {
+  const saveScrollPositionForKey = useCallback((scrollKey: string) => {
     const scrollOwner = mainRef.current;
     if (!scrollOwner) return;
     try {
-      localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
+      localStorage.setItem(scrollKey, String(scrollOwner.scrollTop));
     } catch (error) {
       console.warn('Unable to save the mobile conversation-list scroll position', error);
     }
-  }, [currentScrollKey]);
+  }, []);
+
+  const saveScrollPosition = useCallback(() => {
+    saveScrollPositionForKey(currentScrollKey);
+  }, [currentScrollKey, saveScrollPositionForKey]);
+
+  useLayoutEffect(() => () => {
+    saveScrollPositionForKey(currentScrollKeyRef.current);
+  }, [saveScrollPositionForKey]);
 
   useLayoutEffect(() => {
     didRestoreScrollRef.current = false;
   }, [currentScrollKey]);
 
   useLayoutEffect(() => {
-    if (isDesktop || loading || didRestoreScrollRef.current || visibleConversationCount === 0) return;
+    if (isDesktop || loading || !hasCompletedFirstFetch || didRestoreScrollRef.current || visibleConversationCount === 0) return;
     const scrollOwner = mainRef.current;
     if (!scrollOwner) return;
     try {
@@ -167,7 +177,7 @@ export function ConversationListPage() {
     } catch (error) {
       console.warn('Unable to restore the mobile conversation-list scroll position', error);
     }
-  }, [currentScrollKey, isDesktop, loading, visibleConversationCount]);
+  }, [currentScrollKey, hasCompletedFirstFetch, isDesktop, loading, visibleConversationCount]);
 
   useLayoutEffect(() => {
     const handleVisibilityChange = () => {
@@ -421,19 +431,7 @@ export function ConversationListPage() {
                   compact
                 />
               )}
-              footer={(
-                <>
-                  <button
-                    type="button"
-                    className="btn-secondary mobile-list-refresh"
-                    onClick={() => void refresh()}
-                    title="Refresh conversations"
-                  >
-                    Refresh
-                  </button>
-                  <StorageStatus conversationCount={totalConversations} />
-                </>
-              )}
+              footer={<StorageStatus conversationCount={totalConversations} />}
             />
           </>
         )}
