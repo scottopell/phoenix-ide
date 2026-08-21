@@ -16,8 +16,8 @@
           document.querySelector('link[rel="manifest"]').href = '/manifest-light.webmanifest';
           document.documentElement.dataset.theme = 'light';
         }
-      } catch (_) {
-        // Storage can be unavailable in private browsing; dark is the safe default.
+      } catch (error) {
+        console.warn('Unable to read the saved Phoenix theme during bootstrap', error);
       }
     </script>
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />

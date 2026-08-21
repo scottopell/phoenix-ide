@@ -14,6 +14,42 @@ use std::path::PathBuf;
 #[folder = "../../ui/dist"]
 struct Assets;
 
+#[derive(Clone, Copy)]
+pub struct PublicRootAsset {
+    pub path: &'static str,
+    pub content_type: &'static str,
+}
+
+pub const PUBLIC_ROOT_ASSETS: &[PublicRootAsset] = &[
+    PublicRootAsset {
+        path: "/manifest.webmanifest",
+        content_type: "application/manifest+json",
+    },
+    PublicRootAsset {
+        path: "/manifest-light.webmanifest",
+        content_type: "application/manifest+json",
+    },
+    PublicRootAsset {
+        path: "/apple-touch-icon.png",
+        content_type: "image/png",
+    },
+    PublicRootAsset {
+        path: "/icon-192.png",
+        content_type: "image/png",
+    },
+    PublicRootAsset {
+        path: "/icon-512.png",
+        content_type: "image/png",
+    },
+];
+
+pub fn public_root_asset(path: &str) -> Option<PublicRootAsset> {
+    PUBLIC_ROOT_ASSETS
+        .iter()
+        .copied()
+        .find(|asset| asset.path == path)
+}
+
 const REVALIDATE: &str = "no-cache";
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
@@ -62,17 +98,15 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 
 /// Serve a root-level web application asset.
 pub async fn serve_root_asset(uri: Uri) -> impl IntoResponse {
-    let path = uri.path().trim_start_matches('/');
-    let content_type = match path {
-        "manifest.webmanifest" | "manifest-light.webmanifest" => "application/manifest+json",
-        "apple-touch-icon.png" | "icon-192.png" | "icon-512.png" => "image/png",
-        _ => return StatusCode::NOT_FOUND.into_response(),
+    let Some(asset) = public_root_asset(uri.path()) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
+    let path = asset.path.trim_start_matches('/');
 
     if let Some(content) = Assets::get(path) {
         return Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, asset.content_type)
             .header(header::CACHE_CONTROL, "public, max-age=86400")
             .body(Body::from(content.data.to_vec()))
             .unwrap();
@@ -82,7 +116,7 @@ pub async fn serve_root_asset(uri: Uri) -> impl IntoResponse {
     if let Ok(content) = std::fs::read(fs_path) {
         return Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, asset.content_type)
             .header(header::CACHE_CONTROL, "public, max-age=86400")
             .body(Body::from(content))
             .unwrap();

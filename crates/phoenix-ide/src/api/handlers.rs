@@ -5,6 +5,7 @@
 
 use super::assets::{
     get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
+    PUBLIC_ROOT_ASSETS,
 };
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
@@ -111,16 +112,14 @@ pub fn create_router(state: AppState) -> Router {
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
     // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
     // React route means adding one entry there, not here.
-    let router = Router::new()
-        // Service worker
+    let mut router = Router::new()
         .route("/service-worker.js", get(serve_service_worker))
-        // Favicon (referenced from index.html)
-        .route("/phoenix.svg", get(serve_favicon))
-        .route("/manifest.webmanifest", get(serve_root_asset))
-        .route("/manifest-light.webmanifest", get(serve_root_asset))
-        .route("/apple-touch-icon.png", get(serve_root_asset))
-        .route("/icon-192.png", get(serve_root_asset))
-        .route("/icon-512.png", get(serve_root_asset))
+        .route("/phoenix.svg", get(serve_favicon));
+    for asset in PUBLIC_ROOT_ASSETS {
+        router = router.route(asset.path, get(serve_root_asset));
+    }
+
+    let router = router
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work

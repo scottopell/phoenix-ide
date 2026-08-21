@@ -245,6 +245,25 @@ body.app-viewport-active #root {
     padding-left: calc(20px + env(safe-area-inset-left, 0));
   }
 
+  #conversation-nav {
+    min-height: calc(var(--breadcrumb-height) + env(safe-area-inset-top, 0));
+    padding-top: env(safe-area-inset-top, 0);
+    padding-right: env(safe-area-inset-right, 0);
+    padding-left: env(safe-area-inset-left, 0);
+  }
+
+  .coordinator-page-status {
+    top: calc(12px + env(safe-area-inset-top, 0));
+    right: calc(12px + env(safe-area-inset-right, 0));
+    left: calc(12px + env(safe-area-inset-left, 0));
+  }
+
+  .module-load-notice {
+    right: calc(16px + env(safe-area-inset-right, 0));
+    bottom: calc(16px + env(safe-area-inset-bottom, 0));
+    left: max(16px, env(safe-area-inset-left, 0));
+  }
+
   .terminal-page {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
