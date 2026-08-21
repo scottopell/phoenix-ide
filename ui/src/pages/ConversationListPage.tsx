@@ -144,8 +144,8 @@ export function ConversationListPage() {
     if (!scrollOwner) return;
     try {
       localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
-    } catch {
-      // Storage can be unavailable in private browsing; navigation still works.
+    } catch (error) {
+      console.warn('Unable to save the mobile conversation-list scroll position', error);
     }
   }, [currentScrollKey]);
 
@@ -164,8 +164,8 @@ export function ConversationListPage() {
         const maxScrollTop = Math.max(0, scrollOwner.scrollHeight - scrollOwner.clientHeight);
         scrollOwner.scrollTop = Math.min(Math.max(0, saved), maxScrollTop);
       }
-    } catch {
-      // Storage can be unavailable in private browsing.
+    } catch (error) {
+      console.warn('Unable to restore the mobile conversation-list scroll position', error);
     }
   }, [currentScrollKey, isDesktop, loading, visibleConversationCount]);
 
@@ -180,11 +180,11 @@ export function ConversationListPage() {
       if (!scrollOwner) return;
       try {
         localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
-      } catch {
-        // Storage can be unavailable in private browsing.
+      } catch (error) {
+        console.warn('Unable to save the mobile conversation-list scroll position', error);
       }
     };
-  }, [currentScrollKey, saveScrollPosition]);
+  }, [currentScrollKey, isDesktop, saveScrollPosition]);
 
   const handleConversationClick = useCallback((conv: Conversation) => {
     saveScrollPosition();
