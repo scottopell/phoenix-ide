@@ -136,21 +136,40 @@ fn next_poll_delay() -> Duration {
 pub(crate) async fn run(manager: Arc<RuntimeManager>) {
     loop {
         tokio::time::sleep(next_poll_delay()).await;
-        let pass = manager.run_local_authority_pass(poll_once(&manager)).await;
-        let Ok(result) = pass else {
-            return;
-        };
-        if let Err(err) = result {
+        if let Err(err) = poll_once(&manager).await {
             tracing::debug!(error = %err, "background PR status poll failed");
         }
+        if manager.local_authority_is_closed() {
+            return;
+        }
+    }
+}
+
+async fn poll_units_with_admission<Target, Admission, Guard, Poll, PollFuture>(
+    targets: impl IntoIterator<Item = Target>,
+    mut admit: Admission,
+    mut poll: Poll,
+) where
+    Admission: FnMut() -> Result<Guard, ()>,
+    Poll: FnMut(Target) -> PollFuture,
+    PollFuture: std::future::Future<Output = ()>,
+{
+    for target in targets {
+        let Ok(_owner) = admit() else {
+            break;
+        };
+        poll(target).await;
     }
 }
 
 async fn poll_once(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let targets = collect_targets(manager.db()).await?;
-    for target in targets {
-        poll_target(manager, target).await;
-    }
+    poll_units_with_admission(
+        targets,
+        || manager.acquire_local_authority_pass(),
+        |target| poll_target(manager, target),
+    )
+    .await;
     Ok(())
 }
 
@@ -331,6 +350,33 @@ mod tests {
             interval_with_jitter(Duration::from_secs(300), Duration::from_secs(90), 900,),
             Duration::from_secs(390),
         );
+    }
+
+    #[tokio::test]
+    async fn closure_between_pr_targets_prevents_later_target_poll() {
+        let admission_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&admission_open);
+        let close_after_first = Arc::clone(&admission_open);
+        let polled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&polled);
+
+        poll_units_with_admission(
+            ["first", "second"],
+            move || {
+                admission
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+                    .ok_or(())
+            },
+            move |target| {
+                observed.lock().unwrap().push(target);
+                close_after_first.store(false, std::sync::atomic::Ordering::Release);
+                async {}
+            },
+        )
+        .await;
+
+        assert_eq!(*polled.lock().unwrap(), vec!["first"]);
     }
 }
 

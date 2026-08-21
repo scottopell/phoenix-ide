@@ -245,11 +245,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         let startup = self
             .startup_reconciliation
             .load(std::sync::atomic::Ordering::Acquire);
-        let Ok(startup_owner) = self.dispatcher.acquire_local_authority() else {
-            return Ok(EMPTY_RESCAN_INTERVAL);
-        };
         self.dispatcher.reconcile_startup_parents(startup).await?;
-        drop(startup_owner);
         if startup {
             self.startup_reconciliation
                 .store(false, std::sync::atomic::Ordering::Release);

@@ -2643,7 +2643,7 @@ impl RuntimeManager {
         Ok(false)
     }
 
-    async fn run_startup_authority_units<T, F, Fut>(
+    async fn run_authority_units<T, F, Fut>(
         self: &Arc<Self>,
         units: impl IntoIterator<Item = T>,
         mut run: F,
@@ -2673,7 +2673,7 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let manager = Arc::clone(self);
-        self.run_startup_authority_units(conversation_ids, move |conversation_id| {
+        self.run_authority_units(conversation_ids, move |conversation_id| {
             let manager = Arc::clone(&manager);
             async move {
                 match manager.get_or_create(&conversation_id).await {
@@ -2704,7 +2704,7 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        self.run_startup_authority_units(conversation_ids, move |conversation_id| {
+        self.run_authority_units(conversation_ids, move |conversation_id| {
             let repository = repository.clone();
             async move {
                 let Some(_summary) = repository
@@ -3589,6 +3589,11 @@ impl RuntimeManager {
         self: &Arc<Self>,
         startup: bool,
     ) -> Result<(), DatabaseTerminalRecoveryError> {
+        let startup_owner = self.acquire_local_authority_pass().map_err(|()| {
+            DatabaseTerminalRecoveryError::Unclassifiable(
+                "fatal local authority closed before startup reconciliation".to_string(),
+            )
+        })?;
         let conversation_ids = self.startup_obligated_conversations.read().await.clone();
         let reconciled = if conversation_ids.is_empty() {
             Vec::new()
@@ -3598,6 +3603,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
         };
+        drop(startup_owner);
         for reconciliation in reconciled {
             self.startup_obligated_conversations
                 .write()
@@ -3605,7 +3611,15 @@ impl RuntimeManager {
                 .remove(&reconciliation.conversation_id);
         }
         if startup {
-            for conversation in crate::reconcile_worktrees_with_terminalized(&self.db).await {
+            let Ok(worktree_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            let conversations = crate::reconcile_worktrees_with_terminalized(&self.db).await;
+            drop(worktree_owner);
+            for conversation in conversations {
+                let Ok(_owner) = self.acquire_local_authority_pass() else {
+                    return Ok(());
+                };
                 executor::complete_terminal_lifecycle_without_broadcast(
                     &conversation.id,
                     conversation.parent_conversation_id.is_some(),
@@ -3626,6 +3640,9 @@ impl RuntimeManager {
             .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         for action_record in actions {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
             let conversation_id = action_record.conversation_id.clone();
             match action_record.action {
                 phoenix_db::StartupParentAction::Reconcile => {
@@ -6708,7 +6725,7 @@ mod scope_liveness_tests {
         let close_manager = Arc::clone(&manager);
 
         let completed = manager
-            .run_startup_authority_units(["first", "second"], move |_| {
+            .run_authority_units(["first", "second"], move |_| {
                 let observed_commits = Arc::clone(&observed_commits);
                 let close_manager = Arc::clone(&close_manager);
                 async move {
@@ -6722,6 +6739,29 @@ mod scope_liveness_tests {
 
         assert_eq!(completed, 1);
         assert_eq!(commits.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn closure_between_startup_parent_actions_prevents_next_action() {
+        let manager = Arc::new(test_manager().await);
+        let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&actions);
+        let close_manager = Arc::clone(&manager);
+
+        manager
+            .run_authority_units(["first-action", "second-action"], move |action| {
+                let observed = Arc::clone(&observed);
+                let close_manager = Arc::clone(&close_manager);
+                async move {
+                    observed.lock().unwrap().push(action);
+                    close_manager.signal_fatal_local_authority("test_parent_action_boundary");
+                    Ok(true)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*actions.lock().unwrap(), vec!["first-action"]);
     }
 
     #[tokio::test(start_paused = true)]
