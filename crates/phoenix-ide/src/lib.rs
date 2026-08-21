@@ -715,7 +715,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile worktrees after excluding conversations whose exact terminal
     // projection is still owned by startup obligation settlement.
-    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
+    let mut admit = || Ok::<(), ()>(());
+    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations, &mut admit).await;
 
     // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
     // rows whose main_ref was defaulted to a literal `main` are corrected before
@@ -1105,17 +1106,28 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// transferred to a continuation — not a genuine orphan.
 #[cfg(test)]
 pub(crate) async fn reconcile_worktrees(db: &Database) {
-    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+    let mut admit = || Ok::<(), ()>(());
+    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new(), &mut admit).await;
 }
 
-pub(crate) async fn reconcile_worktrees_with_terminalized(db: &Database) -> Vec<Conversation> {
-    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await
+pub(crate) async fn reconcile_worktrees_with_terminalized<Admission, Guard>(
+    db: &Database,
+    mut admit: Admission,
+) -> Vec<Conversation>
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
+    reconcile_worktrees_excluding(db, &std::collections::HashSet::new(), &mut admit).await
 }
 
-async fn reconcile_worktrees_excluding(
+async fn reconcile_worktrees_excluding<Admission, Guard>(
     db: &Database,
     excluded_conversations: &std::collections::HashSet<String>,
-) -> Vec<Conversation> {
+    admit: &mut Admission,
+) -> Vec<Conversation>
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
     let mut terminalized = Vec::new();
     let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
@@ -1153,6 +1165,10 @@ async fn reconcile_worktrees_excluding(
         if std::path::Path::new(wt_path).exists() {
             continue;
         }
+
+        let Ok(_owner) = admit() else {
+            break;
+        };
 
         tracing::warn!(
             conv_id = %conv.id,
@@ -1205,7 +1221,7 @@ async fn reconcile_worktrees_excluding(
         );
     }
 
-    reclaim_unowned_worktrees(db).await;
+    reclaim_unowned_worktrees(db, admit).await;
     terminalized
 }
 
@@ -1426,7 +1442,10 @@ fn add_physical_project_worktrees(
     }
 }
 
-async fn reclaim_unowned_worktrees(db: &Database) {
+async fn reclaim_unowned_worktrees<Admission, Guard>(db: &Database, admit: &mut Admission)
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
     let conversations = match db.managed_worktree_conversations().await {
         Ok(conversations) => conversations,
         Err(error) => {
@@ -1455,6 +1474,9 @@ async fn reclaim_unowned_worktrees(db: &Database) {
     let mut reclaimed = 0usize;
     let mut quarantined = 0usize;
     for (path, owners) in by_path {
+        let Ok(_owner) = admit() else {
+            return;
+        };
         if owners
             .iter()
             .any(crate::runtime::conversation_attachment_retains_work_scope)
@@ -1681,9 +1703,48 @@ mod suggest_token_tests {
 }
 
 #[cfg(test)]
+fn run_reconciliation_targets_with_admission<T>(
+    targets: impl IntoIterator<Item = T>,
+    mut admit: impl FnMut() -> Result<(), ()>,
+    mut run: impl FnMut(T),
+) {
+    for target in targets {
+        if admit().is_err() {
+            break;
+        }
+        run(target);
+    }
+}
+
+#[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;
     use crate::db::{ConvMode, ConvState, NonEmptyString};
+
+    #[tokio::test]
+    async fn closure_between_worktree_targets_prevents_later_reconciliation() {
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = std::sync::Arc::clone(&open);
+        let close = std::sync::Arc::clone(&open);
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reconciled = std::sync::Arc::clone(&observed);
+
+        run_reconciliation_targets_with_admission(
+            ["missing-1", "missing-2"],
+            move || {
+                admission
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+                    .ok_or(())
+            },
+            move |target| {
+                reconciled.lock().unwrap().push(target);
+                close.store(false, std::sync::atomic::Ordering::Release);
+            },
+        );
+
+        assert_eq!(*observed.lock().unwrap(), vec!["missing-1"]);
+    }
 
     /// Initialise a git repo in a tempdir with one commit on main.
     fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {

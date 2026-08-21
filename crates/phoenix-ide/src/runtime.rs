@@ -3611,11 +3611,10 @@ impl RuntimeManager {
                 .remove(&reconciliation.conversation_id);
         }
         if startup {
-            let Ok(worktree_owner) = self.acquire_local_authority_pass() else {
-                return Ok(());
-            };
-            let conversations = crate::reconcile_worktrees_with_terminalized(&self.db).await;
-            drop(worktree_owner);
+            let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
+                self.acquire_local_authority_pass()
+            })
+            .await;
             for conversation in conversations {
                 let Ok(_owner) = self.acquire_local_authority_pass() else {
                     return Ok(());
