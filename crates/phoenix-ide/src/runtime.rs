@@ -395,6 +395,10 @@ pub struct RuntimeManager {
     runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1814,6 +1818,10 @@ impl RuntimeManager {
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             fork_command_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            browser_retirement_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            hard_delete_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -1947,6 +1955,16 @@ impl RuntimeManager {
         use phoenix_core::domain::work_scope_inventory::{
             BrowserSessionLiveness, TmuxServerStatus,
         };
+
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(work_scope = %work_scope, "skipping browser teardown retirement after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.browser_retirement_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
         let Some(scope_id) = work_scope.work_scope_id() else {
             return;
@@ -2756,6 +2774,24 @@ impl RuntimeManager {
 
     pub(crate) fn acquire_local_authority_pass(&self) -> Result<FatalLocalAuthorityOwner, ()> {
         self.fatal_local_authority_fence.try_acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_hard_delete_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.hard_delete_barrier.lock().await = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_at_hard_delete_barrier(&self) {
+        if let Some(barrier) = self.hard_delete_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fatal_authority_owners_at_first_close(&self) -> Option<usize> {
+        self.fatal_local_authority_fence.owners_at_first_close()
     }
 
     pub(crate) async fn run_local_authority_pass<T>(
@@ -8015,6 +8051,75 @@ mod scope_liveness_tests {
             mgr.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::registry::BashHandleError::SpawnFenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_retirement_is_rejected_after_fatal_closure() {
+        let mgr = test_manager().await;
+        let scope_id =
+            phoenix_core::work_scope::WorkScopeId::parse("closed-browser-scope").expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+        mgr.signal_fatal_local_authority("test_browser_retirement");
+
+        mgr.retire_scope_after_browser_teardown(&scope).await;
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "active");
+    }
+
+    #[tokio::test]
+    async fn admitted_browser_retirement_remains_owned_until_settlement() {
+        let mgr = Arc::new(test_manager().await);
+        let scope_id = phoenix_core::work_scope::WorkScopeId::parse("admitted-browser-scope")
+            .expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.browser_retirement_barrier.lock().await = Some(Arc::clone(&barrier));
+        let retirement = {
+            let mgr = Arc::clone(&mgr);
+            let scope = scope.clone();
+            tokio::spawn(async move { mgr.retire_scope_after_browser_teardown(&scope).await })
+        };
+
+        barrier.wait().await;
+        mgr.signal_fatal_local_authority("test_browser_retirement");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        retirement.await.unwrap();
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "retired");
     }
 
     /// Register a lingering runtime handle for `conv_id` without spawning a

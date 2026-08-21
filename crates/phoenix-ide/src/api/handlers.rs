@@ -5588,6 +5588,11 @@ async fn delete_conversation(
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
+    #[cfg(test)]
+    state.runtime.wait_at_hard_delete_barrier().await;
     refuse_if_coordinator(state, id, "delete").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
@@ -13594,6 +13599,39 @@ pub(crate) mod hard_delete_cascade_tests {
             "an unreadable DB during the sibling-liveness lookup must fail the \
              cascade, not silently preserve-and-archive; got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn admitted_hard_delete_remains_owned_through_cascade_settlement() {
+        let state = make_test_state().await;
+        let origin = "admitted-hard-delete-origin";
+        state
+            .db
+            .create_conversation(origin, origin, "/tmp", false, None, None)
+            .await
+            .expect("create origin");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state
+            .runtime
+            .install_hard_delete_barrier(Arc::clone(&barrier))
+            .await;
+
+        let cascade = {
+            let state = state.clone();
+            tokio::spawn(async move { run_hard_delete_cascade(&state, origin).await })
+        };
+        barrier.wait().await;
+        state
+            .runtime
+            .signal_fatal_local_authority("test_hard_delete_cascade");
+        assert_eq!(
+            state.runtime.fatal_authority_owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        cascade.await.unwrap().expect("admitted cascade settles");
+        assert!(state.db.get_conversation(origin).await.is_err());
     }
 
     #[tokio::test]

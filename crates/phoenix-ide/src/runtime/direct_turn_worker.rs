@@ -253,6 +253,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
 
         let mut cursor = None;
         loop {
+            let Ok(discovery_owner) = self.dispatcher.acquire_local_authority() else {
+                return Ok(EMPTY_RESCAN_INTERVAL);
+            };
             let page = self
                 .terminal_discovery
                 .list_accepted(cursor, DISCOVERY_BATCH_LIMIT)
@@ -260,6 +263,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 .map_err(|error| {
                     crate::runtime::DatabaseTerminalRecoveryError::Retryable(error.clone())
                 })?;
+            drop(discovery_owner);
             let exhausted = page.next_cursor.is_none() || page.next_cursor == cursor;
             cursor = page.next_cursor;
             for candidate in page.candidates {
@@ -1350,6 +1354,21 @@ mod tests {
         .unwrap();
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         let worker = worker(repo.clone(), dispatcher.clone(), 10, 1);
+        dispatcher
+            .admission_open
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        worker.run_once().await.unwrap();
+
+        assert!(dispatcher.events.lock().unwrap().is_empty());
+        assert!(repo
+            .list_attempts(workflow_id, phoenix_workflow::EffectId(1))
+            .await
+            .unwrap()
+            .is_empty());
+        dispatcher
+            .admission_open
+            .store(true, std::sync::atomic::Ordering::Release);
         worker.run_once().await.unwrap();
         worker.run_once().await.unwrap();
         assert!(dispatcher.events.lock().unwrap().is_empty());
