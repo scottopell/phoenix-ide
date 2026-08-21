@@ -47,6 +47,10 @@ export function ConversationListPage() {
   const mainRef = useRef<HTMLElement>(null);
   const didRestoreScrollRef = useRef(false);
 
+  useEffect(() => {
+    if (isDesktop) didRestoreScrollRef.current = false;
+  }, [isDesktop]);
+
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
   const { toasts, dismissToast, showWarning, showError } = useToast();
@@ -143,18 +147,20 @@ export function ConversationListPage() {
   }, []);
 
   useLayoutEffect(() => {
-    if (loading || didRestoreScrollRef.current || conversations.length === 0) return;
-    didRestoreScrollRef.current = true;
+    if (isDesktop || loading || didRestoreScrollRef.current || conversations.length === 0) return;
+    const scrollOwner = mainRef.current;
+    if (!scrollOwner) return;
     try {
       const saved = Number(localStorage.getItem(MOBILE_LIST_SCROLL_KEY));
-      if (Number.isFinite(saved) && mainRef.current) {
-        const maxScrollTop = Math.max(0, mainRef.current.scrollHeight - mainRef.current.clientHeight);
-        mainRef.current.scrollTop = Math.min(Math.max(0, saved), maxScrollTop);
+      if (Number.isFinite(saved)) {
+        didRestoreScrollRef.current = true;
+        const maxScrollTop = Math.max(0, scrollOwner.scrollHeight - scrollOwner.clientHeight);
+        scrollOwner.scrollTop = Math.min(Math.max(0, saved), maxScrollTop);
       }
     } catch {
       // Storage can be unavailable in private browsing.
     }
-  }, [conversations.length, loading]);
+  }, [conversations.length, isDesktop, loading]);
 
   useLayoutEffect(() => {
     const scrollOwner = mainRef.current;
