@@ -64,7 +64,7 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 pub async fn serve_root_asset(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
     let content_type = match path {
-        "manifest.webmanifest" => "application/manifest+json",
+        "manifest.webmanifest" | "manifest-light.webmanifest" => "application/manifest+json",
         "apple-touch-icon.png" | "icon-192.png" | "icon-512.png" => "image/png",
         _ => return StatusCode::NOT_FOUND.into_response(),
     };

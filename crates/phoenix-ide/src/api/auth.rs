@@ -353,6 +353,7 @@ fn is_exempt_path(path: &str) -> bool {
         || path == "/service-worker.js"
         || path == "/phoenix.svg"
         || path == "/manifest.webmanifest"
+        || path == "/manifest-light.webmanifest"
         || path == "/apple-touch-icon.png"
         || path == "/icon-192.png"
         || path == "/icon-512.png"
@@ -597,6 +598,7 @@ mod tests {
         assert!(is_exempt_path("/service-worker.js"));
         assert!(is_exempt_path("/phoenix.svg"));
         assert!(is_exempt_path("/manifest.webmanifest"));
+        assert!(is_exempt_path("/manifest-light.webmanifest"));
         assert!(is_exempt_path("/apple-touch-icon.png"));
         assert!(is_exempt_path("/icon-192.png"));
         assert!(is_exempt_path("/icon-512.png"));

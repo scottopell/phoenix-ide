@@ -117,6 +117,7 @@ pub fn create_router(state: AppState) -> Router {
         // Favicon (referenced from index.html)
         .route("/phoenix.svg", get(serve_favicon))
         .route("/manifest.webmanifest", get(serve_root_asset))
+        .route("/manifest-light.webmanifest", get(serve_root_asset))
         .route("/apple-touch-icon.png", get(serve_root_asset))
         .route("/icon-192.png", get(serve_root_asset))
         .route("/icon-512.png", get(serve_root_asset))

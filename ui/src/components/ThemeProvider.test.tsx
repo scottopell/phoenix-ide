@@ -25,6 +25,9 @@ describe('ThemeProvider render isolation', () => {
     const meta = document.createElement('meta');
     meta.name = 'theme-color';
     document.head.append(meta);
+    const manifest = document.createElement('link');
+    manifest.rel = 'manifest';
+    document.head.append(manifest);
     localStorage.setItem('phoenix-theme', 'dark');
 
     function Toggle() {
@@ -34,11 +37,14 @@ describe('ThemeProvider render isolation', () => {
 
     const { getByRole, unmount } = render(<ThemeProvider><Toggle /></ThemeProvider>);
     expect(meta.content).toBe('#0f1115');
+    expect(manifest.getAttribute('href')).toBe('/manifest.webmanifest');
     act(() => getByRole('button', { name: 'toggle' }).click());
     expect(meta.content).toBe('#f8fafc');
+    expect(manifest.getAttribute('href')).toBe('/manifest-light.webmanifest');
 
     unmount();
     meta.remove();
+    manifest.remove();
     localStorage.removeItem('phoenix-theme');
   });
 

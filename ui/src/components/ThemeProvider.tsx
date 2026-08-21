@@ -13,6 +13,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     document.documentElement.setAttribute('data-theme', theme);
     document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
       ?.setAttribute('content', theme === 'light' ? '#f8fafc' : '#0f1115');
+    document.querySelector<HTMLLinkElement>('link[rel="manifest"]')
+      ?.setAttribute('href', theme === 'light' ? '/manifest-light.webmanifest' : '/manifest.webmanifest');
     localStorage.setItem(THEME_STORAGE_KEY, theme);
   }, [theme]);
 
