@@ -186,6 +186,10 @@ body.app-viewport-active #root {
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
 
+  .desktop-main {
+    --new-conv-bottom-inset: env(safe-area-inset-bottom, 0);
+  }
+
   .list-page #main-area {
     padding-top: env(safe-area-inset-top, 0);
     padding-bottom: env(safe-area-inset-bottom, 0);
@@ -200,18 +204,22 @@ body.app-viewport-active #root {
   }
 
   .file-browser-overlay,
-  .viewer-shell--overlay {
+  .viewer-shell--overlay,
+  .task-approval-reader {
     padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
       env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
   }
 
   .terminal-page {
-    height: 100%;
     padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
       env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
   }
 
-  #state-bar {
+  .desktop-main .terminal-page {
+    height: 100%;
+  }
+
+  #app #state-bar {
     height: calc(var(--state-bar-height) + env(safe-area-inset-bottom, 0));
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
@@ -5547,7 +5555,7 @@ html * {
   padding: 16px 20px;
 }
 
-@media (display-mode: standalone) {
+@media (display-mode: standalone) and (width <= 1024px) {
   .new-conv-header-minimal {
     padding-top: calc(16px + env(safe-area-inset-top, 0));
   }
@@ -7733,6 +7741,7 @@ html * {
 
 .desktop-main .new-conv-page {
   height: 100%;
+  padding-bottom: var(--new-conv-bottom-inset, 0);
 }
 
 

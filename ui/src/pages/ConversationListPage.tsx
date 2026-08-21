@@ -156,14 +156,20 @@ export function ConversationListPage() {
     }
   }, [conversations.length, loading]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const scrollOwner = mainRef.current;
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') saveScrollPosition();
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      saveScrollPosition();
+      if (!scrollOwner) return;
+      try {
+        localStorage.setItem(MOBILE_LIST_SCROLL_KEY, String(scrollOwner.scrollTop));
+      } catch {
+        // Storage can be unavailable in private browsing.
+      }
     };
   }, [saveScrollPosition]);
 
