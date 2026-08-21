@@ -18976,7 +18976,12 @@ mod tests {
                 .await
         });
 
-        latch.parent_read.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            latch.parent_read.notified(),
+        )
+        .await
+        .expect("child creation must reach its parent snapshot");
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db.path))
             .unwrap()
             .journal_mode(SqliteJournalMode::Wal)
