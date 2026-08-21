@@ -45,7 +45,7 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
-  const mainRef = useRef<HTMLElement>(null);
+  const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
   const visibleConversationCount = showArchived ? archivedConversations.length : conversations.length;
@@ -141,8 +141,7 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
-  const saveScrollPositionForKey = useCallback((scrollKey: string) => {
-    const scrollOwner = mainRef.current;
+  const saveScrollPositionForKey = useCallback((scrollKey: string, scrollOwner = mainRef.current) => {
     if (!scrollOwner) return;
     try {
       localStorage.setItem(scrollKey, String(scrollOwner.scrollTop));
@@ -155,8 +154,11 @@ export function ConversationListPage() {
     saveScrollPositionForKey(currentScrollKey);
   }, [currentScrollKey, saveScrollPositionForKey]);
 
-  useLayoutEffect(() => () => {
-    saveScrollPositionForKey(currentScrollKeyRef.current);
+  const setMainScrollOwner = useCallback((node: HTMLElement | null) => {
+    if (mainRef.current && !node) {
+      saveScrollPositionForKey(currentScrollKeyRef.current, mainRef.current);
+    }
+    mainRef.current = node;
   }, [saveScrollPositionForKey]);
 
   useLayoutEffect(() => {
@@ -391,7 +393,7 @@ export function ConversationListPage() {
           {pendingOpsCount > 0 && ` · ${pendingOpsCount} pending`}
         </div>
       )}
-      <main id="main-area" ref={mainRef} data-app-scroll-owner>
+      <main id="main-area" ref={setMainScrollOwner} data-app-scroll-owner>
         {loading ? (
           <section id="conversation-list" className="view active">
             <div className="view-header">
