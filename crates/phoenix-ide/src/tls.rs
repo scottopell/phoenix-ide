@@ -197,7 +197,7 @@ pub(crate) async fn wait_for_fatal_local_authority(
     }
 }
 
-async fn drain_concurrently<OwnerDrain, ConnectionDrain>(
+pub(crate) async fn drain_concurrently<OwnerDrain, ConnectionDrain>(
     owner_drain: OwnerDrain,
     connection_drain: ConnectionDrain,
 ) where

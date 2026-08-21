@@ -171,6 +171,7 @@ pub use phoenix_core::task_handoff::TaskApprovalHandoffData;
 #[derive(Debug, Clone)]
 pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
+    pub state_updated_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -472,6 +473,8 @@ pub struct RuntimeManager {
     runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_result_fixed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1907,6 +1910,8 @@ impl RuntimeManager {
             runtime_authority_transfer_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_authority_sealed_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            runtime_result_fixed_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -2021,7 +2026,9 @@ impl RuntimeManager {
             .collect();
         for handle in handles {
             handle.broadcast_tx.close_publication();
-            let _ = handle.event_tx.send(Event::Shutdown).await;
+            if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
+                tracing::debug!(?error, "fatal shutdown event delivery skipped");
+            }
         }
     }
 
@@ -3088,6 +3095,7 @@ impl RuntimeManager {
             .await?;
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
+            state_updated_at: successor.state_updated_at,
         })
     }
 
@@ -3650,6 +3658,7 @@ impl RuntimeManager {
                 tokio::spawn(async move {
                     let worker_manager = Arc::clone(&manager);
                     let worker_conversation_id = conversation_id.clone();
+                    let worker_slot = Arc::clone(&slot);
                     let worker = tokio::spawn(async move {
                         let span = tracing::info_span!(
                             target: "phoenix_ide::otel",
@@ -3661,7 +3670,7 @@ impl RuntimeManager {
                         let started = std::time::Instant::now();
                         let result = Box::pin(
                             worker_manager
-                                .materialize_runtime(&worker_conversation_id, Arc::clone(&slot)),
+                                .materialize_runtime(&worker_conversation_id, worker_slot),
                         )
                         .instrument(span.clone())
                         .await;
@@ -3692,6 +3701,13 @@ impl RuntimeManager {
                         }
                     }
 
+                    slot.seal_authority_transfers();
+                    #[cfg(test)]
+                    if let Some(barrier) = manager.runtime_result_fixed_barrier.lock().await.take()
+                    {
+                        barrier.wait().await;
+                        barrier.wait().await;
+                    }
                     let removed_slot = {
                         let mut creations = manager.runtime_creations.lock().await;
                         let slot = creations.get(&conversation_id).expect(
@@ -7217,7 +7233,8 @@ mod scope_liveness_tests {
 
         let response = handoff.await.unwrap().unwrap();
         assert_eq!(response.successor_conv_id, successor_id);
-        assert!(manager.db().get_conversation(&successor_id).await.is_ok());
+        let successor = manager.db().get_conversation(&successor_id).await.unwrap();
+        assert_eq!(response.state_updated_at, successor.state_updated_at);
     }
 
     #[tokio::test]
@@ -7588,6 +7605,30 @@ mod scope_liveness_tests {
                 .unwrap(),
             Err("runtime stopped before event settled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
+        let manager = test_manager().await;
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        event_tx.send(Event::DismissError).await.unwrap();
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            "full-fatal-channel".to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+
+        manager.fence_fatal_local_authority().await;
+
+        assert!(manager.fatal_local_authority_fence.is_closed());
     }
 
     #[tokio::test]
@@ -8693,6 +8734,37 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn authority_arriving_after_worker_result_retries_failed_slot() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "fixed-result-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let inherited_owner = mgr.acquire_local_authority_pass().unwrap();
+        mgr.signal_fatal_local_authority("test_fixed_result_materialization");
+        let result_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_result_fixed_barrier.lock().await = Some(Arc::clone(&result_barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create_inner(conversation_id, None).await })
+        };
+        result_barrier.wait().await;
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, inherited_owner)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        result_barrier.wait().await;
+
+        assert!(ordinary.await.unwrap().is_err());
+        inherited.await.unwrap().unwrap();
     }
 
     #[tokio::test]

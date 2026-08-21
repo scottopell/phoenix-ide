@@ -1994,6 +1994,7 @@ where
     proposed_direct_turn_state: Option<ProposedDirectTurnState>,
     fatal_local_authority_fence: Option<Arc<crate::runtime::FatalLocalAuthorityFence>>,
     handoff_completion_authority: Option<crate::runtime::FatalLocalAuthorityOwner>,
+    handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2136,6 +2137,7 @@ where
             proposed_direct_turn_state: None,
             fatal_local_authority_fence: None,
             handoff_completion_authority: None,
+            handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2956,6 +2958,7 @@ where
             let generated = self.apply_transition_result(chained_result).await?;
             if settles_handoff {
                 self.handoff_completion_authority = None;
+                self.handoff_completion_timestamp = None;
             }
             events_to_process.extend(generated);
         }
@@ -3208,6 +3211,7 @@ where
             let generated = self.apply_transition_result(result).await?;
             if settles_handoff {
                 self.handoff_completion_authority = None;
+                self.handoff_completion_timestamp = None;
             }
             events_to_process.extend(generated);
         }
@@ -3345,7 +3349,7 @@ where
                 }
             );
             let next_state_updated_at = if state_changed && !retry_has_durable_fact {
-                Utc::now()
+                self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
             } else {
                 self.state_updated_at
             };
@@ -8408,6 +8412,7 @@ where
         let response = response_rx
             .await
             .map_err(|e| format!("fresh task handoff response dropped: {e}"))??;
+        self.handoff_completion_timestamp = Some(response.state_updated_at);
         Ok(Some(Event::TaskHandoffComplete {
             successor_conv_id: response.successor_conv_id,
         }))
@@ -12298,6 +12303,8 @@ mod authoritative_user_message_effect_tests {
         let owner = fence.try_acquire().unwrap();
         rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
         rt.handoff_completion_authority = Some(owner);
+        let persisted_timestamp = Utc::now() - chrono::Duration::seconds(5);
+        rt.handoff_completion_timestamp = Some(persisted_timestamp);
         fence.close("test_handoff_completion");
         assert_eq!(fence.owners_at_first_close(), Some(1));
 
@@ -12312,6 +12319,7 @@ mod authoritative_user_message_effect_tests {
             ConvState::HandedOff { successor_conv_id }
                 if successor_conv_id == "successor-conv"
         ));
+        assert_eq!(rt.state_updated_at, persisted_timestamp);
         assert!(rt.handoff_completion_authority.is_none());
     }
 
