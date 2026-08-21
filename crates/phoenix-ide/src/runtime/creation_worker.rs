@@ -234,7 +234,11 @@ async fn process_job(
 
     match provision_conversation(manager, &mut job).await {
         Ok(ProvisionOutcome::SeededEmpty | ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
-        Err((message, kind)) => {
+        Err(CreationProvisionError::FatalAuthorityDeferred) => {
+            tracing::info!(job_id = %job.id, "leaving admitted creation job recoverable after fatal authority closure");
+            Ok(())
+        }
+        Err(CreationProvisionError::Failed(message, kind)) => {
             if creation_error_is_retryable(&kind) && job.protocol.attempt < 4 {
                 let delay_ms = crate::state_machine::creation_protocol::creation_retry_delay_ms(
                     job.protocol.attempt,
@@ -303,6 +307,17 @@ fn creation_state_allows_existing_message_completion(state: &ConvState) -> bool 
     )
 }
 
+enum CreationProvisionError {
+    Failed(String, ErrorKind),
+    FatalAuthorityDeferred,
+}
+
+impl From<(String, ErrorKind)> for CreationProvisionError {
+    fn from(error: (String, ErrorKind)) -> Self {
+        Self::Failed(error.0, error.1)
+    }
+}
+
 enum ProvisionOutcome {
     SeededEmpty,
     InitialMessageSubmitted,
@@ -312,13 +327,14 @@ enum ProvisionOutcome {
 async fn provision_conversation(
     manager: &Arc<RuntimeManager>,
     job: &mut crate::db::ConversationCreationJob,
-) -> Result<ProvisionOutcome, (String, ErrorKind)> {
+) -> Result<ProvisionOutcome, CreationProvisionError> {
     let intent = job.intent.clone();
     let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
         return Err((
             "creation provisioning lacks claim authority".to_string(),
             ErrorKind::ServerError,
-        ));
+        )
+            .into());
     };
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&intent.cwd)
         .map_err(|e| (e.to_string(), ErrorKind::InvalidRequest))?;
@@ -568,7 +584,8 @@ async fn provision_conversation(
             return Err((
                 format!("Invalid mode '{other}'. Expected one of: direct, managed, branch, auto"),
                 ErrorKind::InvalidRequest,
-            ));
+            )
+                .into());
         }
     }
 
@@ -693,7 +710,8 @@ async fn provision_conversation(
             return Err((
                 format!("Effort '{effort}' is not supported by resolved model '{resolved_model}'"),
                 ErrorKind::InvalidRequest,
-            ));
+            )
+                .into());
         }
     }
 
@@ -722,7 +740,8 @@ async fn provision_conversation(
             return Err((
                 "creation claim was lost before metadata commit".to_string(),
                 ErrorKind::Cancelled,
-            ));
+            )
+                .into());
         }
         job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
     }
@@ -783,7 +802,8 @@ async fn provision_conversation(
             return Err((
                 "creation claim was lost before seeded completion".to_string(),
                 ErrorKind::Cancelled,
-            ));
+            )
+                .into());
         }
         if let Some(broadcast_tx) = {
             let runtimes = manager.runtimes.read().await;
@@ -847,10 +867,11 @@ async fn provision_conversation(
         return Err((
             "creation claim was lost before runtime bootstrap settlement".to_string(),
             ErrorKind::Cancelled,
-        ));
+        )
+            .into());
     }
     let conversation_id = job.conversation_id.clone();
-    checkpoint_then_deliver_creation(
+    let delivery = checkpoint_then_deliver_creation(
         || {
             checkpoint_creation_stage(
                 manager,
@@ -861,7 +882,8 @@ async fn provision_conversation(
         },
         || manager.send_event(&conversation_id, event),
     )
-    .await?;
+    .await;
+    classify_creation_delivery(delivery, manager.local_authority_is_closed())?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
 }
 
@@ -938,6 +960,17 @@ where
             ErrorKind::ServerError,
         )
     })
+}
+
+fn classify_creation_delivery(
+    delivery: Result<(), (String, ErrorKind)>,
+    fatal_authority_closed: bool,
+) -> Result<(), CreationProvisionError> {
+    match delivery {
+        Ok(()) => Ok(()),
+        Err(_) if fatal_authority_closed => Err(CreationProvisionError::FatalAuthorityDeferred),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn checkpoint_creation_stage(
@@ -1293,6 +1326,33 @@ mod runtime_bootstrap_settlement_tests {
         release_checkpoint_tx.send(()).unwrap();
         settlement.await.unwrap();
         delivery_started_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_closure_between_finalize_and_delivery_defers_creation_job() {
+        let fatal_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close_after_checkpoint = Arc::clone(&fatal_closed);
+        let observe_closed_delivery = Arc::clone(&fatal_closed);
+
+        let delivery = checkpoint_then_deliver_creation(
+            || async move {
+                close_after_checkpoint.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+            || async move {
+                assert!(observe_closed_delivery.load(std::sync::atomic::Ordering::Acquire));
+                Err("runtime admission closed after fatal local authority loss".to_string())
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            classify_creation_delivery(
+                delivery,
+                fatal_closed.load(std::sync::atomic::Ordering::Acquire)
+            ),
+            Err(CreationProvisionError::FatalAuthorityDeferred)
+        ));
     }
 }
 

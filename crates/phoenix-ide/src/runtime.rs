@@ -2693,6 +2693,10 @@ impl RuntimeManager {
         Ok(reconciled)
     }
 
+    pub(crate) fn local_authority_is_closed(&self) -> bool {
+        self.fatal_local_authority_fence.is_closed()
+    }
+
     pub(crate) async fn run_local_authority_pass<T>(
         &self,
         pass: impl std::future::Future<Output = T>,
