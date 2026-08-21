@@ -9279,7 +9279,6 @@ impl Database {
                 | ConvState::RecoverableContinuationFailure { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
-                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
                 | ConvState::Terminal => None,
