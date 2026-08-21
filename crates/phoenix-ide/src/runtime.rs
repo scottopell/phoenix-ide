@@ -159,10 +159,10 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
-#[derive(Debug)]
 pub struct TaskApprovalHandoffRequest {
     pub parent_conversation_id: String,
     pub approval: TaskApprovalHandoffData,
+    pub authority: FatalLocalAuthorityOwner,
     pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
 }
 
@@ -340,6 +340,18 @@ impl FatalLocalAuthorityOwner {
     pub(crate) fn close(&self, boundary: &'static str) {
         self.fence.close(boundary);
     }
+
+    pub(crate) fn child(&self) -> Self {
+        let mut state = self
+            .fence
+            .state
+            .lock()
+            .expect("fatal authority fence poisoned");
+        state.owners += 1;
+        Self {
+            fence: Arc::clone(&self.fence),
+        }
+    }
 }
 
 impl Drop for FatalLocalAuthorityOwner {
@@ -399,6 +411,14 @@ pub struct RuntimeManager {
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    bash_reconciliation_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    handoff_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1822,6 +1842,14 @@ impl RuntimeManager {
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             hard_delete_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            terminal_cleanup_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            bash_reconciliation_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            fork_runtime_start_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            handoff_runtime_start_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -2298,6 +2326,15 @@ impl RuntimeManager {
         self: &Arc<Self>,
         request: WorkScopeReconciliationRequest,
     ) {
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(work_scope = %request.work_scope, "skipping bash terminal reconciliation after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.bash_reconciliation_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         if let Err(error) = self
             .reconcile_work_scope_after_bash_terminal_inner(&request)
             .await
@@ -2984,7 +3021,14 @@ impl RuntimeManager {
             .create_task_approval_handoff_conversation(&req.parent_conversation_id, &req.approval)
             .await
             .map_err(|e| e.to_string())?;
-        let _ = self.get_or_create(&successor.id).await?;
+        #[cfg(test)]
+        if let Some(barrier) = self.handoff_runtime_start_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let _ = self
+            .get_or_create_with_authority(&successor.id, req.authority.child())
+            .await?;
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
         })
@@ -2999,6 +3043,15 @@ impl RuntimeManager {
             || conv.runtime_role != crate::work_scope::RuntimeRole::SubAgent
         {
             return;
+        }
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(conv_id = %conv.id, "skipping terminal sub-agent cleanup after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.terminal_cleanup_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
         }
         if let Err(error) =
             crate::api::handlers::run_runtime_resource_cleanup_cascade(self, conv).await
@@ -3476,6 +3529,22 @@ impl RuntimeManager {
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
         self.require_local_authority_admission()?;
+        self.get_or_create_inner(conversation_id, None).await
+    }
+
+    async fn get_or_create_with_authority(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        owner: FatalLocalAuthorityOwner,
+    ) -> Result<ConversationHandle, String> {
+        self.get_or_create_inner(conversation_id, Some(owner)).await
+    }
+
+    async fn get_or_create_inner(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        inherited_authority: Option<FatalLocalAuthorityOwner>,
+    ) -> Result<ConversationHandle, String> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
         }
@@ -3506,10 +3575,12 @@ impl RuntimeManager {
                         "otel.status_code" = tracing::field::Empty,
                     );
                     let started = std::time::Instant::now();
-                    let result =
-                        Box::pin(worker_manager.materialize_runtime(&worker_conversation_id))
-                            .instrument(span.clone())
-                            .await;
+                    let result = Box::pin(
+                        worker_manager
+                            .materialize_runtime(&worker_conversation_id, inherited_authority),
+                    )
+                    .instrument(span.clone())
+                    .await;
                     span.record(
                         "runtime.materialization_ms",
                         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -4010,8 +4081,8 @@ impl RuntimeManager {
     async fn materialize_runtime(
         self: &Arc<Self>,
         conversation_id: &str,
+        inherited_authority: Option<FatalLocalAuthorityOwner>,
     ) -> Result<ConversationHandle, String> {
-        self.require_local_authority_admission()?;
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
         }
@@ -4042,9 +4113,12 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let recovery_owner = self.acquire_local_authority_pass().map_err(|()| {
-            "runtime admission closed after fatal local authority loss".to_string()
-        })?;
+        let recovery_owner = match inherited_authority.as_ref() {
+            Some(owner) => owner.child(),
+            None => self.acquire_local_authority_pass().map_err(|()| {
+                "runtime admission closed after fatal local authority loss".to_string()
+            })?,
+        };
         let mut conv = self
             .db
             .get_conversation(conversation_id)
@@ -4073,6 +4147,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+
         drop(recovery_owner);
 
         let cleanup_conversation = conv.clone();
@@ -4537,14 +4612,14 @@ impl RuntimeManager {
         {
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
-            let _admission = self
-                .fatal_local_authority_fence
-                .try_acquire()
-                .map_err(|()| {
+            let _publication_owner = match inherited_authority.as_ref() {
+                Some(owner) => owner.child(),
+                None => self.acquire_local_authority_pass().map_err(|()| {
                     broadcaster.close_publication();
                     reservations.remove(conversation_id);
                     "runtime admission closed after fatal local authority loss".to_string()
-                })?;
+                })?,
+            };
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
                 reservations.remove(conversation_id);
@@ -6998,6 +7073,56 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn admitted_task_handoff_startup_survives_closure_after_commit() {
+        let manager = Arc::new(test_manager().await);
+        create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
+        let authority = manager.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.handoff_runtime_start_barrier.lock().await = Some(Arc::clone(&barrier));
+        let (response_tx, _response_rx) = oneshot::channel();
+        let request = TaskApprovalHandoffRequest {
+            parent_conversation_id: "handoff-parent".to_string(),
+            approval: TaskApprovalHandoffData {
+                task_id: "12345".to_string(),
+                task_title: "Inherited handoff".to_string(),
+                branch_name: "task-12345-inherited-handoff".to_string(),
+                worktree_path: "/tmp".to_string(),
+                base_branch: "main".to_string(),
+                title: "Inherited handoff".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: "Do the work".to_string(),
+                task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
+            },
+            authority,
+            response_tx,
+        };
+        let handoff = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.create_and_start_task_handoff(&request).await })
+        };
+
+        barrier.wait().await;
+        let parent = manager
+            .db()
+            .get_conversation("handoff-parent")
+            .await
+            .unwrap();
+        let successor_id = parent
+            .continued_in_conv_id
+            .expect("handoff commit links successor");
+        manager.signal_fatal_local_authority("test_handoff_startup");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        let response = handoff.await.unwrap().unwrap();
+        assert_eq!(response.successor_conv_id, successor_id);
+        assert!(manager.db().get_conversation(&successor_id).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn terminal_subagent_cleanup_is_gated_by_typed_exit_disposition() {
         let manager = test_manager().await;
         let parent = manager
@@ -7040,6 +7165,149 @@ mod scope_liveness_tests {
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_cleanup_is_rejected_after_fatal_closure() {
+        let manager = test_manager().await;
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "closed-cleanup-child",
+                "closed-cleanup-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+        let _ = manager.bash_handles().get_or_create(&scope).await;
+        manager.signal_fatal_local_authority("test_terminal_cleanup");
+
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+            .await;
+
+        assert!(manager.bash_handles().reserve_spawn(&scope).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admitted_terminal_cleanup_remains_owned_until_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "admitted-cleanup-child",
+                "admitted-cleanup-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+        let _ = manager.bash_handles().get_or_create(&scope).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.terminal_cleanup_barrier.lock().await = Some(Arc::clone(&barrier));
+        let cleanup = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_terminal_cleanup");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        cleanup.await.unwrap();
+        assert!(matches!(
+            manager.bash_handles().reserve_spawn(&scope).await,
+            Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bash_reconciliation_is_rejected_after_fatal_closure() {
+        let manager = Arc::new(test_manager().await);
+        manager.signal_fatal_local_authority("test_bash_reconciliation");
+
+        manager
+            .reconcile_work_scope_after_bash_terminal(WorkScopeReconciliationRequest {
+                work_scope: ResourceScopeKey::Work(
+                    phoenix_core::work_scope::WorkScopeId::parse("closed-scope").unwrap(),
+                ),
+                terminal_generation: 0,
+            })
+            .await;
+
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_bash_reconciliation_remains_owned_until_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.bash_reconciliation_barrier.lock().await = Some(Arc::clone(&barrier));
+        let reconciliation = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .reconcile_work_scope_after_bash_terminal(WorkScopeReconciliationRequest {
+                        work_scope: ResourceScopeKey::Work(
+                            phoenix_core::work_scope::WorkScopeId::parse("admitted-scope").unwrap(),
+                        ),
+                        terminal_generation: 0,
+                    })
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_bash_reconciliation");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        reconciliation.await.unwrap();
     }
 
     #[tokio::test]
@@ -8322,6 +8590,43 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn inherited_runtime_materialization_survives_fatal_closure() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "inherited-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let authority = mgr.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, authority)
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        mgr.signal_fatal_local_authority("test_inherited_materialization");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        materialization
+            .await
+            .expect("materialization joins")
+            .expect("inherited materialization succeeds");
+        assert!(mgr.try_get_handle(conversation_id).await.is_some());
     }
 
     #[tokio::test]

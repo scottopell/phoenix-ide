@@ -6258,7 +6258,11 @@ where
                 priority,
                 plan,
             } => {
-                self.execute_approve_task_fresh_handoff(task_file, title, priority, plan)
+                let authority = effect_owner
+                    .as_ref()
+                    .expect("fresh handoff effect owns durable authority")
+                    .child();
+                self.execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
                     .await
             }
 
@@ -8277,6 +8281,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        authority: crate::runtime::FatalLocalAuthorityOwner,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
@@ -8354,6 +8359,7 @@ where
                 plan: plan_backup,
                 task_file: approval_result.task_file,
             },
+            authority,
             response_tx,
         };
         handoff_tx

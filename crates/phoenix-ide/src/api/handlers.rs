@@ -5588,7 +5588,7 @@ async fn delete_conversation(
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+    let owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
     #[cfg(test)]
@@ -5678,7 +5678,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    cleanup_pending_fork_orphans_on_delete(state, &conv).await?;
+    cleanup_pending_fork_orphans_on_delete(state, &conv, owner.child()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; a
@@ -6011,10 +6011,11 @@ async fn cascade_projects_on_delete(
 async fn cleanup_pending_fork_orphans_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
+    authority: crate::runtime::FatalLocalAuthorityOwner,
 ) -> Result<(), AppError> {
     state
         .runtime
-        .cleanup_pending_fork_orphans_on_delete(&conv.id)
+        .cleanup_pending_fork_orphans_on_delete(&conv.id, authority)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))
 }
