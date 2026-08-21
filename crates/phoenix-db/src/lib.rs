@@ -9016,20 +9016,13 @@ impl Database {
             )));
         }
         sqlx::query(
-            "INSERT INTO startup_parent_actions
+            "INSERT OR REPLACE INTO startup_parent_actions
                  (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
              SELECT c.id, ?2, c.transcript_generation, t.turn_id, t.generation, ?3
              FROM conversations AS c
              LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                  AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
-             WHERE c.id = ?1
-             ON CONFLICT(conversation_id) DO UPDATE SET
-                 action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
-                 action = excluded.action,
-                 transcript_generation = excluded.transcript_generation,
-                 turn_id = excluded.turn_id,
-                 turn_generation = excluded.turn_generation,
-                 created_at = excluded.created_at",
+             WHERE c.id = ?1",
         )
         .bind(conversation_id)
         .bind(match action {
@@ -9313,21 +9306,24 @@ impl Database {
                         && matches!(conversation.state, ConvState::LlmRequesting { .. })
                     {
                         sqlx::query(
-                            "UPDATE startup_parent_actions SET
-                                 action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
-                                 action = 'Resume',
-                                 transcript_generation = ?2, created_at = ?3
-                             WHERE conversation_id = ?1 AND action = 'Reconcile'
+                            "INSERT OR REPLACE INTO startup_parent_actions
+                                 (conversation_id, action, transcript_generation,
+                                  turn_id, turn_generation, created_at)
+                             SELECT c.id, 'Resume', c.transcript_generation,
+                                    a.turn_id, a.turn_generation, ?3
+                             FROM conversations AS c
+                             JOIN startup_parent_actions AS a ON a.conversation_id = c.id
+                             WHERE c.id = ?1 AND a.action = 'Reconcile'
                                AND (
-                                   (turn_id IS NULL AND NOT EXISTS (
+                                   (a.turn_id IS NULL AND NOT EXISTS (
                                        SELECT 1 FROM durable_turns
                                        WHERE conversation_id = ?1 AND owns_conversation = 1
                                          AND terminal_kind IS NULL
                                    ))
                                    OR EXISTS (
                                        SELECT 1 FROM durable_turns
-                                       WHERE turn_id = startup_parent_actions.turn_id
-                                         AND generation = startup_parent_actions.turn_generation
+                                       WHERE turn_id = a.turn_id
+                                         AND generation = a.turn_generation
                                          AND owns_conversation = 1 AND terminal_kind IS NULL
                                    )
                                )",
@@ -9364,20 +9360,13 @@ impl Database {
             .await?;
             if updated.rows_affected() == 1 {
                 sqlx::query(
-                    "INSERT INTO startup_parent_actions
+                    "INSERT OR REPLACE INTO startup_parent_actions
                          (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
                      SELECT c.id, 'Resume', c.transcript_generation, t.turn_id, t.generation, ?2
                      FROM conversations AS c
                      LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                          AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
-                     WHERE c.id = ?1
-                     ON CONFLICT(conversation_id) DO UPDATE SET
-                         action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
-                         action = 'Resume',
-                         transcript_generation = excluded.transcript_generation,
-                         turn_id = excluded.turn_id,
-                         turn_generation = excluded.turn_generation,
-                         created_at = excluded.created_at",
+                     WHERE c.id = ?1",
                 )
                 .bind(conversation_id)
                 .bind(now.to_rfc3339())
@@ -18053,6 +18042,50 @@ mod tests {
         assert_eq!(actions[0].conversation_id, parent_id);
         assert_eq!(actions[0].action, StartupParentAction::Resume);
         assert_eq!(db.get_messages(parent_id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn startup_action_replacement_never_reuses_a_consumed_high_id() {
+        let db = Database::open_in_memory().await.unwrap();
+        for conversation_id in ["action-low", "action-high"] {
+            db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+                .await
+                .unwrap();
+            db.establish_parent_reconcile_action(conversation_id)
+                .await
+                .unwrap();
+        }
+        let actions = db.list_startup_parent_actions().await.unwrap();
+        let low_id = actions
+            .iter()
+            .find(|action| action.conversation_id == "action-low")
+            .unwrap()
+            .action_id;
+        let consumed_high_id = actions
+            .iter()
+            .find(|action| action.conversation_id == "action-high")
+            .unwrap()
+            .action_id;
+        assert!(consumed_high_id > low_id);
+        db.delete_startup_parent_action("action-high", consumed_high_id)
+            .await
+            .unwrap();
+
+        db.persist_startup_sub_agent_fan_in(
+            "action-low",
+            &[],
+            None,
+            &ConvState::Idle,
+            &ConvState::LlmRequesting { attempt: 1 },
+            StartupParentAction::Resume,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let replacement = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert!(replacement[0].action_id > consumed_high_id);
     }
 
     #[tokio::test]

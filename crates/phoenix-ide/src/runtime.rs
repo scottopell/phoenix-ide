@@ -3325,7 +3325,19 @@ impl RuntimeManager {
                 .remove(&reconciliation.conversation_id);
         }
         if startup {
-            crate::reconcile_worktrees(&self.db).await;
+            for conversation in crate::reconcile_worktrees_with_terminalized(&self.db).await {
+                executor::complete_terminal_lifecycle_without_broadcast(
+                    &conversation.id,
+                    conversation.parent_conversation_id.is_some(),
+                    &conversation.state,
+                    conversation
+                        .conv_mode
+                        .worktree_path()
+                        .map(std::path::Path::new),
+                    Some(&self.fork_cmd_tx),
+                )
+                .await;
+            }
         }
         let actions = self
             .db
@@ -6004,6 +6016,59 @@ mod scope_liveness_tests {
             Arc::new(McpClientManager::new()),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn second_startup_worktree_scan_retires_top_level_fork_proposals() {
+        use crate::db::{ForkProposal, ForkProposalStatus};
+
+        let mgr = Arc::new(test_manager().await);
+        mgr.start_sub_agent_handler().await;
+        let root = tempfile::tempdir().unwrap();
+        let worktree_path = root.path().join("missing-worktree");
+        let conversation_id = "missing-top-level-worktree";
+        create_handleless_work_conv(&mgr, conversation_id, worktree_path.to_str().unwrap(), None)
+            .await;
+        let proposal = ForkProposal {
+            id: "missing-worktree-proposal".to_string(),
+            origin_conversation_id: conversation_id.to_string(),
+            task_file: "tasks/12345-p1-ready--missing.md".to_string(),
+            title: "Missing".to_string(),
+            priority: "p1".to_string(),
+            body: "# Missing".to_string(),
+            status: ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+        };
+        mgr.db().insert_fork_proposal(&proposal).await.unwrap();
+        assert!(mgr
+            .db()
+            .list_startup_parent_actions()
+            .await
+            .unwrap()
+            .is_empty());
+
+        mgr.reconcile_startup_obligated_parents(true).await.unwrap();
+
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Terminal
+        ));
+        assert_eq!(
+            mgr.db()
+                .get_fork_proposal(&proposal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Dismissed
+        );
     }
 
     fn stale_creation_event() -> Event {

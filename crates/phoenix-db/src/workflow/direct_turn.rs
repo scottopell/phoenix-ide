@@ -1881,7 +1881,7 @@ impl WorkflowRepository {
         .await?
         {
             sqlx::query(
-                "INSERT INTO startup_parent_actions
+                "INSERT OR REPLACE INTO startup_parent_actions
                      (conversation_id, action, transcript_generation,
                       turn_id, turn_generation, created_at)
                  SELECT c.id, 'Reconcile', c.transcript_generation,
@@ -1889,12 +1889,7 @@ impl WorkflowRepository {
                  FROM conversations AS c
                  LEFT JOIN durable_turns AS t ON t.conversation_id = c.id
                      AND t.owns_conversation = 1 AND t.terminal_kind IS NULL
-                 WHERE c.id = ?1
-                 ON CONFLICT(conversation_id) DO UPDATE SET
-                     action_id = (SELECT COALESCE(MAX(action_id), 0) + 1 FROM startup_parent_actions),
-                     action = 'Reconcile',
-                     transcript_generation = excluded.transcript_generation,
-                     created_at = excluded.created_at",
+                 WHERE c.id = ?1",
             )
             .bind(parent_id)
             .bind(Utc::now().to_rfc3339())

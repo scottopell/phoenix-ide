@@ -70,7 +70,7 @@ use phoenix_tools as tools;
 use phoenix_db as db;
 
 use api::{create_router, AppState};
-use db::Database;
+use db::{Conversation, Database};
 use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
@@ -715,7 +715,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile worktrees after excluding conversations whose exact terminal
     // projection is still owned by startup obligation settlement.
-    reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
+    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
 
     // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
     // rows whose main_ref was defaulted to a literal `main` are corrected before
@@ -1099,19 +1099,25 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// `continued_in_conv_id` is set. Their worktree is intentionally preserved
 /// pending a user action (Continue / Abandon / `MarkAsMerged`) or already
 /// transferred to a continuation — not a genuine orphan.
+#[cfg(test)]
 pub(crate) async fn reconcile_worktrees(db: &Database) {
-    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+}
+
+pub(crate) async fn reconcile_worktrees_with_terminalized(db: &Database) -> Vec<Conversation> {
+    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await
 }
 
 async fn reconcile_worktrees_excluding(
     db: &Database,
     excluded_conversations: &std::collections::HashSet<String>,
-) {
+) -> Vec<Conversation> {
+    let mut terminalized = Vec::new();
     let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to query worktree conversations for reconciliation");
-            return;
+            return terminalized;
         }
     };
 
@@ -1160,6 +1166,9 @@ async fn reconcile_worktrees_excluding(
             continue;
         }
         terminated += 1;
+        let mut terminal = conv.clone();
+        terminal.state = db::ConvState::Terminal;
+        terminalized.push(terminal);
 
         // wt_path is always {root}/.phoenix/worktrees/{id} for a real Phoenix
         // worktree. If the strict predicate fails the row is malformed; skip
@@ -1193,6 +1202,7 @@ async fn reconcile_worktrees_excluding(
     }
 
     reclaim_unowned_worktrees(db).await;
+    terminalized
 }
 
 fn submodules_have_ignored_evidence(worktree_path: &std::path::Path) -> Result<bool, String> {
