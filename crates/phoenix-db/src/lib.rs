@@ -1299,6 +1299,25 @@ enum TerminalEvidenceTransactionCut {
     AfterCommit,
 }
 
+fn parent_scope_and_effort(
+    row: Option<SqliteRow>,
+) -> DbResult<(Option<WorkScopeId>, Option<ModelEffort>)> {
+    let Some(row) = row else {
+        return Ok((None, None));
+    };
+    let scope = row
+        .try_get::<Option<String>, _>("work_scope_id")?
+        .map(WorkScopeId::parse)
+        .transpose()
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let effort = row
+        .try_get::<Option<String>, _>("effort")?
+        .map(|value| ModelEffort::from_str(&value))
+        .transpose()
+        .map_err(DbError::Serialization)?;
+    Ok((scope, effort))
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -3555,30 +3574,22 @@ impl Database {
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
-        let (inherited_scope, inherited_effort) = if let Some(parent_id) = parent_id {
-            let row = sqlx::query("SELECT work_scope_id, effort FROM conversations WHERE id = ?1")
-                .bind(parent_id)
-                .fetch_optional(&self.pool)
-                .await?;
-            match row {
-                Some(row) => {
-                    let scope = row
-                        .try_get::<Option<String>, _>("work_scope_id")?
-                        .map(WorkScopeId::parse)
-                        .transpose()
-                        .map_err(|error| DbError::Serialization(error.to_string()))?;
-                    let effort = row
-                        .try_get::<Option<String>, _>("effort")?
-                        .map(|value| ModelEffort::from_str(&value))
-                        .transpose()
-                        .map_err(|error| DbError::Serialization(error.clone()))?;
-                    (scope, effort)
+        let unchecked_parent_values =
+            if matches!(expected_parent_scope, ExpectedParentScope::NotChecked) {
+                if let Some(parent_id) = parent_id {
+                    let row = sqlx::query(
+                        "SELECT work_scope_id, effort FROM conversations WHERE id = ?1",
+                    )
+                    .bind(parent_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                    Some(parent_scope_and_effort(row)?)
+                } else {
+                    Some((None, None))
                 }
-                None => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                None
+            };
         let runtime_role = if parent_id.is_some() {
             RuntimeRole::SubAgent
         } else {
@@ -3590,8 +3601,40 @@ impl Database {
         let mut attempts = 0u8;
         let preserve_unattached_parent =
             matches!(expected_parent_scope, ExpectedParentScope::Snapshot(None));
-        let created_work_scope_id = loop {
+        let (created_work_scope_id, inherited_effort) = loop {
             let title_str = schema::title_from_slug(&actual_slug);
+            let mut tx = match &expected_parent_scope {
+                ExpectedParentScope::NotChecked => self.pool.begin().await?,
+                ExpectedParentScope::Snapshot(_) => self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            };
+            let (inherited_scope, inherited_effort) = match &expected_parent_scope {
+                ExpectedParentScope::NotChecked => unchecked_parent_values
+                    .clone()
+                    .expect("unchecked parent values are loaded before the transaction"),
+                ExpectedParentScope::Snapshot(expected_scope) => {
+                    let parent_id = parent_id.expect("scope snapshots require a parent");
+                    let row = sqlx::query(
+                        "SELECT work_scope_id, effort FROM conversations WHERE id = ?1",
+                    )
+                    .bind(parent_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let Some(row) = row else {
+                        tx.rollback().await?;
+                        return Err(DbError::CloseFoundationConflict(format!(
+                            "parent conversation {parent_id} no longer exists"
+                        )));
+                    };
+                    let values = parent_scope_and_effort(Some(row))?;
+                    if values.0.as_ref() != *expected_scope {
+                        tx.rollback().await?;
+                        return Err(DbError::CloseFoundationConflict(format!(
+                            "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
+                        )));
+                    }
+                    values
+                }
+            };
             let generated_scope =
                 (inherited_scope.is_none() && !preserve_unattached_parent).then(|| {
                     let (scope_id, authority_kind, environment) =
@@ -3603,27 +3646,6 @@ impl Database {
                     .as_ref()
                     .map(|(scope_id, _, _)| scope_id.clone())
             });
-            let mut tx = self.pool.begin().await?;
-            if let (Some(parent_id), ExpectedParentScope::Snapshot(expected_scope)) =
-                (parent_id, &expected_parent_scope)
-            {
-                let parent_matches: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM conversations
-                         WHERE id = ?1 AND work_scope_id IS ?2
-                     )",
-                )
-                .bind(parent_id)
-                .bind(expected_scope.map(WorkScopeId::as_str))
-                .fetch_one(&mut *tx)
-                .await?;
-                if !parent_matches {
-                    tx.rollback().await?;
-                    return Err(DbError::CloseFoundationConflict(format!(
-                        "parent conversation {parent_id} no longer owns captured WorkScope {expected_scope:?}"
-                    )));
-                }
-            }
             if let Some((scope_id, authority_kind, environment)) = generated_scope {
                 Self::insert_work_scope_tx(
                     &mut tx,
@@ -3667,7 +3689,7 @@ impl Database {
             match result {
                 Ok(_) => {
                     tx.commit().await?;
-                    break work_scope_id;
+                    break (work_scope_id, inherited_effort);
                 }
                 Err(sqlx::Error::Database(ref e))
                     if (is_sqlite_unique_constraint(e.as_ref())
@@ -18874,6 +18896,162 @@ mod tests {
 
         assert_eq!(child.attached_work_scope_id, None);
         assert_eq!(child.effort, Some(ModelEffort::High));
+    }
+
+    async fn open_file_backed_test_db(name: &str) -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn parallel_sub_agent_creation_serializes_scope_snapshot_and_insert() {
+        let (_dir, db) = open_file_backed_test_db("parallel-sub-agents.sqlite").await;
+        let parent = db
+            .create_conversation_with_project(
+                "parallel-parent",
+                "parallel-parent",
+                "/tmp",
+                true,
+                None,
+                Some("gpt-5.4"),
+                None,
+                &work_mode_fixture(),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        db.update_conversation_model_and_effort(
+            &parent.id,
+            "gpt-5.4",
+            Some(ModelEffort::High),
+            ServiceTier::Standard,
+        )
+        .await
+        .unwrap();
+        let expected_scope = parent.attached_work_scope_id.unwrap();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(10));
+        let mut children = tokio::task::JoinSet::new();
+
+        for index in 0..10 {
+            let db = db.clone();
+            let start = start.clone();
+            let expected_scope = expected_scope.clone();
+            children.spawn(async move {
+                start.wait().await;
+                db.create_subagent_conversation(
+                    &format!("parallel-child-{index}"),
+                    &format!("parallel-child-{index}"),
+                    "/tmp",
+                    "parallel-parent",
+                    "gpt-5.4",
+                    &ConvMode::Explore {
+                        worktree_path: None,
+                        next_taskmd_id_hint: None,
+                    },
+                    phoenix_core::llm_language::LlmLanguage::default(),
+                    Some(&expected_scope),
+                )
+                .await
+            });
+        }
+
+        let mut created = Vec::new();
+        while let Some(result) = children.join_next().await {
+            created.push(result.unwrap().unwrap());
+        }
+        assert_eq!(created.len(), 10);
+        assert!(created.iter().all(|child| {
+            child.attached_work_scope_id.as_ref() == Some(&expected_scope)
+                && child.effort == Some(ModelEffort::High)
+        }));
+        let persisted_children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE parent_conversation_id = 'parallel-parent'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(persisted_children, 10);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_creation_rejects_changed_parent_scope_without_partial_child() {
+        let (_dir, db) = open_file_backed_test_db("changed-parent-scope.sqlite").await;
+        let parent = db
+            .create_conversation_with_project(
+                "scope-parent",
+                "scope-parent",
+                "/tmp",
+                true,
+                None,
+                Some("gpt-5.4"),
+                None,
+                &work_mode_fixture(),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let captured_scope = parent.attached_work_scope_id.unwrap();
+        let replacement_parent = db
+            .create_conversation_with_project(
+                "replacement-scope-parent",
+                "replacement-scope-parent",
+                "/tmp/replacement",
+                true,
+                None,
+                Some("gpt-5.4"),
+                None,
+                &work_mode_fixture(),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'scope-parent'")
+            .bind(
+                replacement_parent
+                    .attached_work_scope_id
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let error = db
+            .create_subagent_conversation(
+                "rejected-child",
+                "rejected-child",
+                "/tmp",
+                "scope-parent",
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                Some(&captured_scope),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::CloseFoundationConflict(_)));
+        let child_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = 'rejected-child'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(child_count, 0);
     }
 
     #[tokio::test]
