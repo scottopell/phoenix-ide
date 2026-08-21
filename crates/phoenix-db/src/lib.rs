@@ -1203,6 +1203,23 @@ pub struct StartupParentReconciliation {
     pub conversation_id: String,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct SubAgentCreationTestLatch {
+    parent_read: tokio::sync::Notify,
+    competing_write_observed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SubAgentCreationTestLatch {
+    fn new() -> Self {
+        Self {
+            parent_read: tokio::sync::Notify::new(),
+            competing_write_observed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 pub struct Database {
     pool: SqlitePool,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
@@ -1210,6 +1227,8 @@ pub struct Database {
     path: String,
     dormant_git_repository_catchup_authority_state:
         std::sync::Arc<git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState>,
+    #[cfg(test)]
+    sub_agent_creation_test_latch: Option<std::sync::Arc<SubAgentCreationTestLatch>>,
 }
 
 impl Clone for Database {
@@ -1220,6 +1239,8 @@ impl Clone for Database {
             dormant_git_repository_catchup_authority_state: self
                 .dormant_git_repository_catchup_authority_state
                 .clone(),
+            #[cfg(test)]
+            sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
         }
     }
 }
@@ -1361,6 +1382,8 @@ impl Database {
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
             ),
+            #[cfg(test)]
+            sub_agent_creation_test_latch: None,
         }
     }
 
@@ -3626,6 +3649,11 @@ impl Database {
                         )));
                     };
                     let values = parent_scope_and_effort(Some(row))?;
+                    #[cfg(test)]
+                    if let Some(latch) = &self.sub_agent_creation_test_latch {
+                        latch.parent_read.notify_one();
+                        latch.competing_write_observed.notified().await;
+                    }
                     if values.0.as_ref() != *expected_scope {
                         tx.rollback().await?;
                         return Err(DbError::CloseFoundationConflict(format!(
@@ -18904,6 +18932,72 @@ mod tests {
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
         migrations::run_pending_migrations(db.pool()).await.unwrap();
         (dir, db)
+    }
+
+    #[tokio::test]
+    async fn sub_agent_creation_owns_write_intent_before_parent_snapshot() {
+        let (_dir, mut db) = open_file_backed_test_db("write-intent-before-snapshot.sqlite").await;
+        let parent = db
+            .create_conversation_with_project(
+                "write-intent-parent",
+                "write-intent-parent",
+                "/tmp",
+                true,
+                None,
+                Some("gpt-5.4"),
+                None,
+                &work_mode_fixture(),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .unwrap();
+        let expected_scope = parent.attached_work_scope_id.unwrap();
+        let latch = std::sync::Arc::new(SubAgentCreationTestLatch::new());
+        db.sub_agent_creation_test_latch = Some(latch.clone());
+        let child_db = db.clone();
+        let child = tokio::spawn(async move {
+            child_db
+                .create_subagent_conversation(
+                    "write-intent-child",
+                    "write-intent-child",
+                    "/tmp",
+                    "write-intent-parent",
+                    "gpt-5.4",
+                    &ConvMode::Explore {
+                        worktree_path: None,
+                        next_taskmd_id_hint: None,
+                    },
+                    phoenix_core::llm_language::LlmLanguage::default(),
+                    Some(&expected_scope),
+                )
+                .await
+        });
+
+        latch.parent_read.notified().await;
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", db.path))
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut competing_writer = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let write_error = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at WHERE id = 'write-intent-parent'",
+        )
+        .execute(&mut competing_writer)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            write_error.as_database_error().unwrap().code().as_deref(),
+            Some("5")
+        );
+        latch.competing_write_observed.notify_one();
+        let created = child.await.unwrap().unwrap();
+
+        assert_eq!(created.id, "write-intent-child");
     }
 
     #[tokio::test]
