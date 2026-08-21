@@ -30,6 +30,7 @@ import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
+const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
@@ -46,6 +47,8 @@ export function ConversationListPage() {
   const [showArchived, setShowArchived] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const didRestoreScrollRef = useRef(false);
+  const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
+  const visibleConversationCount = showArchived ? archivedConversations.length : conversations.length;
 
   useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;
@@ -140,18 +143,22 @@ export function ConversationListPage() {
     const scrollOwner = mainRef.current;
     if (!scrollOwner) return;
     try {
-      localStorage.setItem(MOBILE_LIST_SCROLL_KEY, String(scrollOwner.scrollTop));
+      localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
     } catch {
       // Storage can be unavailable in private browsing; navigation still works.
     }
-  }, []);
+  }, [currentScrollKey]);
 
   useLayoutEffect(() => {
-    if (isDesktop || loading || didRestoreScrollRef.current || conversations.length === 0) return;
+    didRestoreScrollRef.current = false;
+  }, [currentScrollKey]);
+
+  useLayoutEffect(() => {
+    if (isDesktop || loading || didRestoreScrollRef.current || visibleConversationCount === 0) return;
     const scrollOwner = mainRef.current;
     if (!scrollOwner) return;
     try {
-      const saved = Number(localStorage.getItem(MOBILE_LIST_SCROLL_KEY));
+      const saved = Number(localStorage.getItem(currentScrollKey));
       if (Number.isFinite(saved)) {
         didRestoreScrollRef.current = true;
         const maxScrollTop = Math.max(0, scrollOwner.scrollHeight - scrollOwner.clientHeight);
@@ -160,7 +167,7 @@ export function ConversationListPage() {
     } catch {
       // Storage can be unavailable in private browsing.
     }
-  }, [conversations.length, isDesktop, loading]);
+  }, [currentScrollKey, isDesktop, loading, visibleConversationCount]);
 
   useLayoutEffect(() => {
     const scrollOwner = mainRef.current;
@@ -172,12 +179,12 @@ export function ConversationListPage() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (!scrollOwner) return;
       try {
-        localStorage.setItem(MOBILE_LIST_SCROLL_KEY, String(scrollOwner.scrollTop));
+        localStorage.setItem(currentScrollKey, String(scrollOwner.scrollTop));
       } catch {
         // Storage can be unavailable in private browsing.
       }
     };
-  }, [saveScrollPosition]);
+  }, [currentScrollKey, saveScrollPosition]);
 
   const handleConversationClick = useCallback((conv: Conversation) => {
     saveScrollPosition();
@@ -310,8 +317,9 @@ export function ConversationListPage() {
   };
 
   const handleToggleArchived = useCallback(() => {
+    saveScrollPosition();
     setShowArchived((prev) => !prev);
-  }, []);
+  }, [saveScrollPosition]);
 
   const handleSetDeleteTarget = useCallback((conv: Conversation) => {
     setDeleteTarget(conv);

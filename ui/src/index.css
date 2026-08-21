@@ -205,7 +205,8 @@ body.app-viewport-active #root {
 
   .file-browser-overlay,
   .viewer-shell--overlay,
-  .pinsp-panel,
+  .pinsp-panel:not(.pinsp-panel--inline),
+  .browser-view-overlay,
   .task-approval-reader,
   .commission-review-approval-backdrop {
     padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
