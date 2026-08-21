@@ -215,23 +215,23 @@ pub fn build_system_prompt_with_options(
     }
 
     // Worktree grounding when cwd is inside .phoenix/worktrees/. The Work and
-    // Branch mode blocks below already state the worktree boundary (with the
-    // concrete path), so only emit the generic note when no such block will —
-    // i.e. for Explore (REQ-PROJ-028 gives Explore conversations a worktree
-    // too) and the no-mode case.
+    // Branch mode blocks below already state the concrete worktree path, so
+    // only emit the generic note when no such block will — i.e. for Explore
+    // (REQ-PROJ-028 gives Explore conversations a worktree too) and the no-mode
+    // case.
     let mode_states_worktree_boundary = matches!(
         mode,
         Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
     );
-    if !mode_states_worktree_boundary {
-        if let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(working_dir) {
-            let _ = write!(
-                prompt,
-                "\n\nYou are working in a git worktree. Your working directory is the worktree, \
-                 not the main checkout at {}. Stay grounded here for file operations.",
-                repo_root.display()
-            );
-        }
+    if !mode_states_worktree_boundary
+        && crate::git_ops::repo_root_from_phoenix_worktree(working_dir).is_some()
+    {
+        let _ = write!(
+            prompt,
+            "\n\nYou are working in a git worktree. Your working directory is {}. \
+             Stay grounded here for file operations.",
+            working_dir.display()
+        );
     }
 
     // Add mode context so the agent understands its capabilities
@@ -822,6 +822,28 @@ mod tests {
         // The Work block no longer hands out a taskmd ID prefix — task files
         // need not be taskmd files at all (task 13009).
         assert!(!prompt.contains("task ID prefix"));
+    }
+
+    #[test]
+    fn test_explore_mode_prompt_names_worktree_without_main_checkout() {
+        let working_dir = Path::new("/repo/.phoenix/worktrees/conv-123");
+        let temp = TempDir::new().unwrap();
+        let prompt = build_system_prompt_with_options(
+            working_dir,
+            "tasks",
+            false,
+            Some(&ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            }),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            None,
+            ExploreBashCapability::Unavailable,
+        );
+
+        assert!(prompt.contains("Your working directory is /repo/.phoenix/worktrees/conv-123."));
+        assert!(!prompt.contains("main checkout"));
     }
 
     // -------------------------------------------------------------------------
