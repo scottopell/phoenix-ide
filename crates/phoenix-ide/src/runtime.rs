@@ -2693,6 +2693,14 @@ impl RuntimeManager {
         Ok(reconciled)
     }
 
+    pub(crate) async fn run_local_authority_pass<T>(
+        &self,
+        pass: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        let _owner = self.fatal_local_authority_fence.try_acquire()?;
+        Ok(pass.await)
+    }
+
     pub async fn start_creation_worker(self: &Arc<Self>) {
         let rx = self.creation_kick_rx.write().await.take();
         let Some(mut rx) = rx else {
@@ -2700,25 +2708,34 @@ impl RuntimeManager {
             return;
         };
         let manager = Arc::clone(self);
+        let mut fatal_local_authority_rx = self.fatal_local_authority_receiver();
         tokio::spawn(async move {
             loop {
-                if let Err(error) =
-                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
-                {
-                    tracing::error!(error = %error, "conversation creation worker drain failed");
-                }
-                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
-                    Ok(deadline) => deadline,
-                    Err(error) => {
-                        tracing::error!(error = %error, "failed to read conversation creation deadline");
-                        Some(chrono::Utc::now() + chrono::Duration::seconds(1))
-                    }
+                let pass = Box::pin(manager.run_local_authority_pass(async {
+                        if let Err(error) =
+                            crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                        {
+                            tracing::error!(error = %error, "conversation creation worker drain failed");
+                        }
+                        match manager.db().next_conversation_creation_deadline().await {
+                            Ok(deadline) => deadline,
+                            Err(error) => {
+                                tracing::error!(error = %error, "failed to read conversation creation deadline");
+                                Some(chrono::Utc::now() + chrono::Duration::seconds(1))
+                            }
+                        }
+                    }))
+                    .await;
+                let Ok(next_deadline) = pass else {
+                    break;
                 };
                 if let Some(deadline) = next_deadline {
                     let delay = (deadline - chrono::Utc::now())
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     tokio::select! {
+                        biased;
+                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
                         changed = rx.changed() => {
                             if changed.is_err() {
                                 break;
@@ -2726,8 +2743,16 @@ impl RuntimeManager {
                         }
                         () = tokio::time::sleep(delay) => {}
                     }
-                } else if rx.changed().await.is_err() {
-                    break;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             tracing::info!("Conversation creation worker stopped");
@@ -2794,7 +2819,7 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            crate::runtime::wake::run(manager, rx, ready_tx).await;
+            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await;
         });
         ready_rx.await.map_err(|_| {
             "wake worker stopped before startup reconciliation completed".to_string()
@@ -6590,6 +6615,53 @@ mod scope_liveness_tests {
         assert!(fence.try_acquire().is_err());
         drop(owner);
         fence.wait_for_owners().await;
+    }
+
+    #[tokio::test]
+    async fn workflow_pass_is_not_polled_after_fatal_closure_wins() {
+        let manager = test_manager().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pass_polled = Arc::clone(&polled);
+
+        let result = manager
+            .run_local_authority_pass(async move {
+                pass_polled.store(true, Ordering::Release);
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn admitted_workflow_pass_holds_owner_until_completion() {
+        let manager = Arc::new(test_manager().await);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let pass = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .run_local_authority_pass(async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("workflow pass entered");
+
+        manager.signal_fatal_local_authority("test_authority_boundary");
+
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        release_tx.send(()).expect("release workflow pass");
+        pass.await
+            .expect("workflow pass joins")
+            .expect("admitted pass completes");
     }
 
     #[tokio::test(start_paused = true)]

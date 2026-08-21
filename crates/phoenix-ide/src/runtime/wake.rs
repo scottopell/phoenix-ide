@@ -118,10 +118,7 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = worker
-        .run_loop_with_manager(kick_rx, manager, ready_tx)
-        .await
-    {
+    if let Err(error) = Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await {
         tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
     }
 }
@@ -155,14 +152,21 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Arc<RuntimeManager>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), String> {
-        self.repo
-            .reconcile_continuation_transfers(self.clock.now())
-            .await
-            .map_err(|error| error.to_string())?;
-        self.run_once().await?;
-        deliver_pending(&manager, &self.repo, self.clock.now()).await?;
+        let startup = Box::pin(manager.run_local_authority_pass(async {
+            self.repo
+                .reconcile_continuation_transfers(self.clock.now())
+                .await
+                .map_err(|error| error.to_string())?;
+            self.run_once().await?;
+            deliver_pending(&manager, &self.repo, self.clock.now()).await
+        }))
+        .await;
+        match startup {
+            Ok(result) => result?,
+            Err(()) => return Ok(()),
+        }
         let _ = ready_tx.send(());
-        self.run_loop_inner(&mut kick_rx, Some(manager)).await
+        Box::pin(self.run_loop_inner(&mut kick_rx, Some(manager))).await
     }
 
     async fn run_loop_inner(
@@ -171,29 +175,31 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Option<Arc<RuntimeManager>>,
     ) -> Result<(), String> {
         let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
+        let mut fatal_local_authority_rx = manager
+            .as_ref()
+            .map(|manager| manager.fatal_local_authority_receiver());
         loop {
-            let wait = match self.run_once().await {
+            let pass = async {
+                let wait = self.run_once().await?;
+                if let Some(manager) = manager.as_ref() {
+                    deliver_pending(manager, &self.repo, self.clock.now()).await?;
+                }
+                Ok::<Duration, String>(wait)
+            };
+            let pass = match manager.as_ref() {
+                Some(manager) => match Box::pin(manager.run_local_authority_pass(pass)).await {
+                    Ok(result) => result,
+                    Err(()) => return Ok(()),
+                },
+                None => pass.await,
+            };
+            let wait = match pass {
                 Ok(wait) => {
-                    if let Some(manager) = manager.as_ref() {
-                        if let Err(error) =
-                            deliver_pending(manager, &self.repo, self.clock.now()).await
-                        {
-                            tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker delivery failed; retrying");
-                            let wait = error_backoff;
-                            error_backoff =
-                                (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
-                            wait
-                        } else {
-                            error_backoff = ERROR_RETRY_BASE_INTERVAL;
-                            wait
-                        }
-                    } else {
-                        error_backoff = ERROR_RETRY_BASE_INTERVAL;
-                        wait
-                    }
+                    error_backoff = ERROR_RETRY_BASE_INTERVAL;
+                    wait
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker iteration failed; retrying");
+                    tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker pass failed; retrying");
                     let wait = error_backoff;
                     error_backoff = (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
                     wait
@@ -201,11 +207,24 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             };
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
-            tokio::select! {
-                () = &mut sleep => {}
-                changed = kick_rx.changed() => {
-                    if changed.is_err() {
-                        return Ok(());
+            if let Some(fatal) = fatal_local_authority_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = crate::tls::wait_for_fatal_local_authority(fatal) => return Ok(()),
+                    () = &mut sleep => {}
+                    changed = kick_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    () = &mut sleep => {}
+                    changed = kick_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -214,7 +233,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
 
     #[cfg(test)]
     async fn run_loop(&self, mut kick_rx: watch::Receiver<u64>) -> Result<(), String> {
-        self.run_loop_inner(&mut kick_rx, None).await
+        Box::pin(self.run_loop_inner(&mut kick_rx, None)).await
     }
 
     async fn run_once(&self) -> Result<Duration, String> {
@@ -1268,7 +1287,7 @@ mod tests {
             ProcessIncarnation(1),
         );
         let (tx, rx) = watch::channel(0u64);
-        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+        let join = tokio::spawn(async move { Box::pin(worker.run_loop(rx)).await });
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, EMPTY_RESCAN_INTERVAL);
         tx.send(1).unwrap();
@@ -1342,7 +1361,7 @@ mod tests {
             ProcessIncarnation(1),
         );
         let (_tx, rx) = watch::channel(0u64);
-        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+        let join = tokio::spawn(async move { Box::pin(worker.run_loop(rx)).await });
 
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);
