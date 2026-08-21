@@ -1437,22 +1437,16 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
     Ok(paths)
 }
 
-fn sweep_expired_attachments_blocking(
+fn discover_expired_attachment_candidates_blocking(
     root: &std::path::Path,
     cutoff: SystemTime,
     referenced: &HashSet<PathBuf>,
-    cancelled: &tokio_util::sync::CancellationToken,
+    candidates: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    if cancelled.is_cancelled() {
-        return Ok(());
-    }
     for entry in std::fs::read_dir(root)? {
-        if cancelled.is_cancelled() {
-            return Ok(());
-        }
         let entry = entry?;
         let path = entry.path();
         let metadata = match entry.metadata() {
@@ -1461,24 +1455,11 @@ fn sweep_expired_attachments_blocking(
             Err(e) => return Err(e),
         };
         if metadata.is_dir() {
-            sweep_expired_attachments_blocking(&path, cutoff, referenced, cancelled)?;
-            match std::fs::remove_dir(&path) {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                    ) => {}
-                Err(e) => return Err(e),
-            }
+            discover_expired_attachment_candidates_blocking(&path, cutoff, referenced, candidates)?;
         } else if metadata.modified().is_ok_and(|modified| modified < cutoff)
             && !referenced.contains(&path)
         {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            candidates.push(path);
         }
     }
     Ok(())
@@ -1486,7 +1467,7 @@ fn sweep_expired_attachments_blocking(
 
 async fn cleanup_expired_attachments(
     db: &crate::db::Database,
-    cancelled: tokio_util::sync::CancellationToken,
+    runtime: &crate::runtime::RuntimeManager,
 ) {
     let root = attachment_root();
     let referenced = match referenced_attachment_paths(db).await {
@@ -1499,14 +1480,39 @@ async fn cleanup_expired_attachments(
     let cutoff = SystemTime::now()
         .checked_sub(ATTACHMENT_TTL)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    let result = tokio::task::spawn_blocking(move || {
-        sweep_expired_attachments_blocking(&root, cutoff, &referenced, &cancelled)
+    let discovery = tokio::task::spawn_blocking(move || {
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
+            &root,
+            cutoff,
+            &referenced,
+            &mut candidates,
+        )?;
+        Ok::<_, std::io::Error>(candidates)
     })
     .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "failed to sweep expired attachments"),
-        Err(e) => tracing::warn!(error = %e, "attachment sweep task failed"),
+    let candidates = match discovery {
+        Ok(Ok(candidates)) => candidates,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to discover expired attachments");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "attachment discovery task failed");
+            return;
+        }
+    };
+    for path in candidates {
+        let Ok(_admitted) = runtime.acquire_local_authority_pass() else {
+            return;
+        };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to delete expired attachment");
+            }
+        }
     }
 }
 
@@ -1516,14 +1522,7 @@ pub(super) fn start_attachment_cleanup_task(
 ) {
     tokio::spawn(async move {
         loop {
-            if runtime
-                .acquire_local_authority_pass()
-                .map(|owner| drop(owner))
-                .is_err()
-            {
-                return;
-            }
-            cleanup_expired_attachments(&db, runtime.external_effect_cancellation()).await;
+            cleanup_expired_attachments(&db, &runtime).await;
             if runtime.fatal_local_authority_is_latched() {
                 return;
             }
@@ -5608,7 +5607,7 @@ async fn delete_conversation(
 /// request; bash / tmux / projects cleanup failures log WARN and continue per
 /// REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
-    let owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+    let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
         AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
     })?;
     #[cfg(test)]
@@ -5698,7 +5697,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    cleanup_pending_fork_orphans_on_delete(state, &conv, owner.child()).await?;
+    let _owner = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; a
@@ -6031,8 +6030,8 @@ async fn cascade_projects_on_delete(
 async fn cleanup_pending_fork_orphans_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
-    authority: crate::runtime::FatalLocalAuthorityOwner,
-) -> Result<(), AppError> {
+    authority: crate::runtime::AdmittedOperation,
+) -> Result<crate::runtime::AdmittedOperation, AppError> {
     state
         .runtime
         .cleanup_pending_fork_orphans_on_delete(&conv.id, authority)
@@ -14889,27 +14888,7 @@ mod attachment_storage_tests {
     }
 
     #[test]
-    fn sweep_stops_before_deletion_when_cancelled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path();
-        let expired = root.join("old.txt");
-        std::fs::write(&expired, b"old").expect("write old");
-        let cancelled = tokio_util::sync::CancellationToken::new();
-        cancelled.cancel();
-
-        sweep_expired_attachments_blocking(
-            root,
-            SystemTime::now() + Duration::from_secs(1),
-            &HashSet::new(),
-            &cancelled,
-        )
-        .expect("cancelled sweep");
-
-        assert!(expired.exists());
-    }
-
-    #[test]
-    fn sweep_deletes_expired_files_and_empty_dirs() {
+    fn discovery_returns_expired_unreferenced_files_without_mutating() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
         let conv = root.join("conv-old");
@@ -14917,18 +14896,17 @@ mod attachment_storage_tests {
         let expired = conv.join("old.txt");
         std::fs::write(&expired, b"old").expect("write old");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
-        sweep_expired_attachments_blocking(
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
             root,
             cutoff,
             &HashSet::new(),
-            &tokio_util::sync::CancellationToken::new(),
+            &mut candidates,
         )
-        .expect("sweep");
-        assert!(!expired.exists());
-        assert!(
-            !conv.exists(),
-            "empty conversation attachment dir should be removed"
-        );
+        .expect("discover");
+        assert_eq!(candidates, vec![expired.clone()]);
+        assert!(expired.exists());
+        assert!(conv.exists());
     }
 
     #[test]
@@ -14941,13 +14919,15 @@ mod attachment_storage_tests {
         std::fs::write(&referenced, b"keep").expect("write referenced");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
         let referenced_set = HashSet::from([referenced.clone()]);
-        sweep_expired_attachments_blocking(
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
             root,
             cutoff,
             &referenced_set,
-            &tokio_util::sync::CancellationToken::new(),
+            &mut candidates,
         )
-        .expect("sweep");
+        .expect("discover");
+        assert!(candidates.is_empty());
         assert!(referenced.exists());
         assert!(conv.exists());
     }
@@ -15092,13 +15072,15 @@ mod attachment_storage_tests {
         let recent = conv.join("recent.txt");
         std::fs::write(&recent, b"recent").expect("write recent");
         let cutoff = SystemTime::UNIX_EPOCH;
-        sweep_expired_attachments_blocking(
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
             root,
             cutoff,
             &HashSet::new(),
-            &tokio_util::sync::CancellationToken::new(),
+            &mut candidates,
         )
-        .expect("sweep");
+        .expect("discover");
+        assert!(candidates.is_empty());
         assert!(recent.exists());
         assert!(conv.exists());
     }

@@ -34,7 +34,7 @@ const FATAL_AUTHORITY_CLOSED: &str = "fatal local authority closed during wake p
 
 fn wake_authority_owner(
     manager: Option<&Arc<RuntimeManager>>,
-) -> Result<Option<crate::runtime::FatalLocalAuthorityOwner>, String> {
+) -> Result<Option<crate::runtime::AdmittedOperation>, String> {
     manager
         .map(|manager| manager.acquire_local_authority_pass())
         .transpose()

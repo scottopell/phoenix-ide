@@ -37,6 +37,28 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// `None` if the deadline elapsed first. Callers that need to *force-close*
 /// remaining work on timeout (e.g. aborting an `axum::serve` `JoinHandle`) do
 /// that themselves on `None`; this helper does not own task ownership.
+pub(crate) async fn bounded_post_shutdown_drain_until<F>(
+    deadline: tokio::time::Instant,
+    drain: F,
+    label: &'static str,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    match tokio::time::timeout_at(deadline, drain).await {
+        Ok(v) => Some(v),
+        Err(_elapsed) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tracing::warn!(
+                timeout_seconds = SHUTDOWN_GRACE.as_secs(),
+                remaining_ms = remaining.as_millis(),
+                "Timed out waiting for {label} connections to drain"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) async fn bounded_post_shutdown_drain<F>(
     drain: F,
     label: &'static str,
@@ -44,16 +66,8 @@ pub(crate) async fn bounded_post_shutdown_drain<F>(
 where
     F: std::future::Future,
 {
-    match tokio::time::timeout(SHUTDOWN_GRACE, drain).await {
-        Ok(v) => Some(v),
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_seconds = SHUTDOWN_GRACE.as_secs(),
-                "Timed out waiting for {label} connections to drain"
-            );
-            None
-        }
-    }
+    bounded_post_shutdown_drain_until(tokio::time::Instant::now() + SHUTDOWN_GRACE, drain, label)
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -240,16 +254,24 @@ pub async fn serve_https(
             boundary = wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 drop(listener);
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping HTTPS without database cleanup");
+                let deadline = runtime
+                    .fatal_local_authority_deadline()
+                    .expect("fatal authority deadline must be set before HTTPS drain");
                 let fatal_tail = async {
                     drain_concurrently(
                         runtime.fence_fatal_local_authority(),
                         graceful.shutdown(),
                     )
                     .await;
-                    crate::tools::bash::shutdown_kill_tree(bash_handles).await;
+                    crate::tools::bash::shutdown_kill_tree_until(deadline, bash_handles).await;
                 };
-                let _ = bounded_post_shutdown_drain(fatal_tail, "HTTPS fatal authority").await;
-                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
+                let _ = bounded_post_shutdown_drain_until(
+                    deadline,
+                    fatal_tail,
+                    "HTTPS fatal authority",
+                )
+                .await;
+                return Err(crate::FatalLocalAuthorityExit.into());
             }
             accepted = listener.accept() => {
                 let (stream, peer_addr) = match accepted {
@@ -434,7 +456,10 @@ mod external_host_tests {
 
 #[cfg(test)]
 mod bounded_drain_tests {
-    use super::{bounded_post_shutdown_drain, wait_for_fatal_local_authority};
+    use super::{
+        bounded_post_shutdown_drain, bounded_post_shutdown_drain_until,
+        wait_for_fatal_local_authority,
+    };
 
     /// A drain future that completes before the deadline forwards its
     /// inner value verbatim. The contract `Some(F::Output) iff fast
@@ -484,5 +509,27 @@ mod bounded_drain_tests {
         tokio::time::advance(super::SHUTDOWN_GRACE + std::time::Duration::from_secs(1)).await;
         let result = join.await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_deadline_uses_remaining_budget_instead_of_fresh_grace() {
+        let deadline = tokio::time::Instant::now() + super::SHUTDOWN_GRACE;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+
+        let drain = std::future::pending::<()>();
+        let join = tokio::spawn(async move {
+            bounded_post_shutdown_drain_until(deadline, drain, "absolute-test").await
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !join.is_finished(),
+            "remaining budget should still be active"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(join.await.unwrap().is_none());
     }
 }

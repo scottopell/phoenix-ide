@@ -25,7 +25,7 @@ use crate::git_ops::{
     materialize_branch, run_git, GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::executor::{promote_task_status_to_in_progress, TASK_APPROVAL_MUTEX};
-use crate::runtime::{FatalLocalAuthorityOwner, RuntimeManager};
+use crate::runtime::{AdmittedOperation, RuntimeManager};
 use phoenix_core::task_source::TaskSource;
 
 /// A fork-resolution operation routed to the single serialized fork-resolution
@@ -73,8 +73,8 @@ pub(crate) enum ForkCommand {
     /// hard-delete cascade.
     CleanupOnHardDelete {
         origin_id: String,
-        authority: FatalLocalAuthorityOwner,
-        reply: oneshot::Sender<Result<(), ForkResolveError>>,
+        authority: AdmittedOperation,
+        reply: oneshot::Sender<Result<AdmittedOperation, ForkResolveError>>,
     },
 }
 
@@ -426,18 +426,18 @@ impl RuntimeManager {
     pub(crate) async fn handle_fork_command(self: &std::sync::Arc<Self>, cmd: ForkCommand) {
         if let ForkCommand::CleanupOnHardDelete {
             origin_id,
-            authority: _owner,
+            authority,
             reply,
         } = cmd
         {
             #[cfg(test)]
             self.wait_at_fork_command_barrier().await;
             handle_cleanup_on_hard_delete(&self.db, &origin_id).await;
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(Ok(authority));
             return;
         }
 
-        let Ok(owner) = self.acquire_local_authority_pass() else {
+        let Ok(mut owner) = self.acquire_local_authority_pass() else {
             cmd.reject_after_fatal_authority();
             return;
         };
@@ -445,7 +445,7 @@ impl RuntimeManager {
         self.wait_at_fork_command_barrier().await;
         match cmd {
             ForkCommand::Approve { proposal_id, reply } => {
-                let _ = reply.send(self.handle_approve(&proposal_id, &owner).await);
+                let _ = reply.send(self.handle_approve(&proposal_id, &mut owner).await);
             }
             ForkCommand::RequestChanges {
                 proposal_id,
@@ -453,7 +453,7 @@ impl RuntimeManager {
                 reply,
             } => {
                 let _ = reply.send(
-                    self.handle_request_changes(&proposal_id, change_request, &owner)
+                    self.handle_request_changes(&proposal_id, change_request, &mut owner)
                         .await,
                 );
             }
@@ -580,10 +580,10 @@ impl RuntimeManager {
     pub(crate) async fn cleanup_pending_fork_orphans_on_delete(
         self: &std::sync::Arc<Self>,
         origin_id: &str,
-        authority: FatalLocalAuthorityOwner,
-    ) -> Result<(), ForkResolveError> {
+        authority: AdmittedOperation,
+    ) -> Result<AdmittedOperation, ForkResolveError> {
         if !self.origin_has_pending_fork_proposal(origin_id).await {
-            return Ok(());
+            return Ok(authority);
         }
         let (reply, reply_rx) = oneshot::channel();
         self.fork_cmd_tx
@@ -959,7 +959,7 @@ impl RuntimeManager {
     async fn handle_approve(
         self: &std::sync::Arc<Self>,
         proposal_id: &str,
-        authority: &FatalLocalAuthorityOwner,
+        authority: &mut AdmittedOperation,
     ) -> Result<String, ForkResolveError> {
         // No lock: the fork-resolution consumer is single-threaded, so this
         // whole critical section (precondition check + git phase + DB resolve)
@@ -993,7 +993,7 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        self.get_or_create_with_authority(&fork_conv_id, authority.child())
+        self.get_or_create_with_authority(&fork_conv_id, authority.reborrow())
             .await
             .map_err(ForkResolveError::Internal)?;
         Ok(fork_conv_id)
@@ -1016,7 +1016,7 @@ impl RuntimeManager {
         self: &std::sync::Arc<Self>,
         proposal_id: &str,
         change_request: String,
-        authority: &FatalLocalAuthorityOwner,
+        authority: &mut AdmittedOperation,
     ) -> Result<String, ForkResolveError> {
         // No lock: serialized by the single fork-resolution consumer.
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
@@ -1046,7 +1046,7 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        self.get_or_create_with_authority(&refinement_conv_id, authority.child())
+        self.get_or_create_with_authority(&refinement_conv_id, authority.reborrow())
             .await
             .map_err(ForkResolveError::Internal)?;
         Ok(refinement_conv_id)

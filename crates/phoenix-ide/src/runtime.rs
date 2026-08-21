@@ -162,7 +162,7 @@ pub(crate) struct AcknowledgedEventRequest {
 pub struct TaskApprovalHandoffRequest {
     pub parent_conversation_id: String,
     pub approval: TaskApprovalHandoffData,
-    pub authority: FatalLocalAuthorityOwner,
+    pub authority: AdmittedOperation,
     pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
 }
 
@@ -224,7 +224,7 @@ mod conversation_mutex_gate_tests {
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
 
 struct RuntimeMaterializationAuthority {
-    inherited: Option<FatalLocalAuthorityOwner>,
+    inherited: Option<AdmittedOperation>,
     accepting_transfers: bool,
 }
 
@@ -234,10 +234,7 @@ struct RuntimeMaterializationSlot {
 }
 
 impl RuntimeMaterializationSlot {
-    fn transfer_authority(
-        &self,
-        authority: FatalLocalAuthorityOwner,
-    ) -> Result<(), FatalLocalAuthorityOwner> {
+    fn transfer_authority(&self, authority: AdmittedOperation) -> Result<(), AdmittedOperation> {
         let mut state = self
             .authority
             .lock()
@@ -251,25 +248,21 @@ impl RuntimeMaterializationSlot {
         Ok(())
     }
 
-    fn authority_child(&self) -> Option<FatalLocalAuthorityOwner> {
+    fn take_authority(&self) -> Option<AdmittedOperation> {
         self.authority
             .lock()
             .expect("runtime materialization authority poisoned")
             .inherited
-            .as_ref()
-            .map(FatalLocalAuthorityOwner::child)
+            .take()
     }
 
-    fn seal_authority_transfers(&self) -> Option<FatalLocalAuthorityOwner> {
+    fn seal_authority_transfers(&self) -> Option<AdmittedOperation> {
         let mut state = self
             .authority
             .lock()
             .expect("runtime materialization authority poisoned");
         state.accepting_transfers = false;
-        state
-            .inherited
-            .as_ref()
-            .map(FatalLocalAuthorityOwner::child)
+        state.inherited.take()
     }
 }
 
@@ -284,6 +277,7 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 struct FatalLocalAuthorityFenceState {
     closed: bool,
     boundary: Option<&'static str>,
+    fatal_deadline: Option<tokio::time::Instant>,
     owners: usize,
 }
 
@@ -296,8 +290,8 @@ pub(crate) struct FatalLocalAuthorityFence {
     owners_at_first_close: AtomicUsize,
 }
 
-pub(crate) struct FatalLocalAuthorityOwner {
-    fence: Arc<FatalLocalAuthorityFence>,
+pub(crate) struct AdmittedOperation {
+    fence: Option<Arc<FatalLocalAuthorityFence>>,
 }
 
 impl FatalLocalAuthorityFence {
@@ -307,6 +301,7 @@ impl FatalLocalAuthorityFence {
             state: Mutex::new(FatalLocalAuthorityFenceState {
                 closed: false,
                 boundary: None,
+                fatal_deadline: None,
                 owners: 0,
             }),
             owners_drained: Notify::new(),
@@ -317,14 +312,14 @@ impl FatalLocalAuthorityFence {
         })
     }
 
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<FatalLocalAuthorityOwner, ()> {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<AdmittedOperation, ()> {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         if state.closed {
             return Err(());
         }
         state.owners += 1;
-        Ok(FatalLocalAuthorityOwner {
-            fence: Arc::clone(self),
+        Ok(AdmittedOperation {
+            fence: Some(Arc::clone(self)),
         })
     }
 
@@ -332,6 +327,9 @@ impl FatalLocalAuthorityFence {
         let mut state = self.state.lock().expect("fatal authority fence poisoned");
         state.closed = true;
         let boundary = *state.boundary.get_or_insert(boundary);
+        state
+            .fatal_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + crate::tls::SHUTDOWN_GRACE);
         #[cfg(test)]
         let _ = self.owners_at_first_close.compare_exchange(
             usize::MAX,
@@ -369,6 +367,13 @@ impl FatalLocalAuthorityFence {
             .closed
     }
 
+    pub(crate) fn fatal_deadline(&self) -> Option<tokio::time::Instant> {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .fatal_deadline
+    }
+
     #[cfg(test)]
     fn owners_at_first_close(&self) -> Option<usize> {
         match self.owners_at_first_close.load(Ordering::Acquire) {
@@ -386,35 +391,47 @@ impl FatalLocalAuthorityFence {
     }
 }
 
-impl FatalLocalAuthorityOwner {
+impl AdmittedOperation {
     pub(crate) fn close(&self, boundary: &'static str) {
-        self.fence.close(boundary);
+        self.fence
+            .as_ref()
+            .expect("transferred admitted operation used again")
+            .close(boundary);
     }
 
-    pub(crate) fn child(&self) -> Self {
-        let mut state = self
+    pub(crate) fn transfer(&mut self) -> Self {
+        Self {
+            fence: Some(
+                self.fence
+                    .take()
+                    .expect("transferred admitted operation used again"),
+            ),
+        }
+    }
+
+    pub(crate) fn reborrow(&mut self) -> Self {
+        let fence = self
             .fence
-            .state
-            .lock()
-            .expect("fatal authority fence poisoned");
+            .as_ref()
+            .expect("transferred admitted operation used again");
+        let mut state = fence.state.lock().expect("fatal authority fence poisoned");
         state.owners += 1;
         Self {
-            fence: Arc::clone(&self.fence),
+            fence: Some(Arc::clone(fence)),
         }
     }
 }
 
-impl Drop for FatalLocalAuthorityOwner {
+impl Drop for AdmittedOperation {
     fn drop(&mut self) {
-        let mut state = self
-            .fence
-            .state
-            .lock()
-            .expect("fatal authority fence poisoned");
+        let Some(fence) = self.fence.as_ref() else {
+            return;
+        };
+        let mut state = fence.state.lock().expect("fatal authority fence poisoned");
         state.owners -= 1;
         if state.owners == 0 {
             drop(state);
-            self.fence.owners_drained.notify_waiters();
+            fence.owners_drained.notify_waiters();
         }
     }
 }
@@ -992,7 +1009,7 @@ impl SseBroadcaster {
         self
     }
 
-    fn fatal_publication_guard(&self) -> Result<Option<FatalLocalAuthorityOwner>, ()> {
+    fn fatal_publication_guard(&self) -> Result<Option<AdmittedOperation>, ()> {
         self.fatal_local_authority_fence
             .as_ref()
             .map(FatalLocalAuthorityFence::try_acquire)
@@ -2032,7 +2049,15 @@ impl RuntimeManager {
                 }
             }
         };
-        let _ = crate::tls::bounded_post_shutdown_drain(shutdown, "fatal authority fence").await;
+        let deadline = self
+            .fatal_local_authority_deadline()
+            .expect("fatal authority deadline must be set before fence drain");
+        let _ = crate::tls::bounded_post_shutdown_drain_until(
+            deadline,
+            shutdown,
+            "fatal authority fence",
+        )
+        .await;
     }
 
     pub fn fatal_local_authority_receiver(
@@ -2876,17 +2901,16 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.is_closed()
     }
 
-    pub(crate) fn acquire_local_authority_pass(&self) -> Result<FatalLocalAuthorityOwner, ()> {
+    pub(crate) fn acquire_local_authority_pass(&self) -> Result<AdmittedOperation, ()> {
         self.fatal_local_authority_fence.try_acquire()
-    }
-
-    pub(crate) fn external_effect_cancellation(&self) -> tokio_util::sync::CancellationToken {
-        self.fatal_local_authority_fence
-            .external_effect_cancellation()
     }
 
     pub(crate) fn fatal_local_authority_is_latched(&self) -> bool {
         self.fatal_local_authority_fence.is_closed()
+    }
+
+    pub(crate) fn fatal_local_authority_deadline(&self) -> Option<tokio::time::Instant> {
+        self.fatal_local_authority_fence.fatal_deadline()
     }
 
     #[cfg(test)]
@@ -3084,17 +3108,27 @@ impl RuntimeManager {
     }
 
     async fn handle_task_handoff_request(self: &Arc<Self>, req: TaskApprovalHandoffRequest) {
-        let result = self.create_and_start_task_handoff(&req).await;
-        let _ = req.response_tx.send(result);
+        let TaskApprovalHandoffRequest {
+            parent_conversation_id,
+            approval,
+            mut authority,
+            response_tx,
+        } = req;
+        let result = self
+            .create_and_start_task_handoff(&parent_conversation_id, &approval, &mut authority)
+            .await;
+        let _ = response_tx.send(result);
     }
 
     async fn create_and_start_task_handoff(
         self: &Arc<Self>,
-        req: &TaskApprovalHandoffRequest,
+        parent_conversation_id: &str,
+        approval: &TaskApprovalHandoffData,
+        authority: &mut AdmittedOperation,
     ) -> Result<TaskApprovalHandoffResponse, String> {
         let successor = self
             .db
-            .create_task_approval_handoff_conversation(&req.parent_conversation_id, &req.approval)
+            .create_task_approval_handoff_conversation(parent_conversation_id, approval)
             .await
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
@@ -3103,7 +3137,7 @@ impl RuntimeManager {
             barrier.wait().await;
         }
         let _ = self
-            .get_or_create_with_authority(&successor.id, req.authority.child())
+            .get_or_create_with_authority(&successor.id, authority.reborrow())
             .await?;
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
@@ -3612,7 +3646,7 @@ impl RuntimeManager {
     async fn get_or_create_with_authority(
         self: &Arc<Self>,
         conversation_id: &str,
-        owner: FatalLocalAuthorityOwner,
+        owner: AdmittedOperation,
     ) -> Result<ConversationHandle, String> {
         self.get_or_create_inner(conversation_id, Some(owner)).await
     }
@@ -3621,7 +3655,7 @@ impl RuntimeManager {
     async fn get_or_create_inner(
         self: &Arc<Self>,
         conversation_id: &str,
-        inherited_authority: Option<FatalLocalAuthorityOwner>,
+        inherited_authority: Option<AdmittedOperation>,
     ) -> Result<ConversationHandle, String> {
         let mut inherited_authority = inherited_authority;
         loop {
@@ -3755,6 +3789,7 @@ impl RuntimeManager {
 
     async fn persist_and_broadcast_system_message(
         &self,
+        _admitted: &mut AdmittedOperation,
         broadcaster: &SseBroadcaster,
         conversation_id: &str,
         text: String,
@@ -4231,11 +4266,14 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let recovery_owner = match slot.authority_child() {
-            Some(owner) => owner,
-            None => self.acquire_local_authority_pass().map_err(|()| {
-                "runtime admission closed after fatal local authority loss".to_string()
-            })?,
+        let (materialization_admission, inherited_materialization) = match slot.take_authority() {
+            Some(owner) => (owner, true),
+            None => (
+                self.acquire_local_authority_pass().map_err(|()| {
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?,
+                false,
+            ),
         };
         let mut conv = self
             .db
@@ -4679,8 +4717,16 @@ impl RuntimeManager {
                      next. Do NOT re-execute the same command that was just running."
                 )
             };
+            let mut restart_admission = self.acquire_local_authority_pass().map_err(|()| {
+                "runtime admission closed before restart marker persistence".to_string()
+            })?;
             if let Err(error) = self
-                .persist_and_broadcast_system_message(&broadcaster, conversation_id, restart_msg)
+                .persist_and_broadcast_system_message(
+                    &mut restart_admission,
+                    &broadcaster,
+                    conversation_id,
+                    restart_msg,
+                )
                 .await
             {
                 tracing::warn!(conv_id = %conversation_id, error = %error,
@@ -4724,10 +4770,10 @@ impl RuntimeManager {
         };
         // Another caller may have completed construction while this caller was
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
-        drop(recovery_owner);
-
         // losing, not-yet-spawned executor.
         {
+            let materialization_admission =
+                inherited_materialization.then_some(materialization_admission);
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
             let sealed_authority = slot.seal_authority_transfers();
@@ -4736,8 +4782,8 @@ impl RuntimeManager {
                 barrier.wait().await;
                 barrier.wait().await;
             }
-            let _publication_owner = match sealed_authority {
-                Some(owner) => owner,
+            let _publication_admission = match sealed_authority.or(materialization_admission) {
+                Some(admitted) => admitted,
                 None => self.acquire_local_authority_pass().map_err(|()| {
                     broadcaster.close_publication();
                     reservations.remove(conversation_id);
@@ -6969,6 +7015,23 @@ mod scope_liveness_tests {
         fence.wait_for_owners().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn repeated_fatal_close_keeps_first_boundary_and_deadline() {
+        let fence = FatalLocalAuthorityFence::new();
+        let mut fatal = fence.subscribe();
+
+        fence.close("first_boundary");
+        let first_deadline = fence
+            .fatal_deadline()
+            .expect("first close sets fatal deadline");
+
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        fence.close("second_boundary");
+
+        assert_eq!(*fatal.borrow_and_update(), Some("first_boundary"));
+        assert_eq!(fence.fatal_deadline(), Some(first_deadline));
+    }
+
     #[tokio::test]
     async fn workflow_pass_is_not_polled_after_fatal_closure_wins() {
         let manager = test_manager().await;
@@ -7222,7 +7285,16 @@ mod scope_liveness_tests {
         };
         let handoff = {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.create_and_start_task_handoff(&request).await })
+            tokio::spawn(async move {
+                let mut authority = request.authority;
+                manager
+                    .create_and_start_task_handoff(
+                        &request.parent_conversation_id,
+                        &request.approval,
+                        &mut authority,
+                    )
+                    .await
+            })
         };
 
         barrier.wait().await;
@@ -8731,7 +8803,9 @@ mod scope_liveness_tests {
         let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
         let mut receiver = broadcaster.subscribe();
 
+        let mut admitted = mgr.acquire_local_authority_pass().unwrap();
         mgr.persist_and_broadcast_system_message(
+            &mut admitted,
             &broadcaster,
             conversation_id,
             "recovery marker".to_string(),

@@ -270,6 +270,18 @@ impl TracingHandles {
             }
         }
     }
+
+    pub fn shutdown_tracer_until(&self, deadline: tokio::time::Instant) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        if let Some(provider) = &self.tracer_provider {
+            if let Err(e) = provider.shutdown_with_timeout(remaining.min(Duration::from_secs(1))) {
+                tracing::warn!(error = ?e, "tracer shutdown error");
+            }
+        }
+    }
 }
 
 impl LogConfig {

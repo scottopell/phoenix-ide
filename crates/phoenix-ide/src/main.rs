@@ -46,6 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = runtime.block_on(phoenix_ide::run_server());
             if let Err(error) = &result {
                 phoenix_ide::record_fatal_diagnostic(error);
+                if error
+                    .downcast_ref::<phoenix_ide::FatalLocalAuthorityExit>()
+                    .is_some()
+                {
+                    std::process::exit(phoenix_ide::FATAL_LOCAL_AUTHORITY_EXIT);
+                }
             }
             result
         }

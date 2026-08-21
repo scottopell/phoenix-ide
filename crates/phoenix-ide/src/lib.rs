@@ -595,11 +595,26 @@ pub async fn migrate_database() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub const FATAL_LOCAL_AUTHORITY_EXIT: i32 = 70;
+
+#[derive(Debug)]
+pub struct FatalLocalAuthorityExit;
+
+impl std::fmt::Display for FatalLocalAuthorityExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fatal local SQLite authority loss")
+    }
+}
+
+impl std::error::Error for FatalLocalAuthorityExit {}
+
 /// Start the Phoenix HTTP server with the production composition root.
 ///
 /// # Errors
+/// Returns the originating bootstrap, bind, server, or fatal-authority error.
 ///
-/// Returns an error when production bootstrap, binding, or server execution fails.
+/// # Panics
+/// Panics if fatal-authority notification arrives without its fence-captured deadline.
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // `phx` companion: when this binary is invoked through the PATH-injected
@@ -1011,7 +1026,11 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            tracing_handles.shutdown_tracer();
+            if let Some(deadline) = runtime_for_fatal.fatal_local_authority_deadline() {
+                tracing_handles.shutdown_tracer_until(deadline);
+            } else {
+                tracing_handles.shutdown_tracer();
+            }
             return Err(error);
         }
     } else {
@@ -1058,19 +1077,22 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
                 let _ = drain_tx.send(());
+                let deadline = runtime_for_fatal
+                    .fatal_local_authority_deadline()
+                    .expect("fatal authority deadline must be set before HTTP drain");
                 let fatal_tail = async {
                     tls::drain_concurrently(
                         runtime_for_fatal.fence_fatal_local_authority(),
                         &mut server,
                     )
                     .await;
-                    crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
+                    crate::tools::bash::shutdown_kill_tree_until(deadline, &bash_handles_for_shutdown).await;
                 };
-                if tls::bounded_post_shutdown_drain(fatal_tail, "HTTP fatal authority").await.is_none() {
+                if tls::bounded_post_shutdown_drain_until(deadline, fatal_tail, "HTTP fatal authority").await.is_none() {
                     server_abort.abort();
                 }
-                tracing_handles.shutdown_tracer();
-                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
+                tracing_handles.shutdown_tracer_until(deadline);
+                return Err(FatalLocalAuthorityExit.into());
             }
         }
     }
