@@ -105,7 +105,10 @@ export function SettingsDropdown({
     if (left + menuWidth > vw - margin) left = vw - menuWidth - margin;
     if (left < margin) left = margin;
     const top = tRect.bottom + 6;
-    const maxHeight = Math.max(120, vh - top - margin);
+    const safeAreaBottom = Number.parseFloat(
+      getComputedStyle(document.documentElement).getPropertyValue('--safe-area-bottom'),
+    ) || 0;
+    const maxHeight = Math.max(120, vh - top - margin - safeAreaBottom);
     setMenuPos((prev) =>
       prev && prev.top === top && prev.left === left && prev.maxHeight === maxHeight
         ? prev

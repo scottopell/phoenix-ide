@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
@@ -29,6 +29,9 @@ import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 
+const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
+const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
+
 export function ConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
@@ -42,6 +45,16 @@ export function ConversationListPage() {
   const { refresh } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
   const [showArchived, setShowArchived] = useState(false);
+  const mainRef = useRef<HTMLElement | null>(null);
+  const didRestoreScrollRef = useRef(false);
+  const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
+  const visibleConversationCount = showArchived ? archivedConversations.length : conversations.length;
+  const currentScrollKeyRef = useRef(currentScrollKey);
+  currentScrollKeyRef.current = currentScrollKey;
+
+  useEffect(() => {
+    if (isDesktop) didRestoreScrollRef.current = false;
+  }, [isDesktop]);
 
   // App state for offline/sync status
   const { isOnline, isReady, initError, pendingOpsCount, queueOperation } = useAppMachine();
@@ -128,9 +141,58 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
+  const saveScrollPositionForKey = useCallback((scrollKey: string, scrollOwner = mainRef.current) => {
+    if (!scrollOwner) return;
+    try {
+      localStorage.setItem(scrollKey, String(scrollOwner.scrollTop));
+    } catch (error) {
+      console.warn('Unable to save the mobile conversation-list scroll position', error);
+    }
+  }, []);
+
+  const saveScrollPosition = useCallback(() => {
+    saveScrollPositionForKey(currentScrollKey);
+  }, [currentScrollKey, saveScrollPositionForKey]);
+
+  const setMainScrollOwner = useCallback((node: HTMLElement | null) => {
+    if (mainRef.current && !node) {
+      saveScrollPositionForKey(currentScrollKeyRef.current, mainRef.current);
+    }
+    mainRef.current = node;
+  }, [saveScrollPositionForKey]);
+
+  useLayoutEffect(() => {
+    didRestoreScrollRef.current = false;
+  }, [currentScrollKey]);
+
+  useLayoutEffect(() => {
+    if (isDesktop || loading || !hasCompletedFirstFetch || didRestoreScrollRef.current || visibleConversationCount === 0) return;
+    const scrollOwner = mainRef.current;
+    if (!scrollOwner) return;
+    try {
+      const saved = Number(localStorage.getItem(currentScrollKey));
+      if (Number.isFinite(saved)) {
+        didRestoreScrollRef.current = true;
+        const maxScrollTop = Math.max(0, scrollOwner.scrollHeight - scrollOwner.clientHeight);
+        scrollOwner.scrollTop = Math.min(Math.max(0, saved), maxScrollTop);
+      }
+    } catch (error) {
+      console.warn('Unable to restore the mobile conversation-list scroll position', error);
+    }
+  }, [currentScrollKey, hasCompletedFirstFetch, isDesktop, loading, visibleConversationCount]);
+
+  useLayoutEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') saveScrollPosition();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [isDesktop, saveScrollPosition]);
+
   const handleConversationClick = useCallback((conv: Conversation) => {
+    saveScrollPosition();
     navigate(`/c/${conv.slug}`);
-  }, [navigate]);
+  }, [navigate, saveScrollPosition]);
 
   const handleNewConversation = () => {
     navigate('/new');
@@ -258,8 +320,9 @@ export function ConversationListPage() {
   };
 
   const handleToggleArchived = useCallback(() => {
+    saveScrollPosition();
     setShowArchived((prev) => !prev);
-  }, []);
+  }, [saveScrollPosition]);
 
   const handleSetDeleteTarget = useCallback((conv: Conversation) => {
     setDeleteTarget(conv);
@@ -281,12 +344,12 @@ export function ConversationListPage() {
   if (initError) {
     return (
       <div id="app" className="list-page">
-        <div className="init-error">
+        <main className="init-error" data-app-scroll-owner>
           <h2><AlertTriangle />Storage Error</h2>
           <p>Failed to initialize local storage: {initError}</p>
           <p>Please try refreshing the page. If the problem persists, try clearing your browser data for this site.</p>
           <button onClick={() => window.location.reload()} title="Reload this page">Refresh Page</button>
-        </div>
+        </main>
       </div>
     );
   }
@@ -330,7 +393,7 @@ export function ConversationListPage() {
           {pendingOpsCount > 0 && ` · ${pendingOpsCount} pending`}
         </div>
       )}
-      <main id="main-area" data-app-scroll-owner>
+      <main id="main-area" ref={setMainScrollOwner} data-app-scroll-owner>
         {loading ? (
           <section id="conversation-list" className="view active">
             <div className="view-header">

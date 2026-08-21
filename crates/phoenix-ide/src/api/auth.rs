@@ -24,6 +24,7 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use super::assets::public_root_asset;
 use super::AppState;
 
 /// Lifetime of a minted session token. Drives both the `expires_at` persisted
@@ -352,6 +353,7 @@ fn is_exempt_path(path: &str) -> bool {
     if path.starts_with("/assets/")
         || path == "/service-worker.js"
         || path == "/phoenix.svg"
+        || public_root_asset(path).is_some()
         || path == "/version"
         || path == "/api/version"
     {
@@ -592,6 +594,11 @@ mod tests {
         assert!(is_exempt_path("/assets/index-abc.js"));
         assert!(is_exempt_path("/service-worker.js"));
         assert!(is_exempt_path("/phoenix.svg"));
+        assert!(is_exempt_path("/manifest.webmanifest"));
+        assert!(is_exempt_path("/manifest-light.webmanifest"));
+        assert!(is_exempt_path("/apple-touch-icon.png"));
+        assert!(is_exempt_path("/icon-192.png"));
+        assert!(is_exempt_path("/icon-512.png"));
         assert!(is_exempt_path("/version"));
         assert!(is_exempt_path("/api/version"));
         assert!(is_exempt_path("/api/auth/status"));

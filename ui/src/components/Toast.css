@@ -27,6 +27,14 @@
   }
 }
 
+@media (display-mode: standalone) and (width <= 1024px) {
+  .toast-container {
+    top: calc(8px + env(safe-area-inset-top, 0));
+    width: calc(100vw - env(safe-area-inset-left, 0) - env(safe-area-inset-right, 0) - 16px);
+    max-width: 480px;
+  }
+}
+
 .toast {
   display: inline-flex;
   align-items: center;

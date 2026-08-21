@@ -17,6 +17,12 @@
   color: var(--text-primary);
 }
 
+@media (display-mode: standalone) {
+  .commission-review-approval {
+    min-height: 100%;
+  }
+}
+
 .commission-review-approval__header,
 .commission-review-approval__actions {
   padding: 16px 20px;
