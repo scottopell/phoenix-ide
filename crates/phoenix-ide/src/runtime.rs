@@ -393,6 +393,8 @@ pub struct RuntimeManager {
     subagent_persistence_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -1810,6 +1812,8 @@ impl RuntimeManager {
             subagent_persistence_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            fork_command_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),

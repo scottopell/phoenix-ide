@@ -76,6 +76,27 @@ pub(crate) enum ForkCommand {
     },
 }
 
+impl ForkCommand {
+    fn reject_after_fatal_authority(self) {
+        let error = || {
+            ForkResolveError::Internal(
+                "runtime admission closed after fatal local authority loss".to_string(),
+            )
+        };
+        match self {
+            Self::Approve { reply, .. } | Self::RequestChanges { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Self::Dismiss { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Self::RetireForOrigin { reply, .. } | Self::CleanupOnHardDelete { reply, .. } => {
+                let _ = reply.send(());
+            }
+        }
+    }
+}
+
 /// Fixed namespace for deterministic fork/refinement conversation ids. A v5
 /// UUID over `{proposal_id}:{kind}` under this namespace is stable across
 /// retries (so a crashed approve/promote re-derives the same id and adopts its
@@ -398,6 +419,15 @@ impl RuntimeManager {
     /// so it shares that task's lifecycle and ends when every `fork_cmd_tx` clone
     /// drops (no standalone task, no reference cycle to leak).
     pub(crate) async fn handle_fork_command(self: &std::sync::Arc<Self>, cmd: ForkCommand) {
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            cmd.reject_after_fatal_authority();
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.fork_command_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         match cmd {
             ForkCommand::Approve { proposal_id, reply } => {
                 let _ = reply.send(self.handle_approve(&proposal_id).await);
@@ -1653,6 +1683,56 @@ mod tests {
         // call resolves through the actor's channel, not inline.
         rt.start_sub_agent_handler().await;
         rt
+    }
+
+    #[tokio::test]
+    async fn queued_fork_command_is_rejected_after_fatal_closure() {
+        let rt = make_runtime(Database::open_in_memory().await.unwrap()).await;
+        rt.signal_fatal_local_authority("test_fork_boundary");
+        let (reply, reply_rx) = oneshot::channel();
+
+        rt.handle_fork_command(ForkCommand::Dismiss {
+            proposal_id: "queued-proposal".to_string(),
+            reply,
+        })
+        .await;
+
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(ForkResolveError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+    }
+
+    #[tokio::test]
+    async fn admitted_fork_command_remains_owned_until_settlement() {
+        let rt = make_runtime(Database::open_in_memory().await.unwrap()).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *rt.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
+        let (reply, reply_rx) = oneshot::channel();
+        let command = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move {
+                rt.handle_fork_command(ForkCommand::Dismiss {
+                    proposal_id: "admitted-proposal".to_string(),
+                    reply,
+                })
+                .await;
+            })
+        };
+
+        barrier.wait().await;
+        rt.signal_fatal_local_authority("test_fork_boundary");
+        assert_eq!(
+            rt.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        command.await.unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(ForkResolveError::NotFound(_))
+        ));
     }
 
     /// Create a project + a live Direct-mode origin conversation in it. Returns
