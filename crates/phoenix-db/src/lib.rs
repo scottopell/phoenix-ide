@@ -9,6 +9,7 @@ mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
 mod sqlite_telemetry;
+mod sqlite_workload;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
@@ -48,6 +49,7 @@ use phoenix_core::domain::llm_types::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use sqlite_workload::SqliteWorkloadCollector;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -1222,6 +1224,7 @@ impl SubAgentCreationTestLatch {
 
 pub struct Database {
     pool: SqlitePool,
+    sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
@@ -1235,6 +1238,7 @@ impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
                 .dormant_git_repository_catchup_authority_state
@@ -1346,6 +1350,11 @@ impl Database {
         &self.pool
     }
 
+    #[must_use]
+    pub(crate) fn sqlite_workload_collector(&self) -> &SqliteWorkloadCollector {
+        &self.sqlite_workload_collector
+    }
+
     #[allow(
         dead_code,
         reason = "task 59004 consumes the existing dormant catch-up seam"
@@ -1378,6 +1387,7 @@ impl Database {
     fn new_with_generated_target_binding(pool: SqlitePool, path: String) -> Self {
         Self {
             pool,
+            sqlite_workload_collector: SqliteWorkloadCollector::new(),
             path,
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
