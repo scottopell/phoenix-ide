@@ -1926,6 +1926,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(trigger);
     const abandon = screen.getByRole('button', { name: /^Abandon\./ });
     abandon.focus();
+    fireEvent.focusIn(abandon);
     rerender(renderBar('stuck'));
 
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
@@ -2151,6 +2152,36 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
+  it('suppresses desktop recovery after the conversation continues elsewhere', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-desktop-continued"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId="conv-next"
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Resume PR inference' })).not.toBeInTheDocument();
+    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
   });
 
   it('offers desktop inference recovery for an unresolved explicit selection', async () => {

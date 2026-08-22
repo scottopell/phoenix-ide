@@ -298,7 +298,7 @@ export function WorkControlBar({
       return;
     }
     if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) {
-      const menuOwnedFocus = fallbackDockRef.current?.querySelector('#mobile-work-fallback-more-actions')?.contains(document.activeElement) ?? false;
+      const menuOwnedFocus = fallbackOwnedFocusRef.current;
       setFallbackPanel(null);
       if (menuOwnedFocus) {
         requestAnimationFrame(() => (fallbackMenuButtonRef.current ?? fallbackInfoButtonRef.current)?.focus());
@@ -853,7 +853,7 @@ export function WorkControlBar({
         >
           Workspace Diff
         </button>
-        {explicitSelectionUnresolved && (
+        {explicitSelectionUnresolved && disposition.primary !== 'none' && (
           <button
             type="button"
             className="work-actions-btn work-actions-resolve work-actions-btn--primary"
