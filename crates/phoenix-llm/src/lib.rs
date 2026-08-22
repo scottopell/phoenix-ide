@@ -347,9 +347,9 @@ impl LoggingService {
                 LlmErrorKind::Network => LlmAttemptOutcome::NetworkError,
                 LlmErrorKind::ContextWindowExceeded => LlmAttemptOutcome::TokenBudgetExceeded,
                 LlmErrorKind::Auth => LlmAttemptOutcome::AuthError,
-                LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => {
-                    LlmAttemptOutcome::RequestRejected
-                }
+                LlmErrorKind::InvalidRequest
+                | LlmErrorKind::PromptRejected
+                | LlmErrorKind::ContentFilter => LlmAttemptOutcome::RequestRejected,
             },
         };
         let stream = match result {

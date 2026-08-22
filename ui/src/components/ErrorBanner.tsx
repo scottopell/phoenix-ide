@@ -36,6 +36,14 @@ function humanizeError(
     };
   }
 
+  if (errorKind === 'prompt_rejected') {
+    return {
+      title: 'Prompt rejected',
+      details:
+        'The provider rejected the assembled prompt. Revise your next message or retry with “continue” to keep working in this conversation.',
+    };
+  }
+
   // Try to parse as JSON (backend often wraps errors)
   try {
     const parsed = JSON.parse(message);

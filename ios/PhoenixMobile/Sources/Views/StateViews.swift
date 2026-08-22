@@ -70,7 +70,7 @@ struct StateDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .error(let message):
+        case .error(let message, _):
             errorCard(message: message)
 
         case .creationFailed(let message):

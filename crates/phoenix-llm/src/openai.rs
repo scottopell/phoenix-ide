@@ -121,19 +121,7 @@ pub async fn complete(
     // means we're on the platform Responses API path, which doesn't emit the
     // codex `x-codex-*` headers or `usage_limit_reached` envelopes.
     if !status.is_success() {
-        if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
-            let message = error_resp.error.message;
-            return Err(match status.as_u16() {
-                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-                429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400..=499 => {
-                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
-                }
-                500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
-            });
-        }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(responses_http_error(status.as_u16(), &body));
     }
 
     let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
@@ -156,17 +144,21 @@ pub async fn complete(
 /// `parse_codex_error` uses on the HTTP-status path. SSE-side has no headers,
 /// so `QuotaDetails` is empty — the plan-aware formatter handles `plan_type:
 /// None` by falling back to generic wording (see PR #77 tests).
-fn classify_responses_error(code: &str, message: &str) -> LlmError {
-    let detail = if code.is_empty() {
+fn responses_error_detail(code: &str, message: &str) -> String {
+    if code.is_empty() {
         message.to_string()
     } else {
         format!("{code}: {message}")
-    };
+    }
+}
+
+fn classify_known_responses_error(code: &str, message: &str) -> Option<LlmError> {
+    let detail = responses_error_detail(code, message);
     let lower = code.to_ascii_lowercase();
 
     // Codex-specific terminal signals — match PR 77's HTTP-path semantics.
     if lower == "usage_limit_reached" {
-        return LlmError::usage_limit_reached(QuotaDetails {
+        return Some(LlmError::usage_limit_reached(QuotaDetails {
             plan_type: None,
             resets_at: None,
             limit_id: None,
@@ -178,40 +170,75 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
             individual_limit: None,
             promo_message: None,
             rate_limit_reached_type: None,
-        });
+        }));
     }
     if lower == "usage_not_included" {
-        return LlmError::auth(
+        return Some(LlmError::auth(
             "Upgrade required: this plan does not include Codex usage. \
              Visit https://chatgpt.com/codex/settings/usage to upgrade.",
-        );
+        ));
     }
     if lower == "server_is_overloaded" || lower == "slow_down" {
-        return LlmError::server_overloaded(
+        return Some(LlmError::server_overloaded(
             "Selected model is at capacity. Try a different model.",
-        );
+        ));
+    }
+    if lower == "invalid_prompt" {
+        return Some(LlmError::prompt_rejected(detail));
     }
 
     if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
-        LlmError::rate_limit(detail)
+        Some(LlmError::rate_limit(detail))
     } else if lower.contains("auth")
         || lower.contains("invalid_api_key")
         || lower.contains("permission")
     {
-        LlmError::auth(detail)
+        Some(LlmError::auth(detail))
     } else if lower.contains("context_length")
         || lower.contains("token_limit")
         || lower.contains("max_tokens")
     {
-        LlmError::new(super::LlmErrorKind::ContextWindowExceeded, detail)
+        Some(LlmError::new(
+            super::LlmErrorKind::ContextWindowExceeded,
+            detail,
+        ))
     } else if lower.contains("content_filter") || lower.contains("safety") {
-        LlmError::new(super::LlmErrorKind::ContentFilter, detail)
+        Some(LlmError::new(super::LlmErrorKind::ContentFilter, detail))
     } else if lower.contains("invalid") || lower.contains("bad_request") {
-        LlmError::invalid_request(detail)
+        Some(LlmError::invalid_request(detail))
     } else {
-        // Default: retryable server error so the executor's retry loop kicks in.
-        LlmError::server_error(detail)
+        None
     }
+}
+
+fn classify_responses_error(code: &str, message: &str) -> LlmError {
+    classify_known_responses_error(code, message).unwrap_or_else(|| {
+        // A streaming error has no HTTP status to fall back to. Unknown codes
+        // remain retryable so the executor can recover from provider failures.
+        LlmError::server_error(responses_error_detail(code, message))
+    })
+}
+
+fn responses_http_error(status: u16, body: &str) -> LlmError {
+    if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
+        let message = error_resp.error.message;
+        if let Some(error) = error_resp
+            .error
+            .code
+            .as_deref()
+            .and_then(|code| classify_known_responses_error(code, &message))
+        {
+            return error;
+        }
+        return match status {
+            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
+            429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+            400..=499 => LlmError::invalid_request(format!("Bad request ({status}): {message}")),
+            500..=599 => LlmError::server_error(format!("Server error: {message}")),
+            _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
+        };
+    }
+    LlmError::from_http_status(status, body)
 }
 
 /// Accumulates state across Responses API SSE stream events.
@@ -847,8 +874,28 @@ fn parse_wrapped_codex_websocket_error(value: &serde_json::Value) -> Option<LlmE
             }
         }
     }
-    parse_codex_error(status, &headers, &body)
-        .or_else(|| Some(LlmError::from_http_status(status, &body)))
+    parse_codex_error(status, &headers, &body).or_else(|| {
+        let code = error.get("code").and_then(serde_json::Value::as_str);
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| code.unwrap_or("unknown error"));
+        if let Some(classified) =
+            code.and_then(|code| classify_known_responses_error(code, message))
+        {
+            return Some(classified);
+        }
+        if code.is_none() {
+            if let Some(classified) = error
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|error_type| classify_known_responses_error(error_type, message))
+            {
+                return Some(classified);
+            }
+        }
+        Some(responses_http_error(status, &body))
+    })
 }
 
 fn parse_codex_rate_limits(value: &serde_json::Value) -> Option<QuotaDetails> {
@@ -1318,7 +1365,7 @@ pub async fn complete_streaming(
                 return Err(err);
             }
         }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(responses_http_error(status.as_u16(), &body));
     }
 
     // Codex bridge emits a fresh quota snapshot in response headers on
@@ -3556,6 +3603,21 @@ mod tests {
         assert_eq!(error.kind, crate::LlmErrorKind::InvalidRequest);
     }
 
+    #[test]
+    fn wrapped_websocket_invalid_prompt_is_user_resumable() {
+        let error = parse_wrapped_codex_websocket_error(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_prompt",
+                "message": "prompt rejected by policy"
+            }
+        }))
+        .expect("wrapped error maps");
+        assert_eq!(error.kind, crate::LlmErrorKind::PromptRejected);
+        assert!(error.kind.is_user_resumable());
+    }
+
     #[tokio::test]
     async fn websocket_reuses_connection_continues_resets_and_falls_back_safely() {
         // also covers HTTP fallback path: the mock HTTP SSE stream emits control + text + terminal.
@@ -4639,6 +4701,10 @@ mod tests {
             LlmErrorKind::ContentFilter
         );
         assert_eq!(
+            classify_responses_error("invalid_prompt", "x").kind,
+            LlmErrorKind::PromptRejected
+        );
+        assert_eq!(
             classify_responses_error("invalid_request_error", "x").kind,
             LlmErrorKind::InvalidRequest
         );
@@ -4652,6 +4718,32 @@ mod tests {
             classify_responses_error("", "boom").kind,
             LlmErrorKind::ServerError
         );
+    }
+
+    #[test]
+    fn responses_http_error_routes_provider_code_through_classifier() {
+        use super::super::LlmErrorKind;
+
+        let prompt_rejected = responses_http_error(
+            400,
+            r#"{"error":{"message":"prompt rejected by policy","type":"invalid_request_error","code":"invalid_prompt"}}"#,
+        );
+        assert_eq!(prompt_rejected.kind, LlmErrorKind::PromptRejected);
+        assert!(prompt_rejected.kind.is_user_resumable());
+
+        let generic_invalid = responses_http_error(
+            400,
+            r#"{"error":{"message":"unsupported input","type":"invalid_request_error","code":"invalid_request_error"}}"#,
+        );
+        assert_eq!(generic_invalid.kind, LlmErrorKind::InvalidRequest);
+        assert!(!generic_invalid.kind.is_user_resumable());
+
+        let unknown_client_code = responses_http_error(
+            404,
+            r#"{"error":{"message":"model does not exist","type":"invalid_request_error","code":"model_not_found"}}"#,
+        );
+        assert_eq!(unknown_client_code.kind, LlmErrorKind::InvalidRequest);
+        assert!(!unknown_client_code.kind.is_auto_retryable());
     }
 
     #[tokio::test]

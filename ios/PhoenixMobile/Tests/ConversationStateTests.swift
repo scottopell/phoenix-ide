@@ -106,8 +106,8 @@ final class ConversationStateTests: XCTestCase {
 
     func testErrorCarriesMessage() {
         XCTAssertEqual(
-            parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"llm_rate_limit\"}"),
-            .error(message: "rate limited"))
+            parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"rate_limit\"}"),
+            .error(message: "rate limited", kind: .rateLimit))
     }
 
     func testCreationFailedCarriesServerError() {
@@ -224,7 +224,8 @@ final class ConversationStateTests: XCTestCase {
             parse("{\"type\":\"tool_executing\"}"),
             .toolExecuting(toolName: "tool", remainingCount: 0, completedCount: 0))
         XCTAssertEqual(
-            parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
+            parse("{\"type\":\"error\"}"),
+            .error(message: "Unknown error", kind: .unknown))
     }
     func testDeliveryPolicyCoversChatArchiveAndSessionActions() {
         XCTAssertEqual(ClientOperation.chat.policy, .outboxed)
@@ -280,7 +281,15 @@ final class ConversationStateTests: XCTestCase {
 
     func testChatEligibilityMatchesInteractiveStateFamilies() {
         XCTAssertTrue(ConversationState.idle.acceptsChatMessage)
-        XCTAssertTrue(ConversationState.error(message: "retryable").acceptsChatMessage)
+        XCTAssertTrue(
+            ConversationState.error(message: "retryable", kind: .serverError)
+                .acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.error(message: "terminal", kind: .invalidRequest)
+                .acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.error(message: "unknown", kind: .unknown)
+                .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)

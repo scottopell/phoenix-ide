@@ -10985,6 +10985,7 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
         phoenix_llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         phoenix_llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
+        phoenix_llm::LlmErrorKind::PromptRejected => crate::db::ErrorKind::PromptRejected,
         phoenix_llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
         phoenix_llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
         phoenix_llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
@@ -11050,6 +11051,9 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             recovery_in_progress: error.recovery_in_progress,
         },
         LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
+            message: error.message,
+        },
+        LlmErrorKind::PromptRejected => LlmOutcome::PromptRejected {
             message: error.message,
         },
     }
@@ -11236,6 +11240,10 @@ mod error_mapping_tests {
             crate::db::ErrorKind::InvalidRequest
         );
         assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::PromptRejected),
+            crate::db::ErrorKind::PromptRejected
+        );
+        assert_eq!(
             llm_error_to_db_error(LlmErrorKind::ServerError),
             crate::db::ErrorKind::ServerError,
             "ServerError must map to ServerError"
@@ -11314,6 +11322,18 @@ mod error_mapping_tests {
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn prompt_rejection_is_user_resumable_without_auto_retry() {
+        let db_error = llm_error_to_db_error(LlmErrorKind::PromptRejected);
+        assert!(!db_error.is_auto_retryable());
+        assert!(db_error.is_user_resumable());
+
+        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::prompt_rejected(
+            "invalid_prompt: policy rejected the assembled prompt",
+        ));
+        assert!(matches!(outcome, LlmOutcome::PromptRejected { .. }));
     }
 
     #[test]

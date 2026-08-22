@@ -818,6 +818,7 @@ fn transition_code(err: &TransitionError) -> &'static str {
     match err {
         TransitionError::ContextExhausted => "context_exhausted",
         TransitionError::ConversationTerminal => "conversation_terminal",
+        TransitionError::NonResumableError => "non_resumable_error",
         TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
         TransitionError::AwaitingUserResponse => "awaiting_user_response",
         TransitionError::AgentBusy => "agent_busy",

@@ -74,6 +74,9 @@ pub enum LlmOutcome {
     },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
+    /// Provider rejected the assembled prompt. This does not retry the same
+    /// request automatically, but persists a user-resumable conversation error.
+    PromptRejected { message: String },
     /// Request was cancelled (abort signal received).
     #[allow(dead_code)]
     Cancelled,

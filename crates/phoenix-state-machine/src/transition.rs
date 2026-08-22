@@ -269,6 +269,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::UsageLimitReached
         | ErrorKind::ServerOverloaded
         | ErrorKind::InvalidRequest
+        | ErrorKind::PromptRejected
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
@@ -371,6 +372,8 @@ pub enum TransitionError {
     AwaitingUserResponse,
     #[error("Conversation has reached terminal state (completed or abandoned)")]
     ConversationTerminal,
+    #[error("Conversation error does not allow a new message; start a new conversation")]
+    NonResumableError,
     #[error("Invalid transition: no arm for state={state} event={event}")]
     InvalidTransition {
         /// Variant name of the `ConvState` that didn't have a matching
@@ -412,8 +415,9 @@ pub enum TransitionError {
 /// not accept a new user message.
 pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), TransitionError> {
     match state {
-        // Idle and Error: transition_core arm (Idle | Error, UserMessage) → LlmRequesting
-        ConvState::Idle | ConvState::Error { .. } => Ok(()),
+        ConvState::Idle => Ok(()),
+        ConvState::Error { error_kind, .. } if error_kind.is_user_resumable() => Ok(()),
+        ConvState::Error { .. } => Err(TransitionError::NonResumableError),
 
         // transition_core: AgentBusy
         ConvState::LlmRequesting { .. }
@@ -657,6 +661,20 @@ impl CoreTransitionResult {
 // transition_core — shared behavior for both parent and sub-agent
 // ============================================================================
 
+fn core_state_accepts_user_message(state: &CoreState) -> bool {
+    match state {
+        CoreState::Idle => true,
+        CoreState::Error { error_kind, .. } => error_kind.is_user_resumable(),
+        CoreState::LlmRequesting { .. }
+        | CoreState::ToolExecuting { .. }
+        | CoreState::CancellingTool { .. }
+        | CoreState::AwaitingSubAgents { .. }
+        | CoreState::CancellingSubAgents { .. }
+        | CoreState::AwaitingContinuation { .. }
+        | CoreState::RecoverableContinuationFailure { .. } => false,
+    }
+}
+
 /// Core transition function handling behavior shared by both conversation types.
 ///
 /// Routes (state, event) pairs to domain-specific handlers. Each handler is
@@ -689,35 +707,40 @@ pub fn transition_core(
                 user_agent,
                 skill_invocation,
             },
-        ) => Ok(
-            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::persist_user_message(
-                    text.clone(),
-                    llm_text.clone(),
-                    images.clone(),
-                    files.clone(),
-                    message_id.clone(),
-                    user_agent.clone(),
-                    skill_invocation.clone(),
-                    false,
-                ))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm),
-        ),
+        ) if core_state_accepts_user_message(state) => Ok(CoreTransitionResult::new(
+            CoreState::LlmRequesting { attempt: 1 },
+        )
+        .with_effect(Effect::persist_user_message(
+            text.clone(),
+            llm_text.clone(),
+            images.clone(),
+            files.clone(),
+            message_id.clone(),
+            user_agent.clone(),
+            skill_invocation.clone(),
+            false,
+        ))
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())
+        .with_effect(Effect::RequestLlm)),
         (
             CoreState::Idle | CoreState::Error { .. },
             CoreEvent::AuthoritativeUserMessage { payload, authority },
-        ) => Ok(
-            CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
-                .with_effect(Effect::PersistAuthoritativeUserMessage {
-                    payload: payload.as_ref().clone(),
-                    authority: authority.clone(),
-                    idempotent: false,
-                })
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm),
-        ),
+        ) if core_state_accepts_user_message(state) => Ok(CoreTransitionResult::new(
+            CoreState::LlmRequesting { attempt: 1 },
+        )
+        .with_effect(Effect::PersistAuthoritativeUserMessage {
+            payload: payload.as_ref().clone(),
+            authority: authority.clone(),
+            idempotent: false,
+        })
+        .with_effect(Effect::notify_state_change())
+        .with_effect(Effect::RequestLlm)),
+
+        (
+            CoreState::Error { .. },
+            CoreEvent::UserMessage { .. } | CoreEvent::AuthoritativeUserMessage { .. },
+        ) => Err(TransitionError::NonResumableError),
 
         (
             CoreState::LlmRequesting { .. }
@@ -3660,6 +3683,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::PromptRejected { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::PromptRejected,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -3868,6 +3901,9 @@ pub fn llm_error_to_db_error(
         phoenix_core::domain::llm_error_kind::LlmErrorKind::Network => ErrorKind::Network,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidRequest => {
             ErrorKind::InvalidRequest
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::PromptRejected => {
+            ErrorKind::PromptRejected
         }
         phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidResponse => {
             ErrorKind::InvalidResponse
@@ -6547,6 +6583,47 @@ mod tests {
     #[test]
     fn check_user_message_acceptable_idle_ok() {
         assert!(check_user_message_acceptable(&ConvState::Idle).is_ok());
+    }
+
+    #[test]
+    fn prompt_rejection_accepts_a_fresh_user_turn() {
+        let state = ConvState::Error {
+            message: "invalid_prompt".to_string(),
+            error_kind: ErrorKind::PromptRejected,
+            resets_at: None,
+        };
+
+        assert!(check_user_message_acceptable(&state).is_ok());
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::UserMessage {
+                text: "revised request".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "recovery-message".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+        .expect("prompt rejection must remain recoverable in place");
+        assert!(matches!(
+            result.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+    }
+
+    #[test]
+    fn non_resumable_error_rejects_a_hidden_chat_post() {
+        let state = ConvState::Error {
+            message: "malformed request".to_string(),
+            error_kind: ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+
+        let err = check_user_message_acceptable(&state).expect_err("must reject");
+        assert!(matches!(err, TransitionError::NonResumableError));
     }
 
     #[test]
