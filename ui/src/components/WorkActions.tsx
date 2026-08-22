@@ -454,6 +454,15 @@ export function WorkControlBar({
         </div>
 
         {fallbackPanel !== 'info' && (disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
+          {cleanupBlockedByAmbiguity && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--hero"
+              onClick={requestActivePrSelectorOpen}
+            >
+              Select active PR
+            </button>
+          )}
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}

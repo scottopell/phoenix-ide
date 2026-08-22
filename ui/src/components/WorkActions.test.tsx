@@ -1900,6 +1900,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(api.markMerged).not.toHaveBeenCalled();
   });
 
