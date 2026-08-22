@@ -110,10 +110,12 @@ interface PhysicalStore<T> {
    *  the top spacer (mid-scroll anchor compensation, REQ-VT-004). */
   drift: number;
   lastScrollAtMs: number;
-  /** Identifiers of touches that began anywhere inside this scroller and
-   *  are still down. `targetTouches` cannot serve here: it is scoped to the
-   *  event's target row, so an ancestor listener reads zero while a finger
-   *  remains down on a sibling row. */
+  /** Ids of touch pointers that went down inside this scroller and have not
+   *  come up. Pointer events rather than touch events: a touch target is
+   *  fixed at touchstart, so when virtualization unmounts the touched row
+   *  its touchend is dispatched at a detached node and observed by nobody —
+   *  scroller, document and window alike — stranding the gesture open.
+   *  Pointer events retarget on removal and still deliver pointerup. */
   activeTouchIds: Set<number>;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
@@ -622,30 +624,25 @@ function VirtualTranscriptInner<T>(
         current.initialTailPending = false;
         setScrollerScrollTop(current, totalPhysicalExtent(current));
       }
-      // changedTouches carries exactly the touches this event starts or
-      // ends, whichever descendant they landed on, so the set stays accurate
-      // for multi-finger gestures spanning rows.
-      const onTouchStart = (event: TouchEvent) => {
+      const onPointerDown = (event: PointerEvent) => {
+        const store = storeRef.current;
+        if (!store || event.pointerType !== 'touch') return;
+        store.activeTouchIds.add(event.pointerId);
+      };
+      // Bound on the window so a pointer that leaves the scroller — or whose
+      // element is unmounted under it — still reports its release.
+      const onPointerStop = (event: PointerEvent) => {
         const store = storeRef.current;
         if (!store) return;
-        for (const touch of Array.from(event.changedTouches)) {
-          store.activeTouchIds.add(touch.identifier);
-        }
+        store.activeTouchIds.delete(event.pointerId);
       };
-      const onTouchStop = (event: TouchEvent) => {
-        const store = storeRef.current;
-        if (!store) return;
-        for (const touch of Array.from(event.changedTouches)) {
-          store.activeTouchIds.delete(touch.identifier);
-        }
-      };
-      element.addEventListener('touchstart', onTouchStart, { passive: true });
-      element.addEventListener('touchend', onTouchStop, { passive: true });
-      element.addEventListener('touchcancel', onTouchStop, { passive: true });
+      element.addEventListener('pointerdown', onPointerDown, { passive: true });
+      window.addEventListener('pointerup', onPointerStop, { passive: true });
+      window.addEventListener('pointercancel', onPointerStop, { passive: true });
       detachTouchListenersRef.current = () => {
-        element.removeEventListener('touchstart', onTouchStart);
-        element.removeEventListener('touchend', onTouchStop);
-        element.removeEventListener('touchcancel', onTouchStop);
+        element.removeEventListener('pointerdown', onPointerDown);
+        window.removeEventListener('pointerup', onPointerStop);
+        window.removeEventListener('pointercancel', onPointerStop);
       };
     }
     recompute(current);

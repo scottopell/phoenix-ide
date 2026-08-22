@@ -2464,7 +2464,7 @@ describe('handleTotalListHeightChanged', () => {
 
       // Engagement stops the watch: no more corrections after the user
       // takes over.
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       written.length = 0;
       act(() => vi.advanceTimersByTime(1000));
       expect(written).toHaveLength(0);
@@ -2530,12 +2530,12 @@ describe('handleTotalListHeightChanged', () => {
   it.each([
     ['moved touch cancellation', (scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       void rerender;
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       fireEvent.touchMove(scroller, { touches: [{}] });
       // The gesture leaves the pin zone before cancelling — a cancel inside
       // the zone would legitimately confirm tail return instead.
       act(() => virtualTranscriptMock.pinnedChanged?.(false));
-      fireEvent.touchCancel(scroller, { touches: [] });
+      fireEvent.touchCancel(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
     }],
     ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
       rerender(withConvContext(
@@ -2633,7 +2633,7 @@ describe('handleTotalListHeightChanged', () => {
     // The user starts dragging up (still within the pin threshold) and
     // VirtualTranscript reports them off the bottom.
     act(() => virtualTranscriptMock.pinnedChanged?.(false));
-    fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
     fireEvent.touchMove(scroller, { touches: [{}] });
 
     // Genuine tail growth (sub-agents phase) lands while the gesture
@@ -2740,7 +2740,7 @@ describe('handleTotalListHeightChanged', () => {
       // Finger goes down and drags up out of the pin zone (the drag's scroll
       // event refreshes geometry: 600 - 80 - 400 = 120 above the bottom)
       // when a measurement-driven height delta lands.
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       fireEvent.touchMove(scroller, { touches: [{}] });
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
       fireEvent.scroll(scroller);
@@ -2749,7 +2749,7 @@ describe('handleTotalListHeightChanged', () => {
 
       // A finger lift outside the pin zone and elapsed time do not release
       // durable reading ownership.
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(700));
@@ -2787,8 +2787,8 @@ describe('handleTotalListHeightChanged', () => {
 
       // Momentum follows a real gesture: finger down + lift (engagement),
       // then the fling's upward scroll events with no finger down.
-      fireEvent.touchStart(scroller, { touches: [{}] });
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       // scrollTop decreases (upward) — momentum after finger lift, a wheel
       // notch, or a scrollbar drag all look like this.
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 60, clientHeight: 400 });
@@ -2841,9 +2841,9 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -2891,9 +2891,9 @@ describe('handleTotalListHeightChanged', () => {
       act(() => virtualTranscriptMock.pinnedChanged?.(true));
 
       vi.setSystemTime(1100);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1110);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1150);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -2937,22 +2937,22 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1070);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1080);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 80, clientHeight: 400 });
       fireEvent.scroll(scroller);
       act(() => virtualTranscriptMock.pinnedChanged?.(false));
 
       vi.setSystemTime(1800);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1820);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1830);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
 
       vi.setSystemTime(1900);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
@@ -3001,11 +3001,11 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
       vi.setSystemTime(1070);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -3048,7 +3048,7 @@ describe('handleTotalListHeightChanged', () => {
       virtualTranscriptMock.scrollToTail.mockClear();
 
       vi.setSystemTime(1050);
-      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
       // The at-bottom confirmation is blocked while the moved touch owns the
@@ -3062,7 +3062,7 @@ describe('handleTotalListHeightChanged', () => {
       // return: this edge is never re-delivered, so deferring it past the
       // touch would strand the user in reading with a permanent unread chip.
       vi.setSystemTime(1070);
-      fireEvent.touchEnd(scroller, { touches: [] });
+      fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1100);
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
       act(() => virtualTranscriptMock.totalExtentChanged?.(600));
@@ -3096,17 +3096,61 @@ describe('handleTotalListHeightChanged', () => {
     act(() => virtualTranscriptMock.totalExtentChanged?.(500));
     virtualTranscriptMock.scrollToTail.mockClear();
 
-    fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
     fireEvent.touchMove(scroller, { touches: [{}] });
     // The gesture leaves the pin zone before cancelling — a cancel inside
     // the zone confirms tail return instead of holding reading ownership.
     act(() => virtualTranscriptMock.pinnedChanged?.(false));
-    fireEvent.touchCancel(scroller, { touches: [] });
+    fireEvent.touchCancel(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
     act(() => virtualTranscriptMock.totalExtentChanged?.(600));
 
     expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('resolves a gesture whose row unmounts before the finger lifts', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-detached-touch-target"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+
+    // The finger lands on a row, drags up out of the pin zone, then the row
+    // is virtualized away while still under the finger.
+    const row = document.createElement('div');
+    scroller.appendChild(row);
+    fireEvent.touchStart(row, { touches: [{ identifier: 7 }], changedTouches: [{ identifier: 7 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 7 }] });
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 20, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    act(() => virtualTranscriptMock.totalExtentChanged?.(600));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+    row.remove();
+
+    // The finger lifts, but its touchend is dispatched at the detached row
+    // and reaches no listener anywhere — verified against Chromium, where
+    // scroller, document and window all miss it. The gesture cannot resolve
+    // at that instant; what must not happen is a permanent wedge, so the
+    // next gesture prunes the vanished touch and resolves normally.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 8 }], changedTouches: [{ identifier: 8 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 8 }] });
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 200, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
   it('downward scroll does not suppress the pinned re-snap', () => {

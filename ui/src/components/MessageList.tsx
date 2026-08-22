@@ -775,6 +775,13 @@ function MessageListImpl({
   const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
   const updateEarlierHistoryRestoreRef = useRef<() => void>(() => {});
   const touchStartYRef = useRef<number | null>(null);
+  /** Identifiers of touches that began on the transcript. Counts are taken
+   *  by intersecting this with the event's live `touches` list: the set alone
+   *  over-counts a finger whose row was unmounted mid-gesture (its touchend
+   *  reaches no listener at all), while `touches` alone counts fingers down
+   *  elsewhere on the page. The intersection is both scoped and self-healing,
+   *  since a vanished touch is absent from every later event's list. */
+  const scrollerTouchIdsRef = useRef(new Set<number>());
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -902,6 +909,13 @@ function MessageListImpl({
         if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
       const onTouchStart = (e: TouchEvent) => {
+        const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(scrollerTouchIdsRef.current)) {
+          if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
+        }
+        for (const touch of Array.from(e.changedTouches)) {
+          scrollerTouchIdsRef.current.add(touch.identifier);
+        }
         touchStartYRef.current = e.touches[0]?.clientY ?? null;
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
@@ -913,14 +927,24 @@ function MessageListImpl({
           requestFromUpwardIntent();
         }
       };
-      const onTouchEnd = (e: TouchEvent) => {
+      const resolveTouchStop = (e: TouchEvent, type: 'touchEnded' | 'touchCancelled') => {
+        let owned = false;
+        for (const touch of Array.from(e.changedTouches)) {
+          if (scrollerTouchIdsRef.current.delete(touch.identifier)) owned = true;
+        }
+        // Prune anything the browser no longer reports as down, so a touch
+        // whose row was unmounted before it lifted cannot hold the gesture
+        // open past this event.
+        const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(scrollerTouchIdsRef.current)) {
+          if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
+        }
+        if (!owned) return;
         touchStartYRef.current = null;
-        dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
+        dispatchScrollEvent({ type, remainingTouches: scrollerTouchIdsRef.current.size });
       };
-      const onTouchCancel = (e: TouchEvent) => {
-        touchStartYRef.current = null;
-        dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
-      };
+      const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
+      const onTouchCancel = (e: TouchEvent) => resolveTouchStop(e, 'touchCancelled');
       const onWheel = (e: WheelEvent) => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
@@ -985,6 +1009,8 @@ function MessageListImpl({
       ref.addEventListener('touchmove', onTouchMove, { passive: true });
       ref.addEventListener('touchend', onTouchEnd, { passive: true });
       ref.addEventListener('touchcancel', onTouchCancel, { passive: true });
+      window.addEventListener('touchend', onTouchEnd, { passive: true });
+      window.addEventListener('touchcancel', onTouchCancel, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
       window.addEventListener('keydown', onKeyDown);
@@ -994,6 +1020,9 @@ function MessageListImpl({
         ref.removeEventListener('touchmove', onTouchMove);
         ref.removeEventListener('touchend', onTouchEnd);
         ref.removeEventListener('touchcancel', onTouchCancel);
+        window.removeEventListener('touchend', onTouchEnd);
+        window.removeEventListener('touchcancel', onTouchCancel);
+        scrollerTouchIdsRef.current.clear();
         ref.removeEventListener('wheel', onWheel);
         ref.removeEventListener('scroll', onScroll);
         window.removeEventListener('keydown', onKeyDown);

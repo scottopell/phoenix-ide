@@ -68,9 +68,14 @@ value BrowserSessionLifecycleEvent {
 -- carrier kinds as string discriminants, not as referencable per-variant
 -- values. It is the wire-visible counterpart of the internal lifecycle
 -- event above: fanning that one out is not by itself delivery.
+--
+-- The wire carries a viewer-facing boolean, not the lifecycle kind:
+-- SseWireEvent::BrowserSessionState { active }, mapped from the kind by
+-- BrowserSessionLifecycleKind::viewer_active. Sequencing is sse_wire's
+-- concern and is not modelled here.
 value BrowserSessionStateEvent {
     conversation: bedrock/Conversation
-    kind: BrowserLifecycleKind
+    active: Boolean
 }
 
 ------------------------------------------------------------
@@ -423,7 +428,7 @@ rule LifecycleEventFannedOut {
              and live_runtime_exists(c):
         BrowserSessionStateEvent.delivered(
             c,
-            kind in { active, teardown_pending }
+            active = kind in { active, teardown_pending }
         )
 
     @guidance
