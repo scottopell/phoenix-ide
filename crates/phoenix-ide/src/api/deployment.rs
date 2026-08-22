@@ -206,6 +206,7 @@ pub struct SqliteClassificationSummary {
     pub other_operation_share_percent: Option<f64>,
     pub abandoned_count: u64,
     pub classification_gap_count: u64,
+    pub writer_occupancy_gap_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -788,6 +789,7 @@ fn classification_summary(
         },
         abandoned_count,
         classification_gap_count: report.classification_gap_count,
+        writer_occupancy_gap_count: report.writer_occupancy_gap_count,
     }
 }
 

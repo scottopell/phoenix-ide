@@ -3,13 +3,13 @@ use crate::sqlite_workload::{
     SqliteWorkloadCollector,
 };
 use libsqlite3_sys as ffi;
-use sqlx::sqlite::SqliteConnection;
 #[cfg(test)]
 use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::SqliteConnection;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 const TRACE_MASK: u32 = (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as u32;
 const CONTEXT_FUNCTION_NAME: &str = "__phoenix_native_statement_context";
+const MAIN_DB_NAME: &[u8] = b"main\0";
 const STATEMENT_CACHE_SIZE: usize = 256;
 
 #[derive(Debug)]
@@ -26,6 +27,8 @@ pub(crate) struct NativeStatementCallbackContext {
     active_read_concurrency: u32,
     prepare_category: SqliteWorkloadCategory,
     statement_categories: [CachedStatementCategory; STATEMENT_CACHE_SIZE],
+    writer_admitted_at: Option<Instant>,
+    current_writer_category: SqliteWorkloadCategory,
     #[cfg(test)]
     drop_counter: Option<Arc<AtomicUsize>>,
 }
@@ -50,6 +53,8 @@ impl NativeStatementCallbackContext {
             active_read_concurrency: 0,
             prepare_category: SqliteWorkloadCategory::Other,
             statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
+            writer_admitted_at: None,
+            current_writer_category: SqliteWorkloadCategory::Other,
             #[cfg(test)]
             drop_counter: None,
         }
@@ -65,6 +70,8 @@ impl NativeStatementCallbackContext {
             active_read_concurrency: 0,
             prepare_category: SqliteWorkloadCategory::Other,
             statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
+            writer_admitted_at: None,
+            current_writer_category: SqliteWorkloadCategory::Other,
             drop_counter: Some(drop_counter),
         }
     }
@@ -114,6 +121,39 @@ impl NativeStatementCallbackContext {
         self.reset_prepare_state();
         self.cache_statement_category(statement_identity, category);
         category
+    }
+
+    fn note_writer_statement(
+        &mut self,
+        category: SqliteWorkloadCategory,
+        txn_state: c_int,
+    ) -> bool {
+        if txn_state != ffi::SQLITE_TXN_WRITE {
+            return false;
+        }
+        self.current_writer_category = category_precedence(self.current_writer_category, category);
+        let first_admission = self.writer_admitted_at.is_none();
+        if first_admission {
+            self.writer_admitted_at = Some(Instant::now());
+        }
+        first_admission
+    }
+
+    fn finish_writer_transaction(&mut self) {
+        let Some(writer_admitted_at) = self.writer_admitted_at.take() else {
+            return;
+        };
+        self.collector.record_writer_occupancy(
+            unix_now_micros(),
+            self.current_writer_category,
+            writer_admitted_at.elapsed(),
+        );
+        self.current_writer_category = SqliteWorkloadCategory::Other;
+    }
+
+    fn record_writer_gap(&mut self) {
+        self.collector.record_writer_occupancy_gap();
+        self.current_writer_category = SqliteWorkloadCategory::Other;
     }
 }
 
@@ -257,7 +297,7 @@ unsafe extern "C" fn profile_callback(
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT as u32 {
-        let _ = context
+        let _category = context
             .lookup_statement_category(statement_identity)
             .unwrap_or_else(|| context.take_prepare_category_for_statement(statement_identity));
         if readonly {
@@ -288,6 +328,26 @@ unsafe extern "C" fn profile_callback(
         ffi::SQLITE_LOCKED => SqliteOutcome::Locked,
         _ => SqliteOutcome::OtherFailure,
     };
+    let category = context
+        .lookup_statement_category(statement_identity)
+        .unwrap_or(SqliteWorkloadCategory::Other);
+    let txn_state = if db.is_null() {
+        ffi::SQLITE_TXN_NONE
+    } else {
+        unsafe { ffi::sqlite3_txn_state(db, MAIN_DB_NAME.as_ptr().cast()) }
+    };
+    if txn_state == ffi::SQLITE_TXN_WRITE {
+        let first_write_admission = context.note_writer_statement(category, txn_state);
+        if first_write_admission && !readonly {
+            context.collector.record_writer_occupancy_gap();
+        }
+    } else if txn_state == ffi::SQLITE_TXN_NONE {
+        if context.writer_admitted_at.is_some() {
+            context.finish_writer_transaction();
+        } else if !readonly && outcome == SqliteOutcome::Success {
+            context.record_writer_gap();
+        }
+    }
     let read_concurrency = context.active_read_concurrency;
     if readonly {
         context.collector.end_native_read();
@@ -295,14 +355,18 @@ unsafe extern "C" fn profile_callback(
     }
     let observation = SqliteObservation {
         completed_at_unix_micros: unix_now_micros(),
-        category: context
-            .lookup_statement_category(statement_identity)
-            .unwrap_or(SqliteWorkloadCategory::Other),
+        category,
         access,
         outcome,
         latency,
         pool_wait: Duration::ZERO,
-        write_admission_wait: Duration::ZERO,
+        write_admission_wait: if !readonly
+            && matches!(outcome, SqliteOutcome::Busy | SqliteOutcome::Locked)
+        {
+            latency
+        } else {
+            Duration::ZERO
+        },
         writer_held: Duration::ZERO,
         read_connection_time,
         retry_count: 0,
@@ -310,6 +374,9 @@ unsafe extern "C" fn profile_callback(
         writer_concurrency: 0,
         read_concurrency,
         baseline_statement_count: 1,
+        counted_operation: true,
+        counted_outcome: true,
+        counted_histograms: true,
     };
     context.collector.record(observation);
     0
@@ -496,6 +563,8 @@ mod tests {
     use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
     use sqlx::{Connection, Execute, Executor, Statement};
     use std::str::FromStr;
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
     fn category_totals(
         report: &SqliteWorkloadAggregateReport,
@@ -507,6 +576,28 @@ mod tests {
 
     fn report_now(collector: &SqliteWorkloadCollector) -> SqliteWorkloadAggregateReport {
         collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros())
+    }
+
+    async fn connect_raw_pool(
+        path: &str,
+        collector: SqliteWorkloadCollector,
+        busy_timeout: Duration,
+    ) -> sqlx::SqlitePool {
+        let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(busy_timeout)
+            .foreign_keys(true);
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |conn, _meta| {
+                let collector = collector.clone();
+                Box::pin(async move { install_native_statement_baseline(conn, collector).await })
+            })
+            .connect_with(opts)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -754,6 +845,232 @@ mod tests {
             Some(SqliteWorkloadCategory::Other)
         );
         assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[tokio::test]
+    async fn immediate_holder_gets_occupancy_and_busy_victim_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_occupancy_busy.db");
+        let holder_collector = SqliteWorkloadCollector::new();
+        let victim_collector = SqliteWorkloadCollector::new();
+        let holder = connect_raw_pool(
+            path.to_str().unwrap(),
+            holder_collector.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let victim = connect_raw_pool(
+            path.to_str().unwrap(),
+            victim_collector.clone(),
+            Duration::ZERO,
+        )
+        .await;
+        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .execute(&holder)
+            .await
+            .unwrap();
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&holder)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (body) VALUES ('holder')")
+            .execute(&holder)
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let holder_clone = holder.clone();
+        let holder_task = tokio::spawn(async move {
+            started_tx.send(()).ok();
+            sleep(Duration::from_millis(25)).await;
+            let _ = release_rx.await;
+            sqlx::query("ROLLBACK")
+                .execute(&holder_clone)
+                .await
+                .unwrap();
+        });
+        let _ = started_rx.await;
+        let victim_gap_before = report_now(&victim_collector).writer_occupancy_gap_count;
+        let err = sqlx::query("INSERT INTO messages (body) VALUES ('victim')")
+            .execute(&victim)
+            .await
+            .unwrap_err();
+        let code = err
+            .as_database_error()
+            .and_then(|db| db.code())
+            .and_then(|code| code.parse::<i32>().ok())
+            .unwrap_or_default();
+        assert_eq!(code & 0xff, ffi::SQLITE_BUSY);
+        release_tx.send(()).ok();
+        holder_task.await.unwrap();
+
+        let holder_report = report_now(&holder_collector);
+        let victim_report = report_now(&victim_collector);
+        let holder_totals = category_totals(
+            &holder_report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::MessagePersistence,
+        );
+        assert!(holder_totals.writer_held_micros > 0);
+        assert!(victim_report.writer_occupancy_gap_count >= victim_gap_before);
+        assert_eq!(
+            category_totals(
+                &victim_report,
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::MessagePersistence,
+            )
+            .writer_held_micros,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_transaction_write_records_gap_and_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_occupancy_deferred.db");
+        let collector = SqliteWorkloadCollector::new();
+        let pool = connect_raw_pool(
+            path.to_str().unwrap(),
+            collector.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN DEFERRED").execute(&pool).await.unwrap();
+        sleep(Duration::from_millis(10)).await;
+        sqlx::query("INSERT INTO messages (body) VALUES ('deferred')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(10)).await;
+        sqlx::query("COMMIT").execute(&pool).await.unwrap();
+
+        let report = report_now(&collector);
+        let totals = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::MessagePersistence,
+        );
+        assert!(totals.writer_held_micros > 0);
+        assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn autocommit_write_records_gap_without_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_occupancy_autocommit.db");
+        let collector = SqliteWorkloadCollector::new();
+        let pool = connect_raw_pool(
+            path.to_str().unwrap(),
+            collector.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (body) VALUES ('auto')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let report = report_now(&collector);
+        let totals = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::MessagePersistence,
+        );
+        assert_eq!(totals.writer_held_micros, 0);
+        assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn nested_fts_message_precedence_uses_fts_for_transaction_occupancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_occupancy_precedence.db");
+        let collector = SqliteWorkloadCollector::new();
+        let pool = connect_raw_pool(
+            path.to_str().unwrap(),
+            collector.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIRTUAL TABLE message_fts USING fts5(body)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE message_fts_rows (fts_rowid INTEGER PRIMARY KEY, conversation_id TEXT, message_id TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages (body) VALUES ('message')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(5)).await;
+        sqlx::query("INSERT INTO message_fts (body) VALUES ('fts')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(5)).await;
+        sqlx::query("COMMIT").execute(&pool).await.unwrap();
+        let report = report_now(&collector);
+        let fts = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::Fts,
+        );
+        let msg = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::MessagePersistence,
+        );
+        assert!(fts.writer_held_micros > 0);
+        assert_eq!(msg.writer_held_micros, 0);
+    }
+
+    #[tokio::test]
+    async fn total_writer_occupancy_does_not_exceed_covered_wall_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_occupancy_bound.db");
+        let collector = SqliteWorkloadCollector::new();
+        let pool = connect_raw_pool(
+            path.to_str().unwrap(),
+            collector.clone(),
+            Duration::from_secs(5),
+        )
+        .await;
+        sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
+        sleep(Duration::from_millis(20)).await;
+        sqlx::query("INSERT INTO messages (body) VALUES ('bounded')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(20)).await;
+        sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
+
+        let report = report_now(&collector);
+        let total_writer_held: u64 = SqliteWorkloadCategory::ALL
+            .iter()
+            .map(|category| {
+                report.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
+            })
+            .sum();
+        assert!(total_writer_held <= report.covered_uptime_micros);
     }
 
     #[test]

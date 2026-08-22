@@ -461,14 +461,14 @@ function SqliteDiagnostics({
               <dt>Confidence</dt>
               <dd>{report.restart_truncated ? 'Restart truncated' : 'Full requested uptime available'}</dd>
               <div className="settings-section__hint">
-                {report.classification.classified_operation_count} classified · {report.classification.baseline_statement_count} baseline statements · {report.classification.other_operation_count} other{report.classification.other_operation_share_percent != null ? ` (${formatPercent(report.classification.other_operation_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned · {report.classification.classification_gap_count} classification gaps
+                {report.classification.classified_operation_count} classified · {report.classification.baseline_statement_count} baseline statements · {report.classification.other_operation_count} other{report.classification.other_operation_share_percent != null ? ` (${formatPercent(report.classification.other_operation_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned · {report.classification.classification_gap_count} classification gaps · {report.classification.writer_occupancy_gap_count} writer occupancy gaps
               </div>
             </div>
           </dl>
           <div className="about-sqlite-tables">
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">
-                <h4>Writer transaction-envelope proxy by category</h4>
+                <h4>Writer transaction occupancy by category</h4>
                 <span>{report.writer_categories.length} categories</span>
               </div>
               <table className="deploy-table about-sqlite-table">

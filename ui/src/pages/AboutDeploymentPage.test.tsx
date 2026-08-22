@@ -166,7 +166,7 @@ function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): Sq
     covered_uptime_seconds: 125,
     covered_uptime_micros: 125_000_000,
     coverage: { bucket_count: 2, fully_covered: false, label: '2m 5s covered across 2 buckets; requested 60m' },
-    classification: { classified_operation_count: 0, baseline_statement_count: 0, other_operation_count: 0, other_operation_share_percent: null, abandoned_count: 0, classification_gap_count: 0 },
+    classification: { classified_operation_count: 0, baseline_statement_count: 0, other_operation_count: 0, other_operation_share_percent: null, abandoned_count: 0, classification_gap_count: 0, writer_occupancy_gap_count: 0 },
     writer_categories: [],
     reads: [],
     ...overrides,

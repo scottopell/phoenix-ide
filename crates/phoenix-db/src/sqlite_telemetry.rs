@@ -385,13 +385,16 @@ impl SqliteTelemetry {
             latency: self.started_at.elapsed(),
             pool_wait: timing.acquisition_elapsed,
             write_admission_wait: timing.write_admission_wait_elapsed,
-            writer_held: timing.transaction_elapsed,
+            writer_held: Duration::ZERO,
             read_connection_time: Duration::ZERO,
             retry_count: 0,
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
         self.record_slow_success(timing, outcome);
     }
@@ -530,6 +533,9 @@ impl SqliteTelemetry {
             writer_concurrency: 0,
             read_concurrency: 0,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
     }
 
@@ -960,7 +966,7 @@ mod tests {
             1
         );
         assert!(snapshot.totals[access][category].pool_wait_micros >= 20_000);
-        assert!(snapshot.totals[access][category].writer_held_micros >= 30_000);
+        assert_eq!(snapshot.totals[access][category].writer_held_micros, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

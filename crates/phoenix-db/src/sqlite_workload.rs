@@ -161,6 +161,9 @@ pub(crate) struct SqliteObservation {
     pub(crate) writer_concurrency: u32,
     pub(crate) read_concurrency: u32,
     pub(crate) baseline_statement_count: u64,
+    pub(crate) counted_operation: bool,
+    pub(crate) counted_outcome: bool,
+    pub(crate) counted_histograms: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -223,6 +226,7 @@ pub struct SqliteWorkloadAggregateReport {
     pub process_uptime_micros: u64,
     pub covered_uptime_micros: u64,
     pub classification_gap_count: u64,
+    pub writer_occupancy_gap_count: u64,
     pub totals: Box<
         [[BucketCategoryTotals; SqliteWorkloadCategory::ALL.len()]; SqliteAccessKind::ALL.len()],
     >,
@@ -321,6 +325,7 @@ struct InnerCollector {
     process_started_at_unix_micros: u64,
     process_started_at: Instant,
     classification_gap_count: u64,
+    writer_occupancy_gap_count: u64,
     buckets: Box<[SqliteBucket; BUCKET_COUNT]>,
 }
 
@@ -330,6 +335,7 @@ impl Default for InnerCollector {
             process_started_at_unix_micros: unix_now_micros(),
             process_started_at: Instant::now(),
             classification_gap_count: 0,
+            writer_occupancy_gap_count: 0,
             buckets: Box::new(std::array::from_fn(|_| SqliteBucket::default())),
         }
     }
@@ -377,6 +383,41 @@ impl SqliteWorkloadCollector {
             .lock()
             .expect("sqlite workload collector mutex poisoned");
         inner.classification_gap_count = inner.classification_gap_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_writer_occupancy_gap(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("sqlite workload collector mutex poisoned");
+        inner.writer_occupancy_gap_count = inner.writer_occupancy_gap_count.saturating_add(1);
+    }
+
+    pub(crate) fn record_writer_occupancy(
+        &self,
+        completed_at_unix_micros: u64,
+        category: SqliteWorkloadCategory,
+        writer_held: Duration,
+    ) {
+        self.record(SqliteObservation {
+            completed_at_unix_micros,
+            category,
+            access: SqliteAccessKind::Write,
+            outcome: SqliteOutcome::Success,
+            latency: Duration::ZERO,
+            pool_wait: Duration::ZERO,
+            write_admission_wait: Duration::ZERO,
+            writer_held,
+            read_connection_time: Duration::ZERO,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 1,
+            read_concurrency: 0,
+            baseline_statement_count: 0,
+            counted_operation: false,
+            counted_outcome: false,
+            counted_histograms: false,
+        });
     }
 
     pub fn snapshot(
@@ -452,11 +493,16 @@ impl SqliteWorkloadCollector {
                 }
             }
         }
-        let classification_gap_count = self
-            .inner
-            .lock()
-            .expect("sqlite workload collector mutex poisoned")
-            .classification_gap_count;
+        let (classification_gap_count, writer_occupancy_gap_count) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("sqlite workload collector mutex poisoned");
+            (
+                inner.classification_gap_count,
+                inner.writer_occupancy_gap_count,
+            )
+        };
         SqliteWorkloadAggregateReport {
             requested_window: snapshot.window,
             bucket_count: snapshot.bucket_count,
@@ -465,6 +511,7 @@ impl SqliteWorkloadCollector {
             process_uptime_micros: snapshot.process_uptime_micros,
             covered_uptime_micros: snapshot.covered_uptime_micros,
             classification_gap_count,
+            writer_occupancy_gap_count,
             totals,
             outcomes,
             latency_histogram,
@@ -481,30 +528,38 @@ impl InnerCollector {
         let access_index = observation.access.index();
         let category_index = observation.category.index();
         let totals = &mut bucket.totals[access_index][category_index];
-        totals.operation_count += 1;
-        totals.baseline_statement_count += observation.baseline_statement_count;
-        totals.latency_micros += duration_to_micros(observation.latency);
-        totals.pool_wait_micros += duration_to_micros(observation.pool_wait);
-        totals.write_admission_wait_micros += duration_to_micros(observation.write_admission_wait);
-        totals.retry_count += observation.retry_count;
-        totals.retry_backoff_micros += duration_to_micros(observation.retry_backoff);
-        totals.writer_concurrency_peak = totals
-            .writer_concurrency_peak
-            .max(observation.writer_concurrency);
-        totals.read_concurrency_peak = totals
-            .read_concurrency_peak
-            .max(observation.read_concurrency);
-        if observation.outcome == SqliteOutcome::Abandoned {
-            totals.abandoned_count += 1;
+        if observation.counted_operation {
+            totals.operation_count += 1;
+            totals.baseline_statement_count += observation.baseline_statement_count;
+            totals.latency_micros += duration_to_micros(observation.latency);
+            totals.pool_wait_micros += duration_to_micros(observation.pool_wait);
+            totals.write_admission_wait_micros +=
+                duration_to_micros(observation.write_admission_wait);
+            totals.retry_count += observation.retry_count;
+            totals.retry_backoff_micros += duration_to_micros(observation.retry_backoff);
+            totals.writer_concurrency_peak = totals
+                .writer_concurrency_peak
+                .max(observation.writer_concurrency);
+            totals.read_concurrency_peak = totals
+                .read_concurrency_peak
+                .max(observation.read_concurrency);
+            if observation.outcome == SqliteOutcome::Abandoned {
+                totals.abandoned_count += 1;
+            }
         }
-        bucket.outcomes[access_index][category_index][observation.outcome.index()] += 1;
-        bucket.latency_histogram[access_index][category_index]
-            [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
-        bucket.pool_wait_histogram[access_index][category_index]
-            [SqliteLatencyBin::from_duration(observation.pool_wait).index()] += 1;
-        if observation.access == SqliteAccessKind::Write {
-            bucket.write_admission_wait_histogram[access_index][category_index]
-                [SqliteLatencyBin::from_duration(observation.write_admission_wait).index()] += 1;
+        if observation.counted_outcome {
+            bucket.outcomes[access_index][category_index][observation.outcome.index()] += 1;
+        }
+        if observation.counted_histograms {
+            bucket.latency_histogram[access_index][category_index]
+                [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
+            bucket.pool_wait_histogram[access_index][category_index]
+                [SqliteLatencyBin::from_duration(observation.pool_wait).index()] += 1;
+            if observation.access == SqliteAccessKind::Write {
+                bucket.write_admission_wait_histogram[access_index][category_index]
+                    [SqliteLatencyBin::from_duration(observation.write_admission_wait).index()] +=
+                    1;
+            }
         }
 
         self.distribute_duration(
@@ -790,6 +845,9 @@ mod tests {
             writer_concurrency: 1,
             read_concurrency: 0,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
 
         let snapshot =
@@ -837,6 +895,9 @@ mod tests {
             writer_concurrency: 0,
             read_concurrency: 2,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
 
         let snapshot =
@@ -942,6 +1003,9 @@ mod tests {
             writer_concurrency: 1,
             read_concurrency: 0,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
 
         let one = collector.snapshot(SqliteSnapshotWindow::OneHour, 1_000 * M);
@@ -997,6 +1061,9 @@ mod tests {
             writer_concurrency: 1,
             read_concurrency: 0,
             baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
         });
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, completed_at);
         let bucket = snapshot.buckets.last().unwrap();
