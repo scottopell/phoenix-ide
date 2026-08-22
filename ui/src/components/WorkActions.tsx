@@ -203,7 +203,12 @@ export function WorkControlBar({
   const { openDiffFullscreen } = useViewerSlotCommands();
 
   useEffect(() => {
+    const fallbackOwnedFocus = fallbackOwnedFocusRef.current;
     setFallbackPanel(null);
+    setFallbackMenuAction(null);
+    if (fallbackOwnedFocus) {
+      requestAnimationFrame(() => fallbackInfoButtonRef.current?.focus());
+    }
   }, [conversationId]);
 
   useEffect(() => {
@@ -273,11 +278,38 @@ export function WorkControlBar({
     requestActivePrSelectorOpen();
     setOpenSelectorAfterRefresh(false);
   }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
+  const activeSelectionProvenance = prStatusHandle.activeSelection?.active_pr?.provenance
+    ?? (prStatusHandle.activeSelection?.active_pr as unknown as { active_source?: string } | undefined)?.active_source;
+  const explicitActivePrResolved = activePr !== null && (activeSelectionProvenance === 'pinned' || activeSelectionProvenance === 'user_pinned');
+  const dispositionPrStatus = explicitActivePrResolved && activePr && prStatus
+    ? {
+        ...prStatus,
+        number: activePr.pr_number,
+        title: activePr.title,
+        url: activePr.url,
+        state: activePr.state,
+        draft: activePr.draft,
+        base: activePr.base,
+        head: activePr.head,
+        display_state: activePr.display_state,
+        feedback_status: activePr.feedback_status,
+        pr: {
+          number: activePr.pr_number,
+          title: activePr.title,
+          url: activePr.url,
+          state: activePr.state,
+          draft: activePr.draft,
+          display_state: activePr.display_state,
+          base: activePr.base,
+          head: activePr.head,
+        },
+      }
+    : prStatus;
   const disposition = deriveWorkDisposition({
     convModeLabel,
     phaseType,
     continuedInConvId,
-    prStatus,
+    prStatus: dispositionPrStatus,
     prLoading,
     canSendMessage: !!onSendMessage,
     workChange: prStatus?.work_change ?? null,

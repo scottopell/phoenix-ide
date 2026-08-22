@@ -1701,6 +1701,28 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
+  it('restores owned overflow focus after the conversation identity changes', async () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const renderBar = (conversationId: string) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId={conversationId} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('conv-focus-a'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.focusIn(abandon);
+    rerender(renderBar('conv-focus-b'));
+
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Work status details' })).toHaveFocus());
+  });
+
   it('resets open details while the Work Actions bar is hidden during an LLM turn', () => {
     enableMobile();
     const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
@@ -2020,6 +2042,30 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR open');
+  });
+
+  it('derives terminal actions from the resolved explicit PR instead of stale cached status', () => {
+    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [explicitPr],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: explicitPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-explicit-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Merge on GitHub #13/ })).toBeInTheDocument();
   });
 
   it('does not render a stale cached PR link beside an unresolved explicit selection', () => {
