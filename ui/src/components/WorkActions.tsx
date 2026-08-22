@@ -879,7 +879,7 @@ export function WorkControlBar({
             <CoverageMarker marker={coverageMarker} />
           </button>
         )}
-        {!prStatusHandle.ambiguous && disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+        {!prStatusHandle.ambiguous && !explicitSelectionUnresolved && disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
           <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
         )}
         {!prStatusHandle.ambiguous && disposition.secondaryResolve && (

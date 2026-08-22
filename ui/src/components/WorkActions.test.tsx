@@ -2120,6 +2120,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');
   });
 

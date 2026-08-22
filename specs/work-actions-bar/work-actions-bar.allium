@@ -683,14 +683,11 @@ rule CompactFallbackDockPresentedWhenMobilePrRailUnavailable {
 
     ensures: bar.presentation.kind = compact_fallback_dock
     ensures: bar.presentation.pr_rail = null
-    ensures: bar.inputs.explicit_active_pr != null and not bar.inputs.active_summary_resolved implies
-        bar.presentation.selection_owner = work_actions
-    ensures: not (bar.inputs.explicit_active_pr != null and not bar.inputs.active_summary_resolved) implies
-        bar.presentation.selection_owner = state_bar
+    ensures: bar.presentation.selection_owner = state_bar
 
     @guidance
-        -- An unresolved explicit selection is recovered from the fallback dock
-        -- because the StateBar has no representable selector in this state.
+        -- An unresolved explicit selection is recovered from the fallback dock,
+        -- but the fallback does not become the active-selection authority.
         -- Keep the disposition's primary verb in the single action row. A
         -- non-primary terminal verb may move into overflow. The status row is
         -- concise; full disposition and terminal guidance remains available
