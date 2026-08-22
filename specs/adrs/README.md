@@ -42,6 +42,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [028](028_ios-companion-includes-read-only-project-context-and-prose-review.md) | The iOS companion includes read-only project context and prose review | Superseded by ADR-029 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [029](029_ios-companion-uses-session-scoped-prose-feedback.md) | The iOS companion uses session-scoped prose feedback | Superseded by ADR-030 | REQ-IOS-019, REQ-IOS-020, REQ-IOS-021 |
 | [030](030_ios-prose-review-authority-survives-composer-handoff.md) | iOS prose-review authority survives the composer handoff | Accepted | REQ-IOS-002, REQ-IOS-003, REQ-IOS-021; `ProseReviewAuthority` |
+| [031](031_phoenix-composes-local-agents-from-portable-capabilities.md) | Phoenix composes local named agents from portable capabilities | Proposed | REQ-AG-001 through REQ-AG-009; REQ-SK-001 through REQ-SK-007; named-agent configuration; Agent Plugins adoption |
 
 ## For agents: which decisions bind your task
 
@@ -73,6 +74,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying projects task-file shapes, proposal classification, or managed approval behavior across taskmd and plain markdown briefs | 023 |
 | Specifying continuation summary retry, restart recovery, or exactly-once commit | 025 |
 | Specifying iOS grounding, server-backed file browsing, prose reading, or anchored comments | 030, then 029, 028, and 026 for draft authority, reader sessions, the companion boundary, ProductConversation, and WorkScope ownership |
+| Specifying named-agent configuration, filesystem-agent retirement, or Agent Plugins adoption | 031 |
 
 ## Decision dependencies
 
@@ -106,6 +108,7 @@ ADR-000 (adopt spEARS v2 for new work)
       │       └── ADR-027 (Write-capable ProductConversations use bounded global evidence)
       ├── ADR-023 (Projects accept taskmd files by default and plain markdown briefs through one task-source seam)
       ├── ADR-024 (Direct-turn authority is partitioned by semantic fact)
+      ├── ADR-031 (Phoenix composes local named agents from portable capabilities)
       └── ADR-026 (Product conversation lifecycle is separate from WorkScope resource ownership)
           └── ADR-028 (iOS companion adds read-only project context and prose review)
               └── ADR-029 (iOS companion uses session-scoped prose feedback)
