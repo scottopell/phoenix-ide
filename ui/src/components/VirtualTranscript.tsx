@@ -49,6 +49,10 @@ export interface VirtualTranscriptHandle {
     targetSelector?: string,
   ): void;
   scrollToTail(): void;
+  /** Whether a scroll event at this scrollTop is the echo of a write this
+   *  component made (anchor compensation, drift reconcile, tail snap) rather
+   *  than user movement. */
+  isProgrammaticScroll(scrollTop: number): boolean;
   captureVisibleAnchor(): VirtualTranscriptAnchor | null;
   preserveViewportOnNextItemsChange(): void;
   measureOffsetForIndex(index: number): number | null;
@@ -109,9 +113,16 @@ interface PhysicalStore<T> {
    *  settles. */
   drift: number;
   lastScrollAtMs: number;
+  /** Touches currently down on the scroller — an active gesture counts as
+   *  scrolling even without recent scroll events (a held finger). */
+  activeTouches: number;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
+  /** ScrollTop value this component last wrote. Its scroll-event echo is
+   *  physical compensation, not user movement; cleared by the first
+   *  non-matching scroll event. */
+  pendingProgrammaticTop: number | null;
 }
 
 interface StorePublisher<T> {
@@ -124,7 +135,7 @@ const PINNED_EPSILON = 1;
 export const SCROLL_SETTLE_MS = 150;
 
 function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
-  return Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
+  return store.activeTouches > 0 || Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
 }
 
 function clampNonNegative(value: number): number {
@@ -286,8 +297,14 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
   store.viewportTop = scrollTop;
   if (scroller && scroller.scrollTop !== scrollTop) {
+    store.pendingProgrammaticTop = scrollTop;
     scroller.scrollTop = scrollTop;
   }
+}
+
+function isProgrammaticScrollTop<T>(store: PhysicalStore<T>, scrollTop: number): boolean {
+  return store.pendingProgrammaticTop !== null
+    && Math.abs(scrollTop - store.pendingProgrammaticTop) <= 1;
 }
 
 function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
@@ -451,7 +468,9 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     revision: 0,
     drift: 0,
     lastScrollAtMs: Number.NEGATIVE_INFINITY,
+    activeTouches: 0,
     pendingScrollDelta: null,
+    pendingProgrammaticTop: null,
   };
   recompute(store);
   return store;
@@ -587,12 +606,17 @@ function VirtualTranscriptInner<T>(
     }
   }, [publish]);
 
+  const detachTouchListenersRef = useRef<(() => void) | null>(null);
+
   const scrollerCallback = useCallback((element: HTMLDivElement | null) => {
     const current = storeRef.current;
     if (!current) return;
     if (current.scroller && current.scroller !== element) {
       unobserveElement(current, current.scroller);
     }
+    detachTouchListenersRef.current?.();
+    detachTouchListenersRef.current = null;
+    current.activeTouches = 0;
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
@@ -602,6 +626,18 @@ function VirtualTranscriptInner<T>(
         current.initialTailPending = false;
         setScrollerScrollTop(current, totalPhysicalExtent(current));
       }
+      const onTouchChange = (event: TouchEvent) => {
+        const store = storeRef.current;
+        if (store) store.activeTouches = event.touches.length;
+      };
+      element.addEventListener('touchstart', onTouchChange, { passive: true });
+      element.addEventListener('touchend', onTouchChange, { passive: true });
+      element.addEventListener('touchcancel', onTouchChange, { passive: true });
+      detachTouchListenersRef.current = () => {
+        element.removeEventListener('touchstart', onTouchChange);
+        element.removeEventListener('touchend', onTouchChange);
+        element.removeEventListener('touchcancel', onTouchChange);
+      };
     }
     recompute(current);
     scrollerRef?.(element);
@@ -642,6 +678,8 @@ function VirtualTranscriptInner<T>(
         clearTimeout(reconcileTimerRef.current);
         reconcileTimerRef.current = 0;
       }
+      detachTouchListenersRef.current?.();
+      detachTouchListenersRef.current = null;
       current?.resizeObserver?.disconnect();
       current?.rowElements.clear();
       if (current) {
@@ -699,6 +737,10 @@ function VirtualTranscriptInner<T>(
       recompute(current);
       publish();
     },
+    isProgrammaticScroll(scrollTop) {
+      const current = storeRef.current;
+      return current ? isProgrammaticScrollTop(current, scrollTop) : false;
+    },
     captureVisibleAnchor() {
       const current = storeRef.current;
       if (!current) return null;
@@ -747,6 +789,16 @@ function VirtualTranscriptInner<T>(
   const handleScroll = useCallback(() => {
     const current = storeRef.current;
     if (!current?.scroller) return;
+    // A programmatic write's echo is not user scrolling: it must neither
+    // extend the scroll-active window nor delay drift reconciliation.
+    if (isProgrammaticScrollTop(current, current.scroller.scrollTop)) {
+      current.viewportTop = current.scroller.scrollTop;
+      if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
+      recompute(current);
+      publish();
+      return;
+    }
+    current.pendingProgrammaticTop = null;
     current.lastScrollAtMs = Date.now();
     current.viewportTop = current.scroller.scrollTop;
     if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
@@ -772,6 +824,23 @@ function VirtualTranscriptInner<T>(
       recompute(current);
       publish();
       return;
+    }
+    if (current.drift !== 0) {
+      // The leading spacer can no longer represent the drift (the rendered
+      // range has reached the top of the layout): reconcile immediately via
+      // the direct-write fallback instead of letting the clamped spacer
+      // diverge from the layout model.
+      const firstOffset = current.range
+        ? current.layout.itemAt(current.range.startIndex)?.offset ?? 0
+        : 0;
+      if (firstOffset + current.drift < 0) {
+        const drift = current.drift;
+        current.drift = 0;
+        current.pendingScrollDelta = -drift;
+        recompute(current);
+        publish();
+        return;
+      }
     }
     if (current.drift === 0 || reconcileTimerRef.current !== 0) return;
     const arm = () => {

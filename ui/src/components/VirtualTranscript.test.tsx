@@ -339,16 +339,21 @@ describe('VirtualTranscript', () => {
 
       act(() => ref.current?.scrollToIndex(20, 'start'));
       expect(scrollTopOf(scroller)).toBe(400);
+      // The write's own echo is recognized as programmatic, not user motion.
+      expect(ref.current?.isProgrammaticScroll(400)).toBe(true);
 
-      // A scroll event marks scrolling as in-flight; a resize of a mounted
-      // row above the anchor must then keep scrollTop untouched
-      // (momentum-preserving) while the top spacer absorbs the delta.
+      // A user scroll event (non-matching scrollTop) marks scrolling as
+      // in-flight; a resize of a mounted row above the anchor must then keep
+      // scrollTop untouched (momentum-preserving) while the top spacer
+      // absorbs the delta.
       act(() => {
+        scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
+      expect(ref.current?.isProgrammaticScroll(395)).toBe(false);
       const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
       act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
-      expect(scrollTopOf(scroller)).toBe(400);
+      expect(scrollTopOf(scroller)).toBe(395);
 
       const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
       expect(spacer.style.height).toBe('190px');
@@ -357,18 +362,114 @@ describe('VirtualTranscript', () => {
       act(() => {
         anchor = ref.current?.captureVisibleAnchor() ?? null;
       });
-      expect(anchor).toMatchObject({ index: 20, key: 'item-20', offset: 0 });
+      expect(anchor).toMatchObject({ index: 19, key: 'item-19', offset: -15 });
 
       // Once scrolling settles, drift reconciles into true layout coordinates
       // with a single scrollTop adjustment.
       act(() => {
         vi.advanceTimersByTime(400);
       });
-      expect(scrollTopOf(scroller)).toBe(430);
+      expect(scrollTopOf(scroller)).toBe(425);
       act(() => {
         anchor = ref.current?.captureVisibleAnchor() ?? null;
       });
-      expect(anchor).toMatchObject({ index: 20, key: 'item-20', offset: 0 });
+      expect(anchor).toMatchObject({ index: 19, key: 'item-19', offset: -15 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('defers drift reconciliation while a touch is held, then reconciles after lift', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      act(() => {
+        fireEvent.touchStart(scroller!, { touches: [{}] });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // A stationary held finger keeps the gesture active even with no
+      // scroll events: reconciliation must not write scrollTop mid-gesture.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        fireEvent.touchEnd(scroller!, { touches: [] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      act(() => {
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // Continued upward scrolling reaches the top of the layout before the
+      // settle timer fires: the drift is reconciled through the direct-write
+      // fallback instead of clamping the spacer away from the layout model.
+      act(() => {
+        scroller!.scrollTop = 10;
+        fireEvent.scroll(scroller!);
+      });
+      expect(scrollTopOf(scroller)).toBe(40);
+      const spacer = document.querySelector<HTMLElement>('.virtual-transcript__spacer')!;
+      expect(spacer.style.height).toBe('0px');
+      let anchor = null as ReturnType<VirtualTranscriptHandle['captureVisibleAnchor']>;
+      act(() => {
+        anchor = ref.current?.captureVisibleAnchor() ?? null;
+      });
+      expect(anchor).toMatchObject({ index: 2, key: 'item-2', offset: 0 });
     } finally {
       vi.useRealTimers();
     }

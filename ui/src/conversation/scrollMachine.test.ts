@@ -166,6 +166,27 @@ describe('scrollMachine durable follow policy', () => {
     expect(effectTypes(arrival.effects)).toContain('clearUnread');
   });
 
+  it('a moved touch whose geometry leaves the pin zone before lift keeps reading', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    // Streaming grows the tail past the pin threshold before the finger
+    // lifts; the fresher height snapshot supersedes the stale at-bottom flag.
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_500,
+      unitCount: 6,
+      snapshot: snap(1_500, 600, 400),
+      tailActivity: 'active',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(true);
+  });
+
   it('downward movement in the pin zone during a moved touch defers to gesture end', () => {
     let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
@@ -578,7 +599,7 @@ const commandArb: fc.Arbitrary<ScrollEvent> = fc.oneof(
     type: fc.constant('heightChanged' as const),
     totalHeight: fc.integer({ min: 1, max: 100_000 }),
     unitCount: fc.integer({ min: 1, max: 200 }),
-    snapshot: fc.constant(snap(1_000, 600, 400)),
+    snapshot: fc.constantFrom(snap(1_000, 600, 400), snap(1_000, 100, 400)),
     tailActivity: fc.constantFrom<'none' | 'active'>('none', 'active'),
   }),
   fc.record({
@@ -630,14 +651,15 @@ describe('scrollMachine reachable-history properties', () => {
 
   it('never returns reading ownership merely because more events or time pass', () => {
     // Excluded events are the legitimate release paths: bottom confirmation,
-    // explicit jump, navigation, and downward arrival in the pin zone (any
-    // pinned event can mark geometry at-bottom, which a later gesture end is
-    // then allowed to confirm).
+    // explicit jump, navigation, and downward arrival in the pin zone. Any
+    // pinned-snapshot event marks geometry at-bottom, which a later gesture
+    // end is then allowed to confirm — so pinned snapshots are excluded too.
     const nonReleaseArb = commandArb.filter((event) =>
       event.type !== 'viewportPinnedChanged' &&
       event.type !== 'jumpToNewestRequested' &&
       event.type !== 'navigationJumped' &&
-      !(event.type === 'downwardMovement' && snapshotIsPinned(event.snapshot)),
+      !(event.type === 'downwardMovement' && snapshotIsPinned(event.snapshot)) &&
+      !(event.type === 'heightChanged' && event.snapshot !== null && snapshotIsPinned(event.snapshot)),
     );
     fc.assert(
       fc.property(fc.array(nonReleaseArb, { maxLength: 100 }), (events) => {

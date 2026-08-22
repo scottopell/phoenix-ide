@@ -130,6 +130,7 @@ vi.mock('./MessageContextMenu', () => ({
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
   scrollToTail: vi.fn(),
+  isProgrammaticScroll: vi.fn(),
   captureVisibleAnchor: vi.fn(),
   preserveViewportOnNextItemsChange: vi.fn(),
   measureOffsetForIndex: vi.fn(),
@@ -150,6 +151,7 @@ function indexOrZero(index: number): number {
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
+  virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
   virtualTranscriptMock.measureOffsetForIndex = vi.fn(() => null);
@@ -194,7 +196,7 @@ vi.mock('./VirtualTranscript', async () => {
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -211,6 +213,7 @@ vi.mock('./VirtualTranscript', async () => {
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToTail: virtualTranscriptMock.scrollToTail,
+        isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
         preserveViewportOnNextItemsChange: virtualTranscriptMock.preserveViewportOnNextItemsChange,
         measureOffsetForIndex: virtualTranscriptMock.measureOffsetForIndex,
@@ -3138,6 +3141,47 @@ describe('handleTotalListHeightChanged', () => {
     // oldFromBottom = 500 - 100 - 400 = 0 (pinned)
     act(() => virtualTranscriptMock.totalExtentChanged?.(600));
     expect(virtualTranscriptMock.scrollToTail).toHaveBeenCalled();
+  });
+
+  it('a programmatic scroll echo in the pin zone does not confirm a tail return', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-programmatic-echo"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // The user reads 300px above the bottom; streamed growth shows the chip.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // An anchor-compensation write lands the scroller inside the pin zone.
+    // Its echo carries no user intent and must not clear the chip. (The
+    // handle captured the mock instance at mount, so mutate it in place.)
+    virtualTranscriptMock.isProgrammaticScroll.mockReturnValue(true);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 620, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // The same geometry arrived at by real user movement confirms the return.
+    virtualTranscriptMock.isProgrammaticScroll.mockReturnValue(false);
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {

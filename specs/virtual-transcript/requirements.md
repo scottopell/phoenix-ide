@@ -33,12 +33,13 @@ THE SYSTEM SHALL update the authoritative layout model from that measurement
 AND, if the changed extent precedes an active physical anchor, SHALL preserve that anchor's viewport-start offset
 AND SHALL NOT infer user intent from the measurement change.
 
-WHILE a user scroll is in flight
+WHILE a user scroll or touch gesture is in flight — recent scroll events or any touch still down on the scroller
 WHEN preserving an anchor's viewport-start offset requires a position correction
 THE SYSTEM SHALL apply the correction by shifting the rendered block's leading spacer rather than writing the scroll position
-SO THAT native scroll momentum is never cancelled by a compensation write
-AND SHALL reconcile the accumulated shift back into authoritative layout coordinates, with a single equivalent scroll-position write, once scrolling settles
-AND SHALL fall back to a direct scroll-position write when the leading spacer lacks room to absorb the shift.
+SO THAT native scroll momentum is never cancelled, and an active gesture never disturbed, by a compensation write
+AND SHALL reconcile the accumulated shift back into authoritative layout coordinates, with a single equivalent scroll-position write, once scrolling settles and no touch remains down
+AND SHALL reconcile immediately via the direct-write fallback the moment the leading spacer can no longer represent the shift, so the rendered spacer never diverges from the layout model
+AND SHALL identify the scroll-event echoes of its own position writes so consumers can distinguish physical compensation from user movement.
 
 Reconciliation is triggered by layout measurements. It shall not poll or use elapsed time as evidence of positioning success; the scroll-settle wait governs only when an already-computed spacer shift is folded back into layout coordinates.
 

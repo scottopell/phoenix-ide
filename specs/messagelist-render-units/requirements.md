@@ -409,6 +409,13 @@ range before comparing against the previous position
 SO THAT overscroll rubber-band bounce-back at either edge is never
 classified as user reading intent
 
+WHEN a scroll event is the echo of a position write VirtualTranscript
+itself made — anchor compensation, drift reconciliation, or a tail snap
+THE SYSTEM SHALL update geometry baselines without classifying the
+movement as user intent
+SO THAT physical compensation inside the pin-to-bottom zone cannot be
+mistaken for a user tail return
+
 THE SYSTEM SHALL use VirtualTranscript pinned-state notification only as
 bottom geometry and explicit return-to-tail confirmation
 AND SHALL use VirtualTranscript total-extent notification only as

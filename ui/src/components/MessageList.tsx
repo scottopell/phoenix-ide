@@ -781,12 +781,7 @@ function MessageListImpl({
     return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
   }, []);
 
-  // Report the physical edge honestly. Widening a pinned=false edge back to
-  // "at bottom" via the policy threshold would re-enter following the moment
-  // the user starts scrolling up, letting the next streamed height change
-  // yank the viewport back down. Zone semantics (within
-  // PIN_TO_BOTTOM_THRESHOLD counts as bottom) are applied by the machine on
-  // direction-carrying events: downwardMovement snapshots and touch ends.
+  // Raw edge only — zone semantics live in scroll_policy.allium.
   const handlePinnedStateChange = useCallback((pinned: boolean) => {
     dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned });
   }, []);
@@ -947,10 +942,20 @@ function MessageListImpl({
           }
           return;
         }
-        // Clamp into the scrollable range before classifying direction: iOS
-        // rubber-band overscroll produces decreasing scrollTop frames while
-        // the user is visually pinned, and treating that bounce-back as
-        // upward intent silently flips following into reading.
+        // Echoes of VirtualTranscript's own writes (anchor compensation,
+        // drift reconcile, tail snap) carry no user intent: update geometry
+        // without direction classification, which would otherwise mistake a
+        // compensation write inside the pin zone for a user tail return.
+        if (transcriptRef.current?.isProgrammaticScroll(ref.scrollTop)) {
+          dispatchScrollEvent({
+            type: 'scrollerAttached',
+            snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
+          });
+          updateEarlierHistoryRestoreRef.current();
+          return;
+        }
+        // Clamp before classifying direction: overscroll rubber-band frames
+        // must not read as intent (scroll_policy.allium / REQ-MLRU-014).
         const maxScrollTop = Math.max(0, ref.scrollHeight - ref.clientHeight);
         const clampedTop = Math.min(Math.max(ref.scrollTop, 0), maxScrollTop);
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: clampedTop, clientHeight: ref.clientHeight };

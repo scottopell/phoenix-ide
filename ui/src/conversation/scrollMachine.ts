@@ -266,9 +266,7 @@ function resolveTouch(
     gesture: IDLE,
     unread: state.unread,
   };
-  // A gesture ending inside the pin-to-bottom zone is an arrival at the tail.
-  // The bottom-confirmation callback is edge-triggered and may have fired (and
-  // been blocked) mid-gesture, so it cannot be relied on to re-deliver here.
+  // Gesture-end tail confirmation: scroll_policy.allium MovedTouchEndAtBottomConfirmsTailReturn
   if (follow.kind === 'reading' && state.geometry.atBottom) {
     return confirmTailReturn({ ...session, kind: 'live', follow });
   }
@@ -460,9 +458,7 @@ export function reduceScrollMachine(
     case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
       const next: ReadySession = { ...state, geometry: trackGeometry(state.geometry, event.snapshot) };
-      // Level-triggered tail return: arriving in the pin-to-bottom zone by
-      // downward movement restores following without waiting for the physical
-      // layer's exact-bottom pinned edge, which the viewport may never cross.
+      // Level-triggered: scroll_policy.allium DownwardArrivalAtBottomConfirmsTailReturn
       if (
         next.kind === 'live' &&
         next.gesture.kind === 'idle' &&
@@ -485,7 +481,10 @@ export function reduceScrollMachine(
       const previousTotalHeight = state.geometry.previousTotalHeight;
       const nextState = {
         ...state,
-        geometry: updateGeometry(state.geometry, event.snapshot, event.totalHeight),
+        geometry: {
+          ...trackGeometry(state.geometry, event.snapshot),
+          previousTotalHeight: event.totalHeight,
+        },
       };
       if (event.unitCount === 0 || event.snapshot === null) {
         return { state: nextState, effects: [] };
