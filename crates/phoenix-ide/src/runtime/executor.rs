@@ -3801,6 +3801,19 @@ where
             Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
         };
         let mut terminal_unit_admission = None;
+        let terminal_state_has_notify = terminal_direct_turn_transition
+            && result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::NotifyStateChange));
+        if terminal_direct_turn_transition {
+            #[cfg(test)]
+            if let Some(barrier) = self.terminal_effect_admission_barrier.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            terminal_unit_admission = Some(Box::new(self.admit_authoritative_effect()?));
+        }
         if let Some((drain_event, projection_guard)) = steering_drain {
             Box::pin(self.run_effects_with_inline_drain(
                 result.effects,
@@ -3857,17 +3870,7 @@ where
                 } else {
                     None
                 };
-                if terminal_unit_admission.is_none()
-                    && (terminal_message_settlement.is_some()
-                        || (is_state_persist && terminal_direct_turn_transition))
-                {
-                    #[cfg(test)]
-                    if let Some(barrier) = self.terminal_effect_admission_barrier.take() {
-                        barrier.wait().await;
-                        barrier.wait().await;
-                    }
-                    terminal_unit_admission = Some(Box::new(self.admit_authoritative_effect()?));
-                }
+
                 let effect_result = if let Some(settlement) = terminal_message_settlement {
                     match effect {
                         Effect::PersistMessage {
@@ -3907,7 +3910,14 @@ where
                                     TerminalEvidenceEstablishment::Established(message) => {
                                         self.direct_turn_terminal_fact =
                                             TerminalFactDurability::Durable;
-                                        let _ = self.broadcast_tx.send_message(*message);
+                                        let _ = self
+                                            .broadcast_tx
+                                            .admitted_publication(
+                                                terminal_unit_admission.as_deref_mut().expect(
+                                                    "terminal message publication is admitted",
+                                                ),
+                                            )
+                                            .persisted_message(*message);
                                         Ok(None)
                                     }
                                     TerminalEvidenceEstablishment::Retired => {
@@ -3964,9 +3974,25 @@ where
                                 .as_deref_mut()
                                 .expect("terminal state settlement is admitted");
                             match ClassifiedEffect::classify(effect) {
-                                ClassifiedEffect::Authoritative(effect) => {
-                                    self.execute_authoritative_effect(*effect, admitted).await
-                                }
+                                ClassifiedEffect::Authoritative(effect) => match *effect {
+                                    AuthoritativeEffect::PersistState => {
+                                        let result = self.persist_state_effect(false).await;
+                                        if result.is_ok() && !terminal_state_has_notify {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .admitted_publication(admitted)
+                                                .state_change(
+                                                    self.state.clone(),
+                                                    self.state.presentation_mode().to_string(),
+                                                    self.state_updated_at,
+                                                );
+                                        }
+                                        result
+                                    }
+                                    effect => {
+                                        self.execute_authoritative_effect(effect, admitted).await
+                                    }
+                                },
                                 ClassifiedEffect::Control(_) => unreachable!(
                                     "terminal state settlement matched authoritative effect"
                                 ),
@@ -3976,6 +4002,54 @@ where
                         TerminalMutationEstablishment::Unclassifiable(error) => {
                             self.local_terminal_authority = LocalTerminalAuthority::Fatal;
                             Err(error)
+                        }
+                    }
+                } else if terminal_direct_turn_transition {
+                    match ClassifiedEffect::classify(effect) {
+                        ClassifiedEffect::Authoritative(effect) => match *effect {
+                            AuthoritativeEffect::PersistState => {
+                                let result = self.persist_state_effect(false).await;
+                                if result.is_ok() && !terminal_state_has_notify {
+                                    let admitted = terminal_unit_admission
+                                        .as_deref_mut()
+                                        .expect("terminal state persistence is admitted");
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .state_change(
+                                            self.state.clone(),
+                                            self.state.presentation_mode().to_string(),
+                                            self.state_updated_at,
+                                        );
+                                }
+                                result
+                            }
+                            effect => {
+                                self.execute_authoritative_effect(
+                                    effect,
+                                    terminal_unit_admission
+                                        .as_deref_mut()
+                                        .expect("terminal direct-turn unit is admitted"),
+                                )
+                                .await
+                            }
+                        },
+                        ClassifiedEffect::Control(ControlEffect::NotifyStateChange) => {
+                            let admitted = terminal_unit_admission
+                                .as_deref_mut()
+                                .expect("terminal state publication is admitted");
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .state_change(
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
+                            Ok(None)
+                        }
+                        ClassifiedEffect::Control(effect) => {
+                            self.execute_control_effect(effect).await
                         }
                     }
                 } else {
@@ -5622,8 +5696,11 @@ where
                         self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
                         self.publish_live_state_admitted();
-                        drop(materialization_owner);
-                        let _ = self.broadcast_tx.send_message(*message);
+                        let mut materialization_owner = materialization_owner;
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(&mut materialization_owner)
+                            .persisted_message(*message);
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
@@ -5817,19 +5894,19 @@ where
                                 ConvState::AwaitingContinuation { request: persisted_request }
                                     if persisted_request.operation_id == request.operation_id
                             ) {
-                                let _ = self.broadcast_tx.send_message(message);
+                                let _ = self
+                                    .broadcast_tx
+                                    .admitted_publication(admitted)
+                                    .persisted_message(message);
                                 drop(reserved_range);
-                                let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                    SseEvent::StateChange {
-                                        sequence_id,
-                                        state: self.state.clone(),
-                                        presentation_mode: self
-                                            .state
-                                            .presentation_mode()
-                                            .to_string(),
-                                        state_updated_at: self.state_updated_at,
-                                    }
-                                });
+                                let _ = self
+                                    .broadcast_tx
+                                    .admitted_publication(admitted)
+                                    .state_change(
+                                        self.state.clone(),
+                                        self.state.presentation_mode().to_string(),
+                                        self.state_updated_at,
+                                    );
                                 return Ok(None);
                             }
                         }
@@ -6366,7 +6443,7 @@ where
                         state: self.state.clone(),
                         state_updated_at: self.state_updated_at,
                     };
-                    self.persist_checkpoint_with_terminal_obligation(data, &settlement)
+                    self.persist_checkpoint_with_terminal_obligation(data, &settlement, admitted)
                         .await
                 } else {
                     self.persist_checkpoint(data).await
@@ -6447,7 +6524,7 @@ where
                 spawn_tool_id,
                 summary_message_id,
             } => {
-                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id)
+                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id, admitted)
                     .await
             }
 
@@ -6546,7 +6623,8 @@ where
                 };
                 let _ = self
                     .broadcast_tx
-                    .send_ephemeral_message_admitted(admitted, db_msg);
+                    .admitted_publication(admitted)
+                    .assistant_message(db_msg);
                 Ok(None)
             }
             AuthoritativeEffect::CommitSteeringDrain {
@@ -7633,6 +7711,7 @@ where
         &mut self,
         data: CheckpointData,
         settlement: &ActiveDirectTurnSettlement,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let CheckpointData::ToolRound {
             assistant_message,
@@ -7699,9 +7778,15 @@ where
                 return Err(error);
             }
         }
-        let _ = self.broadcast_tx.send_message(agent_msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
         for message in tool_msgs {
-            let _ = self.broadcast_tx.send_message(message);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
         }
         Ok(None)
     }
@@ -7901,6 +7986,7 @@ where
         results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
         summary_message_id: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         // Build the display_data for subagent results
         let display_data = serde_json::json!({
@@ -7931,6 +8017,7 @@ where
                     llm_content,
                     display_data,
                     &settlement,
+                    admitted,
                 )
                 .await;
         }
@@ -8027,6 +8114,7 @@ where
         llm_content: String,
         display_data: serde_json::Value,
         settlement: &ActiveDirectTurnSettlement,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let evidence = if let Some(tool_id) = spawn_tool_id {
             TerminalSubAgentEvidence::Update {
@@ -8074,17 +8162,16 @@ where
                 display_data,
                 ..
             } => {
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                    sequence_id: seq,
-                    message_id,
-                    transcript_generation,
-                    display_data: Some(display_data),
-                    content: Some(content),
-                    duration_ms: None,
-                });
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .message_updated(message_id, transcript_generation, display_data, content);
             }
             TerminalSubAgentEvidence::Insert(message) => {
-                let _ = self.broadcast_tx.send_message(message);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(message);
             }
         }
         Ok(None)
@@ -12702,8 +12789,76 @@ mod authoritative_user_message_effect_tests {
     }
 
     #[tokio::test]
-    async fn terminal_message_settlement_admitted_unit_finishes_after_fatal_close() {
-        let (mut rt, storage, _rx) = runtime(
+    async fn tool_cancellation_terminal_unit_finishes_after_checkpoint_close() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(27),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        let (checkpoint_started, checkpoint_release) = storage.gate_terminal_obligation();
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+        ));
+        rt.state = ConvState::CancellingTool {
+            tool_use_id: "cancelled-tool".to_string(),
+            skipped_tools: Vec::new(),
+            completed_results: Vec::new(),
+            assistant_message: crate::state_machine::AssistantMessage::new(
+                "cancel-assistant".to_string(),
+                vec![ContentBlock::ToolUse {
+                    id: "cancelled-tool".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"cmd":"sleep 10"}),
+                }],
+                None,
+                None,
+            ),
+            pending_sub_agents: Vec::new(),
+        };
+        let cancellation = tokio::spawn(async move {
+            let result = rt
+                .process_event(Event::ToolAborted {
+                    tool_use_id: "cancelled-tool".to_string(),
+                })
+                .await;
+            (rt, result)
+        });
+
+        checkpoint_started
+            .await
+            .expect("checkpoint entered storage");
+        fence.close("test_tool_cancellation_checkpoint");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        checkpoint_release.send(()).expect("release checkpoint");
+
+        let (rt, result) = cancellation.await.expect("cancellation joins");
+        result.expect("admitted cancellation unit completes");
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        let mut message_count = 0;
+        let mut state_count = 0;
+        while let Ok(event) = broadcast_rx.try_recv() {
+            message_count += usize::from(matches!(event, SseEvent::Message { .. }));
+            state_count += usize::from(matches!(event, SseEvent::StateChange { .. }));
+        }
+        assert!(message_count > 0, "checkpoint evidence is published");
+        assert_eq!(state_count, 1, "terminal state is published exactly once");
+    }
+
+    #[tokio::test]
+    async fn terminal_persisted_message_and_state_publish_after_close_during_write() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
             DirectTurnMaterializationEligibility::StaleAuthority,
             AuthoritativeUserMessageMaterialization::StaleAuthority,
         );
@@ -12740,6 +12895,14 @@ mod authoritative_user_message_effect_tests {
         result.expect("admitted terminal unit completes");
         assert!(matches!(rt.state, ConvState::Idle));
         assert_eq!(storage.recorded_messages().len(), 1);
+        let mut message_count = 0;
+        let mut state_count = 0;
+        while let Ok(event) = broadcast_rx.try_recv() {
+            message_count += usize::from(matches!(event, SseEvent::Message { .. }));
+            state_count += usize::from(matches!(event, SseEvent::StateChange { .. }));
+        }
+        assert_eq!(message_count, 1, "terminal evidence is published once");
+        assert_eq!(state_count, 1, "terminal state is published once");
     }
 
     #[tokio::test]
@@ -13306,15 +13469,15 @@ mod authoritative_user_message_effect_tests {
             transition.await.expect("transition joins").unwrap_err(),
             "runtime state publication closed after fatal local authority loss"
         );
-        let post_close = broadcast_rx.try_recv();
-        assert!(
-            matches!(
-                post_close,
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty
-                    | tokio::sync::broadcast::error::TryRecvError::Closed)
-            ),
-            "unexpected post-close publication: {post_close:?}"
-        );
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { message }) if message.message_id == "msg-direct"
+        ));
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -15794,7 +15957,8 @@ mod steer_drain_detector_tests {
             task: "investigate".to_string(),
             outcome: SubAgentOutcome::TimedOut,
         }];
-        rt.persist_sub_agent_results(results, None, "subagent-summary".to_string())
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_sub_agent_results(results, None, "subagent-summary".to_string(), &mut admitted)
             .await
             .expect("persist must succeed");
 
@@ -16796,7 +16960,8 @@ mod steer_drain_detector_tests {
         )
         .unwrap();
 
-        rt.persist_checkpoint_with_terminal_obligation(data, &settlement)
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_checkpoint_with_terminal_obligation(data, &settlement, &mut admitted)
             .await
             .expect("retired checkpoint is resolved");
 
