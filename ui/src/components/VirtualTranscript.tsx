@@ -110,8 +110,11 @@ interface PhysicalStore<T> {
    *  the top spacer (mid-scroll anchor compensation, REQ-VT-004). */
   drift: number;
   lastScrollAtMs: number;
-  /** Touches that began on this scroller and are still down. */
-  activeTouches: number;
+  /** Identifiers of touches that began anywhere inside this scroller and
+   *  are still down. `targetTouches` cannot serve here: it is scoped to the
+   *  event's target row, so an ancestor listener reads zero while a finger
+   *  remains down on a sibling row. */
+  activeTouchIds: Set<number>;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
@@ -130,7 +133,7 @@ const PINNED_EPSILON = 1;
 export const SCROLL_SETTLE_MS = 150;
 
 function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
-  return store.activeTouches > 0 || Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
+  return store.activeTouchIds.size > 0 || Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
 }
 
 function clampNonNegative(value: number): number {
@@ -461,7 +464,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     revision: 0,
     drift: 0,
     lastScrollAtMs: Number.NEGATIVE_INFINITY,
-    activeTouches: 0,
+    activeTouchIds: new Set(),
     pendingScrollDelta: null,
     pendingProgrammaticTop: null,
   };
@@ -609,7 +612,7 @@ function VirtualTranscriptInner<T>(
     }
     detachTouchListenersRef.current?.();
     detachTouchListenersRef.current = null;
-    current.activeTouches = 0;
+    current.activeTouchIds.clear();
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
@@ -619,17 +622,30 @@ function VirtualTranscriptInner<T>(
         current.initialTailPending = false;
         setScrollerScrollTop(current, totalPhysicalExtent(current));
       }
-      const onTouchChange = (event: TouchEvent) => {
+      // changedTouches carries exactly the touches this event starts or
+      // ends, whichever descendant they landed on, so the set stays accurate
+      // for multi-finger gestures spanning rows.
+      const onTouchStart = (event: TouchEvent) => {
         const store = storeRef.current;
-        if (store) store.activeTouches = event.targetTouches.length;
+        if (!store) return;
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.add(touch.identifier);
+        }
       };
-      element.addEventListener('touchstart', onTouchChange, { passive: true });
-      element.addEventListener('touchend', onTouchChange, { passive: true });
-      element.addEventListener('touchcancel', onTouchChange, { passive: true });
+      const onTouchStop = (event: TouchEvent) => {
+        const store = storeRef.current;
+        if (!store) return;
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.delete(touch.identifier);
+        }
+      };
+      element.addEventListener('touchstart', onTouchStart, { passive: true });
+      element.addEventListener('touchend', onTouchStop, { passive: true });
+      element.addEventListener('touchcancel', onTouchStop, { passive: true });
       detachTouchListenersRef.current = () => {
-        element.removeEventListener('touchstart', onTouchChange);
-        element.removeEventListener('touchend', onTouchChange);
-        element.removeEventListener('touchcancel', onTouchChange);
+        element.removeEventListener('touchstart', onTouchStart);
+        element.removeEventListener('touchend', onTouchStop);
+        element.removeEventListener('touchcancel', onTouchStop);
       };
     }
     recompute(current);

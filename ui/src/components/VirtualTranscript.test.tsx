@@ -400,7 +400,7 @@ describe('VirtualTranscript', () => {
 
       act(() => ref.current?.scrollToIndex(20, 'start'));
       act(() => {
-        fireEvent.touchStart(scroller!, { touches: [{}], targetTouches: [{}] });
+        fireEvent.touchStart(scroller!, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
         scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
@@ -416,7 +416,66 @@ describe('VirtualTranscript', () => {
       expect(scrollTopOf(scroller)).toBe(395);
 
       act(() => {
-        fireEvent.touchEnd(scroller!, { touches: [], targetTouches: [] });
+        fireEvent.touchEnd(scroller!, { touches: [], changedTouches: [{ identifier: 1 }] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(425);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps reconciliation deferred while a second finger stays down on another row', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 20)}
+          getKey={(item) => item.id}
+          estimatedExtent={20}
+          overscan={200}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => ref.current?.scrollToIndex(20, 'start'));
+      // Two fingers land on different rows, so their touch events target
+      // different descendants of the scroller.
+      const rowA = document.querySelector<HTMLElement>('[data-virtual-key="item-18"]')!;
+      const rowB = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
+      act(() => {
+        fireEvent.touchStart(rowA, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+        fireEvent.touchStart(rowB, {
+          touches: [{ identifier: 1 }, { identifier: 2 }],
+          changedTouches: [{ identifier: 2 }],
+        });
+        scroller!.scrollTop = 395;
+        fireEvent.scroll(scroller!);
+      });
+      const row12 = document.querySelector<HTMLElement>('[data-virtual-key="item-12"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      // First finger lifts; the second is still down, so the gesture is not
+      // over and reconciliation must stay deferred.
+      act(() => {
+        fireEvent.touchEnd(rowA, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 1 }] });
+      });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        fireEvent.touchEnd(rowB, { touches: [], changedTouches: [{ identifier: 2 }] });
       });
       act(() => {
         vi.advanceTimersByTime(400);

@@ -434,24 +434,26 @@ export function reduceScrollMachine(
       if (!isReady(state)) return { state, effects: [] };
       return resolveTouch(state, event.remainingTouches);
 
-    case 'upwardIntent':
+    case 'upwardIntent': {
       if (!isReady(state)) return { state, effects: [] };
-      if (state.kind === 'live' && state.follow.kind === 'navigating') {
+      // Revoked for every upward move, navigating included: the gesture is
+      // heading away from the tail whoever owns the viewport
+      // (scroll_policy.allium UpwardIntentDuringGestureRevokesTailArrival).
+      const departed: ReadySession = state.gesture.kind === 'touch' && state.gesture.arrivedAtTail
+        ? { ...state, gesture: { ...state.gesture, arrivedAtTail: false } }
+        : state;
+      if (departed.kind === 'live' && departed.follow.kind === 'navigating') {
         return {
           state: {
-            ...state,
-            geometry: updateGeometry(state.geometry, event.snapshot ?? null),
-            follow: state.follow,
+            ...departed,
+            geometry: updateGeometry(departed.geometry, event.snapshot ?? null),
+            follow: departed.follow,
           },
           effects: [],
         };
       }
-      return takeUserOwnership(
-        state.gesture.kind === 'touch' && state.gesture.arrivedAtTail
-          ? { ...state, gesture: { ...state.gesture, arrivedAtTail: false } }
-          : state,
-        event.snapshot,
-      );
+      return takeUserOwnership(departed, event.snapshot);
+    }
 
     case 'navigationJumped':
       if (!isReady(state)) return { state: { ...state, navigationPending: true }, effects: [] };
