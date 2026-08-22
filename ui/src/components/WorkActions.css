@@ -103,10 +103,6 @@
 
 .mobile-work-fallback-panel,
 .mobile-work-fallback-menu {
-  position: absolute;
-  z-index: 20;
-  right: 8px;
-  left: 8px;
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-primary);
@@ -114,7 +110,6 @@
 }
 
 .mobile-work-fallback-panel {
-  bottom: 7px;
   min-height: 44px;
   padding: 10px 12px;
   color: var(--text-secondary);
@@ -132,6 +127,8 @@
 }
 
 .mobile-work-fallback-menu {
+  position: absolute;
+  z-index: 20;
   right: 8px;
   bottom: calc(100% - 27px);
   left: auto;

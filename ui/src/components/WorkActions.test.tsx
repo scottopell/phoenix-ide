@@ -1980,6 +1980,28 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(cleanup).toHaveFocus();
   });
 
+  it('keeps a terminal-action error visible while details are open', async () => {
+    enableMobile();
+    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup remains visible'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-error-details"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Clean up\./ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup remains visible');
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('cleanup remains visible');
+    expect(screen.getByRole('status').nextElementSibling).toBe(screen.getByRole('alert'));
+  });
+
   it('removes covered actions from the interaction tree while details are open', () => {
     enableMobile();
     renderWithProviders(
