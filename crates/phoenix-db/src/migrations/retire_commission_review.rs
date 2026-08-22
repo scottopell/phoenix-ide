@@ -170,69 +170,9 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
         )?;
         let (tool_use_id, assistant_message) = legacy.into_parts();
         validate_tool_call(&conversation_id, &tool_use_id, &assistant_message)?;
-        let carried_result_id = matching_tool_result_for_assistant(
-            tx,
-            &conversation_id,
-            &assistant_message.message_id,
-            &tool_use_id,
-        )
-        .await?;
-        sqlx::query(
-            "DELETE FROM messages
-             WHERE conversation_id = ?1 AND message_id = ?2",
-        )
-        .bind(&conversation_id)
-        .bind(&assistant_message.message_id)
-        .execute(&mut **tx)
-        .await?;
-
-        if let Some(message_id) = carried_result_id {
-            sqlx::query("DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2")
-                .bind(&conversation_id)
-                .bind(message_id)
-                .execute(&mut **tx)
+        let result_message_id =
+            replace_carried_tool_round(tx, &conversation_id, &tool_use_id, assistant_message)
                 .await?;
-        }
-
-        let next_sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
-        )
-        .bind(&conversation_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        insert_message(
-            tx,
-            &Message {
-                message_id: assistant_message.message_id,
-                conversation_id: conversation_id.clone(),
-                sequence_id: next_sequence,
-                message_type: MessageType::Agent,
-                content: MessageContent::agent(assistant_message.content),
-                display_data: assistant_message.display_data,
-                usage_data: assistant_message.usage,
-                created_at: assistant_message.created_at,
-            },
-        )
-        .await?;
-        let result_message_id = recovery_result_id(&conversation_id, &tool_use_id);
-        insert_message(
-            tx,
-            &Message {
-                message_id: result_message_id.clone(),
-                conversation_id: conversation_id.clone(),
-                sequence_id: next_sequence + 1,
-                message_type: MessageType::Tool,
-                content: MessageContent::tool(
-                    &tool_use_id,
-                    "commission_review is unavailable because the capability was retired",
-                    true,
-                ),
-                display_data: None,
-                usage_data: None,
-                created_at: chrono::Utc::now(),
-            },
-        )
-        .await?;
 
         sqlx::query(
             "INSERT INTO conversation_recovery_settlements (
@@ -259,6 +199,74 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
         .await?;
     }
     Ok(())
+}
+
+async fn replace_carried_tool_round(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+    tool_use_id: &str,
+    assistant_message: AssistantMessage,
+) -> DbResult<String> {
+    let carried_result_id = matching_tool_result_for_assistant(
+        tx,
+        conversation_id,
+        &assistant_message.message_id,
+        tool_use_id,
+    )
+    .await?;
+    sqlx::query("DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2")
+        .bind(conversation_id)
+        .bind(&assistant_message.message_id)
+        .execute(&mut **tx)
+        .await?;
+    if let Some(message_id) = carried_result_id {
+        sqlx::query("DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2")
+            .bind(conversation_id)
+            .bind(message_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    let next_sequence: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    insert_message(
+        tx,
+        &Message {
+            message_id: assistant_message.message_id,
+            conversation_id: conversation_id.to_string(),
+            sequence_id: next_sequence,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(assistant_message.content),
+            display_data: assistant_message.display_data,
+            usage_data: assistant_message.usage,
+            created_at: assistant_message.created_at,
+        },
+    )
+    .await?;
+    let result_message_id = recovery_result_id(conversation_id, tool_use_id);
+    insert_message(
+        tx,
+        &Message {
+            message_id: result_message_id.clone(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id: next_sequence + 1,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool(
+                tool_use_id,
+                "commission_review is unavailable because the capability was retired",
+                true,
+            ),
+            display_data: None,
+            usage_data: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    Ok(result_message_id)
 }
 
 async fn matching_tool_result_for_assistant(
