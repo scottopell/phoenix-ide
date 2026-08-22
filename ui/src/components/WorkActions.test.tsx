@@ -1537,6 +1537,10 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     const details = screen.getByRole('status');
     expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
     expect(details).toHaveTextContent('Captures a diff snapshot');
+    const infoTrigger = screen.getByRole('button', { name: 'Work status details' });
+    fireEvent.click(infoTrigger);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.click(infoTrigger);
 
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();

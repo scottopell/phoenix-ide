@@ -9,6 +9,8 @@
 }
 
 .mobile-work-fallback-status {
+  position: relative;
+  z-index: 21;
   min-width: 0;
   min-height: 20px;
   display: flex;
@@ -57,6 +59,11 @@
   color: var(--text-muted);
   font: inherit;
   font-size: 15px;
+}
+
+.mobile-work-fallback-info-button[aria-expanded='true'] {
+  border-radius: 5px;
+  background: var(--bg-primary);
 }
 
 .mobile-work-fallback-info-button::before {
