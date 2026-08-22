@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -159,11 +160,13 @@ pub(crate) struct SqliteObservation {
     pub(crate) retry_backoff: Duration,
     pub(crate) writer_concurrency: u32,
     pub(crate) read_concurrency: u32,
+    pub(crate) baseline_statement_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BucketCategoryTotals {
     pub operation_count: u64,
+    pub baseline_statement_count: u64,
     pub latency_micros: u64,
     pub pool_wait_micros: u64,
     pub write_admission_wait_micros: u64,
@@ -332,6 +335,7 @@ impl Default for InnerCollector {
 #[derive(Debug, Clone, Default)]
 pub struct SqliteWorkloadCollector {
     inner: Arc<Mutex<InnerCollector>>,
+    active_native_reads: Arc<AtomicU32>,
 }
 
 impl SqliteWorkloadCollector {
@@ -350,6 +354,18 @@ impl SqliteWorkloadCollector {
             .lock()
             .expect("sqlite workload collector mutex poisoned");
         inner.record(observation);
+    }
+
+    pub(crate) fn begin_native_read(&self) -> u32 {
+        self.active_native_reads.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub(crate) fn end_native_read(&self) {
+        let _ =
+            self.active_native_reads
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                    Some(active.saturating_sub(1))
+                });
     }
 
     pub fn snapshot(
@@ -398,6 +414,7 @@ impl SqliteWorkloadCollector {
                     let dst = &mut totals[a][c];
                     let src = bucket.totals[a][c];
                     dst.operation_count += src.operation_count;
+                    dst.baseline_statement_count += src.baseline_statement_count;
                     dst.latency_micros += src.latency_micros;
                     dst.pool_wait_micros += src.pool_wait_micros;
                     dst.write_admission_wait_micros += src.write_admission_wait_micros;
@@ -448,6 +465,7 @@ impl InnerCollector {
         let category_index = observation.category.index();
         let totals = &mut bucket.totals[access_index][category_index];
         totals.operation_count += 1;
+        totals.baseline_statement_count += observation.baseline_statement_count;
         totals.latency_micros += duration_to_micros(observation.latency);
         totals.pool_wait_micros += duration_to_micros(observation.pool_wait);
         totals.write_admission_wait_micros += duration_to_micros(observation.write_admission_wait);
@@ -754,6 +772,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
+            baseline_statement_count: 0,
         });
 
         let snapshot =
@@ -800,6 +819,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 2,
+            baseline_statement_count: 0,
         });
 
         let snapshot =
@@ -904,6 +924,7 @@ mod tests {
             retry_backoff: Duration::from_millis(20),
             writer_concurrency: 1,
             read_concurrency: 0,
+            baseline_statement_count: 0,
         });
 
         let one = collector.snapshot(SqliteSnapshotWindow::OneHour, 1_000 * M);
@@ -958,6 +979,7 @@ mod tests {
             retry_backoff: Duration::from_millis(15),
             writer_concurrency: 1,
             read_concurrency: 0,
+            baseline_statement_count: 0,
         });
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, completed_at);
         let bucket = snapshot.buckets.last().unwrap();

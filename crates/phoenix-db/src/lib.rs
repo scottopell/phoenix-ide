@@ -8,6 +8,7 @@ mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
+mod sqlite_native_statement;
 mod sqlite_telemetry;
 mod sqlite_workload;
 pub mod workflow;
@@ -54,6 +55,7 @@ use phoenix_core::domain::llm_types::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use sqlite_native_statement::install_native_statement_baseline;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
@@ -1408,10 +1410,14 @@ impl Database {
         )
     }
 
-    fn new_with_generated_target_binding(pool: SqlitePool, path: String) -> Self {
+    fn new_with_generated_target_binding(
+        pool: SqlitePool,
+        path: String,
+        sqlite_workload_collector: SqliteWorkloadCollector,
+    ) -> Self {
         Self {
             pool,
-            sqlite_workload_collector: SqliteWorkloadCollector::new(),
+            sqlite_workload_collector,
             path,
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
@@ -1423,7 +1429,7 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn from_pool_for_tests(pool: SqlitePool, path: String) -> Self {
-        Self::new_with_generated_target_binding(pool, path)
+        Self::new_with_generated_target_binding(pool, path, SqliteWorkloadCollector::new())
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
@@ -2735,13 +2741,29 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
+        let pool = SqlitePoolOptions::new()
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
+            .connect_with(opts)
+            .await?;
         // The DB (and its WAL sidecars) holds conversation history — command
         // output, secrets the agent saw. On a multi-user host the default umask
         // can leave it world-readable, so tighten to owner-only. Best-effort:
         // a chmod failure is logged, never fatal to startup.
         restrict_db_permissions(path);
-        let db = Self::new_with_generated_target_binding(pool, path.to_string());
+        let db = Self::new_with_generated_target_binding(
+            pool,
+            path.to_string(),
+            sqlite_workload_collector,
+        );
         db.run_migrations().await?;
         // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
         // early chmod above could not see. Re-tighten now they exist. The prod
@@ -2785,11 +2807,22 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         // In-memory SQLite DBs are per-connection, so limit to 1 connection
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
             .connect_with(opts)
             .await?;
-        let db = Self::new_with_generated_target_binding(pool, String::new());
+        let db =
+            Self::new_with_generated_target_binding(pool, String::new(), sqlite_workload_collector);
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)

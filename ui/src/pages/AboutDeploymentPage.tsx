@@ -461,7 +461,7 @@ function SqliteDiagnostics({
               <dt>Confidence</dt>
               <dd>{report.restart_truncated ? 'Restart truncated' : 'Full requested uptime available'}</dd>
               <div className="settings-section__hint">
-                {report.classification.classified_count} classified · {report.classification.other_count} other{report.classification.other_share_percent != null ? ` (${formatPercent(report.classification.other_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned
+                {report.classification.classified_operation_count} classified · {report.classification.baseline_statement_count} baseline statements · {report.classification.other_operation_count} other{report.classification.other_operation_share_percent != null ? ` (${formatPercent(report.classification.other_operation_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned
               </div>
             </div>
           </dl>

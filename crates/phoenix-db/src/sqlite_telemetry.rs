@@ -391,6 +391,7 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
+            baseline_statement_count: 0,
         });
         self.record_slow_success(timing, outcome);
     }
@@ -528,6 +529,7 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
+            baseline_statement_count: 0,
         });
     }
 

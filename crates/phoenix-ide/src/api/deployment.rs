@@ -200,9 +200,10 @@ pub struct SqliteWorkloadCoverage {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteClassificationSummary {
-    pub classified_count: u64,
-    pub other_count: u64,
-    pub other_share_percent: Option<f64>,
+    pub classified_operation_count: u64,
+    pub baseline_statement_count: u64,
+    pub other_operation_count: u64,
+    pub other_operation_share_percent: Option<f64>,
     pub abandoned_count: u64,
 }
 
@@ -749,28 +750,40 @@ fn classification_summary(
 ) -> SqliteClassificationSummary {
     use crate::db::{SqliteAccessKind, SqliteOutcome, SqliteWorkloadCategory};
 
-    let mut classified_count = 0u64;
-    let mut other_count = 0u64;
+    let mut classified_operation_count = 0u64;
+    let mut baseline_statement_count = 0u64;
+    let mut other_operation_count = 0u64;
     let mut abandoned_count = 0u64;
     for access in SqliteAccessKind::ALL {
         for category in SqliteWorkloadCategory::ALL {
             let totals = report.totals[access.index()][category.index()];
-            classified_count = classified_count.saturating_add(totals.operation_count);
+            classified_operation_count = classified_operation_count.saturating_add(
+                totals
+                    .operation_count
+                    .saturating_sub(totals.baseline_statement_count),
+            );
+            baseline_statement_count =
+                baseline_statement_count.saturating_add(totals.baseline_statement_count);
             abandoned_count = abandoned_count.saturating_add(
                 report.outcomes[access.index()][category.index()][SqliteOutcome::Abandoned.index()],
             );
             if category == SqliteWorkloadCategory::Other {
-                other_count = other_count.saturating_add(totals.operation_count);
+                other_operation_count = other_operation_count.saturating_add(
+                    totals
+                        .operation_count
+                        .saturating_sub(totals.baseline_statement_count),
+                );
             }
         }
     }
     SqliteClassificationSummary {
-        classified_count,
-        other_count,
-        other_share_percent: if classified_count == 0 {
+        classified_operation_count,
+        baseline_statement_count,
+        other_operation_count,
+        other_operation_share_percent: if classified_operation_count == 0 {
             None
         } else {
-            Some(other_count as f64 * 100.0 / classified_count as f64)
+            Some(other_operation_count as f64 * 100.0 / classified_operation_count as f64)
         },
         abandoned_count,
     }
