@@ -25,6 +25,7 @@ struct SourceSnapshotTestBarrier {
 }
 
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use crate::sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{Message, MessageType};
@@ -740,7 +741,11 @@ impl MessageRetriever for Fts5Retriever {
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
 pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsUpsert,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     let mut tx = telemetry
         .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
         .await?;
@@ -764,7 +769,11 @@ pub async fn fts_upsert_conn(
     conn: &mut sqlx::SqliteConnection,
     message: &Message,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsUpsert,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     fts_upsert_conn_with_telemetry(conn, message, &telemetry).await
 }
 
@@ -883,7 +892,11 @@ pub async fn fts_reconcile_upsert(
     message: &Message,
     observed: &[FtsLocatorWitness],
 ) -> Result<bool, sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsReconcileUpsert);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsReconcileUpsert,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
     let mut tx = telemetry
@@ -1026,7 +1039,11 @@ pub(crate) async fn fts_hide_message_tx(
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete fails.
 pub async fn fts_delete_message(pool: &SqlitePool, message_id: &str) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteMessage);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsDeleteMessage,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     let mut tx = telemetry
         .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
         .await?;
@@ -1046,7 +1063,11 @@ pub async fn fts_delete_conversation(
     pool: &SqlitePool,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsDeleteConversation,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     let mut tx = telemetry
         .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
         .await?;
@@ -1069,7 +1090,11 @@ pub async fn fts_delete_conversation_conn(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
+    let telemetry = SqliteTelemetry::without_collector(
+        SqliteOperation::FtsDeleteConversation,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+    );
     fts_delete_conversation_conn_with_telemetry(conn, conversation_id, &telemetry).await
 }
 

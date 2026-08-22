@@ -49,7 +49,7 @@ use phoenix_core::domain::llm_types::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
-use sqlite_workload::SqliteWorkloadCollector;
+use sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -1353,6 +1353,20 @@ impl Database {
     #[must_use]
     pub(crate) fn sqlite_workload_collector(&self) -> &SqliteWorkloadCollector {
         &self.sqlite_workload_collector
+    }
+
+    fn sqlite_telemetry(
+        &self,
+        operation: SqliteOperation,
+        category: SqliteWorkloadCategory,
+        access: SqliteAccessKind,
+    ) -> SqliteTelemetry {
+        SqliteTelemetry::with_collector(
+            operation,
+            category,
+            access,
+            self.sqlite_workload_collector.clone(),
+        )
     }
 
     #[allow(
@@ -6736,7 +6750,11 @@ impl Database {
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::CreateTaskApprovalHandoff);
+        let fts_telemetry = self.sqlite_telemetry(
+            SqliteOperation::CreateTaskApprovalHandoff,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;
@@ -8481,7 +8499,11 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::ConversationDelete);
+        let fts_telemetry = self.sqlite_telemetry(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;
@@ -10305,7 +10327,11 @@ impl Database {
             .get("hidden")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::UpdateMessageDisplayData);
+        let fts_telemetry = self.sqlite_telemetry(
+            SqliteOperation::UpdateMessageDisplayData,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
         let mut tx = fts_telemetry
             .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
             .await?;
