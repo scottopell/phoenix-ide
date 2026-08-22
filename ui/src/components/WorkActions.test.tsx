@@ -2121,7 +2121,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('view-diff-button')).not.toHaveClass('work-actions-btn--primary');
     expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByRole('link', { name: /Merge PR #12|Open PR #12/ })).not.toBeInTheDocument();
   });
 
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {

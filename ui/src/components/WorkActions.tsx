@@ -422,7 +422,7 @@ export function WorkControlBar({
   if (!disposition.visible) return null;
 
   const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
-    disposition.primary === role ? ' work-actions-btn--primary' : '';
+    !explicitSelectionUnresolved && disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const terminalActionStillSafe = async (): Promise<boolean> => {
     const latest = await prStatusHandle.refreshForSafety();
@@ -882,7 +882,7 @@ export function WorkControlBar({
         {!prStatusHandle.ambiguous && !explicitSelectionUnresolved && disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
           <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
         )}
-        {!prStatusHandle.ambiguous && disposition.secondaryResolve && (
+        {!prStatusHandle.ambiguous && !explicitSelectionUnresolved && disposition.secondaryResolve && (
           <ResolveLink verb={disposition.secondaryResolve} primary={false} coverageMarker={coverageMarker} />
         )}
         {!cleanupBlockedByAmbiguity && disposition.showCleanUp && (
