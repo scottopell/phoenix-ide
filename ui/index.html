@@ -4,6 +4,26 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/phoenix.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#0d1117" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Phoenix" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      try {
+        const savedTheme = localStorage.getItem('phoenix-theme');
+        const useLightTheme = savedTheme === 'light'
+          || (savedTheme === null && matchMedia('(prefers-color-scheme: light)').matches);
+        if (useLightTheme) {
+          document.querySelector('meta[name="theme-color"]').content = '#ffffff';
+          document.querySelector('link[rel="manifest"]').href = '/manifest-light.webmanifest';
+          document.documentElement.dataset.theme = 'light';
+        }
+      } catch (error) {
+        console.warn('Unable to read the saved Phoenix theme during bootstrap', error);
+      }
+    </script>
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <title>Phoenix</title>
   </head>
   <body>

@@ -17,9 +17,28 @@ pub struct ActiveDirectTurn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedActiveDirectTurn {
-    pub active: ActiveDirectTurn,
-    pub materialized: bool,
+pub enum LoadedActiveDirectTurn {
+    Unmaterialized {
+        active: ActiveDirectTurn,
+    },
+    Materialized {
+        active: ActiveDirectTurn,
+        canonical_message_id: String,
+    },
+}
+
+impl LoadedActiveDirectTurn {
+    pub const fn active(&self) -> &ActiveDirectTurn {
+        match self {
+            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+        }
+    }
+
+    pub fn into_active(self) -> ActiveDirectTurn {
+        match self {
+            Self::Unmaterialized { active } | Self::Materialized { active, .. } => active,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +71,7 @@ impl ActiveDirectTurnTerminal {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveDirectTurnSettlement {
     pub turn: ActiveDirectTurn,
+    pub conversation_id: String,
     pub terminal: ActiveDirectTurnTerminal,
     pub state: ConvState,
     pub state_updated_at: DateTime<Utc>,
@@ -129,6 +149,18 @@ pub trait MessageStore: Send + Sync {
         display_data: Option<&Value>,
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalEvidenceEstablishment;
 
     /// Like `add_message_with_seq`, but writes a caller-supplied
     /// `created_at` instead of `Utc::now()`. Used by `persist_checkpoint`
@@ -218,6 +250,12 @@ pub trait MessageStore: Send + Sync {
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String>;
 
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
+    ) -> TerminalMutationEstablishment;
+
     async fn settle_continuation_direct_turn(
         &self,
         settlement: &ContinuationDirectTurnSettlement,
@@ -268,6 +306,47 @@ pub trait MessageStore: Send + Sync {
         assistant: &crate::db::Message,
         tool_results: &[crate::db::Message],
     ) -> Result<(), String>;
+
+    async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment;
+
+    async fn persist_sub_agent_results_with_terminal_obligation(
+        &self,
+        evidence: &TerminalSubAgentEvidence,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment;
+}
+
+#[derive(Clone, Debug)]
+pub enum TerminalEvidenceEstablishment {
+    Established(Box<Message>),
+    Retired,
+    KnownNotCommitted(String),
+    Unclassifiable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalMutationEstablishment {
+    Established { transcript_generation: Option<i64> },
+    Retired,
+    KnownNotCommitted(String),
+    Unclassifiable(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum TerminalSubAgentEvidence {
+    Update {
+        conversation_id: String,
+        message_id: String,
+        content: MessageContent,
+        display_data: Value,
+    },
+    Insert(Message),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -279,6 +358,13 @@ pub struct PersistedStateSnapshot {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
+    async fn establish_parent_reconcile_action(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Update the conversation state (full state as JSON). `state_updated_at`
     /// is the runtime's authoritative phase-entry timestamp; persisting it
     /// (rather than a fresh `now()` at the storage layer) keeps the DB row and
@@ -511,6 +597,30 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalEvidenceEstablishment {
+        (**self)
+            .add_message_with_seq_and_terminal_obligation(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                settlement,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
         message_id: &str,
@@ -613,6 +723,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).load_active_direct_turn(conversation_id).await
     }
 
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
+    ) -> TerminalMutationEstablishment {
+        (**self)
+            .persist_active_direct_turn_terminal_obligation(settlement, response_message_id)
+            .await
+    }
+
     async fn settle_active_direct_turn(
         &self,
         settlement: &ActiveDirectTurnSettlement,
@@ -672,6 +792,33 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .persist_tool_round(conv_id, assistant, tool_results)
+            .await
+    }
+
+    async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment {
+        (**self)
+            .persist_tool_round_with_terminal_obligation(
+                conv_id,
+                assistant,
+                tool_results,
+                settlement,
+            )
+            .await
+    }
+
+    async fn persist_sub_agent_results_with_terminal_obligation(
+        &self,
+        evidence: &TerminalSubAgentEvidence,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment {
+        (**self)
+            .persist_sub_agent_results_with_terminal_obligation(evidence, settlement)
             .await
     }
 }
@@ -966,6 +1113,83 @@ impl MessageStore for DatabaseStorage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_and_terminal_obligation(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalEvidenceEstablishment {
+        let terminal = match &settlement.terminal {
+            ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
+            ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+            ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
+                reason: reason.clone(),
+            },
+        };
+        let obligation = phoenix_db::workflow::DirectTurnTerminalObligationInput {
+            turn_id: settlement.turn.turn_id,
+            expected_generation: settlement.turn.generation,
+            terminal,
+            projection: phoenix_db::workflow::PersistedConversationProjection {
+                state: settlement.state.clone(),
+                state_updated_at: settlement.state_updated_at,
+            },
+            response_message_id: Some(message_id.to_string()),
+        };
+        match self
+            .db
+            .add_message_with_seq_and_terminal_obligation(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                &obligation,
+            )
+            .await
+        {
+            Ok(message) => TerminalEvidenceEstablishment::Established(Box::new(message)),
+            Err(write_error) => {
+                let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+                match repo
+                    .probe_terminal_evidence(conv_id, message_id, &obligation)
+                    .await
+                {
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established { .. }) => self
+                        .db
+                        .get_message_by_id_in_conversation(conv_id, message_id)
+                        .await
+                        .map_or_else(
+                            |probe_error| TerminalEvidenceEstablishment::Unclassifiable(format!(
+                                "{write_error}; established terminal response retrieval failed: {probe_error}"
+                            )),
+                            |message| TerminalEvidenceEstablishment::Established(Box::new(message)),
+                        ),
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
+                        TerminalEvidenceEstablishment::Retired
+                    }
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::KnownNotCommitted) => {
+                        TerminalEvidenceEstablishment::KnownNotCommitted(write_error.to_string())
+                    }
+                    Ok(phoenix_db::workflow::TerminalEvidenceProbe::Incomplete) => {
+                        TerminalEvidenceEstablishment::Unclassifiable(format!(
+                            "{write_error}; terminal evidence is incomplete"
+                        ))
+                    }
+                    Err(probe_error) => TerminalEvidenceEstablishment::Unclassifiable(format!(
+                        "{write_error}; exact terminal evidence classification failed: {probe_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
         message_id: &str,
@@ -1136,18 +1360,52 @@ impl MessageStore for DatabaseStorage {
         ))
         .await
         .map(|turn| {
-            turn.map(|turn| LoadedActiveDirectTurn {
-                materialized: matches!(
-                    turn.materialization,
-                    phoenix_workflow::Materialization::Materialized { .. }
-                ),
-                active: ActiveDirectTurn {
+            turn.map(|turn| {
+                let active = ActiveDirectTurn {
                     turn_id: turn.id,
                     generation: turn.generation,
-                },
+                };
+                match turn.materialization {
+                    phoenix_workflow::Materialization::Unmaterialized => {
+                        LoadedActiveDirectTurn::Unmaterialized { active }
+                    }
+                    phoenix_workflow::Materialization::Materialized { message_id } => {
+                        LoadedActiveDirectTurn::Materialized {
+                            active,
+                            canonical_message_id: message_id.0,
+                        }
+                    }
+                }
             })
         })
         .map_err(|error| error.to_string())
+    }
+
+    async fn persist_active_direct_turn_terminal_obligation(
+        &self,
+        settlement: &ActiveDirectTurnSettlement,
+        response_message_id: Option<&str>,
+    ) -> TerminalMutationEstablishment {
+        let obligation =
+            terminal_obligation(settlement, response_message_id.map(ToString::to_string));
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        match repo.persist_terminal_obligation(&obligation).await {
+            Ok(()) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+            },
+            Err(error) => {
+                classify_terminal_mutation(
+                    &self.db,
+                    &phoenix_db::workflow::TerminalEvidenceExpectation::ObligationOnly {
+                        conversation_id: settlement.conversation_id.clone(),
+                    },
+                    &obligation,
+                    error.to_string(),
+                    None,
+                )
+                .await
+            }
+        }
     }
 
     async fn settle_active_direct_turn(
@@ -1245,6 +1503,156 @@ impl MessageStore for DatabaseStorage {
             .await
             .map_err(|e| e.to_string())
     }
+
+    async fn persist_tool_round_with_terminal_obligation(
+        &self,
+        conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment {
+        let obligation = terminal_obligation(settlement, None);
+        let mut messages = Vec::with_capacity(1 + tool_results.len());
+        messages.push(assistant.clone());
+        messages.extend_from_slice(tool_results);
+        let evidence = phoenix_db::workflow::TerminalEvidenceExpectation::Messages(messages);
+        match self
+            .db
+            .persist_tool_round_with_terminal_obligation(
+                conv_id,
+                assistant,
+                tool_results,
+                &obligation,
+            )
+            .await
+        {
+            Ok(()) => TerminalMutationEstablishment::Established {
+                transcript_generation: None,
+            },
+            Err(error) => {
+                classify_terminal_mutation(
+                    &self.db,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn persist_sub_agent_results_with_terminal_obligation(
+        &self,
+        evidence: &TerminalSubAgentEvidence,
+        settlement: &ActiveDirectTurnSettlement,
+    ) -> TerminalMutationEstablishment {
+        let obligation = terminal_obligation(settlement, None);
+        let evidence = match evidence {
+            TerminalSubAgentEvidence::Update {
+                conversation_id,
+                message_id,
+                content,
+                display_data,
+            } => phoenix_db::workflow::TerminalEvidenceExpectation::MessageMutation {
+                conversation_id: conversation_id.clone(),
+                message_id: message_id.clone(),
+                content: content.clone(),
+                display_data: display_data.clone(),
+            },
+            TerminalSubAgentEvidence::Insert(message) => {
+                phoenix_db::workflow::TerminalEvidenceExpectation::Messages(vec![message.clone()])
+            }
+        };
+        match self
+            .db
+            .persist_sub_agent_terminal_evidence(&evidence, &obligation)
+            .await
+        {
+            Ok(transcript_generation) => TerminalMutationEstablishment::Established {
+                transcript_generation,
+            },
+            Err(error) => {
+                let transcript_generation = if evidence.is_message_mutation() {
+                    sqlx::query_scalar(
+                        "SELECT transcript_generation FROM conversations WHERE id = ?1",
+                    )
+                    .bind(evidence.conversation_id())
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                classify_terminal_mutation(
+                    &self.db,
+                    &evidence,
+                    &obligation,
+                    error.to_string(),
+                    transcript_generation,
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn terminal_obligation(
+    settlement: &ActiveDirectTurnSettlement,
+    response_message_id: Option<String>,
+) -> phoenix_db::workflow::DirectTurnTerminalObligationInput {
+    let terminal = match &settlement.terminal {
+        ActiveDirectTurnTerminal::Completed => phoenix_workflow::TurnTerminal::Completed,
+        ActiveDirectTurnTerminal::Cancelled => phoenix_workflow::TurnTerminal::Cancelled,
+        ActiveDirectTurnTerminal::Failed { reason } => phoenix_workflow::TurnTerminal::Failed {
+            reason: reason.clone(),
+        },
+    };
+    phoenix_db::workflow::DirectTurnTerminalObligationInput {
+        turn_id: settlement.turn.turn_id,
+        expected_generation: settlement.turn.generation,
+        terminal,
+        projection: phoenix_db::workflow::PersistedConversationProjection {
+            state: settlement.state.clone(),
+            state_updated_at: settlement.state_updated_at,
+        },
+        response_message_id,
+    }
+}
+
+async fn classify_terminal_mutation(
+    db: &crate::db::Database,
+    evidence: &phoenix_db::workflow::TerminalEvidenceExpectation,
+    obligation: &phoenix_db::workflow::DirectTurnTerminalObligationInput,
+    command_error: String,
+    _transcript_generation: Option<i64>,
+) -> TerminalMutationEstablishment {
+    let repo = phoenix_db::workflow::WorkflowRepository::new(db.pool().clone());
+    match repo
+        .probe_exact_terminal_evidence(evidence, obligation)
+        .await
+    {
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Established {
+            transcript_generation,
+        }) => TerminalMutationEstablishment::Established {
+            transcript_generation,
+        },
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Retired) => {
+            TerminalMutationEstablishment::Retired
+        }
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::KnownNotCommitted) => {
+            TerminalMutationEstablishment::KnownNotCommitted(command_error)
+        }
+        Ok(phoenix_db::workflow::TerminalEvidenceProbe::Incomplete) => {
+            TerminalMutationEstablishment::Unclassifiable(format!(
+                "terminal evidence command failed: {command_error}; exact evidence is incomplete"
+            ))
+        }
+        Err(probe_error) => TerminalMutationEstablishment::Unclassifiable(format!(
+            "terminal evidence command failed: {command_error}; exact probe failed: {probe_error}"
+        )),
+    }
 }
 
 fn direct_turn_local_authority(
@@ -1266,6 +1674,13 @@ fn direct_turn_local_authority(
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
+    async fn establish_parent_reconcile_action(&self, conversation_id: &str) -> Result<(), String> {
+        self.db
+            .establish_parent_reconcile_action(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn update_state(
         &self,
         conv_id: &str,

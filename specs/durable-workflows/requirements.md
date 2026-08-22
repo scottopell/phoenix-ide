@@ -513,6 +513,12 @@ AND SHALL NOT publish the terminal or rest state to live observers before that t
 WHEN recovery derives a terminal or rest reducer state for a materialized turn that still owns the conversation
 THE SYSTEM SHALL use the same atomic settlement transaction to repair the projection and release ownership.
 
+WHEN Phoenix opens a database containing a materialized runtime direct turn that still owns its conversation but predates durable terminal-obligation records
+THE SYSTEM SHALL retire that ambiguous turn as failed with its exact turn identity and generation
+AND SHALL preserve its transcript
+AND SHALL NOT infer successful completion from transcript shape
+AND SHALL settle the failed projection and ownership through the same atomic terminal transaction before runtime execution resumes.
+
 ### REQ-DWF-CHAT-014: Deterministic Crash and Interleaving Verification
 
 WHEN direct-turn behavior is verified
@@ -525,6 +531,10 @@ publication.
 Correctness SHALL NOT depend on sleeps, polling cadence, timestamps that infer
 semantic ownership, manual sequence rewind discipline, provider-response-derived
 tool authority, or mutable runtime steering truth.
+
+WHEN a completed provider result has not yet committed its terminal-obligation record
+THE SYSTEM SHALL retain the exact process-owned response transition and SHALL NOT replace it with database reconstruction
+AND after the terminal-obligation record commits, bounded settlement retry exhaustion SHALL actively rematerialize the owning runtime from that durable record without requiring client or SSE activity.
 
 ### REQ-DWF-CHAT-015: Lifecycle Settlement Uses Exact Accepted-Turn Identity
 

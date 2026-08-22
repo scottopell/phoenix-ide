@@ -343,6 +343,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_git_repository_shadow_tables",
         sql: MIGRATION_065,
     },
+    Migration {
+        version: 66,
+        name: "create_direct_turn_terminal_obligations",
+        sql: MIGRATION_066,
+    },
+    Migration {
+        version: 67,
+        name: "create_startup_parent_actions",
+        sql: MIGRATION_067,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -422,6 +432,78 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_067: &str = r"
+CREATE TABLE startup_parent_actions (
+    action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL UNIQUE
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    action TEXT NOT NULL
+        CHECK (action IN ('Reconcile', 'Resume', 'Cancel')),
+    transcript_generation INTEGER NOT NULL,
+    turn_id INTEGER REFERENCES durable_turns(turn_id) ON DELETE SET NULL,
+    turn_generation INTEGER,
+    created_at TEXT NOT NULL
+);
+";
+
+const MIGRATION_066: &str = r"
+CREATE TABLE direct_turn_terminal_obligations (
+    turn_id INTEGER NOT NULL PRIMARY KEY
+        REFERENCES durable_turns(turn_id) ON DELETE CASCADE,
+    expected_generation INTEGER NOT NULL
+        CHECK (typeof(expected_generation) = 'integer' AND expected_generation >= 0),
+    terminal_kind TEXT NOT NULL
+        CHECK (typeof(terminal_kind) = 'text')
+        CHECK (terminal_kind IN ('Completed', 'Cancelled', 'Failed')),
+    terminal_reason TEXT,
+    target_state TEXT NOT NULL
+        CHECK (typeof(target_state) = 'text' AND json_valid(target_state)),
+    target_state_updated_at_us INTEGER NOT NULL
+        CHECK (typeof(target_state_updated_at_us) = 'integer' AND target_state_updated_at_us >= 0),
+    response_message_id TEXT,
+    CHECK (
+        (terminal_kind = 'Failed' AND terminal_reason IS NOT NULL)
+        OR (terminal_kind IN ('Completed', 'Cancelled') AND terminal_reason IS NULL)
+    )
+);
+
+CREATE TABLE direct_turn_retirements (
+    turn_id INTEGER NOT NULL PRIMARY KEY,
+    conversation_id TEXT NOT NULL
+);
+
+INSERT INTO direct_turn_terminal_obligations (
+    turn_id,
+    expected_generation,
+    terminal_kind,
+    terminal_reason,
+    target_state,
+    target_state_updated_at_us,
+    response_message_id
+)
+SELECT
+    t.turn_id,
+    t.generation,
+    'Failed',
+    'Phoenix restarted before this direct turn recorded an exact terminal result',
+    json_object(
+        'type', 'error',
+        'message', 'Phoenix restarted before this direct turn recorded an exact terminal result',
+        'error_kind', 'server_error'
+    ),
+    CAST(strftime(
+        '%s',
+        COALESCE(NULLIF(c.state_updated_at, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    ) AS INTEGER) * 1000000,
+    NULL
+FROM durable_turns AS t
+JOIN conversations AS c ON c.id = t.conversation_id
+WHERE t.disposition = 'Runtime'
+  AND t.terminal_kind IS NULL
+  AND t.owns_conversation = 1
+  AND t.canonical_message_id IS NOT NULL;
+";
 
 const MIGRATION_065: &str = r"
 CREATE TABLE git_repositories (
@@ -8897,6 +8979,68 @@ mod tests {
                 "hash-1".into()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn migration_066_quarantines_legacy_materialized_owners_without_fabricating_completion() {
+        let pool = test_pool().await;
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (
+                 id TEXT PRIMARY KEY,
+                 state TEXT NOT NULL,
+                 state_updated_at TEXT NOT NULL
+             );
+             CREATE TABLE durable_turns (
+                 turn_id INTEGER PRIMARY KEY,
+                 conversation_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 disposition TEXT NOT NULL,
+                 canonical_message_id TEXT,
+                 terminal_kind TEXT,
+                 owns_conversation INTEGER NOT NULL
+             );
+             INSERT INTO conversations VALUES (
+                 'legacy', '{\"type\":\"llm_requesting\",\"attempt\":1}', '2025-05-03T04:09:11Z'
+             );
+             INSERT INTO durable_turns VALUES (
+                 661, 'legacy', 3, 'Runtime', 'canonical-user', NULL, 1
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_066).execute(&pool).await.unwrap();
+
+        let row: (String, String, String, i64) = sqlx::query_as(
+            "SELECT terminal_kind, terminal_reason, target_state, expected_generation
+             FROM direct_turn_terminal_obligations WHERE turn_id = 661",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "Failed");
+        assert!(row.1.contains("exact terminal result"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.2).unwrap()["type"],
+            "error"
+        );
+        assert_eq!(row.3, 3);
+        let timestamp_us: i64 = sqlx::query_scalar(
+            "SELECT target_state_updated_at_us FROM direct_turn_terminal_obligations WHERE turn_id = 661",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(timestamp_us, 1_746_245_351_000_000);
+        let column: (String, i64) = sqlx::query_as(
+            "SELECT type, \"notnull\" FROM pragma_table_info('direct_turn_terminal_obligations')
+             WHERE name = 'target_state_updated_at_us'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(column, ("INTEGER".to_string(), 1));
     }
 
     #[tokio::test]

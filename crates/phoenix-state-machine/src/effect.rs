@@ -224,6 +224,8 @@ pub enum Effect {
         results: Vec<SubAgentResult>,
         /// `tool_use_id` of `spawn_agents` call - used to update its `display_data`
         spawn_tool_id: Option<String>,
+        /// Stable identity for the standalone summary when no tool message exists.
+        summary_message_id: String,
     },
 
     /// Request continuation summary from LLM (no tools) - REQ-BED-020

@@ -3,7 +3,10 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_response, serve_favicon, serve_service_worker, serve_static};
+use super::assets::{
+    get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
+    PUBLIC_ROOT_ASSETS,
+};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
@@ -109,11 +112,14 @@ pub fn create_router(state: AppState) -> Router {
     // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
     // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
     // React route means adding one entry there, not here.
-    let router = Router::new()
-        // Service worker
+    let mut router = Router::new()
         .route("/service-worker.js", get(serve_service_worker))
-        // Favicon (referenced from index.html)
-        .route("/phoenix.svg", get(serve_favicon))
+        .route("/phoenix.svg", get(serve_favicon));
+    for asset in PUBLIC_ROOT_ASSETS {
+        router = router.route(asset.path, get(serve_root_asset));
+    }
+
+    let router = router
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
         // Preview: serves files from absolute paths so relative references work
@@ -5753,20 +5759,12 @@ async fn retire_work_scope_after_hard_delete(state: &AppState, deleted: &crate::
 
 async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
-        let conv_id = id.to_string();
         let _ = handle
             .broadcast_tx
-            .send_live_projection(|seq| SseEvent::ConversationHardDeleted {
-                sequence_id: seq,
-                conversation_id: conv_id,
-            });
+            .send_hard_deleted_and_close(id.to_string());
     }
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
-        let conv_id = id.to_string();
-        let _ = tx.send_live_projection(|seq| SseEvent::ConversationHardDeleted {
-            sequence_id: seq,
-            conversation_id: conv_id,
-        });
+        let _ = tx.send_hard_deleted_and_close(id.to_string());
     }
 }
 

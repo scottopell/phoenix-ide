@@ -132,6 +132,8 @@ pub enum EvictionReason {
     CreationProvisioned,
     /// A one-shot steering wake found no durable work and its idle runtime can retire.
     SteeringReconciliation,
+    /// Durable recovery replaced an in-memory state with its exact DB projection.
+    RecoveryReconciliation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +277,8 @@ pub struct RuntimeManager {
     /// it. Without inheritance the clients would sit on a dead channel until
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
+    startup_obligated_conversations: RwLock<HashSet<String>>,
+    consumed_startup_parent_actions: RwLock<HashSet<i64>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -338,7 +342,35 @@ pub struct RuntimeManager {
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    fatal_local_authority_tx: tokio::sync::watch::Sender<Option<&'static str>>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum DatabaseTerminalRecovery {
+    NoObligation,
+    AlreadyCommitted,
+    Committed {
+        projection: Box<phoenix_db::workflow::PersistedConversationProjection>,
+        is_sub_agent: bool,
+        worktree_path: Option<std::path::PathBuf>,
+    },
+}
+
+impl DatabaseTerminalRecovery {
+    fn committed(&self) -> bool {
+        matches!(self, Self::Committed { .. } | Self::AlreadyCommitted)
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub(crate) enum DatabaseTerminalRecoveryError {
+    #[error("terminal settlement remains owed: {0}")]
+    StillOwed(String),
+    #[error("terminal recovery discovery is retryable: {0}")]
+    Retryable(String),
+    #[error("fatal local terminal authority is unclassifiable: {0}")]
+    Unclassifiable(String),
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +668,7 @@ struct QueuedBroadcast {
 struct BroadcastGate {
     reserved_until: Option<i64>,
     queued: Vec<QueuedBroadcast>,
+    hard_deleted: bool,
 }
 
 pub struct ReservedBroadcastRange {
@@ -801,7 +834,7 @@ impl SseBroadcaster {
     /// `broadcast::error::SendError<SseEvent>` is ~320 bytes, which triggers
     /// clippy's `result_large_err` lint, and every call site here only ever
     /// reads `.is_err()`.
-    fn send_with_ring_raw(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+    fn send_with_ring_unlocked(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
         match op {
             RingOp::Anchor => {
                 self.ring.lock().expect("ReplayRing mutex").reset(seq);
@@ -821,17 +854,45 @@ impl SseBroadcaster {
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
-        {
-            let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-            if gate
-                .reserved_until
-                .is_some_and(|reserved_until| seq > reserved_until)
-            {
-                gate.queued.push(QueuedBroadcast { event, seq, op });
-                return Ok(self.tx.receiver_count());
-            }
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
         }
-        self.send_with_ring_raw(event, seq, op)
+        if gate
+            .reserved_until
+            .is_some_and(|reserved_until| seq > reserved_until)
+        {
+            gate.queued.push(QueuedBroadcast { event, seq, op });
+            return Ok(self.tx.receiver_count());
+        }
+        self.send_with_ring_unlocked(event, seq, op)
+    }
+
+    pub fn close_publication(&self) {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        gate.queued.clear();
+        gate.reserved_until = None;
+        gate.hard_deleted = true;
+    }
+
+    pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
+        gate.queued.clear();
+        gate.reserved_until = None;
+        let sequence_id = self.last_seq.load(Ordering::Acquire);
+        let result = self.send_with_ring_unlocked(
+            SseEvent::ConversationHardDeleted {
+                sequence_id,
+                conversation_id,
+            },
+            sequence_id,
+            RingOp::BroadcastOnly,
+        );
+        gate.hard_deleted = true;
+        result
     }
 
     pub fn reserve_next_persisted_message_range(
@@ -886,8 +947,10 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
-        for QueuedBroadcast { event, seq, op } in queued {
-            let _ = self.send_with_ring_raw(event, seq, op);
+        if !gate.hard_deleted {
+            for QueuedBroadcast { event, seq, op } in queued {
+                let _ = self.send_with_ring_unlocked(event, seq, op);
+            }
         }
         gate.reserved_until = None;
     }
@@ -932,10 +995,13 @@ impl SseBroadcaster {
     /// sequenced allocation. A later sequenced event therefore cannot allocate
     /// and reach the channel before this event carrying the earlier witness.
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
-        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        let gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
         let witnessed_seq = self.last_seq.load(Ordering::Acquire);
         let event = build(witnessed_seq);
-        self.send_with_ring_raw(event, witnessed_seq, RingOp::BroadcastOnly)
+        self.send_with_ring_unlocked(event, witnessed_seq, RingOp::BroadcastOnly)
     }
 
     /// Broadcast a persisted `Message` event using the DB-allocated
@@ -1560,6 +1626,7 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
+        let (fatal_local_authority_tx, _) = watch::channel(None);
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1592,6 +1659,8 @@ impl RuntimeManager {
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
+            startup_obligated_conversations: RwLock::new(HashSet::new()),
+            consumed_startup_parent_actions: RwLock::new(HashSet::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
@@ -1613,6 +1682,7 @@ impl RuntimeManager {
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
+            fatal_local_authority_tx,
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -1621,6 +1691,40 @@ impl RuntimeManager {
     #[allow(dead_code)]
     pub fn platform(&self) -> PlatformCapability {
         self.platform.clone()
+    }
+
+    pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
+        self.fatal_local_authority_tx.send_replace(Some(boundary));
+    }
+
+    fn propagate_fatal_runtime_exit(
+        &self,
+        disposition: executor::RuntimeExitDisposition,
+        boundary: &'static str,
+    ) {
+        if disposition == executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
+            self.signal_fatal_local_authority(boundary);
+        }
+    }
+
+    pub(crate) async fn fence_fatal_local_authority(&self) {
+        let handles: Vec<_> = self
+            .runtimes
+            .write()
+            .await
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.broadcast_tx.close_publication();
+            let _ = handle.event_tx.send(Event::Shutdown).await;
+        }
+    }
+
+    pub fn fatal_local_authority_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
+        self.fatal_local_authority_tx.subscribe()
     }
 
     /// Get the browser session manager
@@ -2465,6 +2569,10 @@ impl RuntimeManager {
         let _ = self.direct_turn_kick_tx.send(next);
     }
 
+    pub async fn set_startup_obligated_conversations(&self, conversation_ids: HashSet<String>) {
+        *self.startup_obligated_conversations.write().await = conversation_ids;
+    }
+
     pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
         let rx = self.direct_turn_kick_rx.write().await.take();
         let Some(rx) = rx else {
@@ -2473,8 +2581,21 @@ impl RuntimeManager {
         };
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let supervisor = Arc::clone(self);
         tokio::spawn(async move {
-            crate::runtime::direct_turn_worker::run(manager, rx, ready_tx).await;
+            let task = tokio::spawn(crate::runtime::direct_turn_worker::run(
+                manager, rx, ready_tx,
+            ));
+            match task.await {
+                Ok(()) => {
+                    tracing::error!("direct-turn authority worker exited unexpectedly");
+                    supervisor.signal_fatal_local_authority("direct_turn_worker_exit");
+                }
+                Err(error) => {
+                    tracing::error!(%error, "direct-turn authority worker panicked or was cancelled");
+                    supervisor.signal_fatal_local_authority("direct_turn_worker_join");
+                }
+            }
         });
         ready_rx
             .await
@@ -2596,6 +2717,23 @@ impl RuntimeManager {
             parent_event_tx,
             parent_turn_link,
         } = req;
+        if let Err(error) = self
+            .db
+            .establish_parent_reconcile_action(&parent_conversation_id)
+            .await
+        {
+            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                        error: format!("failed to persist parent recovery authority: {error}"),
+                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
 
         tracing::info!(
             agent_id = %spec.agent_id,
@@ -2912,6 +3050,8 @@ impl RuntimeManager {
                 .await;
 
             let disposition = runtime.run().await;
+            manager_for_cleanup
+                .propagate_fatal_runtime_exit(disposition, "spawned conversation runtime");
 
             // Its sender targets this exited runtime's event channel.
             timeout_task.abort();
@@ -3106,6 +3246,408 @@ impl RuntimeManager {
         Ok(())
     }
 
+    pub(crate) async fn complete_database_terminal_recovery(
+        &self,
+        conversation_id: &str,
+        recovery: DatabaseTerminalRecovery,
+    ) {
+        let DatabaseTerminalRecovery::Committed {
+            projection,
+            is_sub_agent,
+            worktree_path,
+        } = recovery
+        else {
+            return;
+        };
+        if !projection.state.is_terminal() {
+            if let Some(broadcaster) = self
+                .existing_conversation_broadcaster(conversation_id)
+                .await
+            {
+                let _ = broadcaster.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
+                    presentation_mode: projection.state.presentation_mode().to_string(),
+                    state: projection.state.clone(),
+                    state_updated_at: projection.state_updated_at,
+                });
+            }
+            return;
+        }
+        if let Some(broadcaster) = self
+            .existing_conversation_broadcaster(conversation_id)
+            .await
+        {
+            let _ = broadcaster.send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                presentation_mode: projection.state.presentation_mode().to_string(),
+                state: projection.state.clone(),
+                state_updated_at: projection.state_updated_at,
+            });
+            executor::emit_terminal_lifecycle_event(
+                conversation_id,
+                is_sub_agent,
+                &projection.state,
+                worktree_path.as_deref(),
+                Some(&self.fork_cmd_tx),
+                &broadcaster,
+            )
+            .await;
+        } else {
+            executor::complete_terminal_lifecycle_without_broadcast(
+                conversation_id,
+                is_sub_agent,
+                &projection.state,
+                worktree_path.as_deref(),
+                Some(&self.fork_cmd_tx),
+            )
+            .await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn reconcile_startup_obligated_parents(
+        self: &Arc<Self>,
+        startup: bool,
+    ) -> Result<(), DatabaseTerminalRecoveryError> {
+        let conversation_ids = self.startup_obligated_conversations.read().await.clone();
+        let reconciled = if conversation_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.db
+                .reconcile_startup_obligated_parents(&conversation_ids, startup)
+                .await
+                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
+        };
+        for reconciliation in reconciled {
+            self.startup_obligated_conversations
+                .write()
+                .await
+                .remove(&reconciliation.conversation_id);
+        }
+        if startup {
+            for conversation in crate::reconcile_worktrees_with_terminalized(&self.db).await {
+                executor::complete_terminal_lifecycle_without_broadcast(
+                    &conversation.id,
+                    conversation.parent_conversation_id.is_some(),
+                    &conversation.state,
+                    conversation
+                        .conv_mode
+                        .worktree_path()
+                        .map(std::path::Path::new),
+                    Some(&self.fork_cmd_tx),
+                )
+                .await;
+            }
+        }
+        let actions = self
+            .db
+            .list_startup_parent_actions()
+            .await
+            .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        for action_record in actions {
+            let conversation_id = action_record.conversation_id.clone();
+            match action_record.action {
+                phoenix_db::StartupParentAction::Reconcile => {
+                    let ids = HashSet::from([conversation_id.clone()]);
+                    let reconciled = self
+                        .db
+                        .reconcile_startup_obligated_parents(&ids, startup)
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                        })?;
+                    let _ = reconciled;
+                }
+                phoenix_db::StartupParentAction::Resume => {
+                    if self
+                        .consumed_startup_parent_actions
+                        .read()
+                        .await
+                        .contains(&action_record.action_id)
+                    {
+                        continue;
+                    }
+                    let current = repo
+                        .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
+                            conversation_id.clone(),
+                        ))
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                        })?;
+                    if current.as_ref().map(|turn| turn.id) != action_record.turn_id
+                        || current.as_ref().map(|turn| turn.generation)
+                            != action_record.turn_generation
+                    {
+                        self.db
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        continue;
+                    }
+                    let projection =
+                        self.db
+                            .get_conversation(&conversation_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                    if projection.state.is_terminal() {
+                        if let Some(turn) = current {
+                            repo.terminalize_authoritative_turn(
+                                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                                    command: phoenix_workflow::TurnCommand::Cancel {
+                                        turn_id: turn.id,
+                                        expected_generation: turn.generation,
+                                    },
+                                    projection: Some(
+                                        phoenix_db::workflow::PersistedConversationProjection {
+                                            state: projection.state.clone(),
+                                            state_updated_at: projection.state_updated_at,
+                                        },
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        }
+                        executor::complete_terminal_lifecycle_without_broadcast(
+                            &conversation_id,
+                            false,
+                            &projection.state,
+                            Some(std::path::Path::new(&projection.cwd)),
+                            Some(&self.fork_cmd_tx),
+                        )
+                        .await;
+                        self.db
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        continue;
+                    }
+                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
+                        .await;
+                    self.get_or_create(&conversation_id)
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(format!(
+                                "failed to resume reconciled parent {conversation_id}: {error}"
+                            ))
+                        })?;
+                    self.consumed_startup_parent_actions
+                        .write()
+                        .await
+                        .insert(action_record.action_id);
+                }
+                phoenix_db::StartupParentAction::Cancel => {
+                    let authority =
+                        phoenix_workflow::ConversationAuthority(conversation_id.clone());
+                    if let Some(turn) = repo
+                        .load_owning_authoritative_turn(&authority)
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                        })?
+                    {
+                        if action_record.turn_id != Some(turn.id)
+                            || action_record.turn_generation != Some(turn.generation)
+                        {
+                            self.db
+                                .delete_startup_parent_action(
+                                    &conversation_id,
+                                    action_record.action_id,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                })?;
+                            continue;
+                        }
+                        let conversation = self
+                            .db
+                            .get_conversation(&conversation_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        repo.terminalize_authoritative_turn(
+                            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                                command: phoenix_workflow::TurnCommand::Cancel {
+                                    turn_id: turn.id,
+                                    expected_generation: turn.generation,
+                                },
+                                projection: Some(
+                                    phoenix_db::workflow::PersistedConversationProjection {
+                                        state: conversation.state,
+                                        state_updated_at: conversation.state_updated_at,
+                                    },
+                                ),
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                        })?;
+                    }
+                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
+                        .await;
+                    self.db
+                        .delete_startup_parent_action(&conversation_id, action_record.action_id)
+                        .await
+                        .map_err(|error| {
+                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn settle_database_terminal_obligation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<DatabaseTerminalRecovery, DatabaseTerminalRecoveryError> {
+        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let Some(obligation) = repo
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
+        else {
+            return Ok(DatabaseTerminalRecovery::NoObligation);
+        };
+        let turn_id = obligation.turn_id;
+        let projection = obligation.projection.clone();
+        let conversation = self
+            .db
+            .get_conversation(conversation_id)
+            .await
+            .map_err(|error| {
+                DatabaseTerminalRecoveryError::Retryable(format!(
+                    "terminal obligation exists but conversation metadata is unreadable ({error})"
+                ))
+            })?;
+        let parent_conversation_id = conversation.parent_conversation_id.clone();
+        let is_sub_agent = parent_conversation_id.is_some();
+        let worktree_path = conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::PathBuf::from);
+        let command = match obligation.terminal {
+            phoenix_workflow::TurnTerminal::Completed => phoenix_workflow::TurnCommand::Complete {
+                turn_id: obligation.turn_id,
+                expected_generation: obligation.expected_generation,
+            },
+            phoenix_workflow::TurnTerminal::Cancelled => phoenix_workflow::TurnCommand::Cancel {
+                turn_id: obligation.turn_id,
+                expected_generation: obligation.expected_generation,
+            },
+            phoenix_workflow::TurnTerminal::Failed { ref reason } => {
+                phoenix_workflow::TurnCommand::Fail {
+                    turn_id: obligation.turn_id,
+                    expected_generation: obligation.expected_generation,
+                    reason: reason.clone(),
+                }
+            }
+        };
+        let recovery = match repo
+            .terminalize_authoritative_turn(
+                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                    command,
+                    projection: Some(obligation.projection.clone()),
+                },
+            )
+            .await
+        {
+            Ok(step)
+                if matches!(
+                    step.outcome,
+                    phoenix_workflow::TurnOutcome::TerminalReplay { .. }
+                ) =>
+            {
+                Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+            }
+            Ok(_) => {
+                if let Some(parent_id) = parent_conversation_id {
+                    self.startup_obligated_conversations
+                        .write()
+                        .await
+                        .insert(parent_id);
+                }
+                Ok(DatabaseTerminalRecovery::Committed {
+                    projection: Box::new(projection),
+                    is_sub_agent,
+                    worktree_path,
+                })
+            }
+            Err(settlement_error) => {
+                match repo
+                    .probe_terminal_projection(&obligation)
+                    .await
+                    .map_err(|probe_error| {
+                        DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); exact projection probe failed ({probe_error})"
+                        ))
+                    })?
+                {
+                    phoenix_db::workflow::TerminalProjectionProbe::Missing => {
+                        if repo
+                            .exact_turn_retired(turn_id, conversation_id)
+                            .await
+                            .map_err(|probe_error| {
+                                DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                    "terminal settlement failed ({settlement_error}); retirement probe failed ({probe_error})"
+                                ))
+                            })?
+                        {
+                            Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+                        } else {
+                            Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                                "terminal settlement failed ({settlement_error}); authoritative turn {turn_id:?} disappeared without exact retirement"
+                            )))
+                        }
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::Current => {
+                        Ok(DatabaseTerminalRecovery::Committed {
+                            projection: Box::new(projection),
+                            is_sub_agent,
+                            worktree_path,
+                        })
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::Superseded => {
+                        Ok(DatabaseTerminalRecovery::AlreadyCommitted)
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::StillOwed => {
+                        Err(DatabaseTerminalRecoveryError::StillOwed(
+                            settlement_error.to_string(),
+                        ))
+                    }
+                    phoenix_db::workflow::TerminalProjectionProbe::Unclassifiable => {
+                        Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                            "terminal settlement failed ({settlement_error}); authoritative turn no longer matches the exact obligation"
+                        )))
+                    }
+                }
+            }
+        }?;
+        if recovery.committed() {
+            self.startup_obligated_conversations
+                .write()
+                .await
+                .remove(conversation_id);
+        }
+        Ok(recovery)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn materialize_runtime(
         self: &Arc<Self>,
@@ -3141,11 +3683,34 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
-        let conv = self
+        let mut conv = self
             .db
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
+        let terminal_recovery = match self
+            .settle_database_terminal_obligation(conversation_id)
+            .await
+        {
+            Ok(recovery) => recovery,
+            Err(DatabaseTerminalRecoveryError::Unclassifiable(error)) => {
+                self.signal_fatal_local_authority("runtime_materialization_terminal_recovery");
+                return Err(format!(
+                    "fatal local terminal authority is unclassifiable: {error}"
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let terminal_committed = terminal_recovery.committed();
+        self.complete_database_terminal_recovery(conversation_id, terminal_recovery)
+            .await;
+        if terminal_committed {
+            conv = self
+                .db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         let cleanup_conversation = conv.clone();
 
@@ -3399,11 +3964,33 @@ impl RuntimeManager {
             }
         };
 
+        let recovery_started = std::time::Instant::now();
+        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
+            &storage,
+            conversation_id,
+        )
+        .await?;
+        let recovered_terminal_obligation = self
+            .load_active_direct_turn_terminal_obligation(conversation_id)
+            .await?
+            .filter(|obligation| {
+                active_direct_turn.as_ref().is_some_and(|loaded| {
+                    loaded.active().turn_id == obligation.turn_id
+                        && loaded.active().generation == obligation.expected_generation
+                })
+            });
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let recovery_started = std::time::Instant::now();
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
-            self.determine_resume_state(conversation_id).await?;
+            if let Some(obligation) = &recovered_terminal_obligation {
+                (
+                    obligation.projection.state.clone(),
+                    obligation.projection.state_updated_at,
+                    false,
+                )
+            } else {
+                self.determine_resume_state(conversation_id).await?
+            };
         tracing::Span::current().record(
             "runtime.recovery_projection_ms",
             u64::try_from(recovery_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3424,46 +4011,34 @@ impl RuntimeManager {
                 None
             };
 
-        let active_direct_turn = crate::runtime::traits::MessageStore::load_active_direct_turn(
-            &storage,
-            conversation_id,
-        )
-        .await?;
         let active_direct_turn = if let Some(loaded) = active_direct_turn {
-            let recovered_terminal = if loaded.materialized {
-                match &initial_state {
-                    ConvState::Idle | ConvState::HandedOff { .. } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Completed)
+            let active = loaded.into_active();
+            if let Some(obligation) = recovered_terminal_obligation {
+                let terminal = match obligation.terminal {
+                    phoenix_workflow::TurnTerminal::Completed => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Completed
                     }
-                    ConvState::Error { message, .. } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                            reason: message.clone(),
-                        })
+                    phoenix_workflow::TurnTerminal::Cancelled => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled
                     }
-                    ConvState::ContextExhausted { summary } => {
-                        Some(crate::runtime::traits::ActiveDirectTurnTerminal::Failed {
-                            reason: summary.clone(),
-                        })
+                    phoenix_workflow::TurnTerminal::Failed { reason } => {
+                        crate::runtime::traits::ActiveDirectTurnTerminal::Failed { reason }
                     }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(terminal) = recovered_terminal {
+                };
                 crate::runtime::traits::MessageStore::settle_active_direct_turn(
                     &storage,
                     &crate::runtime::traits::ActiveDirectTurnSettlement {
-                        turn: loaded.active,
+                        conversation_id: conversation_id.to_string(),
+                        turn: active,
                         terminal,
-                        state: initial_state.clone(),
-                        state_updated_at: initial_state_updated_at,
+                        state: obligation.projection.state,
+                        state_updated_at: obligation.projection.state_updated_at,
                     },
                 )
                 .await?;
                 None
             } else {
-                Some(loaded.active)
+                Some(active)
             }
         } else {
             None
@@ -3647,6 +4222,11 @@ impl RuntimeManager {
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
             }
+            manager_for_cleanup
+                .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");
+            if removed && disposition == executor::RuntimeExitDisposition::RecreateFromDatabase {
+                manager_for_cleanup.kick_direct_turn_worker();
+            }
         });
 
         drop(steering_projection_guard);
@@ -3736,7 +4316,9 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
-            EvictionReason::CreationProvisioned | EvictionReason::SteeringReconciliation => {}
+            EvictionReason::CreationProvisioned
+            | EvictionReason::SteeringReconciliation
+            | EvictionReason::RecoveryReconciliation => {}
         }
 
         if let Some(handle) = old {
@@ -4173,6 +4755,20 @@ impl RuntimeManager {
             .clone()
     }
 
+    async fn existing_conversation_broadcaster(
+        &self,
+        conversation_id: &str,
+    ) -> Option<SseBroadcaster> {
+        if let Some(handle) = self.try_get_handle(conversation_id).await {
+            return Some(handle.broadcast_tx);
+        }
+        self.evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+    }
+
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
     ///
     /// An evicted broadcaster exists in the window between `evict_runtime` (model
@@ -4242,6 +4838,15 @@ impl RuntimeManager {
         }
 
         match &conv.state {
+            ConvState::ToolExecuting { .. } | ConvState::CancellingTool { .. }
+                if self
+                    .startup_obligated_conversations
+                    .read()
+                    .await
+                    .contains(conversation_id) =>
+            {
+                return Ok((conv.state, row_state_updated_at, false));
+            }
             ConvState::Provisioning { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::RecoverableContinuationFailure { .. }
@@ -4320,6 +4925,27 @@ impl RuntimeManager {
             resume_state_updated_at,
             decision.needs_auto_continue,
         ))
+    }
+
+    async fn load_active_direct_turn_terminal_obligation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<phoenix_db::workflow::DirectTurnTerminalObligation>, String> {
+        let obligation = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+            .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(obligation) = &obligation {
+            tracing::warn!(
+                conv_id = %conversation_id,
+                turn_id = obligation.turn_id.0,
+                generation = obligation.expected_generation,
+                "Recovering exact direct-turn terminal obligation"
+            );
+        }
+        Ok(obligation)
     }
 
     async fn has_persisted_llm_request_owner(&self, conversation_id: &str) -> Result<bool, String> {
@@ -4590,6 +5216,74 @@ mod sub_agent_registry_resume_tests {
 #[cfg(test)]
 mod broadcaster_tests {
     use super::*;
+
+    #[test]
+    fn hard_delete_is_the_final_publication() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "before".to_string(),
+                request_id: "before-request".to_string(),
+            })
+            .unwrap();
+        broadcaster
+            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .unwrap();
+
+        assert!(matches!(events.try_recv(), Ok(SseEvent::Token { .. })));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::ConversationHardDeleted { ref conversation_id, .. })
+                if conversation_id == "deleted-conversation"
+        ));
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after".to_string(),
+                request_id: "after-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        let (reserved, reserved_sequence) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "queued".to_string(),
+                request_id: "queued-request".to_string(),
+            })
+            .unwrap();
+        broadcaster
+            .send_hard_deleted_and_close("deleted-conversation".to_string())
+            .unwrap();
+        drop(reserved);
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::ConversationHardDeleted { .. })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(broadcaster
+            .send_reserved_seq(reserved_sequence, |sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "late-reserved".to_string(),
+                request_id: "late-reserved-request".to_string(),
+            })
+            .is_err());
+    }
 
     /// Regression for task 02679: when a caller pre-allocates a message's
     /// `sequence_id` from the broadcaster *before* writing to the DB, the
@@ -5324,6 +6018,59 @@ mod scope_liveness_tests {
         )
     }
 
+    #[tokio::test]
+    async fn second_startup_worktree_scan_retires_top_level_fork_proposals() {
+        use crate::db::{ForkProposal, ForkProposalStatus};
+
+        let mgr = Arc::new(test_manager().await);
+        mgr.start_sub_agent_handler().await;
+        let root = tempfile::tempdir().unwrap();
+        let worktree_path = root.path().join("missing-worktree");
+        let conversation_id = "missing-top-level-worktree";
+        create_handleless_work_conv(&mgr, conversation_id, worktree_path.to_str().unwrap(), None)
+            .await;
+        let proposal = ForkProposal {
+            id: "missing-worktree-proposal".to_string(),
+            origin_conversation_id: conversation_id.to_string(),
+            task_file: "tasks/12345-p1-ready--missing.md".to_string(),
+            title: "Missing".to_string(),
+            priority: "p1".to_string(),
+            body: "# Missing".to_string(),
+            status: ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: chrono::Utc::now(),
+            resolved_at: None,
+        };
+        mgr.db().insert_fork_proposal(&proposal).await.unwrap();
+        assert!(mgr
+            .db()
+            .list_startup_parent_actions()
+            .await
+            .unwrap()
+            .is_empty());
+
+        mgr.reconcile_startup_obligated_parents(true).await.unwrap();
+
+        assert!(matches!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .unwrap()
+                .state,
+            ConvState::Terminal
+        ));
+        assert_eq!(
+            mgr.db()
+                .get_fork_proposal(&proposal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Dismissed
+        );
+    }
+
     fn stale_creation_event() -> Event {
         Event::CreationProvisioned {
             job_id: "missing-current-claim".to_string(),
@@ -5431,6 +6178,67 @@ mod scope_liveness_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn durable_parent_resume_is_discovered_without_process_marker() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "durable-parent-resume";
+        manager
+            .db()
+            .create_conversation(conversation_id, "resume", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(conversation_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation, created_at)
+             SELECT ?1, 'Resume', transcript_generation, ?2
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(conversation_id)
+        .bind(Utc::now().to_rfc3339())
+        .execute(manager.db().pool())
+        .await
+        .unwrap();
+        assert!(manager
+            .startup_obligated_conversations
+            .read()
+            .await
+            .is_empty());
+
+        manager
+            .reconcile_startup_obligated_parents(true)
+            .await
+            .unwrap();
+        assert!(manager.try_get_handle(conversation_id).await.is_some());
+        let actions = manager.db().list_startup_parent_actions().await.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].conversation_id, conversation_id);
+        assert_eq!(actions[0].action, phoenix_db::StartupParentAction::Resume);
+    }
+
+    #[tokio::test]
+    async fn spawned_runtime_fatal_authority_loss_reaches_process_fail_stop() {
+        let manager = test_manager().await;
+        let mut fatal = manager.fatal_local_authority_receiver();
+
+        manager.propagate_fatal_runtime_exit(
+            executor::RuntimeExitDisposition::Interrupted,
+            "spawned conversation runtime",
+        );
+        assert_eq!(*fatal.borrow(), None);
+
+        manager.propagate_fatal_runtime_exit(
+            executor::RuntimeExitDisposition::FatalLocalAuthorityLoss,
+            "spawned conversation runtime",
+        );
+        fatal.changed().await.unwrap();
+        assert_eq!(*fatal.borrow(), Some("spawned conversation runtime"));
     }
 
     #[tokio::test]
@@ -6671,6 +7479,35 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn offline_terminal_recovery_does_not_reserve_broadcaster() {
+        let mgr = Arc::new(test_manager().await);
+        mgr.start_sub_agent_handler().await;
+        let conversation_id = "offline-terminal-recovery";
+        assert!(mgr
+            .existing_conversation_broadcaster(conversation_id)
+            .await
+            .is_none());
+        mgr.complete_database_terminal_recovery(
+            conversation_id,
+            DatabaseTerminalRecovery::Committed {
+                projection: Box::new(phoenix_db::workflow::PersistedConversationProjection {
+                    state: ConvState::Idle,
+                    state_updated_at: Utc::now(),
+                }),
+                is_sub_agent: false,
+                worktree_path: None,
+            },
+        )
+        .await;
+        assert!(!mgr
+            .evicted_broadcasters
+            .read()
+            .await
+            .contains_key(conversation_id));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
     async fn determine_resume_state_preserves_materialized_active_direct_turn() {
         use phoenix_core::domain::sm_event::{
             PreparedDirectTurnDelivery, PreparedDirectTurnPayload,
@@ -6775,6 +7612,79 @@ mod scope_liveness_tests {
             .expect("reconstruct runtime state");
         assert!(matches!(state, ConvState::LlmRequesting { attempt: 1 }));
         assert!(!needs_auto_continue);
+
+        repo.persist_terminal_obligation(
+            &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: 0,
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: ConvState::Idle,
+                    state_updated_at: Utc::now(),
+                },
+                response_message_id: Some("direct-final-response".to_string()),
+            },
+        )
+        .await
+        .expect("persist exact terminal obligation before settlement failure");
+        let recovered = mgr
+            .load_active_direct_turn_terminal_obligation(conversation_id)
+            .await
+            .expect("load owed terminal settlement")
+            .expect("terminal obligation exists");
+        assert_eq!(recovered.projection.state, ConvState::Idle);
+        assert_eq!(recovered.turn_id, turn_id);
+        assert_eq!(recovered.expected_generation, 0);
+
+        mgr.set_startup_obligated_conversations(HashSet::from([conversation_id.to_string()]))
+            .await;
+        let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
+        let mut terminal_events = broadcaster.subscribe();
+        let mgr = Arc::new(mgr);
+        mgr.start_sub_agent_handler().await;
+        let recovery = mgr
+            .settle_database_terminal_obligation(conversation_id)
+            .await
+            .expect("settle database-only terminal obligation");
+        assert!(recovery.committed());
+        assert!(!mgr
+            .startup_obligated_conversations
+            .read()
+            .await
+            .contains(conversation_id));
+        assert!(terminal_events.try_recv().is_err());
+        mgr.complete_database_terminal_recovery(conversation_id, recovery)
+            .await;
+        assert!(matches!(
+            terminal_events.try_recv(),
+            Ok(SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            })
+        ));
+        assert!(terminal_events.try_recv().is_err());
+
+        let durable_turn = repo
+            .load_authoritative_turn(turn_id)
+            .await
+            .expect("load settled turn")
+            .expect("turn exists");
+        assert!(matches!(
+            durable_turn.lifecycle,
+            phoenix_workflow::TurnLifecycle::Terminal {
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                ..
+            }
+        ));
+        assert!(!durable_turn.owns_conversation());
+        assert_eq!(
+            mgr.db()
+                .get_conversation(conversation_id)
+                .await
+                .expect("load settled conversation")
+                .state,
+            ConvState::Idle
+        );
     }
 
     #[tokio::test]

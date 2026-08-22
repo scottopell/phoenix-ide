@@ -51,11 +51,16 @@ THE SYSTEM SHALL display a list of active conversations
 AND show conversation slug, working directory, and last update time
 AND order conversations by most recently updated
 
+WHEN the conversation list is displayed on a mobile-sized viewport
+THE SYSTEM SHALL make the list itself the primary vertically scrollable region
+AND SHALL allow the user to reach the oldest loaded conversation row by direct touch scrolling without first collapsing unrelated chrome or transferring scroll focus to an outer page container
+AND SHALL preserve reliable tap targeting on conversation rows while the list is scrolled
+
 WHEN user taps a conversation
 THE SYSTEM SHALL navigate to that conversation's chat view
 AND preserve the URL for deep linking (`/c/{slug}`)
 
-**Rationale:** Users need to find and resume conversations. Deep links enable sharing and bookmarking.
+**Rationale:** Users need to find and resume conversations. Deep links enable sharing and bookmarking. On mobile, the list is often used as a rapid switching surface; if scrolling belongs to the wrong container, users cannot reliably reach older conversations or select one without fighting the page.
 
 ---
 

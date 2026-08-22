@@ -172,6 +172,9 @@ impl AppState {
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
         runtime
+            .set_startup_obligated_conversations(db.terminal_obligated_conversation_ids().await?)
+            .await;
+        runtime
             .start_direct_turn_worker()
             .await
             .map_err(std::io::Error::other)?;

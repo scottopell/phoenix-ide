@@ -613,6 +613,14 @@
     flex-direction: column;
   }
 
+  @media (display-mode: standalone) {
+    #state-bar.statebar-mobile {
+      padding-right: env(safe-area-inset-right, 0);
+      padding-bottom: env(safe-area-inset-bottom, 0);
+      padding-left: env(safe-area-inset-left, 0);
+    }
+  }
+
   .statebar-mobile-primary {
     min-height: 44px;
     display: flex;

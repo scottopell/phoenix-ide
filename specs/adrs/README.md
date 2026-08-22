@@ -48,6 +48,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [034](034_compatibility-guarantees-are-explicit-and-data-aware.md) | Compatibility guarantees are explicit and data-aware | Accepted | REQ-COMP-001–005 |
 | [035](035_repository-authority-activation-is-consumer-triggered-and-offline.md) | Repository authority activation is consumer-triggered and offline | Accepted | REQ-GITREP-004/009; `GitRepository`, `WorkScope.repository`, repository authority generation |
 | [036](036_local-sqlite-authority-loss-fails-stop.md) | Local SQLite authority loss fails stop | Accepted | REQ-DWF-043, REQ-DWF-CHAT-013, REQ-BED-033 |
+| [037](037_legacy-direct-turn-terminal-ambiguity-is-retired.md) | Legacy direct-turn terminal ambiguity is retired as failure | Accepted | REQ-DWF-CHAT-013, REQ-DWF-CHAT-014, REQ-COMP-004 |
 
 ## For agents: which decisions bind your task
 
@@ -101,6 +102,8 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-034 (Compatibility guarantees are explicit and data-aware)
       ├── ADR-036 (Local SQLite authority loss fails stop)
       │   └── applies ADR-014, ADR-020, ADR-024, and ADR-034 at the local persistence-health boundary
+      ├── ADR-037 (Legacy direct-turn terminal ambiguity is retired as failure)
+      │   └── applies ADR-024 and ADR-034 to pre-obligation materialized direct turns
       ├── ADR-010 (launchd deployment uses an independent transaction helper)
       │   └── ADR-017 (production deployment shares preparation but keeps backend-owned activation)
       │       └── ADR-018 (release updates use published release previews and approval-bound installations)
