@@ -118,7 +118,10 @@ function compactFallbackStatus(
   if (disposition.note?.kind === 'gh_unavailable') return { icon: '⚠', label: 'GitHub unavailable', tone: 'attention' };
 
   if (prStatus?.display_state === 'merged') return { icon: '✓', label: 'PR merged', tone: 'success' };
-  if (disposition.resolve?.kind === 'address_feedback') {
+  if (disposition.resolve?.kind === 'address_feedback' && (
+    prStatus?.feedback_status != null
+    || (prStatus?.feedback_freshness?.count ?? 0) > 0
+  )) {
     return { icon: '⚠', label: 'PR feedback ready', tone: 'attention' };
   }
   if (prStatus?.found && prStatus.display_state === 'draft') {
@@ -305,14 +308,16 @@ export function WorkControlBar({
     return labels.length > 1 ? `Associated PRs: ${labels.join(' · ')}. Cleanup still applies only to this task branch.` : null;
   }, [actionablePrs, associatedPrs]);
 
-  const handleCleanUp = async () => {
+  const handleCleanUp = async (): Promise<boolean> => {
     setError(null);
     setMarkingMerged(true);
     try {
-      if (!(await terminalActionStillSafe())) return;
+      if (!(await terminalActionStillSafe())) return false;
       await api.markMerged(conversationId);
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to mark as merged');
+      return false;
     } finally {
       setMarkingMerged(false);
     }
@@ -518,9 +523,8 @@ export function WorkControlBar({
                 disabled={isLoading}
                 aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
                 title={cleanUpHintText(isBranch)}
-                onClick={() => {
-                  closeFallbackPanel();
-                  void handleCleanUp();
+                onClick={async () => {
+                  if (await handleCleanUp()) closeFallbackPanel();
                 }}
               >
                 Clean up

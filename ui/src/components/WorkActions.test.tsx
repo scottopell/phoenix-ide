@@ -1715,6 +1715,55 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('Checking changes');
   });
 
+  it('does not claim feedback exists when cached PR metadata has no feedback evidence', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      work_change: { kind: 'loading' },
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-no-feedback"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR open');
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR feedback ready');
+  });
+
+  it('keeps overflow cleanup and focus available when cleanup fails', async () => {
+    enableMobile();
+    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup failed'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cleanup-failure"
+        convModeLabel="Work"
+        phaseType="error"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const cleanup = screen.getByRole('button', { name: /^Clean up\./ });
+    cleanup.focus();
+    fireEvent.click(cleanup);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup failed');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(cleanup).toHaveFocus();
+  });
+
   it('removes covered actions from the interaction tree while details are open', () => {
     enableMobile();
     renderWithProviders(
