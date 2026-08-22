@@ -7254,9 +7254,8 @@ where
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
-        let request_admission = admitted.reborrow();
+        let mut request_admission = admitted.reborrow();
         let request_task = async move {
-            let _request_admission = request_admission;
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
 
             if is_sub_agent {
@@ -7464,7 +7463,9 @@ where
                 let effort_for_usage = effective_effort;
                 let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
+                let usage_admission = request_admission.reborrow();
                 tokio::spawn(async move {
+                    let _usage_admission = usage_admission;
                     if let Err(e) = storage_for_usage
                         .insert_turn_usage(
                             &conv_id_for_usage,
@@ -7481,6 +7482,7 @@ where
                 });
             }
 
+            drop(request_admission);
             let _ = llm_tx.send(llm_outcome);
         }
         .instrument(turn_span);
@@ -7584,11 +7586,14 @@ where
 
     fn create_tool_llm_metrics_sink(
         &self,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
     {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let storage = self.storage.clone();
+        let writer_admission = admitted.reborrow();
         tokio::spawn(async move {
+            let _writer_admission = writer_admission;
             while let Some(metrics) = rx.recv().await {
                 if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
                     tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
@@ -7596,6 +7601,15 @@ where
             }
         });
         tx
+    }
+
+    #[cfg(test)]
+    fn test_tool_metrics_writer(
+        &self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
+    {
+        self.create_tool_llm_metrics_sink(admitted)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7672,7 +7686,7 @@ where
                     progress,
                 });
         });
-        let llm_metrics_tx = self.create_tool_llm_metrics_sink();
+        let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
         let tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
@@ -8670,20 +8684,22 @@ where
         let priority_backup = priority;
         let plan_backup = plan.clone();
 
-        // Run blocking git/fs operations on a blocking thread
-        let result = tokio::task::spawn_blocking(move || {
-            execute_approve_task_blocking(
-                &cwd,
-                &repo_root,
-                &conv_id,
-                &tasks_dir_name,
-                &task_file,
-                &title,
-                desired_base_branch.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| format!("Task approval join error: {e}"))?;
+        // Run blocking git/fs operations on a blocking thread.
+        let blocking_admission = admitted.reborrow();
+        let result =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                execute_approve_task_blocking(
+                    &cwd,
+                    &repo_root,
+                    &conv_id,
+                    &tasks_dir_name,
+                    &task_file,
+                    &title,
+                    desired_base_branch.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("Task approval join error: {e}"))?;
 
         match result {
             Ok(approval_result) => {
@@ -8863,19 +8879,22 @@ where
         let priority_backup = priority;
         let plan_backup = plan.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            execute_approve_task_blocking(
-                &cwd,
-                &repo_root,
-                &conv_id,
-                &tasks_dir_name,
-                &task_file,
-                &title,
-                desired_base_branch.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| format!("Task approval join error: {e}"))?;
+        let mut authority = authority;
+        let blocking_admission = authority.reborrow();
+        let result =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                execute_approve_task_blocking(
+                    &cwd,
+                    &repo_root,
+                    &conv_id,
+                    &tasks_dir_name,
+                    &task_file,
+                    &title,
+                    desired_base_branch.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("Task approval join error: {e}"))?;
 
         let approval_result = match result {
             Ok(result) => result,
@@ -17001,6 +17020,54 @@ mod steer_drain_detector_tests {
         .expect("non-idempotent PersistMessage must succeed");
 
         assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_metrics_writer_retains_owner_through_blocked_db_write() {
+        use phoenix_core::domain::llm_types::{
+            LlmAttemptCapture, LlmRequestTelemetry, LlmTransport,
+        };
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-tool-metrics-owner",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (started, release) = storage.gate_metrics_write();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        let metrics_tx = rt.test_tool_metrics_writer(&mut admitted);
+        let capture = LlmAttemptCapture::new();
+        capture.begin(
+            &LlmRequestTelemetry {
+                conversation_id: "conv-tool-metrics-owner".to_string(),
+                root_conversation_id: "conv-tool-metrics-owner".to_string(),
+                request_id: "metrics-request".to_string(),
+                retry_attempt: 0,
+                attempt_capture: capture.clone(),
+            },
+            "test-provider",
+            "test-model",
+            LlmTransport::InProcess,
+        );
+        let metrics = capture
+            .finalize_cancelled()
+            .expect("initialized metrics capture finalizes");
+        metrics_tx.send(metrics).expect("queue metrics write");
+        drop(metrics_tx);
+        drop(admitted);
+
+        started.await.expect("metrics DB write started");
+        fence.close("test_tool_metrics_writer");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert_eq!(fence.owner_count(), 1);
+
+        release.send(()).expect("release metrics DB write");
+        tokio::time::timeout(std::time::Duration::from_secs(10), fence.wait_for_owners())
+            .await
+            .expect("metrics writer owner drains after DB write");
+        assert_eq!(fence.owner_count(), 0);
     }
 
     #[tokio::test]

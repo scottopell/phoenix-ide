@@ -68,6 +68,21 @@ where
     }
 }
 
+pub(crate) async fn run_admitted_blocking<R, F>(
+    admitted: crate::runtime::AdmittedOperation,
+    operation: F,
+) -> Result<R, tokio::task::JoinError>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _admitted = admitted;
+        operation()
+    })
+    .await
+}
+
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
     loop {
@@ -158,7 +173,10 @@ async fn reconcile_creation_cleanup(
         let reservation_id = reservation.id.clone();
         let cleanup_for_blocking = cleanup.clone();
         let db = manager.db().clone();
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let cleanup_admission = manager.acquire_local_authority_pass().map_err(|()| {
+            "creation cleanup mutation rejected after fatal local authority closure".to_string()
+        })?;
+        run_admitted_blocking(cleanup_admission, move || -> Result<(), String> {
             let _lock = match RepositoryMutationLock::acquire(&repo) {
                 Ok(lock) => Some(lock),
                 Err((_message, _))
@@ -539,7 +557,11 @@ async fn provision_conversation(
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
             let path_for_blocking = existing_path.clone();
-            let info = tokio::task::spawn_blocking(move || {
+            let worktree_admission = acquire_creation_admission(
+                manager,
+                "branch worktree mutation rejected after fatal local authority closure",
+            )?;
+            let info = run_admitted_blocking(worktree_admission, move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     validate_worktree_branch(&path_for_blocking, &branch_name)?;
@@ -654,7 +676,11 @@ async fn provision_conversation(
             let path_for_blocking = existing_path.clone();
             let base_branch_for_blocking = base_branch.clone();
             let checkout_ref = intent.checkout_ref.clone();
-            let worktree = tokio::task::spawn_blocking(move || {
+            let worktree_admission = acquire_creation_admission(
+                manager,
+                "managed worktree mutation rejected after fatal local authority closure",
+            )?;
+            let worktree = run_admitted_blocking(worktree_admission, move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     Ok(path_for_blocking.to_string_lossy().to_string())
@@ -1504,6 +1530,35 @@ mod runtime_bootstrap_settlement_tests {
             ),
             Err(CreationProvisionError::FatalAuthorityDeferred)
         ));
+    }
+
+    #[tokio::test]
+    async fn blocking_worktree_operation_retains_owner_after_awaiter_is_cancelled() {
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let admitted = fence
+            .try_acquire()
+            .expect("admit blocking worktree operation");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let awaiting = tokio::spawn(run_admitted_blocking(admitted, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        awaiting.abort();
+        let _ = awaiting.await;
+        fence.close("test_blocking_worktree_operation");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert_eq!(fence.owner_count(), 1);
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), fence.wait_for_owners())
+            .await
+            .expect("blocking worktree owner drains after operation completes");
+        assert_eq!(fence.owner_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -5894,6 +5894,7 @@ async fn cascade_project_target(
     Ok(target)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cascade_projects_on_delete(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
@@ -5970,45 +5971,53 @@ async fn cascade_projects_on_delete(
         None
     };
 
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let worktree_dir = PathBuf::from(&worktree_path);
+    let Ok(cleanup_admission) = runtime.acquire_local_authority_pass() else {
+        report.error =
+            Some("worktree cleanup rejected after fatal local authority closure".to_string());
+        return report;
+    };
+    let outcome = crate::runtime::creation_worker::run_admitted_blocking(
+        cleanup_admission,
+        move || -> Result<(), String> {
+            let worktree_dir = PathBuf::from(&worktree_path);
 
-        if let Some(repo) = repo_root.as_ref() {
-            if let Err(e) = run_git(repo, &["worktree", "remove", &worktree_path, "--force"]) {
-                tracing::debug!(
-                    error = %e,
-                    worktree = %worktree_path,
-                    "git worktree remove failed; trying filesystem fallback"
-                );
-                if worktree_dir.exists() {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
-                        return Err(format!(
-                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
-                        ));
-                    }
-                }
-                let _ = run_git(repo, &["worktree", "prune"]);
-            }
-
-            if is_work_mode {
-                if let Err(e) = run_git(repo, &["branch", "-D", &branch_name]) {
+            if let Some(repo) = repo_root.as_ref() {
+                if let Err(e) = run_git(repo, &["worktree", "remove", &worktree_path, "--force"]) {
                     tracing::debug!(
                         error = %e,
-                        branch = %branch_name,
-                        "branch delete failed (non-fatal in cascade)"
+                        worktree = %worktree_path,
+                        "git worktree remove failed; trying filesystem fallback"
                     );
+                    if worktree_dir.exists() {
+                        if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                            return Err(format!(
+                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
+                        ));
+                        }
+                    }
+                    let _ = run_git(repo, &["worktree", "prune"]);
+                }
+
+                if is_work_mode {
+                    if let Err(e) = run_git(repo, &["branch", "-D", &branch_name]) {
+                        tracing::debug!(
+                            error = %e,
+                            branch = %branch_name,
+                            "branch delete failed (non-fatal in cascade)"
+                        );
+                    }
+                }
+            } else if worktree_dir.exists() {
+                if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                    return Err(format!(
+                        "no project context; fs-only worktree cleanup failed: {rm_err}"
+                    ));
                 }
             }
-        } else if worktree_dir.exists() {
-            if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
-                return Err(format!(
-                    "no project context; fs-only worktree cleanup failed: {rm_err}"
-                ));
-            }
-        }
 
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await;
 
     match outcome {

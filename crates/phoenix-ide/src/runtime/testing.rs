@@ -568,6 +568,8 @@ pub struct InMemoryStorage {
     fail_message_add: Mutex<bool>,
     message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    metrics_write_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
@@ -619,6 +621,8 @@ impl InMemoryStorage {
             fail_message_add: Mutex::new(false),
             message_add_started: Mutex::new(None),
             message_add_release: Mutex::new(None),
+            metrics_write_started: Mutex::new(None),
+            metrics_write_release: Mutex::new(None),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
@@ -654,6 +658,19 @@ impl InMemoryStorage {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.message_add_started.lock().unwrap() = Some(started_tx);
         *self.message_add_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_metrics_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.metrics_write_started.lock().unwrap() = Some(started_tx);
+        *self.metrics_write_release.lock().unwrap() = Some(release_rx);
         (started_rx, release_tx)
     }
 
@@ -1869,6 +1886,13 @@ impl StateStore for InMemoryStorage {
         &self,
         _metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
+        if let Some(started) = self.metrics_write_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.metrics_write_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         Ok(())
     }
 
