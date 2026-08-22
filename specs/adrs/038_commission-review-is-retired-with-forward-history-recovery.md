@@ -42,6 +42,6 @@ REQ-CR-001 through REQ-CR-015 are deprecated because they require the retired ex
 - ADR-034: compatibility guarantees are explicit and data-aware
 - `specs/compatibility/requirements.md`
 - `specs/commission-review/requirements.md`
-- `MIGRATION_066`
+- Migrations 68 and 69
 - `strip_unavailable_tool_blocks`
 - `AgentMessage`

@@ -170,6 +170,13 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
         )?;
         let (tool_use_id, assistant_message) = legacy.into_parts();
         validate_tool_call(&conversation_id, &tool_use_id, &assistant_message)?;
+        let carried_result_id = matching_tool_result_for_assistant(
+            tx,
+            &conversation_id,
+            &assistant_message.message_id,
+            &tool_use_id,
+        )
+        .await?;
         sqlx::query(
             "DELETE FROM messages
              WHERE conversation_id = ?1 AND message_id = ?2",
@@ -179,7 +186,13 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
         .execute(&mut **tx)
         .await?;
 
-        remove_matching_tool_results(tx, &conversation_id, &tool_use_id).await?;
+        if let Some(message_id) = carried_result_id {
+            sqlx::query("DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2")
+                .bind(&conversation_id)
+                .bind(message_id)
+                .execute(&mut **tx)
+                .await?;
+        }
 
         let next_sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
@@ -248,54 +261,49 @@ async fn recover_pending_reviews(tx: &mut Transaction<'_, Sqlite>) -> DbResult<(
     Ok(())
 }
 
-async fn remove_matching_tool_results(
+async fn matching_tool_result_for_assistant(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
+    assistant_message_id: &str,
     tool_use_id: &str,
-) -> DbResult<()> {
-    for message_id in matching_tool_result_ids(tx, conversation_id, tool_use_id).await? {
-        sqlx::query("DELETE FROM messages WHERE conversation_id = ?1 AND message_id = ?2")
-            .bind(conversation_id)
-            .bind(message_id)
-            .execute(&mut **tx)
-            .await?;
-    }
-    Ok(())
-}
-
-async fn matching_tool_result_ids(
-    tx: &mut Transaction<'_, Sqlite>,
-    conversation_id: &str,
-    tool_use_id: &str,
-) -> DbResult<Vec<String>> {
-    let rows = sqlx::query(
-        "SELECT message_id, content FROM messages
-         WHERE conversation_id = ?1 AND message_type = 'tool'",
+) -> DbResult<Option<String>> {
+    let row = sqlx::query(
+        "SELECT next.message_id, next.content
+         FROM messages AS assistant
+         JOIN messages AS next
+           ON next.conversation_id = assistant.conversation_id
+          AND next.sequence_id = (
+              SELECT MIN(candidate.sequence_id)
+              FROM messages AS candidate
+              WHERE candidate.conversation_id = assistant.conversation_id
+                AND candidate.sequence_id > assistant.sequence_id
+          )
+         WHERE assistant.conversation_id = ?1
+           AND assistant.message_id = ?2
+           AND next.message_type = 'tool'",
     )
     .bind(conversation_id)
-    .fetch_all(&mut **tx)
+    .bind(assistant_message_id)
+    .fetch_optional(&mut **tx)
     .await?;
-    let mut matching = Vec::new();
-    for row in rows {
-        let message_id: String = row.get("message_id");
-        let content: String = row.get("content");
-        let value = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
-            DbError::Serialization(format!(
-                "migration 68 cannot decode tool message {message_id} for conversation {conversation_id}: {error}"
-            ))
-        })?;
-        let MessageContent::Tool(tool) = MessageContent::from_stored_json(MessageType::Tool, value)
-            .map_err(DbError::Serialization)?
-        else {
-            return Err(DbError::Serialization(format!(
-                "migration 68 found non-tool content in tool message {message_id} for conversation {conversation_id}"
-            )));
-        };
-        if tool.tool_use_id == tool_use_id {
-            matching.push(message_id);
-        }
-    }
-    Ok(matching)
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let message_id: String = row.get("message_id");
+    let content: String = row.get("content");
+    let value = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+        DbError::Serialization(format!(
+            "migration 68 cannot decode carried tool message {message_id} for conversation {conversation_id}: {error}"
+        ))
+    })?;
+    let MessageContent::Tool(tool) = MessageContent::from_stored_json(MessageType::Tool, value)
+        .map_err(DbError::Serialization)?
+    else {
+        return Err(DbError::Serialization(format!(
+            "migration 68 found non-tool content in carried tool message {message_id} for conversation {conversation_id}"
+        )));
+    };
+    Ok((tool.tool_use_id == tool_use_id).then_some(message_id))
 }
 
 struct SchemaDependencies {
@@ -844,6 +852,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_tool_use_id_in_historical_turn_is_preserved() {
+        let pool = legacy_pool().await;
+        insert_pending(&pool, PENDING_STATE).await;
+        sqlx::raw_sql(
+            "CREATE TABLE message_child_fixture (
+                 message_id TEXT PRIMARY KEY REFERENCES messages(message_id) ON DELETE CASCADE,
+                 value TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let historical_assistant = MessageContent::agent(vec![ContentBlock::ToolUse {
+            id: "tool-review".to_string(),
+            name: "commission_review".to_string(),
+            input: serde_json::json!({"brief": "historical"}),
+        }]);
+        let pending_assistant = MessageContent::agent(vec![ContentBlock::ToolUse {
+            id: "tool-review".to_string(),
+            name: "commission_review".to_string(),
+            input: serde_json::json!({"brief": "Review it", "focus": "correctness"}),
+        }]);
+        for (message_id, sequence_id, content) in [
+            ("historical-assistant", 1, historical_assistant),
+            (
+                "historical-result",
+                2,
+                MessageContent::tool("tool-review", "historical result", false),
+            ),
+            ("assistant-review", 5, pending_assistant),
+            (
+                "pending-result",
+                6,
+                MessageContent::tool("tool-review", "partial pending result", false),
+            ),
+        ] {
+            let content_json = serde_json::to_string(&content.to_stored_json()).unwrap();
+            sqlx::query(
+                "INSERT INTO messages (
+                     message_id, conversation_id, sequence_id, message_type, content, created_at
+                 ) VALUES (?1, 'pending', ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+            )
+            .bind(message_id)
+            .bind(sequence_id)
+            .bind(content.message_type().to_string())
+            .bind(content_json)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO message_child_fixture (message_id, value)
+             VALUES ('historical-result', 'preserve me')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_migration(&pool).await.unwrap();
+
+        let historical: Vec<String> = sqlx::query_scalar(
+            "SELECT message_id FROM messages
+             WHERE conversation_id = 'pending' AND sequence_id IN (1, 2)
+             ORDER BY sequence_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(historical, ["historical-assistant", "historical-result"]);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM message_child_fixture WHERE message_id = 'historical-result'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "preserve me"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages WHERE message_id = 'pending-result'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_pending_state_aborts_without_fabricating_transcript() {
         let pool = legacy_pool().await;
         insert_pending(
@@ -884,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_success_and_materialized_assistant_are_replaced_in_order() {
+    async fn only_result_after_materialized_assistant_is_replaced_in_order() {
         let pool = legacy_pool().await;
         insert_pending(&pool, PENDING_STATE).await;
         for (id, sequence, message_type, content) in [
@@ -930,13 +1028,14 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!((rows[1].0, rows[1].1.as_str()), (5, "assistant-review"));
+        assert_eq!(rows.len(), 4);
+        assert_eq!((rows[1].0, rows[1].1.as_str()), (6, "stale-success"));
+        assert_eq!((rows[2].0, rows[2].1.as_str()), (7, "assistant-review"));
         assert_eq!(
-            (rows[2].0, rows[2].1.as_str()),
-            (6, recovery_result_id("pending", "tool-review").as_str())
+            (rows[3].0, rows[3].1.as_str()),
+            (8, recovery_result_id("pending", "tool-review").as_str())
         );
-        let result: serde_json::Value = serde_json::from_str(&rows[2].2).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&rows[3].2).unwrap();
         assert_eq!(result["is_error"], true);
         assert_ne!(result["content"], "looks good");
     }
