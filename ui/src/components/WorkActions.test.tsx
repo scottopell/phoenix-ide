@@ -1752,6 +1752,37 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
+  it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
+    enableMobile();
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: { associated_prs: [] },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-empty-envelope"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={onSendMessage}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('mobile-primary-address-feedback'));
+    await waitFor(() => expect(onSendMessage).toHaveBeenCalledTimes(1));
+    expect(requestActivePrSelectorOpen).not.toHaveBeenCalled();
+  });
+
   it('prioritizes feedback status over cached workspace-change status', () => {
     enableMobile();
     const handle = prStatusHandle({

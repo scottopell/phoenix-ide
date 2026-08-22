@@ -237,6 +237,13 @@ export function WorkControlBar({
     || prStatusHandle.ambiguous;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
+  const cachedPrCanTargetFeedback = !!prStatus?.found && prStatus.number != null && !prStatusHandle.ambiguous;
+  const canAddressFeedback = prSpecificActionsEnabled || cachedPrCanTargetFeedback;
+  const addressFeedbackPrLabel = activePrNumber != null
+    ? `PR #${activePrNumber}`
+    : prStatus?.found && prStatus.number != null
+      ? `PR #${prStatus.number}`
+      : 'PR';
   const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
   const diffLabel = canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff';
   const associatedPrs = useMemo(
@@ -444,7 +451,7 @@ export function WorkControlBar({
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}
-          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && prSpecificActionsEnabled && (
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && canAddressFeedback && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
@@ -452,11 +459,11 @@ export function WorkControlBar({
               disabled={capturing}
               onClick={handleAddressFeedback}
             >
-              <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
+              <span>{capturing ? `Capturing ${addressFeedbackPrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
               <CoverageMarker marker={coverageMarker} />
             </button>
           )}
-          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && !prSpecificActionsEnabled && (
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && !canAddressFeedback && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
