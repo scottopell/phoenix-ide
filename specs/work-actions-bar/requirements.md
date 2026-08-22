@@ -106,11 +106,13 @@ intermediate action bar while PR metadata loads. Loading and single-PR states SH
 compact rail geometry so metadata refresh does not cause a large layout shift.
 
 WHEN a mobile conversation has no actionable associated PR that the PR rail can represent
-THE SYSTEM SHALL present a compact fallback dock with a concise status row above one action row.
-The action row SHALL keep the disposition's primary verb directly available and MAY place
-non-primary terminal verbs in an overflow menu. Full disposition guidance and terminal intent
-SHALL remain available through a touch- and keyboard-operable disclosure. The collapsed dock SHALL
-bound status text to one line and SHALL NOT render full guidance as a wrapping sibling of its actions.
+THE SYSTEM SHALL present a compact fallback dock with a concise status row. For non-continued
+dispositions, the status row SHALL appear above one action row that keeps the disposition's primary
+verb directly available and MAY place non-primary terminal verbs in an overflow menu. A continued
+disposition SHALL remain status-only because it has no legal primary or terminal verbs. Full
+disposition guidance and terminal intent SHALL remain available through a touch- and
+keyboard-operable disclosure. The collapsed dock SHALL bound status text to one line and SHALL NOT
+render full guidance as a wrapping sibling of its actions.
 
 WHEN the user activates a PR in the rail
 THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
