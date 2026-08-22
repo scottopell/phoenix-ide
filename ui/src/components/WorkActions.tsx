@@ -338,7 +338,7 @@ export function WorkControlBar({
     setError(null);
     setAbandoning(true);
     try {
-      if (!(await terminalActionStillSafe())) return true;
+      if (!(await terminalActionStillSafe())) return false;
       await api.abandonTask(conversationId);
       return true;
     } catch (err) {

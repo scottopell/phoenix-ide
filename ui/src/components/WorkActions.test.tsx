@@ -1617,6 +1617,41 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     window.confirm = prevConfirm;
   });
 
+  it('keeps overflow open when Abandon safety refresh requires PR selection', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    const handle = prStatusHandle(
+      { found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } },
+      {
+        refreshForSafety: vi.fn().mockResolvedValue({
+          found: false,
+          associated_prs: twoOpenPrSelection(false).associated_prs,
+        }),
+      },
+    );
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-abandon-safety"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Select an active PR');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+    window.confirm = prevConfirm;
+  });
+
   it('returns Escape focus to the info trigger that opened the details panel', () => {
     enableMobile();
     renderWithProviders(
