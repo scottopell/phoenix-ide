@@ -1966,6 +1966,37 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
+  it('recovers unresolved selection from review disposition without cached PR guidance', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-review-recovery" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toHaveTextContent('The selected PR is unavailable.');
+    expect(screen.getByRole('status')).not.toHaveTextContent('Open PR #12');
+    expect(screen.queryByRole('button', { name: 'Review workspace changes' })).not.toBeInTheDocument();
+  });
+
   it('derives compact status from the resolved explicit PR instead of stale cached status', () => {
     enableMobile();
     const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, display_state: 'merged' as const };

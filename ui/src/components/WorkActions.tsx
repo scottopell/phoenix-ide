@@ -454,9 +454,11 @@ export function WorkControlBar({
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
     const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved, activePr);
-    const primaryGuidance = disposition.primary === 'review'
-      ? 'Review workspace changes before deciding how to finish this work.'
-      : disposition.resolve?.kind === 'address_feedback'
+    const primaryGuidance = explicitSelectionUnresolved
+      ? 'The selected PR is unavailable. Select an active PR or resume automatic PR inference.'
+      : disposition.primary === 'review'
+        ? 'Review workspace changes before deciding how to finish this work.'
+        : disposition.resolve?.kind === 'address_feedback'
         ? `Review and address feedback on ${activePrLabel}.`
         : disposition.resolve?.kind === 'merge_pr'
           ? `Open PR #${disposition.resolve.number} on GitHub to merge it.`
@@ -572,7 +574,7 @@ export function WorkControlBar({
               </button>
             )
           )}
-          {disposition.primary === 'review' && (
+          {disposition.primary === 'review' && !explicitSelectionUnresolved && (
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
@@ -581,6 +583,26 @@ export function WorkControlBar({
             >
               Review changes
             </button>
+          )}
+          {disposition.primary === 'review' && explicitSelectionUnresolved && (
+            actionablePrs.length > 0 ? (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                onClick={requestActivePrSelectorOpen}
+              >
+                Select active PR
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                disabled={!prStatusHandle.resumeInference}
+                onClick={() => void resumePrInference()}
+              >
+                Resume PR inference
+              </button>
+            )
           )}
           {disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity && (
             <button
