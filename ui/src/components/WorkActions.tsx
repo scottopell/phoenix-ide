@@ -314,7 +314,9 @@ export function WorkControlBar({
   useEffect(() => {
     if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection && fallbackOwnedFocusRef.current) {
       requestAnimationFrame(() => {
-        document.querySelector<HTMLElement>('.mobile-pr-chip--active, .mobile-pr-chip')?.focus();
+        const activeChip = document.querySelector<HTMLElement>('.mobile-pr-chip--active');
+        const firstChip = document.querySelector<HTMLElement>('.mobile-pr-chip');
+        (activeChip ?? firstChip)?.focus();
       });
     }
     if (!fallbackVisible) fallbackOwnedFocusRef.current = false;

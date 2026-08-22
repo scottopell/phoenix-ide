@@ -1788,6 +1788,39 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
+  it('prefers the active PR chip when it follows another chip in the rail', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const selectionWithSecondActive: AssociatedPrStatusEnvelope = {
+      ...twoOpenPrSelection(false),
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 13 }, provenance: 'pinned' },
+    };
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 13,
+      url: 'https://github.com/o/r/pull/13',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: selectionWithSecondActive,
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-second-active-focus" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const trigger = screen.getByRole('button', { name: 'Work status details' });
+    trigger.focus();
+    rerender(renderBar(railHandle));
+
+    const activeChip = screen.getByRole('button', { name: /#13/ });
+    await waitFor(() => expect(activeChip).toHaveFocus());
+    expect(screen.getByRole('button', { name: /#12/ })).not.toHaveFocus();
+  });
+
   it('moves owned fallback focus to the first PR chip when the rail has no active selection', async () => {
     enableMobile();
     const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
