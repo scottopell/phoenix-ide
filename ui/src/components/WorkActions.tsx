@@ -185,6 +185,7 @@ export function WorkControlBar({
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const [fallbackPanel, setFallbackPanel] = useState<'info' | 'menu' | null>(null);
+  const [fallbackMenuAction, setFallbackMenuAction] = useState<'clean_up' | 'abandon' | null>(null);
   const fallbackDockRef = useRef<HTMLDivElement>(null);
   const fallbackInfoButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
@@ -272,18 +273,21 @@ export function WorkControlBar({
   });
 
   const isBranch = convModeLabel === 'Branch';
-  const fallbackHasOverflowActions = !cleanupBlockedByAmbiguity && (
-    (disposition.showCleanUp && disposition.primary !== 'clean_up')
-    || (disposition.showAbandon && disposition.primary !== 'abandon')
-  );
+  const fallbackOverflowAction = !cleanupBlockedByAmbiguity && disposition.showCleanUp && disposition.primary !== 'clean_up'
+    ? 'clean_up'
+    : !cleanupBlockedByAmbiguity && disposition.showAbandon && disposition.primary !== 'abandon'
+      ? 'abandon'
+      : null;
+  const fallbackHasOverflowActions = fallbackOverflowAction !== null;
+  const fallbackMenuIsOpen = fallbackPanel === 'menu' && fallbackMenuAction === fallbackOverflowAction;
 
   useEffect(() => {
     if (!usesCompactLayout || canRepresentActiveSelection) {
       setFallbackPanel(null);
       return;
     }
-    if (!fallbackHasOverflowActions && fallbackPanel === 'menu') setFallbackPanel(null);
-  }, [canRepresentActiveSelection, fallbackHasOverflowActions, fallbackPanel, usesCompactLayout]);
+    if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) setFallbackPanel(null);
+  }, [canRepresentActiveSelection, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
 
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
@@ -513,9 +517,17 @@ export function WorkControlBar({
               type="button"
               className="mobile-work-fallback-menu-button"
               aria-label="More work actions"
-              aria-expanded={fallbackPanel === 'menu'}
+              aria-expanded={fallbackMenuIsOpen}
               aria-controls="mobile-work-fallback-more-actions"
-              onClick={() => setFallbackPanel((panel) => panel === 'menu' ? null : 'menu')}
+              onClick={() => {
+                if (fallbackMenuIsOpen) {
+                  setFallbackPanel(null);
+                  setFallbackMenuAction(null);
+                } else {
+                  setFallbackMenuAction(fallbackOverflowAction);
+                  setFallbackPanel('menu');
+                }
+              }}
             >
               •••
             </button>
@@ -531,7 +543,7 @@ export function WorkControlBar({
             ))}
           </div>
         )}
-        {fallbackPanel === 'menu' && fallbackHasOverflowActions && (
+        {fallbackMenuIsOpen && fallbackHasOverflowActions && (
           <div id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
             {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
               <button

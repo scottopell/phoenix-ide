@@ -1754,6 +1754,31 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
+  it('closes overflow when its secondary terminal action changes identity', () => {
+    enableMobile();
+    const renderBar = (phaseType: 'idle' | 'stuck') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-changing-secondary"
+            convModeLabel="Work"
+            phaseType={phaseType}
+            continuedInConvId={null}
+            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('idle'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    rerender(renderBar('stuck'));
+
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
+  });
+
   it('keeps Address feedback primary and requests PR selection when its target is unresolved', () => {
     enableMobile();
     const handle = prStatusHandle({
