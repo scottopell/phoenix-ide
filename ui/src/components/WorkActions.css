@@ -44,7 +44,7 @@
 }
 
 .mobile-work-fallback-status-copy--success {
-  color: var(--success-color);
+  color: var(--accent-green);
 }
 
 .mobile-work-fallback-status-copy--muted {

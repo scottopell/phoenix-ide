@@ -44,9 +44,10 @@ function CaptureSlot({ onSlot }: { onSlot: (slot: ReturnType<typeof useViewerSlo
   return null;
 }
 
-vi.mock('./activePrSelectorIntent', () => ({
-  requestActivePrSelectorOpen: vi.fn(),
-}));
+vi.mock('./activePrSelectorIntent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./activePrSelectorIntent')>();
+  return { ...actual, requestActivePrSelectorOpen: vi.fn() };
+});
 
 vi.mock('../api', () => ({
   api: {
@@ -1838,6 +1839,31 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Address feedback. Select the active PR first.' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+  });
+
+  it('derives compact status from the resolved explicit PR instead of stale cached status', () => {
+    enableMobile();
+    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, display_state: 'merged' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [explicitPr],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: explicitPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-explicit-status" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR open');
   });
 
   it('does not target a stale cached PR beside an unresolved explicit selection', () => {

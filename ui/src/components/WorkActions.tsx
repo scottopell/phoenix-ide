@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
-import type { PrStatusResponse } from '../api';
+import type { AssociatedPrSummaryResponse, PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
@@ -111,9 +111,14 @@ function compactFallbackStatus(
   disposition: WorkDisposition,
   prStatus: PrStatusResponse | null,
   explicitSelectionUnresolved: boolean,
+  activePr: AssociatedPrSummaryResponse | null | undefined,
 ): CompactFallbackStatus {
   if (disposition.note?.kind === 'continued') return { icon: '✓', label: 'Continued elsewhere', tone: 'muted' };
   if (explicitSelectionUnresolved) return { icon: '⚠', label: 'Active PR unavailable', tone: 'attention' };
+  if (activePr?.display_state === 'merged') return { icon: '✓', label: 'PR merged', tone: 'success' };
+  if (activePr?.display_state === 'closed') return { icon: '⚠', label: 'PR closed', tone: 'attention' };
+  if (activePr?.display_state === 'draft') return { icon: '…', label: 'Draft PR', tone: 'muted' };
+  if (activePr?.display_state === 'open') return { icon: '…', label: 'PR open', tone: 'muted' };
   if (disposition.note?.kind === 'checking') return { icon: '…', label: 'Checking PR', tone: 'muted' };
   if (disposition.note?.kind === 'pr_closed') return { icon: '⚠', label: 'PR closed', tone: 'attention' };
   if (disposition.note?.kind === 'pr_open_stuck') return { icon: '⚠', label: 'PR still open', tone: 'attention' };
@@ -417,7 +422,7 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
-    const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved);
+    const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved, activePr);
     const primaryGuidance = disposition.primary === 'review'
       ? 'Review workspace changes before deciding how to finish this work.'
       : disposition.resolve?.kind === 'address_feedback'
