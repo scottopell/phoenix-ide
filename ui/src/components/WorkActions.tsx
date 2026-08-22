@@ -256,7 +256,9 @@ export function WorkControlBar({
     usesCompactLayout,
   );
 
-  const cleanupBlockedByAmbiguity = prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr;
+  const explicitSelectionUnresolved = prStatusHandle.activeSelection?.active_pr !== undefined && activePr === null;
+  const cleanupBlockedByAmbiguity = explicitSelectionUnresolved
+    || (prStatusHandle.ambiguous && actionablePrs.length > 1 && !activePr);
   useEffect(() => {
     if (!openSelectorAfterRefresh || !prStatusHandle.ambiguous) return;
     requestActivePrSelectorOpen();

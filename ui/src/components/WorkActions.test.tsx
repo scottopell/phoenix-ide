@@ -1872,6 +1872,37 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
+  it('blocks cached-derived cleanup while an explicit selected PR summary is unresolved', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-merged-cache"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
     enableMobile();
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
