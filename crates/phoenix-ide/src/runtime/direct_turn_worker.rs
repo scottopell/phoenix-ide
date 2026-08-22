@@ -122,7 +122,6 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
-    startup_reconciliation: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -146,7 +145,6 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
-            startup_reconciliation: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -172,9 +170,9 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         mut kick_rx: watch::Receiver<u64>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), StartupReconciliationError> {
-        let mut wait = loop {
-            match self.run_once().await {
-                Ok(wait) => break wait,
+        loop {
+            match self.run_startup_recovery_once().await {
+                Ok(()) => break,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::Retryable(error) => {
                         tracing::warn!(
@@ -186,8 +184,19 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                     fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
                 },
             }
-        };
+        }
         let _ = ready_tx.send(());
+
+        let mut wait = match self.dispatch_accepted_turns().await {
+            Ok(wait) => wait,
+            Err(error) => match StartupReconciliationError::from(error) {
+                StartupReconciliationError::Retryable(error) => {
+                    tracing::warn!(%error, "direct-turn worker pass remains owed; retrying");
+                    ERROR_RETRY_INTERVAL
+                }
+                fatal @ StartupReconciliationError::Unclassifiable(_) => return Err(fatal),
+            },
+        };
         loop {
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
@@ -212,9 +221,16 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         }
     }
 
-    pub(crate) async fn run_once(
+    async fn run_startup_recovery_once(
         &self,
-    ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+        self.settle_terminal_obligations().await?;
+        self.dispatcher.reconcile_startup_parents().await
+    }
+
+    async fn settle_terminal_obligations(
+        &self,
+    ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         let mut settled_obligations = std::collections::HashSet::new();
         loop {
             let obligations = self
@@ -229,7 +245,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             for obligation in obligations {
                 if settled_obligations.insert(obligation.turn_id) {
                     let Ok(_owner) = self.dispatcher.acquire_local_authority() else {
-                        return Ok(EMPTY_RESCAN_INTERVAL);
+                        return Ok(());
                     };
                     made_progress = true;
                     self.dispatcher
@@ -241,16 +257,19 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
                 break;
             }
         }
+        Ok(())
+    }
 
-        let startup = self
-            .startup_reconciliation
-            .load(std::sync::atomic::Ordering::Acquire);
-        self.dispatcher.reconcile_startup_parents(startup).await?;
-        if startup {
-            self.startup_reconciliation
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+    pub(crate) async fn run_once(
+        &self,
+    ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
+        self.settle_terminal_obligations().await?;
+        self.dispatch_accepted_turns().await
+    }
 
+    async fn dispatch_accepted_turns(
+        &self,
+    ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
         let mut cursor = None;
         loop {
             let Ok(discovery_owner) = self.dispatcher.acquire_local_authority() else {
@@ -505,7 +524,6 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
 
     async fn reconcile_startup_parents(
         &self,
-        _startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         Ok(())
     }
@@ -549,11 +567,8 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
 
     async fn reconcile_startup_parents(
         &self,
-        startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
-        self.manager
-            .reconcile_startup_obligated_parents(startup)
-            .await
+        self.manager.reconcile_startup_obligated_parents().await
     }
 
     async fn settle_terminal_obligation(
@@ -729,6 +744,107 @@ mod tests {
         }
     }
 
+    struct FailAfterFirstAcceptedPage {
+        repo: WorkflowRepository,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TerminalObligationDiscovery for FailAfterFirstAcceptedPage {
+        async fn list_accepted(
+            &self,
+            cursor: Option<phoenix_db::workflow::DirectTurnDiscoveryCursor>,
+            _limit: usize,
+        ) -> Result<phoenix_db::workflow::DiscoverableAcceptedTurnPage, String> {
+            match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => self
+                    .repo
+                    .list_discoverable_accepted_runtime_direct_turns(cursor, 1)
+                    .await
+                    .map_err(|error| error.to_string()),
+                1 => Err("injected later candidate discovery failure".to_string()),
+                _ => self
+                    .repo
+                    .list_discoverable_accepted_runtime_direct_turns(cursor, 64)
+                    .await
+                    .map_err(|error| error.to_string()),
+            }
+        }
+
+        async fn list(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<phoenix_db::workflow::DiscoverableTerminalObligation>, String> {
+            self.repo
+                .list_discoverable_terminal_obligations(limit)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    struct RealStartupOrderingDispatcher {
+        manager: Arc<RuntimeManager>,
+        fail_settlement_once: std::sync::atomic::AtomicBool,
+        settlement_failed: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        settlement_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        reconciliation_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DirectTurnDispatcher for RealStartupOrderingDispatcher {
+        async fn dispatch(&self, _conversation_id: &str, _event: Event) -> Result<(), String> {
+            Err("ordinary dispatch is outside the startup-ordering fixture".to_string())
+        }
+    }
+
+    #[async_trait]
+    impl TerminalObligationDispatcher for RealStartupOrderingDispatcher {
+        fn acquire_local_authority(&self) -> Result<Box<dyn Send>, ()> {
+            self.manager
+                .acquire_local_authority_pass()
+                .map(|owner| Box::new(owner) as Box<dyn Send>)
+        }
+
+        async fn reconcile_startup_parents(
+            &self,
+        ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+            self.reconciliation_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.manager.reconcile_startup_obligated_parents().await
+        }
+
+        async fn settle_terminal_obligation(
+            &self,
+            conversation_id: &str,
+        ) -> Result<TerminalObligationSettlement, crate::runtime::DatabaseTerminalRecoveryError>
+        {
+            if self
+                .fail_settlement_once
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                if let Some(failed) = self.settlement_failed.lock().unwrap().take() {
+                    let _ = failed.send(());
+                }
+                let release = self.settlement_release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                return Err(crate::runtime::DatabaseTerminalRecoveryError::StillOwed(
+                    "controlled settlement failure".to_string(),
+                ));
+            }
+            let recovery = self
+                .manager
+                .settle_database_terminal_obligation(conversation_id)
+                .await?;
+            Ok(if recovery.committed() {
+                TerminalObligationSettlement::Committed
+            } else {
+                TerminalObligationSettlement::NoObligation
+            })
+        }
+    }
+
     struct RecordingDispatcher {
         result: Mutex<Result<(), String>>,
         terminal_results: Mutex<
@@ -744,6 +860,8 @@ mod tests {
         admission_attempts: std::sync::atomic::AtomicUsize,
         close_after_terminal_settlement: std::sync::atomic::AtomicBool,
         close_after_dispatch: std::sync::atomic::AtomicBool,
+        startup_reconciliations: std::sync::atomic::AtomicUsize,
+        startup_reconciliations_at_dispatch: Mutex<Vec<usize>>,
     }
 
     impl Default for RecordingDispatcher {
@@ -759,6 +877,8 @@ mod tests {
                 admission_attempts: std::sync::atomic::AtomicUsize::new(0),
                 close_after_terminal_settlement: std::sync::atomic::AtomicBool::new(false),
                 close_after_dispatch: std::sync::atomic::AtomicBool::new(false),
+                startup_reconciliations: std::sync::atomic::AtomicUsize::new(0),
+                startup_reconciliations_at_dispatch: Mutex::new(Vec::new()),
             }
         }
     }
@@ -772,6 +892,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
                 .then(|| Box::new(()) as Box<dyn Send>)
                 .ok_or(())
+        }
+
+        async fn reconcile_startup_parents(
+            &self,
+        ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+            self.startup_reconciliations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
         }
 
         async fn settle_terminal_obligation(
@@ -805,6 +933,13 @@ mod tests {
     #[async_trait]
     impl DirectTurnDispatcher for RecordingDispatcher {
         async fn dispatch(&self, conversation_id: &str, event: Event) -> Result<(), String> {
+            self.startup_reconciliations_at_dispatch
+                .lock()
+                .unwrap()
+                .push(
+                    self.startup_reconciliations
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
             self.events
                 .lock()
                 .unwrap()
@@ -1001,6 +1136,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_parent_reconciliation_preserves_in_flight_tool_authority() {
+        use phoenix_core::domain::db_schema::{MessageContent, ToolContent};
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "live-worker-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let in_flight = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "live-tool",
+                ToolInput::Think(ThinkInput {
+                    thoughts: "authoritative side effect".to_string(),
+                }),
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                "live-assistant".to_string(),
+                vec![ContentBlock::tool_use(
+                    "live-tool",
+                    "think",
+                    serde_json::json!({"thoughts": "authoritative side effect"}),
+                )],
+                None,
+                None,
+            ),
+        };
+        db.update_conversation_state(parent_id, &in_flight)
+            .await
+            .unwrap();
+        db.establish_parent_reconcile_action(parent_id)
+            .await
+            .unwrap();
+        let repo = WorkflowRepository::new(db.pool().clone());
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let real_result = {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let result = MessageContent::Tool(ToolContent::new(
+                    "live-tool",
+                    "real side effect completed",
+                    false,
+                ));
+                db.add_message("live-real-result", parent_id, &result, None, None)
+                    .await
+                    .unwrap();
+                db.update_conversation_state(parent_id, &ConvState::LlmRequesting { attempt: 1 })
+                    .await
+                    .unwrap();
+            })
+        };
+        let actions_before = db.list_startup_parent_actions().await.unwrap();
+
+        worker(repo, Arc::clone(&dispatcher), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a normal worker pass cannot enter startup reconciliation"
+        );
+        assert_eq!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            in_flight
+        );
+        assert!(db.get_messages(parent_id).await.unwrap().is_empty());
+        assert_eq!(
+            db.list_startup_parent_actions().await.unwrap(),
+            actions_before,
+            "live pass cannot consume recovery actions or auto-continue"
+        );
+
+        barrier.wait().await;
+        real_result.await.unwrap();
+
+        let messages = db.get_messages(parent_id).await.unwrap();
+        assert_eq!(messages.len(), 1, "real result commits exactly once");
+        let MessageContent::Tool(result) = &messages[0].content else {
+            panic!("expected real tool result")
+        };
+        assert_eq!(result.content, "real side effect completed");
+        assert!(!result.is_error);
+        assert_eq!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        );
+    }
+
+    #[tokio::test]
     async fn dormant_empty_pass_discovers_nothing() {
         let (repo, dispatcher) = fixture().await;
         let wait = worker(repo, dispatcher.clone(), 10, 1)
@@ -1030,7 +1267,7 @@ mod tests {
             dispatcher
                 .admission_attempts
                 .load(std::sync::atomic::Ordering::Acquire),
-            2
+            3
         );
         assert!(dispatcher.events.lock().unwrap().is_empty());
     }
@@ -1487,7 +1724,7 @@ mod tests {
             })
         }));
         let (kick_tx, kick_rx) = watch::channel(0);
-        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
         dispatcher
             .event_dispatched
@@ -1496,8 +1733,8 @@ mod tests {
             .replace(dispatched_tx);
         let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
 
+        ready_rx.await.unwrap();
         retry_started_rx.await.unwrap();
-        assert!(ready_rx.try_recv().is_err());
         assert!(dispatcher.events.lock().unwrap().is_empty());
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         let attempts = repo.list_attempts(workflow_id, EffectId(1)).await.unwrap();
@@ -1509,14 +1746,91 @@ mod tests {
 
         retry_release_tx.send(()).unwrap();
         dispatched_rx.await.unwrap();
-        ready_rx.await.unwrap();
         assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
-        assert_eq!(
-            sleeps.lock().unwrap().as_slice(),
-            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
-        );
+        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
         drop(kick_tx);
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn steady_retry_after_first_dispatch_cannot_reenter_startup_reconciliation() {
+        let (repo, dispatcher) = fixture().await;
+        accept(&repo, "first-dispatch-before-retry").await;
+        accept_for_conversation(&repo, "later-candidate", "conv-b").await;
+        let discovery = Arc::new(FailAfterFirstAcceptedPage {
+            repo: repo.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps: Arc::clone(&sleeps),
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .event_dispatched
+            .lock()
+            .unwrap()
+            .replace(dispatched_tx);
+        let worker =
+            DirectTurnWorker::new(repo, Arc::clone(&dispatcher), clock, ProcessIncarnation(1))
+                .with_terminal_discovery(discovery);
+        let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        ready_rx.await.unwrap();
+        dispatched_rx.await.unwrap();
+        retry_started_rx.await.unwrap();
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "startup phase is sealed before ordinary dispatch begins"
+        );
+        assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations_at_dispatch
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[1],
+            "ordinary dispatch observes the completed startup phase"
+        );
+
+        retry_release_tx.send(()).unwrap();
+        drop(kick_tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "ordinary retry cannot regain startup authority"
+        );
+        let first_message_count = dispatcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    Event::AuthoritativeUserMessage { payload, .. }
+                        if payload.message_id() == "message-first-dispatch-before-retry"
+                )
+            })
+            .count();
+        assert_eq!(
+            first_message_count, 1,
+            "the first authoritative dispatch remains exactly once across retry"
+        );
     }
 
     #[tokio::test]
@@ -1539,7 +1853,7 @@ mod tests {
             retry_release: Mutex::new(Some(retry_release_rx)),
         });
         let (kick_tx, kick_rx) = watch::channel(0);
-        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
         dispatcher
             .event_dispatched
@@ -1550,17 +1864,13 @@ mod tests {
             .with_terminal_discovery(discovery);
         let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
 
+        ready_rx.await.unwrap();
         retry_started_rx.await.unwrap();
-        assert!(ready_rx.try_recv().is_err());
         assert!(dispatcher.events.lock().unwrap().is_empty());
         retry_release_tx.send(()).unwrap();
         dispatched_rx.await.unwrap();
-        ready_rx.await.unwrap();
         assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
-        assert_eq!(
-            sleeps.lock().unwrap().as_slice(),
-            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
-        );
+        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }
@@ -1664,10 +1974,7 @@ mod tests {
             &["conv-a".to_string()]
         );
         assert!(dispatcher.events.lock().unwrap().is_empty());
-        assert_eq!(
-            sleeps.lock().unwrap().as_slice(),
-            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
-        );
+        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
         assert_eq!(
             discovery.attempts.load(std::sync::atomic::Ordering::SeqCst),
             3
@@ -1775,10 +2082,7 @@ mod tests {
             dispatcher.terminal_attempts.lock().unwrap().as_slice(),
             &["conv-a".to_string(), "conv-a".to_string()]
         );
-        assert_eq!(
-            sleeps.lock().unwrap().as_slice(),
-            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
-        );
+        assert_eq!(sleeps.lock().unwrap().as_slice(), &[ERROR_RETRY_INTERVAL]);
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }
@@ -1842,6 +2146,158 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn terminal_settlement_completes_before_startup_resume_can_create_runtime() {
+        use crate::platform::PlatformCapability;
+        use crate::tools::mcp::McpClientManager;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_llm::ModelRegistry;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "settle-before-resume-parent";
+        db.create_conversation(parent_id, "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("conv-a", "obligation", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(parent_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO startup_parent_actions
+                 (conversation_id, action, transcript_generation, created_at)
+             SELECT ?1, 'Resume', transcript_generation, ?2
+             FROM conversations WHERE id = ?1",
+        )
+        .bind(parent_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let repo = WorkflowRepository::new(db.pool().clone());
+        let turn_id = accept(&repo, "settle-before-resume").await;
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let claim = repo
+            .claim_authoritative_turn(&ClaimAuthoritativeTurnInput {
+                turn_id,
+                workflow_id,
+                process_incarnation: ProcessIncarnation(1),
+                now: Timestamp(10),
+                lease_until: LeaseExpiry(40),
+            })
+            .await
+            .unwrap();
+        repo.materialize_authoritative_turn(
+            &phoenix_db::workflow::MaterializeAuthoritativeTurnInput {
+                turn_id,
+                authority: claim.authority.unwrap(),
+                prepared: prepared_payload("message-settle-before-resume"),
+                sequence_id: 110,
+                created_at: Timestamp(110),
+                accepted_state: ConvState::LlmRequesting { attempt: 1 },
+                state_updated_at: chrono::DateTime::from_timestamp(110, 0).unwrap(),
+                now: Timestamp(10),
+            },
+        )
+        .await
+        .established()
+        .unwrap();
+        repo.persist_terminal_obligation(
+            &phoenix_db::workflow::DirectTurnTerminalObligationInput {
+                turn_id,
+                expected_generation: 0,
+                terminal: phoenix_workflow::TurnTerminal::Completed,
+                projection: phoenix_db::workflow::PersistedConversationProjection {
+                    state: ConvState::Idle,
+                    state_updated_at: chrono::Utc::now(),
+                },
+                response_message_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let manager = Arc::new(RuntimeManager::new(
+            db.clone(),
+            Arc::new(ModelRegistry::new_empty()),
+            PlatformCapability::None {
+                details: "test".to_string(),
+            },
+            Arc::new(McpClientManager::new()),
+            None,
+        ));
+        let (settlement_failed_tx, settlement_failed_rx) = tokio::sync::oneshot::channel();
+        let (settlement_release_tx, settlement_release_rx) = tokio::sync::oneshot::channel();
+        let dispatcher = Arc::new(RealStartupOrderingDispatcher {
+            manager: Arc::clone(&manager),
+            fail_settlement_once: std::sync::atomic::AtomicBool::new(true),
+            settlement_failed: Mutex::new(Some(settlement_failed_tx)),
+            settlement_release: Mutex::new(Some(settlement_release_rx)),
+            reconciliation_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (kick_tx, kick_rx) = watch::channel(0);
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let worker = DirectTurnWorker::new(
+            repo.clone(),
+            Arc::clone(&dispatcher),
+            Arc::new(TestClock {
+                now: Timestamp(10),
+                sleeps: Some(Arc::new(Mutex::new(Vec::new()))),
+            }),
+            ProcessIncarnation(1),
+        );
+        let worker_handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
+
+        settlement_failed_rx.await.unwrap();
+        assert!(ready_rx.try_recv().is_err());
+        assert_eq!(
+            dispatcher
+                .reconciliation_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(manager.try_get_handle(parent_id).await.is_none());
+        let failed_actions = db.list_startup_parent_actions().await.unwrap();
+        assert_eq!(failed_actions.len(), 1);
+        assert_eq!(
+            failed_actions[0].action,
+            phoenix_db::StartupParentAction::Resume
+        );
+        assert!(repo
+            .load_active_terminal_obligation(&ConversationAuthority("conv-a".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            !failed_actions
+                .iter()
+                .any(|action| action.action == phoenix_db::StartupParentAction::Reconcile),
+            "failed settlement cannot create a new Reconcile action"
+        );
+
+        settlement_release_tx.send(()).unwrap();
+        ready_rx.await.unwrap();
+        assert_eq!(
+            dispatcher
+                .reconciliation_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(manager.try_get_handle(parent_id).await.is_some());
+        assert!(db.list_startup_parent_actions().await.unwrap().is_empty());
+        assert!(repo
+            .load_active_terminal_obligation(&ConversationAuthority("conv-a".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+
+        drop(kick_tx);
+        worker_handle.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn startup_still_owed_retries_before_signalling_ready() {
         let (repo, dispatcher) = fixture().await;
@@ -1895,19 +2351,25 @@ mod tests {
             Ok(TerminalObligationSettlement::Committed),
         ];
         let sleeps = Arc::new(Mutex::new(Vec::new()));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let (retry_release_tx, retry_release_rx) = tokio::sync::oneshot::channel();
+        let clock = Arc::new(GatedRetryClock {
+            sleeps,
+            retry_started: Mutex::new(Some(retry_started_tx)),
+            retry_release: Mutex::new(Some(retry_release_rx)),
+        });
         let (kick_tx, kick_rx) = watch::channel(0);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let worker = worker_with_recorded_sleeps(repo, dispatcher.clone(), sleeps.clone());
+        let worker =
+            DirectTurnWorker::new(repo, Arc::clone(&dispatcher), clock, ProcessIncarnation(1));
         let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
 
+        retry_started_rx.await.unwrap();
+        retry_release_tx.send(()).unwrap();
         ready_rx.await.unwrap();
         assert_eq!(
             dispatcher.terminal_attempts.lock().unwrap().as_slice(),
             &["conv-a".to_string(), "conv-a".to_string()]
-        );
-        assert_eq!(
-            sleeps.lock().unwrap().as_slice(),
-            &[ERROR_RETRY_INTERVAL, EMPTY_RESCAN_INTERVAL]
         );
         drop(kick_tx);
         handle.await.unwrap().unwrap();
@@ -1995,15 +2457,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_pass_runs_before_ready_signal() {
+    async fn startup_phase_completes_before_ready_and_ordinary_dispatch() {
         let (repo, dispatcher) = fixture().await;
         accept(&repo, "startup").await;
         let (kick_tx, kick_rx) = watch::channel(0);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .event_dispatched
+            .lock()
+            .unwrap()
+            .replace(dispatched_tx);
         let worker = worker(repo, dispatcher.clone(), 10, 1);
         let handle = tokio::spawn(async move { worker.run_loop(kick_rx, ready_tx).await });
         ready_rx.await.unwrap();
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        dispatched_rx.await.unwrap();
         assert_eq!(dispatcher.events.lock().unwrap().len(), 1);
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations_at_dispatch
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[1],
+            "ordinary dispatch observes completed startup reconciliation"
+        );
         drop(kick_tx);
         handle.await.unwrap().unwrap();
     }

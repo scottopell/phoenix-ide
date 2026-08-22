@@ -8615,7 +8615,7 @@ impl Database {
         // prior user turn (REQ-BED-007, F1).
         let materialized = self.materialize_in_flight_tool_rounds(&now, None).await?;
         if !materialized.is_empty() {
-            self.reconcile_startup_obligated_parents(&materialized, true)
+            self.reconcile_startup_obligated_parents(&materialized)
                 .await?;
         }
 
@@ -9195,6 +9195,20 @@ impl Database {
         Ok(())
     }
 
+    /// Reconcile parents after process startup, when no pre-restart runtime can
+    /// still own an in-flight child or tool result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parent or child durable state cannot be read or
+    /// atomically persisted.
+    pub async fn reconcile_startup_obligated_parents(
+        &self,
+        conversation_ids: &std::collections::HashSet<String>,
+    ) -> DbResult<Vec<StartupParentReconciliation>> {
+        self.reconcile_startup_parents(conversation_ids).await
+    }
+
     /// Materialize parent progress that was deliberately preserved while a
     /// child terminal obligation still owned the exact outcome.
     ///
@@ -9203,10 +9217,9 @@ impl Database {
     /// Returns an error when any parent transcript or state cannot be read or
     /// atomically persisted.
     #[allow(clippy::too_many_lines)]
-    pub async fn reconcile_startup_obligated_parents(
+    async fn reconcile_startup_parents(
         &self,
         conversation_ids: &std::collections::HashSet<String>,
-        synthesize_startup_interruptions: bool,
     ) -> DbResult<Vec<StartupParentReconciliation>> {
         let now = Utc::now();
         let _ = self
@@ -9282,13 +9295,6 @@ impl Database {
             )) = pending_fan_in
             {
                 let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await?;
-                if !synthesize_startup_interruptions
-                    && pending
-                        .iter()
-                        .any(|agent| !outcomes.contains_key(&agent.agent_id))
-                {
-                    continue;
-                }
                 for agent in pending {
                     let outcome = if let Some(outcome) = outcomes.get(&agent.agent_id).cloned() {
                         outcome
@@ -9352,9 +9358,7 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
                 if is_parent == 1 {
-                    if synthesize_startup_interruptions
-                        && matches!(conversation.state, ConvState::LlmRequesting { .. })
-                    {
+                    if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
                         sqlx::query(
                             "INSERT OR REPLACE INTO startup_parent_actions
                                  (conversation_id, action, transcript_generation,
@@ -18059,10 +18063,7 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        let reconciled = db
-            .reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
         let actions = db.list_startup_parent_actions().await.unwrap();
@@ -18089,10 +18090,7 @@ mod tests {
         assert!(content.content.contains("exact recovered result"));
         assert!(!content.content.contains("interrupted by server restart"));
 
-        let reconciled = db
-            .reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
         let actions = db.list_startup_parent_actions().await.unwrap();
@@ -18172,10 +18170,9 @@ mod tests {
         let original = db.list_startup_parent_actions().await.unwrap();
         assert_eq!(original.len(), 1);
 
-        db.reconcile_startup_obligated_parents(
-            &std::collections::HashSet::from([parent_id.to_string()]),
-            true,
-        )
+        db.reconcile_startup_obligated_parents(&std::collections::HashSet::from([
+            parent_id.to_string()
+        ]))
         .await
         .unwrap();
 
@@ -18290,10 +18287,9 @@ mod tests {
         let original = db.list_startup_parent_actions().await.unwrap();
         assert_eq!(original.len(), 1);
 
-        db.reconcile_startup_obligated_parents(
-            &std::collections::HashSet::from([conversation_id.to_string()]),
-            true,
-        )
+        db.reconcile_startup_obligated_parents(&std::collections::HashSet::from([
+            conversation_id.to_string()
+        ]))
         .await
         .unwrap();
 
@@ -18363,9 +18359,7 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        db.reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -18487,7 +18481,7 @@ mod tests {
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
         let error = db
-            .reconcile_startup_obligated_parents(&ids, true)
+            .reconcile_startup_obligated_parents(&ids)
             .await
             .expect_err("unreadable terminal evidence must remain retryable");
         assert!(error.to_string().contains("decode pending sub-agent"));
@@ -18545,10 +18539,7 @@ mod tests {
             .unwrap();
             let ids = std::collections::HashSet::from([parent_id.clone()]);
 
-            let reconciled = db
-                .reconcile_startup_obligated_parents(&ids, true)
-                .await
-                .unwrap();
+            let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
             assert_eq!(reconciled.len(), 1);
             let actions = db.list_startup_parent_actions().await.unwrap();
             assert_eq!(actions.len(), 1);
