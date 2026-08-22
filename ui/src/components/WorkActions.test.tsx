@@ -1536,7 +1536,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('menuitem', { name: /^Abandon\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
   });
 
   it('closes the fallback overflow with Escape and returns focus to its trigger', () => {
@@ -1553,10 +1553,37 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     const trigger = screen.getByRole('button', { name: 'More work actions' });
     fireEvent.click(trigger);
-    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it('keeps overflow open and focus in place when Abandon confirmation is declined', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    const confirmSpy = vi.fn(() => false);
+    window.confirm = confirmSpy;
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-cancel"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+    window.confirm = prevConfirm;
   });
 
   it('returns Escape focus to the info trigger that opened the details panel', () => {
@@ -1591,7 +1618,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
 
     rerender(
       <MemoryRouter>
@@ -1600,7 +1627,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
         </ViewerSlotProvider>
       </MemoryRouter>,
     );
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
   it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
@@ -1616,7 +1643,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     const { rerender } = render(renderBar(fallbackHandle));
 
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
 
     const railHandle = prStatusHandle({
       found: true,
@@ -1628,11 +1655,11 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     });
     rerender(renderBar(railHandle));
     expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
 
     rerender(renderBar(fallbackHandle));
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
   it('does not render a stale overflow menu after terminal actions disappear', () => {
@@ -1653,11 +1680,11 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     const { rerender } = render(renderBar(null));
 
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('menu')).toBeInTheDocument();
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
     rerender(renderBar('conv-next'));
 
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 

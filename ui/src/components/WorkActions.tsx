@@ -318,18 +318,20 @@ export function WorkControlBar({
     }
   };
 
-  const handleAbandon = async () => {
+  const handleAbandon = async (): Promise<boolean> => {
     const confirmText = isBranch
       ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
       : 'Abandon this task? The worktree and task branch will be deleted.';
-    if (!window.confirm(confirmText)) return;
+    if (!window.confirm(confirmText)) return false;
     setError(null);
     setAbandoning(true);
     try {
-      if (!(await terminalActionStillSafe())) return;
+      if (!(await terminalActionStillSafe())) return true;
       await api.abandonTask(conversationId);
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to abandon task');
+      return true;
     } finally {
       setAbandoning(false);
     }
@@ -489,8 +491,8 @@ export function WorkControlBar({
               type="button"
               className="mobile-work-fallback-menu-button"
               aria-label="More work actions"
-              aria-haspopup="menu"
               aria-expanded={fallbackPanel === 'menu'}
+              aria-controls="mobile-work-fallback-more-actions"
               onClick={() => setFallbackPanel((panel) => panel === 'menu' ? null : 'menu')}
             >
               •••
@@ -508,12 +510,11 @@ export function WorkControlBar({
           </div>
         )}
         {fallbackPanel === 'menu' && fallbackHasOverflowActions && (
-          <div className="mobile-work-fallback-menu" role="menu" aria-label="More work actions">
+          <div id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
             {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--cleanup"
-                role="menuitem"
                 disabled={isLoading}
                 aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
                 title={cleanUpHintText(isBranch)}
@@ -529,13 +530,11 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--danger"
-                role="menuitem"
                 aria-label={`Abandon. ${abandonHintText(isBranch)}`}
                 title={abandonHintText(isBranch)}
                 disabled={isLoading}
-                onClick={() => {
-                  closeFallbackPanel();
-                  void handleAbandon();
+                onClick={async () => {
+                  if (await handleAbandon()) closeFallbackPanel();
                 }}
               >
                 Abandon
