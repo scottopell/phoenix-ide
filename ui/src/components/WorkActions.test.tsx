@@ -1872,6 +1872,41 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
+  it('resumes inference for unresolved feedback selection without actionable PR choices', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-feedback-no-options"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Address feedback. Select the active PR first.' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+  });
+
   it('blocks cached-derived cleanup while an explicit selected PR summary is unresolved', () => {
     enableMobile();
     const handle = prStatusHandle({

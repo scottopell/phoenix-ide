@@ -490,14 +490,25 @@ export function WorkControlBar({
             </button>
           )}
           {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && !canAddressFeedback && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--hero"
-              aria-label="Address feedback. Select the active PR first."
-              onClick={requestActivePrSelectorOpen}
-            >
-              Address feedback
-            </button>
+            actionablePrs.length > 0 ? (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                aria-label="Address feedback. Select the active PR first."
+                onClick={requestActivePrSelectorOpen}
+              >
+                Address feedback
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                disabled={!prStatusHandle.resumeInference}
+                onClick={() => void resumePrInference()}
+              >
+                Resume PR inference
+              </button>
+            )
           )}
           {disposition.primary === 'review' && (
             <button
