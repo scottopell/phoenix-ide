@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { api } from '../api';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
+import type { SqliteWorkloadReportResponse } from '../generated/SqliteWorkloadReportResponse';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
@@ -57,12 +58,30 @@ type ActiveResourceRequest = {
   abort: () => void;
 };
 
+type SqliteWindow = 'one_hour' | 'six_hours' | 'twenty_four_hours';
+
+type SqliteState = {
+  window: SqliteWindow;
+  report: SqliteWorkloadReportResponse | null;
+  loading: boolean;
+  error: string | null;
+  stale: boolean;
+};
+
 const EMPTY_RESOURCES: ResourceState = {
   sample: null,
   history: [],
   loading: true,
   stale: false,
   error: null,
+};
+
+const EMPTY_SQLITE: SqliteState = {
+  window: 'one_hour',
+  report: null,
+  loading: true,
+  error: null,
+  stale: false,
 };
 
 function formatBytes(bytes: number): string {
@@ -375,6 +394,138 @@ function ResourceTooltip({ active, payload, label }: { active?: boolean; payload
   );
 }
 
+const SQLITE_WINDOWS: Array<{ value: SqliteWindow; label: string }> = [
+  { value: 'one_hour', label: '1h' },
+  { value: 'six_hours', label: '6h' },
+  { value: 'twenty_four_hours', label: '24h' },
+];
+
+function SqliteDiagnostics({
+  state,
+  selectWindow,
+  refresh,
+}: {
+  state: SqliteState;
+  selectWindow: (window: SqliteWindow) => void;
+  refresh: () => void;
+}) {
+  const report = state.report;
+  return (
+    <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
+      <div className="settings-section__title-row">
+        <div>
+          <h3 id="sqlite-diagnostics-title" className="settings-section__title">SQLite workload</h3>
+          <Freshness
+            state={state.stale && report ? 'stale' : state.loading ? 'loading' : report ? 'current' : 'unavailable'}
+            sampledAt={report?.sampled_at}
+          />
+          <div className="settings-section__hint">Read-only aggregate snapshot from in-memory collector buckets.</div>
+        </div>
+        <div className="about-sqlite-toolbar">
+          <div className="about-sqlite-window-buttons" role="group" aria-label="SQLite report window">
+            {SQLITE_WINDOWS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                className={`about-sqlite-window-button${state.window === option.value ? ' about-sqlite-window-button--active' : ''}`}
+                onClick={() => selectWindow(option.value)}
+                disabled={state.loading && state.window === option.value}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <button type="button" className="settings-inline-btn" onClick={refresh} disabled={state.loading}>
+            {state.loading ? 'Refreshing SQLite report…' : 'Refresh SQLite report'}
+          </button>
+        </div>
+      </div>
+      {state.error && <div className="settings-section__error">{report ? `SQLite report stale — ${state.error}` : state.error}</div>}
+      {!report && state.loading && <div className="settings-section__hint">Loading SQLite report…</div>}
+      {report && (
+        <>
+          <div className="about-sqlite-summary" aria-label="SQLite workload coverage">
+            <div className="about-sqlite-summary__card">
+              <span>Coverage</span>
+              <strong>{report.coverage.label}</strong>
+            </div>
+            <div className="about-sqlite-summary__card">
+              <span>Process uptime</span>
+              <strong>{formatUptime(report.process_uptime_seconds)}</strong>
+            </div>
+            <div className="about-sqlite-summary__card">
+              <span>Covered uptime</span>
+              <strong>{formatUptime(report.covered_uptime_seconds)}</strong>
+            </div>
+          </div>
+          <div className="about-sqlite-tables">
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Writer utilization by category</h4>
+                <span>{report.writer_categories.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Writes</th>
+                    <th>Utilization</th>
+                    <th>Wait avg</th>
+                    <th>Retries</th>
+                    <th>Failures</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {report.writer_categories.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.operation_count)}</td>
+                      <td>{formatPercent(row.utilization_percent, 2)}</td>
+                      <td>{row.wait.avg_ms} ms</td>
+                      <td>{formatNumber(row.retries.retry_count)}</td>
+                      <td>busy {row.failures.busy} · locked {row.failures.locked} · timeout {row.failures.pool_timeout + row.failures.other_timeout} · fail {row.failures.other_failure} · abandoned {row.failures.abandoned}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Read activity by category</h4>
+                <span>{report.reads.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Reads</th>
+                    <th>Total duration</th>
+                    <th>Avg duration</th>
+                    <th>Peak concurrency</th>
+                    <th>Retries / failures</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {report.reads.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.operation_count)}</td>
+                      <td>{row.total_duration_ms} ms</td>
+                      <td>{row.avg_duration_ms} ms</td>
+                      <td>{formatNumber(row.peak_concurrency)}</td>
+                      <td>{row.retries.retry_count} retries · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: () => void }) {
   const rollups = useMemo(() => computeResourceRollups(state.history), [state.history]);
   const sample = state.sample;
@@ -654,6 +805,7 @@ export function AboutDeploymentPage() {
   const [pendingDeploymentSignal, setPendingDeploymentSignal] = useState(0);
   const [cleanupPath, setCleanupPath] = useState<string | null>(null);
   const [resources, setResources] = useState<ResourceState>(EMPTY_RESOURCES);
+  const [sqlite, setSqlite] = useState<SqliteState>(EMPTY_SQLITE);
   const resourcesInFlightRef = useRef(false);
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
@@ -833,6 +985,28 @@ export function AboutDeploymentPage() {
     };
   }, [fetchResources, invalidateActiveResourceRequest]);
 
+  const loadSqlite = useCallback((window: SqliteWindow) => {
+    setSqlite((current) => ({ ...current, window, loading: true, error: null }));
+    void api.deploymentSqliteWorkload(window)
+      .then((report) => {
+        setSqlite({ window, report, loading: false, error: null, stale: false });
+      })
+      .catch((cause) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setSqlite((current) => ({
+          ...current,
+          window,
+          loading: false,
+          stale: current.report !== null,
+          error: message,
+        }));
+      });
+  }, []);
+
+  useEffect(() => {
+    loadSqlite('one_hour');
+  }, [loadSqlite]);
+
   const handleCleanup = useCallback((path: string) => {
     setCleanupPath(path);
     setCleanupError(null);
@@ -936,6 +1110,12 @@ export function AboutDeploymentPage() {
               )}
 
               <ResourceMonitor state={resources} refresh={() => { fetchResources(true); }} />
+
+              <SqliteDiagnostics
+                state={sqlite}
+                selectWindow={loadSqlite}
+                refresh={() => loadSqlite(sqlite.window)}
+              />
 
               <section className="settings-section">
                 <div className="settings-section__title-row">

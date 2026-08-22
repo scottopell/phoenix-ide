@@ -39,6 +39,11 @@ pub use retrieval::{
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
+pub use sqlite_workload::{
+    BucketCategoryTotals, SqliteAccessKind, SqliteLatencyBin, SqliteOutcome, SqliteSnapshotWindow,
+    SqliteWorkloadAggregateReport, SqliteWorkloadCategory, SqliteWorkloadCollector,
+    SqliteWorkloadSnapshot,
+};
 pub use workflow::*;
 
 use chrono::{DateTime, Utc};
@@ -49,7 +54,6 @@ use phoenix_core::domain::llm_types::{
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
-use sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -1351,8 +1355,13 @@ impl Database {
     }
 
     #[must_use]
-    pub(crate) fn sqlite_workload_collector(&self) -> &SqliteWorkloadCollector {
-        &self.sqlite_workload_collector
+    pub fn sqlite_workload_aggregate_report(
+        &self,
+        window: SqliteSnapshotWindow,
+        now_unix_micros: u64,
+    ) -> SqliteWorkloadAggregateReport {
+        self.sqlite_workload_collector
+            .aggregate_report(window, now_unix_micros)
     }
 
     fn sqlite_telemetry(

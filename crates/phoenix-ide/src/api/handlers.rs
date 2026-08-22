@@ -430,6 +430,10 @@ pub fn create_router(state: AppState) -> Router {
             get(super::deployment::deployment_disk),
         )
         .route(
+            "/api/deployment/sqlite-workload",
+            get(super::deployment::sqlite_workload_report),
+        )
+        .route(
             "/api/deployment/disk/managed-worktrees/cleanup",
             post(super::deployment::cleanup_managed_worktree),
         )

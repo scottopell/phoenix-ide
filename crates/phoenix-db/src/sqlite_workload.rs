@@ -8,7 +8,7 @@ const MICROS_PER_MINUTE: u64 = BUCKET_SECONDS * MICROS_PER_SECOND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum SqliteWorkloadCategory {
+pub enum SqliteWorkloadCategory {
     MessagePersistence,
     DurableWorkflows,
     Fts,
@@ -19,7 +19,7 @@ pub(crate) enum SqliteWorkloadCategory {
 }
 
 impl SqliteWorkloadCategory {
-    pub(crate) const ALL: [Self; 7] = [
+    pub const ALL: [Self; 7] = [
         Self::MessagePersistence,
         Self::DurableWorkflows,
         Self::Fts,
@@ -29,29 +29,29 @@ impl SqliteWorkloadCategory {
         Self::Other,
     ];
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum SqliteAccessKind {
+pub enum SqliteAccessKind {
     Read,
     Write,
 }
 
 impl SqliteAccessKind {
-    pub(crate) const ALL: [Self; 2] = [Self::Read, Self::Write];
+    pub const ALL: [Self; 2] = [Self::Read, Self::Write];
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum SqliteOutcome {
+pub enum SqliteOutcome {
     Success,
     Busy,
     Locked,
@@ -62,7 +62,7 @@ pub(crate) enum SqliteOutcome {
 }
 
 impl SqliteOutcome {
-    pub(crate) const ALL: [Self; 7] = [
+    pub const ALL: [Self; 7] = [
         Self::Success,
         Self::Busy,
         Self::Locked,
@@ -72,23 +72,23 @@ impl SqliteOutcome {
         Self::Abandoned,
     ];
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum SqliteSnapshotWindow {
+pub enum SqliteSnapshotWindow {
     OneHour,
     SixHours,
     TwentyFourHours,
 }
 
 impl SqliteSnapshotWindow {
-    pub(crate) const ALL: [Self; 3] = [Self::OneHour, Self::SixHours, Self::TwentyFourHours];
+    pub const ALL: [Self; 3] = [Self::OneHour, Self::SixHours, Self::TwentyFourHours];
 
-    pub(crate) const fn minutes(self) -> usize {
+    pub const fn minutes(self) -> usize {
         match self {
             Self::OneHour => 60,
             Self::SixHours => 360,
@@ -99,7 +99,7 @@ impl SqliteSnapshotWindow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum SqliteLatencyBin {
+pub enum SqliteLatencyBin {
     Under1Ms,
     Ms1To4,
     Ms5To19,
@@ -161,59 +161,59 @@ pub(crate) struct SqliteObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct BucketCategoryTotals {
-    pub(crate) operation_count: u64,
-    pub(crate) pool_wait_micros: u64,
-    pub(crate) writer_held_micros: u64,
-    pub(crate) read_connection_micros: u64,
-    pub(crate) retry_count: u64,
-    pub(crate) retry_backoff_micros: u64,
-    pub(crate) abandoned_count: u64,
-    pub(crate) writer_concurrency_peak: u32,
-    pub(crate) read_concurrency_peak: u32,
+pub struct BucketCategoryTotals {
+    pub operation_count: u64,
+    pub pool_wait_micros: u64,
+    pub writer_held_micros: u64,
+    pub read_connection_micros: u64,
+    pub retry_count: u64,
+    pub retry_backoff_micros: u64,
+    pub abandoned_count: u64,
+    pub writer_concurrency_peak: u32,
+    pub read_concurrency_peak: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SqliteBucketSnapshot {
-    pub(crate) minute_start_unix_micros: u64,
-    pub(crate) totals: Box<
+pub struct SqliteBucketSnapshot {
+    pub minute_start_unix_micros: u64,
+    pub totals: Box<
         [[BucketCategoryTotals; SqliteWorkloadCategory::ALL.len()]; SqliteAccessKind::ALL.len()],
     >,
-    pub(crate) outcomes: Box<
+    pub outcomes: Box<
         [[[u64; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-    pub(crate) latency_histogram: Box<
+    pub latency_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SqliteWorkloadSnapshot {
-    pub(crate) window: SqliteSnapshotWindow,
-    pub(crate) covered_minutes: usize,
-    pub(crate) process_started_at_unix_micros: u64,
-    pub(crate) process_uptime_micros: u64,
-    pub(crate) covered_uptime_micros: u64,
-    pub(crate) buckets: Vec<SqliteBucketSnapshot>,
+pub struct SqliteWorkloadSnapshot {
+    pub window: SqliteSnapshotWindow,
+    pub covered_minutes: usize,
+    pub process_started_at_unix_micros: u64,
+    pub process_uptime_micros: u64,
+    pub covered_uptime_micros: u64,
+    pub buckets: Vec<SqliteBucketSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SqliteWorkloadAggregateReport {
-    pub(crate) requested_window: SqliteSnapshotWindow,
-    pub(crate) covered_minutes: usize,
-    pub(crate) process_started_at_unix_micros: u64,
-    pub(crate) process_uptime_micros: u64,
-    pub(crate) covered_uptime_micros: u64,
-    pub(crate) totals: Box<
+pub struct SqliteWorkloadAggregateReport {
+    pub requested_window: SqliteSnapshotWindow,
+    pub covered_minutes: usize,
+    pub process_started_at_unix_micros: u64,
+    pub process_uptime_micros: u64,
+    pub covered_uptime_micros: u64,
+    pub totals: Box<
         [[BucketCategoryTotals; SqliteWorkloadCategory::ALL.len()]; SqliteAccessKind::ALL.len()],
     >,
-    pub(crate) outcomes: Box<
+    pub outcomes: Box<
         [[[u64; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-    pub(crate) latency_histogram: Box<
+    pub latency_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
@@ -291,15 +291,16 @@ impl Default for InnerCollector {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SqliteWorkloadCollector {
+pub struct SqliteWorkloadCollector {
     inner: Arc<Mutex<InnerCollector>>,
 }
 
 impl SqliteWorkloadCollector {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_id(&self) -> usize {
         Arc::as_ptr(&self.inner) as usize
     }
@@ -312,7 +313,7 @@ impl SqliteWorkloadCollector {
         inner.record(observation);
     }
 
-    pub(crate) fn snapshot(
+    pub fn snapshot(
         &self,
         window: SqliteSnapshotWindow,
         now_unix_micros: u64,
@@ -324,7 +325,7 @@ impl SqliteWorkloadCollector {
         inner.snapshot(window, now_unix_micros)
     }
 
-    pub(crate) fn aggregate_report(
+    pub fn aggregate_report(
         &self,
         window: SqliteSnapshotWindow,
         now_unix_micros: u64,

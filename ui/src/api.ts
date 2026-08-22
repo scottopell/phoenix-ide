@@ -3,6 +3,7 @@ import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
+import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
 import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
@@ -1309,6 +1310,12 @@ export const api = {
   async deploymentResources(options?: { signal?: AbortSignal }): Promise<AboutResourcesSnapshot> {
     const resp = await fetch('/api/about/resources', options?.signal ? { signal: options.signal } : undefined);
     if (!resp.ok) throw new Error('Failed to load deployment resources');
+    return resp.json();
+  },
+
+  async deploymentSqliteWorkload(window: 'one_hour' | 'six_hours' | 'twenty_four_hours'): Promise<SqliteWorkloadReportResponse> {
+    const resp = await fetch(`/api/deployment/sqlite-workload?window=${encodeURIComponent(window)}`);
+    if (!resp.ok) throw new Error('Failed to load sqlite workload report');
     return resp.json();
   },
 

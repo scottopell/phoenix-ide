@@ -60,6 +60,7 @@ impl SqliteAccessKind {
     }
 }
 
+#[cfg(test)]
 impl SqliteOutcome {
     const fn as_str(self) -> &'static str {
         match self {
