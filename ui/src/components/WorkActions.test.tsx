@@ -1529,7 +1529,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
-    expect(screen.getByRole('status')).toHaveTextContent('Review, commit, and push before opening a PR.');
+    const details = screen.getByRole('status');
+    expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
+    expect(details).toHaveTextContent('Captures a diff snapshot');
 
     fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
@@ -1554,6 +1556,67 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it('returns Escape focus to the info trigger that opened the details panel', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-info"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: 'Work status details' });
+    fireEvent.click(trigger);
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('resets an open fallback panel when the conversation identity changes', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const { rerender } = renderWithProviders(
+      <WorkControlBar conversationId="conv-a" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-b" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
+  it('describes an unrepresentable PR resolve action instead of cleanup', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-open-link" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('link', { name: /Open PR #12/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    const details = screen.getByRole('status');
+    expect(details).toHaveTextContent('Open PR #12 on GitHub to review its current state.');
+    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).not.toHaveTextContent('Mark as merged');
   });
 
   it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {

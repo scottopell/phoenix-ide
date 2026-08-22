@@ -83,9 +83,10 @@ THE SYSTEM SHALL dispatch the typed `UserRequestsCloseConversation` command agai
 AND SHALL treat any local `user_close_started`-style UI state only as a projection or acknowledgement of that dispatched command
 AND SHALL NOT treat the bar as an independent close authority or as a lifecycle-mutating state machine.
 
-WHEN the conversation is presented in a narrow mobile viewport
+WHEN the conversation is presented in a narrow mobile viewport and has actionable associated PRs
+that the PR rail can represent
 THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
-rail containing the actionable associated PRs and their current status.
+rail containing those actionable associated PRs and their current status.
 THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
 
 WHEN a desktop conversation has multiple actionable associated PRs and its active PR is either

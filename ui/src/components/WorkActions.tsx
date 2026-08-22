@@ -180,10 +180,15 @@ export function WorkControlBar({
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
   const [fallbackPanel, setFallbackPanel] = useState<'info' | 'menu' | null>(null);
   const fallbackDockRef = useRef<HTMLDivElement>(null);
+  const fallbackInfoButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
+
+  useEffect(() => {
+    setFallbackPanel(null);
+  }, [conversationId]);
 
   useEffect(() => {
     if (!fallbackPanel) return;
@@ -193,8 +198,10 @@ export function WorkControlBar({
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      const dismissedPanel = fallbackPanel;
       setFallbackPanel(null);
-      fallbackMenuButtonRef.current?.focus();
+      if (dismissedPanel === 'info') fallbackInfoButtonRef.current?.focus();
+      else fallbackMenuButtonRef.current?.focus();
     };
 
     document.addEventListener('mousedown', closeOnOutsideClick);
@@ -368,12 +375,22 @@ export function WorkControlBar({
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
     const status = compactFallbackStatus(disposition, prStatus);
-    const infoText = disposition.note?.text
-      ?? (disposition.resolve?.kind === 'address_feedback'
+    const primaryGuidance = disposition.primary === 'review'
+      ? 'Review workspace changes before deciding how to finish this work.'
+      : disposition.resolve?.kind === 'address_feedback'
         ? `Review and address feedback on ${activePrLabel}.`
-        : disposition.primary === 'abandon'
-          ? abandonHintText(isBranch)
-          : cleanUpHintText(isBranch));
+        : disposition.resolve?.kind === 'merge_pr'
+          ? `Open PR #${disposition.resolve.number} on GitHub to merge it.`
+          : disposition.resolve?.kind === 'open_pr'
+            ? `Open PR #${disposition.resolve.number} on GitHub to review its current state.`
+            : disposition.resolve?.kind === 'create_pr'
+              ? `Create a PR on GitHub for branch ${disposition.resolve.branchName}.`
+              : null;
+    const detailItems = [
+      disposition.note?.text ?? primaryGuidance,
+      disposition.showCleanUp ? cleanUpHintText(isBranch) : null,
+      disposition.showAbandon ? abandonHintText(isBranch) : null,
+    ].filter((item): item is string => item !== null);
     const hasOverflowActions = !cleanupBlockedByAmbiguity && (
       (disposition.showCleanUp && disposition.primary !== 'clean_up')
       || (disposition.showAbandon && disposition.primary !== 'abandon')
@@ -391,6 +408,7 @@ export function WorkControlBar({
           <button
             type="button"
             className="mobile-work-fallback-info-button"
+            ref={fallbackInfoButtonRef}
             aria-label="Work status details"
             aria-expanded={fallbackPanel === 'info'}
             onClick={() => setFallbackPanel((panel) => panel === 'info' ? null : 'info')}
@@ -466,7 +484,11 @@ export function WorkControlBar({
 
         {fallbackPanel === 'info' && (
           <div className="mobile-work-fallback-panel" role="status">
-            {infoText}
+            {detailItems.map((item, index) => (
+              <span key={item} className={index > 0 ? 'mobile-work-fallback-panel-item--terminal' : undefined}>
+                {item}
+              </span>
+            ))}
           </div>
         )}
         {fallbackPanel === 'menu' && (
