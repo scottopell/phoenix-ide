@@ -375,6 +375,14 @@ impl FatalLocalAuthorityFence {
     }
 
     #[cfg(test)]
+    pub(crate) fn owner_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .owners
+    }
+
+    #[cfg(test)]
     fn owners_at_first_close(&self) -> Option<usize> {
         match self.owners_at_first_close.load(Ordering::Acquire) {
             usize::MAX => None,
@@ -1284,10 +1292,37 @@ impl SseBroadcaster {
     /// checkpoints, which resets the ring (discarding this entry) and emits
     /// a duplicate `sse_message` that the UI dedups via
     /// `SseMessageDedupReplay`.
+    #[cfg(test)]
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
         self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+    }
+
+    pub(crate) fn send_ephemeral_message_admitted(
+        &self,
+        _admitted: &mut AdmittedOperation,
+        message: crate::db::Message,
+    ) -> Result<usize, ()> {
+        let seq = message.sequence_id;
+        self.observe_seq(seq);
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
+        let event = SseEvent::Message { message };
+        if gate
+            .reserved_until
+            .is_some_and(|reserved_until| seq > reserved_until)
+        {
+            gate.queued.push(QueuedBroadcast {
+                event,
+                seq,
+                op: RingOp::Append,
+            });
+            return Ok(self.tx.receiver_count());
+        }
+        self.send_with_ring_unlocked(event, seq, RingOp::Append)
     }
 
     /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
@@ -3014,7 +3049,16 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
-    pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
+    pub async fn start_direct_turn_worker(
+        self: &Arc<Self>,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
+        self.start_direct_turn_worker_with_startup_hook(|| {}).await
+    }
+
+    async fn start_direct_turn_worker_with_startup_hook(
+        self: &Arc<Self>,
+        after_ready: impl FnOnce(),
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
         let rx = self.direct_turn_kick_rx.write().await.take();
         let Some(rx) = rx else {
             tracing::debug!("direct-turn worker already started; skipping");
@@ -3038,9 +3082,13 @@ impl RuntimeManager {
                 }
             }
         });
-        ready_rx
-            .await
-            .map_err(|_| "direct-turn worker stopped before startup pass completed".to_string())?;
+        if ready_rx.await.is_err() {
+            return Err(crate::FatalLocalAuthorityExit);
+        }
+        after_ready();
+        if self.fatal_local_authority_is_latched() {
+            return Err(crate::FatalLocalAuthorityExit);
+        }
         self.kick_direct_turn_worker();
         Ok(())
     }
@@ -7687,6 +7735,22 @@ mod scope_liveness_tests {
                 .unwrap(),
             Err("runtime stopped before event settled".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn startup_readiness_race_after_fence_close_returns_fatal_local_authority_exit() {
+        let manager = Arc::new(test_manager().await);
+        let closer = Arc::clone(&manager);
+
+        let error = manager
+            .start_direct_turn_worker_with_startup_hook(move || {
+                closer.signal_fatal_local_authority("test_startup_readiness_race");
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+        assert!(manager.fatal_local_authority_is_latched());
     }
 
     #[tokio::test]

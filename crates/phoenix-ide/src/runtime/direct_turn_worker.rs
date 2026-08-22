@@ -1914,7 +1914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_unclassifiable_authority_does_not_retry_or_signal_ready() {
+    async fn initial_unclassifiable_reconciliation_returns_fatal_local_authority_exit() {
         let (repo, dispatcher) = fixture().await;
         let turn_id = accept(&repo, "startup-unclassifiable").await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();

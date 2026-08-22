@@ -174,10 +174,7 @@ impl AppState {
         runtime
             .set_startup_obligated_conversations(db.terminal_obligated_conversation_ids().await?)
             .await;
-        runtime
-            .start_direct_turn_worker()
-            .await
-            .map_err(std::io::Error::other)?;
+        runtime.start_direct_turn_worker().await?;
         runtime
             .require_startup_local_authority()
             .map_err(std::io::Error::other)?;

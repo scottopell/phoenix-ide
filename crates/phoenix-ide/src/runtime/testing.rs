@@ -556,6 +556,8 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
     terminal_obligation_establishment_failures: Mutex<usize>,
+    terminal_obligation_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    terminal_obligation_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     terminal_mutation_retired: Mutex<bool>,
     fail_state_snapshot: Mutex<bool>,
     fail_load_active_direct_turn: Mutex<bool>,
@@ -604,6 +606,8 @@ impl InMemoryStorage {
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
             terminal_obligation_establishment_failures: Mutex::new(0),
+            terminal_obligation_started: Mutex::new(None),
+            terminal_obligation_release: Mutex::new(None),
             terminal_mutation_retired: Mutex::new(false),
             fail_state_snapshot: Mutex::new(false),
             fail_load_active_direct_turn: Mutex::new(false),
@@ -660,6 +664,19 @@ impl InMemoryStorage {
 
     pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
         *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
+    }
+
+    pub fn gate_terminal_obligation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.terminal_obligation_started.lock().unwrap() = Some(started_tx);
+        *self.terminal_obligation_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
@@ -1000,6 +1017,13 @@ impl MessageStore for InMemoryStorage {
         usage_data: Option<&UsageData>,
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalEvidenceEstablishment {
+        if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.terminal_obligation_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         {
             let mut failures = self
                 .terminal_obligation_establishment_failures
@@ -1273,6 +1297,13 @@ impl MessageStore for InMemoryStorage {
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
         _response_message_id: Option<&str>,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.terminal_obligation_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
         }

@@ -22,6 +22,25 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerFailureDisposition {
+    RecordDiagnostic,
+    ExitFatalLocalAuthority,
+}
+
+fn server_failure_disposition(
+    error: &(dyn std::error::Error + 'static),
+) -> ServerFailureDisposition {
+    if error
+        .downcast_ref::<phoenix_ide::FatalLocalAuthorityExit>()
+        .is_some()
+    {
+        ServerFailureDisposition::ExitFatalLocalAuthority
+    } else {
+        ServerFailureDisposition::RecordDiagnostic
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let invocation = parse_invocation(std::env::args().skip(1))?;
     let records_fatal_diagnostics =
@@ -45,12 +64,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Invocation::Server | Invocation::ServerCommand => {
             let result = runtime.block_on(phoenix_ide::run_server());
             if let Err(error) = &result {
-                phoenix_ide::record_fatal_diagnostic(error);
-                if error
-                    .downcast_ref::<phoenix_ide::FatalLocalAuthorityExit>()
-                    .is_some()
-                {
-                    std::process::exit(phoenix_ide::FATAL_LOCAL_AUTHORITY_EXIT);
+                match server_failure_disposition(error.as_ref()) {
+                    ServerFailureDisposition::ExitFatalLocalAuthority => {
+                        std::process::exit(phoenix_ide::FATAL_LOCAL_AUTHORITY_EXIT);
+                    }
+                    ServerFailureDisposition::RecordDiagnostic => {
+                        phoenix_ide::record_fatal_diagnostic(error);
+                    }
                 }
             }
             result
@@ -61,7 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_invocation, Invocation};
+    use super::{
+        parse_invocation, server_failure_disposition, Invocation, ServerFailureDisposition,
+    };
 
     #[test]
     fn parses_supported_invocations() {
@@ -81,6 +103,18 @@ mod tests {
         ] {
             assert_eq!(parse_invocation(args).unwrap(), Invocation::ServerCommand);
         }
+    }
+
+    #[test]
+    fn fatal_local_authority_exit_bypasses_synchronous_diagnostic() {
+        assert_eq!(
+            server_failure_disposition(&phoenix_ide::FatalLocalAuthorityExit),
+            ServerFailureDisposition::ExitFatalLocalAuthority
+        );
+        assert_eq!(
+            server_failure_disposition(&std::io::Error::other("ordinary failure")),
+            ServerFailureDisposition::RecordDiagnostic
+        );
     }
 
     #[test]

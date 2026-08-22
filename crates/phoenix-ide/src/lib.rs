@@ -597,7 +597,7 @@ pub async fn migrate_database() -> Result<(), Box<dyn std::error::Error>> {
 
 pub const FATAL_LOCAL_AUTHORITY_EXIT: i32 = 70;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatalLocalAuthorityExit;
 
 impl std::fmt::Display for FatalLocalAuthorityExit {
