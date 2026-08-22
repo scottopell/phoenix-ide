@@ -30,6 +30,7 @@ impl SqliteWorkloadCategory {
         Self::Other,
     ];
 
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -45,6 +46,7 @@ pub enum SqliteAccessKind {
 impl SqliteAccessKind {
     pub const ALL: [Self; 2] = [Self::Read, Self::Write];
 
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -73,6 +75,7 @@ impl SqliteOutcome {
         Self::Abandoned,
     ];
 
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -89,6 +92,7 @@ pub enum SqliteSnapshotWindow {
 impl SqliteSnapshotWindow {
     pub const ALL: [Self; 3] = [Self::OneHour, Self::SixHours, Self::TwentyFourHours];
 
+    #[must_use]
     pub const fn minutes(self) -> usize {
         match self {
             Self::OneHour => 60,
@@ -348,6 +352,7 @@ pub struct SqliteWorkloadCollector {
 }
 
 impl SqliteWorkloadCollector {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -420,6 +425,10 @@ impl SqliteWorkloadCollector {
         });
     }
 
+    /// # Panics
+    ///
+    /// Panics if a previous collector update poisoned the bounded ring mutex.
+    #[must_use]
     pub fn snapshot(
         &self,
         window: SqliteSnapshotWindow,
@@ -432,6 +441,10 @@ impl SqliteWorkloadCollector {
         inner.snapshot(window, now_unix_micros)
     }
 
+    /// # Panics
+    ///
+    /// Panics if a previous collector update poisoned the bounded ring mutex.
+    #[must_use]
     pub fn aggregate_report(
         &self,
         window: SqliteSnapshotWindow,
@@ -726,6 +739,7 @@ impl SqliteLatencyBin {
     }
 }
 
+#[must_use]
 pub fn approximate_percentiles_from_histogram(
     histogram: &[u64; SqliteLatencyBin::ALL.len()],
 ) -> SqlitePercentiles {
@@ -777,7 +791,7 @@ mod tests {
                 .lock()
                 .expect("sqlite workload collector mutex poisoned");
             inner.process_started_at_unix_micros = started_at_unix_micros;
-            inner.process_started_at = Instant::now() - uptime;
+            inner.process_started_at = Instant::now().checked_sub(uptime).unwrap();
         }
         collector
     }
@@ -937,7 +951,9 @@ mod tests {
                 .lock()
                 .expect("sqlite workload collector mutex poisoned");
             inner.process_started_at_unix_micros = 10 * M;
-            inner.process_started_at = Instant::now() - Duration::from_secs(150);
+            inner.process_started_at = Instant::now()
+                .checked_sub(Duration::from_secs(150))
+                .unwrap();
         }
 
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, 20 * M);
@@ -968,7 +984,9 @@ mod tests {
                 .lock()
                 .expect("sqlite workload collector mutex poisoned");
             inner.process_started_at_unix_micros = 10 * M;
-            inner.process_started_at = Instant::now() - Duration::from_secs(200 * 60);
+            inner.process_started_at = Instant::now()
+                .checked_sub(Duration::from_secs(200 * 60))
+                .unwrap();
         }
 
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, 300 * M);

@@ -337,7 +337,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-@media (max-width: 720px) {
+@media (width <= 720px) {
   .about-sqlite-summary {
     grid-template-columns: 1fr;
   }

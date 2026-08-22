@@ -191,6 +191,7 @@ impl SuccessfulTransactionTiming {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 struct CompletedTransactionTiming {
     acquisition_elapsed: Duration,
     write_admission_wait_elapsed: Duration,
@@ -586,6 +587,7 @@ fn unix_now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::match_same_arms)]
 fn classify_outcome(error: &sqlx::Error) -> SqliteOutcome {
     match error {
         sqlx::Error::PoolTimedOut => SqliteOutcome::PoolTimeout,
@@ -599,6 +601,25 @@ fn classify_outcome(error: &sqlx::Error) -> SqliteOutcome {
                 _ => SqliteOutcome::OtherFailure,
             }
         }
+        sqlx::Error::Configuration(_)
+        | sqlx::Error::InvalidArgument(_)
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::RowNotFound
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Encode(_)
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::AnyDriverError(_)
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Migrate(_)
+        | sqlx::Error::InvalidSavePointStatement
+        | sqlx::Error::BeginFailed => SqliteOutcome::OtherFailure,
+        #[allow(unreachable_patterns)]
         _ => SqliteOutcome::OtherFailure,
     }
 }
@@ -969,7 +990,9 @@ mod tests {
             SqliteAccessKind::Write,
             SqliteWorkloadCollector::new(),
         );
-        let acquisition_started_at = Instant::now() - Duration::from_millis(50);
+        let acquisition_started_at = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .unwrap();
         let transaction_started_at = acquisition_started_at + Duration::from_millis(20);
 
         telemetry

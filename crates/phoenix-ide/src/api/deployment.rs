@@ -609,6 +609,7 @@ fn remove_leftover_worktree(
     Ok(removed)
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn sample_sqlite_workload_report(
     state: &AppState,
     window: SqliteReportWindow,
@@ -616,7 +617,7 @@ fn sample_sqlite_workload_report(
     use crate::db::{SqliteAccessKind, SqliteSnapshotWindow, SqliteWorkloadCategory};
 
     let sampled_at = Utc::now();
-    let now_micros = sampled_at.timestamp_micros().max(0) as u64;
+    let now_micros = sampled_at.timestamp_micros().max(0).cast_unsigned();
     let report = state
         .db
         .sqlite_workload_aggregate_report(window.into(), now_micros);
@@ -733,13 +734,14 @@ fn wait_summary(
     SqliteWaitSummary {
         sample_count: percentiles.sample_count,
         total_ms,
-        avg_ms: (percentiles.sample_count > 0).then_some(total_ms / percentiles.sample_count),
+        avg_ms: total_ms.checked_div(percentiles.sample_count),
         p50_upper_bound_ms: percentiles.p50_upper_bound_ms,
         p95_upper_bound_ms: percentiles.p95_upper_bound_ms,
         p99_upper_bound_ms: percentiles.p99_upper_bound_ms,
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn classification_summary(
     report: &crate::db::SqliteWorkloadAggregateReport,
 ) -> SqliteClassificationSummary {
@@ -752,22 +754,16 @@ fn classification_summary(
     for access in SqliteAccessKind::ALL {
         for category in SqliteWorkloadCategory::ALL {
             let totals = report.totals[access.index()][category.index()];
-            classified_operation_count = classified_operation_count.saturating_add(
-                totals
-                    .operation_count
-                    .saturating_sub(totals.baseline_statement_count),
-            );
+            classified_operation_count =
+                classified_operation_count.saturating_add(totals.operation_count);
             baseline_statement_count =
                 baseline_statement_count.saturating_add(totals.baseline_statement_count);
             abandoned_count = abandoned_count.saturating_add(
                 report.outcomes[access.index()][category.index()][SqliteOutcome::Abandoned.index()],
             );
             if category == SqliteWorkloadCategory::Other {
-                other_operation_count = other_operation_count.saturating_add(
-                    totals
-                        .operation_count
-                        .saturating_sub(totals.baseline_statement_count),
-                );
+                other_operation_count =
+                    other_operation_count.saturating_add(totals.operation_count);
             }
         }
     }
@@ -1498,6 +1494,14 @@ mod tests {
     use phoenix_core::domain::db_schema::ConvMode;
     use phoenix_core::domain::db_schema::NonEmptyString;
     use std::fs;
+
+    #[test]
+    fn empty_sqlite_wait_summary_is_unavailable_without_dividing() {
+        let summary = wait_summary(&[0; crate::db::SqliteLatencyBin::ALL.len()], 0);
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.avg_ms, None);
+        assert_eq!(summary.p50_upper_bound_ms, None);
+    }
 
     fn loc(path: PathBuf, mode: MeasureMode) -> DiskLocation {
         DiskLocation {

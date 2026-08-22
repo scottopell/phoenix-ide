@@ -476,7 +476,7 @@ function SqliteDiagnostics({
                   <tr>
                     <th>Category</th>
                     <th>Writes</th>
-                    <th>Tx envelope %</th>
+                    <th>Writer occupancy</th>
                     <th>Pool / admission wait</th>
                     <th>Retries</th>
                     <th>Failures</th>

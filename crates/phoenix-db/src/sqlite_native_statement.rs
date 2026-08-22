@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
 
-const TRACE_MASK: u32 = (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as u32;
+const TRACE_MASK: u32 = ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE;
 const CONTEXT_FUNCTION_NAME: &str = "__phoenix_native_statement_context";
 const MAIN_DB_NAME: &[u8] = b"main\0";
 const STATEMENT_CACHE_SIZE: usize = 256;
@@ -296,7 +296,7 @@ unsafe extern "C" fn profile_callback(
     let statement = statement.cast::<ffi::sqlite3_stmt>();
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
-    if trace == ffi::SQLITE_TRACE_STMT as u32 {
+    if trace == ffi::SQLITE_TRACE_STMT {
         let _category = context
             .lookup_statement_category(statement_identity)
             .unwrap_or_else(|| context.take_prepare_category_for_statement(statement_identity));
@@ -305,7 +305,7 @@ unsafe extern "C" fn profile_callback(
         }
         return 0;
     }
-    if trace != ffi::SQLITE_TRACE_PROFILE as u32 || elapsed_nanos.is_null() {
+    if trace != ffi::SQLITE_TRACE_PROFILE || elapsed_nanos.is_null() {
         return 0;
     }
     let nanos = unsafe { *(elapsed_nanos.cast::<ffi::sqlite3_int64>()) };
@@ -883,6 +883,7 @@ mod tests {
         let holder_clone = holder.clone();
         let holder_task = tokio::spawn(async move {
             started_tx.send(()).ok();
+            // test-timing-allow: elapsed writer occupancy is the behavior under test
             sleep(Duration::from_millis(25)).await;
             let _ = release_rx.await;
             sqlx::query("ROLLBACK")
@@ -898,7 +899,7 @@ mod tests {
             .unwrap_err();
         let code = err
             .as_database_error()
-            .and_then(|db| db.code())
+            .and_then(sqlx::error::DatabaseError::code)
             .and_then(|code| code.parse::<i32>().ok())
             .unwrap_or_default();
         assert_eq!(code & 0xff, ffi::SQLITE_BUSY);
@@ -936,18 +937,27 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
+        let mut connection = pool.acquire().await.unwrap();
         sqlx::query("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
-            .execute(&pool)
+            .execute(&mut *connection)
             .await
             .unwrap();
-        sqlx::query("BEGIN DEFERRED").execute(&pool).await.unwrap();
+        sqlx::query("BEGIN DEFERRED")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(10)).await;
         sqlx::query("INSERT INTO messages (body) VALUES ('deferred')")
-            .execute(&pool)
+            .execute(&mut *connection)
             .await
             .unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(10)).await;
-        sqlx::query("COMMIT").execute(&pool).await.unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
 
         let report = report_now(&collector);
         let totals = category_totals(
@@ -1017,11 +1027,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(5)).await;
         sqlx::query("INSERT INTO message_fts (body) VALUES ('fts')")
             .execute(&pool)
             .await
             .unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(5)).await;
         sqlx::query("COMMIT").execute(&pool).await.unwrap();
         let report = report_now(&collector);
@@ -1055,11 +1067,13 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("BEGIN IMMEDIATE").execute(&pool).await.unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(20)).await;
         sqlx::query("INSERT INTO messages (body) VALUES ('bounded')")
             .execute(&pool)
             .await
             .unwrap();
+        // test-timing-allow: elapsed writer occupancy is the behavior under test
         sleep(Duration::from_millis(20)).await;
         sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
 
