@@ -455,13 +455,24 @@ export function WorkControlBar({
 
         {fallbackPanel !== 'info' && (disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
           {cleanupBlockedByAmbiguity && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
-            <button
-              type="button"
-              className="mobile-pr-action mobile-pr-action--hero"
-              onClick={requestActivePrSelectorOpen}
-            >
-              Select active PR
-            </button>
+            actionablePrs.length > 0 ? (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                onClick={requestActivePrSelectorOpen}
+              >
+                Select active PR
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                aria-label="Review workspace changes"
+                onClick={() => openDiffFullscreen('workspace')}
+              >
+                Review changes
+              </button>
+            )
           )}
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
