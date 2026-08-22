@@ -198,6 +198,8 @@ export function WorkControlBar({
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
       const dismissedPanel = fallbackPanel;
       setFallbackPanel(null);
       if (dismissedPanel === 'info') fallbackInfoButtonRef.current?.focus();
@@ -254,6 +256,19 @@ export function WorkControlBar({
   });
 
   const isBranch = convModeLabel === 'Branch';
+  const fallbackHasOverflowActions = !cleanupBlockedByAmbiguity && (
+    (disposition.showCleanUp && disposition.primary !== 'clean_up')
+    || (disposition.showAbandon && disposition.primary !== 'abandon')
+  );
+
+  useEffect(() => {
+    if (!usesCompactLayout || canRepresentActiveSelection) {
+      setFallbackPanel(null);
+      return;
+    }
+    if (!fallbackHasOverflowActions && fallbackPanel === 'menu') setFallbackPanel(null);
+  }, [canRepresentActiveSelection, fallbackHasOverflowActions, fallbackPanel, usesCompactLayout]);
+
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
@@ -391,11 +406,6 @@ export function WorkControlBar({
       disposition.showCleanUp ? cleanUpHintText(isBranch) : null,
       disposition.showAbandon ? abandonHintText(isBranch) : null,
     ].filter((item): item is string => item !== null);
-    const hasOverflowActions = !cleanupBlockedByAmbiguity && (
-      (disposition.showCleanUp && disposition.primary !== 'clean_up')
-      || (disposition.showAbandon && disposition.primary !== 'abandon')
-    );
-
     const closeFallbackPanel = () => setFallbackPanel(null);
 
     return (
@@ -417,7 +427,7 @@ export function WorkControlBar({
           </button>
         </div>
 
-        {(disposition.primary !== 'none' || hasOverflowActions) && <div className="mobile-work-fallback-actions">
+        {(disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}
@@ -467,7 +477,7 @@ export function WorkControlBar({
               {abandoning ? 'Abandoning…' : 'Abandon'}
             </button>
           )}
-          {hasOverflowActions && (
+          {fallbackHasOverflowActions && (
             <button
               ref={fallbackMenuButtonRef}
               type="button"
@@ -491,7 +501,7 @@ export function WorkControlBar({
             ))}
           </div>
         )}
-        {fallbackPanel === 'menu' && (
+        {fallbackPanel === 'menu' && fallbackHasOverflowActions && (
           <div className="mobile-work-fallback-menu" role="menu" aria-label="More work actions">
             {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
               <button

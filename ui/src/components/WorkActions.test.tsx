@@ -1570,12 +1570,16 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
+    const globalEscapeHandler = vi.fn();
+    window.addEventListener('keydown', globalEscapeHandler);
     const trigger = screen.getByRole('button', { name: 'Work status details' });
     fireEvent.click(trigger);
     expect(screen.getByRole('status')).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+    expect(globalEscapeHandler).not.toHaveBeenCalled();
+    window.removeEventListener('keydown', globalEscapeHandler);
   });
 
   it('resets an open fallback panel when the conversation identity changes', () => {
@@ -1596,6 +1600,64 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       </MemoryRouter>,
     );
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
+  it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
+    enableMobile();
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-stable" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: twoOpenPrSelection(),
+    });
+    rerender(renderBar(railHandle));
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+
+    rerender(renderBar(fallbackHandle));
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
+
+  it('does not render a stale overflow menu after terminal actions disappear', () => {
+    enableMobile();
+    const renderBar = (continuedInConvId: string | null) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-stable"
+            convModeLabel="Work"
+            phaseType="idle"
+            continuedInConvId={continuedInConvId}
+            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(null));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    rerender(renderBar('conv-next'));
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
   it('describes an unrepresentable PR resolve action instead of cleanup', () => {
