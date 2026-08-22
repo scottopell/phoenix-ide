@@ -4,8 +4,10 @@ use crate::sqlite_workload::{
 };
 use libsqlite3_sys as ffi;
 use sqlx::sqlite::SqliteConnection;
-use std::ffi::CString;
-use std::os::raw::{c_int, c_void};
+#[cfg(test)]
+use sqlx::sqlite::SqliteConnectOptions;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,13 +18,29 @@ use std::sync::Arc;
 
 const TRACE_MASK: u32 = (ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_PROFILE) as u32;
 const CONTEXT_FUNCTION_NAME: &str = "__phoenix_native_statement_context";
+const STATEMENT_CACHE_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct NativeStatementCallbackContext {
     collector: SqliteWorkloadCollector,
     active_read_concurrency: u32,
+    prepare_category: SqliteWorkloadCategory,
+    statement_categories: [CachedStatementCategory; STATEMENT_CACHE_SIZE],
     #[cfg(test)]
     drop_counter: Option<Arc<AtomicUsize>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedStatementCategory {
+    statement_identity: usize,
+    category: SqliteWorkloadCategory,
+}
+
+impl CachedStatementCategory {
+    const EMPTY: Self = Self {
+        statement_identity: 0,
+        category: SqliteWorkloadCategory::Other,
+    };
 }
 
 impl NativeStatementCallbackContext {
@@ -30,6 +48,8 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
+            prepare_category: SqliteWorkloadCategory::Other,
+            statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
             #[cfg(test)]
             drop_counter: None,
         }
@@ -43,8 +63,57 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
+            prepare_category: SqliteWorkloadCategory::Other,
+            statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
             drop_counter: Some(drop_counter),
         }
+    }
+
+    fn reset_prepare_state(&mut self) {
+        self.prepare_category = SqliteWorkloadCategory::Other;
+    }
+
+    fn note_prepare_category(&mut self, category: SqliteWorkloadCategory) {
+        self.prepare_category = category_precedence(self.prepare_category, category);
+    }
+
+    fn cache_statement_category(
+        &mut self,
+        statement_identity: usize,
+        category: SqliteWorkloadCategory,
+    ) {
+        let slot = statement_cache_slot(statement_identity);
+        let entry = &mut self.statement_categories[slot];
+        if entry.statement_identity == 0 || entry.statement_identity == statement_identity {
+            *entry = CachedStatementCategory {
+                statement_identity,
+                category,
+            };
+        } else {
+            *entry = CachedStatementCategory {
+                statement_identity,
+                category: SqliteWorkloadCategory::Other,
+            };
+            self.collector.record_classification_gap();
+        }
+    }
+
+    fn lookup_statement_category(
+        &self,
+        statement_identity: usize,
+    ) -> Option<SqliteWorkloadCategory> {
+        let entry = self.statement_categories[statement_cache_slot(statement_identity)];
+        (entry.statement_identity == statement_identity).then_some(entry.category)
+    }
+
+    fn take_prepare_category_for_statement(
+        &mut self,
+        statement_identity: usize,
+    ) -> SqliteWorkloadCategory {
+        let category = self.prepare_category;
+        self.reset_prepare_state();
+        self.cache_statement_category(statement_identity, category);
+        category
     }
 }
 
@@ -107,10 +176,32 @@ async fn install_native_statement_baseline_with_context(
             "sqlite3_create_function_v2 failed: {create_rc}"
         )));
     }
+    let authorizer_rc =
+        unsafe { ffi::sqlite3_set_authorizer(db, Some(authorizer_callback), context.cast()) };
+    if authorizer_rc != ffi::SQLITE_OK {
+        unsafe {
+            ffi::sqlite3_create_function_v2(
+                db,
+                name.as_ptr(),
+                0,
+                ffi::SQLITE_UTF8,
+                ptr::null_mut(),
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        return Err(sqlx::Error::Protocol(format!(
+            "sqlite3_set_authorizer failed: {authorizer_rc}"
+        )));
+    }
     let trace_rc =
         unsafe { ffi::sqlite3_trace_v2(db, TRACE_MASK, Some(profile_callback), context.cast()) };
     if trace_rc != ffi::SQLITE_OK {
         unsafe {
+            ffi::sqlite3_trace_v2(db, 0, None, ptr::null_mut());
+            ffi::sqlite3_set_authorizer(db, None, ptr::null_mut());
             ffi::sqlite3_create_function_v2(
                 db,
                 name.as_ptr(),
@@ -130,6 +221,28 @@ async fn install_native_statement_baseline_with_context(
     Ok(())
 }
 
+unsafe extern "C" fn authorizer_callback(
+    context: *mut c_void,
+    action_code: c_int,
+    arg1: *const c_char,
+    _arg2: *const c_char,
+    _db_name: *const c_char,
+    _trigger_or_view: *const c_char,
+) -> c_int {
+    if context.is_null() {
+        return ffi::SQLITE_OK;
+    }
+    let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
+    if action_code == ffi::SQLITE_SELECT {
+        context.reset_prepare_state();
+        return ffi::SQLITE_OK;
+    }
+    if let Some(category) = classify_authorizer_action(action_code, arg1) {
+        context.note_prepare_category(category);
+    }
+    ffi::SQLITE_OK
+}
+
 unsafe extern "C" fn profile_callback(
     trace: u32,
     context: *mut c_void,
@@ -140,8 +253,13 @@ unsafe extern "C" fn profile_callback(
         return 0;
     }
     let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
-    let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement.cast()) } == 1;
+    let statement = statement.cast::<ffi::sqlite3_stmt>();
+    let statement_identity = statement as usize;
+    let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT as u32 {
+        let _ = context
+            .lookup_statement_category(statement_identity)
+            .unwrap_or_else(|| context.take_prepare_category_for_statement(statement_identity));
         if readonly {
             context.active_read_concurrency = context.collector.begin_native_read();
         }
@@ -158,7 +276,7 @@ unsafe extern "C" fn profile_callback(
         SqliteAccessKind::Write
     };
     let read_connection_time = if readonly { latency } else { Duration::ZERO };
-    let db = unsafe { ffi::sqlite3_db_handle(statement.cast()) };
+    let db = unsafe { ffi::sqlite3_db_handle(statement) };
     let primary_code = if db.is_null() {
         ffi::SQLITE_ERROR
     } else {
@@ -177,7 +295,9 @@ unsafe extern "C" fn profile_callback(
     }
     let observation = SqliteObservation {
         completed_at_unix_micros: unix_now_micros(),
-        category: SqliteWorkloadCategory::Other,
+        category: context
+            .lookup_statement_category(statement_identity)
+            .unwrap_or(SqliteWorkloadCategory::Other),
         access,
         outcome,
         latency,
@@ -193,6 +313,156 @@ unsafe extern "C" fn profile_callback(
     };
     context.collector.record(observation);
     0
+}
+
+fn statement_cache_slot(statement_identity: usize) -> usize {
+    (statement_identity >> 3) & (STATEMENT_CACHE_SIZE - 1)
+}
+
+fn classify_authorizer_action(
+    action_code: c_int,
+    object_name: *const c_char,
+) -> Option<SqliteWorkloadCategory> {
+    match action_code {
+        ffi::SQLITE_READ | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE => {
+            Some(classify_schema_object(object_name))
+        }
+        ffi::SQLITE_TRANSACTION
+        | ffi::SQLITE_SAVEPOINT
+        | ffi::SQLITE_PRAGMA
+        | ffi::SQLITE_ANALYZE
+        | ffi::SQLITE_ATTACH
+        | ffi::SQLITE_DETACH
+        | ffi::SQLITE_ALTER_TABLE
+        | ffi::SQLITE_REINDEX
+        | ffi::SQLITE_CREATE_TABLE
+        | ffi::SQLITE_CREATE_INDEX
+        | ffi::SQLITE_CREATE_TRIGGER
+        | ffi::SQLITE_CREATE_VIEW
+        | ffi::SQLITE_CREATE_VTABLE
+        | ffi::SQLITE_DROP_TABLE
+        | ffi::SQLITE_DROP_INDEX
+        | ffi::SQLITE_DROP_TRIGGER
+        | ffi::SQLITE_DROP_VIEW
+        | ffi::SQLITE_DROP_VTABLE => Some(SqliteWorkloadCategory::Maintenance),
+        _ => None,
+    }
+}
+
+fn classify_schema_object(object_name: *const c_char) -> SqliteWorkloadCategory {
+    if object_name.is_null() {
+        return SqliteWorkloadCategory::Other;
+    }
+    let Ok(name) = (unsafe { CStr::from_ptr(object_name) }).to_str() else {
+        return SqliteWorkloadCategory::Other;
+    };
+    if is_fts_name(name) {
+        return SqliteWorkloadCategory::Fts;
+    }
+    if is_message_persistence_name(name) {
+        return SqliteWorkloadCategory::MessagePersistence;
+    }
+    if is_workflow_name(name) {
+        return SqliteWorkloadCategory::DurableWorkflows;
+    }
+    if is_runtime_state_name(name) {
+        return SqliteWorkloadCategory::RuntimeState;
+    }
+    if is_pr_project_name(name) {
+        return SqliteWorkloadCategory::PrProjectData;
+    }
+    if is_maintenance_name(name) {
+        return SqliteWorkloadCategory::Maintenance;
+    }
+    SqliteWorkloadCategory::Other
+}
+
+fn is_fts_name(name: &str) -> bool {
+    name == "message_fts"
+        || name == "message_fts_data"
+        || name == "message_fts_idx"
+        || name == "message_fts_docsize"
+        || name == "message_fts_config"
+        || name == "message_fts_rows"
+        || name.starts_with("idx_message_fts_")
+}
+
+fn is_message_persistence_name(name: &str) -> bool {
+    matches!(
+        name,
+        "messages"
+            | "message_files"
+            | "message_images"
+            | "steering_messages"
+            | "steering_acceptance_receipts"
+            | "steering_message_files"
+            | "steering_message_images"
+            | "turn_usage"
+            | "llm_request_metrics"
+    )
+}
+
+fn is_workflow_name(name: &str) -> bool {
+    name == "workflows"
+        || name.starts_with("workflow_")
+        || name.starts_with("wake_")
+        || name.starts_with("direct_turn_")
+}
+
+fn is_runtime_state_name(name: &str) -> bool {
+    name == "conversations"
+        || name.starts_with("conversation_creation_")
+        || name == "continuation_dispatch_intents"
+        || name == "startup_parent_actions"
+        || name == "fork_proposals"
+        || name == "chain_qa"
+        || name == "share_tokens"
+        || name == "auth_sessions"
+        || name == "mcp_disabled_servers"
+        || name == "mcp_oauth_tokens"
+        || name == "sub_agent_personas"
+        || name == "notification_settings"
+        || name == "app_settings"
+}
+
+fn is_pr_project_name(name: &str) -> bool {
+    name == "projects"
+        || name == "git_repositories"
+        || name.starts_with("git_repository_")
+        || name == "work_scopes"
+        || name.starts_with("work_scope_")
+}
+
+fn is_maintenance_name(name: &str) -> bool {
+    name == "sqlite_schema"
+        || name == "sqlite_master"
+        || name == "sqlite_temp_schema"
+        || name == "sqlite_temp_master"
+        || name == "_sqlx_migrations"
+        || name == "sqlite_sequence"
+}
+
+fn category_precedence(
+    current: SqliteWorkloadCategory,
+    incoming: SqliteWorkloadCategory,
+) -> SqliteWorkloadCategory {
+    if category_rank(incoming) < category_rank(current) {
+        incoming
+    } else {
+        current
+    }
+}
+
+const fn category_rank(category: SqliteWorkloadCategory) -> u8 {
+    match category {
+        SqliteWorkloadCategory::Fts => 0,
+        SqliteWorkloadCategory::MessagePersistence => 1,
+        SqliteWorkloadCategory::DurableWorkflows => 2,
+        SqliteWorkloadCategory::RuntimeState => 3,
+        SqliteWorkloadCategory::PrProjectData => 4,
+        SqliteWorkloadCategory::Maintenance => 5,
+        SqliteWorkloadCategory::Other => 6,
+    }
 }
 
 unsafe extern "C" fn noop_function(
@@ -222,17 +492,21 @@ fn unix_now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SqliteSnapshotWindow, SqliteWorkloadAggregateReport};
-    use sqlx::sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    };
+    use crate::{Database, SqliteSnapshotWindow, SqliteWorkloadAggregateReport};
+    use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+    use sqlx::{Connection, Execute, Executor, Statement};
     use std::str::FromStr;
 
-    fn other_totals(
+    fn category_totals(
         report: &SqliteWorkloadAggregateReport,
         access: SqliteAccessKind,
+        category: SqliteWorkloadCategory,
     ) -> crate::BucketCategoryTotals {
-        report.totals[access.index()][SqliteWorkloadCategory::Other.index()]
+        report.totals[access.index()][category.index()]
+    }
+
+    fn report_now(collector: &SqliteWorkloadCollector) -> SqliteWorkloadAggregateReport {
+        collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros())
     }
 
     #[tokio::test]
@@ -271,16 +545,33 @@ mod tests {
             .await
             .unwrap();
 
-        let report = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
-        let writes = other_totals(&report, SqliteAccessKind::Write);
-        let reads = other_totals(&report, SqliteAccessKind::Read);
+        let report = report_now(&collector);
+        let writes = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::Maintenance,
+        );
+        let other_writes = category_totals(
+            &report,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCategory::Other,
+        );
+        let reads = category_totals(
+            &report,
+            SqliteAccessKind::Read,
+            SqliteWorkloadCategory::Other,
+        );
         assert!(
-            writes.baseline_statement_count >= 2,
-            "expected create + insert baseline writes, got {writes:?}"
+            writes.baseline_statement_count >= 1,
+            "expected create baseline write"
+        );
+        assert!(
+            other_writes.baseline_statement_count >= 1,
+            "expected insert write"
         );
         assert!(
             reads.baseline_statement_count >= 1,
-            "expected select baseline read, got {reads:?}"
+            "expected select baseline read"
         );
         assert_eq!(writes.writer_held_micros, 0);
         assert_eq!(writes.write_admission_wait_micros, 0);
@@ -319,6 +610,152 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn classifies_representative_domain_tables() {
+        let db = Database::open_in_memory().await.unwrap();
+        sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES ('m1','c1',1,'user','{}','2026-01-01T00:00:00Z')")
+            .execute(db.pool())
+            .await
+            .unwrap_err();
+        sqlx::query("SELECT COUNT(*) FROM conversations")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('p1','/tmp/p1','main','2026-01-01T00:00:00Z')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (1,'wake',1,1,0,0,0,'Active','wake',1,X'00',1,1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        assert!(
+            category_totals(
+                &report,
+                SqliteAccessKind::Read,
+                SqliteWorkloadCategory::RuntimeState
+            )
+            .operation_count
+                >= 1
+        );
+        assert!(
+            category_totals(
+                &report,
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::PrProjectData
+            )
+            .operation_count
+                >= 1
+        );
+        assert!(
+            category_totals(
+                &report,
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::DurableWorkflows
+            )
+            .operation_count
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_statement_uses_fts_precedence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let _: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
+            "SELECT message_fts.rowid FROM message_fts JOIN message_fts_rows ON message_fts.rowid = message_fts_rows.fts_rowid",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        assert!(
+            category_totals(&report, SqliteAccessKind::Read, SqliteWorkloadCategory::Fts)
+                .operation_count
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_statement_reuse_keeps_category() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut conn, collector.clone())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
+            .await
+            .unwrap();
+        let stmt = conn
+            .prepare(sqlx::query::<sqlx::Sqlite>("SELECT id FROM projects").sql())
+            .await
+            .unwrap();
+        stmt.query().fetch_all(&mut conn).await.unwrap();
+        stmt.query().fetch_all(&mut conn).await.unwrap();
+        let report = report_now(&collector);
+        assert!(
+            category_totals(
+                &report,
+                SqliteAccessKind::Read,
+                SqliteWorkloadCategory::PrProjectData
+            )
+            .operation_count
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_schema_objects_fall_back_to_other() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut conn, collector.clone())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE mystery (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO mystery DEFAULT VALUES")
+            .await
+            .unwrap();
+        let report = report_now(&collector);
+        assert!(
+            category_totals(
+                &report,
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::Other
+            )
+            .operation_count
+                >= 1
+        );
+    }
+
+    #[test]
+    fn bounded_cache_collision_increments_gap_and_degrades_to_other() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        let first = 8usize;
+        let collision = first + (STATEMENT_CACHE_SIZE << 3);
+        context.cache_statement_category(first, SqliteWorkloadCategory::Fts);
+        context.cache_statement_category(collision, SqliteWorkloadCategory::DurableWorkflows);
+
+        assert_eq!(context.lookup_statement_category(first), None);
+        assert_eq!(
+            context.lookup_statement_category(collision),
+            Some(SqliteWorkloadCategory::Other)
+        );
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
     #[test]
     fn source_never_inspects_sql_text_or_expanded_sql() {
         let source = include_str!("sqlite_native_statement.rs");
@@ -326,5 +763,7 @@ mod tests {
         let disallow_expanded_sql = ["sqlite3_", "expanded_sql", "("].concat();
         assert!(!source.contains(&disallow_sql));
         assert!(!source.contains(&disallow_expanded_sql));
+        let forbidden_owned_conversion = ["CString", "::", "from_raw"].concat();
+        assert!(!source.contains(&forbidden_owned_conversion));
     }
 }

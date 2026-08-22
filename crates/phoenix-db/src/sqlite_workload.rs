@@ -222,6 +222,7 @@ pub struct SqliteWorkloadAggregateReport {
     pub process_started_at_unix_micros: u64,
     pub process_uptime_micros: u64,
     pub covered_uptime_micros: u64,
+    pub classification_gap_count: u64,
     pub totals: Box<
         [[BucketCategoryTotals; SqliteWorkloadCategory::ALL.len()]; SqliteAccessKind::ALL.len()],
     >,
@@ -319,6 +320,7 @@ impl SqliteBucket {
 struct InnerCollector {
     process_started_at_unix_micros: u64,
     process_started_at: Instant,
+    classification_gap_count: u64,
     buckets: Box<[SqliteBucket; BUCKET_COUNT]>,
 }
 
@@ -327,6 +329,7 @@ impl Default for InnerCollector {
         Self {
             process_started_at_unix_micros: unix_now_micros(),
             process_started_at: Instant::now(),
+            classification_gap_count: 0,
             buckets: Box::new(std::array::from_fn(|_| SqliteBucket::default())),
         }
     }
@@ -366,6 +369,14 @@ impl SqliteWorkloadCollector {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
                     Some(active.saturating_sub(1))
                 });
+    }
+
+    pub(crate) fn record_classification_gap(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("sqlite workload collector mutex poisoned");
+        inner.classification_gap_count = inner.classification_gap_count.saturating_add(1);
     }
 
     pub fn snapshot(
@@ -441,6 +452,11 @@ impl SqliteWorkloadCollector {
                 }
             }
         }
+        let classification_gap_count = self
+            .inner
+            .lock()
+            .expect("sqlite workload collector mutex poisoned")
+            .classification_gap_count;
         SqliteWorkloadAggregateReport {
             requested_window: snapshot.window,
             bucket_count: snapshot.bucket_count,
@@ -448,6 +464,7 @@ impl SqliteWorkloadCollector {
             process_started_at_unix_micros: snapshot.process_started_at_unix_micros,
             process_uptime_micros: snapshot.process_uptime_micros,
             covered_uptime_micros: snapshot.covered_uptime_micros,
+            classification_gap_count,
             totals,
             outcomes,
             latency_histogram,
