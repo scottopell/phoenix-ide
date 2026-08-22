@@ -1777,13 +1777,44 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
     const { rerender } = render(renderBar(fallbackHandle));
 
-    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    const detailsTrigger = screen.getByRole('button', { name: 'Work status details' });
+    detailsTrigger.focus();
+    fireEvent.click(detailsTrigger);
     expect(screen.getByRole('status')).toBeInTheDocument();
     rerender(renderBar(railHandle));
 
     const activeChip = screen.getByRole('button', { name: /#12/ });
     await waitFor(() => expect(activeChip).toHaveFocus());
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('does not steal unrelated focus when a background refresh replaces the fallback', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: twoOpenPrSelection(),
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <input aria-label="Composer" />
+          <WorkControlBar conversationId="conv-no-focus-steal" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const composer = screen.getByRole('textbox', { name: 'Composer' });
+    composer.focus();
+    rerender(renderBar(railHandle));
+
+    await waitFor(() => expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument());
+    expect(composer).toHaveFocus();
   });
 
   it('does not render a stale overflow menu after terminal actions disappear', () => {
@@ -2089,7 +2120,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-resolve--primary');
+    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');
   });
 
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {

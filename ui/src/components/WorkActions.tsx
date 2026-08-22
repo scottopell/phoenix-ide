@@ -197,6 +197,7 @@ export function WorkControlBar({
   const fallbackInfoButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackWasVisibleRef = useRef(false);
+  const fallbackOwnedFocusRef = useRef(false);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
@@ -299,15 +300,26 @@ export function WorkControlBar({
     if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) setFallbackPanel(null);
   }, [canRepresentActiveSelection, disposition.visible, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
 
+  const fallbackVisible = disposition.visible && usesCompactLayout && !canRepresentActiveSelection;
+
   useEffect(() => {
-    const fallbackVisible = disposition.visible && usesCompactLayout && !canRepresentActiveSelection;
-    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection) {
+    if (!fallbackVisible) return;
+    const trackFocus = (event: FocusEvent) => {
+      fallbackOwnedFocusRef.current = fallbackDockRef.current?.contains(event.target as Node) ?? false;
+    };
+    document.addEventListener('focusin', trackFocus);
+    return () => document.removeEventListener('focusin', trackFocus);
+  }, [fallbackVisible]);
+
+  useEffect(() => {
+    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection && fallbackOwnedFocusRef.current) {
       requestAnimationFrame(() => {
         document.querySelector<HTMLElement>('.mobile-pr-chip--active')?.focus();
       });
     }
+    if (!fallbackVisible) fallbackOwnedFocusRef.current = false;
     fallbackWasVisibleRef.current = fallbackVisible;
-  }, [canRepresentActiveSelection, disposition.visible, usesCompactLayout]);
+  }, [canRepresentActiveSelection, fallbackVisible]);
 
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
@@ -836,7 +848,7 @@ export function WorkControlBar({
         {explicitSelectionUnresolved && (
           <button
             type="button"
-            className="work-actions-btn work-actions-resolve work-actions-resolve--primary"
+            className="work-actions-btn work-actions-resolve work-actions-btn--primary"
             disabled={!prStatusHandle.resumeInference}
             onClick={() => void resumePrInference()}
           >
