@@ -101,8 +101,15 @@ WHEN a desktop conversation has fewer than two actionable associated PRs, its ac
 represented by the PR-selector rail, or PR metadata is still loading
 THE SYSTEM SHALL preserve the StateBar active-PR selector fallback and present the derived Work
 Actions verbs in one thin, horizontally scrollable rail. The system SHALL NOT render a larger
-intermediate action bar while PR metadata loads. Loading, single-PR, terminal-PR, and no-PR states
-SHALL use the same compact rail geometry so metadata refresh does not cause a large layout shift.
+intermediate action bar while PR metadata loads. Loading and single-PR states SHALL use the same
+compact rail geometry so metadata refresh does not cause a large layout shift.
+
+WHEN a mobile conversation has no actionable associated PR that the PR rail can represent
+THE SYSTEM SHALL present a compact fallback dock with a concise status row above one action row.
+The action row SHALL keep the disposition's primary verb directly available and MAY place
+non-primary terminal verbs in an overflow menu. Full disposition guidance and terminal intent
+SHALL remain available through a touch- and keyboard-operable disclosure. The collapsed dock SHALL
+bound status text to one line and SHALL NOT render full guidance as a wrapping sibling of its actions.
 
 WHEN the user activates a PR in the rail
 THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action

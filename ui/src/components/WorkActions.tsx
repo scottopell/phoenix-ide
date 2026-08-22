@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
+import type { PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
+import type { WorkDisposition } from './workDisposition';
 import { derivePrRailAvailability } from './prRailAvailability';
 import { prReviewState } from './prReviewState';
 import { useIsCompactLayout } from '../hooks';
@@ -99,6 +101,56 @@ function abandonHintText(isBranch: boolean): string {
     : 'Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation.';
 }
 
+type CompactFallbackStatus = {
+  icon: '⚠' | '✓' | '…';
+  label: string;
+  tone: 'attention' | 'success' | 'muted';
+};
+
+function compactFallbackStatus(
+  disposition: WorkDisposition,
+  prStatus: PrStatusResponse | null,
+): CompactFallbackStatus {
+  if (disposition.note?.kind === 'continued') return { icon: '✓', label: 'Continued elsewhere', tone: 'muted' };
+  if (disposition.note?.kind === 'checking') return { icon: '…', label: 'Checking PR', tone: 'muted' };
+  if (disposition.note?.kind === 'pr_closed') return { icon: '⚠', label: 'PR closed', tone: 'attention' };
+  if (disposition.note?.kind === 'pr_open_stuck') return { icon: '⚠', label: 'PR still open', tone: 'attention' };
+  if (disposition.note?.kind === 'gh_unavailable') return { icon: '⚠', label: 'GitHub unavailable', tone: 'attention' };
+
+  if (prStatus?.display_state === 'merged') return { icon: '✓', label: 'PR merged', tone: 'success' };
+
+  switch (prStatus?.work_change?.kind) {
+    case 'dirty_needs_review': {
+      const labels: Record<typeof prStatus.work_change.reason, string> = {
+        uncommitted_changes: 'Uncommitted changes',
+        branch_not_pushed: 'Branch not pushed',
+        local_ahead_of_remote: 'Unpushed commits',
+        remote_diverged: 'Branch diverged',
+        non_github_remote: 'Non-GitHub remote',
+        unknown_remote: 'Remote status unknown',
+        unknown: 'Changes need review',
+      };
+      return { icon: '⚠', label: labels[prStatus.work_change.reason], tone: 'attention' };
+    }
+    case 'dirty_pr_ready':
+      return { icon: '✓', label: 'Ready to open PR', tone: 'success' };
+    case 'unavailable':
+      return { icon: '⚠', label: 'Work status unavailable', tone: 'attention' };
+    case 'loading':
+      return { icon: '…', label: 'Checking changes', tone: 'muted' };
+    case 'clean':
+      return { icon: '✓', label: 'Workspace ready', tone: 'success' };
+    case undefined:
+      break;
+  }
+
+  if (disposition.resolve?.kind === 'address_feedback') {
+    return { icon: '⚠', label: 'PR feedback ready', tone: 'attention' };
+  }
+  if (disposition.primary === 'abandon') return { icon: '⚠', label: 'Cleanup required', tone: 'attention' };
+  return { icon: '✓', label: 'Workspace ready', tone: 'success' };
+}
+
 function PrReviewStateIndicator({ feedbackStatus }: { feedbackStatus: 'open' | 'in_progress' | 'approved' | null }) {
   const reviewState = prReviewState(feedbackStatus);
   if (!reviewState) return null;
@@ -126,9 +178,32 @@ export function WorkControlBar({
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [expandedPrIdentity, setExpandedPrIdentity] = useState<string | null>(null);
   const [savingPrIdentity, setSavingPrIdentity] = useState<string | null>(null);
+  const [fallbackPanel, setFallbackPanel] = useState<'info' | 'menu' | null>(null);
+  const fallbackDockRef = useRef<HTMLDivElement>(null);
+  const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
+
+  useEffect(() => {
+    if (!fallbackPanel) return;
+
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!fallbackDockRef.current?.contains(event.target as Node)) setFallbackPanel(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setFallbackPanel(null);
+      fallbackMenuButtonRef.current?.focus();
+    };
+
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [fallbackPanel]);
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
@@ -292,8 +367,39 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
-      return (
-        <div className="mobile-work-fallback" data-testid="mobile-work-fallback">
+    const status = compactFallbackStatus(disposition, prStatus);
+    const infoText = disposition.note?.text
+      ?? (disposition.resolve?.kind === 'address_feedback'
+        ? `Review and address feedback on ${activePrLabel}.`
+        : disposition.primary === 'abandon'
+          ? abandonHintText(isBranch)
+          : cleanUpHintText(isBranch));
+    const hasOverflowActions = !cleanupBlockedByAmbiguity && (
+      (disposition.showCleanUp && disposition.primary !== 'clean_up')
+      || (disposition.showAbandon && disposition.primary !== 'abandon')
+    );
+
+    const closeFallbackPanel = () => setFallbackPanel(null);
+
+    return (
+      <div ref={fallbackDockRef} className="mobile-work-fallback" data-testid="mobile-work-fallback">
+        <div className="mobile-work-fallback-status">
+          <span className={`mobile-work-fallback-status-copy mobile-work-fallback-status-copy--${status.tone}`}>
+            <span aria-hidden="true">{status.icon}</span>
+            <span>{status.label}</span>
+          </span>
+          <button
+            type="button"
+            className="mobile-work-fallback-info-button"
+            aria-label="Work status details"
+            aria-expanded={fallbackPanel === 'info'}
+            onClick={() => setFallbackPanel((panel) => panel === 'info' ? null : 'info')}
+          >
+            ⓘ
+          </button>
+        </div>
+
+        {(disposition.primary !== 'none' || hasOverflowActions) && <div className="mobile-work-fallback-actions">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}
@@ -310,38 +416,98 @@ export function WorkControlBar({
             </button>
           )}
           {disposition.primary === 'review' && (
-            <button type="button" className="mobile-pr-action mobile-pr-action--hero" onClick={() => openDiffFullscreen('workspace')}>
-              Review workspace changes
-            </button>
-          )}
-          {disposition.showCleanUp && !cleanupBlockedByAmbiguity && (
             <button
               type="button"
-              className={`mobile-pr-action mobile-pr-action--cleanup${disposition.primary === 'clean_up' ? ' mobile-pr-action--hero' : ''}`}
+              className="mobile-pr-action mobile-pr-action--hero"
+              aria-label="Review workspace changes"
+              onClick={() => openDiffFullscreen('workspace')}
+            >
+              Review changes
+            </button>
+          )}
+          {disposition.primary === 'clean_up' && !cleanupBlockedByAmbiguity && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--cleanup mobile-pr-action--hero"
               aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
               title={cleanUpHintText(isBranch)}
               disabled={isLoading}
               onClick={handleCleanUp}
             >
-              Clean up
+              {markingMerged ? 'Cleaning…' : 'Clean up'}
             </button>
           )}
-          {disposition.showAbandon && !cleanupBlockedByAmbiguity && (
+          {disposition.primary === 'abandon' && !cleanupBlockedByAmbiguity && (
             <button
               type="button"
-              className={`mobile-pr-action mobile-pr-action--danger${disposition.primary === 'abandon' ? ' mobile-pr-action--hero' : ''}`}
+              className="mobile-pr-action mobile-pr-action--danger mobile-pr-action--hero"
               aria-label={`Abandon. ${abandonHintText(isBranch)}`}
               title={abandonHintText(isBranch)}
               disabled={isLoading}
               onClick={handleAbandon}
             >
-              Abandon
+              {abandoning ? 'Abandoning…' : 'Abandon'}
             </button>
           )}
-          {disposition.note && <span className="work-actions-note">{disposition.note.text}</span>}
-          {error && <div className="work-actions-error" role="alert">{error}</div>}
-        </div>
-      );
+          {hasOverflowActions && (
+            <button
+              ref={fallbackMenuButtonRef}
+              type="button"
+              className="mobile-work-fallback-menu-button"
+              aria-label="More work actions"
+              aria-haspopup="menu"
+              aria-expanded={fallbackPanel === 'menu'}
+              onClick={() => setFallbackPanel((panel) => panel === 'menu' ? null : 'menu')}
+            >
+              •••
+            </button>
+          )}
+        </div>}
+
+        {fallbackPanel === 'info' && (
+          <div className="mobile-work-fallback-panel" role="status">
+            {infoText}
+          </div>
+        )}
+        {fallbackPanel === 'menu' && (
+          <div className="mobile-work-fallback-menu" role="menu" aria-label="More work actions">
+            {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--cleanup"
+                role="menuitem"
+                disabled={isLoading}
+                aria-label={`Clean up. ${cleanUpHintText(isBranch)}`}
+                title={cleanUpHintText(isBranch)}
+                onClick={() => {
+                  closeFallbackPanel();
+                  void handleCleanUp();
+                }}
+              >
+                Clean up
+              </button>
+            )}
+            {disposition.showAbandon && disposition.primary !== 'abandon' && !cleanupBlockedByAmbiguity && (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--danger"
+                role="menuitem"
+                aria-label={`Abandon. ${abandonHintText(isBranch)}`}
+                title={abandonHintText(isBranch)}
+                disabled={isLoading}
+                onClick={() => {
+                  closeFallbackPanel();
+                  void handleAbandon();
+                }}
+              >
+                Abandon
+              </button>
+            )}
+          </div>
+        )}
+        {error && <div className="work-actions-error mobile-work-fallback-error" role="alert">{error}</div>}
+      </div>
+    );
   }
 
   if (shouldRenderPrRail) {

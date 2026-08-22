@@ -17,6 +17,11 @@ export function WorkActionsFixture({ scenario }: Props) {
     refresh: async () => undefined,
     refreshForSafety: async () => undefined,
     refreshAfterMutation: async () => undefined,
+    activeSelection: null,
+    activePrSummary: null,
+    ambiguous: false,
+    pinActivePr: async () => undefined,
+    resumeInference: async () => undefined,
   };
 
   return (

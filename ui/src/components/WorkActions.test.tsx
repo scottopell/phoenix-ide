@@ -1511,6 +1511,51 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
+  it('keeps dirty no-PR guidance compact and discloses secondary actions', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: false,
+      work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+      selection: { associated_prs: [] },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-dirty" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    const dock = screen.getByTestId('mobile-work-fallback');
+    expect(dock).toHaveTextContent('Uncommitted changes');
+    expect(screen.getByRole('button', { name: 'Review workspace changes' })).toHaveTextContent('Review changes');
+    expect(screen.queryByText(/Review, commit, and push/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toHaveTextContent('Review, commit, and push before opening a PR.');
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /^Abandon\./ })).toBeInTheDocument();
+  });
+
+  it('closes the fallback overflow with Escape and returns focus to its trigger', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-menu"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: 'More work actions' });
+    fireEvent.click(trigger);
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {
     enableMobile();
     const handle = prStatusHandle({
@@ -1642,6 +1687,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
   });
 
   it('lets a pinned mobile selection resume automatic inference', async () => {
