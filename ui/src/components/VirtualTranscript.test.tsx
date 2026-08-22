@@ -1,7 +1,7 @@
 import { type ReactElement } from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
+import { GESTURE_STALE_MS, VirtualTranscript, type VirtualTranscriptHandle, type VirtualTranscriptPhysicalSnapshot } from './VirtualTranscript';
 
 interface TestItem {
   id: string;
@@ -400,7 +400,7 @@ describe('VirtualTranscript', () => {
 
       act(() => ref.current?.scrollToIndex(20, 'start'));
       act(() => {
-        fireEvent.pointerDown(scroller!, { pointerId: 1, pointerType: 'touch' });
+        fireEvent.touchStart(scroller!, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
         scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
@@ -416,7 +416,7 @@ describe('VirtualTranscript', () => {
       expect(scrollTopOf(scroller)).toBe(395);
 
       act(() => {
-        fireEvent.pointerUp(window, { pointerId: 1, pointerType: 'touch' });
+        fireEvent.touchEnd(scroller!, { touches: [], changedTouches: [{ identifier: 1 }] });
       });
       act(() => {
         vi.advanceTimersByTime(400);
@@ -452,8 +452,11 @@ describe('VirtualTranscript', () => {
       const rowA = document.querySelector<HTMLElement>('[data-virtual-key="item-18"]')!;
       const rowB = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
       act(() => {
-        fireEvent.pointerDown(rowA, { pointerId: 1, pointerType: 'touch' });
-        fireEvent.pointerDown(rowB, { pointerId: 2, pointerType: 'touch' });
+        fireEvent.touchStart(rowA, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+        fireEvent.touchStart(rowB, {
+          touches: [{ identifier: 1 }, { identifier: 2 }],
+          changedTouches: [{ identifier: 2 }],
+        });
         scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
@@ -464,7 +467,7 @@ describe('VirtualTranscript', () => {
       // First finger lifts; the second is still down, so the gesture is not
       // over and reconciliation must stay deferred.
       act(() => {
-        fireEvent.pointerUp(window, { pointerId: 1, pointerType: 'touch' });
+        fireEvent.touchEnd(rowA, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 1 }] });
       });
       act(() => {
         vi.advanceTimersByTime(1000);
@@ -472,7 +475,7 @@ describe('VirtualTranscript', () => {
       expect(scrollTopOf(scroller)).toBe(395);
 
       act(() => {
-        fireEvent.pointerUp(window, { pointerId: 2, pointerType: 'touch' });
+        fireEvent.touchEnd(rowB, { touches: [], changedTouches: [{ identifier: 2 }] });
       });
       act(() => {
         vi.advanceTimersByTime(400);
@@ -483,7 +486,7 @@ describe('VirtualTranscript', () => {
     }
   });
 
-  it('reconciles after a touch whose row unmounts before the finger lifts', () => {
+  it('reconciles within the stale bound when a touch lift is unobservable', () => {
     vi.useFakeTimers();
     try {
       const ref = { current: null as VirtualTranscriptHandle | null };
@@ -505,7 +508,7 @@ describe('VirtualTranscript', () => {
       act(() => ref.current?.scrollToIndex(20, 'start'));
       const row = document.querySelector<HTMLElement>('[data-virtual-key="item-20"]')!;
       act(() => {
-        fireEvent.pointerDown(row, { pointerId: 5, pointerType: 'touch' });
+        fireEvent.touchStart(row, { touches: [{ identifier: 5 }], changedTouches: [{ identifier: 5 }] });
         scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
@@ -513,16 +516,20 @@ describe('VirtualTranscript', () => {
       act(() => resizeObservers[0]!.triggerEntries([[row12, 50]]));
       expect(scrollTopOf(scroller)).toBe(395);
 
-      // Virtualization detaches the touched row. A touchend would be
-      // dispatched at that detached node and reach no listener at all;
-      // pointerup retargets and still arrives, so drift reconciles instead
-      // of re-arming the timer forever.
+      // Virtualization detaches the touched row and the finger lifts. That
+      // touchend is dispatched at the detached node and reaches no listener
+      // anywhere — verified against Chromium — and pointer events are no
+      // help either, being cancelled when the pan took over and never
+      // reporting the lift. Reconciliation must therefore be bounded rather
+      // than waiting on an event that will never arrive.
       row.remove();
       act(() => {
-        fireEvent.pointerUp(window, { pointerId: 5, pointerType: 'touch' });
-      });
-      act(() => {
         vi.advanceTimersByTime(400);
+      });
+      expect(scrollTopOf(scroller)).toBe(395);
+
+      act(() => {
+        vi.advanceTimersByTime(GESTURE_STALE_MS);
       });
       expect(scrollTopOf(scroller)).toBe(425);
     } finally {

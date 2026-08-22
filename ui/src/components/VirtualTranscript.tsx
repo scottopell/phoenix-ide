@@ -110,13 +110,17 @@ interface PhysicalStore<T> {
    *  the top spacer (mid-scroll anchor compensation, REQ-VT-004). */
   drift: number;
   lastScrollAtMs: number;
-  /** Ids of touch pointers that went down inside this scroller and have not
-   *  come up. Pointer events rather than touch events: a touch target is
-   *  fixed at touchstart, so when virtualization unmounts the touched row
-   *  its touchend is dispatched at a detached node and observed by nobody —
-   *  scroller, document and window alike — stranding the gesture open.
-   *  Pointer events retarget on removal and still deliver pointerup. */
+  /** Identifiers of touches that began inside this scroller and have not
+   *  been reported up. No event source is fully reliable here: a touch whose
+   *  row is unmounted mid-gesture has its touchend dispatched at a detached
+   *  node that nothing observes, while pointer events are cancelled the
+   *  moment a native pan takes over and then never report the lift at all.
+   *  Touch events are therefore the primary signal, pruned against each
+   *  event's live list and bounded by GESTURE_STALE_MS so an unobservable
+   *  lift cannot hold reconciliation open forever. */
   activeTouchIds: Set<number>;
+  /** Last touch activity (down or move) on this scroller. */
+  lastGestureAtMs: number;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
@@ -133,9 +137,16 @@ interface StorePublisher<T> {
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
 export const SCROLL_SETTLE_MS = 150;
+/** A finger resting this long without moving or scrolling has no momentum
+ *  left to preserve, so a correction written then cannot cancel one. The
+ *  bound also stops a lift that no listener could observe from deferring
+ *  reconciliation indefinitely. */
+export const GESTURE_STALE_MS = 2000;
 
 function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
-  return store.activeTouchIds.size > 0 || Date.now() - store.lastScrollAtMs < SCROLL_SETTLE_MS;
+  const now = Date.now();
+  if (now - store.lastScrollAtMs < SCROLL_SETTLE_MS) return true;
+  return store.activeTouchIds.size > 0 && now - store.lastGestureAtMs < GESTURE_STALE_MS;
 }
 
 function clampNonNegative(value: number): number {
@@ -467,6 +478,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     drift: 0,
     lastScrollAtMs: Number.NEGATIVE_INFINITY,
     activeTouchIds: new Set(),
+    lastGestureAtMs: Number.NEGATIVE_INFINITY,
     pendingScrollDelta: null,
     pendingProgrammaticTop: null,
   };
@@ -624,25 +636,45 @@ function VirtualTranscriptInner<T>(
         current.initialTailPending = false;
         setScrollerScrollTop(current, totalPhysicalExtent(current));
       }
-      const onPointerDown = (event: PointerEvent) => {
-        const store = storeRef.current;
-        if (!store || event.pointerType !== 'touch') return;
-        store.activeTouchIds.add(event.pointerId);
+      // Anything the browser no longer lists as down is released, whether or
+      // not its own end event ever reached a listener.
+      const pruneToLive = (store: PhysicalStore<T>, event: TouchEvent) => {
+        const live = new Set(Array.from(event.touches).map((touch) => touch.identifier));
+        for (const id of Array.from(store.activeTouchIds)) {
+          if (!live.has(id)) store.activeTouchIds.delete(id);
+        }
       };
-      // Bound on the window so a pointer that leaves the scroller — or whose
-      // element is unmounted under it — still reports its release.
-      const onPointerStop = (event: PointerEvent) => {
+      const onTouchStart = (event: TouchEvent) => {
         const store = storeRef.current;
         if (!store) return;
-        store.activeTouchIds.delete(event.pointerId);
+        pruneToLive(store, event);
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.add(touch.identifier);
+        }
+        store.lastGestureAtMs = Date.now();
       };
-      element.addEventListener('pointerdown', onPointerDown, { passive: true });
-      window.addEventListener('pointerup', onPointerStop, { passive: true });
-      window.addEventListener('pointercancel', onPointerStop, { passive: true });
+      const onTouchMove = () => {
+        const store = storeRef.current;
+        if (store) store.lastGestureAtMs = Date.now();
+      };
+      const onTouchStop = (event: TouchEvent) => {
+        const store = storeRef.current;
+        if (!store) return;
+        for (const touch of Array.from(event.changedTouches)) {
+          store.activeTouchIds.delete(touch.identifier);
+        }
+        pruneToLive(store, event);
+        store.lastGestureAtMs = Date.now();
+      };
+      element.addEventListener('touchstart', onTouchStart, { passive: true });
+      element.addEventListener('touchmove', onTouchMove, { passive: true });
+      element.addEventListener('touchend', onTouchStop, { passive: true });
+      element.addEventListener('touchcancel', onTouchStop, { passive: true });
       detachTouchListenersRef.current = () => {
-        element.removeEventListener('pointerdown', onPointerDown);
-        window.removeEventListener('pointerup', onPointerStop);
-        window.removeEventListener('pointercancel', onPointerStop);
+        element.removeEventListener('touchstart', onTouchStart);
+        element.removeEventListener('touchmove', onTouchMove);
+        element.removeEventListener('touchend', onTouchStop);
+        element.removeEventListener('touchcancel', onTouchStop);
       };
     }
     recompute(current);

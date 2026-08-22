@@ -187,6 +187,31 @@ describe('scrollMachine durable follow policy', () => {
     expect(result.state.kind === 'live' && result.state.unread).toBe(true);
   });
 
+  it('a zone arrival restores following without asserting the physical edge', () => {
+    // The reader has left the tail, so the physical edge reads false.
+    const departed = reduceScrollMachine(reading(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    const state = reduceScrollMachine(departed, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 520, 400),
+    }).state;
+    expectLiveMode(state, 'following');
+    // 1000 - 520 - 400 = 80: inside the pin zone, but the viewport never
+    // crossed the physical edge, so the edge must still read false. Recording
+    // it as true would survive as a stale value that a later navigation reads
+    // as permission to resume following.
+    expect(state.kind === 'live' && state.geometry.atBottom).toBe(false);
+
+    // Concretely: navigate away, then interact. A stale edge would confirm
+    // the tail return here and let streaming snap the reader to the bottom.
+    let navigated = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+    navigated = reduceScrollMachine(navigated, { type: 'interactionStarted' }).state;
+    expectLiveMode(navigated, 'navigating');
+    expect(navigated.kind === 'live' && navigated.follow.kind === 'navigating' && navigated.follow.phase).toBe('user-returning');
+  });
+
   it('downward movement in the pin zone during a moved touch defers to gesture end', () => {
     let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;

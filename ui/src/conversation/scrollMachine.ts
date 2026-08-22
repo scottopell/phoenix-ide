@@ -202,13 +202,19 @@ function requestTailReturn(
   };
 }
 
+// Confirms follow intent and clears unread. It deliberately does not touch
+// `geometry.atBottom`: that field is the physical pinned edge's, and this
+// runs for zone arrivals and gesture-end evidence that never crossed it.
+// Recording zone membership as the edge would leave a stale `true` that no
+// later false edge corrects, which a subsequent navigation would read as
+// permission to resume following (scroll_policy.allium).
 function confirmTailReturn(
   state: ReadySession,
 ): Reduction {
   const effects = unreadEffects(state.unread, false);
   const session: MeasuredSession = {
     conversationId: state.conversationId,
-    geometry: { ...state.geometry, atBottom: true },
+    geometry: state.geometry,
     gesture: state.gesture,
     unread: false,
   };
