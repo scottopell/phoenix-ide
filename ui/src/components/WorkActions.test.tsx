@@ -1905,8 +1905,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(api.markMerged).not.toHaveBeenCalled();
   });
 
-  it('offers workspace review when an unresolved selection has no actionable PR choices', () => {
+  it('resumes inference when an unresolved selection has no actionable PR choices', async () => {
     enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
     const handle = prStatusHandle({
       found: true,
       number: 12,
@@ -1920,24 +1921,21 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       },
       activePrSummary: null,
       ambiguous: false,
+      resumeInference,
     });
-    const onSlot = vi.fn();
     renderWithProviders(
-      <>
-        <WorkControlBar
-          conversationId="conv-unresolved-no-options"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={handle}
-        />
-        <CaptureSlot onSlot={onSlot} />
-      </>,
+      <WorkControlBar
+        conversationId="conv-unresolved-no-options"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
     );
 
     expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Review workspace changes' }));
-    expect(onSlot).toHaveBeenLastCalledWith({ kind: 'diff', presentation: 'fullscreen', target: 'workspace' });
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
   });
 

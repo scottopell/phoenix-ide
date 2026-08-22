@@ -467,10 +467,10 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                aria-label="Review workspace changes"
-                onClick={() => openDiffFullscreen('workspace')}
+                disabled={!prStatusHandle.resumeInference}
+                onClick={() => void resumePrInference()}
               >
-                Review changes
+                Resume PR inference
               </button>
             )
           )}
