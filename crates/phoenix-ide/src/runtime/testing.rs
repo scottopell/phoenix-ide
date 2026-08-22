@@ -15,6 +15,7 @@ use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinit
 use phoenix_workflow::Timestamp;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -544,6 +545,10 @@ pub struct InMemoryStorage {
     preflight_authoritative_user_message_calls: Mutex<Vec<PreflightAuthoritativeUserMessageCall>>,
     materialize_authoritative_user_message_calls:
         Mutex<Vec<MaterializeAuthoritativeUserMessageCall>>,
+    materialize_authoritative_user_message_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    materialize_authoritative_user_message_release:
+        Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    panic_authoritative_user_message_materialization: AtomicBool,
     active_direct_turn: Mutex<Option<crate::runtime::traits::LoadedActiveDirectTurn>>,
     settle_active_direct_turn_calls: Mutex<Vec<crate::runtime::traits::ActiveDirectTurnSettlement>>,
     settle_active_direct_turn_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -551,6 +556,8 @@ pub struct InMemoryStorage {
     settle_active_direct_turn_commit_error_once: Mutex<bool>,
     settle_active_direct_turn_failures: Mutex<usize>,
     terminal_obligation_establishment_failures: Mutex<usize>,
+    terminal_obligation_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    terminal_obligation_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     terminal_mutation_retired: Mutex<bool>,
     fail_state_snapshot: Mutex<bool>,
     fail_load_active_direct_turn: Mutex<bool>,
@@ -559,6 +566,10 @@ pub struct InMemoryStorage {
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
     fail_message_add: Mutex<bool>,
+    message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    metrics_write_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    metrics_write_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
@@ -589,6 +600,9 @@ impl InMemoryStorage {
             materialize_authoritative_user_message_results: Mutex::new(VecDeque::new()),
             preflight_authoritative_user_message_calls: Mutex::new(Vec::new()),
             materialize_authoritative_user_message_calls: Mutex::new(Vec::new()),
+            materialize_authoritative_user_message_started: Mutex::new(None),
+            materialize_authoritative_user_message_release: Mutex::new(None),
+            panic_authoritative_user_message_materialization: AtomicBool::new(false),
             active_direct_turn: Mutex::new(None),
             settle_active_direct_turn_calls: Mutex::new(Vec::new()),
             settle_active_direct_turn_started: Mutex::new(None),
@@ -596,6 +610,8 @@ impl InMemoryStorage {
             settle_active_direct_turn_commit_error_once: Mutex::new(false),
             settle_active_direct_turn_failures: Mutex::new(0),
             terminal_obligation_establishment_failures: Mutex::new(0),
+            terminal_obligation_started: Mutex::new(None),
+            terminal_obligation_release: Mutex::new(None),
             terminal_mutation_retired: Mutex::new(false),
             fail_state_snapshot: Mutex::new(false),
             fail_load_active_direct_turn: Mutex::new(false),
@@ -603,6 +619,10 @@ impl InMemoryStorage {
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
             fail_message_add: Mutex::new(false),
+            message_add_started: Mutex::new(None),
+            message_add_release: Mutex::new(None),
+            metrics_write_started: Mutex::new(None),
+            metrics_write_release: Mutex::new(None),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
@@ -626,6 +646,32 @@ impl InMemoryStorage {
 
     pub fn set_fail_message_add(&self, fail: bool) {
         *self.fail_message_add.lock().unwrap() = fail;
+    }
+
+    pub fn gate_message_add(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.message_add_started.lock().unwrap() = Some(started_tx);
+        *self.message_add_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
+    pub fn gate_metrics_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.metrics_write_started.lock().unwrap() = Some(started_tx);
+        *self.metrics_write_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn set_steering_drain_failures(&self, failures: usize) {
@@ -652,6 +698,19 @@ impl InMemoryStorage {
 
     pub fn set_settle_active_direct_turn_failures(&self, failures: usize) {
         *self.settle_active_direct_turn_failures.lock().unwrap() = failures;
+    }
+
+    pub fn gate_terminal_obligation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.terminal_obligation_started.lock().unwrap() = Some(started_tx);
+        *self.terminal_obligation_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn set_terminal_obligation_establishment_failures(&self, failures: usize) {
@@ -805,6 +864,30 @@ impl InMemoryStorage {
             .push_back(result);
     }
 
+    pub fn panic_authoritative_user_message_materialization(&self) {
+        self.panic_authoritative_user_message_materialization
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn gate_authoritative_user_message_materialization(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .materialize_authoritative_user_message_started
+            .lock()
+            .unwrap() = Some(started_tx);
+        *self
+            .materialize_authoritative_user_message_release
+            .lock()
+            .unwrap() = Some(release_rx);
+        (started_rx, release_tx)
+    }
+
     pub fn recorded_preflight_authoritative_user_message_calls(
         &self,
     ) -> Vec<PreflightAuthoritativeUserMessageCall> {
@@ -925,6 +1008,13 @@ impl MessageStore for InMemoryStorage {
         if *self.fail_message_add.lock().unwrap() {
             return Err("injected message persistence failure".to_string());
         }
+        if let Some(started) = self.message_add_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.message_add_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         // Keep the monotonic id counter at least as high as the provided
         // seq so any subsequent `add_message` call produces a strictly
         // greater id. Mirrors DB.add_message_with_seq semantics.
@@ -968,6 +1058,13 @@ impl MessageStore for InMemoryStorage {
         usage_data: Option<&UsageData>,
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
     ) -> crate::runtime::traits::TerminalEvidenceEstablishment {
+        if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.terminal_obligation_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         {
             let mut failures = self
                 .terminal_obligation_establishment_failures
@@ -1196,6 +1293,28 @@ impl MessageStore for InMemoryStorage {
                 state_updated_at: input.state_updated_at,
                 now: input.now,
             });
+        if self
+            .panic_authoritative_user_message_materialization
+            .swap(false, Ordering::SeqCst)
+        {
+            panic!("injected direct-turn authority-boundary panic");
+        }
+        if let Some(started) = self
+            .materialize_authoritative_user_message_started
+            .lock()
+            .unwrap()
+            .take()
+        {
+            let _ = started.send(());
+        }
+        let release = self
+            .materialize_authoritative_user_message_release
+            .lock()
+            .unwrap()
+            .take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         Ok(self
             .materialize_authoritative_user_message_results
             .lock()
@@ -1219,6 +1338,13 @@ impl MessageStore for InMemoryStorage {
         _settlement: &crate::runtime::traits::ActiveDirectTurnSettlement,
         _response_message_id: Option<&str>,
     ) -> crate::runtime::traits::TerminalMutationEstablishment {
+        if let Some(started) = self.terminal_obligation_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.terminal_obligation_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         crate::runtime::traits::TerminalMutationEstablishment::Established {
             transcript_generation: None,
         }
@@ -1760,6 +1886,13 @@ impl StateStore for InMemoryStorage {
         &self,
         _metrics: &phoenix_llm::LlmAttemptMetrics,
     ) -> Result<(), String> {
+        if let Some(started) = self.metrics_write_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.metrics_write_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
         Ok(())
     }
 

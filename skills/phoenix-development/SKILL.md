@@ -34,6 +34,30 @@ Read [references/development-loop.md](references/development-loop.md) for comman
 
 These are compact reminders, not replacements for `AGENTS.md` or normative specs.
 
+## Type and authority refactors
+
+When a change establishes an authority, lifecycle, or shutdown boundary, make the boundary compile-time visible before migrating behavior:
+
+1. Introduce the non-optional type or exhaustive enum first and restore a green compile boundary.
+2. Separate read-only discovery from independently committable mutation units. Admit each mutation at the owning orchestration layer; do not pass application-local capability types into lower-level persistence crates.
+3. Use mutable reborrows for nested synchronous work and owned transfer for queued work. If the caller must continue authoritatively after a queue hop, return the same affine token through the reply rather than minting another capability.
+4. Require the capability at high-level mutation, publication, filesystem, and external-dispatch sinks. A predicate or cancellation check is supporting defense, not primary enforcement.
+5. Give constructors production-valid defaults. If production always installs an authority fence or lifecycle owner, do not let unit-test construction represent a runtime without one.
+6. For bounded teardown, capture one absolute deadline at the first close and pass it through every nested drain. Never restart a full grace period at each layer.
+
+Use compiler errors as the migration inventory. After each slice, run formatting plus the owning crate's all-target compile before changing the next seam.
+
+## Recover from partial delegated edits
+
+Treat a failed sub-agent patch as untrusted until inspected. Before continuing:
+
+1. Record `git status` and the file-local diff; identify exactly what existed before delegation.
+2. Either finish the delegated slice immediately or revert only its delta. Never leave mixed old/new enums, match arms, or enforcement paths.
+3. Restore `cargo fmt` and the narrowest all-target compile before any further refactor.
+4. Re-run semantic race tests after compile recovery; a compiling ownership rewrite can still shorten a capability lifetime or change which caller observes failure.
+
+Prefer delegating bounded leaf slices with explicit file limits and validation commands. Keep ownership-sensitive integration work with one implementation owner.
+
 ## Report an owned workstream
 
 Use the roadmap only for work substantial enough that another agent needs to know its owner, blocker, or next step. Do not post routine edits, transient test failures, or leaf tasks already clear from an active parent workstream.
@@ -82,6 +106,8 @@ A good async test can explain who owns pending work, what marks completion, why 
 | Production-only behavior | Narrow TraceQL/log inspection first; fetch full traces only after finding trace IDs |
 
 A red broad check is evidence to classify, not permission to ignore it or to fix unrelated code blindly: **introduced**, **exposed**, **unrelated blocking**, or **unrelated non-blocking**. Record anything not fixed.
+
+When a broad run fails after focused tests pass, reproduce the named test alone, then run its entire owning module. If multiple standalone fixtures fail on the same missing production dependency, fix the constructor/type invariant instead of patching fixtures one by one. Distinguish a deterministic test failure from a suite timeout caused by an earlier failure leaving companion tests blocked; resolve the first causal failure before treating the timeout as a separate defect.
 
 ## Route specialized work
 

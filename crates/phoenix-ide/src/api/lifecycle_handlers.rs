@@ -385,6 +385,11 @@ pub(crate) async fn abandon_task(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
+    let mut authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal(
+            "task abandonment rejected after fatal local authority closure".to_string(),
+        )
+    })?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -631,7 +636,10 @@ pub(crate) async fn abandon_task(
     // 3. Broadcast diff snapshot (persisted above, before state transition).
     // Reuses the handle obtained during seq pre-allocation at step 2b.
     if let Some((handle, snap_msg)) = snapshot_msg {
-        let _ = handle.broadcast_tx.send_message(snap_msg);
+        let _ = handle
+            .broadcast_tx
+            .admitted_publication(&mut authority)
+            .persisted_message(snap_msg);
     }
 
     // 4. Route through state machine (REQ-BED-029, REQ-BED-001)

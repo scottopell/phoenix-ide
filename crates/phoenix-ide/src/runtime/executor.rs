@@ -50,6 +50,308 @@ const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty 
 const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
 const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
+enum AuthoritativeEffect {
+    BroadcastAssistantMessage {
+        message: crate::state_machine::AssistantMessage,
+    },
+    PersistMessage {
+        content: MessageContent,
+        display_data: Option<serde_json::Value>,
+        usage_data: Option<crate::db::UsageData>,
+        message_id: String,
+        idempotent: bool,
+    },
+    PersistAuthoritativeUserMessage {
+        payload: phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
+        authority: phoenix_core::domain::sm_event::DirectTurnAttemptAuthority,
+        idempotent: bool,
+    },
+    PersistState,
+    RequestLlm,
+    CompleteCreation {
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+    },
+    MaterializeCreation {
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+        content: MessageContent,
+        display_data: Option<serde_json::Value>,
+        usage_data: Option<crate::db::UsageData>,
+        message_id: String,
+    },
+    ExecuteTool {
+        tool: ToolCall,
+    },
+    AbortLlm,
+    ScheduleRetry {
+        delay: Duration,
+        attempt: u32,
+        reason: phoenix_core::domain::llm_error_kind::LlmAttemptReason,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    PersistCheckpoint {
+        data: CheckpointData,
+    },
+    PersistToolResults {
+        results: Vec<ToolResult>,
+    },
+    PersistHiddenSystemMarker {
+        marker: &'static str,
+        message_id: String,
+    },
+    PersistSubAgentResults {
+        results: Vec<SubAgentResult>,
+        spawn_tool_id: Option<String>,
+        summary_message_id: String,
+    },
+    RequestContinuation {
+        request: crate::state_machine::state::ContinuationSummaryRequest,
+    },
+    BeginContinuation {
+        request: crate::state_machine::state::ContinuationSummaryRequest,
+        content: MessageContent,
+        display_data: Option<serde_json::Value>,
+        usage_data: crate::db::UsageData,
+        message_id: String,
+    },
+    ContinuationCommit {
+        request: crate::state_machine::state::ContinuationSummaryRequest,
+        summary: String,
+    },
+    ApproveTask {
+        task_file: String,
+        title: String,
+        priority: crate::task_source::Priority,
+        plan: String,
+    },
+    ApproveTaskFreshHandoff {
+        task_file: String,
+        title: String,
+        priority: crate::task_source::Priority,
+        plan: String,
+    },
+    PersistForkProposal {
+        proposal_id: String,
+        task_file: String,
+        title: String,
+        priority: crate::task_source::Priority,
+        body: String,
+        checkpoint: CheckpointData,
+    },
+    ResolveTask {
+        system_message: String,
+        repo_root: String,
+    },
+    CommitSteeringDrain {
+        messages: Vec<SteeringDrainMessage>,
+        post_commit: SteeringDrainPostCommit,
+    },
+}
+
+enum ControlEffect {
+    AbortTool { tool_use_id: String },
+    CancelSubAgents { ids: Vec<String> },
+    NotifyParent { outcome: SubAgentOutcome },
+    NotifyStateChange,
+    NotifyAgentDone,
+    NotifyContextExhausted { summary: String },
+}
+
+enum ClassifiedEffect {
+    Authoritative(Box<AuthoritativeEffect>),
+    Control(ControlEffect),
+}
+
+impl ClassifiedEffect {
+    #[allow(clippy::too_many_lines)]
+    fn classify(effect: Effect) -> Self {
+        match effect {
+            Effect::BroadcastAssistantMessage { message } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::BroadcastAssistantMessage {
+                    message,
+                }))
+            }
+            Effect::AbortTool { tool_use_id } => {
+                Self::Control(ControlEffect::AbortTool { tool_use_id })
+            }
+            Effect::CancelSubAgents { ids } => {
+                Self::Control(ControlEffect::CancelSubAgents { ids })
+            }
+            Effect::NotifyParent { outcome } => {
+                Self::Control(ControlEffect::NotifyParent { outcome })
+            }
+            Effect::NotifyStateChange => Self::Control(ControlEffect::NotifyStateChange),
+            Effect::NotifyAgentDone => Self::Control(ControlEffect::NotifyAgentDone),
+            Effect::NotifyContextExhausted { summary } => {
+                Self::Control(ControlEffect::NotifyContextExhausted { summary })
+            }
+            Effect::PersistMessage {
+                content,
+                display_data,
+                usage_data,
+                message_id,
+                idempotent,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistMessage {
+                content,
+                display_data,
+                usage_data,
+                message_id,
+                idempotent,
+            })),
+            Effect::PersistAuthoritativeUserMessage {
+                payload,
+                authority,
+                idempotent,
+            } => Self::Authoritative(Box::new(
+                AuthoritativeEffect::PersistAuthoritativeUserMessage {
+                    payload,
+                    authority,
+                    idempotent,
+                },
+            )),
+            Effect::PersistState => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::PersistState))
+            }
+            Effect::RequestLlm => Self::Authoritative(Box::new(AuthoritativeEffect::RequestLlm)),
+            Effect::CompleteCreation { job_id, claim } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::CompleteCreation {
+                    job_id,
+                    claim,
+                }))
+            }
+            Effect::MaterializeCreation {
+                job_id,
+                claim,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::MaterializeCreation {
+                job_id,
+                claim,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            })),
+            Effect::ExecuteTool { tool } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::ExecuteTool { tool }))
+            }
+            Effect::AbortLlm => Self::Authoritative(Box::new(AuthoritativeEffect::AbortLlm)),
+            Effect::ScheduleRetry {
+                delay,
+                attempt,
+                reason,
+                resets_at,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::ScheduleRetry {
+                delay,
+                attempt,
+                reason,
+                resets_at,
+            })),
+            Effect::PersistCheckpoint { data } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::PersistCheckpoint { data }))
+            }
+            Effect::PersistToolResults { results } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::PersistToolResults {
+                    results,
+                }))
+            }
+            Effect::PersistHiddenSystemMarker { marker, message_id } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::PersistHiddenSystemMarker {
+                    marker,
+                    message_id,
+                }))
+            }
+            Effect::PersistSubAgentResults {
+                results,
+                spawn_tool_id,
+                summary_message_id,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistSubAgentResults {
+                results,
+                spawn_tool_id,
+                summary_message_id,
+            })),
+            Effect::RequestContinuation { request } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::RequestContinuation {
+                    request,
+                }))
+            }
+            Effect::BeginContinuation {
+                request,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::BeginContinuation {
+                request,
+                content,
+                display_data,
+                usage_data,
+                message_id,
+            })),
+            Effect::ContinuationCommit { request, summary } => {
+                Self::Authoritative(Box::new(AuthoritativeEffect::ContinuationCommit {
+                    request,
+                    summary,
+                }))
+            }
+            Effect::ApproveTask {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTask {
+                task_file,
+                title,
+                priority,
+                plan,
+            })),
+            Effect::ApproveTaskFreshHandoff {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTaskFreshHandoff {
+                task_file,
+                title,
+                priority,
+                plan,
+            })),
+            Effect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint,
+            })),
+            Effect::ResolveTask {
+                system_message,
+                repo_root,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::ResolveTask {
+                system_message,
+                repo_root,
+            })),
+            Effect::CommitSteeringDrain {
+                messages,
+                post_commit,
+            } => Self::Authoritative(Box::new(AuthoritativeEffect::CommitSteeringDrain {
+                messages,
+                post_commit,
+            })),
+        }
+    }
+}
+
 struct AbortTaskOnDrop(tokio::task::AbortHandle);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +365,7 @@ enum StartupSteeringDrainOutcome {
 pub(crate) enum RuntimeExitDisposition {
     FatalLocalAuthorityLoss,
     Terminal,
+    CoordinatedShutdown,
     Interrupted,
     RecreateFromDatabase,
 }
@@ -104,6 +407,13 @@ enum TerminalSettlementAttempt {
 impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+async fn wait_for_optional_cancellation(cancellation: Option<CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1732,6 +2042,30 @@ enum CreationSettlementDisposition {
     StaleAuthority,
 }
 
+#[derive(Debug)]
+struct ProposedDirectTurnState {
+    state: ConvState,
+    updated_at: DateTime<Utc>,
+}
+
+struct AuthorityBoundaryConsumerGuard {
+    fence: Option<Arc<crate::runtime::FatalLocalAuthorityFence>>,
+}
+
+impl AuthorityBoundaryConsumerGuard {
+    fn disarm(&mut self) {
+        self.fence = None;
+    }
+}
+
+impl Drop for AuthorityBoundaryConsumerGuard {
+    fn drop(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            fence.close("direct_turn_boundary_owner_disappeared");
+        }
+    }
+}
+
 pub struct ConversationRuntime<S, L, T>
 where
     S: Storage + Clone + 'static,
@@ -1932,6 +2266,14 @@ where
     /// the conversation has already left `CancellingTool` (id/state mismatch ->
     /// logged, harmless).
     tool_task_handle: Option<tokio::task::JoinHandle<()>>,
+    fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
+    fatal_external_effect_cancellation: Option<CancellationToken>,
+    #[cfg(test)]
+    external_effect_dispatch_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    semantic_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    terminal_effect_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
@@ -1955,6 +2297,10 @@ where
     local_terminal_authority: LocalTerminalAuthority,
     direct_turn_cancellation_initiated: bool,
     direct_turn_materialization_aborted: bool,
+    proposed_direct_turn_state: Option<ProposedDirectTurnState>,
+    fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
+    handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
     /// Cap on `parent_tool_cycle_count` before the runtime halts and emits
@@ -2084,12 +2430,24 @@ where
             steering_projection_gate: None,
             deadline: None,
             tool_task_handle: None,
+            fatal_local_authority_rx: None,
+            fatal_external_effect_cancellation: None,
+            #[cfg(test)]
+            external_effect_dispatch_barrier: None,
+            #[cfg(test)]
+            semantic_publication_barrier: None,
+            #[cfg(test)]
+            terminal_effect_admission_barrier: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
             grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             direct_turn_materialization_aborted: false,
+            proposed_direct_turn_state: None,
+            fatal_local_authority_fence: crate::runtime::FatalLocalAuthorityFence::new(),
+            handoff_completion_authority: None,
+            handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
             active_direct_turn: None,
@@ -2141,6 +2499,67 @@ where
     pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
         self.state_watcher = Some(tx);
         self
+    }
+
+    pub fn with_fatal_local_authority_fence(
+        mut self,
+        fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    ) -> Self {
+        self.fatal_local_authority_rx = Some(fence.subscribe());
+        self.fatal_external_effect_cancellation = Some(fence.external_effect_cancellation());
+        self.fatal_local_authority_fence = fence;
+        self
+    }
+
+    fn retain_handoff_completion_authority(
+        &mut self,
+        completion: Option<&Event>,
+        authority: Option<crate::runtime::AdmittedOperation>,
+    ) {
+        if completion.is_some() {
+            self.handoff_completion_authority = authority;
+        }
+    }
+
+    fn live_state_owner(&self) -> Result<Option<crate::runtime::AdmittedOperation>, String> {
+        if self.handoff_completion_authority.is_some() {
+            return Ok(None);
+        }
+        self.fatal_local_authority_fence
+            .try_acquire()
+            .map(Some)
+            .map_err(|()| {
+                "runtime state publication closed after fatal local authority loss".to_string()
+            })
+    }
+
+    fn install_live_state(
+        &mut self,
+        state: ConvState,
+        state_updated_at: DateTime<Utc>,
+        publish: bool,
+    ) -> Result<(), String> {
+        let _owner = self.live_state_owner()?;
+        self.state = state;
+        self.state_updated_at = state_updated_at;
+        if publish {
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_live_state_admitted(&self) {
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
+        }
+    }
+
+    fn publish_live_state(&self) -> Result<(), String> {
+        let _owner = self.live_state_owner()?;
+        self.publish_live_state_admitted();
+        Ok(())
     }
 
     /// Set the credential helper for recovery settlement (REQ-BED-030).
@@ -2338,7 +2757,15 @@ where
                 operation_id = %request.operation_id,
                 "resuming interrupted continuation summary"
             );
-            self.request_continuation(request.clone());
+            if let Err(error) = self
+                .execute_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                })
+                .await
+            {
+                tracing::error!(%error, "Failed to resume continuation request");
+                return RuntimeExitDisposition::Interrupted;
+            }
         }
 
         // If the credential helper is still running, the select loop will pick it up.
@@ -2402,6 +2829,17 @@ where
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
+                biased;
+                boundary = async {
+                    match self.fatal_local_authority_rx.as_mut() {
+                        Some(receiver) => crate::tls::wait_for_fatal_local_authority(receiver).await,
+                        None => std::future::pending::<&'static str>().await,
+                    }
+                }, if self.fatal_local_authority_rx.is_some() => {
+                    tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
+                    self.abort_external_effects();
+                    return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                }
                 Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
                     let result = self.process_acknowledged_event(event).await;
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
@@ -2424,11 +2862,16 @@ where
                     if matches!(event, Event::Shutdown) {
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
-                            "Runtime shutdown signal received; exiting executor loop"
+                            "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
-                        return RuntimeExitDisposition::Interrupted;
+                        self.abort_external_effects();
+                        return RuntimeExitDisposition::CoordinatedShutdown;
                     }
                     if let Err(e) = self.process_event(event).await {
+                        if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
+                            tracing::error!(error = %e, "fatal local SQLite authority loss");
+                            return RuntimeExitDisposition::FatalLocalAuthorityLoss;
+                        }
                         // process_event already broadcast a typed
                         // SseEvent::Error at the source if appropriate
                         // (task 24682). No double-broadcast here.
@@ -2589,6 +3032,7 @@ where
             }
         }
 
+        self.abort_external_effects();
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
             RuntimeExitDisposition::RecreateFromDatabase
@@ -2643,6 +3087,7 @@ where
     /// A later dispatch or abort supersedes the generation. Its stale outcome
     /// cannot clear the current request's task handle or metrics capture;
     /// current outcomes consume both before entering the state machine.
+    #[allow(clippy::large_futures)]
     async fn process_generation_tagged_llm_outcome(
         &mut self,
         generation: u64,
@@ -2756,6 +3201,7 @@ where
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
+    #[allow(clippy::large_futures)]
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
         // A `RetryTimeout` reaching this point has already passed the
         // generation guard in the select loop (`retry_timeout_is_stale`), so it
@@ -2812,6 +3258,7 @@ where
 
         // Process chained events (e.g., SpawnAgentsComplete from execute_effect)
         while let Some(event) = events_to_process.pop() {
+            let settles_handoff = matches!(event, Event::TaskHandoffComplete { .. });
             let chained_result = match transition(&self.state, &self.context, event) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2819,8 +3266,12 @@ where
                     continue;
                 }
             };
-            let more_events = self.apply_transition_result(chained_result).await?;
-            events_to_process.extend(more_events);
+            let generated = self.apply_transition_result(chained_result).await?;
+            if settles_handoff {
+                self.handoff_completion_authority = None;
+                self.handoff_completion_timestamp = None;
+            }
+            events_to_process.extend(generated);
         }
 
         Ok(())
@@ -2836,11 +3287,7 @@ where
             );
             return Ok(());
         }
-        self.state = ConvState::LlmRequesting { attempt: 1 };
-        self.state_updated_at = Utc::now();
-        if let Some(state_watcher) = &self.state_watcher {
-            let _ = state_watcher.send(self.state.clone());
-        }
+        self.install_live_state(ConvState::LlmRequesting { attempt: 1 }, Utc::now(), true)?;
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
             sequence_id: seq,
             state: self.state.clone(),
@@ -2897,6 +3344,12 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn process_event(&mut self, event: Event) -> Result<(), String> {
+        if self.fatal_local_authority_fence.is_closed()
+            && self.handoff_completion_authority.is_none()
+            && !matches!(event, Event::Shutdown)
+        {
+            return Err("runtime processing closed after fatal local authority loss".to_string());
+        }
         self.creation_settlement_disposition = CreationSettlementDisposition::Continue;
         let owes_parent_direct_turn_terminal = !self.context.is_sub_agent
             && self.terminal_transition_retry.is_some()
@@ -3020,6 +3473,7 @@ where
         let mut events_to_process = vec![event];
 
         while let Some(current_event) = events_to_process.pop() {
+            let settles_handoff = matches!(current_event, Event::TaskHandoffComplete { .. });
             // Decrement one-writer counter when a Work sub-agent completes (REQ-PROJ-008)
             if let Event::SubAgentResult { ref agent_id, .. } = current_event {
                 if let ConvState::AwaitingSubAgents { ref pending, .. }
@@ -3062,8 +3516,12 @@ where
                 self.parent_tool_cycle_count = 0;
             }
             self.classify_active_direct_turn_terminal(&terminal_event, &result.new_state);
-            let generated_events = self.apply_transition_result(result).await?;
-            events_to_process.extend(generated_events);
+            let generated = self.apply_transition_result(result).await?;
+            if settles_handoff {
+                self.handoff_completion_authority = None;
+                self.handoff_completion_timestamp = None;
+            }
+            events_to_process.extend(generated);
         }
 
         drop(immediate_drain_guard);
@@ -3145,12 +3603,14 @@ where
     /// dispatches effects. Returns any synchronously generated events
     /// (e.g., from `SpawnAgentsComplete`).
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::large_futures)]
     async fn apply_transition_result(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
         self.direct_turn_materialization_aborted = false;
+        self.proposed_direct_turn_state = None;
         self.continuation_effect_disposition = ContinuationEffectDisposition::Continue;
         let terminal_subagent_transition = self.context.is_sub_agent
             && matches!(result.new_state.step_result(), StepResult::Terminal(_));
@@ -3176,17 +3636,20 @@ where
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
         let old_state_updated_at = self.state_updated_at;
-        let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        let is_direct_turn_adoption = result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistAuthoritativeUserMessage { .. }));
+        let old_state = self.state.clone();
         let will_settle_active_direct_turn =
             self.active_direct_turn.is_some() && self.pending_direct_turn_terminal.is_some();
-        // Only stamp a fresh entry time when the phase actually changes.
-        // Several events absorb as no-ops (Terminal absorbs unknown events;
-        // an empty steering drain re-enters the same state) and reach here
-        // with new_state == old_state; bumping then would reset the client's
-        // elapsed counter (REQ-WPV-001) for a phase the agent never left.
-        // No-op transitions emit no PersistState effect, so the DB row keeps
-        // its prior value too — gating here keeps the in-memory stamp in sync.
-        if self.state != old_state {
+        if is_direct_turn_adoption {
+            self.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+                state: result.new_state.clone(),
+                updated_at: Utc::now(),
+            });
+        } else {
+            let state_changed = result.new_state != old_state;
             let retry_has_durable_fact = matches!(
                 self.terminal_settlement_attempt,
                 TerminalSettlementAttempt::Retry {
@@ -3194,18 +3657,12 @@ where
                     ..
                 }
             );
-            if !retry_has_durable_fact {
-                self.state_updated_at = Utc::now();
-            }
-            // Publish early for most transitions so effective_conversation_state
-            // reflects the new state before long-running effects (e.g. ApproveTask
-            // git work) complete. Exception: suppress when entering Idle with
-            // queued steering messages — the inline drain will immediately advance
-            // the state to LlmRequesting, and exposing the transient Idle would let
-            // a concurrent POST /chat route a UserMessage before the drain finishes
-            // (FM-7 intermediate-Idle race). The end-of-function publish below
-            // covers that suppressed case once the drain completes.
-            let will_drain_from_idle = matches!(self.state, ConvState::Idle)
+            let next_state_updated_at = if state_changed && !retry_has_durable_fact {
+                self.handoff_completion_timestamp.unwrap_or_else(Utc::now)
+            } else {
+                self.state_updated_at
+            };
+            let will_drain_from_idle = matches!(result.new_state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
             let will_commit_steering_drain = result
@@ -3218,19 +3675,18 @@ where
                     Effect::CompleteCreation { .. } | Effect::MaterializeCreation { .. }
                 )
             });
-            if !will_drain_from_idle
+            let publish = state_changed
+                && !will_drain_from_idle
                 && !will_commit_steering_drain
                 && !will_settle_creation
-                && !will_settle_active_direct_turn
-            {
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                && !will_settle_active_direct_turn;
+            if will_settle_active_direct_turn {
+                self.state = result.new_state.clone();
+                self.state_updated_at = next_state_updated_at;
+            } else {
+                self.install_live_state(result.new_state.clone(), next_state_updated_at, publish)?;
             }
-            // The turn's trace ends when the conversation stops working —
-            // including the transient Idle of a steering drain, where the
-            // queued message legitimately starts a new turn (and span).
-            if !will_settle_active_direct_turn {
+            if state_changed && !will_settle_active_direct_turn {
                 self.settle_turn_span();
             }
         }
@@ -3344,6 +3800,20 @@ where
         } else {
             Box::pin(self.prepare_steering_drain(&old_state, is_error_dismissal)).await?
         };
+        let mut terminal_unit_admission = None;
+        let terminal_state_has_notify = terminal_direct_turn_transition
+            && result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::NotifyStateChange));
+        if terminal_direct_turn_transition {
+            #[cfg(test)]
+            if let Some(barrier) = self.terminal_effect_admission_barrier.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            terminal_unit_admission = Some(Box::new(self.admit_authoritative_effect()?));
+        }
         if let Some((drain_event, projection_guard)) = steering_drain {
             Box::pin(self.run_effects_with_inline_drain(
                 result.effects,
@@ -3363,6 +3833,13 @@ where
                         | Effect::CompleteCreation { .. }
                         | Effect::MaterializeCreation { .. }
                 );
+                if matches!(effect, Effect::PersistState)
+                    && self.handoff_completion_authority.is_some()
+                    && matches!(self.state, ConvState::HandedOff { .. })
+                {
+                    state_committed = true;
+                    continue;
+                }
                 let is_steering_drain = matches!(effect, Effect::CommitSteeringDrain { .. });
                 let terminal_message_settlement = if terminal_direct_turn_transition {
                     match &effect {
@@ -3393,6 +3870,7 @@ where
                 } else {
                     None
                 };
+
                 let effect_result = if let Some(settlement) = terminal_message_settlement {
                     match effect {
                         Effect::PersistMessage {
@@ -3412,6 +3890,9 @@ where
                             if retry_has_durable_fact {
                                 Ok(None)
                             } else {
+                                let _admitted = terminal_unit_admission
+                                    .as_deref_mut()
+                                    .expect("terminal evidence write is admitted");
                                 let sequence_id = self.broadcast_tx.next_seq();
                                 match self
                                     .storage
@@ -3429,7 +3910,14 @@ where
                                     TerminalEvidenceEstablishment::Established(message) => {
                                         self.direct_turn_terminal_fact =
                                             TerminalFactDurability::Durable;
-                                        let _ = self.broadcast_tx.send_message(*message);
+                                        let _ = self
+                                            .broadcast_tx
+                                            .admitted_publication(
+                                                terminal_unit_admission.as_deref_mut().expect(
+                                                    "terminal message publication is admitted",
+                                                ),
+                                            )
+                                            .persisted_message(*message);
                                         Ok(None)
                                     }
                                     TerminalEvidenceEstablishment::Retired => {
@@ -3482,12 +3970,100 @@ where
                         TerminalMutationEstablishment::Established { .. }
                         | TerminalMutationEstablishment::Retired => {
                             self.direct_turn_terminal_fact = TerminalFactDurability::Durable;
-                            Box::pin(self.execute_effect(effect)).await
+                            let admitted = terminal_unit_admission
+                                .as_deref_mut()
+                                .expect("terminal state settlement is admitted");
+                            match ClassifiedEffect::classify(effect) {
+                                ClassifiedEffect::Authoritative(effect) => match *effect {
+                                    AuthoritativeEffect::PersistState => {
+                                        let result =
+                                            self.persist_state_effect(false, admitted).await;
+                                        if result.is_ok() && !terminal_state_has_notify {
+                                            let _ = self
+                                                .broadcast_tx
+                                                .admitted_publication(admitted)
+                                                .state_change(
+                                                    self.state.clone(),
+                                                    self.state.presentation_mode().to_string(),
+                                                    self.state_updated_at,
+                                                );
+                                        }
+                                        result
+                                    }
+                                    effect => {
+                                        self.execute_authoritative_effect(effect, admitted).await
+                                    }
+                                },
+                                ClassifiedEffect::Control(_) => unreachable!(
+                                    "terminal state settlement matched authoritative effect"
+                                ),
+                            }
                         }
                         TerminalMutationEstablishment::KnownNotCommitted(error) => Err(error),
                         TerminalMutationEstablishment::Unclassifiable(error) => {
                             self.local_terminal_authority = LocalTerminalAuthority::Fatal;
                             Err(error)
+                        }
+                    }
+                } else if terminal_direct_turn_transition {
+                    match ClassifiedEffect::classify(effect) {
+                        ClassifiedEffect::Authoritative(effect) => match *effect {
+                            AuthoritativeEffect::PersistState => {
+                                let admitted = terminal_unit_admission
+                                    .as_deref_mut()
+                                    .expect("terminal state persistence is admitted");
+                                let result = self.persist_state_effect(false, admitted).await;
+                                if result.is_ok() && !terminal_state_has_notify {
+                                    let admitted = terminal_unit_admission
+                                        .as_deref_mut()
+                                        .expect("terminal state persistence is admitted");
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .state_change(
+                                            self.state.clone(),
+                                            self.state.presentation_mode().to_string(),
+                                            self.state_updated_at,
+                                        );
+                                }
+                                result
+                            }
+                            effect => {
+                                self.execute_authoritative_effect(
+                                    effect,
+                                    terminal_unit_admission
+                                        .as_deref_mut()
+                                        .expect("terminal direct-turn unit is admitted"),
+                                )
+                                .await
+                            }
+                        },
+                        ClassifiedEffect::Control(ControlEffect::NotifyStateChange) => {
+                            let admitted = terminal_unit_admission
+                                .as_deref_mut()
+                                .expect("terminal state publication is admitted");
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .state_change(
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
+                            Ok(None)
+                        }
+                        ClassifiedEffect::Control(ControlEffect::NotifyAgentDone) => {
+                            let admitted = terminal_unit_admission
+                                .as_deref_mut()
+                                .expect("terminal completion publication is admitted");
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .agent_done();
+                            Ok(None)
+                        }
+                        ClassifiedEffect::Control(effect) => {
+                            self.execute_control_effect(effect).await
                         }
                     }
                 } else {
@@ -3505,11 +4081,14 @@ where
                                 || terminal_direct_turn_transition)
                                 && !state_committed) =>
                     {
-                        let failed_state = std::mem::replace(&mut self.state, old_state.clone());
-                        self.state_updated_at = old_state_updated_at;
-                        self.manage_deadline(&failed_state);
-                        if let Some(tx) = &self.state_watcher {
-                            let _ = tx.send(self.state.clone());
+                        let failed_state = self.state.clone();
+                        if terminal_direct_turn_transition {
+                            self.state = old_state.clone();
+                            self.state_updated_at = old_state_updated_at;
+                            self.manage_deadline(&failed_state);
+                        } else {
+                            self.install_live_state(old_state.clone(), old_state_updated_at, true)?;
+                            self.manage_deadline(&failed_state);
                         }
                         if (terminal_subagent_transition || terminal_direct_turn_transition)
                             && !state_committed
@@ -3538,8 +4117,8 @@ where
                 if self.creation_settlement_disposition
                     == CreationSettlementDisposition::StaleAuthority
                 {
-                    let failed_state = std::mem::replace(&mut self.state, old_state.clone());
-                    self.state_updated_at = old_state_updated_at;
+                    let failed_state = self.state.clone();
+                    self.install_live_state(old_state.clone(), old_state_updated_at, false)?;
                     self.manage_deadline(&failed_state);
                     return Ok(generated_events);
                 }
@@ -3553,11 +4132,7 @@ where
         }
 
         if self.direct_turn_materialization_aborted {
-            self.state = old_state;
-            self.state_updated_at = old_state_updated_at;
-            if let Some(tx) = &self.state_watcher {
-                let _ = tx.send(self.state.clone());
-            }
+            self.install_live_state(old_state, old_state_updated_at, true)?;
             if let Some((drain_event, projection_guard)) =
                 Box::pin(self.prepare_steering_drain(&self.state.clone(), false)).await?
             {
@@ -3589,8 +4164,13 @@ where
         // the await inside `run_effects_with_inline_drain`, which would cause a
         // concurrent `POST /chat` to route a `UserMessage` before the drain has
         // advanced the state back to `LlmRequesting` (FM-7).
-        if let Some(tx) = &self.state_watcher {
-            let _ = tx.send(self.state.clone());
+        if terminal_direct_turn_transition {
+            let _admitted = terminal_unit_admission
+                .as_deref_mut()
+                .expect("terminal direct-turn transition is admitted");
+            self.publish_live_state_admitted();
+        } else {
+            self.publish_live_state()?;
         }
         Ok(generated_events)
     }
@@ -3623,7 +4203,8 @@ where
             if suppress_intermediate_state_change {
                 match &effect {
                     Effect::PersistState => {
-                        self.persist_state_effect(false).await?;
+                        let mut admitted = self.admit_authoritative_effect()?;
+                        self.persist_state_effect(false, &mut admitted).await?;
                         continue;
                     }
                     Effect::NotifyStateChange => {
@@ -3696,7 +4277,11 @@ where
     /// emit the `StateChange` SSE; the inline-drain path persists with
     /// `broadcast = false` to suppress an intermediate Idle flicker (task
     /// 60004) since the drain emits its own authoritative state-change.
-    async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
+    async fn persist_state_effect(
+        &mut self,
+        broadcast: bool,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
@@ -3713,12 +4298,14 @@ where
                 .await?;
         }
         if broadcast {
-            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                sequence_id: seq,
-                state: self.state.clone(),
-                presentation_mode: self.state.presentation_mode().to_string(),
-                state_updated_at: self.state_updated_at,
-            });
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().to_string(),
+                    self.state_updated_at,
+                );
         }
         Ok(None)
     }
@@ -4321,6 +4908,9 @@ where
     /// cancelled checkpoint so the message's sequence is strictly after the
     /// work it describes (history replays by `sequence_id`).
     async fn broadcast_cancellation_backstop_message(&mut self) {
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return;
+        };
         let msg_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::system(
             "Cancellation completed. Aborted work may still be reclaiming resources in the \
@@ -4341,7 +4931,10 @@ where
             .await
         {
             Ok(msg) => {
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(&mut admitted)
+                    .persisted_message(msg);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
@@ -4477,6 +5070,9 @@ where
     /// while a bare "limit reached ({cap})" invites confusion about whether
     /// the counter shown elsewhere (`cap + 1`) is a bug.
     async fn halt_parent_cycle_cap(&mut self, cap: u32, attempted: u32) {
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return;
+        };
         let msg_id = uuid::Uuid::new_v4().to_string();
         let text = format!(
             "Tool-use iteration limit reached: attempted LLM call #{attempted} exceeds the cap \
@@ -4504,7 +5100,10 @@ where
             .await
         {
             Ok(msg) => {
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(&mut admitted)
+                    .persisted_message(msg);
             }
             Err(e) => {
                 tracing::warn!(
@@ -4972,11 +5571,71 @@ where
         }
     }
 
+    fn abort_external_effects(&mut self) {
+        self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
+        if let Some(handle) = self.llm_task_handle.take() {
+            handle.abort();
+        }
+        self.tool_request_generation = self.tool_request_generation.wrapping_add(1);
+        if let Some(token) = self.tool_cancel_token.take() {
+            token.cancel();
+        }
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute_effect(&mut self, effect: Effect) -> Result<Option<Event>, String> {
+        match ClassifiedEffect::classify(effect) {
+            ClassifiedEffect::Control(effect) => self.execute_control_effect(effect).await,
+            ClassifiedEffect::Authoritative(effect) => {
+                let retained = self.handoff_completion_authority.take();
+                let restore_retained = retained.is_some();
+                let mut admitted = match retained {
+                    Some(admitted) => admitted,
+                    None => self.admit_authoritative_effect()?,
+                };
+                let result = self
+                    .execute_authoritative_effect(*effect, &mut admitted)
+                    .await;
+                if restore_retained {
+                    self.handoff_completion_authority = Some(admitted);
+                }
+                result
+            }
+        }
+    }
+
+    fn admit_authoritative_effect(&self) -> Result<crate::runtime::AdmittedOperation, String> {
+        self.fatal_local_authority_fence
+            .try_acquire()
+            .map_err(|()| "runtime persistence closed after fatal local authority loss".to_string())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_authoritative_effect(
+        &mut self,
+        effect: AuthoritativeEffect,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
+        #[cfg(test)]
+        if matches!(
+            effect,
+            AuthoritativeEffect::RequestLlm
+                | AuthoritativeEffect::ExecuteTool { .. }
+                | AuthoritativeEffect::RequestContinuation { .. }
+        ) {
+            if let Some(barrier) = self.external_effect_dispatch_barrier.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         match effect {
-            Effect::PersistAuthoritativeUserMessage {
-                payload, authority, ..
+            AuthoritativeEffect::PersistAuthoritativeUserMessage {
+                payload,
+                authority,
+                idempotent: _idempotent,
             } => {
                 let now = chrono::Utc::now()
                     .timestamp()
@@ -5001,20 +5660,50 @@ where
                 let (reserved_broadcast_range, reserved_seqs) =
                     self.broadcast_tx.reserve_next_persisted_message_range(1);
                 let _reserved_broadcast_range = reserved_broadcast_range;
-                let materialization = self
-                    .storage
-                    .materialize_authoritative_user_message(
-                        &crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
-                            authority,
-                            payload,
-                            sequence_id: reserved_seqs[0],
-                            created_at: phoenix_workflow::Timestamp(now),
-                            accepted_state: self.state.clone(),
-                            state_updated_at: self.state_updated_at,
-                            now: phoenix_workflow::Timestamp(now),
-                        },
-                    )
-                    .await;
+                let input = crate::runtime::traits::AuthoritativeUserMessageAdoptionInput {
+                    authority,
+                    payload,
+                    sequence_id: reserved_seqs[0],
+                    created_at: phoenix_workflow::Timestamp(now),
+                    accepted_state: self
+                        .proposed_direct_turn_state
+                        .as_ref()
+                        .map(|proposed| proposed.state.clone())
+                        .ok_or_else(|| {
+                            "authoritative materialization missing proposed state".to_string()
+                        })?,
+                    state_updated_at: self
+                        .proposed_direct_turn_state
+                        .as_ref()
+                        .map(|proposed| proposed.updated_at)
+                        .ok_or_else(|| {
+                            "authoritative materialization missing proposed timestamp".to_string()
+                        })?,
+                    now: phoenix_workflow::Timestamp(now),
+                };
+                let storage = self.storage.clone();
+                let materialization_admission = admitted.transfer();
+                let boundary_owner = tokio::spawn(async move {
+                    let materialization =
+                        storage.materialize_authoritative_user_message(&input).await;
+                    if matches!(
+                        materialization,
+                        Ok(crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified)
+                    ) {
+                        materialization_admission.close("direct_turn_materialization");
+                    }
+                    (materialization, materialization_admission)
+                });
+                let mut owner_guard = AuthorityBoundaryConsumerGuard {
+                    fence: Some(self.fatal_local_authority_fence.clone()),
+                };
+                let (materialization, materialization_owner) =
+                    boundary_owner.await.map_err(|error| {
+                        tracing::error!(?error, "direct-turn authority boundary owner disappeared");
+                        "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
+                            .to_string()
+                    })?;
+                owner_guard.disarm();
                 let materialization = match materialization {
                     Ok(materialization) => materialization,
                     Err(error) => {
@@ -5027,20 +5716,43 @@ where
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::Materialized {
                         message,
                         active,
+                    }
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::ClassifiedCommitted {
+                        message,
+                        active,
                     } => {
+                        let proposed = self
+                            .proposed_direct_turn_state
+                            .take()
+                            .ok_or_else(|| "committed direct turn missing proposed state".to_string())?;
+                        self.state = proposed.state;
+                        self.state_updated_at = proposed.updated_at;
                         self.active_direct_turn = Some(Box::new(active));
-                        let _ = self.broadcast_tx.send_message(*message);
+                        self.publish_live_state_admitted();
+                        let mut materialization_owner = materialization_owner;
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(&mut materialization_owner)
+                            .persisted_message(*message);
                         Ok(None)
                     }
                     crate::runtime::traits::AuthoritativeUserMessageMaterialization::ExactReplay
-                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority => {
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::NotCommitted
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::StaleAuthority
+                    | crate::runtime::traits::AuthoritativeUserMessageMaterialization::CommandRejected => {
+                        self.proposed_direct_turn_state = None;
                         self.direct_turn_materialization_aborted = true;
                         Ok(None)
+                    }
+                    crate::runtime::traits::AuthoritativeUserMessageMaterialization::DurableFactUnclassified => {
+                        self.proposed_direct_turn_state = None;
+                        Err("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+                            .to_string())
                     }
                 }
             }
 
-            Effect::PersistMessage {
+            AuthoritativeEffect::PersistMessage {
                 content,
                 display_data,
                 usage_data,
@@ -5084,12 +5796,14 @@ where
                     );
                 }
 
-                // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
                 Ok(None)
             }
 
-            Effect::BeginContinuation {
+            AuthoritativeEffect::BeginContinuation {
                 request,
                 content,
                 display_data,
@@ -5165,18 +5879,18 @@ where
                                     self.active_direct_turn = None;
                                     self.pending_direct_turn_terminal = None;
                                     self.direct_turn_cancellation_initiated = false;
-                                    let _ = self.broadcast_tx.send_message(message.clone());
-                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                        SseEvent::StateChange {
-                                            sequence_id,
-                                            state: self.state.clone(),
-                                            state_updated_at: self.state_updated_at,
-                                            presentation_mode: self
-                                                .state
-                                                .presentation_mode()
-                                                .to_string(),
-                                        }
-                                    });
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .persisted_message(message.clone());
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .state_change(
+                                            self.state.clone(),
+                                            self.state.presentation_mode().to_string(),
+                                            self.state_updated_at,
+                                        );
                                 }
                                 if matches!(
                                     &self.state,
@@ -5188,7 +5902,10 @@ where
                                         operation_id = %request.operation_id,
                                         "continuation start committed ambiguously; resuming persisted operation"
                                     );
-                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .persisted_message(message.clone());
                                     drop(reserved_range);
                                     return Ok(None);
                                 }
@@ -5215,19 +5932,19 @@ where
                                 ConvState::AwaitingContinuation { request: persisted_request }
                                     if persisted_request.operation_id == request.operation_id
                             ) {
-                                let _ = self.broadcast_tx.send_message(message);
+                                let _ = self
+                                    .broadcast_tx
+                                    .admitted_publication(admitted)
+                                    .persisted_message(message);
                                 drop(reserved_range);
-                                let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                    SseEvent::StateChange {
-                                        sequence_id,
-                                        state: self.state.clone(),
-                                        presentation_mode: self
-                                            .state
-                                            .presentation_mode()
-                                            .to_string(),
-                                        state_updated_at: self.state_updated_at,
-                                    }
-                                });
+                                let _ = self
+                                    .broadcast_tx
+                                    .admitted_publication(admitted)
+                                    .state_change(
+                                        self.state.clone(),
+                                        self.state.presentation_mode().to_string(),
+                                        self.state_updated_at,
+                                    );
                                 return Ok(None);
                             }
                         }
@@ -5240,22 +5957,28 @@ where
                         }
                         self.continuation_effect_disposition =
                             ContinuationEffectDisposition::AbortRemaining;
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                         let _ = self
                             .broadcast_tx
-                            .send_seq(|sequence_id| SseEvent::StateChange {
-                                sequence_id,
-                                state: self.state.clone(),
-                                presentation_mode: self.state.presentation_mode().to_string(),
-                                state_updated_at: self.state_updated_at,
-                            });
+                            .admitted_publication(admitted)
+                            .state_change(
+                                self.state.clone(),
+                                self.state.presentation_mode().to_string(),
+                                self.state_updated_at,
+                            );
                         return Ok(None);
                     }
                 };
                 match outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                     }
                     crate::db::ContinuationCommitOutcome::Duplicate
@@ -5272,7 +5995,8 @@ where
                         }
                         let _ = self
                             .broadcast_tx
-                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                            .admitted_publication(admitted)
+                            .reserved_event(sequence_id, |sequence_id| SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
@@ -5284,7 +6008,7 @@ where
                 Ok(None)
             }
 
-            Effect::ContinuationCommit { request, summary } => {
+            AuthoritativeEffect::ContinuationCommit { request, summary } => {
                 let operation_id = request.operation_id.clone();
                 let (reserved_range, reserved_sequences) =
                     self.broadcast_tx.reserve_next_persisted_message_range(1);
@@ -5523,14 +6247,15 @@ where
                                     )
                                     .await?;
                             }
-                            let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
-                                SseEvent::StateChange {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .reserved_event(seq, |sequence_id| SseEvent::StateChange {
                                     sequence_id,
                                     state: self.state.clone(),
                                     presentation_mode: self.state.presentation_mode().to_string(),
                                     state_updated_at: self.state_updated_at,
-                                }
-                            });
+                                });
                             drop(reserved_range);
                             return Ok(None);
                         }
@@ -5538,16 +6263,19 @@ where
                 };
                 match continuation_outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                         let _ = self
                             .broadcast_tx
-                            .send_seq(|sequence_id| SseEvent::StateChange {
-                                sequence_id,
-                                state: self.state.clone(),
-                                presentation_mode: self.state.presentation_mode().to_string(),
-                                state_updated_at: self.state_updated_at,
-                            });
+                            .admitted_publication(admitted)
+                            .state_change(
+                                self.state.clone(),
+                                self.state.presentation_mode().to_string(),
+                                self.state_updated_at,
+                            );
                         self.active_direct_turn = None;
                         self.pending_direct_turn_terminal = None;
                         self.direct_turn_cancellation_initiated = false;
@@ -5576,40 +6304,42 @@ where
                             if used_direct_turn_settlement {
                                 self.settle_turn_span();
                             }
-                            let _ = self.broadcast_tx.send_message(message);
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+
                             drop(reserved_range);
-                            let _ =
-                                self.broadcast_tx
-                                    .send_seq(|sequence_id| SseEvent::StateChange {
-                                        sequence_id,
-                                        state: self.state.clone(),
-                                        presentation_mode: self
-                                            .state
-                                            .presentation_mode()
-                                            .to_string(),
-                                        state_updated_at: self.state_updated_at,
-                                    });
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .state_change(
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
                             return Ok(None);
                         }
-                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
-                            SseEvent::StateChange {
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .reserved_event(seq, |sequence_id| SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
                                 state_updated_at: self.state_updated_at,
-                            }
-                        });
+                            });
                         drop(reserved_range);
                     }
                 }
                 Ok(None)
             }
 
-            Effect::PersistState => self.persist_state_effect(true).await,
+            AuthoritativeEffect::PersistState => self.persist_state_effect(true, admitted).await,
 
-            Effect::RequestLlm => self.dispatch_llm_request().await,
+            AuthoritativeEffect::RequestLlm => self.dispatch_llm_request(admitted).await,
 
-            Effect::MaterializeCreation {
+            AuthoritativeEffect::MaterializeCreation {
                 job_id,
                 claim,
                 content,
@@ -5647,7 +6377,10 @@ where
                             .take()
                             .expect("materialized creation reserved an SSE sequence");
                         debug_assert_eq!(sequence_id, message.sequence_id);
-                        let _ = self.broadcast_tx.send_message(*message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(*message);
                         drop(reservation);
                     }
                     Ok(crate::db::CreationRuntimeMaterialization::ClaimLost) => {
@@ -5676,7 +6409,7 @@ where
                 Ok(None)
             }
 
-            Effect::CompleteCreation { job_id, claim } => {
+            AuthoritativeEffect::CompleteCreation { job_id, claim } => {
                 match self
                     .storage
                     .settle_creation_runtime(
@@ -5702,9 +6435,11 @@ where
                 Ok(None)
             }
 
-            Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
+            AuthoritativeEffect::ExecuteTool { tool } => {
+                self.dispatch_tool_execution(tool, admitted).await
+            }
 
-            Effect::ScheduleRetry {
+            AuthoritativeEffect::ScheduleRetry {
                 delay,
                 attempt,
                 reason,
@@ -5718,14 +6453,17 @@ where
                 // BEFORE the tokio sleep so a client subscribing in the
                 // backoff window observes it via the replay ring.
                 let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::LlmAttempt {
-                    sequence_id: seq,
-                    attempt,
-                    max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
-                    reason,
-                    backing_off_ms,
-                    resets_at,
-                });
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .event(|seq| SseEvent::LlmAttempt {
+                        sequence_id: seq,
+                        attempt,
+                        max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                        reason,
+                        backing_off_ms,
+                        resets_at,
+                    });
 
                 // Open a fresh retry generation for this timer. The timer task
                 // stamps it onto its fire; the select loop discards a fire whose
@@ -5744,7 +6482,9 @@ where
                 self.retry_generation = self.retry_generation.wrapping_add(1);
                 let timer_generation = self.retry_generation;
                 let retry_outcome_tx = self.retry_outcome_tx.clone();
+                let timer_admission = admitted.reborrow();
                 let handle = tokio::spawn(async move {
+                    let _timer_admission = timer_admission;
                     tokio::time::sleep(delay).await;
                     let _ = retry_outcome_tx.send((timer_generation, attempt)).await;
                 });
@@ -5752,14 +6492,265 @@ where
                 Ok(None)
             }
 
-            Effect::NotifyAgentDone => {
-                let _ = self
-                    .broadcast_tx
-                    .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
+            AuthoritativeEffect::PersistCheckpoint { data } => {
+                if let (Some(turn), Some(terminal)) = (
+                    self.active_direct_turn.as_deref(),
+                    self.pending_direct_turn_terminal.as_deref(),
+                ) {
+                    let settlement = ActiveDirectTurnSettlement {
+                        conversation_id: self.context.conversation_id.clone(),
+                        turn: turn.clone(),
+                        terminal: terminal.clone(),
+                        state: self.state.clone(),
+                        state_updated_at: self.state_updated_at,
+                    };
+                    self.persist_checkpoint_with_terminal_obligation(data, &settlement, admitted)
+                        .await
+                } else {
+                    self.persist_checkpoint(data, admitted).await
+                }
+            }
+
+            AuthoritativeEffect::PersistToolResults { results } => {
+                for result in results {
+                    let content = MessageContent::tool_with_images(
+                        &result.tool_use_id,
+                        result.output(),
+                        result.is_error(),
+                        result.images().to_vec(),
+                    );
+                    let tool_msg_id = uuid::Uuid::new_v4().to_string();
+                    let seq = self.broadcast_tx.next_seq();
+                    let msg = self
+                        .storage
+                        .add_message_with_seq(
+                            &tool_msg_id,
+                            &self.context.conversation_id,
+                            seq,
+                            &content,
+                            None,
+                            None,
+                        )
+                        .await?;
+
+                    // Tool results don't contain bash tool_use blocks, no enrichment needed
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(msg);
+                }
                 Ok(None)
             }
 
-            Effect::NotifyStateChange => {
+            AuthoritativeEffect::AbortLlm => {
+                tracing::info!("Aborting LLM request");
+                // Bump the generation so the aborted task's forwarded outcome
+                // (a synthetic NetworkError from the dropped sender) is stale
+                // and gets discarded by the select loop, rather than being
+                // applied to a subsequent unrelated `LlmRequesting` turn.
+                self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
+                if let Some(handle) = self.llm_task_handle.take() {
+                    handle.abort();
+                }
+                if let Some(capture) = self.active_llm_attempt.take() {
+                    if let Some(metrics) = capture.finalize_cancelled() {
+                        if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await
+                        {
+                            tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics");
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
+            AuthoritativeEffect::PersistHiddenSystemMarker { marker, message_id } => {
+                let seq = self.broadcast_tx.next_seq();
+                let content = MessageContent::system(marker);
+                let display_data = Some(serde_json::json!({ "hidden": true }));
+                let msg = self
+                    .storage
+                    .add_message_with_seq(
+                        &message_id,
+                        &self.context.conversation_id,
+                        seq,
+                        &content,
+                        display_data.as_ref(),
+                        None,
+                    )
+                    .await?;
+
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
+                Ok(None)
+            }
+
+            AuthoritativeEffect::PersistSubAgentResults {
+                results,
+                spawn_tool_id,
+                summary_message_id,
+            } => {
+                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id, admitted)
+                    .await
+            }
+
+            AuthoritativeEffect::RequestContinuation { request } => {
+                if matches!(
+                    &self.state,
+                    ConvState::AwaitingContinuation { request: active }
+                        if active.operation_id == request.operation_id
+                ) {
+                    self.request_continuation(request, admitted);
+                } else {
+                    tracing::debug!(
+                        operation_id = %request.operation_id,
+                        "skipping continuation request that no longer owns state"
+                    );
+                }
+                Ok(None)
+            }
+
+            AuthoritativeEffect::ApproveTask {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => {
+                self.execute_approve_task(task_file, title, priority, plan, admitted)
+                    .await?;
+                Ok(None)
+            }
+
+            AuthoritativeEffect::ApproveTaskFreshHandoff {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => {
+                let authority = admitted.reborrow();
+                let completion = self
+                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
+                    .await?;
+                self.retain_handoff_completion_authority(
+                    completion.as_ref(),
+                    if completion.is_some() {
+                        Some(admitted.transfer())
+                    } else {
+                        None
+                    },
+                );
+                Ok(completion)
+            }
+
+            AuthoritativeEffect::ResolveTask {
+                system_message,
+                repo_root,
+            } => {
+                self.execute_resolve_task(system_message, repo_root, admitted)
+                    .await?;
+                Ok(None)
+            }
+
+            AuthoritativeEffect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint,
+            } => {
+                self.execute_persist_fork_proposal(
+                    proposal_id,
+                    task_file,
+                    title,
+                    priority,
+                    body,
+                    checkpoint,
+                    admitted,
+                )
+                .await
+            }
+
+            AuthoritativeEffect::BroadcastAssistantMessage { message } => {
+                #[cfg(test)]
+                if let Some(barrier) = self.semantic_publication_barrier.take() {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                let seq = self.broadcast_tx.next_seq();
+                let agent_content = MessageContent::agent(message.content);
+                let db_msg = crate::db::Message {
+                    message_id: message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: seq,
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: message.display_data,
+                    usage_data: message.usage,
+                    created_at: message.created_at,
+                };
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .assistant_message(db_msg);
+                Ok(None)
+            }
+            AuthoritativeEffect::CommitSteeringDrain {
+                messages,
+                post_commit,
+            } => {
+                self.commit_steering_drain(messages, post_commit, admitted)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_control_effect(
+        &mut self,
+        effect: ControlEffect,
+    ) -> Result<Option<Event>, String> {
+        match effect {
+            ControlEffect::AbortTool { tool_use_id } => {
+                tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
+                if let Some(token) = self.tool_cancel_token.take() {
+                    token.cancel();
+                }
+                Ok(None)
+            }
+            ControlEffect::CancelSubAgents { ids } => {
+                tracing::info!(?ids, "Cancelling sub-agents");
+                if let Some(cancel_tx) = &self.cancel_tx {
+                    let request = SubAgentCancelRequest {
+                        ids,
+                        parent_conversation_id: self.context.conversation_id.clone(),
+                        parent_event_tx: self.event_tx.clone(),
+                    };
+                    if let Err(error) = cancel_tx.send(request).await {
+                        tracing::error!(%error, "Failed to send cancel request");
+                    }
+                } else {
+                    tracing::warn!("No cancel channel configured, cannot cancel sub-agents");
+                }
+                Ok(None)
+            }
+            ControlEffect::NotifyParent { outcome } => {
+                tracing::info!(?outcome, "Notifying parent of sub-agent completion");
+                if let Some(parent_tx) = &self.parent_event_tx {
+                    let event = Event::SubAgentResult {
+                        agent_id: self.context.conversation_id.clone(),
+                        outcome,
+                    };
+                    if let Err(error) = parent_tx.send(event).await {
+                        tracing::warn!(%error, "Failed to notify parent (may have terminated)");
+                    }
+                } else {
+                    tracing::warn!("No parent channel configured for sub-agent");
+                }
+                Ok(None)
+            }
+            ControlEffect::NotifyStateChange => {
                 let state = self.state.clone();
                 let state_name = state.variant_name();
                 let presentation_mode = state.presentation_mode().to_string();
@@ -5791,219 +6782,13 @@ where
                 }
                 Ok(None)
             }
-
-            Effect::PersistCheckpoint { data } => {
-                if let (Some(turn), Some(terminal)) = (
-                    self.active_direct_turn.as_deref(),
-                    self.pending_direct_turn_terminal.as_deref(),
-                ) {
-                    let settlement = ActiveDirectTurnSettlement {
-                        conversation_id: self.context.conversation_id.clone(),
-                        turn: turn.clone(),
-                        terminal: terminal.clone(),
-                        state: self.state.clone(),
-                        state_updated_at: self.state_updated_at,
-                    };
-                    self.persist_checkpoint_with_terminal_obligation(data, &settlement)
-                        .await
-                } else {
-                    self.persist_checkpoint(data).await
-                }
-            }
-
-            Effect::BroadcastAssistantMessage { message } => {
-                // Broadcast-only: no DB write here. The atomic
-                // `PersistCheckpoint` at the end of the tool round performs
-                // the durable write (and emits a duplicate `sse_message`
-                // that the UI dedups by `message_id`).
-                //
-                // The eager message is appended to the per-conversation
-                // ReplayRing via `send_ephemeral_message` so reconnecting
-                // clients during the tool round still see the in-flight
-                // assistant content. The eventual persisted Message with
-                // the same `message_id` will fire `send_persisted_message`
-                // when the checkpoint completes, resetting the ring anchor
-                // and discarding this entry; the client dedups by
-                // `message_id` via `SseMessageDedupReplay`.
-                //
-                // `created_at` comes from `AssistantMessage` (captured at
-                // LLM-response time) — NOT a fresh `Utc::now()`. The same
-                // timestamp is later written to the DB row by
-                // `persist_checkpoint`, so a reconnecting client's init
-                // payload reads back the same timestamp the UI is already
-                // displaying. Without that alignment, the displayed
-                // timestamp would jump when init merges the DB row in.
-                let seq = self.broadcast_tx.next_seq();
-                let agent_content = MessageContent::agent(message.content);
-                let db_msg = crate::db::Message {
-                    message_id: message.message_id,
-                    conversation_id: self.context.conversation_id.clone(),
-                    sequence_id: seq,
-                    message_type: agent_content.message_type(),
-                    content: agent_content,
-                    display_data: message.display_data,
-                    usage_data: message.usage,
-                    created_at: message.created_at,
-                };
-                let _ = self.broadcast_tx.send_ephemeral_message(db_msg);
+            ControlEffect::NotifyAgentDone => {
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
                 Ok(None)
             }
-
-            Effect::PersistToolResults { results } => {
-                for result in results {
-                    let content = MessageContent::tool_with_images(
-                        &result.tool_use_id,
-                        result.output(),
-                        result.is_error(),
-                        result.images().to_vec(),
-                    );
-                    let tool_msg_id = uuid::Uuid::new_v4().to_string();
-                    let seq = self.broadcast_tx.next_seq();
-                    let msg = self
-                        .storage
-                        .add_message_with_seq(
-                            &tool_msg_id,
-                            &self.context.conversation_id,
-                            seq,
-                            &content,
-                            None,
-                            None,
-                        )
-                        .await?;
-
-                    // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let _ = self.broadcast_tx.send_message(msg);
-                }
-                Ok(None)
-            }
-
-            Effect::AbortTool { tool_use_id } => {
-                // Signal abort to running tool. Unlike `Effect::AbortLlm`, this
-                // only cancels the token — the cooperative tool task observes it
-                // and produces a real `Aborted` outcome that the state machine
-                // consumes (`CancellingTool + ToolAborted -> Idle`). That outcome
-                // carries the dispatch generation and is still current, so it
-                // must NOT be discarded; the generation is therefore NOT bumped
-                // here. The id-reuse race is closed at the two points where the
-                // outcome genuinely becomes stale: the next tool dispatch (which
-                // bumps the generation) and the forced backstop teardown (which
-                // aborts the task, dropping its sender — `handle_cancelling_tool_timeout`).
-                tracing::info!(tool_id = %tool_use_id, "Aborting tool execution");
-                if let Some(token) = self.tool_cancel_token.take() {
-                    token.cancel();
-                }
-                // The spawned task will send ToolAborted event when it sees cancellation
-                Ok(None)
-            }
-
-            Effect::AbortLlm => {
-                tracing::info!("Aborting LLM request");
-                // Bump the generation so the aborted task's forwarded outcome
-                // (a synthetic NetworkError from the dropped sender) is stale
-                // and gets discarded by the select loop, rather than being
-                // applied to a subsequent unrelated `LlmRequesting` turn.
-                self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
-                if let Some(handle) = self.llm_task_handle.take() {
-                    handle.abort();
-                }
-                if let Some(capture) = self.active_llm_attempt.take() {
-                    if let Some(metrics) = capture.finalize_cancelled() {
-                        if let Err(error) = self.storage.upsert_llm_request_metrics(&metrics).await
-                        {
-                            tracing::warn!(%error, "failed to persist cancelled LLM attempt metrics");
-                        }
-                    }
-                }
-                Ok(None)
-            }
-
-            Effect::CancelSubAgents { ids } => {
-                tracing::info!(?ids, "Cancelling sub-agents");
-
-                if let Some(cancel_tx) = &self.cancel_tx {
-                    let request = SubAgentCancelRequest {
-                        ids,
-                        parent_conversation_id: self.context.conversation_id.clone(),
-                        parent_event_tx: self.event_tx.clone(),
-                    };
-                    if let Err(e) = cancel_tx.send(request).await {
-                        tracing::error!(error = %e, "Failed to send cancel request");
-                    }
-                } else {
-                    tracing::warn!("No cancel channel configured, cannot cancel sub-agents");
-                }
-                Ok(None)
-            }
-
-            Effect::NotifyParent { outcome } => {
-                tracing::info!(?outcome, "Notifying parent of sub-agent completion");
-
-                if let Some(parent_tx) = &self.parent_event_tx {
-                    let event = Event::SubAgentResult {
-                        agent_id: self.context.conversation_id.clone(),
-                        outcome,
-                    };
-                    if let Err(e) = parent_tx.send(event).await {
-                        // Parent may have terminated - that's OK
-                        tracing::warn!(error = %e, "Failed to notify parent (may have terminated)");
-                    }
-                } else {
-                    tracing::warn!("No parent channel configured for sub-agent");
-                }
-                Ok(None)
-            }
-
-            Effect::PersistHiddenSystemMarker { marker, message_id } => {
-                let seq = self.broadcast_tx.next_seq();
-                let content = MessageContent::system(marker);
-                let display_data = Some(serde_json::json!({ "hidden": true }));
-                let msg = self
-                    .storage
-                    .add_message_with_seq(
-                        &message_id,
-                        &self.context.conversation_id,
-                        seq,
-                        &content,
-                        display_data.as_ref(),
-                        None,
-                    )
-                    .await?;
-
-                let _ = self.broadcast_tx.send_message(msg);
-                Ok(None)
-            }
-
-            Effect::PersistSubAgentResults {
-                results,
-                spawn_tool_id,
-                summary_message_id,
-            } => {
-                self.persist_sub_agent_results(results, spawn_tool_id, summary_message_id)
-                    .await
-            }
-
-            Effect::RequestContinuation { request } => {
-                if matches!(
-                    &self.state,
-                    ConvState::AwaitingContinuation { request: active }
-                        if active.operation_id == request.operation_id
-                ) {
-                    self.request_continuation(request);
-                } else {
-                    tracing::debug!(
-                        operation_id = %request.operation_id,
-                        "skipping continuation request that no longer owns state"
-                    );
-                }
-                Ok(None)
-            }
-
-            Effect::NotifyContextExhausted { summary } => {
-                // REQ-BED-021 / REQ-BED-031: Notify client of context
-                // exhaustion. Worktree is intentionally preserved (no
-                // auto-cleanup, no conv_mode demotion) — continuation
-                // transfer (REQ-BED-030) or a user-initiated abandon /
-                // mark-as-merged is the only path that removes it.
+            ControlEffect::NotifyContextExhausted { summary } => {
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                     sequence_id: seq,
                     state: ConvState::ContextExhausted { summary },
@@ -6012,59 +6797,6 @@ where
                 });
                 Ok(None)
             }
-
-            Effect::ApproveTask {
-                task_file,
-                title,
-                priority,
-                plan,
-            } => {
-                self.execute_approve_task(task_file, title, priority, plan)
-                    .await?;
-                Ok(None)
-            }
-
-            Effect::ApproveTaskFreshHandoff {
-                task_file,
-                title,
-                priority,
-                plan,
-            } => {
-                self.execute_approve_task_fresh_handoff(task_file, title, priority, plan)
-                    .await
-            }
-
-            Effect::ResolveTask {
-                system_message,
-                repo_root,
-            } => {
-                self.execute_resolve_task(system_message, repo_root).await?;
-                Ok(None)
-            }
-
-            Effect::PersistForkProposal {
-                proposal_id,
-                task_file,
-                title,
-                priority,
-                body,
-                checkpoint,
-            } => {
-                self.execute_persist_fork_proposal(
-                    proposal_id,
-                    task_file,
-                    title,
-                    priority,
-                    body,
-                    checkpoint,
-                )
-                .await
-            }
-
-            Effect::CommitSteeringDrain {
-                messages,
-                post_commit,
-            } => self.commit_steering_drain(messages, post_commit).await,
         }
     }
 
@@ -6072,6 +6804,7 @@ where
         &mut self,
         messages: Vec<SteeringDrainMessage>,
         post_commit: SteeringDrainPostCommit,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         if messages.is_empty() {
             return Err("reducer emitted an empty steering drain commit".to_string());
@@ -6127,7 +6860,10 @@ where
                 .unwrap_or(crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized);
             match status {
                 crate::db::SteeringDrainMessageStatus::Inserted => {
-                    let _ = self.broadcast_tx.send_message(message);
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(message);
                 }
                 crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized => {
                     tracing::warn!(
@@ -6135,43 +6871,45 @@ where
                         message_id = %message.message_id,
                         "Recovered a legacy partially-materialized steering drain"
                     );
-                    let _ =
-                        self.broadcast_tx
-                            .send_reserved_seq(message.sequence_id, |sequence_id| {
-                                SseEvent::StateChange {
-                                    sequence_id,
-                                    state: self.state.clone(),
-                                    presentation_mode: self.state.presentation_mode().to_string(),
-                                    state_updated_at: self.state_updated_at,
-                                }
-                            });
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .reserved_state_change(
+                            message.sequence_id,
+                            self.state.clone(),
+                            self.state.presentation_mode().to_string(),
+                            self.state_updated_at,
+                        );
                 }
             }
         }
         drop(reserved_range);
 
-        self.finish_steering_drain(post_commit).await
+        self.finish_steering_drain(post_commit, admitted).await
     }
 
     async fn finish_steering_drain(
         &mut self,
         post_commit: SteeringDrainPostCommit,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         match post_commit {
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
                 self.parent_tool_cycle_count = 0;
                 let _ = self
                     .broadcast_tx
-                    .send_seq(|sequence_id| SseEvent::StateChange {
-                        sequence_id,
-                        state: self.state.clone(),
-                        presentation_mode: self.state.presentation_mode().to_string(),
-                        state_updated_at: self.state_updated_at,
-                    });
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
-                match self.dispatch_llm_request().await {
+                    .admitted_publication(admitted)
+                    .state_change(
+                        self.state.clone(),
+                        self.state.presentation_mode().to_string(),
+                        self.state_updated_at,
+                    );
+                self.publish_live_state_admitted();
+                match Box::pin(
+                    self.execute_authoritative_effect(AuthoritativeEffect::RequestLlm, admitted),
+                )
+                .await
+                {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
                 }
@@ -6269,7 +7007,10 @@ where
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
+    async fn dispatch_llm_request(
+        &mut self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -6512,9 +7253,9 @@ where
         let attempt_capture = phoenix_llm::LlmAttemptCapture::new();
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
-        let handle = tokio::spawn(async move {
-            // Tokio cancellation is not recursive. Aborting the request must
-            // also stop its forwarder before buffered chunks reach a later turn.
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let mut request_admission = admitted.reborrow();
+        let request_task = async move {
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
 
             if is_sub_agent {
@@ -6722,7 +7463,9 @@ where
                 let effort_for_usage = effective_effort;
                 let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
+                let usage_admission = request_admission.reborrow();
                 tokio::spawn(async move {
+                    let _usage_admission = usage_admission;
                     if let Err(e) = storage_for_usage
                         .insert_turn_usage(
                             &conv_id_for_usage,
@@ -6739,8 +7482,17 @@ where
                 });
             }
 
+            drop(request_admission);
             let _ = llm_tx.send(llm_outcome);
-        }.instrument(turn_span));
+        }
+        .instrument(turn_span);
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = request_task => {}
+            }
+        });
         self.active_llm_attempt = Some(attempt_capture);
         self.llm_task_handle = Some(handle);
 
@@ -6834,11 +7586,14 @@ where
 
     fn create_tool_llm_metrics_sink(
         &self,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
     {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let storage = self.storage.clone();
+        let writer_admission = admitted.reborrow();
         tokio::spawn(async move {
+            let _writer_admission = writer_admission;
             while let Some(metrics) = rx.recv().await {
                 if let Err(error) = storage.upsert_llm_request_metrics(&metrics).await {
                     tracing::warn!(%error, "failed to persist tool-internal LLM metrics");
@@ -6848,8 +7603,21 @@ where
         tx
     }
 
+    #[cfg(test)]
+    fn test_tool_metrics_writer(
+        &self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> tokio::sync::mpsc::UnboundedSender<phoenix_core::domain::llm_types::LlmAttemptMetrics>
+    {
+        self.create_tool_llm_metrics_sink(admitted)
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+    async fn dispatch_tool_execution(
+        &mut self,
+        tool: ToolCall,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             let advertised = self
@@ -6889,7 +7657,11 @@ where
         let tool_outcome_tx = self.tool_outcome_tx.clone();
 
         // Create cancellation token for this tool execution
-        let cancel_token = CancellationToken::new();
+        let cancel_token = self
+            .fatal_external_effect_cancellation
+            .as_ref()
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
         self.tool_cancel_token = Some(cancel_token.clone());
         let cancel_token_check = cancel_token.clone();
 
@@ -6914,7 +7686,7 @@ where
                     progress,
                 });
         });
-        let llm_metrics_tx = self.create_tool_llm_metrics_sink();
+        let llm_metrics_tx = self.create_tool_llm_metrics_sink(admitted);
         let tool_ctx = match &self.context.execution_environment {
             phoenix_core::domain::sm_state::ConversationExecutionEnvironment::Filesystem {
                 working_dir,
@@ -6986,25 +7758,32 @@ where
         // Instrumenting the detached task with the turn span parents the
         // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.
         let turn_span = self.current_turn_span();
-        let tool_task = tokio::spawn(
-            async move {
-                let tool_outcome = execute_tool_to_outcome(
-                    storage,
-                    tool_executor,
-                    checked,
-                    tool_ctx,
-                    &cancel_token_check,
-                    conv_id,
-                    root_conv_id,
-                    tool_name,
-                    tool_use_id,
-                )
-                .await;
-                // Send typed outcome through oneshot channel
-                let _ = tool_tx.send(tool_outcome);
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let tool_admission = admitted.reborrow();
+        let tool_execution = async move {
+            let _tool_admission = tool_admission;
+            let tool_outcome = execute_tool_to_outcome(
+                storage,
+                tool_executor,
+                checked,
+                tool_ctx,
+                &cancel_token_check,
+                conv_id,
+                root_conv_id,
+                tool_name,
+                tool_use_id,
+            )
+            .await;
+            let _ = tool_tx.send(tool_outcome);
+        }
+        .instrument(turn_span);
+        let tool_task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = tool_execution => {}
             }
-            .instrument(turn_span),
-        );
+        });
         // Retain the handle so the cancellation backstop (REQ-BED-005a) can
         // abort an uncooperative tool task that never observes its token.
         // Replacing any prior handle is correct: only one tool executes at a
@@ -7037,6 +7816,7 @@ where
         &mut self,
         data: CheckpointData,
         settlement: &ActiveDirectTurnSettlement,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let CheckpointData::ToolRound {
             assistant_message,
@@ -7103,15 +7883,25 @@ where
                 return Err(error);
             }
         }
-        let _ = self.broadcast_tx.send_message(agent_msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
         for message in tool_msgs {
-            let _ = self.broadcast_tx.send_message(message);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
         }
         Ok(None)
     }
 
     /// Persist a checkpoint (assistant message + tool results) atomically.
-    async fn persist_checkpoint(&mut self, data: CheckpointData) -> Result<Option<Event>, String> {
+    async fn persist_checkpoint(
+        &mut self,
+        data: CheckpointData,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         match data {
             CheckpointData::ToolRound {
                 assistant_message,
@@ -7182,9 +7972,16 @@ where
                 // sequence ids after the preallocated tool-message ids and can
                 // therefore leapfrog later tool-result messages in live
                 // delivery.
-                let _ = self.broadcast_tx.send_message(agent_msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(agent_msg);
+
                 for msg in tool_msgs {
-                    let _ = self.broadcast_tx.send_message(msg);
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(msg);
                 }
             }
         }
@@ -7195,6 +7992,7 @@ where
     /// tool round (REQ-PROJ-033). The assistant message, synthetic success ack,
     /// and the `fork_proposals` row commit in one transaction; the ack and the
     /// row that the review surface reads are never durable independently.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_persist_fork_proposal(
         &mut self,
         proposal_id: String,
@@ -7203,6 +8001,7 @@ where
         priority: phoenix_core::task_source::Priority,
         body: String,
         checkpoint: CheckpointData,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let CheckpointData::ToolRound {
             assistant_message,
@@ -7288,9 +8087,15 @@ where
         // assistant message and the success ack (matches `persist_checkpoint`).
         // Duration is already present in each tool-result message's display_data;
         // do not emit a follow-up update that can overtake later persisted rows.
-        let _ = self.broadcast_tx.send_message(agent_msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
         for msg in tool_msgs {
-            let _ = self.broadcast_tx.send_message(msg);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
         }
 
         Ok(None)
@@ -7305,6 +8110,7 @@ where
         results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
         summary_message_id: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         // Build the display_data for subagent results
         let display_data = serde_json::json!({
@@ -7335,6 +8141,7 @@ where
                     llm_content,
                     display_data,
                     &settlement,
+                    admitted,
                 )
                 .await;
         }
@@ -7385,14 +8192,17 @@ where
 
             debug_assert!(transcript_generation >= transcript_generation_after_content);
             let updated_content = crate::db::MessageContent::tool(&tool_id, &llm_content, false);
-            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                sequence_id: seq,
-                message_id: message_id.clone(),
-                transcript_generation: Some(transcript_generation),
-                display_data: Some(display_data.clone()),
-                content: Some(updated_content),
-                duration_ms: None,
-            });
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .event(|seq| SseEvent::MessageUpdated {
+                    sequence_id: seq,
+                    message_id: message_id.clone(),
+                    transcript_generation: Some(transcript_generation),
+                    display_data: Some(display_data.clone()),
+                    content: Some(updated_content),
+                    duration_ms: None,
+                });
         } else {
             // No spawn_tool_id: spawn_agents wasn't the last tool in the batch, so
             // there is no assistant tool_use to pair a tool_result against. Persist
@@ -7418,7 +8228,10 @@ where
                 .await?;
 
             // Broadcast the new message (meta user observation, no bash enrichment needed)
-            let _ = self.broadcast_tx.send_message(message);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
         }
 
         Ok(None)
@@ -7431,6 +8244,7 @@ where
         llm_content: String,
         display_data: serde_json::Value,
         settlement: &ActiveDirectTurnSettlement,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let evidence = if let Some(tool_id) = spawn_tool_id {
             TerminalSubAgentEvidence::Update {
@@ -7478,17 +8292,16 @@ where
                 display_data,
                 ..
             } => {
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                    sequence_id: seq,
-                    message_id,
-                    transcript_generation,
-                    display_data: Some(display_data),
-                    content: Some(content),
-                    duration_ms: None,
-                });
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .message_updated(message_id, transcript_generation, display_data, content);
             }
             TerminalSubAgentEvidence::Insert(message) => {
-                let _ = self.broadcast_tx.send_message(message);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(message);
             }
         }
         Ok(None)
@@ -7517,6 +8330,7 @@ where
     fn request_continuation(
         &mut self,
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) {
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
@@ -7574,7 +8388,10 @@ where
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
 
-        let handle = tokio::spawn(async move {
+        let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let continuation_admission = admitted.reborrow();
+        let continuation_task = async move {
+            let _continuation_admission = continuation_admission;
             // Build messages from history and add continuation request
             let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                 Ok(m) => m,
@@ -7738,6 +8555,13 @@ where
                     let _ = event_tx.send(event).await;
                 }
             }
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = wait_for_optional_cancellation(fatal_external_effect_cancellation) => {}
+                () = continuation_task => {}
+            }
         });
         self.llm_task_handle = Some(handle);
     }
@@ -7748,6 +8572,7 @@ where
         &mut self,
         system_message: String,
         repo_root: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         let conv_id = &self.context.conversation_id;
 
@@ -7788,16 +8613,22 @@ where
             .await?;
 
         // Broadcast SSE events
-        let _ = self.broadcast_tx.send_message(msg);
-        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            state: ConvState::Terminal,
-            presentation_mode: ConvState::Terminal.presentation_mode().to_string(),
-            state_updated_at: self.state_updated_at,
-        });
         let _ = self
             .broadcast_tx
-            .send_seq(|seq| SseEvent::ConversationUpdate {
+            .admitted_publication(admitted)
+            .persisted_message(msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .state_change(
+                ConvState::Terminal,
+                ConvState::Terminal.presentation_mode().to_string(),
+                self.state_updated_at,
+            );
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|seq| SseEvent::ConversationUpdate {
                 sequence_id: seq,
                 update: crate::runtime::ConversationMetadataUpdate {
                     slug: None,
@@ -7833,6 +8664,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         let cwd = self.context.filesystem_root().to_path_buf();
         // The spec invariant WorktreePathDerivedFromConversation requires
@@ -7852,20 +8684,22 @@ where
         let priority_backup = priority;
         let plan_backup = plan.clone();
 
-        // Run blocking git/fs operations on a blocking thread
-        let result = tokio::task::spawn_blocking(move || {
-            execute_approve_task_blocking(
-                &cwd,
-                &repo_root,
-                &conv_id,
-                &tasks_dir_name,
-                &task_file,
-                &title,
-                desired_base_branch.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| format!("Task approval join error: {e}"))?;
+        // Run blocking git/fs operations on a blocking thread.
+        let blocking_admission = admitted.reborrow();
+        let result =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                execute_approve_task_blocking(
+                    &cwd,
+                    &repo_root,
+                    &conv_id,
+                    &tasks_dir_name,
+                    &task_file,
+                    &title,
+                    desired_base_branch.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("Task approval join error: {e}"))?;
 
         match result {
             Ok(approval_result) => {
@@ -7948,14 +8782,18 @@ where
                         None,
                     )
                     .await?;
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
 
                 // Push updated conversation metadata to the client so it
                 // reflects the new cwd, branch, worktree_path, and mode label
                 // without requiring a reconnect.
                 let _ = self
                     .broadcast_tx
-                    .send_seq(|seq| SseEvent::ConversationUpdate {
+                    .admitted_publication(admitted)
+                    .event(|seq| SseEvent::ConversationUpdate {
                         sequence_id: seq,
                         update: crate::runtime::ConversationMetadataUpdate {
                             slug: None,
@@ -7987,19 +8825,16 @@ where
                 // Revert in-memory state to AwaitingTaskApproval so the user can retry.
                 // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
                 // new Idle state yet), so this keeps memory and DB consistent.
-                self.state = ConvState::AwaitingTaskApproval {
-                    task_file: task_file_backup,
-                    title: title_backup,
-                    priority: priority_backup,
-                    plan: plan_backup,
-                };
-                self.state_updated_at = Utc::now();
-                // Publish the revert so live-state observers (effective_conversation_state)
-                // see AwaitingTaskApproval, not the LlmRequesting this approval briefly
-                // advanced to before the failure.
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                self.install_live_state(
+                    ConvState::AwaitingTaskApproval {
+                        task_file: task_file_backup,
+                        title: title_backup,
+                        priority: priority_backup,
+                        plan: plan_backup,
+                    },
+                    Utc::now(),
+                    true,
+                )?;
                 // Direct state write bypasses apply_transition_result, so
                 // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
@@ -8030,6 +8865,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
         let repo_root =
@@ -8043,35 +8879,37 @@ where
         let priority_backup = priority;
         let plan_backup = plan.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            execute_approve_task_blocking(
-                &cwd,
-                &repo_root,
-                &conv_id,
-                &tasks_dir_name,
-                &task_file,
-                &title,
-                desired_base_branch.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| format!("Task approval join error: {e}"))?;
+        let mut authority = authority;
+        let blocking_admission = authority.reborrow();
+        let result =
+            crate::runtime::creation_worker::run_admitted_blocking(blocking_admission, move || {
+                execute_approve_task_blocking(
+                    &cwd,
+                    &repo_root,
+                    &conv_id,
+                    &tasks_dir_name,
+                    &task_file,
+                    &title,
+                    desired_base_branch.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| format!("Task approval join error: {e}"))?;
 
         let approval_result = match result {
             Ok(result) => result,
             Err(e) => {
                 tracing::error!(error = %e, "Fresh task approval git operations failed");
-                self.state = ConvState::AwaitingTaskApproval {
-                    task_file: task_file_backup,
-                    title: title_backup,
-                    priority: priority_backup,
-                    plan: plan_backup,
-                };
-                self.state_updated_at = Utc::now();
-                // Publish the revert so live-state observers stay consistent.
-                if let Some(tx) = &self.state_watcher {
-                    let _ = tx.send(self.state.clone());
-                }
+                self.install_live_state(
+                    ConvState::AwaitingTaskApproval {
+                        task_file: task_file_backup,
+                        title: title_backup,
+                        priority: priority_backup,
+                        plan: plan_backup,
+                    },
+                    Utc::now(),
+                    true,
+                )?;
                 // Direct state write bypasses apply_transition_result, so
                 // close any turn span opened by the brief LlmRequesting here.
                 self.settle_turn_span();
@@ -8108,6 +8946,7 @@ where
                 plan: plan_backup,
                 task_file: approval_result.task_file,
             },
+            authority,
             response_tx,
         };
         handoff_tx
@@ -8117,6 +8956,7 @@ where
         let response = response_rx
             .await
             .map_err(|e| format!("fresh task handoff response dropped: {e}"))??;
+        self.handoff_completion_timestamp = Some(response.state_updated_at);
         Ok(Some(Event::TaskHandoffComplete {
             successor_conv_id: response.successor_conv_id,
         }))
@@ -10323,6 +11163,7 @@ fn cleanup_worktree_if_present(
 
 #[cfg(test)]
 mod continuation_prompt_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::state_machine::state::ToolInput;
     use crate::tools::BashToolInput;
@@ -10542,7 +11383,7 @@ mod dispatch_context_budget_tests {
         );
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("dispatch large request");
         runtime
@@ -10721,7 +11562,8 @@ mod creation_completion_lifecycle_tests {
             event_rx,
             mpsc::channel::<Event>(1).0,
             crate::runtime::SseBroadcaster::new(128, 0),
-        );
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
         RuntimeHarness {
             runtime,
             storage,
@@ -10951,6 +11793,7 @@ mod creation_completion_lifecycle_tests {
 
 #[cfg(test)]
 mod authoritative_user_message_effect_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::db::{Message, MessageContent, MessageType};
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
@@ -11027,6 +11870,7 @@ mod authoritative_user_message_effect_tests {
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
         let broadcast_rx = broadcaster.subscribe();
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
         (
             ConversationRuntime::new(
                 context,
@@ -11042,7 +11886,8 @@ mod authoritative_user_message_effect_tests {
                 event_rx,
                 event_tx_dup,
                 broadcaster,
-            ),
+            )
+            .with_fatal_local_authority_fence(fence),
             storage,
             broadcast_rx,
         )
@@ -11111,6 +11956,10 @@ mod authoritative_user_message_effect_tests {
             },
         );
 
+        rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+            state: ConvState::LlmRequesting { attempt: 1 },
+            updated_at: Utc::now(),
+        });
         rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
             payload: payload("msg-direct"),
             authority: authority(),
@@ -11969,8 +12818,9 @@ mod authoritative_user_message_effect_tests {
             }));
             rt.classify_active_direct_turn_terminal(&event, &new_state);
             rt.state = new_state.clone();
-            rt.persist_state_effect(false).await.unwrap();
-            rt.persist_state_effect(false).await.unwrap();
+            let mut admitted = rt.admit_authoritative_effect().unwrap();
+            rt.persist_state_effect(false, &mut admitted).await.unwrap();
+            rt.persist_state_effect(false, &mut admitted).await.unwrap();
             let settlements = storage.recorded_settle_active_direct_turn_calls();
             assert_eq!(settlements.len(), 1);
             assert_eq!(
@@ -11983,6 +12833,61 @@ mod authoritative_user_message_effect_tests {
             assert_eq!(settlements[0].terminal, expected);
             assert_eq!(settlements[0].state, new_state);
         }
+    }
+
+    #[tokio::test]
+    async fn handoff_completion_retains_authority_through_state_publication() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        rt.state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--handoff-completion.md".to_string(),
+            title: "Handoff completion".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Complete the handoff".to_string(),
+        };
+        let (state_tx, state_rx) = watch::channel(rt.state.clone());
+        rt.state_watcher = Some(state_tx);
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let owner = fence.try_acquire().unwrap();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.handoff_completion_authority = Some(owner);
+        let persisted_timestamp = Utc::now() - chrono::Duration::seconds(5);
+        rt.handoff_completion_timestamp = Some(persisted_timestamp);
+        fence.close("test_handoff_completion");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+
+        rt.process_event(Event::TaskHandoffComplete {
+            successor_conv_id: "successor-conv".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &*state_rx.borrow(),
+            ConvState::HandedOff { successor_conv_id }
+                if successor_conv_id == "successor-conv"
+        ));
+        assert_eq!(rt.state_updated_at, persisted_timestamp);
+        assert!(rt.handoff_completion_authority.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_handoff_without_completion_does_not_retain_authority() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let owner = fence.try_acquire().unwrap();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+
+        rt.retain_handoff_completion_authority(None, Some(owner));
+        fence.close("test_failed_handoff");
+
+        assert!(rt.handoff_completion_authority.is_none());
+        assert_eq!(fence.owners_at_first_close(), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
@@ -12032,6 +12937,172 @@ mod authoritative_user_message_effect_tests {
             MessageContent::system("Task rejected.")
         );
         assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_cancellation_terminal_unit_finishes_after_checkpoint_close() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(27),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        let (checkpoint_started, checkpoint_release) = storage.gate_terminal_obligation();
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Cancelled,
+        ));
+        rt.state = ConvState::CancellingTool {
+            tool_use_id: "cancelled-tool".to_string(),
+            skipped_tools: Vec::new(),
+            completed_results: Vec::new(),
+            assistant_message: crate::state_machine::AssistantMessage::new(
+                "cancel-assistant".to_string(),
+                vec![ContentBlock::ToolUse {
+                    id: "cancelled-tool".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"cmd":"sleep 10"}),
+                }],
+                None,
+                None,
+            ),
+            pending_sub_agents: Vec::new(),
+        };
+        let cancellation = tokio::spawn(async move {
+            let result = rt
+                .process_event(Event::ToolAborted {
+                    tool_use_id: "cancelled-tool".to_string(),
+                })
+                .await;
+            (rt, result)
+        });
+
+        checkpoint_started
+            .await
+            .expect("checkpoint entered storage");
+        fence.close("test_tool_cancellation_checkpoint");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        checkpoint_release.send(()).expect("release checkpoint");
+
+        let (rt, result) = cancellation.await.expect("cancellation joins");
+        result.expect("admitted cancellation unit completes");
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(storage.recorded_settle_active_direct_turn_calls().len(), 1);
+        let mut message_count = 0;
+        let mut state_count = 0;
+        while let Ok(event) = broadcast_rx.try_recv() {
+            message_count += usize::from(matches!(event, SseEvent::Message { .. }));
+            state_count += usize::from(matches!(event, SseEvent::StateChange { .. }));
+        }
+        assert!(message_count > 0, "checkpoint evidence is published");
+        assert_eq!(state_count, 1, "terminal state is published exactly once");
+    }
+
+    #[tokio::test]
+    async fn terminal_persisted_message_and_state_publish_after_close_during_write() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(28),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        let (started, release) = storage.gate_terminal_obligation();
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/admitted-terminal.md".to_string(),
+            title: "Admitted terminal".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Finish the admitted atomic unit".to_string(),
+        };
+        let settlement = tokio::spawn(async move {
+            let result = rt
+                .process_event(Event::TaskApprovalDecided {
+                    outcome: crate::state_machine::state::TaskApprovalOutcome::Rejected,
+                })
+                .await;
+            (rt, result)
+        });
+
+        started.await.expect("terminal unit entered storage");
+        fence.close("test_terminal_settlement");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        release.send(()).expect("release terminal unit");
+
+        let (rt, result) = settlement.await.expect("settlement joins");
+        result.expect("admitted terminal unit completes");
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let mut message_count = 0;
+        let mut state_count = 0;
+        let mut agent_done_count = 0;
+        while let Ok(event) = broadcast_rx.try_recv() {
+            message_count += usize::from(matches!(event, SseEvent::Message { .. }));
+            state_count += usize::from(matches!(event, SseEvent::StateChange { .. }));
+            agent_done_count += usize::from(matches!(event, SseEvent::AgentDone { .. }));
+        }
+        assert_eq!(message_count, 1, "terminal evidence is published once");
+        assert_eq!(state_count, 1, "terminal state is published once");
+        assert_eq!(agent_done_count, 1, "terminal completion is published once");
+    }
+
+    #[tokio::test]
+    async fn terminal_state_settlement_rejected_when_fence_closes_before_admission() {
+        let (mut rt, storage, _rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.terminal_effect_admission_barrier = Some(Arc::clone(&barrier));
+        let turn = crate::runtime::traits::ActiveDirectTurn {
+            turn_id: phoenix_workflow::TurnAuthorityId(29),
+            generation: 0,
+        };
+        storage.set_active_direct_turn(Some(turn.clone()));
+        rt.active_direct_turn = Some(Box::new(turn));
+        rt.pending_direct_turn_terminal = Some(Box::new(
+            crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
+        ));
+        rt.state = ConvState::LlmRequesting { attempt: 1 };
+        let result = crate::state_machine::transition::TransitionResult::new(ConvState::Idle)
+            .with_effect(Effect::PersistState);
+        let settlement = tokio::spawn(async move {
+            let outcome = rt.apply_transition_result(result).await;
+            (rt, outcome)
+        });
+
+        barrier.wait().await;
+        fence.close("test_pre_terminal_admission");
+        assert_eq!(fence.owners_at_first_close(), Some(0));
+        barrier.wait().await;
+
+        let (rt, outcome) = settlement.await.expect("settlement joins");
+        assert_eq!(
+            outcome.unwrap_err(),
+            "runtime persistence closed after fatal local authority loss"
+        );
+        assert_eq!(
+            rt.direct_turn_terminal_fact,
+            TerminalFactDurability::ProcessOnly
+        );
+        assert!(storage
+            .recorded_settle_active_direct_turn_calls()
+            .is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -12330,7 +13401,8 @@ mod authoritative_user_message_effect_tests {
             ));
             rt.state = ConvState::Idle;
 
-            assert!(rt.persist_state_effect(true).await.is_err());
+            let mut admitted = rt.admit_authoritative_effect().unwrap();
+            assert!(rt.persist_state_effect(true, &mut admitted).await.is_err());
 
             assert!(matches!(
                 rt.pending_direct_turn_terminal.as_deref(),
@@ -12377,7 +13449,8 @@ mod authoritative_user_message_effect_tests {
             },
         };
 
-        rt.persist_state_effect(false).await.unwrap();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
 
         assert!(rt.active_direct_turn.is_none());
         assert!(rt.pending_direct_turn_terminal.is_none());
@@ -12411,7 +13484,8 @@ mod authoritative_user_message_effect_tests {
             &ConvState::Idle,
         );
         rt.state = ConvState::Idle;
-        rt.persist_state_effect(false).await.unwrap();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
         assert!(matches!(
             storage
                 .recorded_settle_active_direct_turn_calls()
@@ -12422,6 +13496,479 @@ mod authoritative_user_message_effect_tests {
                 ..
             }]
         ));
+    }
+
+    #[tokio::test]
+    async fn classifier_proven_commit_is_adopted_and_published() {
+        let (mut rt, _storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::ClassifiedCommitted {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        rt.apply_transition_result(result).await.unwrap();
+
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn proposed_direct_turn_state_is_not_observable_before_materialization_returns() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let transition = rt.apply_transition_result(result);
+        tokio::pin!(transition);
+        tokio::select! {
+            started = materialization_started => started.expect("materialization started"),
+            result = &mut transition => panic!("transition returned before materialization release: {result:?}"),
+        }
+
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
+        release_materialization
+            .send(())
+            .expect("release materialization");
+        transition.await.unwrap();
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fatal_signal_is_immediate_but_admitted_persistence_finishes() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = fence.subscribe();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+        let transition = tokio::spawn(async move { rt.apply_transition_result(result).await });
+
+        materialization_started
+            .await
+            .expect("persistence owner entered materialization");
+        while broadcast_rx.try_recv().is_ok() {}
+        fence.close("test_authority_boundary");
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("test_authority_boundary")
+        );
+
+        release_materialization
+            .send(())
+            .expect("release persistence owner");
+        assert_eq!(
+            transition.await.expect("transition joins").unwrap_err(),
+            "runtime state publication closed after fatal local authority loss"
+        );
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { message }) if message.message_id == "msg-direct"
+        ));
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_owner_signals_fatal_authority_loss() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut fatal_rx = fence.subscribe();
+        rt = rt.with_fatal_local_authority_fence(fence);
+        let (materialization_started, release_materialization) =
+            storage.gate_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let mut transition = Box::pin(rt.apply_transition_result(result));
+        tokio::select! {
+            started = materialization_started => started.expect("materialization started"),
+            result = &mut transition => panic!("transition returned before cancellation: {result:?}"),
+        }
+        drop(transition);
+
+        assert_eq!(
+            *fatal_rx.borrow_and_update(),
+            Some("direct_turn_boundary_owner_disappeared")
+        );
+        assert_no_broadcast(&mut broadcast_rx);
+        release_materialization
+            .send(())
+            .expect("release supervised boundary task");
+    }
+
+    #[tokio::test]
+    async fn direct_turn_authority_boundary_panic_is_fatal_without_adopting_state() {
+        let (mut rt, storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        storage.panic_authoritative_user_message_materialization();
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_boundary_disappeared"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
+    }
+
+    #[tokio::test]
+    async fn committed_direct_turn_publishes_watcher_before_later_effect_failure() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::Materialized {
+                message: Box::new(message("msg-direct", 1)),
+                active: crate::runtime::traits::ActiveDirectTurn {
+                    turn_id: phoenix_workflow::TurnAuthorityId(1),
+                    generation: 0,
+                },
+            },
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        rt.context.effort = Some(phoenix_core::domain::llm_types::ModelEffort::High);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            })
+            .with_effect(Effect::RequestLlm);
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert!(error.contains("Persisted effort"));
+        assert_eq!(*watch_rx.borrow(), ConvState::LlmRequesting { attempt: 1 });
+    }
+
+    #[tokio::test]
+    async fn unclassified_direct_turn_result_is_fatal_without_adopting_state() {
+        let (mut rt, _storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::DurableFactUnclassified,
+        );
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt.with_state_watcher(watch_tx);
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+        assert_no_broadcast(&mut broadcast_rx);
+    }
+
+    #[tokio::test]
+    async fn unclassified_materialization_closes_fence_while_effect_owner_is_live() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::DurableFactUnclassified,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let result =
+            crate::state_machine::transition::TransitionResult::new(ConvState::LlmRequesting {
+                attempt: 1,
+            })
+            .with_effect(Effect::PersistAuthoritativeUserMessage {
+                payload: payload("msg-direct"),
+                authority: authority(),
+                idempotent: false,
+            });
+
+        let error = rt.apply_transition_result(result).await.unwrap_err();
+
+        assert_eq!(
+            error,
+            "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:direct_turn_materialization"
+        );
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert!(fence.try_acquire().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_fence_rejects_live_state_installation_and_watcher_publication() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rt = rt
+            .with_state_watcher(watch_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        fence.close("test_authority_boundary");
+
+        let error = rt
+            .apply_transition_result(crate::state_machine::transition::TransitionResult::new(
+                ConvState::LlmRequesting { attempt: 1 },
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "runtime state publication closed after fatal local authority loss"
+        );
+        assert_eq!(rt.state, ConvState::Idle);
+        assert_eq!(*watch_rx.borrow(), ConvState::Idle);
+    }
+
+    #[test]
+    fn provider_and_tool_dispatch_are_authoritative_effects() {
+        assert!(matches!(
+            ClassifiedEffect::classify(Effect::RequestLlm),
+            ClassifiedEffect::Authoritative(_)
+        ));
+        assert!(matches!(
+            ClassifiedEffect::classify(Effect::ExecuteTool {
+                tool: ToolCall::new(
+                    "tool-1",
+                    crate::state_machine::state::ToolInput::Malformed {
+                        name: "test-tool".to_string(),
+                        input: serde_json::json!({}),
+                        error: "test input".to_string(),
+                    },
+                ),
+            }),
+            ClassifiedEffect::Authoritative(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn assistant_broadcast_admitted_before_fatal_close_still_completes() {
+        let (mut rt, _storage, mut broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::StaleAuthority,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.semantic_publication_barrier = Some(Arc::clone(&barrier));
+        let publish = tokio::spawn(async move {
+            let result = rt
+                .execute_effect(Effect::BroadcastAssistantMessage {
+                    message: crate::state_machine::AssistantMessage::new(
+                        "semantic-publication".to_string(),
+                        vec![ContentBlock::text("published")],
+                        None,
+                        None,
+                    ),
+                })
+                .await;
+            (rt, result)
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), barrier.wait())
+            .await
+            .expect("publication reached admitted barrier");
+        assert_eq!(fence.owner_count(), 1);
+        fence.close("test_semantic_publication");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        barrier.wait().await;
+
+        let (_rt, result) = publish.await.expect("publication joins");
+        result.expect("admitted semantic publication completes");
+        assert!(matches!(
+            broadcast_rx.try_recv(),
+            Ok(SseEvent::Message { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_effect_dispatch_holds_owner_until_task_is_registered() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.external_effect_dispatch_barrier = Some(Arc::clone(&barrier));
+        let dispatch = tokio::spawn(async move {
+            let result = rt.execute_effect(Effect::RequestLlm).await;
+            (rt, result)
+        });
+
+        barrier.wait().await;
+        fence.close("test_authority_boundary");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        barrier.wait().await;
+        let (mut rt, result) = dispatch.await.expect("dispatch joins");
+        result.expect("admitted external effect dispatches");
+        assert!(rt.llm_task_handle.is_some());
+        rt.abort_external_effects();
+        assert!(rt.llm_task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn fatal_signal_aborts_registered_external_tasks() {
+        let (mut rt, _storage, _broadcast_rx) = runtime(
+            DirectTurnMaterializationEligibility::Fresh,
+            AuthoritativeUserMessageMaterialization::StaleAuthority,
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (llm_started_tx, llm_started_rx) = oneshot::channel();
+        let (llm_dropped_tx, llm_dropped_rx) = oneshot::channel();
+        let (tool_dropped_tx, tool_dropped_rx) = oneshot::channel();
+        let tool_cancel_token = CancellationToken::new();
+        rt.tool_cancel_token = Some(tool_cancel_token.clone());
+        rt.llm_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(llm_dropped_tx));
+            let _ = llm_started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        rt.tool_task_handle = Some(tokio::spawn(async move {
+            struct NotifyDrop(Option<oneshot::Sender<()>>);
+            impl Drop for NotifyDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let _notify_drop = NotifyDrop(Some(tool_dropped_tx));
+            std::future::pending::<()>().await;
+        }));
+        let run = tokio::spawn(rt.run_inner());
+        llm_started_rx.await.expect("provider task started");
+
+        fence.close("test_authority_boundary");
+
+        assert_eq!(
+            run.await.expect("runtime joins"),
+            RuntimeExitDisposition::FatalLocalAuthorityLoss
+        );
+        llm_dropped_rx.await.expect("provider task aborted");
+        tool_dropped_rx.await.expect("tool task aborted");
+        assert!(tool_cancel_token.is_cancelled());
     }
 
     #[tokio::test]
@@ -12471,6 +14018,10 @@ mod authoritative_user_message_effect_tests {
             let (mut rt, storage, mut rx) =
                 runtime(DirectTurnMaterializationEligibility::Fresh, materialize);
 
+            rt.proposed_direct_turn_state = Some(ProposedDirectTurnState {
+                state: ConvState::LlmRequesting { attempt: 1 },
+                updated_at: Utc::now(),
+            });
             rt.execute_effect(Effect::PersistAuthoritativeUserMessage {
                 payload: payload("msg-direct"),
                 authority: authority(),
@@ -13428,7 +14979,8 @@ mod approve_task_failure_effect_tests {
             event_rx,
             event_tx_dup,
             SseBroadcaster::new(128, 0),
-        );
+        )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new());
 
         let result = rt
             .process_event(Event::TaskApprovalDecided {
@@ -13850,6 +15402,7 @@ mod runtime_context_promotion_tests {
 
 #[cfg(test)]
 mod steer_drain_detector_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::event::SteerEntry;
@@ -13945,6 +15498,7 @@ mod steer_drain_detector_tests {
             event_tx_dup,
             broadcaster,
         )
+        .with_fatal_local_authority_fence(crate::runtime::FatalLocalAuthorityFence::new())
         .with_steering_queue(queue);
         (rt, storage)
     }
@@ -14560,7 +16114,8 @@ mod steer_drain_detector_tests {
             task: "investigate".to_string(),
             outcome: SubAgentOutcome::TimedOut,
         }];
-        rt.persist_sub_agent_results(results, None, "subagent-summary".to_string())
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_sub_agent_results(results, None, "subagent-summary".to_string(), &mut admitted)
             .await
             .expect("persist must succeed");
 
@@ -15467,6 +17022,97 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
     }
 
+    #[tokio::test]
+    async fn tool_metrics_writer_retains_owner_through_blocked_db_write() {
+        use phoenix_core::domain::llm_types::{
+            LlmAttemptCapture, LlmRequestTelemetry, LlmTransport,
+        };
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-tool-metrics-owner",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        let (started, release) = storage.gate_metrics_write();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        let metrics_tx = rt.test_tool_metrics_writer(&mut admitted);
+        let capture = LlmAttemptCapture::new();
+        capture.begin(
+            &LlmRequestTelemetry {
+                conversation_id: "conv-tool-metrics-owner".to_string(),
+                root_conversation_id: "conv-tool-metrics-owner".to_string(),
+                request_id: "metrics-request".to_string(),
+                retry_attempt: 0,
+                attempt_capture: capture.clone(),
+            },
+            "test-provider",
+            "test-model",
+            LlmTransport::InProcess,
+        );
+        let metrics = capture
+            .finalize_cancelled()
+            .expect("initialized metrics capture finalizes");
+        metrics_tx.send(metrics).expect("queue metrics write");
+        drop(metrics_tx);
+        drop(admitted);
+
+        started.await.expect("metrics DB write started");
+        fence.close("test_tool_metrics_writer");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert_eq!(fence.owner_count(), 1);
+
+        release.send(()).expect("release metrics DB write");
+        tokio::time::timeout(std::time::Duration::from_secs(10), fence.wait_for_owners())
+            .await
+            .expect("metrics writer owner drains after DB write");
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn nonterminal_persist_message_publishes_after_close_during_write() {
+        use crate::db::{MessageContent, UserContent};
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-admitted-nonterminal",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = rt.broadcast_tx.subscribe();
+        let (started, release) = storage.gate_message_add();
+        let persistence = tokio::spawn(async move {
+            let result = rt
+                .execute_effect(Effect::PersistMessage {
+                    content: MessageContent::User(UserContent::new("admitted-message")),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: "admitted-nonterminal".to_string(),
+                    idempotent: false,
+                })
+                .await;
+            (rt, result)
+        });
+
+        started.await.expect("message write started");
+        fence.close("test_nonterminal_message_write");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        release.send(()).expect("release message write");
+
+        let (_rt, result) = persistence.await.expect("message write joins");
+        result.expect("admitted message write completes");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Message { message }) if message.message_id == "admitted-nonterminal"
+        ));
+        assert_eq!(fence.owner_count(), 0);
+    }
+
     /// Regression: a tool result carrying typed images must survive the
     /// normal `PersistCheckpoint` round into `ToolContent.images`. Before
     /// this was threaded, `MessageContent::tool(...)` dropped the field, so
@@ -15562,7 +17208,8 @@ mod steer_drain_detector_tests {
         )
         .unwrap();
 
-        rt.persist_checkpoint_with_terminal_obligation(data, &settlement)
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_checkpoint_with_terminal_obligation(data, &settlement, &mut admitted)
             .await
             .expect("retired checkpoint is resolved");
 
@@ -15723,7 +17370,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.llm_turn_count = 1;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("grace dispatch");
 
@@ -15787,7 +17434,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.llm_turn_count = 1;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("normal retry dispatch");
 
@@ -15858,7 +17505,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.grace_turn_granted = true;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("grace retry dispatch");
 
@@ -16731,6 +18378,7 @@ mod sender_drop_forwarder_tests {
 /// live fire is still honored when it arrives.
 #[cfg(test)]
 mod retry_timer_epoch_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::tools::BrowserSessionManager;
@@ -16780,6 +18428,7 @@ mod retry_timer_epoch_tests {
     /// `process_outcome`. Returns `true` if the timeout was applied, `false` if
     /// discarded as stale. Tests use this to exercise the real guard
     /// (`retry_timeout_is_stale`) deterministically without spinning the loop.
+    #[allow(clippy::large_futures)]
     async fn route_retry_timeout(rt: &mut TestRuntime, generation: u64, attempt: u32) -> bool {
         if rt.retry_timeout_is_stale(generation) {
             return false;
@@ -17678,6 +19327,7 @@ mod stale_tool_result_clearing_tests {
 /// discarded.
 #[cfg(test)]
 mod llm_generation_guard_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::outcome::LlmOutcome;
@@ -17830,6 +19480,7 @@ mod llm_generation_guard_tests {
 /// the reducer. REQ-BED-005a.
 #[cfg(test)]
 mod tool_generation_guard_tests {
+    #![allow(clippy::large_futures)]
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::outcome::ToolExecOutcome;

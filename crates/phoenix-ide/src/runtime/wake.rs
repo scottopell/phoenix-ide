@@ -30,6 +30,16 @@ const LEASE_DURATION: Duration = Duration::from_secs(30);
 const EMPTY_RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 const ERROR_RETRY_BASE_INTERVAL: Duration = Duration::from_millis(250);
 const ERROR_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(5);
+const FATAL_AUTHORITY_CLOSED: &str = "fatal local authority closed during wake pass";
+
+fn wake_authority_owner(
+    manager: Option<&Arc<RuntimeManager>>,
+) -> Result<Option<crate::runtime::AdmittedOperation>, String> {
+    manager
+        .map(|manager| manager.acquire_local_authority_pass())
+        .transpose()
+        .map_err(|()| FATAL_AUTHORITY_CLOSED.to_string())
+}
 
 fn fresh_process_incarnation() -> ProcessIncarnation {
     let mut bytes = [0u8; 8];
@@ -118,10 +128,7 @@ pub(crate) async fn run(
         Arc::new(SystemClock),
         fresh_process_incarnation(),
     );
-    if let Err(error) = worker
-        .run_loop_with_manager(kick_rx, manager, ready_tx)
-        .await
-    {
+    if let Err(error) = Box::pin(worker.run_loop_with_manager(kick_rx, manager, ready_tx)).await {
         tracing::warn!(error = %error, "wake worker stopped after DB/inspection error");
     }
 }
@@ -155,14 +162,29 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Arc<RuntimeManager>,
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), String> {
-        self.repo
-            .reconcile_continuation_transfers(self.clock.now())
+        let transfers = self
+            .repo
+            .list_continuation_transfer_units()
             .await
             .map_err(|error| error.to_string())?;
-        self.run_once().await?;
+        for (predecessor, continuation, workflow_id) in transfers {
+            let Ok(_owner) = manager.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            self.repo
+                .transfer_workflow_for_continuation(
+                    &predecessor,
+                    &continuation,
+                    workflow_id,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        self.run_once_with_manager(Some(&manager)).await?;
         deliver_pending(&manager, &self.repo, self.clock.now()).await?;
         let _ = ready_tx.send(());
-        self.run_loop_inner(&mut kick_rx, Some(manager)).await
+        Box::pin(self.run_loop_inner(&mut kick_rx, Some(manager))).await
     }
 
     async fn run_loop_inner(
@@ -171,29 +193,28 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         manager: Option<Arc<RuntimeManager>>,
     ) -> Result<(), String> {
         let mut error_backoff = ERROR_RETRY_BASE_INTERVAL;
+        let mut fatal_local_authority_rx = manager
+            .as_ref()
+            .map(|manager| manager.fatal_local_authority_receiver());
         loop {
-            let wait = match self.run_once().await {
+            let pass = async {
+                let wait = self.run_once_with_manager(manager.as_ref()).await?;
+                if let Some(manager) = manager.as_ref() {
+                    deliver_pending(manager, &self.repo, self.clock.now()).await?;
+                }
+                Ok::<Duration, String>(wait)
+            }
+            .await;
+            if matches!(&pass, Err(error) if error == FATAL_AUTHORITY_CLOSED) {
+                return Ok(());
+            }
+            let wait = match pass {
                 Ok(wait) => {
-                    if let Some(manager) = manager.as_ref() {
-                        if let Err(error) =
-                            deliver_pending(manager, &self.repo, self.clock.now()).await
-                        {
-                            tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker delivery failed; retrying");
-                            let wait = error_backoff;
-                            error_backoff =
-                                (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
-                            wait
-                        } else {
-                            error_backoff = ERROR_RETRY_BASE_INTERVAL;
-                            wait
-                        }
-                    } else {
-                        error_backoff = ERROR_RETRY_BASE_INTERVAL;
-                        wait
-                    }
+                    error_backoff = ERROR_RETRY_BASE_INTERVAL;
+                    wait
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker iteration failed; retrying");
+                    tracing::warn!(error = %error, retry_in = ?error_backoff, "wake worker pass failed; retrying");
                     let wait = error_backoff;
                     error_backoff = (error_backoff.saturating_mul(2)).min(ERROR_RETRY_MAX_INTERVAL);
                     wait
@@ -201,11 +222,24 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
             };
             let sleep = self.clock.sleep(wait);
             tokio::pin!(sleep);
-            tokio::select! {
-                () = &mut sleep => {}
-                changed = kick_rx.changed() => {
-                    if changed.is_err() {
-                        return Ok(());
+            if let Some(fatal) = fatal_local_authority_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = crate::tls::wait_for_fatal_local_authority(fatal) => return Ok(()),
+                    () = &mut sleep => {}
+                    changed = kick_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    () = &mut sleep => {}
+                    changed = kick_rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -214,23 +248,36 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
 
     #[cfg(test)]
     async fn run_loop(&self, mut kick_rx: watch::Receiver<u64>) -> Result<(), String> {
-        self.run_loop_inner(&mut kick_rx, None).await
+        Box::pin(self.run_loop_inner(&mut kick_rx, None)).await
     }
 
+    #[cfg(test)]
     async fn run_once(&self) -> Result<Duration, String> {
+        self.run_once_with_manager(None).await
+    }
+
+    async fn run_once_with_manager(
+        &self,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<Duration, String> {
         let now = self.clock.now();
-        let next_wait = self.observe_candidates(now).await?;
-        self.expire_due(now).await?;
+        let next_wait = self.observe_candidates(now, manager).await?;
+        self.expire_due(now, manager).await?;
         Ok(next_wait)
     }
 
-    async fn expire_due(&self, now: Timestamp) -> Result<(), String> {
+    async fn expire_due(
+        &self,
+        now: Timestamp,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<(), String> {
         let expired = self
             .repo
             .list_expired_unresolved(now, EXPIRY_BATCH_LIMIT)
             .await
             .map_err(|e| e.to_string())?;
         for row in expired {
+            let _owner = wake_authority_owner(manager)?;
             if let Err(error) = self.repo.expire_if_unresolved(row.workflow_id, now).await {
                 tracing::warn!(workflow_id = row.workflow_id.0, error = %error, "wake expiry failed for one contract; continuing");
             }
@@ -238,7 +285,11 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
         Ok(())
     }
 
-    async fn observe_candidates(&self, now: Timestamp) -> Result<Duration, String> {
+    async fn observe_candidates(
+        &self,
+        now: Timestamp,
+        manager: Option<&Arc<RuntimeManager>>,
+    ) -> Result<Duration, String> {
         let mut next_wait = EMPTY_RESCAN_INTERVAL;
         let mut saw_candidate = false;
         let mut cursor = None;
@@ -250,6 +301,7 @@ impl<I: TerminalInspector, C: WakeClock> WakeWorker<I, C> {
                 .map_err(|e| e.to_string())?;
             let page_len = candidates.len();
             for candidate in candidates {
+                let _owner = wake_authority_owner(manager)?;
                 cursor = Some(candidate.workflow_id);
                 saw_candidate = true;
                 let claim_until = LeaseExpiry(
@@ -383,6 +435,8 @@ async fn deliver_pending(
         }
         let page_len = pending.len();
         for row in pending {
+            let mut owner = wake_authority_owner(Some(manager))?
+                .expect("runtime-backed wake delivery has fatal authority admission");
             let next_cursor = WakePendingGlobalCursor {
                 workflow_id: row.workflow_id,
                 delivery_id: row.delivery_id,
@@ -469,7 +523,8 @@ async fn deliver_pending(
                 MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
                     let _ = handle
                         .broadcast_tx
-                        .send_message(link.linked_message.message.clone());
+                        .admitted_publication(&mut owner)
+                        .persisted_message(link.linked_message.message.clone());
                     let conversation_id = current.conversation_id;
                     match repo
                         .adopt_materialized_pending_for_conversation(&conversation_id, now)
@@ -744,6 +799,73 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
+
+    fn run_test_units_with_admission<T>(
+        units: impl IntoIterator<Item = T>,
+        mut admit: impl FnMut() -> Result<(), ()>,
+        mut run: impl FnMut(T),
+    ) {
+        for unit in units {
+            if admit().is_err() {
+                break;
+            }
+            run(unit);
+        }
+    }
+
+    #[tokio::test]
+    async fn closure_between_wake_candidates_prevents_next_candidate() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&open);
+        let close = Arc::clone(&open);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::clone(&observed);
+        run_test_units_with_admission(
+            ["candidate-1", "candidate-2"],
+            move || admission.load(Ordering::Acquire).then_some(()).ok_or(()),
+            move |unit| {
+                results.lock().unwrap().push(unit);
+                close.store(false, Ordering::Release);
+            },
+        );
+        assert_eq!(*observed.lock().unwrap(), vec!["candidate-1"]);
+    }
+
+    #[tokio::test]
+    async fn closure_between_wake_deliveries_prevents_next_delivery() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&open);
+        let close = Arc::clone(&open);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::clone(&observed);
+        run_test_units_with_admission(
+            ["delivery-1", "delivery-2"],
+            move || admission.load(Ordering::Acquire).then_some(()).ok_or(()),
+            move |unit| {
+                results.lock().unwrap().push(unit);
+                close.store(false, Ordering::Release);
+            },
+        );
+        assert_eq!(*observed.lock().unwrap(), vec!["delivery-1"]);
+    }
+
+    #[tokio::test]
+    async fn closure_between_exact_workflow_transfers_prevents_next_transfer() {
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = Arc::clone(&open);
+        let close = Arc::clone(&open);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let results = Arc::clone(&observed);
+        run_test_units_with_admission(
+            ["workflow-1", "workflow-2"],
+            move || admission.load(Ordering::Acquire).then_some(()).ok_or(()),
+            move |unit| {
+                results.lock().unwrap().push(unit);
+                close.store(false, Ordering::Release);
+            },
+        );
+        assert_eq!(*observed.lock().unwrap(), vec!["workflow-1"]);
+    }
 
     #[derive(Clone)]
     struct TestClock {
@@ -1268,7 +1390,7 @@ mod tests {
             ProcessIncarnation(1),
         );
         let (tx, rx) = watch::channel(0u64);
-        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+        let join = tokio::spawn(async move { Box::pin(worker.run_loop(rx)).await });
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, EMPTY_RESCAN_INTERVAL);
         tx.send(1).unwrap();
@@ -1342,7 +1464,7 @@ mod tests {
             ProcessIncarnation(1),
         );
         let (_tx, rx) = watch::channel(0u64);
-        let join = tokio::spawn(async move { worker.run_loop(rx).await });
+        let join = tokio::spawn(async move { Box::pin(worker.run_loop(rx)).await });
 
         let observed_sleep = sleep_rx.await.unwrap();
         assert_eq!(observed_sleep, ERROR_RETRY_MAX_INTERVAL);

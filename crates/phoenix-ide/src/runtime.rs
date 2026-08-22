@@ -51,9 +51,11 @@ use phoenix_core::domain::bash_progress::BashToolProgress;
 use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, RwLock};
 use tracing::Instrument;
 
 /// Shared slot carrying the trace identity of whatever triggered a
@@ -157,10 +159,10 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
-#[derive(Debug)]
 pub struct TaskApprovalHandoffRequest {
     pub parent_conversation_id: String,
     pub approval: TaskApprovalHandoffData,
+    pub authority: AdmittedOperation,
     pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
 }
 
@@ -169,6 +171,7 @@ pub use phoenix_core::task_handoff::TaskApprovalHandoffData;
 #[derive(Debug, Clone)]
 pub struct TaskApprovalHandoffResponse {
     pub successor_conv_id: String,
+    pub state_updated_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -219,7 +222,49 @@ mod conversation_mutex_gate_tests {
 }
 
 type RuntimeMaterializationResult = Result<ConversationHandle, String>;
-type RuntimeMaterializationSender = watch::Sender<Option<RuntimeMaterializationResult>>;
+
+struct RuntimeMaterializationAuthority {
+    inherited: Option<AdmittedOperation>,
+    accepting_transfers: bool,
+}
+
+struct RuntimeMaterializationSlot {
+    result_tx: watch::Sender<Option<RuntimeMaterializationResult>>,
+    authority: std::sync::Mutex<RuntimeMaterializationAuthority>,
+}
+
+impl RuntimeMaterializationSlot {
+    fn transfer_authority(&self, authority: AdmittedOperation) -> Result<(), AdmittedOperation> {
+        let mut state = self
+            .authority
+            .lock()
+            .expect("runtime materialization authority poisoned");
+        if !state.accepting_transfers {
+            return Err(authority);
+        }
+        if state.inherited.is_none() {
+            state.inherited = Some(authority);
+        }
+        Ok(())
+    }
+
+    fn take_authority(&self) -> Option<AdmittedOperation> {
+        self.authority
+            .lock()
+            .expect("runtime materialization authority poisoned")
+            .inherited
+            .take()
+    }
+
+    fn seal_authority_transfers(&self) -> Option<AdmittedOperation> {
+        let mut state = self
+            .authority
+            .lock()
+            .expect("runtime materialization authority poisoned");
+        state.accepting_transfers = false;
+        state.inherited.take()
+    }
+}
 
 pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
     error.contains("has an invalid working directory")
@@ -229,6 +274,176 @@ pub(crate) fn is_invalid_runtime_cwd_error(error: &str) -> bool {
 }
 
 /// Manager for all conversation runtimes
+struct FatalLocalAuthorityFenceState {
+    closed: bool,
+    boundary: Option<&'static str>,
+    fatal_deadline: Option<tokio::time::Instant>,
+    owners: usize,
+}
+
+pub(crate) struct FatalLocalAuthorityFence {
+    state: Mutex<FatalLocalAuthorityFenceState>,
+    owners_drained: Notify,
+    external_effect_cancellation: tokio_util::sync::CancellationToken,
+    tx: watch::Sender<Option<&'static str>>,
+    #[cfg(test)]
+    owners_at_first_close: AtomicUsize,
+}
+
+pub(crate) struct AdmittedOperation {
+    fence: Option<Arc<FatalLocalAuthorityFence>>,
+}
+
+impl FatalLocalAuthorityFence {
+    fn new() -> Arc<Self> {
+        let (tx, _) = watch::channel(None);
+        Arc::new(Self {
+            state: Mutex::new(FatalLocalAuthorityFenceState {
+                closed: false,
+                boundary: None,
+                fatal_deadline: None,
+                owners: 0,
+            }),
+            owners_drained: Notify::new(),
+            external_effect_cancellation: tokio_util::sync::CancellationToken::new(),
+            tx,
+            #[cfg(test)]
+            owners_at_first_close: AtomicUsize::new(usize::MAX),
+        })
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<AdmittedOperation, ()> {
+        let mut state = self.state.lock().expect("fatal authority fence poisoned");
+        if state.closed {
+            return Err(());
+        }
+        state.owners += 1;
+        Ok(AdmittedOperation {
+            fence: Some(Arc::clone(self)),
+        })
+    }
+
+    pub(crate) fn close(&self, boundary: &'static str) {
+        let mut state = self.state.lock().expect("fatal authority fence poisoned");
+        state.closed = true;
+        let boundary = *state.boundary.get_or_insert(boundary);
+        state
+            .fatal_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + crate::tls::SHUTDOWN_GRACE);
+        #[cfg(test)]
+        let _ = self.owners_at_first_close.compare_exchange(
+            usize::MAX,
+            state.owners,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.tx.send_replace(Some(boundary));
+        self.external_effect_cancellation.cancel();
+        drop(state);
+    }
+
+    async fn wait_for_owners(&self) {
+        loop {
+            let notified = self.owners_drained.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .expect("fatal authority fence poisoned")
+                .owners
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .closed
+    }
+
+    pub(crate) fn fatal_deadline(&self) -> Option<tokio::time::Instant> {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .fatal_deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect("fatal authority fence poisoned")
+            .owners
+    }
+
+    #[cfg(test)]
+    fn owners_at_first_close(&self) -> Option<usize> {
+        match self.owners_at_first_close.load(Ordering::Acquire) {
+            usize::MAX => None,
+            owners => Some(owners),
+        }
+    }
+
+    pub(crate) fn external_effect_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.external_effect_cancellation.clone()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<&'static str>> {
+        self.tx.subscribe()
+    }
+}
+
+impl AdmittedOperation {
+    pub(crate) fn close(&self, boundary: &'static str) {
+        self.fence
+            .as_ref()
+            .expect("transferred admitted operation used again")
+            .close(boundary);
+    }
+
+    pub(crate) fn transfer(&mut self) -> Self {
+        Self {
+            fence: Some(
+                self.fence
+                    .take()
+                    .expect("transferred admitted operation used again"),
+            ),
+        }
+    }
+
+    pub(crate) fn reborrow(&mut self) -> Self {
+        let fence = self
+            .fence
+            .as_ref()
+            .expect("transferred admitted operation used again");
+        let mut state = fence.state.lock().expect("fatal authority fence poisoned");
+        state.owners += 1;
+        Self {
+            fence: Some(Arc::clone(fence)),
+        }
+    }
+}
+
+impl Drop for AdmittedOperation {
+    fn drop(&mut self) {
+        let Some(fence) = self.fence.as_ref() else {
+            return;
+        };
+        let mut state = fence.state.lock().expect("fatal authority fence poisoned");
+        state.owners -= 1;
+        if state.owners == 0 {
+            drop(state);
+            fence.owners_drained.notify_waiters();
+        }
+    }
+}
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -253,7 +468,7 @@ pub struct RuntimeManager {
     /// The mutex protects only map admission/removal; unrelated conversations
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
-    runtime_creations: AsyncMutex<HashMap<String, RuntimeMaterializationSender>>,
+    runtime_creations: AsyncMutex<HashMap<String, Arc<RuntimeMaterializationSlot>>>,
     conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
@@ -261,6 +476,32 @@ pub struct RuntimeManager {
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     steering_enqueue_handle_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    subagent_persistence_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    bash_reconciliation_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    handoff_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    runtime_result_fixed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    fatal_runtime_map_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Serializes message admission per conversation while leaving unrelated
     /// conversations independent.
     message_acceptance: ConversationMutexGates,
@@ -342,7 +583,7 @@ pub struct RuntimeManager {
     wake_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
-    fatal_local_authority_tx: tokio::sync::watch::Sender<Option<&'static str>>,
+    fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -657,11 +898,27 @@ enum RingOp {
     BroadcastOnly,
 }
 
+impl std::fmt::Debug for AdmittedOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedOperation")
+            .field("active", &self.fence.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+enum QueuedBroadcastAuthority {
+    Unfenced,
+    Admitted(AdmittedOperation),
+}
+
 #[derive(Debug)]
 struct QueuedBroadcast {
     event: SseEvent,
     seq: i64,
     op: RingOp,
+    authority: QueuedBroadcastAuthority,
 }
 
 #[derive(Debug, Default)]
@@ -682,6 +939,112 @@ impl Drop for ReservedBroadcastRange {
             self.broadcaster.release_reserved_range();
             self.active = false;
         }
+    }
+}
+
+pub(crate) struct AdmittedPublication<'a> {
+    broadcaster: &'a SseBroadcaster,
+    admitted: &'a mut AdmittedOperation,
+}
+
+impl AdmittedPublication<'_> {
+    fn send(self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        self.broadcaster
+            .send_with_admission(self.admitted, event, seq, op)
+    }
+
+    pub(crate) fn event(self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(build(seq), seq, RingOp::Append)
+    }
+
+    pub(crate) fn reserved_event(
+        self,
+        sequence_id: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send(build(sequence_id), sequence_id, RingOp::Append)
+    }
+
+    pub(crate) fn persisted_message(self, message: crate::db::Message) -> Result<usize, ()> {
+        let seq = message.sequence_id;
+        self.broadcaster.observe_seq(seq);
+        self.send(SseEvent::Message { message }, seq, RingOp::Anchor)
+    }
+
+    pub(crate) fn assistant_message(self, message: crate::db::Message) -> Result<usize, ()> {
+        let seq = message.sequence_id;
+        self.broadcaster.observe_seq(seq);
+        self.send(SseEvent::Message { message }, seq, RingOp::Append)
+    }
+
+    pub(crate) fn message_updated(
+        self,
+        message_id: String,
+        transcript_generation: Option<i64>,
+        display_data: serde_json::Value,
+        content: crate::db::MessageContent,
+    ) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(
+            SseEvent::MessageUpdated {
+                sequence_id: seq,
+                message_id,
+                transcript_generation,
+                display_data: Some(display_data),
+                content: Some(content),
+                duration_ms: None,
+            },
+            seq,
+            RingOp::Append,
+        )
+    }
+
+    pub(crate) fn agent_done(self) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(
+            SseEvent::AgentDone { sequence_id: seq },
+            seq,
+            RingOp::Append,
+        )
+    }
+
+    pub(crate) fn state_change(
+        self,
+        state: ConvState,
+        presentation_mode: String,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(
+            SseEvent::StateChange {
+                sequence_id: seq,
+                state,
+                presentation_mode,
+                state_updated_at,
+            },
+            seq,
+            RingOp::Append,
+        )
+    }
+
+    pub(crate) fn reserved_state_change(
+        self,
+        sequence_id: i64,
+        state: ConvState,
+        presentation_mode: String,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<usize, ()> {
+        self.send(
+            SseEvent::StateChange {
+                sequence_id,
+                state,
+                presentation_mode,
+                state_updated_at,
+            },
+            sequence_id,
+            RingOp::Append,
+        )
     }
 }
 
@@ -737,6 +1100,7 @@ pub struct SseBroadcaster {
     /// Queues higher-sequence broadcasts while checkpoint persistence holds a
     /// reserved persisted-message sequence range.
     gate: Arc<Mutex<BroadcastGate>>,
+    fatal_local_authority_fence: Option<Arc<FatalLocalAuthorityFence>>,
 }
 
 impl SseBroadcaster {
@@ -758,6 +1122,7 @@ impl SseBroadcaster {
             last_seq: Arc::new(AtomicI64::new(initial_last_seq)),
             ring: Arc::new(Mutex::new(ring)),
             gate: Arc::new(Mutex::new(BroadcastGate::default())),
+            fatal_local_authority_fence: None,
         }
     }
 
@@ -767,6 +1132,18 @@ impl SseBroadcaster {
     pub fn new(channel_capacity: usize, initial_last_seq: i64) -> Self {
         let (tx, _rx) = broadcast::channel(channel_capacity);
         Self::from_sender(tx, initial_last_seq)
+    }
+
+    fn with_fatal_local_authority_fence(mut self, fence: Arc<FatalLocalAuthorityFence>) -> Self {
+        self.fatal_local_authority_fence = Some(fence);
+        self
+    }
+
+    fn fatal_publication_guard(&self) -> Result<Option<AdmittedOperation>, ()> {
+        self.fatal_local_authority_fence
+            .as_ref()
+            .map(FatalLocalAuthorityFence::try_acquire)
+            .transpose()
     }
 
     fn same_channel(&self, other: &Self) -> bool {
@@ -854,6 +1231,10 @@ impl SseBroadcaster {
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
+        let authority = match self.fatal_publication_guard()? {
+            Some(admitted) => QueuedBroadcastAuthority::Admitted(admitted),
+            None => QueuedBroadcastAuthority::Unfenced,
+        };
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -862,7 +1243,12 @@ impl SseBroadcaster {
             .reserved_until
             .is_some_and(|reserved_until| seq > reserved_until)
         {
-            gate.queued.push(QueuedBroadcast { event, seq, op });
+            gate.queued.push(QueuedBroadcast {
+                event,
+                seq,
+                op,
+                authority,
+            });
             return Ok(self.tx.receiver_count());
         }
         self.send_with_ring_unlocked(event, seq, op)
@@ -876,6 +1262,7 @@ impl SseBroadcaster {
     }
 
     pub fn send_hard_deleted_and_close(&self, conversation_id: String) -> Result<usize, ()> {
+        let _fatal_guard = self.fatal_publication_guard()?;
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -948,8 +1335,21 @@ impl SseBroadcaster {
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
         if !gate.hard_deleted {
-            for QueuedBroadcast { event, seq, op } in queued {
-                let _ = self.send_with_ring_unlocked(event, seq, op);
+            for QueuedBroadcast {
+                event,
+                seq,
+                op,
+                authority,
+            } in queued
+            {
+                match authority {
+                    QueuedBroadcastAuthority::Unfenced => {
+                        let _ = self.send_with_ring_unlocked(event, seq, op);
+                    }
+                    QueuedBroadcastAuthority::Admitted(_admitted) => {
+                        let _ = self.send_with_ring_unlocked(event, seq, op);
+                    }
+                }
             }
         }
         gate.reserved_until = None;
@@ -995,6 +1395,7 @@ impl SseBroadcaster {
     /// sequenced allocation. A later sequenced event therefore cannot allocate
     /// and reach the channel before this event carrying the earlier witness.
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let _fatal_guard = self.fatal_publication_guard()?;
         let gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -1008,6 +1409,7 @@ impl SseBroadcaster {
     /// `message.sequence_id`, advance the broadcaster's counter, AND reset
     /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
     /// events below this seq are no longer needed for replay).
+    #[cfg(test)]
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
@@ -1018,6 +1420,7 @@ impl SseBroadcaster {
     /// Existing call sites that broadcast persisted messages can keep using
     /// `send_message`; the eager (non-persisted) path is the new entry point
     /// [`SseBroadcaster::send_ephemeral_message`].
+    #[cfg(test)]
     pub fn send_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         self.send_persisted_message(message)
     }
@@ -1033,10 +1436,47 @@ impl SseBroadcaster {
     /// checkpoints, which resets the ring (discarding this entry) and emits
     /// a duplicate `sse_message` that the UI dedups via
     /// `SseMessageDedupReplay`.
+    #[cfg(test)]
     pub fn send_ephemeral_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
         self.send_with_ring(SseEvent::Message { message }, seq, RingOp::Append)
+    }
+
+    pub(crate) fn admitted_publication<'a>(
+        &'a self,
+        admitted: &'a mut AdmittedOperation,
+    ) -> AdmittedPublication<'a> {
+        AdmittedPublication {
+            broadcaster: self,
+            admitted,
+        }
+    }
+
+    fn send_with_admission(
+        &self,
+        admitted: &mut AdmittedOperation,
+        event: SseEvent,
+        seq: i64,
+        op: RingOp,
+    ) -> Result<usize, ()> {
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        if gate.hard_deleted {
+            return Err(());
+        }
+        if gate
+            .reserved_until
+            .is_some_and(|reserved_until| seq > reserved_until)
+        {
+            gate.queued.push(QueuedBroadcast {
+                event,
+                seq,
+                op,
+                authority: QueuedBroadcastAuthority::Admitted(admitted.reborrow()),
+            });
+            return Ok(self.tx.receiver_count());
+        }
+        self.send_with_ring_unlocked(event, seq, op)
     }
 
     /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
@@ -1626,7 +2066,7 @@ impl RuntimeManager {
         let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         let (wake_kick_tx, wake_kick_rx) = watch::channel(0u64);
         let (direct_turn_kick_tx, direct_turn_kick_rx) = watch::channel(0u64);
-        let (fatal_local_authority_tx, _) = watch::channel(None);
+        let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
                 phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
@@ -1656,6 +2096,32 @@ impl RuntimeManager {
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
             steering_enqueue_handle_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            subagent_persistence_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
+            #[cfg(test)]
+            fork_command_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            browser_retirement_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            hard_delete_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            terminal_cleanup_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            bash_reconciliation_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            fork_runtime_start_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            handoff_runtime_start_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            runtime_authority_transfer_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            runtime_authority_sealed_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            runtime_result_fixed_barrier: AsyncMutex::new(None),
+            #[cfg(test)]
+            fatal_runtime_map_barrier: AsyncMutex::new(None),
             message_acceptance: ConversationMutexGates::default(),
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
@@ -1682,7 +2148,7 @@ impl RuntimeManager {
             wake_kick_rx: RwLock::new(Some(wake_kick_rx)),
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
-            fatal_local_authority_tx,
+            fatal_local_authority_fence,
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -1694,7 +2160,22 @@ impl RuntimeManager {
     }
 
     pub(crate) fn signal_fatal_local_authority(&self, boundary: &'static str) {
-        self.fatal_local_authority_tx.send_replace(Some(boundary));
+        self.fatal_local_authority_fence.close(boundary);
+    }
+
+    pub(crate) fn require_startup_local_authority(
+        &self,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
+        self.require_local_authority_admission()
+            .map_err(|_| crate::FatalLocalAuthorityExit)
+    }
+
+    fn require_local_authority_admission(&self) -> Result<(), String> {
+        if self.fatal_local_authority_is_latched() {
+            Err("runtime admission closed after fatal local authority loss".to_string())
+        } else {
+            Ok(())
+        }
     }
 
     fn propagate_fatal_runtime_exit(
@@ -1707,24 +2188,74 @@ impl RuntimeManager {
         }
     }
 
-    pub(crate) async fn fence_fatal_local_authority(&self) {
-        let handles: Vec<_> = self
-            .runtimes
-            .write()
+    async fn handle_primary_runtime_exit(
+        &self,
+        conversation: &crate::db::Conversation,
+        disposition: executor::RuntimeExitDisposition,
+    ) {
+        self.propagate_fatal_runtime_exit(disposition, "primary conversation runtime");
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .runtime_exit_barriers
+            .lock()
             .await
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-        for handle in handles {
-            handle.broadcast_tx.close_publication();
-            let _ = handle.event_tx.send(Event::Shutdown).await;
+            .remove(&conversation.id)
+        {
+            barrier.wait().await;
         }
+        self.handle_runtime_exit(conversation, disposition).await;
+    }
+
+    pub(crate) async fn fence_fatal_local_authority(&self) {
+        self.fatal_local_authority_fence
+            .close("fatal_local_authority_fence");
+        let shutdown = async {
+            self.fatal_local_authority_fence.wait_for_owners().await;
+            let reserved: Vec<_> = self
+                .evicted_broadcasters
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect();
+            for broadcaster in reserved {
+                broadcaster.close_publication();
+            }
+
+            #[cfg(test)]
+            if let Some(barrier) = self.fatal_runtime_map_barrier.lock().await.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            let handles: Vec<_> = self
+                .runtimes
+                .write()
+                .await
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect();
+            for handle in handles {
+                handle.broadcast_tx.close_publication();
+                if let Err(error) = handle.event_tx.try_send(Event::Shutdown) {
+                    tracing::debug!(?error, "fatal shutdown event delivery skipped");
+                }
+            }
+        };
+        let deadline = self
+            .fatal_local_authority_deadline()
+            .expect("fatal authority deadline must be set before fence drain");
+        let _ = crate::tls::bounded_post_shutdown_drain_until(
+            deadline,
+            shutdown,
+            "fatal authority fence",
+        )
+        .await;
     }
 
     pub fn fatal_local_authority_receiver(
         &self,
     ) -> tokio::sync::watch::Receiver<Option<&'static str>> {
-        self.fatal_local_authority_tx.subscribe()
+        self.fatal_local_authority_fence.subscribe()
     }
 
     /// Get the browser session manager
@@ -1736,6 +2267,16 @@ impl RuntimeManager {
         use phoenix_core::domain::work_scope_inventory::{
             BrowserSessionLiveness, TmuxServerStatus,
         };
+
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(work_scope = %work_scope, "skipping browser teardown retirement after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.browser_retirement_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
         let Some(scope_id) = work_scope.work_scope_id() else {
             return;
@@ -2069,6 +2610,15 @@ impl RuntimeManager {
         self: &Arc<Self>,
         request: WorkScopeReconciliationRequest,
     ) {
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(work_scope = %request.work_scope, "skipping bash terminal reconciliation after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.bash_reconciliation_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         if let Err(error) = self
             .reconcile_work_scope_after_bash_terminal_inner(&request)
             .await
@@ -2458,6 +3008,27 @@ impl RuntimeManager {
         Ok(false)
     }
 
+    async fn run_authority_units<T, F, Fut>(
+        self: &Arc<Self>,
+        units: impl IntoIterator<Item = T>,
+        mut run: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(T) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, String>>,
+    {
+        let mut completed = 0;
+        for unit in units {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                break;
+            };
+            if run(unit).await? {
+                completed += 1;
+            }
+        }
+        Ok(completed)
+    }
+
     /// Materialize persisted continuation operations so restart recovery does
     /// not depend on a browser reconnecting to each conversation.
     pub async fn resume_pending_continuations(self: &Arc<Self>) -> Result<usize, String> {
@@ -2466,20 +3037,24 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let mut resumed = 0;
-        for conversation_id in &conversation_ids {
-            match self.get_or_create(conversation_id).await {
-                Ok(_) => resumed += 1,
-                Err(error) => {
-                    tracing::warn!(
-                        %conversation_id,
-                        %error,
-                        "failed to materialize persisted continuation operation"
-                    );
+        let manager = Arc::clone(self);
+        self.run_authority_units(conversation_ids, move |conversation_id| {
+            let manager = Arc::clone(&manager);
+            async move {
+                match manager.get_or_create(&conversation_id).await {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        tracing::warn!(
+                            %conversation_id,
+                            %error,
+                            "failed to materialize persisted continuation operation"
+                        );
+                        Ok(false)
+                    }
                 }
             }
-        }
-        Ok(resumed)
+        })
+        .await
     }
 
     /// Reconcile legacy half-committed continuation rows left behind by older
@@ -2493,38 +3068,100 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let mut reconciled = 0;
-        for conversation_id in &conversation_ids {
-            let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-            let Some(_summary) = repository
-                .reconcile_legacy_continuation_atomically(conversation_id, Utc::now())
-                .await
-                .map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
-            tracing::info!(
-                %conversation_id,
-                "reconciled legacy half-committed continuation to context exhausted"
-            );
-            reconciled += 1;
-        }
-        Ok(reconciled)
+        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        self.run_authority_units(conversation_ids, move |conversation_id| {
+            let repository = repository.clone();
+            async move {
+                let Some(_summary) = repository
+                    .reconcile_legacy_continuation_atomically(&conversation_id, Utc::now())
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(false);
+                };
+                tracing::info!(
+                    %conversation_id,
+                    "reconciled legacy half-committed continuation to context exhausted"
+                );
+                Ok(true)
+            }
+        })
+        .await
     }
 
-    pub async fn start_creation_worker(self: &Arc<Self>) {
+    pub(crate) fn local_authority_is_closed(&self) -> bool {
+        self.fatal_local_authority_fence.is_closed()
+    }
+
+    pub(crate) fn acquire_local_authority_pass(&self) -> Result<AdmittedOperation, ()> {
+        self.fatal_local_authority_fence.try_acquire()
+    }
+
+    pub(crate) fn fatal_local_authority_is_latched(&self) -> bool {
+        self.fatal_local_authority_fence.is_closed()
+    }
+
+    pub(crate) fn fatal_local_authority_deadline(&self) -> Option<tokio::time::Instant> {
+        self.fatal_local_authority_fence.fatal_deadline()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_hard_delete_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.hard_delete_barrier.lock().await = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_at_hard_delete_barrier(&self) {
+        if let Some(barrier) = self.hard_delete_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fatal_authority_owners_at_first_close(&self) -> Option<usize> {
+        self.fatal_local_authority_fence.owners_at_first_close()
+    }
+
+    pub(crate) async fn run_local_authority_pass<T>(
+        &self,
+        pass: impl std::future::Future<Output = T>,
+    ) -> Result<T, ()> {
+        let _owner = self.acquire_local_authority_pass()?;
+        Ok(pass.await)
+    }
+
+    pub async fn start_creation_worker(
+        self: &Arc<Self>,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
+        self.start_creation_worker_with_startup_hook(|| {}).await
+    }
+
+    async fn start_creation_worker_with_startup_hook<F>(
+        self: &Arc<Self>,
+        startup_hook: F,
+    ) -> Result<(), crate::FatalLocalAuthorityExit>
+    where
+        F: FnOnce(),
+    {
         let rx = self.creation_kick_rx.write().await.take();
         let Some(mut rx) = rx else {
             tracing::debug!("creation worker already started; skipping");
-            return;
+            return self.require_startup_local_authority();
         };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let manager = Arc::clone(self);
+        let mut fatal_local_authority_rx = self.fatal_local_authority_receiver();
         tokio::spawn(async move {
+            let _ = ready_tx.send(());
             loop {
                 if let Err(error) =
                     crate::runtime::creation_worker::drain_pending_jobs(&manager).await
                 {
                     tracing::error!(error = %error, "conversation creation worker drain failed");
+                }
+                if manager.local_authority_is_closed() {
+                    break;
                 }
                 let next_deadline = match manager.db().next_conversation_creation_deadline().await {
                     Ok(deadline) => deadline,
@@ -2538,6 +3175,8 @@ impl RuntimeManager {
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     tokio::select! {
+                        biased;
+                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
                         changed = rx.changed() => {
                             if changed.is_err() {
                                 break;
@@ -2545,13 +3184,25 @@ impl RuntimeManager {
                         }
                         () = tokio::time::sleep(delay) => {}
                     }
-                } else if rx.changed().await.is_err() {
-                    break;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = crate::tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => break,
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             tracing::info!("Conversation creation worker stopped");
         });
+        ready_rx.await.map_err(|_| crate::FatalLocalAuthorityExit)?;
+        startup_hook();
+        self.require_startup_local_authority()?;
         self.kick_creation_worker();
+        Ok(())
     }
 
     pub fn kick_creation_worker(&self) {
@@ -2573,7 +3224,16 @@ impl RuntimeManager {
         *self.startup_obligated_conversations.write().await = conversation_ids;
     }
 
-    pub async fn start_direct_turn_worker(self: &Arc<Self>) -> Result<(), String> {
+    pub async fn start_direct_turn_worker(
+        self: &Arc<Self>,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
+        self.start_direct_turn_worker_with_startup_hook(|| {}).await
+    }
+
+    async fn start_direct_turn_worker_with_startup_hook(
+        self: &Arc<Self>,
+        after_ready: impl FnOnce(),
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
         let rx = self.direct_turn_kick_rx.write().await.take();
         let Some(rx) = rx else {
             tracing::debug!("direct-turn worker already started; skipping");
@@ -2597,9 +3257,13 @@ impl RuntimeManager {
                 }
             }
         });
-        ready_rx
-            .await
-            .map_err(|_| "direct-turn worker stopped before startup pass completed".to_string())?;
+        if ready_rx.await.is_err() {
+            return Err(crate::FatalLocalAuthorityExit);
+        }
+        after_ready();
+        if self.fatal_local_authority_is_latched() {
+            return Err(crate::FatalLocalAuthorityExit);
+        }
         self.kick_direct_turn_worker();
         Ok(())
     }
@@ -2613,7 +3277,7 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            crate::runtime::wake::run(manager, rx, ready_tx).await;
+            Box::pin(crate::runtime::wake::run(manager, rx, ready_tx)).await;
         });
         ready_rx.await.map_err(|_| {
             "wake worker stopped before startup reconciliation completed".to_string()
@@ -2667,22 +3331,40 @@ impl RuntimeManager {
     }
 
     async fn handle_task_handoff_request(self: &Arc<Self>, req: TaskApprovalHandoffRequest) {
-        let result = self.create_and_start_task_handoff(&req).await;
-        let _ = req.response_tx.send(result);
+        let TaskApprovalHandoffRequest {
+            parent_conversation_id,
+            approval,
+            mut authority,
+            response_tx,
+        } = req;
+        let result = self
+            .create_and_start_task_handoff(&parent_conversation_id, &approval, &mut authority)
+            .await;
+        let _ = response_tx.send(result);
     }
 
     async fn create_and_start_task_handoff(
         self: &Arc<Self>,
-        req: &TaskApprovalHandoffRequest,
+        parent_conversation_id: &str,
+        approval: &TaskApprovalHandoffData,
+        authority: &mut AdmittedOperation,
     ) -> Result<TaskApprovalHandoffResponse, String> {
         let successor = self
             .db
-            .create_task_approval_handoff_conversation(&req.parent_conversation_id, &req.approval)
+            .create_task_approval_handoff_conversation(parent_conversation_id, approval)
             .await
             .map_err(|e| e.to_string())?;
-        let _ = self.get_or_create(&successor.id).await?;
+        #[cfg(test)]
+        if let Some(barrier) = self.handoff_runtime_start_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        let _ = self
+            .get_or_create_with_authority(&successor.id, authority.reborrow())
+            .await?;
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
+            state_updated_at: successor.state_updated_at,
         })
     }
 
@@ -2695,6 +3377,15 @@ impl RuntimeManager {
             || conv.runtime_role != crate::work_scope::RuntimeRole::SubAgent
         {
             return;
+        }
+        let Ok(_owner) = self.acquire_local_authority_pass() else {
+            tracing::debug!(conv_id = %conv.id, "skipping terminal sub-agent cleanup after fatal local authority loss");
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self.terminal_cleanup_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
         }
         if let Err(error) =
             crate::api::handlers::run_runtime_resource_cleanup_cascade(self, conv).await
@@ -2717,23 +3408,6 @@ impl RuntimeManager {
             parent_event_tx,
             parent_turn_link,
         } = req;
-        if let Err(error) = self
-            .db
-            .establish_parent_reconcile_action(&parent_conversation_id)
-            .await
-        {
-            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
-            let _ = parent_event_tx
-                .send(Event::SubAgentResult {
-                    agent_id: spec.agent_id,
-                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
-                        error: format!("failed to persist parent recovery authority: {error}"),
-                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                    },
-                })
-                .await;
-            return;
-        }
 
         tracing::info!(
             agent_id = %spec.agent_id,
@@ -2820,6 +3494,49 @@ impl RuntimeManager {
             }
         };
 
+        let Ok(persistence_owner) = self.fatal_local_authority_fence.try_acquire() else {
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: SubAgentOutcome::Failure {
+                        error: "runtime admission closed after fatal local authority loss"
+                            .to_string(),
+                        error_kind: crate::db::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .subagent_persistence_barriers
+            .lock()
+            .await
+            .get(&spec.agent_id)
+            .cloned()
+        {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        if let Err(error) = self
+            .db
+            .establish_parent_reconcile_action(&parent_conversation_id)
+            .await
+        {
+            tracing::error!(%error, %parent_conversation_id, "failed to persist parent recovery authority");
+            drop(persistence_owner);
+            let _ = parent_event_tx
+                .send(Event::SubAgentResult {
+                    agent_id: spec.agent_id,
+                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                        error: format!("failed to persist parent recovery authority: {error}"),
+                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                    },
+                })
+                .await;
+            return;
+        }
+
         // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
@@ -2839,6 +3556,7 @@ impl RuntimeManager {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create sub-agent conversation");
+                drop(persistence_owner);
                 // Notify parent of failure
                 let _ = parent_event_tx
                     .send(Event::SubAgentResult {
@@ -2877,6 +3595,7 @@ impl RuntimeManager {
             .await
         {
             tracing::error!(error = %e, "Failed to add initial message");
+            drop(persistence_owner);
             let _ = parent_event_tx
                 .send(Event::SubAgentResult {
                     agent_id: spec.agent_id,
@@ -2888,6 +3607,8 @@ impl RuntimeManager {
                 .await;
             return;
         }
+
+        drop(persistence_owner);
 
         // 3. Create sub-agent context with max_turns from spec (REQ-PROJ-008)
         let root_conversation_id =
@@ -2938,7 +3659,8 @@ impl RuntimeManager {
         // seeds its counter from the message we just inserted (sequence_id=1)
         // so the first non-message event is ordered strictly after it.
         let (event_tx, event_rx) = mpsc::channel(32);
-        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1);
+        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 1)
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
 
         // 5. Create production adapters
@@ -2984,7 +3706,9 @@ impl RuntimeManager {
 
         // Live-state watch channel for sub-agent (seeded Idle; transitions publish updates).
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
-        let runtime = runtime.with_state_watcher(sub_state_tx);
+        let runtime = runtime
+            .with_state_watcher(sub_state_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
 
         // Seed the sub-agent's trigger slot with the parent's turn context. A
         // sub-agent's whole life is one turn (it never leaves "working"
@@ -2999,17 +3723,24 @@ impl RuntimeManager {
 
         // 7. Store handle
         let sub_agent_identity = Arc::new(());
-        self.runtimes.write().await.insert(
-            conv.id.clone(),
-            ConversationHandle {
-                event_tx: event_tx.clone(),
-                acknowledged_event_tx,
-                turn_trigger,
-                broadcast_tx: broadcaster.clone(),
-                identity: sub_agent_identity.clone(),
-                state_rx: sub_state_rx,
-            },
-        );
+        {
+            let mut runtimes = self.runtimes.write().await;
+            let Ok(_admission) = self.fatal_local_authority_fence.try_acquire() else {
+                broadcaster.close_publication();
+                return;
+            };
+            runtimes.insert(
+                conv.id.clone(),
+                ConversationHandle {
+                    event_tx: event_tx.clone(),
+                    acknowledged_event_tx,
+                    turn_trigger,
+                    broadcast_tx: broadcaster.clone(),
+                    identity: sub_agent_identity.clone(),
+                    state_rx: sub_state_rx,
+                },
+            );
+        }
 
         // 8. Set up per-agent timeout — sends UserCancel if sub-agent exceeds its limit.
         // This is a safety net; the parent's AwaitingSubAgents deadline is the primary
@@ -3131,96 +3862,157 @@ impl RuntimeManager {
         self: &Arc<Self>,
         conversation_id: &str,
     ) -> Result<ConversationHandle, String> {
-        if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
-            return Ok(handle);
-        }
+        self.require_local_authority_admission()?;
+        self.get_or_create_inner(conversation_id, None).await
+    }
 
-        let (mut result_rx, is_owner) = {
-            let mut creations = self.runtime_creations.lock().await;
-            if let Some(result_tx) = creations.get(conversation_id) {
-                (result_tx.subscribe(), false)
-            } else {
-                let (result_tx, result_rx) = watch::channel(None);
-                creations.insert(conversation_id.to_string(), result_tx);
-                (result_rx, true)
-            }
-        };
+    async fn get_or_create_with_authority(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        owner: AdmittedOperation,
+    ) -> Result<ConversationHandle, String> {
+        self.get_or_create_inner(conversation_id, Some(owner)).await
+    }
 
-        if is_owner {
-            let manager = Arc::clone(self);
-            let conversation_id = conversation_id.to_string();
-            tokio::spawn(async move {
-                let worker_manager = Arc::clone(&manager);
-                let worker_conversation_id = conversation_id.clone();
-                let worker = tokio::spawn(async move {
-                    let span = tracing::info_span!(
-                        target: "phoenix_ide::otel",
-                        "conversation.runtime.materialize",
-                        "runtime.materialization_ms" = tracing::field::Empty,
-                        "runtime.recovery_projection_ms" = tracing::field::Empty,
-                        "otel.status_code" = tracing::field::Empty,
-                    );
-                    let started = std::time::Instant::now();
-                    let result = async {
-                        worker_manager
-                            .materialize_runtime(&worker_conversation_id)
-                            .await
-                    }
-                    .instrument(span.clone())
-                    .await;
-                    span.record(
-                        "runtime.materialization_ms",
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    );
-                    if result.is_err() {
-                        span.record("otel.status_code", "ERROR");
-                    }
-                    result
-                });
-                let result = worker.await.unwrap_or_else(|error| {
-                    Err(format!("runtime materialization task failed: {error}"))
-                });
-
-                if let Err(error) = &result {
-                    if is_invalid_runtime_cwd_error(error) {
-                        tracing::warn!(conv_id = %conversation_id, error = %error, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
-                    } else {
-                        tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
-                        let broadcaster = manager.conversation_broadcaster(&conversation_id).await;
-                        let _ = broadcaster.send_seq(|sequence_id| SseEvent::Error {
-                            sequence_id,
-                            error: user_facing_error::UserFacingError::internal(),
-                        });
-                    }
-                }
-
-                let result_tx = {
-                    let mut creations = manager.runtime_creations.lock().await;
-                    let result_tx = creations
-                        .get(&conversation_id)
-                        .expect("runtime materialization supervisor retains its single-flight slot")
-                        .clone();
-                    result_tx.send_replace(Some(result));
-                    creations
-                        .remove(&conversation_id)
-                        .expect("published runtime materialization slot remains owned")
-                };
-                drop(result_tx);
-            });
-        }
-
+    #[allow(clippy::too_many_lines)]
+    async fn get_or_create_inner(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        inherited_authority: Option<AdmittedOperation>,
+    ) -> Result<ConversationHandle, String> {
+        let mut inherited_authority = inherited_authority;
         loop {
-            if let Some(result) = result_rx.borrow().clone() {
-                return result;
+            if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
+                return Ok(handle);
             }
-            result_rx.changed().await.map_err(|_| {
-                "runtime materialization task exited without publishing a result".to_string()
-            })?;
+
+            let (slot, mut result_rx, is_owner, rejected_authority) = {
+                let mut creations = self.runtime_creations.lock().await;
+                if let Some(slot) = creations.get(conversation_id) {
+                    let rejected_authority = inherited_authority
+                        .take()
+                        .and_then(|authority| slot.transfer_authority(authority).err());
+                    #[cfg(test)]
+                    if rejected_authority.is_none() {
+                        if let Some(barrier) =
+                            self.runtime_authority_transfer_barrier.lock().await.take()
+                        {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                    }
+                    (
+                        Arc::clone(slot),
+                        slot.result_tx.subscribe(),
+                        false,
+                        rejected_authority,
+                    )
+                } else {
+                    let (result_tx, result_rx) = watch::channel(None);
+                    let slot = Arc::new(RuntimeMaterializationSlot {
+                        result_tx,
+                        authority: std::sync::Mutex::new(RuntimeMaterializationAuthority {
+                            inherited: inherited_authority.take(),
+                            accepting_transfers: true,
+                        }),
+                    });
+                    creations.insert(conversation_id.to_string(), Arc::clone(&slot));
+                    (slot, result_rx, true, None)
+                }
+            };
+
+            if is_owner {
+                let manager = Arc::clone(self);
+                let conversation_id = conversation_id.to_string();
+                tokio::spawn(async move {
+                    let worker_manager = Arc::clone(&manager);
+                    let worker_conversation_id = conversation_id.clone();
+                    let worker_slot = Arc::clone(&slot);
+                    let worker = tokio::spawn(async move {
+                        let span = tracing::info_span!(
+                            target: "phoenix_ide::otel",
+                            "conversation.runtime.materialize",
+                            "runtime.materialization_ms" = tracing::field::Empty,
+                            "runtime.recovery_projection_ms" = tracing::field::Empty,
+                            "otel.status_code" = tracing::field::Empty,
+                        );
+                        let started = std::time::Instant::now();
+                        let result = Box::pin(worker_manager.materialize_runtime(
+                            &worker_conversation_id,
+                            Arc::clone(&worker_slot),
+                        ))
+                        .instrument(span.clone())
+                        .await;
+                        worker_slot.seal_authority_transfers();
+                        span.record(
+                            "runtime.materialization_ms",
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
+                        if result.is_err() {
+                            span.record("otel.status_code", "ERROR");
+                        }
+                        result
+                    });
+                    let result = worker.await.unwrap_or_else(|error| {
+                        Err(format!("runtime materialization task failed: {error}"))
+                    });
+                    slot.seal_authority_transfers();
+                    #[cfg(test)]
+                    if let Some(barrier) = manager.runtime_result_fixed_barrier.lock().await.take()
+                    {
+                        barrier.wait().await;
+                        barrier.wait().await;
+                    }
+
+                    if let Err(error) = &result {
+                        if is_invalid_runtime_cwd_error(error) {
+                            tracing::warn!(conv_id = %conversation_id, error = %error, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
+                        } else {
+                            tracing::error!(conv_id = %conversation_id, error = %error, "Runtime materialization failed after conversation stream opened");
+                            let broadcaster =
+                                manager.conversation_broadcaster(&conversation_id).await;
+                            let _ = broadcaster.send_seq(|sequence_id| SseEvent::Error {
+                                sequence_id,
+                                error: user_facing_error::UserFacingError::internal(),
+                            });
+                        }
+                    }
+
+                    let removed_slot = {
+                        let mut creations = manager.runtime_creations.lock().await;
+                        let slot = creations.get(&conversation_id).expect(
+                            "runtime materialization supervisor retains its single-flight slot",
+                        );
+                        slot.result_tx.send_replace(Some(result));
+                        creations
+                            .remove(&conversation_id)
+                            .expect("published runtime materialization slot remains owned")
+                    };
+                    drop(removed_slot);
+                });
+            }
+
+            loop {
+                if let Some(result) = result_rx.borrow().clone() {
+                    if let Some(authority) = rejected_authority {
+                        if let Ok(handle) = result {
+                            return Ok(handle);
+                        }
+                        inherited_authority = Some(authority);
+                        break;
+                    }
+                    return result;
+                }
+                result_rx.changed().await.map_err(|_| {
+                    "runtime materialization task exited without publishing a result".to_string()
+                })?;
+            }
         }
     }
 
     async fn persist_and_broadcast_system_message(
         &self,
+        admitted: &mut AdmittedOperation,
         broadcaster: &SseBroadcaster,
         conversation_id: &str,
         text: String,
@@ -3241,7 +4033,9 @@ impl RuntimeManager {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let _ = broadcaster.send_persisted_message(message);
+        let _ = broadcaster
+            .admitted_publication(admitted)
+            .persisted_message(message);
         drop(reserved_range);
         Ok(())
     }
@@ -3310,22 +4104,32 @@ impl RuntimeManager {
         startup: bool,
     ) -> Result<(), DatabaseTerminalRecoveryError> {
         let conversation_ids = self.startup_obligated_conversations.read().await.clone();
-        let reconciled = if conversation_ids.is_empty() {
-            Vec::new()
-        } else {
-            self.db
-                .reconcile_startup_obligated_parents(&conversation_ids, startup)
+        for conversation_id in conversation_ids {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            let ids = HashSet::from([conversation_id]);
+            let reconciled = self
+                .db
+                .reconcile_startup_obligated_parents(&ids, startup)
                 .await
-                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?
-        };
-        for reconciliation in reconciled {
-            self.startup_obligated_conversations
-                .write()
-                .await
-                .remove(&reconciliation.conversation_id);
+                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
+            for reconciliation in reconciled {
+                self.startup_obligated_conversations
+                    .write()
+                    .await
+                    .remove(&reconciliation.conversation_id);
+            }
         }
         if startup {
-            for conversation in crate::reconcile_worktrees_with_terminalized(&self.db).await {
+            let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
+                self.acquire_local_authority_pass()
+            })
+            .await;
+            for conversation in conversations {
+                let Ok(_owner) = self.acquire_local_authority_pass() else {
+                    return Ok(());
+                };
                 executor::complete_terminal_lifecycle_without_broadcast(
                     &conversation.id,
                     conversation.parent_conversation_id.is_some(),
@@ -3346,6 +4150,9 @@ impl RuntimeManager {
             .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
         for action_record in actions {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
             let conversation_id = action_record.conversation_id.clone();
             match action_record.action {
                 phoenix_db::StartupParentAction::Reconcile => {
@@ -3652,6 +4459,7 @@ impl RuntimeManager {
     async fn materialize_runtime(
         self: &Arc<Self>,
         conversation_id: &str,
+        slot: Arc<RuntimeMaterializationSlot>,
     ) -> Result<ConversationHandle, String> {
         if let Some(handle) = self.runtimes.read().await.get(conversation_id).cloned() {
             return Ok(handle);
@@ -3683,6 +4491,15 @@ impl RuntimeManager {
             barrier.wait().await;
         }
 
+        let (materialization_admission, inherited_materialization) = match slot.take_authority() {
+            Some(owner) => (owner, true),
+            None => (
+                self.acquire_local_authority_pass().map_err(|()| {
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?,
+                false,
+            ),
+        };
         let mut conv = self
             .db
             .get_conversation(conversation_id)
@@ -4096,7 +4913,9 @@ impl RuntimeManager {
         // The executor writes to `state_tx` on every transition; the handle
         // exposes `state_rx` to HTTP handlers via `effective_conversation_state`.
         let (state_tx, state_rx) = watch::channel(initial_state);
-        let runtime = runtime.with_state_watcher(state_tx);
+        let runtime = runtime
+            .with_state_watcher(state_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -4123,8 +4942,16 @@ impl RuntimeManager {
                      next. Do NOT re-execute the same command that was just running."
                 )
             };
+            let mut restart_admission = self.acquire_local_authority_pass().map_err(|()| {
+                "runtime admission closed before restart marker persistence".to_string()
+            })?;
             if let Err(error) = self
-                .persist_and_broadcast_system_message(&broadcaster, conversation_id, restart_msg)
+                .persist_and_broadcast_system_message(
+                    &mut restart_admission,
+                    &broadcaster,
+                    conversation_id,
+                    restart_msg,
+                )
                 .await
             {
                 tracing::warn!(conv_id = %conversation_id, error = %error,
@@ -4170,8 +4997,24 @@ impl RuntimeManager {
         // awaiting DB/tool setup. Publish exactly one runtime and discard the
         // losing, not-yet-spawned executor.
         {
+            let materialization_admission =
+                inherited_materialization.then_some(materialization_admission);
             let mut runtimes = self.runtimes.write().await;
             let mut reservations = self.evicted_broadcasters.write().await;
+            let sealed_authority = slot.seal_authority_transfers();
+            #[cfg(test)]
+            if let Some(barrier) = self.runtime_authority_sealed_barrier.lock().await.take() {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+            let _publication_admission = match sealed_authority.or(materialization_admission) {
+                Some(admitted) => admitted,
+                None => self.acquire_local_authority_pass().map_err(|()| {
+                    broadcaster.close_publication();
+                    reservations.remove(conversation_id);
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?,
+            };
             if let Some(existing) = runtimes.get(conversation_id) {
                 let existing = existing.clone();
                 reservations.remove(conversation_id);
@@ -4196,7 +5039,7 @@ impl RuntimeManager {
         tokio::spawn(async move {
             let disposition = runtime.run().await;
             manager_for_cleanup
-                .handle_runtime_exit(&cleanup_conversation, disposition)
+                .handle_primary_runtime_exit(&cleanup_conversation, disposition)
                 .await;
 
             // Only remove this runtime's HashMap entry. After evict_runtime()
@@ -4489,6 +5332,7 @@ impl RuntimeManager {
     /// reaches `Idle`. Persists the entry to DB **before** sending to the
     /// executor channel, so the entry survives a crash between acceptance
     /// and executor processing.
+    #[allow(clippy::too_many_lines)]
     pub async fn enqueue_steer_message(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -4522,6 +5366,12 @@ impl RuntimeManager {
             // Materialize before persistence so a newly-created executor loads
             // the old queue rather than the entry delivered below.
             let handle = self.get_or_create(conversation_id).await?;
+            let steering_owner = self
+                .fatal_local_authority_fence
+                .try_acquire()
+                .map_err(|()| {
+                    "runtime admission closed after fatal local authority loss".to_string()
+                })?;
             #[cfg(test)]
             if let Some(barrier) = self
                 .steering_enqueue_handle_barriers
@@ -4540,6 +5390,7 @@ impl RuntimeManager {
             if !handle_is_current {
                 drop(runtimes);
                 drop(projection_guard);
+                drop(steering_owner);
                 continue;
             }
 
@@ -4566,6 +5417,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| format!("Failed to send steer message: {e}"));
             drop(runtimes);
+            drop(steering_owner);
             if let Err(error) = send_result {
                 let stale_broadcaster = handle.broadcast_tx.clone();
                 tracing::warn!(
@@ -4634,8 +5486,8 @@ impl RuntimeManager {
         loop {
             let mut in_flight_result = {
                 let creations = self.runtime_creations.lock().await;
-                if let Some(result_tx) = creations.get(conversation_id) {
-                    Some(result_tx.subscribe())
+                if let Some(slot) = creations.get(conversation_id) {
+                    Some(slot.result_tx.subscribe())
                 } else {
                     let runtimes = self.runtimes.read().await;
                     if runtimes.contains_key(conversation_id) {
@@ -4739,7 +5591,11 @@ impl RuntimeManager {
             .get_last_sequence_id(conversation_id)
             .await
             .unwrap_or(0);
-        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
+        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
+            .with_fatal_local_authority_fence(Arc::clone(&self.fatal_local_authority_fence));
+        if self.fatal_local_authority_fence.is_closed() {
+            candidate.close_publication();
+        }
         // Keep the live-handle check and reservation insertion atomic with
         // runtime publication. Otherwise a caller can reserve a new orphan
         // channel in the narrow gap between handle publication and reservation
@@ -4749,6 +5605,10 @@ impl RuntimeManager {
             return handle.broadcast_tx.clone();
         }
         let mut reservations = self.evicted_broadcasters.write().await;
+        if self.fatal_local_authority_is_latched() {
+            candidate.close_publication();
+            return candidate;
+        }
         reservations
             .entry(conversation_id.to_string())
             .or_insert(candidate)
@@ -5216,6 +6076,113 @@ mod sub_agent_registry_resume_tests {
 #[cfg(test)]
 mod broadcaster_tests {
     use super::*;
+
+    #[test]
+    fn queued_publication_retains_admission_but_future_publication_is_rejected() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut events = broadcaster.subscribe();
+        let (reserved, reserved_seq) = broadcaster.reserve_next_persisted_message_after(0);
+        let queued_seq = broadcaster.next_seq();
+        broadcaster
+            .send_reserved_seq(reserved_seq, |sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "reserved".to_string(),
+                request_id: "reserved-request".to_string(),
+            })
+            .unwrap();
+        broadcaster
+            .send_with_ring(
+                SseEvent::Token {
+                    sequence_id: queued_seq,
+                    text: "queued".to_string(),
+                    request_id: "queued-request".to_string(),
+                },
+                queued_seq,
+                RingOp::Append,
+            )
+            .unwrap();
+
+        fence.close("test_authority_boundary");
+        assert_eq!(fence.owner_count(), 1);
+        drop(reserved);
+
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == reserved_seq
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == queued_seq
+        ));
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[test]
+    fn fatal_authority_latch_rejects_broadcast_only_publication() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 7).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut events = broadcaster.subscribe();
+        fence.close("test_authority_boundary");
+
+        assert!(broadcaster
+            .send_live_progress(|sequence_id| SseEvent::BashToolProgress {
+                sequence_id,
+                tool_use_id: "tool-1".to_string(),
+                progress: BashToolProgress {
+                    handle: "bash-handle".to_string(),
+                    start_offset: 0,
+                    end_offset: 0,
+                    truncated_before: false,
+                    lines: Vec::new(),
+                    partial: None,
+                },
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(broadcaster.current_seq(), 7);
+    }
+
+    #[test]
+    fn fatal_authority_close_discards_queued_and_future_publication() {
+        let broadcaster = SseBroadcaster::new(16, 0);
+        let mut events = broadcaster.subscribe();
+        let (reserved, _) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "queued".to_string(),
+                request_id: "queued-request".to_string(),
+            })
+            .unwrap();
+
+        broadcaster.close_publication();
+        drop(reserved);
+
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
 
     #[test]
     fn hard_delete_is_the_final_publication() {
@@ -6242,6 +7209,360 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn primary_runtime_fatal_exit_signals_before_exit_cleanup() {
+        let manager = Arc::new(test_manager().await);
+        let conversation = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_exit_barriers
+            .lock()
+            .await
+            .insert(conversation.id.clone(), Arc::clone(&barrier));
+        let mut fatal = manager.fatal_local_authority_receiver();
+        let exit = {
+            let manager = Arc::clone(&manager);
+            let conversation = conversation.clone();
+            tokio::spawn(async move {
+                manager
+                    .handle_primary_runtime_exit(
+                        &conversation,
+                        executor::RuntimeExitDisposition::FatalLocalAuthorityLoss,
+                    )
+                    .await;
+            })
+        };
+
+        fatal.changed().await.unwrap();
+        assert_eq!(*fatal.borrow(), Some("primary conversation runtime"));
+        assert!(!exit.is_finished());
+        barrier.wait().await;
+        exit.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_signal_is_immediate_while_existing_owners_drain() {
+        let fence = FatalLocalAuthorityFence::new();
+        let owner = fence.try_acquire().expect("owner admitted before close");
+        let mut fatal = fence.subscribe();
+
+        fence.close("test_authority_boundary");
+
+        assert_eq!(*fatal.borrow_and_update(), Some("test_authority_boundary"));
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert!(fence.try_acquire().is_err());
+        drop(owner);
+        fence.wait_for_owners().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_fatal_close_keeps_first_boundary_and_deadline() {
+        let fence = FatalLocalAuthorityFence::new();
+        let mut fatal = fence.subscribe();
+
+        fence.close("first_boundary");
+        let first_deadline = fence
+            .fatal_deadline()
+            .expect("first close sets fatal deadline");
+
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        fence.close("second_boundary");
+
+        assert_eq!(*fatal.borrow_and_update(), Some("first_boundary"));
+        assert_eq!(fence.fatal_deadline(), Some(first_deadline));
+    }
+
+    #[tokio::test]
+    async fn workflow_pass_is_not_polled_after_fatal_closure_wins() {
+        let manager = test_manager().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pass_polled = Arc::clone(&polled);
+
+        let result = manager
+            .run_local_authority_pass(async move {
+                pass_polled.store(true, Ordering::Release);
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn closure_before_direct_turn_acceptance_prevents_persistence() {
+        let manager = test_manager().await;
+        let conversation = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create acceptance conversation");
+        manager.signal_fatal_local_authority("test_acceptance_boundary");
+        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let prepared = phoenix_workflow::PreparedTurn::from_exact_payload(
+            &phoenix_workflow::ConversationAuthority(conversation.id),
+            b"closed acceptance".to_vec(),
+        );
+
+        let result = manager
+            .run_local_authority_pass(repository.accept_authoritative_turn(
+                &phoenix_db::workflow::AcceptAuthoritativeTurn {
+                    client_key: phoenix_workflow::ClientTurnKey::new("closed-acceptance").unwrap(),
+                    prepared,
+                    disposition: phoenix_workflow::AcceptedDisposition::Runtime,
+                    accepted_at: phoenix_workflow::Timestamp(1),
+                },
+            ))
+            .await;
+
+        assert!(result.is_err());
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workflows")
+            .fetch_one(manager.db().pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn admitted_workflow_pass_holds_owner_until_completion() {
+        let manager = Arc::new(test_manager().await);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let pass = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .run_local_authority_pass(async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.expect("workflow pass entered");
+
+        manager.signal_fatal_local_authority("test_authority_boundary");
+
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        release_tx.send(()).expect("release workflow pass");
+        pass.await
+            .expect("workflow pass joins")
+            .expect("admitted pass completes");
+    }
+
+    #[tokio::test]
+    async fn startup_closure_between_rows_prevents_next_row_commit() {
+        let manager = Arc::new(test_manager().await);
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_commits = Arc::clone(&commits);
+        let close_manager = Arc::clone(&manager);
+
+        let completed = manager
+            .run_authority_units(["first", "second"], move |_| {
+                let observed_commits = Arc::clone(&observed_commits);
+                let close_manager = Arc::clone(&close_manager);
+                async move {
+                    observed_commits.fetch_add(1, Ordering::AcqRel);
+                    close_manager.signal_fatal_local_authority("test_startup_boundary");
+                    Ok(true)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(completed, 1);
+        assert_eq!(commits.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn closure_between_startup_parent_actions_prevents_next_action() {
+        let manager = Arc::new(test_manager().await);
+        let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&actions);
+        let close_manager = Arc::clone(&manager);
+
+        manager
+            .run_authority_units(["first-action", "second-action"], move |action| {
+                let observed = Arc::clone(&observed);
+                let close_manager = Arc::clone(&close_manager);
+                async move {
+                    observed.lock().unwrap().push(action);
+                    close_manager.signal_fatal_local_authority("test_parent_action_boundary");
+                    Ok(true)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*actions.lock().unwrap(), vec!["first-action"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_fatal_authority_owner_has_bounded_drain() {
+        let fence = FatalLocalAuthorityFence::new();
+        let _stuck_owner = fence.try_acquire().expect("owner admitted before close");
+        fence.close("test_authority_boundary");
+        let drain = tokio::spawn({
+            let fence = Arc::clone(&fence);
+            async move {
+                crate::tls::bounded_post_shutdown_drain(
+                    fence.wait_for_owners(),
+                    "test fatal authority owners",
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        tokio::time::advance(crate::tls::SHUTDOWN_GRACE).await;
+        assert!(drain.await.expect("bounded drain task joins").is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_persistence_keeps_one_owner_across_all_semantic_writes() {
+        let manager = Arc::new(test_manager().await);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .expect("create parent");
+        let agent_id = "fenced-subagent";
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .subagent_persistence_barriers
+            .lock()
+            .await
+            .insert(agent_id.to_string(), Arc::clone(&barrier));
+        let (parent_event_tx, _parent_event_rx) = mpsc::channel(1);
+        let spawn = {
+            let manager = Arc::clone(&manager);
+            let parent_id = parent.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .handle_spawn_request(SubAgentSpawnRequest {
+                        spec: SubAgentSpec {
+                            agent_id: agent_id.to_string(),
+                            task: "persist all child semantics".to_string(),
+                            cwd: "/tmp".to_string(),
+                            timeout: std::time::Duration::from_secs(60),
+                            mode: SubAgentMode::Explore,
+                            model_id: "gpt-5.4".to_string(),
+                            max_turns: 1,
+                            agent_name: Some("fence-test".to_string()),
+                            persona: Some("test persona".to_string()),
+                        },
+                        parent_conversation_id: parent_id,
+                        parent_scope: None,
+                        parent_event_tx,
+                        parent_turn_link: opentelemetry::trace::SpanContext::NONE,
+                    })
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        assert!(manager.fatal_local_authority_fence.try_acquire().is_err());
+        barrier.wait().await;
+        spawn.await.expect("spawn handler joins");
+
+        let child = manager
+            .db()
+            .get_conversation(agent_id)
+            .await
+            .expect("child conversation persisted under admitted owner");
+        assert_eq!(
+            manager
+                .db()
+                .get_sub_agent_persona(&child.id)
+                .await
+                .expect("persona lookup")
+                .as_deref(),
+            Some("test persona")
+        );
+        assert_eq!(
+            manager
+                .db()
+                .get_messages(&child.id)
+                .await
+                .expect("initial message lookup")
+                .len(),
+            1
+        );
+        assert!(manager.try_get_handle(agent_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn admitted_task_handoff_startup_survives_closure_after_commit() {
+        let manager = Arc::new(test_manager().await);
+        create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
+        let authority = manager.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.handoff_runtime_start_barrier.lock().await = Some(Arc::clone(&barrier));
+        let (response_tx, _response_rx) = oneshot::channel();
+        let request = TaskApprovalHandoffRequest {
+            parent_conversation_id: "handoff-parent".to_string(),
+            approval: TaskApprovalHandoffData {
+                task_id: "12345".to_string(),
+                task_title: "Inherited handoff".to_string(),
+                branch_name: "task-12345-inherited-handoff".to_string(),
+                worktree_path: "/tmp".to_string(),
+                base_branch: "main".to_string(),
+                title: "Inherited handoff".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: "Do the work".to_string(),
+                task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
+            },
+            authority,
+            response_tx,
+        };
+        let handoff = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                let mut authority = request.authority;
+                manager
+                    .create_and_start_task_handoff(
+                        &request.parent_conversation_id,
+                        &request.approval,
+                        &mut authority,
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        let parent = manager
+            .db()
+            .get_conversation("handoff-parent")
+            .await
+            .unwrap();
+        let successor_id = parent
+            .continued_in_conv_id
+            .expect("handoff commit links successor");
+        manager.signal_fatal_local_authority("test_handoff_startup");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        let response = handoff.await.unwrap().unwrap();
+        assert_eq!(response.successor_conv_id, successor_id);
+        let successor = manager.db().get_conversation(&successor_id).await.unwrap();
+        assert_eq!(response.state_updated_at, successor.state_updated_at);
+    }
+
+    #[tokio::test]
     async fn terminal_subagent_cleanup_is_gated_by_typed_exit_disposition() {
         let manager = test_manager().await;
         let parent = manager
@@ -6284,6 +7605,149 @@ mod scope_liveness_tests {
             manager.bash_handles().reserve_spawn(&scope).await,
             Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_subagent_cleanup_is_rejected_after_fatal_closure() {
+        let manager = test_manager().await;
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "closed-cleanup-child",
+                "closed-cleanup-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+        let _ = manager.bash_handles().get_or_create(&scope).await;
+        manager.signal_fatal_local_authority("test_terminal_cleanup");
+
+        manager
+            .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+            .await;
+
+        assert!(manager.bash_handles().reserve_spawn(&scope).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admitted_terminal_cleanup_remains_owned_until_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let parent = manager
+            .db()
+            .get_or_create_coordinator(
+                Some("gpt-5.4"),
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create unattached parent");
+        let child = manager
+            .db()
+            .create_subagent_conversation(
+                "admitted-cleanup-child",
+                "admitted-cleanup-child",
+                "/tmp",
+                &parent.id,
+                "gpt-5.4",
+                &ConvMode::Explore {
+                    worktree_path: None,
+                    next_taskmd_id_hint: None,
+                },
+                phoenix_core::llm_language::LlmLanguage::default(),
+                None,
+            )
+            .await
+            .expect("create unattached sub-agent");
+        let scope = ResourceScopeKey::Unattached(child.id.clone());
+        let _ = manager.bash_handles().get_or_create(&scope).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.terminal_cleanup_barrier.lock().await = Some(Arc::clone(&barrier));
+        let cleanup = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .handle_runtime_exit(&child, executor::RuntimeExitDisposition::Terminal)
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_terminal_cleanup");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        cleanup.await.unwrap();
+        assert!(matches!(
+            manager.bash_handles().reserve_spawn(&scope).await,
+            Err(phoenix_tools::bash::BashHandleError::SpawnFenced)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bash_reconciliation_is_rejected_after_fatal_closure() {
+        let manager = Arc::new(test_manager().await);
+        manager.signal_fatal_local_authority("test_bash_reconciliation");
+
+        manager
+            .reconcile_work_scope_after_bash_terminal(WorkScopeReconciliationRequest {
+                work_scope: ResourceScopeKey::Work(
+                    phoenix_core::work_scope::WorkScopeId::parse("closed-scope").unwrap(),
+                ),
+                terminal_generation: 0,
+            })
+            .await;
+
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_bash_reconciliation_remains_owned_until_settlement() {
+        let manager = Arc::new(test_manager().await);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.bash_reconciliation_barrier.lock().await = Some(Arc::clone(&barrier));
+        let reconciliation = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .reconcile_work_scope_after_bash_terminal(WorkScopeReconciliationRequest {
+                        work_scope: ResourceScopeKey::Work(
+                            phoenix_core::work_scope::WorkScopeId::parse("admitted-scope").unwrap(),
+                        ),
+                        terminal_generation: 0,
+                    })
+                    .await;
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_bash_reconciliation");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        reconciliation.await.unwrap();
     }
 
     #[tokio::test]
@@ -6469,6 +7933,248 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn startup_readiness_race_after_fence_close_returns_fatal_local_authority_exit() {
+        let manager = Arc::new(test_manager().await);
+        let closer = Arc::clone(&manager);
+
+        let error = manager
+            .start_direct_turn_worker_with_startup_hook(move || {
+                closer.signal_fatal_local_authority("test_startup_readiness_race");
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+        assert!(manager.fatal_local_authority_is_latched());
+    }
+
+    #[tokio::test]
+    async fn creation_worker_readiness_race_returns_typed_fatal_exit() {
+        let manager = Arc::new(test_manager().await);
+        let closer = Arc::clone(&manager);
+
+        let error = manager
+            .start_creation_worker_with_startup_hook(move || {
+                closer.signal_fatal_local_authority("test_creation_worker_readiness_race");
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+        assert!(manager.fatal_local_authority_is_latched());
+    }
+
+    #[tokio::test]
+    async fn continuation_startup_closure_returns_typed_fatal_exit() {
+        let manager = test_manager().await;
+        manager.signal_fatal_local_authority("test_continuation_startup_closure");
+
+        let error = manager.require_startup_local_authority().unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+    }
+
+    #[tokio::test]
+    async fn queued_admitted_assistant_retains_owner_until_reserved_range_release() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = broadcaster.subscribe();
+        let (reservation, _reserved_seq) = broadcaster.reserve_next_persisted_message_after(0);
+        let mut admitted = fence.try_acquire().expect("admit publication");
+        let queued_seq = broadcaster.next_seq();
+        let message = crate::db::Message {
+            message_id: "queued-admitted".to_string(),
+            conversation_id: "conversation".to_string(),
+            sequence_id: queued_seq,
+            message_type: crate::db::MessageType::Agent,
+            content: crate::db::MessageContent::agent(vec![phoenix_llm::ContentBlock::text(
+                "queued",
+            )]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        broadcaster
+            .admitted_publication(&mut admitted)
+            .assistant_message(message)
+            .expect("queue admitted publication");
+        drop(admitted);
+
+        fence.close("test_queued_admitted_publication");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        assert_eq!(fence.owner_count(), 1);
+        assert!(receiver.try_recv().is_err());
+
+        drop(reservation);
+
+        assert!(
+            matches!(receiver.try_recv(), Ok(SseEvent::Message { message }) if message.sequence_id == queued_seq)
+        );
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_ordinary_before_admitted_publication_remains_contiguous_after_close() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = broadcaster.subscribe();
+        let (reservation, reserved_seq) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_reserved_seq(reserved_seq, |sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "reserved".to_string(),
+                request_id: "reserved-request".to_string(),
+            })
+            .unwrap();
+
+        let ordinary_seq = broadcaster.next_seq();
+        broadcaster
+            .send_with_ring(
+                SseEvent::Token {
+                    sequence_id: ordinary_seq,
+                    text: "ordinary".to_string(),
+                    request_id: "ordinary-request".to_string(),
+                },
+                ordinary_seq,
+                RingOp::Append,
+            )
+            .expect("queue ordinary publication");
+        let mut admitted = fence.try_acquire().expect("admit successor publication");
+        let admitted_seq = broadcaster.next_seq();
+        broadcaster
+            .admitted_publication(&mut admitted)
+            .assistant_message(crate::db::Message {
+                message_id: "admitted-successor".to_string(),
+                conversation_id: "conversation".to_string(),
+                sequence_id: admitted_seq,
+                message_type: crate::db::MessageType::Agent,
+                content: crate::db::MessageContent::agent(vec![phoenix_llm::ContentBlock::text(
+                    "admitted",
+                )]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            })
+            .expect("queue admitted successor");
+        drop(admitted);
+
+        fence.close("test_mixed_queued_publications");
+        assert_eq!(fence.owners_at_first_close(), Some(2));
+        assert_eq!(fence.owner_count(), 2);
+        drop(reservation);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == reserved_seq
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == ordinary_seq
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Message { message }) if message.sequence_id == admitted_seq
+        ));
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_shares_one_deadline_across_owner_and_runtime_map_drains() {
+        let manager = Arc::new(test_manager().await);
+        tokio::time::pause();
+        let owner = manager.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *manager.fatal_runtime_map_barrier.lock().await = Some(Arc::clone(&barrier));
+        let fence = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.fence_fatal_local_authority().await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        drop(owner);
+        barrier.wait().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(fence.is_finished());
+        fence.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_fence_does_not_block_on_full_runtime_event_channel() {
+        let manager = test_manager().await;
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        event_tx.send(Event::DismissError).await.unwrap();
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            "full-fatal-channel".to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+
+        manager.fence_fatal_local_authority().await;
+
+        assert!(manager.fatal_local_authority_fence.is_closed());
+    }
+
+    #[tokio::test]
+    async fn fatal_authority_latch_blocks_runtime_racing_drain_snapshot() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "fatal-authority-admission-race";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let materialization = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.get_or_create(conversation_id).await })
+        };
+
+        barrier.wait().await;
+        let broadcaster = manager.conversation_broadcaster(conversation_id).await;
+        let mut events = broadcaster.subscribe();
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        manager.fence_fatal_local_authority().await;
+        barrier.wait().await;
+
+        let Err(error) = materialization.await.expect("materialization task joins") else {
+            panic!("fatal latch must reject runtime insertion");
+        };
+        assert!(error.contains("runtime admission closed"));
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert!(broadcaster
+            .send_seq(|sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "after-fatal".to_string(),
+                request_id: "after-fatal-request".to_string(),
+            })
+            .is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn steering_wake_retires_runtime_when_guarded_reload_finds_no_work() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "steering-wake-empty-reload";
@@ -6537,6 +8243,87 @@ mod scope_liveness_tests {
                 .expect("conversation")
                 .state,
             ConvState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_enqueue_holds_owner_across_persistence_and_executor_handoff() {
+        let manager = Arc::new(test_manager().await);
+        let conversation_id = "steering-fatal-owner";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (acknowledged_event_tx, _acknowledged_event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
+        manager.runtimes.write().await.insert(
+            conversation_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                acknowledged_event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0)
+                    .with_fatal_local_authority_fence(Arc::clone(
+                        &manager.fatal_local_authority_fence,
+                    )),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .steering_enqueue_handle_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let enqueue = {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move {
+                manager
+                    .enqueue_steer_message(
+                        conversation_id,
+                        Event::SteerMessage {
+                            text: "fenced steer".to_string(),
+                            llm_text: None,
+                            images: Vec::new(),
+                            files: Vec::new(),
+                            message_id: "fenced-steer".to_string(),
+                            user_agent: None,
+                            skill_invocation: None,
+                        },
+                        "fenced-steer-fingerprint",
+                    )
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        manager.signal_fatal_local_authority("test_authority_boundary");
+        assert_eq!(
+            manager.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        enqueue
+            .await
+            .expect("enqueue joins")
+            .expect("admitted steering persistence and handoff settle");
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Event::SteerMessage { ref message_id, .. }) if message_id == "fenced-steer"
+        ));
+        assert_eq!(
+            manager
+                .db()
+                .get_steering_queue(conversation_id)
+                .await
+                .expect("durable queue")
+                .iter()
+                .map(|entry| entry.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fenced-steer"]
         );
     }
 
@@ -6717,11 +8504,16 @@ mod scope_liveness_tests {
         let stale_broadcaster = manager.conversation_broadcaster(conversation_id).await;
         let mut stale_events = stale_broadcaster.subscribe();
         let (result_tx, _result_rx) = watch::channel(None);
-        manager
-            .runtime_creations
-            .lock()
-            .await
-            .insert(conversation_id.to_string(), result_tx.clone());
+        manager.runtime_creations.lock().await.insert(
+            conversation_id.to_string(),
+            Arc::new(RuntimeMaterializationSlot {
+                result_tx: result_tx.clone(),
+                authority: std::sync::Mutex::new(RuntimeMaterializationAuthority {
+                    inherited: None,
+                    accepting_transfers: true,
+                }),
+            }),
+        );
 
         let release = {
             let manager = Arc::clone(&manager);
@@ -7171,6 +8963,75 @@ mod scope_liveness_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn browser_retirement_is_rejected_after_fatal_closure() {
+        let mgr = test_manager().await;
+        let scope_id =
+            phoenix_core::work_scope::WorkScopeId::parse("closed-browser-scope").expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+        mgr.signal_fatal_local_authority("test_browser_retirement");
+
+        mgr.retire_scope_after_browser_teardown(&scope).await;
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "active");
+    }
+
+    #[tokio::test]
+    async fn admitted_browser_retirement_remains_owned_until_settlement() {
+        let mgr = Arc::new(test_manager().await);
+        let scope_id = phoenix_core::work_scope::WorkScopeId::parse("admitted-browser-scope")
+            .expect("scope id");
+        sqlx::query(
+            "INSERT INTO work_scopes
+             (id, authority_kind, lifecycle, environment_kind, cwd, created_at, updated_at)
+             VALUES (?1, 'work', 'active', 'unowned_cwd', '/tmp', datetime('now'), datetime('now'))",
+        )
+        .bind(scope_id.as_str())
+        .execute(mgr.db().pool())
+        .await
+        .expect("insert active scope");
+        let scope = ResourceScopeKey::Work(scope_id.clone());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.browser_retirement_barrier.lock().await = Some(Arc::clone(&barrier));
+        let retirement = {
+            let mgr = Arc::clone(&mgr);
+            let scope = scope.clone();
+            tokio::spawn(async move { mgr.retire_scope_after_browser_teardown(&scope).await })
+        };
+
+        barrier.wait().await;
+        mgr.signal_fatal_local_authority("test_browser_retirement");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        retirement.await.unwrap();
+
+        let lifecycle: String =
+            sqlx::query_scalar("SELECT lifecycle FROM work_scopes WHERE id = ?1")
+                .bind(scope_id.as_str())
+                .fetch_one(mgr.db().pool())
+                .await
+                .expect("read lifecycle");
+        assert_eq!(lifecycle, "retired");
+    }
+
     /// Register a lingering runtime handle for `conv_id` without spawning a
     /// real conversation runtime — mirrors the handle the executor inserts.
     async fn register_lingering_handle(mgr: &RuntimeManager, conv_id: &str) {
@@ -7285,7 +9146,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn panicked_runtime_materialization_retires_slot_and_allows_retry() {
+    async fn panicked_runtime_materialization_seals_before_authority_retry() {
         let mgr = Arc::new(test_manager().await);
         let conversation_id = "single-flight-panic-retry";
         mgr.db()
@@ -7296,16 +9157,30 @@ mod scope_liveness_tests {
             .lock()
             .await
             .insert(conversation_id.to_string());
-
-        let Err(first_error) = mgr.get_or_create(conversation_id).await else {
-            panic!("injected panic unexpectedly materialized runtime");
+        let inherited_owner = mgr.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_result_fixed_barrier.lock().await = Some(Arc::clone(&barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
         };
-        assert!(first_error.contains("runtime materialization task failed"));
-        assert!(mgr.runtime_creations.lock().await.is_empty());
+        barrier.wait().await;
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, inherited_owner)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        barrier.wait().await;
 
-        mgr.get_or_create(conversation_id)
-            .await
-            .expect("subsequent caller can retry materialization");
+        let Err(error) = ordinary.await.unwrap() else {
+            panic!("panicked ordinary materialization unexpectedly succeeded");
+        };
+        assert!(error.contains("runtime materialization task failed"));
+        inherited.await.unwrap().unwrap();
+        assert!(mgr.runtime_creations.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -7319,7 +9194,9 @@ mod scope_liveness_tests {
         let broadcaster = mgr.conversation_broadcaster(conversation_id).await;
         let mut receiver = broadcaster.subscribe();
 
+        let mut admitted = mgr.acquire_local_authority_pass().unwrap();
         mgr.persist_and_broadcast_system_message(
+            &mut admitted,
             &broadcaster,
             conversation_id,
             "recovery marker".to_string(),
@@ -7371,6 +9248,158 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn authority_arriving_after_worker_result_retries_failed_slot() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "fixed-result-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let inherited_owner = mgr.acquire_local_authority_pass().unwrap();
+        mgr.signal_fatal_local_authority("test_fixed_result_materialization");
+        let result_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_result_fixed_barrier.lock().await = Some(Arc::clone(&result_barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create_inner(conversation_id, None).await })
+        };
+        result_barrier.wait().await;
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, inherited_owner)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        result_barrier.wait().await;
+
+        assert!(ordinary.await.unwrap().is_err());
+        inherited.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authority_arriving_after_final_checkpoint_retries_failed_slot() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "sealed-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let sealed_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_authority_sealed_barrier.lock().await = Some(Arc::clone(&sealed_barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        sealed_barrier.wait().await;
+        let authority = mgr.acquire_local_authority_pass().unwrap();
+        mgr.signal_fatal_local_authority("test_sealed_materialization");
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, authority)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        sealed_barrier.wait().await;
+
+        assert!(ordinary.await.unwrap().is_err());
+        inherited.await.unwrap().unwrap();
+        assert!(!mgr
+            .runtime_creations
+            .lock()
+            .await
+            .contains_key(conversation_id));
+    }
+
+    #[tokio::test]
+    async fn late_inherited_authority_transfers_into_existing_materialization() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "late-inherited-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let ordinary = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_or_create(conversation_id).await })
+        };
+        barrier.wait().await;
+        let authority = mgr.acquire_local_authority_pass().unwrap();
+        let transfer_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *mgr.runtime_authority_transfer_barrier.lock().await = Some(Arc::clone(&transfer_barrier));
+        let inherited = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, authority)
+                    .await
+            })
+        };
+        transfer_barrier.wait().await;
+
+        mgr.signal_fatal_local_authority("test_late_inherited_materialization");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        transfer_barrier.wait().await;
+        barrier.wait().await;
+
+        ordinary.await.unwrap().unwrap();
+        inherited.await.unwrap().unwrap();
+        assert!(mgr.try_get_handle(conversation_id).await.is_some());
+        assert!(!mgr
+            .runtime_creations
+            .lock()
+            .await
+            .contains_key(conversation_id));
+    }
+
+    #[tokio::test]
+    async fn inherited_runtime_materialization_survives_fatal_closure() {
+        let mgr = Arc::new(test_manager().await);
+        let conversation_id = "inherited-materialization-authority";
+        mgr.db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let authority = mgr.acquire_local_authority_pass().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        mgr.runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let materialization = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_create_with_authority(conversation_id, authority)
+                    .await
+            })
+        };
+
+        barrier.wait().await;
+        mgr.signal_fatal_local_authority("test_inherited_materialization");
+        assert_eq!(
+            mgr.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        let handle = materialization
+            .await
+            .expect("materialization joins")
+            .expect("inherited materialization succeeds");
+        assert_eq!(handle.state_rx.borrow().presentation_mode(), "idle");
     }
 
     #[tokio::test]
@@ -7591,6 +9620,7 @@ mod scope_liveness_tests {
             now: Timestamp(3),
         })
         .await
+        .established()
         .expect("materialize direct turn");
 
         mgr.db()

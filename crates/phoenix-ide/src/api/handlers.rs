@@ -1443,10 +1443,11 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
     Ok(paths)
 }
 
-fn sweep_expired_attachments_blocking(
+fn discover_expired_attachment_candidates_blocking(
     root: &std::path::Path,
     cutoff: SystemTime,
     referenced: &HashSet<PathBuf>,
+    candidates: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
     if !root.exists() {
         return Ok(());
@@ -1460,30 +1461,20 @@ fn sweep_expired_attachments_blocking(
             Err(e) => return Err(e),
         };
         if metadata.is_dir() {
-            sweep_expired_attachments_blocking(&path, cutoff, referenced)?;
-            match std::fs::remove_dir(&path) {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                    ) => {}
-                Err(e) => return Err(e),
-            }
+            discover_expired_attachment_candidates_blocking(&path, cutoff, referenced, candidates)?;
         } else if metadata.modified().is_ok_and(|modified| modified < cutoff)
             && !referenced.contains(&path)
         {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            candidates.push(path);
         }
     }
     Ok(())
 }
 
-async fn cleanup_expired_attachments(db: &crate::db::Database) {
+async fn cleanup_expired_attachments(
+    db: &crate::db::Database,
+    runtime: &crate::runtime::RuntimeManager,
+) {
     let root = attachment_root();
     let referenced = match referenced_attachment_paths(db).await {
         Ok(paths) => paths,
@@ -1495,24 +1486,53 @@ async fn cleanup_expired_attachments(db: &crate::db::Database) {
     let cutoff = SystemTime::now()
         .checked_sub(ATTACHMENT_TTL)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    let result = tokio::task::spawn_blocking(move || {
-        sweep_expired_attachments_blocking(&root, cutoff, &referenced)
+    let discovery = tokio::task::spawn_blocking(move || {
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
+            &root,
+            cutoff,
+            &referenced,
+            &mut candidates,
+        )?;
+        Ok::<_, std::io::Error>(candidates)
     })
     .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "failed to sweep expired attachments"),
-        Err(e) => tracing::warn!(error = %e, "attachment sweep task failed"),
+    let candidates = match discovery {
+        Ok(Ok(candidates)) => candidates,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to discover expired attachments");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "attachment discovery task failed");
+            return;
+        }
+    };
+    for path in candidates {
+        let Ok(_admitted) = runtime.acquire_local_authority_pass() else {
+            return;
+        };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to delete expired attachment");
+            }
+        }
     }
 }
 
-pub(super) fn start_attachment_cleanup_task(db: crate::db::Database) {
+pub(super) fn start_attachment_cleanup_task(
+    db: crate::db::Database,
+    runtime: Arc<crate::runtime::RuntimeManager>,
+) {
     tokio::spawn(async move {
-        cleanup_expired_attachments(&db).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
         loop {
-            interval.tick().await;
-            cleanup_expired_attachments(&db).await;
+            cleanup_expired_attachments(&db, &runtime).await;
+            if runtime.fatal_local_authority_is_latched() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
         }
     });
 }
@@ -1866,6 +1886,9 @@ async fn create_conversation_with_id(
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    let _owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
     let id = match req.conversation_id.as_deref() {
         Some(conversation_id) => {
             uuid::Uuid::parse_str(conversation_id).map_err(|_| {
@@ -4344,6 +4367,12 @@ async fn cancel_conversation_inner(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     if matches!(conversation.state, ConvState::Provisioning { .. }) {
+        let mut admitted = state.runtime.acquire_local_authority_pass().map_err(|()| {
+            AppError::Internal(
+                "conversation creation cancellation rejected after fatal local authority closure"
+                    .to_string(),
+            )
+        })?;
         state
             .runtime
             .db()
@@ -4359,12 +4388,13 @@ async fn cancel_conversation_inner(
         let broadcast_tx = state.runtime.conversation_broadcaster(&id).await;
         let cancelled_state = cancelled.state.clone();
         let state_updated_at = cancelled.state_updated_at;
-        let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            presentation_mode: cancelled_state.presentation_mode().to_string(),
-            state: cancelled_state.clone(),
-            state_updated_at,
-        });
+        let _ = broadcast_tx
+            .admitted_publication(&mut admitted)
+            .state_change(
+                cancelled_state.clone(),
+                cancelled_state.presentation_mode().to_string(),
+                state_updated_at,
+            );
         state
             .runtime
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
@@ -5586,10 +5616,15 @@ async fn delete_conversation(
 
 /// Body of the [`delete_conversation`] handler, factored out so tests can
 /// drive it directly without going through axum routing. Returns `Ok(())`
-/// on success; the only fatal-to-the-request error is the DB row delete
-/// (see `Internal` variant) — bash / tmux / projects cleanup failures
-/// log WARN and continue per REQ-BED-032.
+/// on success. Loss of fatal-authority admission or DB row deletion fails the
+/// request; bash / tmux / projects cleanup failures log WARN and continue per
+/// REQ-BED-032.
 pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let mut owner = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal("runtime admission closed after fatal local authority loss".to_string())
+    })?;
+    #[cfg(test)]
+    state.runtime.wait_at_hard_delete_barrier().await;
     refuse_if_coordinator(state, id, "delete").await?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(id)
@@ -5675,12 +5710,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    cleanup_pending_fork_orphans_on_delete(state, &conv).await;
+    let _owner = cleanup_pending_fork_orphans_on_delete(state, &conv, owner.transfer()).await?;
 
     // Steps 2-5: bash handles, tmux server, project worktree, browser
-    // session. Cleanup-step failures log WARN and continue; the only
-    // fatal error from this call is a continuation-row DB lookup failure
-    // (returned as 500 so the user can retry). Shared with archive /
+    // session. Cleanup-step failures log WARN and continue; a
+    // continuation-row DB lookup failure is returned as 500 so the user can
+    // retry. Shared with archive /
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
     let cleanup = run_resource_cleanup_cascade(state, &conv).await?;
@@ -5865,6 +5900,7 @@ async fn cascade_project_target(
     Ok(target)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cascade_projects_on_delete(
     runtime: &crate::runtime::RuntimeManager,
     conv: &crate::db::Conversation,
@@ -5941,45 +5977,53 @@ async fn cascade_projects_on_delete(
         None
     };
 
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let worktree_dir = PathBuf::from(&worktree_path);
+    let Ok(cleanup_admission) = runtime.acquire_local_authority_pass() else {
+        report.error =
+            Some("worktree cleanup rejected after fatal local authority closure".to_string());
+        return report;
+    };
+    let outcome = crate::runtime::creation_worker::run_admitted_blocking(
+        cleanup_admission,
+        move || -> Result<(), String> {
+            let worktree_dir = PathBuf::from(&worktree_path);
 
-        if let Some(repo) = repo_root.as_ref() {
-            if let Err(e) = run_git(repo, &["worktree", "remove", &worktree_path, "--force"]) {
-                tracing::debug!(
-                    error = %e,
-                    worktree = %worktree_path,
-                    "git worktree remove failed; trying filesystem fallback"
-                );
-                if worktree_dir.exists() {
-                    if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
-                        return Err(format!(
-                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
-                        ));
-                    }
-                }
-                let _ = run_git(repo, &["worktree", "prune"]);
-            }
-
-            if is_work_mode {
-                if let Err(e) = run_git(repo, &["branch", "-D", &branch_name]) {
+            if let Some(repo) = repo_root.as_ref() {
+                if let Err(e) = run_git(repo, &["worktree", "remove", &worktree_path, "--force"]) {
                     tracing::debug!(
                         error = %e,
-                        branch = %branch_name,
-                        "branch delete failed (non-fatal in cascade)"
+                        worktree = %worktree_path,
+                        "git worktree remove failed; trying filesystem fallback"
                     );
+                    if worktree_dir.exists() {
+                        if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                            return Err(format!(
+                            "git worktree remove failed: {e}; fs fallback also failed: {rm_err}"
+                        ));
+                        }
+                    }
+                    let _ = run_git(repo, &["worktree", "prune"]);
+                }
+
+                if is_work_mode {
+                    if let Err(e) = run_git(repo, &["branch", "-D", &branch_name]) {
+                        tracing::debug!(
+                            error = %e,
+                            branch = %branch_name,
+                            "branch delete failed (non-fatal in cascade)"
+                        );
+                    }
+                }
+            } else if worktree_dir.exists() {
+                if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
+                    return Err(format!(
+                        "no project context; fs-only worktree cleanup failed: {rm_err}"
+                    ));
                 }
             }
-        } else if worktree_dir.exists() {
-            if let Err(rm_err) = std::fs::remove_dir_all(&worktree_dir) {
-                return Err(format!(
-                    "no project context; fs-only worktree cleanup failed: {rm_err}"
-                ));
-            }
-        }
 
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await;
 
     match outcome {
@@ -6005,11 +6049,16 @@ async fn cascade_projects_on_delete(
 /// makes a fork-from-a-deleted-origin structurally impossible: any
 /// approve/request-changes queued behind this command runs after it, finds the
 /// proposal non-`pending`, and aborts before creating a worktree.
-async fn cleanup_pending_fork_orphans_on_delete(state: &AppState, conv: &crate::db::Conversation) {
+async fn cleanup_pending_fork_orphans_on_delete(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    authority: crate::runtime::AdmittedOperation,
+) -> Result<crate::runtime::AdmittedOperation, AppError> {
     state
         .runtime
-        .cleanup_pending_fork_orphans_on_delete(&conv.id)
-        .await;
+        .cleanup_pending_fork_orphans_on_delete(&conv.id, authority)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 async fn rename_conversation(
@@ -8175,6 +8224,25 @@ mod conversation_cwd_validation_tests {
             response.conversation["state"]["type"].as_str(),
             Some("provisioning")
         );
+    }
+
+    #[tokio::test]
+    async fn create_conversation_is_rejected_after_fatal_closure() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        state
+            .runtime
+            .signal_fatal_local_authority("test_conversation_creation");
+
+        let result =
+            create_conversation_with_id(state.clone(), create_request("/".to_string()), Vec::new())
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+        assert!(state.db.list_conversations().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -13594,6 +13662,95 @@ pub(crate) mod hard_delete_cascade_tests {
         );
     }
 
+    #[tokio::test]
+    async fn admitted_hard_delete_remains_owned_through_cascade_settlement() {
+        let state = make_test_state().await;
+        let origin = "admitted-hard-delete-origin";
+        state
+            .db
+            .create_conversation(origin, origin, "/tmp", false, None, None)
+            .await
+            .expect("create origin");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        state
+            .runtime
+            .install_hard_delete_barrier(Arc::clone(&barrier))
+            .await;
+
+        let cascade = {
+            let state = state.clone();
+            tokio::spawn(async move { run_hard_delete_cascade(&state, origin).await })
+        };
+        barrier.wait().await;
+        state
+            .runtime
+            .signal_fatal_local_authority("test_hard_delete_cascade");
+        assert_eq!(
+            state.runtime.fatal_authority_owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        cascade.await.unwrap().expect("admitted cascade settles");
+        assert!(state.db.get_conversation(origin).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn hard_delete_stops_when_fork_cleanup_loses_fatal_admission() {
+        use crate::db::{ForkProposal, ForkProposalStatus};
+
+        let state = make_test_state().await;
+        state.runtime.start_sub_agent_handler().await;
+        let origin = "fatal-fork-cleanup-origin";
+        state
+            .db
+            .create_conversation(origin, origin, "/tmp", false, None, None)
+            .await
+            .expect("create origin");
+        state
+            .db
+            .insert_fork_proposal(&ForkProposal {
+                id: "fatal-fork-cleanup-proposal".to_string(),
+                origin_conversation_id: origin.to_string(),
+                task_file: "tasks/12345-p1-ready--fatal-cleanup.md".to_string(),
+                title: "fatal cleanup".to_string(),
+                priority: "p1".to_string(),
+                body: "# Fatal cleanup\n".to_string(),
+                status: ForkProposalStatus::Pending,
+                fork_conversation_id: None,
+                refinement_conversation_id: None,
+                created_at: chrono::Utc::now(),
+                resolved_at: None,
+            })
+            .await
+            .expect("insert proposal");
+        state
+            .runtime
+            .signal_fatal_local_authority("test_hard_delete_fork_cleanup");
+
+        let result = run_hard_delete_cascade(&state, origin).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+        assert!(
+            state.db.get_conversation(origin).await.is_ok(),
+            "fatal fork-cleanup rejection must stop before deleting the conversation row"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_fork_proposal("fatal-fork-cleanup-proposal")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Pending
+        );
+    }
+
     /// F5: `run_hard_delete_cascade` must dismiss + clean pending fork proposals
     /// BEFORE the long resource-cleanup teardown opens its window, so a concurrent
     /// approve racing the cascade finds the proposal non-pending and aborts.
@@ -14753,7 +14910,7 @@ mod attachment_storage_tests {
     }
 
     #[test]
-    fn sweep_deletes_expired_files_and_empty_dirs() {
+    fn discovery_returns_expired_unreferenced_files_without_mutating() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
         let conv = root.join("conv-old");
@@ -14761,12 +14918,17 @@ mod attachment_storage_tests {
         let expired = conv.join("old.txt");
         std::fs::write(&expired, b"old").expect("write old");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
-        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
-        assert!(!expired.exists());
-        assert!(
-            !conv.exists(),
-            "empty conversation attachment dir should be removed"
-        );
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
+            root,
+            cutoff,
+            &HashSet::new(),
+            &mut candidates,
+        )
+        .expect("discover");
+        assert_eq!(candidates, vec![expired.clone()]);
+        assert!(expired.exists());
+        assert!(conv.exists());
     }
 
     #[test]
@@ -14779,7 +14941,15 @@ mod attachment_storage_tests {
         std::fs::write(&referenced, b"keep").expect("write referenced");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
         let referenced_set = HashSet::from([referenced.clone()]);
-        sweep_expired_attachments_blocking(root, cutoff, &referenced_set).expect("sweep");
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
+            root,
+            cutoff,
+            &referenced_set,
+            &mut candidates,
+        )
+        .expect("discover");
+        assert!(candidates.is_empty());
         assert!(referenced.exists());
         assert!(conv.exists());
     }
@@ -14924,7 +15094,15 @@ mod attachment_storage_tests {
         let recent = conv.join("recent.txt");
         std::fs::write(&recent, b"recent").expect("write recent");
         let cutoff = SystemTime::UNIX_EPOCH;
-        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
+        let mut candidates = Vec::new();
+        discover_expired_attachment_candidates_blocking(
+            root,
+            cutoff,
+            &HashSet::new(),
+            &mut candidates,
+        )
+        .expect("discover");
+        assert!(candidates.is_empty());
         assert!(recent.exists());
         assert!(conv.exists());
     }

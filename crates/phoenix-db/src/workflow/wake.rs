@@ -29,8 +29,16 @@ use sqlx::Row;
 #[cfg(test)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
 };
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WakeWriteIntentTestLatch {
+    begin_attempted: tokio::sync::Notify,
+    write_intent_acquired: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
 
 #[cfg(test)]
 type FailpointKey = (u64, u64);
@@ -442,6 +450,8 @@ pub struct WakeRepository {
     workflow_repo: WorkflowRepository,
     #[cfg(test)]
     failpoint_namespace: u64,
+    #[cfg(test)]
+    write_intent_test_latch: Option<Arc<WakeWriteIntentTestLatch>>,
 }
 
 impl WakeRepository {
@@ -451,7 +461,28 @@ impl WakeRepository {
             workflow_repo: WorkflowRepository::new(pool),
             #[cfg(test)]
             failpoint_namespace: next_failpoint_namespace(),
+            #[cfg(test)]
+            write_intent_test_latch: None,
         }
+    }
+
+    async fn begin_authoritative_tx(&self) -> DbResult<WorkflowTx<'_>> {
+        #[cfg(test)]
+        if let Some(latch) = &self.write_intent_test_latch {
+            latch.begin_attempted.notify_one();
+        }
+        let tx = self.workflow_repo.begin_immediate_tx().await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.write_intent_test_latch {
+            latch.write_intent_acquired.notify_one();
+            latch.release.notified().await;
+        }
+        Ok(tx)
+    }
+
+    #[cfg(test)]
+    fn install_write_intent_test_latch(&mut self, latch: Arc<WakeWriteIntentTestLatch>) {
+        self.write_intent_test_latch = Some(latch);
     }
 
     #[cfg(test)]
@@ -912,27 +943,6 @@ impl WakeRepository {
         observation_time: Timestamp,
         evidence: &WakeTerminalEvidence,
     ) -> DbResult<WakeTerminalEvidenceOutcome> {
-        for _ in 0..20 {
-            match self
-                .record_terminal_evidence_once(
-                    workflow_id,
-                    authority,
-                    observation_id,
-                    receipt_id,
-                    delivery_id,
-                    observation_time,
-                    evidence,
-                )
-                .await
-            {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
         self.record_terminal_evidence_once(
             workflow_id,
             authority,
@@ -955,7 +965,7 @@ impl WakeRepository {
         observation_time: Timestamp,
         evidence: &WakeTerminalEvidence,
     ) -> DbResult<WakeTerminalEvidenceOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.begin_authoritative_tx().await?;
         let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, workflow_id).await? else {
             tx.rollback().await?;
             return Ok(WakeTerminalEvidenceOutcome::StaleAttempt);
@@ -1405,16 +1415,6 @@ impl WakeRepository {
     }
 
     pub async fn cancel(&self, input: &WakeCancellationInput) -> DbResult<WakeCancellationOutcome> {
-        for _ in 0..20 {
-            match self.cancel_once(input).await {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
         self.cancel_once(input).await
     }
 
@@ -1654,7 +1654,7 @@ impl WakeRepository {
         &self,
         input: &WakeCancellationInput,
     ) -> DbResult<WakeCancellationOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.begin_authoritative_tx().await?;
         let Some(binding) = fetch_binding_by_workflow_tx(&mut tx, input.workflow_id).await? else {
             tx.rollback().await?;
             return Ok(WakeCancellationOutcome::Stale);
@@ -2438,7 +2438,7 @@ impl WakeRepository {
             .collect()
     }
 
-    pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
+    pub async fn list_continuation_transfer_predecessors(&self) -> DbResult<Vec<String>> {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let predecessors = sqlx::query_scalar::<_, String>(
             "SELECT c.id
@@ -2455,9 +2455,78 @@ impl WakeRepository {
         .fetch_all(&mut *tx.tx)
         .await?;
         tx.commit().await?;
+        Ok(predecessors)
+    }
 
-        let mut repaired = 0;
+    pub async fn list_continuation_transfer_units(
+        &self,
+    ) -> DbResult<Vec<(String, String, WorkflowId)>> {
+        let predecessors = self.list_continuation_transfer_predecessors().await?;
+        let mut units = Vec::new();
         for predecessor in predecessors {
+            let mut tx = self.workflow_repo.begin_tx().await?;
+            let continuation = sqlx::query_scalar::<_, String>(
+                "WITH RECURSIVE continuation_chain(id, continued_in_conv_id, work_scope_id, depth) AS (
+                     SELECT id, continued_in_conv_id, work_scope_id, 0 FROM conversations WHERE id = ?1
+                     UNION ALL
+                     SELECT c.id, c.continued_in_conv_id, c.work_scope_id, chain.depth + 1
+                     FROM conversations c JOIN continuation_chain chain ON c.id = chain.continued_in_conv_id
+                     WHERE chain.depth < 100 AND c.work_scope_id = chain.work_scope_id
+                 ) SELECT id FROM continuation_chain WHERE continued_in_conv_id IS NULL AND depth > 0
+                   ORDER BY depth DESC LIMIT 1",
+            )
+            .bind(&predecessor)
+            .fetch_optional(&mut *tx.tx)
+            .await?;
+            tx.commit().await?;
+            if let Some(continuation) = continuation {
+                for workflow_id in self
+                    .list_workflows_owed_to_conversation(&predecessor)
+                    .await?
+                {
+                    units.push((predecessor.clone(), continuation.clone(), workflow_id));
+                }
+            }
+        }
+        Ok(units)
+    }
+
+    pub async fn transfer_workflow_for_continuation(
+        &self,
+        from_conversation_id: &str,
+        to_conversation_id: &str,
+        workflow_id: WorkflowId,
+        timestamp: Timestamp,
+    ) -> DbResult<()> {
+        for _ in 0..20 {
+            let mut tx = self.workflow_repo.begin_tx().await?;
+            let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
+                tx.rollback().await?;
+                break;
+            };
+            let pending_delivery_ids =
+                fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
+            tx.rollback().await?;
+            let input = WakeTransferInput {
+                workflow_id,
+                from_conversation_id: from_conversation_id.to_string(),
+                to_conversation_id: to_conversation_id.to_string(),
+                expected_version: head.version,
+                exact_pending_delivery_ids: pending_delivery_ids,
+                transition_id: TransitionId(head.version.next().0),
+                timestamp,
+            };
+            match self.transfer(&input).await? {
+                WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
+                WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn reconcile_continuation_transfers(&self, timestamp: Timestamp) -> DbResult<usize> {
+        let mut repaired = 0;
+        for predecessor in self.list_continuation_transfer_predecessors().await? {
             if self
                 .recover_continuation_transfer(&predecessor, timestamp)
                 .await?
@@ -2510,49 +2579,23 @@ impl WakeRepository {
             .list_workflows_owed_to_conversation(from_conversation_id)
             .await?;
         for workflow_id in owed {
-            for _ in 0..20 {
-                let mut tx = self.workflow_repo.begin_tx().await?;
-                let Some(head) = tx.fetch_workflow_head(workflow_id).await? else {
-                    tx.rollback().await?;
-                    break;
-                };
-                let pending_delivery_ids =
-                    fetch_pending_terminal_delivery_ids_tx(&mut tx, workflow_id).await?;
-                tx.rollback().await?;
-                let input = WakeTransferInput {
-                    workflow_id,
-                    from_conversation_id: from_conversation_id.to_string(),
-                    to_conversation_id: to_conversation_id.to_string(),
-                    expected_version: head.version,
-                    exact_pending_delivery_ids: pending_delivery_ids,
-                    transition_id: TransitionId(head.version.next().0),
-                    timestamp,
-                };
-                match self.transfer(&input).await? {
-                    WakeTransferOutcome::Transferred | WakeTransferOutcome::OwnerMismatch => break,
-                    WakeTransferOutcome::VersionConflict | WakeTransferOutcome::SetMismatch => {}
-                }
-            }
+            self.transfer_workflow_for_continuation(
+                from_conversation_id,
+                to_conversation_id,
+                workflow_id,
+                timestamp,
+            )
+            .await?;
         }
         Ok(())
     }
 
     pub async fn transfer(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
-        for _ in 0..5 {
-            match self.transfer_once(input).await {
-                Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                    if super::is_sqlite_busy_retryable(error.as_ref()) =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-                result => return result,
-            }
-        }
         self.transfer_once(input).await
     }
 
     async fn transfer_once(&self, input: &WakeTransferInput) -> DbResult<WakeTransferOutcome> {
-        let mut tx = self.workflow_repo.begin_tx().await?;
+        let mut tx = self.begin_authoritative_tx().await?;
         let to_exists =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations WHERE id = ?1")
                 .bind(&input.to_conversation_id)
@@ -7018,7 +7061,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_vs_terminal_concurrent_has_one_coherent_owner() {
-        let (_dir, first, second) = open_repo_pair().await;
+        let (_dir, mut first, mut second) = open_repo_pair().await;
         insert_conversation(&first.workflow_repo.pool, "conv-2").await;
         let workflow_id = WorkflowId(400);
         let canonical = unwrap_started(register_and_begin(&first, workflow_id).await);
@@ -7031,19 +7074,50 @@ mod tests {
             vec![],
             TransitionId(2),
         );
-        let evidence = bash_evidence(19);
-        let (left, right) = tokio::join!(
-            first.transfer(&transfer),
-            second.record_terminal_evidence(
-                workflow_id,
-                &authority,
-                1,
-                ReceiptId(1),
-                DeliveryId(1),
-                Timestamp(20),
-                &evidence
-            )
-        );
+        let first_latch = Arc::new(WakeWriteIntentTestLatch::default());
+        first.install_write_intent_test_latch(first_latch.clone());
+        let transfer_task = tokio::spawn(async move { first.transfer(&transfer).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            first_latch.write_intent_acquired.notified(),
+        )
+        .await
+        .expect("transfer acquires write intent");
+
+        let second_latch = Arc::new(WakeWriteIntentTestLatch::default());
+        second.install_write_intent_test_latch(second_latch.clone());
+        let terminal_repo = second.clone();
+        let terminal_task = tokio::spawn(async move {
+            terminal_repo
+                .record_terminal_evidence(
+                    workflow_id,
+                    &authority,
+                    1,
+                    ReceiptId(1),
+                    DeliveryId(1),
+                    Timestamp(20),
+                    &bash_evidence(19),
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            second_latch.begin_attempted.notified(),
+        )
+        .await
+        .expect("competitor reaches write-intent boundary");
+        assert!(!terminal_task.is_finished());
+
+        first_latch.release.notify_one();
+        let left = transfer_task.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            second_latch.write_intent_acquired.notified(),
+        )
+        .await
+        .expect("competitor acquires released write intent");
+        second_latch.release.notify_one();
+        let right = terminal_task.await.unwrap();
         match left.unwrap() {
             WakeTransferOutcome::Transferred
             | WakeTransferOutcome::VersionConflict
@@ -7055,14 +7129,14 @@ mod tests {
         match right.unwrap() {
             WakeTerminalEvidenceOutcome::Recorded { .. }
             | WakeTerminalEvidenceOutcome::Replayed { .. } => {
-                let binding_owner = first
+                let binding_owner = second
                     .fetch_binding(workflow_id)
                     .await
                     .unwrap()
                     .unwrap()
                     .conversation_id;
-                let old_pending = first.list_pending("conv-1").await.unwrap();
-                let new_pending = first.list_pending("conv-2").await.unwrap();
+                let old_pending = second.list_pending("conv-1").await.unwrap();
+                let new_pending = second.list_pending("conv-2").await.unwrap();
                 assert!(old_pending.len() + new_pending.len() <= 1);
                 if let Some(item) = old_pending.first() {
                     assert_eq!(binding_owner, item.conversation_id);
@@ -7072,15 +7146,15 @@ mod tests {
                 }
             }
             WakeTerminalEvidenceOutcome::StaleAttempt => {
-                let binding_owner = first
+                let binding_owner = second
                     .fetch_binding(workflow_id)
                     .await
                     .unwrap()
                     .unwrap()
                     .conversation_id;
                 assert_eq!(binding_owner, "conv-2");
-                assert!(first.list_pending("conv-1").await.unwrap().is_empty());
-                assert!(first.list_pending("conv-2").await.unwrap().is_empty());
+                assert!(second.list_pending("conv-1").await.unwrap().is_empty());
+                assert!(second.list_pending("conv-2").await.unwrap().is_empty());
             }
             other @ (WakeTerminalEvidenceOutcome::WrongResource
             | WakeTerminalEvidenceOutcome::EvidenceAfterObservation
@@ -7092,7 +7166,7 @@ mod tests {
 
     #[tokio::test]
     async fn transfer_vs_cancel_concurrent_has_one_coherent_owner() {
-        let (_dir, first, second) = open_repo_pair().await;
+        let (_dir, mut first, mut second) = open_repo_pair().await;
         insert_conversation(&first.workflow_repo.pool, "conv-2").await;
         let workflow_id = WorkflowId(500);
         register_and_begin(&first, workflow_id).await;
@@ -7104,8 +7178,39 @@ mod tests {
             vec![],
             TransitionId(2),
         );
-        let cancel = cancel_input(workflow_id);
-        let (left, right) = tokio::join!(first.transfer(&transfer), second.cancel(&cancel));
+        let first_latch = Arc::new(WakeWriteIntentTestLatch::default());
+        first.install_write_intent_test_latch(first_latch.clone());
+        let transfer_task = tokio::spawn(async move { first.transfer(&transfer).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            first_latch.write_intent_acquired.notified(),
+        )
+        .await
+        .expect("transfer acquires write intent");
+
+        let second_latch = Arc::new(WakeWriteIntentTestLatch::default());
+        second.install_write_intent_test_latch(second_latch.clone());
+        let cancel_repo = second.clone();
+        let cancel_task =
+            tokio::spawn(async move { cancel_repo.cancel(&cancel_input(workflow_id)).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            second_latch.begin_attempted.notified(),
+        )
+        .await
+        .expect("competitor reaches write-intent boundary");
+        assert!(!cancel_task.is_finished());
+
+        first_latch.release.notify_one();
+        let left = transfer_task.await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            second_latch.write_intent_acquired.notified(),
+        )
+        .await
+        .expect("competitor acquires released write intent");
+        second_latch.release.notify_one();
+        let right = cancel_task.await.unwrap();
         match left.unwrap() {
             WakeTransferOutcome::Transferred
             | WakeTransferOutcome::VersionConflict
@@ -7117,14 +7222,14 @@ mod tests {
         match right.unwrap() {
             WakeCancellationOutcome::Cancelled { .. }
             | WakeCancellationOutcome::Replayed { .. } => {
-                let binding_owner = first
+                let binding_owner = second
                     .fetch_binding(workflow_id)
                     .await
                     .unwrap()
                     .unwrap()
                     .conversation_id;
-                let old_pending = first.list_pending("conv-1").await.unwrap();
-                let new_pending = first.list_pending("conv-2").await.unwrap();
+                let old_pending = second.list_pending("conv-1").await.unwrap();
+                let new_pending = second.list_pending("conv-2").await.unwrap();
                 assert!(old_pending.len() + new_pending.len() <= 1);
                 if let Some(item) = old_pending.first() {
                     assert_eq!(binding_owner, item.conversation_id);
@@ -7134,15 +7239,15 @@ mod tests {
                 }
             }
             WakeCancellationOutcome::Stale => {
-                let binding_owner = first
+                let binding_owner = second
                     .fetch_binding(workflow_id)
                     .await
                     .unwrap()
                     .unwrap()
                     .conversation_id;
                 assert_eq!(binding_owner, "conv-2");
-                assert!(first.list_pending("conv-1").await.unwrap().is_empty());
-                assert!(first.list_pending("conv-2").await.unwrap().is_empty());
+                assert!(second.list_pending("conv-1").await.unwrap().is_empty());
+                assert!(second.list_pending("conv-2").await.unwrap().is_empty());
             }
         }
     }

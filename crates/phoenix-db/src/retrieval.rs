@@ -17,6 +17,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SourceSnapshotTestBarrier {
+    hydrated: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -225,10 +232,25 @@ pub struct ReconcileStats {
     pub pruned: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct FtsReconcilePlan {
+    locator_repair_required: bool,
+    messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsMessageReconcileOutcome {
+    Unchanged,
+    Indexed,
+    Reindexed,
+}
+
 /// Lexical (FTS5/BM25) retrieval backend.
 pub struct Fts5Retriever {
     pool: SqlitePool,
     reconciled: Arc<AtomicBool>,
+    #[cfg(test)]
+    source_snapshot_test_barrier: Option<Arc<SourceSnapshotTestBarrier>>,
 }
 
 impl Fts5Retriever {
@@ -239,6 +261,26 @@ impl Fts5Retriever {
         Self {
             pool,
             reconciled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            source_snapshot_test_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn install_source_snapshot_test_barrier(&mut self, barrier: Arc<SourceSnapshotTestBarrier>) {
+        self.source_snapshot_test_barrier = Some(barrier);
+    }
+
+    #[cfg(test)]
+    async fn wait_at_source_snapshot_test_barrier(&self) {
+        if let Some(barrier) = &self.source_snapshot_test_barrier {
+            barrier.hydrated.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                barrier.release.notified(),
+            )
+            .await
+            .expect("release reconciler source snapshot");
         }
     }
 
@@ -256,6 +298,62 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
+        let plan = self.discover_reconcile_plan().await?;
+        if plan.locator_repair_required {
+            self.repair_locator_rows().await?;
+        }
+        let mut stats = ReconcileStats::default();
+        for message in plan.messages {
+            match self.reconcile_message(message).await? {
+                FtsMessageReconcileOutcome::Unchanged => {}
+                FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
+                FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
+            }
+        }
+        stats.pruned = self.prune_orphans().await?;
+        self.mark_reconciled();
+        Ok(stats)
+    }
+
+    /// Discover source messages and locator drift without mutating the index.
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] when `SQLite` discovery or attachment hydration fails.
+    pub async fn discover_reconcile_plan(&self) -> Result<FtsReconcilePlan, RetrievalError> {
+        let locator_repair_required: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM message_fts_rows
+                WHERE fts_rowid NOT IN (SELECT rowid FROM message_fts)
+                UNION ALL
+                SELECT 1 FROM message_fts
+                WHERE rowid NOT IN (SELECT fts_rowid FROM message_fts_rows)
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let mut messages = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
+        )
+        .try_map(crate::parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+        crate::hydrate_attachments(&self.pool, &mut messages).await?;
+        Ok(FtsReconcilePlan {
+            locator_repair_required,
+            messages,
+        })
+    }
+
+    #[must_use]
+    pub fn locator_repair_required(plan: &FtsReconcilePlan) -> bool {
+        plan.locator_repair_required
+    }
+
+    /// Repair inconsistent FTS physical-row locators atomically.
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] when the repair transaction fails.
+    pub async fn repair_locator_rows(&self) -> Result<(), RetrievalError> {
         let mut locator_tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM message_fts_rows
@@ -270,65 +368,86 @@ impl Fts5Retriever {
         .execute(&mut *locator_tx)
         .await?;
         locator_tx.commit().await?;
+        Ok(())
+    }
 
-        // Physical index rows. We track a per-id row count alongside a sample
-        // hash so a *duplicate* physical row for one message_id (which a plain
-        // map would collapse) is detected and repaired — otherwise
-        // `is_fresh_for` would reject the scope forever and chain Q&A would keep
-        // disabling search after every restart.
-        let existing_rows: Vec<(String, String)> =
-            sqlx::query("SELECT message_id, content_hash FROM message_fts_rows")
-                .try_map(|row: sqlx::sqlite::SqliteRow| {
-                    Ok((
-                        row.try_get::<String, _>("message_id")?,
-                        row.try_get::<String, _>("content_hash")?,
-                    ))
-                })
-                .fetch_all(&self.pool)
-                .await?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut existing: HashMap<String, String> = HashMap::new();
-        for (id, hash) in existing_rows {
-            *counts.entry(id.clone()).or_default() += 1;
-            existing.insert(id, hash);
-        }
+    #[must_use]
+    pub fn messages(plan: FtsReconcilePlan) -> Vec<Message> {
+        plan.messages
+    }
 
+    /// Reconcile one discovered source message as one atomic write unit.
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] when the index read or write fails.
+    pub async fn reconcile_message(
+        &self,
+        planned_message: Message,
+    ) -> Result<FtsMessageReconcileOutcome, RetrievalError> {
+        let mut tx = self.pool.begin().await?;
         let mut messages = sqlx::query(
-            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
         )
+        .bind(&planned_message.message_id)
         .try_map(crate::parse_message_row)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        // Attachments live in child tables, not the content blob; hydrate so the
-        // indexed text includes user/skill file-context tags (`index_text`).
-        crate::hydrate_attachments(&self.pool, &mut messages).await?;
-
-        let mut stats = ReconcileStats::default();
-        for m in &messages {
-            let fingerprint = content_fingerprint(&index_text(m));
-            let count = counts.get(&m.message_id).copied().unwrap_or(0);
-            if count == 0 {
-                // Absent: insert (guarded so a concurrent add wins).
-                if fts_reconcile_upsert(&self.pool, m, None).await? {
-                    stats.indexed += 1;
-                }
-            } else if count == 1 {
-                // Single row: re-index only if stale, compare-and-set so a
-                // concurrent edit's fresh content is never clobbered.
-                let prev = existing[&m.message_id].as_str();
-                if prev != fingerprint.as_str()
-                    && fts_reconcile_upsert(&self.pool, m, Some(prev)).await?
-                {
-                    stats.reindexed += 1;
+        if messages.is_empty() {
+            tx.rollback().await?;
+            return Ok(FtsMessageReconcileOutcome::Unchanged);
+        }
+        crate::hydrate_attachments_conn(&mut tx, &mut messages).await?;
+        let Some(message) = messages.pop() else {
+            tx.rollback().await?;
+            return Ok(FtsMessageReconcileOutcome::Unchanged);
+        };
+        #[cfg(test)]
+        self.wait_at_source_snapshot_test_barrier().await;
+        let existing_rows: Vec<FtsLocatorWitness> = sqlx::query(
+            "SELECT r.fts_rowid, r.content_hash,
+                    f.rowid IS NOT NULL AS physical_match
+             FROM message_fts_rows r
+             LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
+             WHERE r.message_id = ?1
+             ORDER BY r.fts_rowid",
+        )
+        .bind(&message.message_id)
+        .try_map(|row: sqlx::sqlite::SqliteRow| {
+            Ok(FtsLocatorWitness {
+                fts_rowid: row.try_get("fts_rowid")?,
+                content_hash: row.try_get("content_hash")?,
+                physical_match: row.try_get("physical_match")?,
+            })
+        })
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        let fingerprint = content_fingerprint(&index_text(&message));
+        if existing_rows.len() == 1
+            && existing_rows[0].physical_match
+            && existing_rows[0].content_hash == fingerprint
+        {
+            return Ok(FtsMessageReconcileOutcome::Unchanged);
+        }
+        Ok(
+            if fts_reconcile_upsert(&self.pool, &message, &existing_rows).await? {
+                if existing_rows.is_empty() {
+                    FtsMessageReconcileOutcome::Indexed
+                } else {
+                    FtsMessageReconcileOutcome::Reindexed
                 }
             } else {
-                // Duplicate physical rows for one live id: force-collapse to a
-                // single fresh row (unconditional delete-all + insert).
-                fts_upsert(&self.pool, m).await?;
-                stats.reindexed += 1;
-            }
-        }
+                FtsMessageReconcileOutcome::Unchanged
+            },
+        )
+    }
 
+    /// Prune index rows whose source message no longer exists.
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] when the prune transaction fails.
+    pub async fn prune_orphans(&self) -> Result<usize, RetrievalError> {
         // Prune index rows with no live source message, evaluated against the
         // CURRENT `messages` table — not the (now possibly stale) snapshot
         // loaded above. This closes a startup race: a hard delete can remove a
@@ -356,10 +475,11 @@ impl Fts5Retriever {
         .execute(&mut *prune_tx)
         .await?;
         prune_tx.commit().await?;
-        stats.pruned = orphan_rowids.len();
+        Ok(orphan_rowids.len())
+    }
 
+    pub fn mark_reconciled(&self) {
         self.reconciled.store(true, Ordering::Release);
-        Ok(stats)
     }
 }
 
@@ -736,6 +856,13 @@ async fn record_fts_row(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FtsLocatorWitness {
+    pub fts_rowid: i64,
+    pub content_hash: String,
+    pub physical_match: bool,
+}
+
 /// Reconcile-path upsert that will not clobber a fresher concurrent write.
 ///
 /// The startup reconcile snapshots `messages`, then upserts changed/absent
@@ -754,7 +881,7 @@ async fn record_fts_row(
 pub async fn fts_reconcile_upsert(
     pool: &SqlitePool,
     message: &Message,
-    observed: Option<&str>,
+    observed: &[FtsLocatorWitness],
 ) -> Result<bool, sqlx::Error> {
     let telemetry = SqliteTelemetry::new(SqliteOperation::FtsReconcileUpsert);
     let text = index_text(message);
@@ -762,56 +889,7 @@ pub async fn fts_reconcile_upsert(
     let mut tx = telemetry
         .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
         .await?;
-    if let Some(prev) = observed {
-        // Replace a stale row only while it still carries the observed hash.
-        let candidates: Vec<(i64, bool)> = telemetry
-            .observe_sqlx(
-                SqlitePhase::LocatorLookup,
-                sqlx::query(
-                    "SELECT r.fts_rowid, f.rowid IS NOT NULL AS physical_match
-                     FROM message_fts_rows r
-                     LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
-                     WHERE r.message_id = ?1 AND r.content_hash = ?2",
-                )
-                .bind(&message.message_id)
-                .bind(prev)
-                .try_map(|row: sqlx::sqlite::SqliteRow| {
-                    Ok((
-                        row.try_get::<i64, _>("fts_rowid")?,
-                        row.try_get::<bool, _>("physical_match")?,
-                    ))
-                })
-                .fetch_all(&mut *tx),
-            )
-            .await?;
-        if candidates.is_empty() || candidates.iter().any(|(_, matches)| !matches) {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        for (rowid, _) in &candidates {
-            let deleted = telemetry
-                .observe_sqlx(
-                    SqlitePhase::FtsRowDelete,
-                    sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-                        .bind(rowid)
-                        .execute(&mut *tx),
-                )
-                .await?;
-            if deleted.rows_affected() != 1 {
-                tx.rollback().await?;
-                return Ok(false);
-            }
-            telemetry
-                .observe_sqlx(
-                    SqlitePhase::LocatorDelete,
-                    sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
-                        .bind(rowid)
-                        .execute(&mut *tx),
-                )
-                .await?;
-        }
-    } else {
-        // Insert an absent row only while it is still absent.
+    if observed.is_empty() {
         let existing: i64 = telemetry
             .observe_sqlx(
                 SqlitePhase::LocatorLookup,
@@ -823,6 +901,55 @@ pub async fn fts_reconcile_upsert(
         if existing > 0 {
             tx.rollback().await?;
             return Ok(false);
+        }
+    } else {
+        let current: Vec<FtsLocatorWitness> = telemetry
+            .observe_sqlx(
+                SqlitePhase::LocatorLookup,
+                sqlx::query(
+                    "SELECT r.fts_rowid, r.content_hash,
+                            f.rowid IS NOT NULL AS physical_match
+                     FROM message_fts_rows r
+                     LEFT JOIN message_fts f ON f.rowid = r.fts_rowid
+                     WHERE r.message_id = ?1
+                     ORDER BY r.fts_rowid",
+                )
+                .bind(&message.message_id)
+                .try_map(|row: sqlx::sqlite::SqliteRow| {
+                    Ok(FtsLocatorWitness {
+                        fts_rowid: row.try_get("fts_rowid")?,
+                        content_hash: row.try_get("content_hash")?,
+                        physical_match: row.try_get("physical_match")?,
+                    })
+                })
+                .fetch_all(&mut *tx),
+            )
+            .await?;
+        if current != observed || current.iter().any(|entry| !entry.physical_match) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for entry in &current {
+            let deleted = telemetry
+                .observe_sqlx(
+                    SqlitePhase::FtsRowDelete,
+                    sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                        .bind(entry.fts_rowid)
+                        .execute(&mut *tx),
+                )
+                .await?;
+            if deleted.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            telemetry
+                .observe_sqlx(
+                    SqlitePhase::LocatorDelete,
+                    sqlx::query("DELETE FROM message_fts_rows WHERE fts_rowid = ?1")
+                        .bind(entry.fts_rowid)
+                        .execute(&mut *tx),
+                )
+                .await?;
         }
     }
     let inserted = telemetry
@@ -1424,6 +1551,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_plan_discovery_is_read_only() {
+        let db = seed().await;
+        db.add_message(
+            "m1",
+            "c-a",
+            &MessageContent::user("planned retrieval"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM message_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+
+        let plan = r.discover_reconcile_plan().await.unwrap();
+
+        assert_eq!(Fts5Retriever::messages(plan).len(), 1);
+        let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(indexed, 0);
+    }
+
+    #[tokio::test]
     async fn reconcile_rolls_back_physical_prune_when_locator_prune_fails() {
         let db = seed().await;
         let orphan = insert_index_row(db.pool(), "ghost", "gone", 0, "c-a", "hash").await;
@@ -1513,6 +1672,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_reconcile_plan_cannot_overwrite_fresh_source_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retrieval-stale-plan.db");
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        db.create_conversation("c-a", "a", "/tmp/a", true, None, None)
+            .await
+            .unwrap();
+        let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+        db.add_message(
+            "m-stale-plan",
+            "c-a",
+            &MessageContent::user("visible stale plan token"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut retriever = Fts5Retriever::new(db.pool().clone());
+        let stale_message =
+            Fts5Retriever::messages(retriever.discover_reconcile_plan().await.unwrap())
+                .into_iter()
+                .find(|message| message.message_id == "m-stale-plan")
+                .unwrap();
+        let barrier = Arc::new(SourceSnapshotTestBarrier::default());
+        retriever.install_source_snapshot_test_barrier(barrier.clone());
+        let reconcile =
+            tokio::spawn(async move { retriever.reconcile_message(stale_message).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            barrier.hydrated.notified(),
+        )
+        .await
+        .expect("reconcile hydrates source snapshot");
+
+        writer
+            .update_message_display_data("m-stale-plan", &serde_json::json!({ "hidden": true }))
+            .await
+            .unwrap();
+        barrier.release.notify_one();
+        assert!(matches!(
+            reconcile.await.unwrap().unwrap(),
+            FtsMessageReconcileOutcome::Unchanged
+        ));
+        let verifier = Fts5Retriever::new(db.pool().clone());
+        assert!(verifier
+            .retrieve(global_request("visible stale plan token"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn reconcile_replaces_only_the_observed_locator_set() {
         let db = seed().await;
         let stale = db
@@ -1526,6 +1740,11 @@ mod tests {
             .await
             .unwrap();
         let stale_hash = content_fingerprint(&index_text(&stale));
+        let stale_rowid: i64 =
+            sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = 'm-cas'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
 
         let current_text = "current concurrent row";
         let current_hash = content_fingerprint(current_text);
@@ -1536,11 +1755,25 @@ mod tests {
             content: MessageContent::user("reconciled snapshot"),
             ..stale
         };
-        assert!(
-            fts_reconcile_upsert(db.pool(), &snapshot, Some(&stale_hash))
+        assert!(!fts_reconcile_upsert(
+            db.pool(),
+            &snapshot,
+            &[FtsLocatorWitness {
+                fts_rowid: stale_rowid,
+                content_hash: stale_hash,
+                physical_match: true,
+            }],
+        )
+        .await
+        .unwrap());
+
+        let stale_locator_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts_rows WHERE fts_rowid = ?1")
+                .bind(stale_rowid)
+                .fetch_one(db.pool())
                 .await
-                .unwrap()
-        );
+                .unwrap();
+        assert_eq!(stale_locator_rows, 1);
 
         let current_fts_rows: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")

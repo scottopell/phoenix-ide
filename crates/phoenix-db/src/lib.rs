@@ -12107,6 +12107,14 @@ pub(crate) async fn hydrate_attachments(
     pool: &SqlitePool,
     messages: &mut [Message],
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    hydrate_attachments_conn(&mut conn, messages).await
+}
+
+pub(crate) async fn hydrate_attachments_conn(
+    conn: &mut sqlx::SqliteConnection,
+    messages: &mut [Message],
+) -> Result<(), sqlx::Error> {
     for msg in messages.iter_mut() {
         if !matches!(msg.message_type, MessageType::User | MessageType::Skill) {
             continue;
@@ -12122,7 +12130,7 @@ pub(crate) async fn hydrate_attachments(
             size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
             stored_path: row.get("stored_path"),
         })
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // SkillContent has no images; skip the query for skill rows.
@@ -12135,7 +12143,7 @@ pub(crate) async fn hydrate_attachments(
                 data: row.get("data"),
                 media_type: row.get("media_type"),
             })
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?
         } else {
             Vec::new()

@@ -595,11 +595,26 @@ pub async fn migrate_database() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub const FATAL_LOCAL_AUTHORITY_EXIT: i32 = 70;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FatalLocalAuthorityExit;
+
+impl std::fmt::Display for FatalLocalAuthorityExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fatal local SQLite authority loss")
+    }
+}
+
+impl std::error::Error for FatalLocalAuthorityExit {}
+
 /// Start the Phoenix HTTP server with the production composition root.
 ///
 /// # Errors
+/// Returns the originating bootstrap, bind, server, or fatal-authority error.
 ///
-/// Returns an error when production bootstrap, binding, or server execution fails.
+/// # Panics
+/// Panics if fatal-authority notification arrives without its fence-captured deadline.
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // `phx` companion: when this binary is invoked through the PATH-injected
@@ -715,7 +730,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reconcile worktrees after excluding conversations whose exact terminal
     // projection is still owned by startup obligation settlement.
-    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations).await;
+    let mut admit = || Ok::<(), ()>(());
+    let _ = reconcile_worktrees_excluding(&db, &terminal_obligated_conversations, &mut admit).await;
 
     // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
     // rows whose main_ref was defaulted to a literal `main` are corrected before
@@ -999,7 +1015,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             ca = loaded_tls.ca_cert_path.as_ref().map(|p| p.display().to_string()),
             "TLS enabled"
         );
-        tls::serve_https(
+        if let Err(error) = tls::serve_https(
             listener,
             app,
             loaded_tls.server,
@@ -1008,7 +1024,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             &runtime_for_fatal,
             &bash_handles_for_shutdown,
         )
-        .await?;
+        .await
+        {
+            if let Some(deadline) = runtime_for_fatal.fatal_local_authority_deadline() {
+                tracing_handles.shutdown_tracer_until(deadline);
+            } else {
+                tracing_handles.shutdown_tracer();
+            }
+            return Err(error);
+        }
     } else {
         tracing::info!(
             addr = %listener.local_addr()?,
@@ -1052,14 +1076,23 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             }
             boundary = tls::wait_for_fatal_local_authority(&mut fatal_local_authority_rx) => {
                 tracing::error!(?boundary, "fatal local SQLite authority loss; stopping without database cleanup");
-                runtime_for_fatal.fence_fatal_local_authority().await;
                 let _ = drain_tx.send(());
-                if tls::bounded_post_shutdown_drain(&mut server, "HTTP fatal authority").await.is_none() {
+                let deadline = runtime_for_fatal
+                    .fatal_local_authority_deadline()
+                    .expect("fatal authority deadline must be set before HTTP drain");
+                let fatal_tail = async {
+                    tls::drain_concurrently(
+                        runtime_for_fatal.fence_fatal_local_authority(),
+                        &mut server,
+                    )
+                    .await;
+                    crate::tools::bash::shutdown_kill_tree_until(deadline, &bash_handles_for_shutdown).await;
+                };
+                if tls::bounded_post_shutdown_drain_until(deadline, fatal_tail, "HTTP fatal authority").await.is_none() {
                     server_abort.abort();
                 }
-                crate::tools::bash::shutdown_kill_tree(&bash_handles_for_shutdown).await;
-                tracing_handles.shutdown_tracer();
-                return Err(std::io::Error::other("fatal local SQLite authority loss").into());
+                tracing_handles.shutdown_tracer_until(deadline);
+                return Err(FatalLocalAuthorityExit.into());
             }
         }
     }
@@ -1101,17 +1134,28 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 /// transferred to a continuation — not a genuine orphan.
 #[cfg(test)]
 pub(crate) async fn reconcile_worktrees(db: &Database) {
-    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await;
+    let mut admit = || Ok::<(), ()>(());
+    let _ = reconcile_worktrees_excluding(db, &std::collections::HashSet::new(), &mut admit).await;
 }
 
-pub(crate) async fn reconcile_worktrees_with_terminalized(db: &Database) -> Vec<Conversation> {
-    reconcile_worktrees_excluding(db, &std::collections::HashSet::new()).await
+pub(crate) async fn reconcile_worktrees_with_terminalized<Admission, Guard>(
+    db: &Database,
+    mut admit: Admission,
+) -> Vec<Conversation>
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
+    reconcile_worktrees_excluding(db, &std::collections::HashSet::new(), &mut admit).await
 }
 
-async fn reconcile_worktrees_excluding(
+async fn reconcile_worktrees_excluding<Admission, Guard>(
     db: &Database,
     excluded_conversations: &std::collections::HashSet<String>,
-) -> Vec<Conversation> {
+    admit: &mut Admission,
+) -> Vec<Conversation>
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
     let mut terminalized = Vec::new();
     let work_convs = match db.managed_worktree_conversations().await {
         Ok(convs) => convs,
@@ -1149,6 +1193,10 @@ async fn reconcile_worktrees_excluding(
         if std::path::Path::new(wt_path).exists() {
             continue;
         }
+
+        let Ok(_owner) = admit() else {
+            break;
+        };
 
         tracing::warn!(
             conv_id = %conv.id,
@@ -1201,7 +1249,7 @@ async fn reconcile_worktrees_excluding(
         );
     }
 
-    reclaim_unowned_worktrees(db).await;
+    reclaim_unowned_worktrees(db, admit).await;
     terminalized
 }
 
@@ -1422,7 +1470,10 @@ fn add_physical_project_worktrees(
     }
 }
 
-async fn reclaim_unowned_worktrees(db: &Database) {
+async fn reclaim_unowned_worktrees<Admission, Guard>(db: &Database, admit: &mut Admission)
+where
+    Admission: FnMut() -> Result<Guard, ()>,
+{
     let conversations = match db.managed_worktree_conversations().await {
         Ok(conversations) => conversations,
         Err(error) => {
@@ -1451,6 +1502,9 @@ async fn reclaim_unowned_worktrees(db: &Database) {
     let mut reclaimed = 0usize;
     let mut quarantined = 0usize;
     for (path, owners) in by_path {
+        let Ok(_owner) = admit() else {
+            return;
+        };
         if owners
             .iter()
             .any(crate::runtime::conversation_attachment_retains_work_scope)
@@ -1677,9 +1731,48 @@ mod suggest_token_tests {
 }
 
 #[cfg(test)]
+fn run_reconciliation_targets_with_admission<T>(
+    targets: impl IntoIterator<Item = T>,
+    mut admit: impl FnMut() -> Result<(), ()>,
+    mut run: impl FnMut(T),
+) {
+    for target in targets {
+        if admit().is_err() {
+            break;
+        }
+        run(target);
+    }
+}
+
+#[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;
     use crate::db::{ConvMode, ConvState, NonEmptyString};
+
+    #[tokio::test]
+    async fn closure_between_worktree_targets_prevents_later_reconciliation() {
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admission = std::sync::Arc::clone(&open);
+        let close = std::sync::Arc::clone(&open);
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reconciled = std::sync::Arc::clone(&observed);
+
+        run_reconciliation_targets_with_admission(
+            ["missing-1", "missing-2"],
+            move || {
+                admission
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then_some(())
+                    .ok_or(())
+            },
+            move |target| {
+                reconciled.lock().unwrap().push(target);
+                close.store(false, std::sync::atomic::Ordering::Release);
+            },
+        );
+
+        assert_eq!(*observed.lock().unwrap(), vec!["missing-1"]);
+    }
 
     /// Initialise a git repo in a tempdir with one commit on main.
     fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
