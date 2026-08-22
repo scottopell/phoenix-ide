@@ -519,7 +519,6 @@ pub struct RuntimeManager {
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     startup_obligated_conversations: RwLock<HashSet<String>>,
-    consumed_startup_parent_actions: RwLock<HashSet<i64>>,
     /// Why each pending-eviction runtime was evicted, keyed by conversation
     /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
     /// by the next `get_or_create` so the auto-continue recovery message says
@@ -2126,7 +2125,6 @@ impl RuntimeManager {
             steering_projection: ConversationMutexGates::default(),
             evicted_broadcasters: RwLock::new(HashMap::new()),
             startup_obligated_conversations: RwLock::new(HashSet::new()),
-            consumed_startup_parent_actions: RwLock::new(HashSet::new()),
             evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
@@ -4140,128 +4138,58 @@ impl RuntimeManager {
             )
             .await;
         }
-        let actions = self
-            .db
-            .list_startup_parent_actions()
-            .await
-            .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
         let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
-        for action_record in actions {
-            let Ok(_owner) = self.acquire_local_authority_pass() else {
-                return Ok(());
-            };
-            let conversation_id = action_record.conversation_id.clone();
-            match action_record.action {
-                phoenix_db::StartupParentAction::Reconcile => {
-                    let ids = HashSet::from([conversation_id.clone()]);
-                    let reconciled = self
-                        .db
-                        .reconcile_startup_obligated_parents(&ids)
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?;
-                    let _ = reconciled;
+        let mut consumed_action_ids = HashSet::new();
+        loop {
+            let actions = self
+                .db
+                .list_startup_parent_actions()
+                .await
+                .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
+            if actions.is_empty() {
+                break;
+            }
+            for action_record in actions {
+                if !consumed_action_ids.insert(action_record.action_id) {
+                    return Err(DatabaseTerminalRecoveryError::Unclassifiable(format!(
+                        "startup parent action {} for {} did not advance",
+                        action_record.action_id, action_record.conversation_id
+                    )));
                 }
-                phoenix_db::StartupParentAction::Resume => {
-                    if self
-                        .consumed_startup_parent_actions
-                        .read()
-                        .await
-                        .contains(&action_record.action_id)
-                    {
-                        continue;
-                    }
-                    let current = repo
-                        .load_owning_authoritative_turn(&phoenix_workflow::ConversationAuthority(
-                            conversation_id.clone(),
-                        ))
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?;
-                    if current.as_ref().map(|turn| turn.id) != action_record.turn_id
-                        || current.as_ref().map(|turn| turn.generation)
-                            != action_record.turn_generation
-                    {
+                let Ok(_owner) = self.acquire_local_authority_pass() else {
+                    return Ok(());
+                };
+                let conversation_id = action_record.conversation_id.clone();
+                match action_record.action {
+                    phoenix_db::StartupParentAction::Reconcile => {
+                        let ids = HashSet::from([conversation_id.clone()]);
+                        let reconciled = self
+                            .db
+                            .reconcile_startup_obligated_parents(&ids)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        let _ = reconciled;
                         self.db
                             .delete_startup_parent_action(&conversation_id, action_record.action_id)
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
                             })?;
-                        continue;
                     }
-                    let projection =
-                        self.db
-                            .get_conversation(&conversation_id)
-                            .await
-                            .map_err(|error| {
-                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                            })?;
-                    if projection.state.is_terminal() {
-                        if let Some(turn) = current {
-                            repo.terminalize_authoritative_turn(
-                                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
-                                    command: phoenix_workflow::TurnCommand::Cancel {
-                                        turn_id: turn.id,
-                                        expected_generation: turn.generation,
-                                    },
-                                    projection: Some(
-                                        phoenix_db::workflow::PersistedConversationProjection {
-                                            state: projection.state.clone(),
-                                            state_updated_at: projection.state_updated_at,
-                                        },
-                                    ),
-                                },
+                    phoenix_db::StartupParentAction::Resume => {
+                        let current = repo
+                            .load_owning_authoritative_turn(
+                                &phoenix_workflow::ConversationAuthority(conversation_id.clone()),
                             )
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
                             })?;
-                        }
-                        executor::complete_terminal_lifecycle_without_broadcast(
-                            &conversation_id,
-                            false,
-                            &projection.state,
-                            Some(std::path::Path::new(&projection.cwd)),
-                            Some(&self.fork_cmd_tx),
-                        )
-                        .await;
-                        self.db
-                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
-                            .await
-                            .map_err(|error| {
-                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                            })?;
-                        continue;
-                    }
-                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
-                        .await;
-                    self.get_or_create(&conversation_id)
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(format!(
-                                "failed to resume reconciled parent {conversation_id}: {error}"
-                            ))
-                        })?;
-                    self.consumed_startup_parent_actions
-                        .write()
-                        .await
-                        .insert(action_record.action_id);
-                }
-                phoenix_db::StartupParentAction::Cancel => {
-                    let authority =
-                        phoenix_workflow::ConversationAuthority(conversation_id.clone());
-                    if let Some(turn) = repo
-                        .load_owning_authoritative_turn(&authority)
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?
-                    {
-                        if action_record.turn_id != Some(turn.id)
-                            || action_record.turn_generation != Some(turn.generation)
+                        if current.as_ref().map(|turn| turn.id) != action_record.turn_id
+                            || current.as_ref().map(|turn| turn.generation)
+                                != action_record.turn_generation
                         {
                             self.db
                                 .delete_startup_parent_action(
@@ -4274,40 +4202,133 @@ impl RuntimeManager {
                                 })?;
                             continue;
                         }
-                        let conversation = self
-                            .db
-                            .get_conversation(&conversation_id)
+                        let projection =
+                            self.db
+                                .get_conversation(&conversation_id)
+                                .await
+                                .map_err(|error| {
+                                    DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                })?;
+                        if projection.state.is_terminal() {
+                            if let Some(turn) = current {
+                                repo.terminalize_authoritative_turn(
+                                    &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                                        command: phoenix_workflow::TurnCommand::Cancel {
+                                            turn_id: turn.id,
+                                            expected_generation: turn.generation,
+                                        },
+                                        projection: Some(
+                                            phoenix_db::workflow::PersistedConversationProjection {
+                                                state: projection.state.clone(),
+                                                state_updated_at: projection.state_updated_at,
+                                            },
+                                        ),
+                                    },
+                                )
+                                .await
+                                .map_err(|error| {
+                                    DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                })?;
+                            }
+                            executor::complete_terminal_lifecycle_without_broadcast(
+                                &conversation_id,
+                                false,
+                                &projection.state,
+                                Some(std::path::Path::new(&projection.cwd)),
+                                Some(&self.fork_cmd_tx),
+                            )
+                            .await;
+                            self.db
+                                .delete_startup_parent_action(
+                                    &conversation_id,
+                                    action_record.action_id,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                })?;
+                            continue;
+                        }
+                        self.evict_runtime(
+                            &conversation_id,
+                            EvictionReason::RecoveryReconciliation,
+                        )
+                        .await;
+                        self.get_or_create(&conversation_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(format!(
+                                    "failed to resume reconciled parent {conversation_id}: {error}"
+                                ))
+                            })?;
+                        self.db
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
                             .await
                             .map_err(|error| {
                                 DatabaseTerminalRecoveryError::Retryable(error.to_string())
                             })?;
-                        repo.terminalize_authoritative_turn(
-                            &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
-                                command: phoenix_workflow::TurnCommand::Cancel {
-                                    turn_id: turn.id,
-                                    expected_generation: turn.generation,
-                                },
-                                projection: Some(
-                                    phoenix_db::workflow::PersistedConversationProjection {
-                                        state: conversation.state,
-                                        state_updated_at: conversation.state_updated_at,
-                                    },
-                                ),
-                            },
-                        )
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?;
                     }
-                    self.evict_runtime(&conversation_id, EvictionReason::RecoveryReconciliation)
+                    phoenix_db::StartupParentAction::Cancel => {
+                        let authority =
+                            phoenix_workflow::ConversationAuthority(conversation_id.clone());
+                        if let Some(turn) = repo
+                            .load_owning_authoritative_turn(&authority)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?
+                        {
+                            if action_record.turn_id != Some(turn.id)
+                                || action_record.turn_generation != Some(turn.generation)
+                            {
+                                self.db
+                                    .delete_startup_parent_action(
+                                        &conversation_id,
+                                        action_record.action_id,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                    })?;
+                                continue;
+                            }
+                            let conversation =
+                                self.db.get_conversation(&conversation_id).await.map_err(
+                                    |error| {
+                                        DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                                    },
+                                )?;
+                            repo.terminalize_authoritative_turn(
+                                &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
+                                    command: phoenix_workflow::TurnCommand::Cancel {
+                                        turn_id: turn.id,
+                                        expected_generation: turn.generation,
+                                    },
+                                    projection: Some(
+                                        phoenix_db::workflow::PersistedConversationProjection {
+                                            state: conversation.state,
+                                            state_updated_at: conversation.state_updated_at,
+                                        },
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                        }
+                        self.evict_runtime(
+                            &conversation_id,
+                            EvictionReason::RecoveryReconciliation,
+                        )
                         .await;
-                    self.db
-                        .delete_startup_parent_action(&conversation_id, action_record.action_id)
-                        .await
-                        .map_err(|error| {
-                            DatabaseTerminalRecoveryError::Retryable(error.to_string())
-                        })?;
+                        self.db
+                            .delete_startup_parent_action(&conversation_id, action_record.action_id)
+                            .await
+                            .map_err(|error| {
+                                DatabaseTerminalRecoveryError::Retryable(error.to_string())
+                            })?;
+                    }
                 }
             }
         }
@@ -7145,6 +7166,61 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn startup_reconcile_replacement_is_drained_before_phase_completion() {
+        let manager = Arc::new(test_manager().await);
+        let parent_id = "startup-fixed-point-parent";
+        manager
+            .db()
+            .create_conversation(parent_id, "parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        manager
+            .db()
+            .create_conversation(
+                "startup-fixed-point-child",
+                "child",
+                "/tmp",
+                false,
+                Some(parent_id),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .db()
+            .update_conversation_state(parent_id, &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .unwrap();
+        manager
+            .db()
+            .establish_parent_reconcile_action(parent_id)
+            .await
+            .unwrap();
+        let initial = manager.db().list_startup_parent_actions().await.unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(
+            initial[0].action,
+            phoenix_db::StartupParentAction::Reconcile
+        );
+
+        manager.reconcile_startup_obligated_parents().await.unwrap();
+
+        assert!(
+            manager
+                .db()
+                .list_startup_parent_actions()
+                .await
+                .unwrap()
+                .is_empty(),
+            "replacement Resume must be consumed in the same startup phase"
+        );
+        assert!(
+            manager.try_get_handle(parent_id).await.is_some(),
+            "ownerless parent must be materialized before startup completes"
+        );
+    }
+
+    #[tokio::test]
     async fn durable_parent_resume_is_discovered_without_process_marker() {
         let manager = Arc::new(test_manager().await);
         let conversation_id = "durable-parent-resume";
@@ -7177,10 +7253,15 @@ mod scope_liveness_tests {
 
         manager.reconcile_startup_obligated_parents().await.unwrap();
         assert!(manager.try_get_handle(conversation_id).await.is_some());
-        let actions = manager.db().list_startup_parent_actions().await.unwrap();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].conversation_id, conversation_id);
-        assert_eq!(actions[0].action, phoenix_db::StartupParentAction::Resume);
+        assert!(
+            manager
+                .db()
+                .list_startup_parent_actions()
+                .await
+                .unwrap()
+                .is_empty(),
+            "startup Resume is consumed after materializing its runtime"
+        );
     }
 
     #[tokio::test]
