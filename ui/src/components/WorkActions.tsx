@@ -110,8 +110,10 @@ type CompactFallbackStatus = {
 function compactFallbackStatus(
   disposition: WorkDisposition,
   prStatus: PrStatusResponse | null,
+  explicitSelectionUnresolved: boolean,
 ): CompactFallbackStatus {
   if (disposition.note?.kind === 'continued') return { icon: '✓', label: 'Continued elsewhere', tone: 'muted' };
+  if (explicitSelectionUnresolved) return { icon: '⚠', label: 'Active PR unavailable', tone: 'attention' };
   if (disposition.note?.kind === 'checking') return { icon: '…', label: 'Checking PR', tone: 'muted' };
   if (disposition.note?.kind === 'pr_closed') return { icon: '⚠', label: 'PR closed', tone: 'attention' };
   if (disposition.note?.kind === 'pr_open_stuck') return { icon: '⚠', label: 'PR still open', tone: 'attention' };
@@ -415,7 +417,7 @@ export function WorkControlBar({
     : addressFeedbackLabel;
 
   if (usesCompactLayout && !canRepresentActiveSelection) {
-    const status = compactFallbackStatus(disposition, prStatus);
+    const status = compactFallbackStatus(disposition, prStatus, explicitSelectionUnresolved);
     const primaryGuidance = disposition.primary === 'review'
       ? 'Review workspace changes before deciding how to finish this work.'
       : disposition.resolve?.kind === 'address_feedback'
@@ -435,7 +437,11 @@ export function WorkControlBar({
     const closeFallbackPanel = () => setFallbackPanel(null);
 
     return (
-      <div ref={fallbackDockRef} className="mobile-work-fallback" data-testid="mobile-work-fallback">
+      <div
+        ref={fallbackDockRef}
+        className={`mobile-work-fallback${disposition.primary === 'none' && !fallbackHasOverflowActions ? ' mobile-work-fallback--status-only' : ''}`}
+        data-testid="mobile-work-fallback"
+      >
         <div className="mobile-work-fallback-status">
           <span className={`mobile-work-fallback-status-copy mobile-work-fallback-status-copy--${status.tone}`}>
             <span aria-hidden="true">{status.icon}</span>
@@ -791,6 +797,16 @@ export function WorkControlBar({
         >
           Workspace Diff
         </button>
+        {explicitSelectionUnresolved && (
+          <button
+            type="button"
+            className="work-actions-btn work-actions-primary"
+            disabled={!prStatusHandle.resumeInference}
+            onClick={() => void resumePrInference()}
+          >
+            Resume PR inference
+          </button>
+        )}
         {canShowPrDiff && (
           <button
             className="work-actions-btn work-actions-view-diff"

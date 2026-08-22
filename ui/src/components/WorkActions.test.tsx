@@ -1778,6 +1778,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveClass('mobile-work-fallback--status-only');
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
@@ -1935,6 +1936,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Active PR unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(api.markMerged).not.toHaveBeenCalled();
@@ -1972,6 +1974,38 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
+  it('offers desktop inference recovery for an unresolved explicit selection', async () => {
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-desktop-unresolved"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
   });
 
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
