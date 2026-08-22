@@ -118,6 +118,15 @@ function compactFallbackStatus(
   if (disposition.note?.kind === 'gh_unavailable') return { icon: '⚠', label: 'GitHub unavailable', tone: 'attention' };
 
   if (prStatus?.display_state === 'merged') return { icon: '✓', label: 'PR merged', tone: 'success' };
+  if (disposition.resolve?.kind === 'address_feedback') {
+    return { icon: '⚠', label: 'PR feedback ready', tone: 'attention' };
+  }
+  if (prStatus?.found && prStatus.display_state === 'draft') {
+    return { icon: '…', label: 'Draft PR', tone: 'muted' };
+  }
+  if (prStatus?.found && prStatus.display_state === 'open') {
+    return { icon: '…', label: 'PR open', tone: 'muted' };
+  }
 
   switch (prStatus?.work_change?.kind) {
     case 'dirty_needs_review': {
@@ -144,9 +153,6 @@ function compactFallbackStatus(
       break;
   }
 
-  if (disposition.resolve?.kind === 'address_feedback') {
-    return { icon: '⚠', label: 'PR feedback ready', tone: 'attention' };
-  }
   if (disposition.primary === 'abandon') return { icon: '⚠', label: 'Cleanup required', tone: 'attention' };
   return { icon: '✓', label: 'Workspace ready', tone: 'success' };
 }
@@ -427,7 +433,7 @@ export function WorkControlBar({
           </button>
         </div>
 
-        {(disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
+        {fallbackPanel !== 'info' && (disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
           {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}

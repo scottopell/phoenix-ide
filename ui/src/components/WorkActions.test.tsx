@@ -1533,8 +1533,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
     expect(details).toHaveTextContent('Captures a diff snapshot');
 
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
     expect(screen.getByRole('menuitem', { name: /^Abandon\./ })).toBeInTheDocument();
   });
 
@@ -1657,6 +1658,53 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
 
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
+  });
+
+  it('prioritizes feedback status over cached workspace-change status', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      work_change: { kind: 'loading' },
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-feedback"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR feedback ready');
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('Checking changes');
+  });
+
+  it('removes covered actions from the interaction tree while details are open', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-covered-actions"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
