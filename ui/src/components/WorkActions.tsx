@@ -460,10 +460,10 @@ export function WorkControlBar({
             <button
               type="button"
               className="mobile-pr-action mobile-pr-action--hero"
-              aria-label="Review workspace changes"
-              onClick={() => openDiffFullscreen('workspace')}
+              aria-label="Address feedback. Select the active PR first."
+              onClick={requestActivePrSelectorOpen}
             >
-              Review changes
+              Address feedback
             </button>
           )}
           {disposition.primary === 'review' && (

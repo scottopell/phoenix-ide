@@ -25,6 +25,7 @@ import { WorkControlBar } from './WorkActions';
 import { StateBar } from './StateBar';
 import { api, type AssociatedPrStatusEnvelope, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
+import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 
 // WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
 // URL contract.
@@ -42,6 +43,10 @@ function CaptureSlot({ onSlot }: { onSlot: (slot: ReturnType<typeof useViewerSlo
   useEffect(() => { onSlot(slot); }, [slot, onSlot]);
   return null;
 }
+
+vi.mock('./activePrSelectorIntent', () => ({
+  requestActivePrSelectorOpen: vi.fn(),
+}));
 
 vi.mock('../api', () => ({
   api: {
@@ -1714,7 +1719,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
-  it('keeps a direct review primary when the cached active PR cannot be targeted', () => {
+  it('keeps Address feedback primary and requests PR selection when its target is unresolved', () => {
     enableMobile();
     const handle = prStatusHandle({
       found: true,
@@ -1742,7 +1747,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Review workspace changes' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Address feedback. Select the active PR first.' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
