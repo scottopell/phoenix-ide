@@ -322,7 +322,7 @@ server-side legality gate.
 
 ### REQ-WAB-011: Mobile Active-PR Rail
 
-WHEN actionable associated PRs exist on mobile
+WHEN actionable associated PRs exist on mobile and the active PR selection can be represented by those PRs
 THE SYSTEM SHALL render a thin PR rail directly above the conversation input that:
 
 - contains only open or draft actionable PRs, never closed or merged history;
