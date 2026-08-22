@@ -2,24 +2,30 @@
 
 ## Requirements Summary
 
-SQLite workload attribution adds a bounded in-memory collector for future operator diagnostics. The first slice introduces a fixed one-minute ring, closed attribution enums, fixed latency bins, boundary-safe duration splitting, fixed 1h/6h/24h snapshots, and shared ownership on `phoenix_db::Database`, while preserving the existing sparse `sqlite_telemetry` signals and deferring API/UI plus production call-site instrumentation.
+SQLite workload attribution defines a bounded, privacy-safe, in-memory diagnostics surface for recent SQLite behavior. The contract centers on a fixed process-local 1,441-minute ring, closed category/access/outcome vocabularies, fixed bounded histograms, half-open minute-window attribution, distinct pool/admission/writer/read timing semantics, bounded percentile upper bounds, sparse incident telemetry preserved alongside aggregate reporting, and read-only 1h/6h/24h diagnostics through the deployment endpoint and About Deployment UI.
 
 ## Technical Summary
 
-The collector lives in `phoenix-db` as a shared in-memory module. It keeps 1,441 one-minute buckets, aggregates counts and histograms with fixed arrays keyed by closed enums, splits writer-held and read-connection durations across minute boundaries, and snapshots bounded windows without querying SQLite. `Database` stores one shared collector behind an `Arc`, and cloning `Database` shares the same collector instance.
+The collector lives in `phoenix-db` and is shared by every clone of `phoenix_db::Database` through an `Arc`-backed in-memory collector. Observations record operation counts, outcome counts, fixed histograms, retry totals, retry backoff totals, writer-held time, read-connection time, and bounded concurrency peaks. Counts and histograms land in the completion bucket, while writer-held and read-connection durations are split across overlapped minute buckets using half-open semantics. `phoenix-ide` samples aggregate reports from the shared collector for fixed 1h, 6h, and 24h windows, derives bounded percentile upper bounds from the histograms, and serves the result through `/api/deployment/sqlite-workload`, which the About Deployment page renders as an in-memory diagnostic report. Reports include coverage metadata, restart truncation, and process-local confidence signals instead of fabricating pre-restart history.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-SWA-001:** Fixed in-memory minute ring | ✅ Complete | Collector ring uses 1,441 fixed one-minute buckets |
-| **REQ-SWA-002:** Closed attribution dimensions | ✅ Complete | Closed category, access kind, outcome, and window enums in collector module |
-| **REQ-SWA-003:** Fixed latency bins | ✅ Complete | Bounded latency histogram bins stored in each bucket |
-| **REQ-SWA-004:** Boundary-safe duration attribution | ✅ Complete | Writer/read durations split across overlapped minute buckets |
-| **REQ-SWA-005:** Separate writer and read duration semantics | ✅ Complete | Separate accumulators for writer-held and read-connection time |
-| **REQ-SWA-006:** Fixed snapshot windows | ✅ Complete | 1h/6h/24h snapshot API over shared ring |
-| **REQ-SWA-007:** Shared Database ownership | ✅ Complete | `Database` owns one shared collector and shares it on clone |
-| **REQ-SWA-008:** Existing sparse SQLite telemetry remains available | ✅ Complete | No sqlite_telemetry behavior change; no call-site instrumentation added |
-| **REQ-SWA-009:** Unit-verifiable collector behavior | ✅ Complete | Focused unit tests cover ring, histograms, splitting, snapshots, and clone sharing |
+| **REQ-SWA-001:** Fixed process-local minute ring | ✅ Complete | `phoenix-db` uses a fixed 1,441-bucket in-memory ring with slot overwrite and no collector persistence. |
+| **REQ-SWA-002:** Closed attribution vocabulary | ✅ Complete | Category, access-kind, and outcome enums are closed and shared across collector and report code. |
+| **REQ-SWA-003:** Fixed bounded histograms | ✅ Complete | Latency, pool-wait, and write-admission histograms use one fixed bounded bin set. |
+| **REQ-SWA-004:** Completion-bucket counts with overlap-safe duration splitting | ✅ Complete | Completion counts stay in the completion minute; writer/read durations split by overlapped fraction with half-open boundary behavior. |
+| **REQ-SWA-005:** Separate pool, admission, writer, and read semantics | ✅ Complete | Aggregate report fields and summaries distinguish these measures; read reports keep admission wait empty. |
+| **REQ-SWA-006:** Aggregate concurrency semantics | ◐ Partial | The report surface carries bounded peak concurrency fields, but production observation coverage is not yet comprehensive enough to claim complete concurrency attribution across all SQLite call sites and outcomes. |
+| **REQ-SWA-007:** Fixed diagnostic windows from a shared collector | ✅ Complete | The deployment API and About Deployment UI expose read-only in-memory 1h/6h/24h reports from the shared collector. |
+| **REQ-SWA-008:** Coverage, restart truncation, and minimum confidence | ✅ Complete | Reports include `restart_truncated`, process start, uptime, covered uptime, and covered bucket counts. |
+| **REQ-SWA-009:** Bounded percentile upper bounds and unavailable semantics | ✅ Complete | Percentiles are derived from histograms, returned as upper bounds, and become unavailable for empty histograms or the open-ended top bin. |
+| **REQ-SWA-010:** Shared collector ownership across Database clones | ✅ Complete | `Database::clone` shares one collector instance rather than copying history. |
+| **REQ-SWA-011:** Sparse incident telemetry remains available | ✅ Complete | Existing `sqlite_telemetry` slow-operation and failure logs/spans remain active beside aggregate reporting. |
+| **REQ-SWA-012:** Privacy-safe diagnostics surface | ✅ Complete | The endpoint and UI expose aggregate counters and bounded summaries only; no SQL text or per-operation payloads are reported. |
+| **REQ-SWA-013:** Verification covers collector contract and surfaces | ◐ Partial | Collector behavior, report generation, and UI surface are covered, but comprehensive verification of category assignment, retry attribution, and concurrency attribution across every production SQLite observation site remains incomplete. |
 
-**Progress:** 9 of 9 complete
+## Coverage Notes
+
+The collector/report contract is implemented end to end: shared collector ownership, aggregate reporting, deployment endpoint, generated wire types, and About Deployment UI are all present. The remaining gap is breadth, not core behavior: workload category assignment is not yet comprehensive across all SQLite call sites, and retry/concurrency attribution is only partially represented in production observations even though the shared collector and report schema support those fields.
