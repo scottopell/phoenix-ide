@@ -122,7 +122,6 @@ pub(crate) struct DirectTurnWorker<D: DirectTurnDispatcher, C: DirectTurnClock> 
     dispatcher: Arc<D>,
     clock: Arc<C>,
     process_incarnation: ProcessIncarnation,
-    startup_reconciliation: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pre_dispatch_hook: Option<PreDispatchHook>,
 }
@@ -146,7 +145,6 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             dispatcher,
             clock,
             process_incarnation,
-            startup_reconciliation: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(test)]
             pre_dispatch_hook: None,
         }
@@ -173,7 +171,7 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         ready_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Result<(), StartupReconciliationError> {
         let mut wait = loop {
-            match self.run_once().await {
+            match self.run_startup_once().await {
                 Ok(wait) => break wait,
                 Err(error) => match StartupReconciliationError::from(error) {
                     StartupReconciliationError::Retryable(error) => {
@@ -212,6 +210,13 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
         }
     }
 
+    async fn run_startup_once(
+        &self,
+    ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
+        self.dispatcher.reconcile_startup_parents().await?;
+        self.run_once().await
+    }
+
     pub(crate) async fn run_once(
         &self,
     ) -> Result<Duration, crate::runtime::DatabaseTerminalRecoveryError> {
@@ -240,15 +245,6 @@ impl<D: DirectTurnDispatcher + TerminalObligationDispatcher, C: DirectTurnClock>
             if !made_progress {
                 break;
             }
-        }
-
-        let startup = self
-            .startup_reconciliation
-            .load(std::sync::atomic::Ordering::Acquire);
-        self.dispatcher.reconcile_startup_parents(startup).await?;
-        if startup {
-            self.startup_reconciliation
-                .store(false, std::sync::atomic::Ordering::Release);
         }
 
         let mut cursor = None;
@@ -505,7 +501,6 @@ pub(crate) trait TerminalObligationDispatcher: Send + Sync + 'static {
 
     async fn reconcile_startup_parents(
         &self,
-        _startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
         Ok(())
     }
@@ -549,11 +544,8 @@ impl TerminalObligationDispatcher for ProductionDirectTurnDispatcher {
 
     async fn reconcile_startup_parents(
         &self,
-        startup: bool,
     ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
-        self.manager
-            .reconcile_startup_obligated_parents(startup)
-            .await
+        self.manager.reconcile_startup_obligated_parents().await
     }
 
     async fn settle_terminal_obligation(
@@ -744,6 +736,7 @@ mod tests {
         admission_attempts: std::sync::atomic::AtomicUsize,
         close_after_terminal_settlement: std::sync::atomic::AtomicBool,
         close_after_dispatch: std::sync::atomic::AtomicBool,
+        startup_reconciliations: std::sync::atomic::AtomicUsize,
     }
 
     impl Default for RecordingDispatcher {
@@ -759,6 +752,7 @@ mod tests {
                 admission_attempts: std::sync::atomic::AtomicUsize::new(0),
                 close_after_terminal_settlement: std::sync::atomic::AtomicBool::new(false),
                 close_after_dispatch: std::sync::atomic::AtomicBool::new(false),
+                startup_reconciliations: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -772,6 +766,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
                 .then(|| Box::new(()) as Box<dyn Send>)
                 .ok_or(())
+        }
+
+        async fn reconcile_startup_parents(
+            &self,
+        ) -> Result<(), crate::runtime::DatabaseTerminalRecoveryError> {
+            self.startup_reconciliations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
         }
 
         async fn settle_terminal_obligation(
@@ -998,6 +1000,108 @@ mod tests {
             }),
             ProcessIncarnation(1),
         )
+    }
+
+    #[tokio::test]
+    async fn live_parent_reconciliation_preserves_in_flight_tool_authority() {
+        use phoenix_core::domain::db_schema::{MessageContent, ToolContent};
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        let parent_id = "live-worker-parent";
+        db.create_conversation(parent_id, parent_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let in_flight = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "live-tool",
+                ToolInput::Think(ThinkInput {
+                    thoughts: "authoritative side effect".to_string(),
+                }),
+            ),
+            remaining_tools: Vec::new(),
+            completed_results: Vec::new(),
+            pending_sub_agents: Vec::new(),
+            assistant_message: AssistantMessage::new(
+                "live-assistant".to_string(),
+                vec![ContentBlock::tool_use(
+                    "live-tool",
+                    "think",
+                    serde_json::json!({"thoughts": "authoritative side effect"}),
+                )],
+                None,
+                None,
+            ),
+        };
+        db.update_conversation_state(parent_id, &in_flight)
+            .await
+            .unwrap();
+        db.establish_parent_reconcile_action(parent_id)
+            .await
+            .unwrap();
+        let repo = WorkflowRepository::new(db.pool().clone());
+        let dispatcher = Arc::new(RecordingDispatcher::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let real_result = {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let result = MessageContent::Tool(ToolContent::new(
+                    "live-tool",
+                    "real side effect completed",
+                    false,
+                ));
+                db.add_message("live-real-result", parent_id, &result, None, None)
+                    .await
+                    .unwrap();
+                db.update_conversation_state(parent_id, &ConvState::LlmRequesting { attempt: 1 })
+                    .await
+                    .unwrap();
+            })
+        };
+        let actions_before = db.list_startup_parent_actions().await.unwrap();
+
+        worker(repo, Arc::clone(&dispatcher), 10, 1)
+            .run_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dispatcher
+                .startup_reconciliations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a normal worker pass cannot enter startup reconciliation"
+        );
+        assert_eq!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            in_flight
+        );
+        assert!(db.get_messages(parent_id).await.unwrap().is_empty());
+        assert_eq!(
+            db.list_startup_parent_actions().await.unwrap(),
+            actions_before,
+            "live pass cannot consume recovery actions or auto-continue"
+        );
+
+        barrier.wait().await;
+        real_result.await.unwrap();
+
+        let messages = db.get_messages(parent_id).await.unwrap();
+        assert_eq!(messages.len(), 1, "real result commits exactly once");
+        let MessageContent::Tool(result) = &messages[0].content else {
+            panic!("expected real tool result")
+        };
+        assert_eq!(result.content, "real side effect completed");
+        assert!(!result.is_error);
+        assert_eq!(
+            db.get_conversation(parent_id).await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        );
     }
 
     #[tokio::test]

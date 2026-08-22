@@ -4101,7 +4101,6 @@ impl RuntimeManager {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn reconcile_startup_obligated_parents(
         self: &Arc<Self>,
-        startup: bool,
     ) -> Result<(), DatabaseTerminalRecoveryError> {
         let conversation_ids = self.startup_obligated_conversations.read().await.clone();
         for conversation_id in conversation_ids {
@@ -4111,7 +4110,7 @@ impl RuntimeManager {
             let ids = HashSet::from([conversation_id]);
             let reconciled = self
                 .db
-                .reconcile_startup_obligated_parents(&ids, startup)
+                .reconcile_startup_obligated_parents(&ids)
                 .await
                 .map_err(|error| DatabaseTerminalRecoveryError::Retryable(error.to_string()))?;
             for reconciliation in reconciled {
@@ -4121,27 +4120,25 @@ impl RuntimeManager {
                     .remove(&reconciliation.conversation_id);
             }
         }
-        if startup {
-            let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
-                self.acquire_local_authority_pass()
-            })
+        let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
+            self.acquire_local_authority_pass()
+        })
+        .await;
+        for conversation in conversations {
+            let Ok(_owner) = self.acquire_local_authority_pass() else {
+                return Ok(());
+            };
+            executor::complete_terminal_lifecycle_without_broadcast(
+                &conversation.id,
+                conversation.parent_conversation_id.is_some(),
+                &conversation.state,
+                conversation
+                    .conv_mode
+                    .worktree_path()
+                    .map(std::path::Path::new),
+                Some(&self.fork_cmd_tx),
+            )
             .await;
-            for conversation in conversations {
-                let Ok(_owner) = self.acquire_local_authority_pass() else {
-                    return Ok(());
-                };
-                executor::complete_terminal_lifecycle_without_broadcast(
-                    &conversation.id,
-                    conversation.parent_conversation_id.is_some(),
-                    &conversation.state,
-                    conversation
-                        .conv_mode
-                        .worktree_path()
-                        .map(std::path::Path::new),
-                    Some(&self.fork_cmd_tx),
-                )
-                .await;
-            }
         }
         let actions = self
             .db
@@ -4159,7 +4156,7 @@ impl RuntimeManager {
                     let ids = HashSet::from([conversation_id.clone()]);
                     let reconciled = self
                         .db
-                        .reconcile_startup_obligated_parents(&ids, startup)
+                        .reconcile_startup_obligated_parents(&ids)
                         .await
                         .map_err(|error| {
                             DatabaseTerminalRecoveryError::Retryable(error.to_string())
@@ -7017,7 +7014,7 @@ mod scope_liveness_tests {
             .unwrap()
             .is_empty());
 
-        mgr.reconcile_startup_obligated_parents(true).await.unwrap();
+        mgr.reconcile_startup_obligated_parents().await.unwrap();
 
         assert!(matches!(
             mgr.db()
@@ -7178,10 +7175,7 @@ mod scope_liveness_tests {
             .await
             .is_empty());
 
-        manager
-            .reconcile_startup_obligated_parents(true)
-            .await
-            .unwrap();
+        manager.reconcile_startup_obligated_parents().await.unwrap();
         assert!(manager.try_get_handle(conversation_id).await.is_some());
         let actions = manager.db().list_startup_parent_actions().await.unwrap();
         assert_eq!(actions.len(), 1);
