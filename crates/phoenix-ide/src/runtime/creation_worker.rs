@@ -54,10 +54,12 @@ where
     ProcessFuture: std::future::Future<Output = CreationDrainControl>,
 {
     loop {
-        let Ok(_owner) = admit() else {
+        let Ok(owner) = admit() else {
             return Ok(());
         };
-        let Some(job) = claim().await? else {
+        let job = claim().await?;
+        drop(owner);
+        let Some(job) = job else {
             return Ok(());
         };
         if matches!(process(job).await, CreationDrainControl::StopDrain) {
@@ -87,6 +89,9 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         };
         if let Err(error) = reconcile_creation_cleanup(manager, &cleanup).await {
             tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
+            let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                "creation cleanup retry rejected after fatal local authority closure".to_string()
+            })?;
             manager
                 .db()
                 .schedule_conversation_creation_cleanup_retry(
@@ -183,6 +188,9 @@ async fn reconcile_creation_cleanup(
         })
         .await
         .map_err(|error| error.to_string())??;
+        let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+            "creation resource release rejected after fatal local authority closure".to_string()
+        })?;
         let outcome = manager
             .db()
             .release_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
@@ -192,12 +200,73 @@ async fn reconcile_creation_cleanup(
             return Ok(());
         }
     }
+    let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+        "creation cleanup completion rejected after fatal local authority closure".to_string()
+    })?;
     manager
         .db()
         .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn renew_creation_claim_with_admission(
+    manager: &Arc<RuntimeManager>,
+    job_id: &str,
+    claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+) -> Result<crate::db::CreationCasOutcome, String> {
+    let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+        "creation claim renewal rejected after fatal local authority closure".to_string()
+    })?;
+    manager
+        .db()
+        .renew_conversation_creation_claim(
+            job_id,
+            claim,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn process_claimed_job_until_closed<
+    Process,
+    ProcessFuture,
+    Renew,
+    RenewFuture,
+    Closure,
+    ClosureFuture,
+>(
+    processing: Process,
+    mut renew: Renew,
+    closure: Closure,
+) -> Result<CreationDrainControl, String>
+where
+    Process: FnOnce() -> ProcessFuture,
+    ProcessFuture: std::future::Future<Output = Result<CreationDrainControl, String>>,
+    Renew: FnMut() -> RenewFuture,
+    RenewFuture: std::future::Future<Output = Result<crate::db::CreationCasOutcome, String>>,
+    Closure: FnOnce() -> ClosureFuture,
+    ClosureFuture: std::future::Future<Output = ()>,
+{
+    let mut processing = std::pin::pin!(processing());
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+    heartbeat.tick().await;
+    let closure = closure();
+    tokio::pin!(closure);
+    loop {
+        tokio::select! {
+            result = &mut processing => return result,
+            () = &mut closure => return Ok(CreationDrainControl::StopDrain),
+            _ = heartbeat.tick() => {
+                if matches!(renew().await?, crate::db::CreationCasOutcome::ClaimLost) {
+                    return Ok(CreationDrainControl::StopDrain);
+                }
+            }
+        }
+    }
 }
 
 async fn process_claimed_job(
@@ -208,40 +277,15 @@ async fn process_claimed_job(
         return Err("claimed creation job lacked claim authority".to_string());
     };
     let job_id = job.id.clone();
-    let mut processing = std::pin::pin!(process_job(manager, job));
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
-    heartbeat.tick().await;
-    loop {
-        tokio::select! {
-            result = &mut processing => return result,
-            _ = heartbeat.tick() => {
-                let outcome = manager
-                    .db()
-                    .renew_conversation_creation_claim(
-                        &job_id,
-                        &claim,
-                        chrono::Utc::now(),
-                        chrono::Duration::seconds(30),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
-                    let terminal = manager
-                        .db()
-                        .get_conversation_creation_job(&job_id)
-                        .await
-                        .map(|job| job.protocol.status.is_terminal())
-                        .unwrap_or(false);
-                    if terminal {
-                        tracing::debug!(job_id = %job_id, generation = claim.generation, "creation heartbeat observed terminal commit");
-                        return processing.await;
-                    }
-                    tracing::debug!(job_id = %job_id, generation = claim.generation, "stopping creation worker after lease authority was lost");
-                    return Ok(CreationDrainControl::StopDrain);
-                }
-            }
-        }
-    }
+    let mut fatal = manager.fatal_local_authority_receiver();
+    process_claimed_job_until_closed(
+        || process_job(manager, job),
+        || renew_creation_claim_with_admission(manager, &job_id, &claim),
+        || async move {
+            crate::tls::wait_for_fatal_local_authority(&mut fatal).await;
+        },
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -269,6 +313,9 @@ async fn process_job(
             .await
             .map_err(|e| e.to_string())?;
         if creation_state_allows_existing_message_completion(&conversation.state) {
+            let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                "creation completion rejected after fatal local authority closure".to_string()
+            })?;
             let outcome = manager
                 .db()
                 .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
@@ -306,6 +353,9 @@ async fn process_job(
                         .map_err(|_| "creation retry delay exceeds chrono range".to_string())?,
                 );
                 let now = chrono::Utc::now();
+                let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                    "creation retry rejected after fatal local authority closure".to_string()
+                })?;
                 let outcome = manager
                     .db()
                     .schedule_conversation_creation_retry(
@@ -327,6 +377,9 @@ async fn process_job(
                 error: message.clone(),
                 error_kind: kind.clone(),
             };
+            let mut admitted = manager.acquire_local_authority_pass().map_err(|()| {
+                "creation failure commit rejected after fatal local authority closure".to_string()
+            })?;
             let outcome = manager
                 .db()
                 .fail_conversation_creation_job(
@@ -343,12 +396,13 @@ async fn process_job(
                 return Ok(CreationDrainControl::Continue);
             }
             let broadcast_tx = manager.conversation_broadcaster(&conv_id).await;
-            let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                sequence_id: seq,
-                state: failed.clone(),
-                presentation_mode: failed.presentation_mode().to_string(),
-                state_updated_at: chrono::Utc::now(),
-            });
+            let _ = broadcast_tx
+                .admitted_publication(&mut admitted)
+                .state_change(
+                    failed.clone(),
+                    failed.presentation_mode().to_string(),
+                    chrono::Utc::now(),
+                );
             manager
                 .evict_runtime(&conv_id, EvictionReason::CreationProvisioned)
                 .await;
@@ -367,6 +421,19 @@ fn creation_state_allows_existing_message_completion(state: &ConvState) -> bool 
 enum CreationProvisionError {
     Failed(String, ErrorKind),
     FatalAuthorityDeferred,
+}
+
+fn creation_admission_error(message: &str) -> CreationProvisionError {
+    CreationProvisionError::Failed(message.to_string(), ErrorKind::Cancelled)
+}
+
+fn acquire_creation_admission(
+    manager: &Arc<RuntimeManager>,
+    message: &str,
+) -> Result<crate::runtime::AdmittedOperation, CreationProvisionError> {
+    manager
+        .acquire_local_authority_pass()
+        .map_err(|()| creation_admission_error(message))
 }
 
 impl From<(String, ErrorKind)> for CreationProvisionError {
@@ -419,6 +486,10 @@ async fn provision_conversation(
     let mut desired_base_branch = intent.base_branch.clone();
 
     if let Some(repo_root) = repo_root.clone() {
+        let _admitted = acquire_creation_admission(
+            manager,
+            "creation project association rejected after fatal local authority closure",
+        )?;
         match manager.db().find_or_create_project(&repo_root).await {
             Ok(project) => project_id = Some(project.id),
             Err(e) => {
@@ -772,6 +843,10 @@ async fn provision_conversation(
         }
     }
 
+    let mut metadata_admission = acquire_creation_admission(
+        manager,
+        "creation metadata publication rejected after fatal local authority closure",
+    )?;
     if creation_metadata_needs_commit(job.protocol.stage) {
         let metadata_outcome = manager
             .db()
@@ -816,35 +891,41 @@ async fn provision_conversation(
             .get(&job.conversation_id)
             .map(|h| h.broadcast_tx.clone())
     } {
-        let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationUpdate {
-            sequence_id: seq,
-            update: ConversationMetadataUpdate {
-                slug: Some(persisted_slug.clone()),
-                title: persisted_title.clone(),
-                cwd: Some(effective_cwd.clone()),
-                project_id: persisted_conversation.project_id.clone(),
-                project_name: None,
-                updated_at: Some(persisted_conversation.updated_at.to_rfc3339()),
-                branch_name: conv_mode.branch_name().map(ToString::to_string),
-                worktree_path: conv_mode.worktree_path().map(ToString::to_string),
-                conv_mode_label: Some(conv_mode.label().to_string()),
-                base_branch: conv_mode.base_branch().map(ToString::to_string),
-                task_title: conv_mode.task_title().map(ToString::to_string),
-                work_scope_key: Some(
-                    crate::work_scope::ResourceScopeKey::Work(
-                        persisted_conversation
-                            .attached_work_scope_id
-                            .clone()
-                            .expect("persisted conversation has work scope"),
-                    )
-                    .stable_key(),
-                ),
-                model: Some(resolved_model.clone()),
-            },
-        });
+        let _ = broadcast_tx
+            .admitted_publication(&mut metadata_admission)
+            .event(|seq| SseEvent::ConversationUpdate {
+                sequence_id: seq,
+                update: ConversationMetadataUpdate {
+                    slug: Some(persisted_slug.clone()),
+                    title: persisted_title.clone(),
+                    cwd: Some(effective_cwd.clone()),
+                    project_id: persisted_conversation.project_id.clone(),
+                    project_name: None,
+                    updated_at: Some(persisted_conversation.updated_at.to_rfc3339()),
+                    branch_name: conv_mode.branch_name().map(ToString::to_string),
+                    worktree_path: conv_mode.worktree_path().map(ToString::to_string),
+                    conv_mode_label: Some(conv_mode.label().to_string()),
+                    base_branch: conv_mode.base_branch().map(ToString::to_string),
+                    task_title: conv_mode.task_title().map(ToString::to_string),
+                    work_scope_key: Some(
+                        crate::work_scope::ResourceScopeKey::Work(
+                            persisted_conversation
+                                .attached_work_scope_id
+                                .clone()
+                                .expect("persisted conversation has work scope"),
+                        )
+                        .stable_key(),
+                    ),
+                    model: Some(resolved_model.clone()),
+                },
+            });
     }
 
     if seeded_empty {
+        let mut admitted = acquire_creation_admission(
+            manager,
+            "seeded creation completion rejected after fatal local authority closure",
+        )?;
         let outcome = manager
             .db()
             .complete_seeded_empty_conversation_creation(
@@ -869,12 +950,13 @@ async fn provision_conversation(
                 .map(|h| h.broadcast_tx.clone())
         } {
             let idle = ConvState::Idle;
-            let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                sequence_id: seq,
-                state: idle.clone(),
-                presentation_mode: idle.presentation_mode().to_string(),
-                state_updated_at: chrono::Utc::now(),
-            });
+            let _ = broadcast_tx
+                .admitted_publication(&mut admitted)
+                .state_change(
+                    idle.clone(),
+                    idle.presentation_mode().to_string(),
+                    chrono::Utc::now(),
+                );
         }
         manager
             .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
@@ -910,16 +992,9 @@ async fn provision_conversation(
     manager
         .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
         .await;
-    let authority = manager
-        .db()
-        .renew_conversation_creation_claim(
-            &job.id,
-            &claim,
-            chrono::Utc::now(),
-            chrono::Duration::seconds(30),
-        )
+    let authority = renew_creation_claim_with_admission(manager, &job.id, &claim)
         .await
-        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+        .map_err(|error| (error, ErrorKind::ServerError))?;
     if matches!(authority, crate::db::CreationCasOutcome::ClaimLost) {
         return Err((
             "creation claim was lost before runtime bootstrap settlement".to_string(),
@@ -1044,6 +1119,12 @@ async fn checkpoint_creation_stage(
                 ErrorKind::ServerError,
             ));
         };
+        let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+            (
+                "creation stage commit rejected after fatal local authority closure".to_string(),
+                ErrorKind::Cancelled,
+            )
+        })?;
         let outcome = manager
             .db()
             .advance_conversation_creation_stage(&job.id, claim, current, next, chrono::Utc::now())
@@ -1067,6 +1148,13 @@ async fn reserve_worktree(
     repo_root: &str,
     worktree_path: &Path,
 ) -> Result<(), (String, ErrorKind)> {
+    let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+        (
+            "creation resource reservation rejected after fatal local authority closure"
+                .to_string(),
+            ErrorKind::Cancelled,
+        )
+    })?;
     let outcome = manager
         .db()
         .reserve_conversation_creation_resource(
@@ -1094,6 +1182,12 @@ async fn mark_worktree_present(
     claim: &phoenix_core::domain::creation_protocol::CreationClaim,
     worktree_path: &Path,
 ) -> Result<(), (String, ErrorKind)> {
+    let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
+        (
+            "creation resource commit rejected after fatal local authority closure".to_string(),
+            ErrorKind::Cancelled,
+        )
+    })?;
     let outcome = manager
         .db()
         .mark_creation_resource_present(
@@ -1410,6 +1504,43 @@ mod runtime_bootstrap_settlement_tests {
             ),
             Err(CreationProvisionError::FatalAuthorityDeferred)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closure_during_blocked_creation_stops_heartbeat_and_stage_work() {
+        let (process_started_tx, process_started_rx) = tokio::sync::oneshot::channel();
+        let (_release_process_tx, release_process_rx) = tokio::sync::oneshot::channel::<()>();
+        let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_renewals = Arc::clone(&renewals);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+
+        let worker = tokio::spawn(process_claimed_job_until_closed(
+            || async move {
+                process_started_tx.send(()).unwrap();
+                let _ = release_process_rx.await;
+                panic!("blocked creation stage resumed after fatal closure");
+            },
+            move || {
+                observed_renewals.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async { Ok(crate::db::CreationCasOutcome::Applied) }
+            },
+            || async move {
+                close_rx.await.unwrap();
+            },
+        ));
+        process_started_rx.await.unwrap();
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(renewals.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        close_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.await.unwrap().unwrap(),
+            CreationDrainControl::StopDrain
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert_eq!(renewals.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
     #[tokio::test]

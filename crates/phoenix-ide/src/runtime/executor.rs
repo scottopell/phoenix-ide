@@ -3976,7 +3976,8 @@ where
                             match ClassifiedEffect::classify(effect) {
                                 ClassifiedEffect::Authoritative(effect) => match *effect {
                                     AuthoritativeEffect::PersistState => {
-                                        let result = self.persist_state_effect(false).await;
+                                        let result =
+                                            self.persist_state_effect(false, admitted).await;
                                         if result.is_ok() && !terminal_state_has_notify {
                                             let _ = self
                                                 .broadcast_tx
@@ -4008,7 +4009,10 @@ where
                     match ClassifiedEffect::classify(effect) {
                         ClassifiedEffect::Authoritative(effect) => match *effect {
                             AuthoritativeEffect::PersistState => {
-                                let result = self.persist_state_effect(false).await;
+                                let admitted = terminal_unit_admission
+                                    .as_deref_mut()
+                                    .expect("terminal state persistence is admitted");
+                                let result = self.persist_state_effect(false, admitted).await;
                                 if result.is_ok() && !terminal_state_has_notify {
                                     let admitted = terminal_unit_admission
                                         .as_deref_mut()
@@ -4046,6 +4050,16 @@ where
                                     self.state.presentation_mode().to_string(),
                                     self.state_updated_at,
                                 );
+                            Ok(None)
+                        }
+                        ClassifiedEffect::Control(ControlEffect::NotifyAgentDone) => {
+                            let admitted = terminal_unit_admission
+                                .as_deref_mut()
+                                .expect("terminal completion publication is admitted");
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .agent_done();
                             Ok(None)
                         }
                         ClassifiedEffect::Control(effect) => {
@@ -4189,7 +4203,8 @@ where
             if suppress_intermediate_state_change {
                 match &effect {
                     Effect::PersistState => {
-                        self.persist_state_effect(false).await?;
+                        let mut admitted = self.admit_authoritative_effect()?;
+                        self.persist_state_effect(false, &mut admitted).await?;
                         continue;
                     }
                     Effect::NotifyStateChange => {
@@ -4262,7 +4277,11 @@ where
     /// emit the `StateChange` SSE; the inline-drain path persists with
     /// `broadcast = false` to suppress an intermediate Idle flicker (task
     /// 60004) since the drain emits its own authoritative state-change.
-    async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
+    async fn persist_state_effect(
+        &mut self,
+        broadcast: bool,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         if let (Some(turn), Some(terminal)) = (
             self.active_direct_turn.as_deref().cloned(),
             self.pending_direct_turn_terminal.as_deref().cloned(),
@@ -4279,12 +4298,14 @@ where
                 .await?;
         }
         if broadcast {
-            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                sequence_id: seq,
-                state: self.state.clone(),
-                presentation_mode: self.state.presentation_mode().to_string(),
-                state_updated_at: self.state_updated_at,
-            });
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .state_change(
+                    self.state.clone(),
+                    self.state.presentation_mode().to_string(),
+                    self.state_updated_at,
+                );
         }
         Ok(None)
     }
@@ -4887,6 +4908,9 @@ where
     /// cancelled checkpoint so the message's sequence is strictly after the
     /// work it describes (history replays by `sequence_id`).
     async fn broadcast_cancellation_backstop_message(&mut self) {
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return;
+        };
         let msg_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::system(
             "Cancellation completed. Aborted work may still be reclaiming resources in the \
@@ -4907,7 +4931,10 @@ where
             .await
         {
             Ok(msg) => {
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(&mut admitted)
+                    .persisted_message(msg);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
@@ -5043,6 +5070,9 @@ where
     /// while a bare "limit reached ({cap})" invites confusion about whether
     /// the counter shown elsewhere (`cap + 1`) is a bug.
     async fn halt_parent_cycle_cap(&mut self, cap: u32, attempted: u32) {
+        let Ok(mut admitted) = self.admit_authoritative_effect() else {
+            return;
+        };
         let msg_id = uuid::Uuid::new_v4().to_string();
         let text = format!(
             "Tool-use iteration limit reached: attempted LLM call #{attempted} exceeds the cap \
@@ -5070,7 +5100,10 @@ where
             .await
         {
             Ok(msg) => {
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(&mut admitted)
+                    .persisted_message(msg);
             }
             Err(e) => {
                 tracing::warn!(
@@ -5763,8 +5796,10 @@ where
                     );
                 }
 
-                // Broadcast to clients (display_data already computed at effect creation)
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
                 Ok(None)
             }
 
@@ -5844,18 +5879,18 @@ where
                                     self.active_direct_turn = None;
                                     self.pending_direct_turn_terminal = None;
                                     self.direct_turn_cancellation_initiated = false;
-                                    let _ = self.broadcast_tx.send_message(message.clone());
-                                    let _ = self.broadcast_tx.send_seq(|sequence_id| {
-                                        SseEvent::StateChange {
-                                            sequence_id,
-                                            state: self.state.clone(),
-                                            state_updated_at: self.state_updated_at,
-                                            presentation_mode: self
-                                                .state
-                                                .presentation_mode()
-                                                .to_string(),
-                                        }
-                                    });
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .persisted_message(message.clone());
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .state_change(
+                                            self.state.clone(),
+                                            self.state.presentation_mode().to_string(),
+                                            self.state_updated_at,
+                                        );
                                 }
                                 if matches!(
                                     &self.state,
@@ -5867,7 +5902,10 @@ where
                                         operation_id = %request.operation_id,
                                         "continuation start committed ambiguously; resuming persisted operation"
                                     );
-                                    let _ = self.broadcast_tx.send_message(message.clone());
+                                    let _ = self
+                                        .broadcast_tx
+                                        .admitted_publication(admitted)
+                                        .persisted_message(message.clone());
                                     drop(reserved_range);
                                     return Ok(None);
                                 }
@@ -5919,22 +5957,28 @@ where
                         }
                         self.continuation_effect_disposition =
                             ContinuationEffectDisposition::AbortRemaining;
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                         let _ = self
                             .broadcast_tx
-                            .send_seq(|sequence_id| SseEvent::StateChange {
-                                sequence_id,
-                                state: self.state.clone(),
-                                presentation_mode: self.state.presentation_mode().to_string(),
-                                state_updated_at: self.state_updated_at,
-                            });
+                            .admitted_publication(admitted)
+                            .state_change(
+                                self.state.clone(),
+                                self.state.presentation_mode().to_string(),
+                                self.state_updated_at,
+                            );
                         return Ok(None);
                     }
                 };
                 match outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                     }
                     crate::db::ContinuationCommitOutcome::Duplicate
@@ -5951,7 +5995,8 @@ where
                         }
                         let _ = self
                             .broadcast_tx
-                            .send_reserved_seq(sequence_id, |sequence_id| SseEvent::StateChange {
+                            .admitted_publication(admitted)
+                            .reserved_event(sequence_id, |sequence_id| SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
@@ -6202,14 +6247,15 @@ where
                                     )
                                     .await?;
                             }
-                            let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
-                                SseEvent::StateChange {
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .reserved_event(seq, |sequence_id| SseEvent::StateChange {
                                     sequence_id,
                                     state: self.state.clone(),
                                     presentation_mode: self.state.presentation_mode().to_string(),
                                     state_updated_at: self.state_updated_at,
-                                }
-                            });
+                                });
                             drop(reserved_range);
                             return Ok(None);
                         }
@@ -6217,16 +6263,19 @@ where
                 };
                 match continuation_outcome {
                     crate::db::ContinuationCommitOutcome::Applied => {
-                        let _ = self.broadcast_tx.send_message(message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(message);
                         drop(reserved_range);
                         let _ = self
                             .broadcast_tx
-                            .send_seq(|sequence_id| SseEvent::StateChange {
-                                sequence_id,
-                                state: self.state.clone(),
-                                presentation_mode: self.state.presentation_mode().to_string(),
-                                state_updated_at: self.state_updated_at,
-                            });
+                            .admitted_publication(admitted)
+                            .state_change(
+                                self.state.clone(),
+                                self.state.presentation_mode().to_string(),
+                                self.state_updated_at,
+                            );
                         self.active_direct_turn = None;
                         self.pending_direct_turn_terminal = None;
                         self.direct_turn_cancellation_initiated = false;
@@ -6255,38 +6304,40 @@ where
                             if used_direct_turn_settlement {
                                 self.settle_turn_span();
                             }
-                            let _ = self.broadcast_tx.send_message(message);
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .persisted_message(message);
+
                             drop(reserved_range);
-                            let _ =
-                                self.broadcast_tx
-                                    .send_seq(|sequence_id| SseEvent::StateChange {
-                                        sequence_id,
-                                        state: self.state.clone(),
-                                        presentation_mode: self
-                                            .state
-                                            .presentation_mode()
-                                            .to_string(),
-                                        state_updated_at: self.state_updated_at,
-                                    });
+                            let _ = self
+                                .broadcast_tx
+                                .admitted_publication(admitted)
+                                .state_change(
+                                    self.state.clone(),
+                                    self.state.presentation_mode().to_string(),
+                                    self.state_updated_at,
+                                );
                             return Ok(None);
                         }
-                        let _ = self.broadcast_tx.send_reserved_seq(seq, |sequence_id| {
-                            SseEvent::StateChange {
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .reserved_event(seq, |sequence_id| SseEvent::StateChange {
                                 sequence_id,
                                 state: self.state.clone(),
                                 presentation_mode: self.state.presentation_mode().to_string(),
                                 state_updated_at: self.state_updated_at,
-                            }
-                        });
+                            });
                         drop(reserved_range);
                     }
                 }
                 Ok(None)
             }
 
-            AuthoritativeEffect::PersistState => self.persist_state_effect(true).await,
+            AuthoritativeEffect::PersistState => self.persist_state_effect(true, admitted).await,
 
-            AuthoritativeEffect::RequestLlm => self.dispatch_llm_request().await,
+            AuthoritativeEffect::RequestLlm => self.dispatch_llm_request(admitted).await,
 
             AuthoritativeEffect::MaterializeCreation {
                 job_id,
@@ -6326,7 +6377,10 @@ where
                             .take()
                             .expect("materialized creation reserved an SSE sequence");
                         debug_assert_eq!(sequence_id, message.sequence_id);
-                        let _ = self.broadcast_tx.send_message(*message);
+                        let _ = self
+                            .broadcast_tx
+                            .admitted_publication(admitted)
+                            .persisted_message(*message);
                         drop(reservation);
                     }
                     Ok(crate::db::CreationRuntimeMaterialization::ClaimLost) => {
@@ -6381,7 +6435,9 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
+            AuthoritativeEffect::ExecuteTool { tool } => {
+                self.dispatch_tool_execution(tool, admitted).await
+            }
 
             AuthoritativeEffect::ScheduleRetry {
                 delay,
@@ -6397,14 +6453,17 @@ where
                 // BEFORE the tokio sleep so a client subscribing in the
                 // backoff window observes it via the replay ring.
                 let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::LlmAttempt {
-                    sequence_id: seq,
-                    attempt,
-                    max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
-                    reason,
-                    backing_off_ms,
-                    resets_at,
-                });
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .event(|seq| SseEvent::LlmAttempt {
+                        sequence_id: seq,
+                        attempt,
+                        max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                        reason,
+                        backing_off_ms,
+                        resets_at,
+                    });
 
                 // Open a fresh retry generation for this timer. The timer task
                 // stamps it onto its fire; the select loop discards a fire whose
@@ -6423,7 +6482,9 @@ where
                 self.retry_generation = self.retry_generation.wrapping_add(1);
                 let timer_generation = self.retry_generation;
                 let retry_outcome_tx = self.retry_outcome_tx.clone();
+                let timer_admission = admitted.reborrow();
                 let handle = tokio::spawn(async move {
+                    let _timer_admission = timer_admission;
                     tokio::time::sleep(delay).await;
                     let _ = retry_outcome_tx.send((timer_generation, attempt)).await;
                 });
@@ -6446,7 +6507,7 @@ where
                     self.persist_checkpoint_with_terminal_obligation(data, &settlement, admitted)
                         .await
                 } else {
-                    self.persist_checkpoint(data).await
+                    self.persist_checkpoint(data, admitted).await
                 }
             }
 
@@ -6473,7 +6534,10 @@ where
                         .await?;
 
                     // Tool results don't contain bash tool_use blocks, no enrichment needed
-                    let _ = self.broadcast_tx.send_message(msg);
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(msg);
                 }
                 Ok(None)
             }
@@ -6515,7 +6579,10 @@ where
                     )
                     .await?;
 
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
                 Ok(None)
             }
 
@@ -6534,7 +6601,7 @@ where
                     ConvState::AwaitingContinuation { request: active }
                         if active.operation_id == request.operation_id
                 ) {
-                    self.request_continuation(request);
+                    self.request_continuation(request, admitted);
                 } else {
                     tracing::debug!(
                         operation_id = %request.operation_id,
@@ -6550,7 +6617,7 @@ where
                 priority,
                 plan,
             } => {
-                self.execute_approve_task(task_file, title, priority, plan)
+                self.execute_approve_task(task_file, title, priority, plan, admitted)
                     .await?;
                 Ok(None)
             }
@@ -6580,7 +6647,8 @@ where
                 system_message,
                 repo_root,
             } => {
-                self.execute_resolve_task(system_message, repo_root).await?;
+                self.execute_resolve_task(system_message, repo_root, admitted)
+                    .await?;
                 Ok(None)
             }
 
@@ -6599,6 +6667,7 @@ where
                     priority,
                     body,
                     checkpoint,
+                    admitted,
                 )
                 .await
             }
@@ -6630,7 +6699,10 @@ where
             AuthoritativeEffect::CommitSteeringDrain {
                 messages,
                 post_commit,
-            } => self.commit_steering_drain(messages, post_commit).await,
+            } => {
+                self.commit_steering_drain(messages, post_commit, admitted)
+                    .await
+            }
         }
     }
 
@@ -6732,6 +6804,7 @@ where
         &mut self,
         messages: Vec<SteeringDrainMessage>,
         post_commit: SteeringDrainPostCommit,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         if messages.is_empty() {
             return Err("reducer emitted an empty steering drain commit".to_string());
@@ -6787,7 +6860,10 @@ where
                 .unwrap_or(crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized);
             match status {
                 crate::db::SteeringDrainMessageStatus::Inserted => {
-                    let _ = self.broadcast_tx.send_message(message);
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(message);
                 }
                 crate::db::SteeringDrainMessageStatus::LegacyAlreadyMaterialized => {
                     tracing::warn!(
@@ -6795,41 +6871,45 @@ where
                         message_id = %message.message_id,
                         "Recovered a legacy partially-materialized steering drain"
                     );
-                    let _ =
-                        self.broadcast_tx
-                            .send_reserved_seq(message.sequence_id, |sequence_id| {
-                                SseEvent::StateChange {
-                                    sequence_id,
-                                    state: self.state.clone(),
-                                    presentation_mode: self.state.presentation_mode().to_string(),
-                                    state_updated_at: self.state_updated_at,
-                                }
-                            });
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .reserved_state_change(
+                            message.sequence_id,
+                            self.state.clone(),
+                            self.state.presentation_mode().to_string(),
+                            self.state_updated_at,
+                        );
                 }
             }
         }
         drop(reserved_range);
 
-        self.finish_steering_drain(post_commit).await
+        self.finish_steering_drain(post_commit, admitted).await
     }
 
     async fn finish_steering_drain(
         &mut self,
         post_commit: SteeringDrainPostCommit,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         match post_commit {
             SteeringDrainPostCommit::StartLlmAndNotifyState => {
                 self.parent_tool_cycle_count = 0;
                 let _ = self
                     .broadcast_tx
-                    .send_seq(|sequence_id| SseEvent::StateChange {
-                        sequence_id,
-                        state: self.state.clone(),
-                        presentation_mode: self.state.presentation_mode().to_string(),
-                        state_updated_at: self.state_updated_at,
-                    });
-                self.publish_live_state()?;
-                match Box::pin(self.execute_effect(Effect::RequestLlm)).await {
+                    .admitted_publication(admitted)
+                    .state_change(
+                        self.state.clone(),
+                        self.state.presentation_mode().to_string(),
+                        self.state_updated_at,
+                    );
+                self.publish_live_state_admitted();
+                match Box::pin(
+                    self.execute_authoritative_effect(AuthoritativeEffect::RequestLlm, admitted),
+                )
+                .await
+                {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
                 }
@@ -6927,7 +7007,10 @@ where
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
+    async fn dispatch_llm_request(
+        &mut self,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
         // only fires for parent conversations. The counter is reset at
@@ -7171,7 +7254,9 @@ where
         let task_attempt_capture = attempt_capture.clone();
         let forwarder_abort = forwarder_handle.abort_handle();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let request_admission = admitted.reborrow();
         let request_task = async move {
+            let _request_admission = request_admission;
             let _forwarder_abort = AbortTaskOnDrop(forwarder_abort);
 
             if is_sub_agent {
@@ -7514,7 +7599,11 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+    async fn dispatch_tool_execution(
+        &mut self,
+        tool: ToolCall,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             let advertised = self
@@ -7656,7 +7745,9 @@ where
         // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.
         let turn_span = self.current_turn_span();
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let tool_admission = admitted.reborrow();
         let tool_execution = async move {
+            let _tool_admission = tool_admission;
             let tool_outcome = execute_tool_to_outcome(
                 storage,
                 tool_executor,
@@ -7792,7 +7883,11 @@ where
     }
 
     /// Persist a checkpoint (assistant message + tool results) atomically.
-    async fn persist_checkpoint(&mut self, data: CheckpointData) -> Result<Option<Event>, String> {
+    async fn persist_checkpoint(
+        &mut self,
+        data: CheckpointData,
+        admitted: &mut crate::runtime::AdmittedOperation,
+    ) -> Result<Option<Event>, String> {
         match data {
             CheckpointData::ToolRound {
                 assistant_message,
@@ -7863,9 +7958,16 @@ where
                 // sequence ids after the preallocated tool-message ids and can
                 // therefore leapfrog later tool-result messages in live
                 // delivery.
-                let _ = self.broadcast_tx.send_message(agent_msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(agent_msg);
+
                 for msg in tool_msgs {
-                    let _ = self.broadcast_tx.send_message(msg);
+                    let _ = self
+                        .broadcast_tx
+                        .admitted_publication(admitted)
+                        .persisted_message(msg);
                 }
             }
         }
@@ -7876,6 +7978,7 @@ where
     /// tool round (REQ-PROJ-033). The assistant message, synthetic success ack,
     /// and the `fork_proposals` row commit in one transaction; the ack and the
     /// row that the review surface reads are never durable independently.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_persist_fork_proposal(
         &mut self,
         proposal_id: String,
@@ -7884,6 +7987,7 @@ where
         priority: phoenix_core::task_source::Priority,
         body: String,
         checkpoint: CheckpointData,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let CheckpointData::ToolRound {
             assistant_message,
@@ -7969,9 +8073,15 @@ where
         // assistant message and the success ack (matches `persist_checkpoint`).
         // Duration is already present in each tool-result message's display_data;
         // do not emit a follow-up update that can overtake later persisted rows.
-        let _ = self.broadcast_tx.send_message(agent_msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .persisted_message(agent_msg);
         for msg in tool_msgs {
-            let _ = self.broadcast_tx.send_message(msg);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(msg);
         }
 
         Ok(None)
@@ -8068,14 +8178,17 @@ where
 
             debug_assert!(transcript_generation >= transcript_generation_after_content);
             let updated_content = crate::db::MessageContent::tool(&tool_id, &llm_content, false);
-            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
-                sequence_id: seq,
-                message_id: message_id.clone(),
-                transcript_generation: Some(transcript_generation),
-                display_data: Some(display_data.clone()),
-                content: Some(updated_content),
-                duration_ms: None,
-            });
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .event(|seq| SseEvent::MessageUpdated {
+                    sequence_id: seq,
+                    message_id: message_id.clone(),
+                    transcript_generation: Some(transcript_generation),
+                    display_data: Some(display_data.clone()),
+                    content: Some(updated_content),
+                    duration_ms: None,
+                });
         } else {
             // No spawn_tool_id: spawn_agents wasn't the last tool in the batch, so
             // there is no assistant tool_use to pair a tool_result against. Persist
@@ -8101,7 +8214,10 @@ where
                 .await?;
 
             // Broadcast the new message (meta user observation, no bash enrichment needed)
-            let _ = self.broadcast_tx.send_message(message);
+            let _ = self
+                .broadcast_tx
+                .admitted_publication(admitted)
+                .persisted_message(message);
         }
 
         Ok(None)
@@ -8200,6 +8316,7 @@ where
     fn request_continuation(
         &mut self,
         request: phoenix_core::domain::sm_state::ContinuationSummaryRequest,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) {
         let operation_id = request.operation_id;
         let rejected_tool_calls = request.rejected_tool_calls;
@@ -8258,7 +8375,9 @@ where
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
 
         let fatal_external_effect_cancellation = self.fatal_external_effect_cancellation.clone();
+        let continuation_admission = admitted.reborrow();
         let continuation_task = async move {
+            let _continuation_admission = continuation_admission;
             // Build messages from history and add continuation request
             let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
                 Ok(m) => m,
@@ -8439,6 +8558,7 @@ where
         &mut self,
         system_message: String,
         repo_root: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         let conv_id = &self.context.conversation_id;
 
@@ -8479,16 +8599,22 @@ where
             .await?;
 
         // Broadcast SSE events
-        let _ = self.broadcast_tx.send_message(msg);
-        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            state: ConvState::Terminal,
-            presentation_mode: ConvState::Terminal.presentation_mode().to_string(),
-            state_updated_at: self.state_updated_at,
-        });
         let _ = self
             .broadcast_tx
-            .send_seq(|seq| SseEvent::ConversationUpdate {
+            .admitted_publication(admitted)
+            .persisted_message(msg);
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .state_change(
+                ConvState::Terminal,
+                ConvState::Terminal.presentation_mode().to_string(),
+                self.state_updated_at,
+            );
+        let _ = self
+            .broadcast_tx
+            .admitted_publication(admitted)
+            .event(|seq| SseEvent::ConversationUpdate {
                 sequence_id: seq,
                 update: crate::runtime::ConversationMetadataUpdate {
                     slug: None,
@@ -8524,6 +8650,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
         let cwd = self.context.filesystem_root().to_path_buf();
         // The spec invariant WorktreePathDerivedFromConversation requires
@@ -8639,14 +8766,18 @@ where
                         None,
                     )
                     .await?;
-                let _ = self.broadcast_tx.send_message(msg);
+                let _ = self
+                    .broadcast_tx
+                    .admitted_publication(admitted)
+                    .persisted_message(msg);
 
                 // Push updated conversation metadata to the client so it
                 // reflects the new cwd, branch, worktree_path, and mode label
                 // without requiring a reconnect.
                 let _ = self
                     .broadcast_tx
-                    .send_seq(|seq| SseEvent::ConversationUpdate {
+                    .admitted_publication(admitted)
+                    .event(|seq| SseEvent::ConversationUpdate {
                         sequence_id: seq,
                         update: crate::runtime::ConversationMetadataUpdate {
                             slug: None,
@@ -11233,7 +11364,7 @@ mod dispatch_context_budget_tests {
         );
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("dispatch large request");
         runtime
@@ -12668,8 +12799,9 @@ mod authoritative_user_message_effect_tests {
             }));
             rt.classify_active_direct_turn_terminal(&event, &new_state);
             rt.state = new_state.clone();
-            rt.persist_state_effect(false).await.unwrap();
-            rt.persist_state_effect(false).await.unwrap();
+            let mut admitted = rt.admit_authoritative_effect().unwrap();
+            rt.persist_state_effect(false, &mut admitted).await.unwrap();
+            rt.persist_state_effect(false, &mut admitted).await.unwrap();
             let settlements = storage.recorded_settle_active_direct_turn_calls();
             assert_eq!(settlements.len(), 1);
             assert_eq!(
@@ -12897,12 +13029,15 @@ mod authoritative_user_message_effect_tests {
         assert_eq!(storage.recorded_messages().len(), 1);
         let mut message_count = 0;
         let mut state_count = 0;
+        let mut agent_done_count = 0;
         while let Ok(event) = broadcast_rx.try_recv() {
             message_count += usize::from(matches!(event, SseEvent::Message { .. }));
             state_count += usize::from(matches!(event, SseEvent::StateChange { .. }));
+            agent_done_count += usize::from(matches!(event, SseEvent::AgentDone { .. }));
         }
         assert_eq!(message_count, 1, "terminal evidence is published once");
         assert_eq!(state_count, 1, "terminal state is published once");
+        assert_eq!(agent_done_count, 1, "terminal completion is published once");
     }
 
     #[tokio::test]
@@ -13247,7 +13382,8 @@ mod authoritative_user_message_effect_tests {
             ));
             rt.state = ConvState::Idle;
 
-            assert!(rt.persist_state_effect(true).await.is_err());
+            let mut admitted = rt.admit_authoritative_effect().unwrap();
+            assert!(rt.persist_state_effect(true, &mut admitted).await.is_err());
 
             assert!(matches!(
                 rt.pending_direct_turn_terminal.as_deref(),
@@ -13294,7 +13430,8 @@ mod authoritative_user_message_effect_tests {
             },
         };
 
-        rt.persist_state_effect(false).await.unwrap();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
 
         assert!(rt.active_direct_turn.is_none());
         assert!(rt.pending_direct_turn_terminal.is_none());
@@ -13328,7 +13465,8 @@ mod authoritative_user_message_effect_tests {
             &ConvState::Idle,
         );
         rt.state = ConvState::Idle;
-        rt.persist_state_effect(false).await.unwrap();
+        let mut admitted = rt.admit_authoritative_effect().unwrap();
+        rt.persist_state_effect(false, &mut admitted).await.unwrap();
         assert!(matches!(
             storage
                 .recorded_settle_active_direct_turn_calls()
@@ -16865,6 +17003,49 @@ mod steer_drain_detector_tests {
         assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
     }
 
+    #[tokio::test]
+    async fn nonterminal_persist_message_publishes_after_close_during_write() {
+        use crate::db::{MessageContent, UserContent};
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-admitted-nonterminal",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+        let fence = crate::runtime::FatalLocalAuthorityFence::new();
+        rt = rt.with_fatal_local_authority_fence(Arc::clone(&fence));
+        rt.broadcast_tx = rt
+            .broadcast_tx
+            .clone()
+            .with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = rt.broadcast_tx.subscribe();
+        let (started, release) = storage.gate_message_add();
+        let persistence = tokio::spawn(async move {
+            let result = rt
+                .execute_effect(Effect::PersistMessage {
+                    content: MessageContent::User(UserContent::new("admitted-message")),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: "admitted-nonterminal".to_string(),
+                    idempotent: false,
+                })
+                .await;
+            (rt, result)
+        });
+
+        started.await.expect("message write started");
+        fence.close("test_nonterminal_message_write");
+        assert_eq!(fence.owners_at_first_close(), Some(1));
+        release.send(()).expect("release message write");
+
+        let (_rt, result) = persistence.await.expect("message write joins");
+        result.expect("admitted message write completes");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Message { message }) if message.message_id == "admitted-nonterminal"
+        ));
+        assert_eq!(fence.owner_count(), 0);
+    }
+
     /// Regression: a tool result carrying typed images must survive the
     /// normal `PersistCheckpoint` round into `ToolContent.images`. Before
     /// this was threaded, `MessageContent::tool(...)` dropped the field, so
@@ -17122,7 +17303,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.llm_turn_count = 1;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("grace dispatch");
 
@@ -17186,7 +17367,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.llm_turn_count = 1;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("normal retry dispatch");
 
@@ -17257,7 +17438,7 @@ mod subagent_grace_tool_surface_tests {
         runtime.grace_turn_granted = true;
 
         runtime
-            .dispatch_llm_request()
+            .execute_effect(Effect::RequestLlm)
             .await
             .expect("grace retry dispatch");
 

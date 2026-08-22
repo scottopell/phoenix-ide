@@ -908,11 +908,17 @@ impl std::fmt::Debug for AdmittedOperation {
 }
 
 #[derive(Debug)]
+enum QueuedBroadcastAuthority {
+    Unfenced,
+    Admitted(AdmittedOperation),
+}
+
+#[derive(Debug)]
 struct QueuedBroadcast {
     event: SseEvent,
     seq: i64,
     op: RingOp,
-    admission: Option<AdmittedOperation>,
+    authority: QueuedBroadcastAuthority,
 }
 
 #[derive(Debug, Default)]
@@ -945,6 +951,19 @@ impl AdmittedPublication<'_> {
     fn send(self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
         self.broadcaster
             .send_with_admission(self.admitted, event, seq, op)
+    }
+
+    pub(crate) fn event(self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(build(seq), seq, RingOp::Append)
+    }
+
+    pub(crate) fn reserved_event(
+        self,
+        sequence_id: i64,
+        build: impl FnOnce(i64) -> SseEvent,
+    ) -> Result<usize, ()> {
+        self.send(build(sequence_id), sequence_id, RingOp::Append)
     }
 
     pub(crate) fn persisted_message(self, message: crate::db::Message) -> Result<usize, ()> {
@@ -981,6 +1000,15 @@ impl AdmittedPublication<'_> {
         )
     }
 
+    pub(crate) fn agent_done(self) -> Result<usize, ()> {
+        let seq = self.broadcaster.next_seq();
+        self.send(
+            SseEvent::AgentDone { sequence_id: seq },
+            seq,
+            RingOp::Append,
+        )
+    }
+
     pub(crate) fn state_change(
         self,
         state: ConvState,
@@ -996,6 +1024,25 @@ impl AdmittedPublication<'_> {
                 state_updated_at,
             },
             seq,
+            RingOp::Append,
+        )
+    }
+
+    pub(crate) fn reserved_state_change(
+        self,
+        sequence_id: i64,
+        state: ConvState,
+        presentation_mode: String,
+        state_updated_at: DateTime<Utc>,
+    ) -> Result<usize, ()> {
+        self.send(
+            SseEvent::StateChange {
+                sequence_id,
+                state,
+                presentation_mode,
+                state_updated_at,
+            },
+            sequence_id,
             RingOp::Append,
         )
     }
@@ -1184,7 +1231,10 @@ impl SseBroadcaster {
     }
 
     fn send_with_ring(&self, event: SseEvent, seq: i64, op: RingOp) -> Result<usize, ()> {
-        let _fatal_guard = self.fatal_publication_guard()?;
+        let authority = match self.fatal_publication_guard()? {
+            Some(admitted) => QueuedBroadcastAuthority::Admitted(admitted),
+            None => QueuedBroadcastAuthority::Unfenced,
+        };
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         if gate.hard_deleted {
             return Err(());
@@ -1197,7 +1247,7 @@ impl SseBroadcaster {
                 event,
                 seq,
                 op,
-                admission: None,
+                authority,
             });
             return Ok(self.tx.receiver_count());
         }
@@ -1281,7 +1331,6 @@ impl SseBroadcaster {
     }
 
     fn release_reserved_range(&self) {
-        let fatal_guard = self.fatal_publication_guard();
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
@@ -1290,11 +1339,16 @@ impl SseBroadcaster {
                 event,
                 seq,
                 op,
-                admission,
+                authority,
             } in queued
             {
-                if admission.is_some() || fatal_guard.is_ok() {
-                    let _ = self.send_with_ring_unlocked(event, seq, op);
+                match authority {
+                    QueuedBroadcastAuthority::Unfenced => {
+                        let _ = self.send_with_ring_unlocked(event, seq, op);
+                    }
+                    QueuedBroadcastAuthority::Admitted(_admitted) => {
+                        let _ = self.send_with_ring_unlocked(event, seq, op);
+                    }
                 }
             }
         }
@@ -1355,6 +1409,7 @@ impl SseBroadcaster {
     /// `message.sequence_id`, advance the broadcaster's counter, AND reset
     /// the `ReplayRing` anchor (the DB row is now durable, so ephemeral
     /// events below this seq are no longer needed for replay).
+    #[cfg(test)]
     pub fn send_persisted_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         let seq = message.sequence_id;
         self.observe_seq(seq);
@@ -1365,6 +1420,7 @@ impl SseBroadcaster {
     /// Existing call sites that broadcast persisted messages can keep using
     /// `send_message`; the eager (non-persisted) path is the new entry point
     /// [`SseBroadcaster::send_ephemeral_message`].
+    #[cfg(test)]
     pub fn send_message(&self, message: crate::db::Message) -> Result<usize, ()> {
         self.send_persisted_message(message)
     }
@@ -1416,7 +1472,7 @@ impl SseBroadcaster {
                 event,
                 seq,
                 op,
-                admission: Some(admitted.reborrow()),
+                authority: QueuedBroadcastAuthority::Admitted(admitted.reborrow()),
             });
             return Ok(self.tx.receiver_count());
         }
@@ -3935,7 +3991,7 @@ impl RuntimeManager {
 
     async fn persist_and_broadcast_system_message(
         &self,
-        _admitted: &mut AdmittedOperation,
+        admitted: &mut AdmittedOperation,
         broadcaster: &SseBroadcaster,
         conversation_id: &str,
         text: String,
@@ -3956,7 +4012,9 @@ impl RuntimeManager {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let _ = broadcaster.send_persisted_message(message);
+        let _ = broadcaster
+            .admitted_publication(admitted)
+            .persisted_message(message);
         drop(reserved_range);
         Ok(())
     }
@@ -5999,21 +6057,34 @@ mod broadcaster_tests {
     use super::*;
 
     #[test]
-    fn fatal_authority_latch_atomically_discards_queued_and_future_publication() {
+    fn queued_publication_retains_admission_but_future_publication_is_rejected() {
         let fence = FatalLocalAuthorityFence::new();
         let broadcaster =
             SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
         let mut events = broadcaster.subscribe();
-        let (reserved, _) = broadcaster.reserve_next_persisted_message_after(0);
+        let (reserved, reserved_seq) = broadcaster.reserve_next_persisted_message_after(0);
+        let queued_seq = broadcaster.next_seq();
         broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
+            .send_reserved_seq(reserved_seq, |sequence_id| SseEvent::Token {
                 sequence_id,
-                text: "queued".to_string(),
-                request_id: "queued-request".to_string(),
+                text: "reserved".to_string(),
+                request_id: "reserved-request".to_string(),
             })
+            .unwrap();
+        broadcaster
+            .send_with_ring(
+                SseEvent::Token {
+                    sequence_id: queued_seq,
+                    text: "queued".to_string(),
+                    request_id: "queued-request".to_string(),
+                },
+                queued_seq,
+                RingOp::Append,
+            )
             .unwrap();
 
         fence.close("test_authority_boundary");
+        assert_eq!(fence.owner_count(), 1);
         drop(reserved);
 
         assert!(broadcaster
@@ -6025,8 +6096,13 @@ mod broadcaster_tests {
             .is_err());
         assert!(matches!(
             events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == reserved_seq
         ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == queued_seq
+        ));
+        assert_eq!(fence.owner_count(), 0);
     }
 
     #[test]
@@ -7888,6 +7964,72 @@ mod scope_liveness_tests {
         assert!(
             matches!(receiver.try_recv(), Ok(SseEvent::Message { message }) if message.sequence_id == queued_seq)
         );
+        assert_eq!(fence.owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_ordinary_before_admitted_publication_remains_contiguous_after_close() {
+        let fence = FatalLocalAuthorityFence::new();
+        let broadcaster =
+            SseBroadcaster::new(16, 0).with_fatal_local_authority_fence(Arc::clone(&fence));
+        let mut receiver = broadcaster.subscribe();
+        let (reservation, reserved_seq) = broadcaster.reserve_next_persisted_message_after(0);
+        broadcaster
+            .send_reserved_seq(reserved_seq, |sequence_id| SseEvent::Token {
+                sequence_id,
+                text: "reserved".to_string(),
+                request_id: "reserved-request".to_string(),
+            })
+            .unwrap();
+
+        let ordinary_seq = broadcaster.next_seq();
+        broadcaster
+            .send_with_ring(
+                SseEvent::Token {
+                    sequence_id: ordinary_seq,
+                    text: "ordinary".to_string(),
+                    request_id: "ordinary-request".to_string(),
+                },
+                ordinary_seq,
+                RingOp::Append,
+            )
+            .expect("queue ordinary publication");
+        let mut admitted = fence.try_acquire().expect("admit successor publication");
+        let admitted_seq = broadcaster.next_seq();
+        broadcaster
+            .admitted_publication(&mut admitted)
+            .assistant_message(crate::db::Message {
+                message_id: "admitted-successor".to_string(),
+                conversation_id: "conversation".to_string(),
+                sequence_id: admitted_seq,
+                message_type: crate::db::MessageType::Agent,
+                content: crate::db::MessageContent::agent(vec![phoenix_llm::ContentBlock::text(
+                    "admitted",
+                )]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            })
+            .expect("queue admitted successor");
+        drop(admitted);
+
+        fence.close("test_mixed_queued_publications");
+        assert_eq!(fence.owners_at_first_close(), Some(2));
+        assert_eq!(fence.owner_count(), 2);
+        drop(reservation);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == reserved_seq
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Token { sequence_id, .. }) if sequence_id == ordinary_seq
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SseEvent::Message { message }) if message.sequence_id == admitted_seq
+        ));
         assert_eq!(fence.owner_count(), 0);
     }
 

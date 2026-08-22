@@ -4361,6 +4361,12 @@ async fn cancel_conversation_inner(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     if matches!(conversation.state, ConvState::Provisioning { .. }) {
+        let mut admitted = state.runtime.acquire_local_authority_pass().map_err(|()| {
+            AppError::Internal(
+                "conversation creation cancellation rejected after fatal local authority closure"
+                    .to_string(),
+            )
+        })?;
         state
             .runtime
             .db()
@@ -4376,12 +4382,13 @@ async fn cancel_conversation_inner(
         let broadcast_tx = state.runtime.conversation_broadcaster(&id).await;
         let cancelled_state = cancelled.state.clone();
         let state_updated_at = cancelled.state_updated_at;
-        let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            presentation_mode: cancelled_state.presentation_mode().to_string(),
-            state: cancelled_state.clone(),
-            state_updated_at,
-        });
+        let _ = broadcast_tx
+            .admitted_publication(&mut admitted)
+            .state_change(
+                cancelled_state.clone(),
+                cancelled_state.presentation_mode().to_string(),
+                state_updated_at,
+            );
         state
             .runtime
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)

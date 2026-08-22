@@ -435,7 +435,8 @@ async fn deliver_pending(
         }
         let page_len = pending.len();
         for row in pending {
-            let _owner = wake_authority_owner(Some(manager))?;
+            let mut owner = wake_authority_owner(Some(manager))?
+                .expect("runtime-backed wake delivery has fatal authority admission");
             let next_cursor = WakePendingGlobalCursor {
                 workflow_id: row.workflow_id,
                 delivery_id: row.delivery_id,
@@ -522,7 +523,8 @@ async fn deliver_pending(
                 MaterializePendingDeliveryMessageOutcome::Materialized(link) => {
                     let _ = handle
                         .broadcast_tx
-                        .send_message(link.linked_message.message.clone());
+                        .admitted_publication(&mut owner)
+                        .persisted_message(link.linked_message.message.clone());
                     let conversation_id = current.conversation_id;
                     match repo
                         .adopt_materialized_pending_for_conversation(&conversation_id, now)

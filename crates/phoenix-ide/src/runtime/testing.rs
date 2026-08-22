@@ -566,6 +566,8 @@ pub struct InMemoryStorage {
     fail_continuation_commit: Mutex<bool>,
     fail_state_update: Mutex<bool>,
     fail_message_add: Mutex<bool>,
+    message_add_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    message_add_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     steering_drain_failures: Mutex<usize>,
     continuation_start_recovery_outcome: Mutex<Option<crate::db::ContinuationCommitOutcome>>,
     continuation_start_recovery_error: Mutex<bool>,
@@ -615,6 +617,8 @@ impl InMemoryStorage {
             fail_continuation_commit: Mutex::new(false),
             fail_state_update: Mutex::new(false),
             fail_message_add: Mutex::new(false),
+            message_add_started: Mutex::new(None),
+            message_add_release: Mutex::new(None),
             steering_drain_failures: Mutex::new(0),
             continuation_start_recovery_outcome: Mutex::new(None),
             continuation_start_recovery_error: Mutex::new(false),
@@ -638,6 +642,19 @@ impl InMemoryStorage {
 
     pub fn set_fail_message_add(&self, fail: bool) {
         *self.fail_message_add.lock().unwrap() = fail;
+    }
+
+    pub fn gate_message_add(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.message_add_started.lock().unwrap() = Some(started_tx);
+        *self.message_add_release.lock().unwrap() = Some(release_rx);
+        (started_rx, release_tx)
     }
 
     pub fn set_steering_drain_failures(&self, failures: usize) {
@@ -973,6 +990,13 @@ impl MessageStore for InMemoryStorage {
     ) -> Result<Message, String> {
         if *self.fail_message_add.lock().unwrap() {
             return Err("injected message persistence failure".to_string());
+        }
+        if let Some(started) = self.message_add_started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = self.message_add_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
         }
         // Keep the monotonic id counter at least as high as the provided
         // seq so any subsequent `add_message` call produces a strictly
