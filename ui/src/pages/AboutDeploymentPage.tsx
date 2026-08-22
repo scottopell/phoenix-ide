@@ -468,7 +468,7 @@ function SqliteDiagnostics({
           <div className="about-sqlite-tables">
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">
-                <h4>Writer transaction occupancy by category</h4>
+                <h4>Writer occupancy by category</h4>
                 <span>{report.writer_categories.length} categories</span>
               </div>
               <table className="deploy-table about-sqlite-table">
@@ -488,9 +488,9 @@ function SqliteDiagnostics({
                     <tr key={row.category}>
                       <td>{row.label}</td>
                       <td>{formatNumber(row.operation_count)}</td>
-                      <td>{formatPercent(row.writer_transaction_envelope_percent, 2)}</td>
-                      <td>pool {row.pool_wait.avg_ms} ms · admit {row.admission_wait.avg_ms} ms</td>
-                      <td>{formatNumber(row.retries.retry_count)}</td>
+                      <td>{formatPercent(row.writer_occupancy_percent, 2)}</td>
+                      <td>pool {row.pool_wait.avg_ms ?? '—'} ms · admit {row.admission_wait.avg_ms ?? '—'} ms</td>
+                      <td>{row.retries ? formatNumber(row.retries.retry_count) : '—'}</td>
                       <td>busy {row.failures.busy} · locked {row.failures.locked} · timeout {row.failures.pool_timeout + row.failures.other_timeout} · fail {row.failures.other_failure} · abandoned {row.failures.abandoned}</td>
                     </tr>
                   ))}
@@ -520,9 +520,9 @@ function SqliteDiagnostics({
                       <td>{row.label}</td>
                       <td>{formatNumber(row.operation_count)}</td>
                       <td>{row.total_duration_ms} ms</td>
-                      <td>{row.avg_duration_ms} ms</td>
+                      <td>{row.avg_duration_ms == null ? '—' : `${row.avg_duration_ms} ms`}</td>
                       <td>{formatNumber(row.peak_concurrency)}</td>
-                      <td>{row.retries.retry_count} retries · pool {row.pool_wait.avg_ms} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
+                      <td>{row.retries ? `${row.retries.retry_count} retries` : 'retries —'} · pool {row.pool_wait.avg_ms ?? '—'} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
                     </tr>
                   ))}
                 </tbody>

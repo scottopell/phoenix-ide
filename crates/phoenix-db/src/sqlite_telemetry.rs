@@ -262,6 +262,36 @@ pub(crate) struct SqliteTelemetry {
     outcome_recorded: AtomicBool,
 }
 
+impl Drop for SqliteTelemetry {
+    fn drop(&mut self) {
+        if self.outcome_recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(collector) = &self.collector else {
+            return;
+        };
+        collector.record(SqliteObservation {
+            completed_at_unix_micros: unix_now_micros(),
+            category: self.category,
+            access: self.access,
+            outcome: SqliteOutcome::Abandoned,
+            latency: self.started_at.elapsed(),
+            pool_wait: Duration::ZERO,
+            write_admission_wait: Duration::ZERO,
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::ZERO,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: 0,
+            baseline_statement_count: 0,
+            counted_operation: true,
+            counted_outcome: true,
+            counted_histograms: true,
+        });
+    }
+}
+
 impl SqliteTelemetry {
     pub(crate) fn new(operation: SqliteOperation) -> Self {
         Self::without_collector(
@@ -1047,6 +1077,27 @@ mod tests {
         let rendered = format!("{event:?}");
         assert!(!rendered.contains("sensitive-message-id"));
         assert!(!rendered.contains("sensitive payload sentinel"));
+    }
+
+    #[test]
+    fn unfinished_telemetry_records_one_abandoned_operation() {
+        let collector = SqliteWorkloadCollector::new();
+        {
+            let _telemetry = SqliteTelemetry::with_collector(
+                SqliteOperation::FtsUpsert,
+                SqliteWorkloadCategory::Fts,
+                SqliteAccessKind::Write,
+                collector.clone(),
+            );
+        }
+        let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::Fts.index();
+        assert_eq!(snapshot.totals[access][category].abandoned_count, 1);
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

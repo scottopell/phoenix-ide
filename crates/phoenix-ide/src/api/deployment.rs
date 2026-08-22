@@ -215,11 +215,11 @@ pub struct SqliteWriterCategoryReport {
     pub category: String,
     pub label: String,
     pub operation_count: u64,
-    pub writer_transaction_envelope_percent: f64,
+    pub writer_occupancy_percent: f64,
     pub latency: SqliteWaitSummary,
     pub pool_wait: SqliteWaitSummary,
     pub admission_wait: SqliteWaitSummary,
-    pub retries: SqliteRetrySummary,
+    pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
 }
 
@@ -230,12 +230,12 @@ pub struct SqliteReadCategoryReport {
     pub label: String,
     pub operation_count: u64,
     pub total_duration_ms: u64,
-    pub avg_duration_ms: u64,
+    pub avg_duration_ms: Option<u64>,
     pub peak_concurrency: u32,
     pub latency: SqliteWaitSummary,
     pub pool_wait: SqliteWaitSummary,
     pub admission_wait: SqliteWaitSummary,
-    pub retries: SqliteRetrySummary,
+    pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
 }
 
@@ -244,7 +244,7 @@ pub struct SqliteReadCategoryReport {
 pub struct SqliteWaitSummary {
     pub sample_count: u64,
     pub total_ms: u64,
-    pub avg_ms: u64,
+    pub avg_ms: Option<u64>,
     pub p50_upper_bound_ms: Option<u64>,
     pub p95_upper_bound_ms: Option<u64>,
     pub p99_upper_bound_ms: Option<u64>,
@@ -657,7 +657,7 @@ fn sample_sqlite_workload_report(
                 category: sqlite_category_key(category).to_string(),
                 label: sqlite_category_label(category).to_string(),
                 operation_count: totals.operation_count,
-                writer_transaction_envelope_percent: utilization_percent,
+                writer_occupancy_percent: utilization_percent,
                 latency: wait_summary(
                     &report.latency_histogram[SqliteAccessKind::Write.index()][category.index()],
                     totals.latency_micros,
@@ -684,11 +684,8 @@ fn sample_sqlite_workload_report(
             let totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
             let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
             let total_duration_ms = totals.read_connection_micros / 1_000;
-            let avg_duration_ms = if totals.operation_count == 0 {
-                0
-            } else {
-                total_duration_ms / totals.operation_count
-            };
+            let avg_duration_ms =
+                (totals.operation_count > 0).then_some(total_duration_ms / totals.operation_count);
             SqliteReadCategoryReport {
                 category: sqlite_category_key(category).to_string(),
                 label: sqlite_category_label(category).to_string(),
@@ -736,11 +733,7 @@ fn wait_summary(
     SqliteWaitSummary {
         sample_count: percentiles.sample_count,
         total_ms,
-        avg_ms: if percentiles.sample_count == 0 {
-            0
-        } else {
-            total_ms / percentiles.sample_count
-        },
+        avg_ms: (percentiles.sample_count > 0).then_some(total_ms / percentiles.sample_count),
         p50_upper_bound_ms: percentiles.p50_upper_bound_ms,
         p95_upper_bound_ms: percentiles.p95_upper_bound_ms,
         p99_upper_bound_ms: percentiles.p99_upper_bound_ms,
@@ -806,11 +799,11 @@ fn format_uptime_seconds(seconds: u64) -> String {
     }
 }
 
-fn retry_summary(retry_count: u64, retry_backoff_micros: u64) -> SqliteRetrySummary {
-    SqliteRetrySummary {
+fn retry_summary(retry_count: u64, retry_backoff_micros: u64) -> Option<SqliteRetrySummary> {
+    (retry_count > 0 || retry_backoff_micros > 0).then_some(SqliteRetrySummary {
         retry_count,
         backed_off_ms: retry_backoff_micros / 1_000,
-    }
+    })
 }
 
 fn failure_summary(outcomes: &[u64; crate::db::SqliteOutcome::ALL.len()]) -> SqliteFailureSummary {

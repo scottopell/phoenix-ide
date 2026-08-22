@@ -3,4 +3,4 @@ import type { SqliteFailureSummary } from "./SqliteFailureSummary";
 import type { SqliteRetrySummary } from "./SqliteRetrySummary";
 import type { SqliteWaitSummary } from "./SqliteWaitSummary";
 
-export type SqliteWriterCategoryReport = { category: string, label: string, operation_count: number, writer_transaction_envelope_percent: number, latency: SqliteWaitSummary, pool_wait: SqliteWaitSummary, admission_wait: SqliteWaitSummary, retries: SqliteRetrySummary, failures: SqliteFailureSummary, };
+export type SqliteWriterCategoryReport = { category: string, label: string, operation_count: number, writer_occupancy_percent: number, latency: SqliteWaitSummary, pool_wait: SqliteWaitSummary, admission_wait: SqliteWaitSummary, retries: SqliteRetrySummary | null, failures: SqliteFailureSummary, };

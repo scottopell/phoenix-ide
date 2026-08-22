@@ -3,4 +3,4 @@ import type { SqliteFailureSummary } from "./SqliteFailureSummary";
 import type { SqliteRetrySummary } from "./SqliteRetrySummary";
 import type { SqliteWaitSummary } from "./SqliteWaitSummary";
 
-export type SqliteReadCategoryReport = { category: string, label: string, operation_count: number, total_duration_ms: number, avg_duration_ms: number, peak_concurrency: number, latency: SqliteWaitSummary, pool_wait: SqliteWaitSummary, admission_wait: SqliteWaitSummary, retries: SqliteRetrySummary, failures: SqliteFailureSummary, };
+export type SqliteReadCategoryReport = { category: string, label: string, operation_count: number, total_duration_ms: number, avg_duration_ms: number | null, peak_concurrency: number, latency: SqliteWaitSummary, pool_wait: SqliteWaitSummary, admission_wait: SqliteWaitSummary, retries: SqliteRetrySummary | null, failures: SqliteFailureSummary, };
