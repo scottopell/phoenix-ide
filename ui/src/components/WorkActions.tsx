@@ -118,10 +118,7 @@ function compactFallbackStatus(
   if (disposition.note?.kind === 'gh_unavailable') return { icon: '⚠', label: 'GitHub unavailable', tone: 'attention' };
 
   if (prStatus?.display_state === 'merged') return { icon: '✓', label: 'PR merged', tone: 'success' };
-  if (disposition.resolve?.kind === 'address_feedback' && (
-    prStatus?.feedback_status != null
-    || (prStatus?.feedback_freshness?.count ?? 0) > 0
-  )) {
+  if (disposition.resolve?.kind === 'address_feedback' && (prStatus?.feedback_freshness?.count ?? 0) > 0) {
     return { icon: '⚠', label: 'PR feedback ready', tone: 'attention' };
   }
   if (prStatus?.found && prStatus.display_state === 'draft') {

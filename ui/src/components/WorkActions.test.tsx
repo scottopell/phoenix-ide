@@ -1825,6 +1825,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       display_state: 'open',
       check_state: 'failing',
       feedback_status: 'open',
+      feedback_freshness: { state: 'new', count: 1 },
       work_change: { kind: 'loading' },
     }, { activeSelection: null, activePrSummary: null });
     renderWithProviders(
@@ -1843,7 +1844,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('Checking changes');
   });
 
-  it('does not claim feedback exists when cached PR metadata has no feedback evidence', () => {
+  it('does not claim actionable feedback from review state alone', () => {
     enableMobile();
     const handle = prStatusHandle({
       found: true,
