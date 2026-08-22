@@ -106,21 +106,16 @@ interface PhysicalStore<T> {
   } | null;
   pinned: boolean;
   revision: number;
-  /** Physical-minus-layout offset of the rendered block. While a scroll is in
-   *  flight, anchor compensation is absorbed here (rendered via the top
-   *  spacer) instead of written to scrollTop — a programmatic scrollTop write
-   *  kills scroll momentum on iOS Safari. Reconciled to 0 once scrolling
-   *  settles. */
+  /** Physical-minus-layout offset of the rendered block, rendered through
+   *  the top spacer (mid-scroll anchor compensation, REQ-VT-004). */
   drift: number;
   lastScrollAtMs: number;
-  /** Touches currently down on the scroller — an active gesture counts as
-   *  scrolling even without recent scroll events (a held finger). */
+  /** Touches that began on this scroller and are still down. */
   activeTouches: number;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
-  /** ScrollTop value this component last wrote. Its scroll-event echo is
-   *  physical compensation, not user movement; cleared by the first
+  /** ScrollTop value this component last wrote; cleared by the first
    *  non-matching scroll event. */
   pendingProgrammaticTop: number | null;
 }
@@ -332,9 +327,7 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor
   const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
   const delta = target - store.viewportTop;
   if (delta !== 0 && scrollIsActive(store)) {
-    // Mid-scroll: absorb the correction into drift (rendered via the top
-    // spacer) so the anchor stays put without a momentum-killing scrollTop
-    // write. Requires spacer room for the shifted rendered block.
+    // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room.
     const driftNext = store.drift - delta;
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
@@ -628,7 +621,7 @@ function VirtualTranscriptInner<T>(
       }
       const onTouchChange = (event: TouchEvent) => {
         const store = storeRef.current;
-        if (store) store.activeTouches = event.touches.length;
+        if (store) store.activeTouches = event.targetTouches.length;
       };
       element.addEventListener('touchstart', onTouchChange, { passive: true });
       element.addEventListener('touchend', onTouchChange, { passive: true });
@@ -789,8 +782,7 @@ function VirtualTranscriptInner<T>(
   const handleScroll = useCallback(() => {
     const current = storeRef.current;
     if (!current?.scroller) return;
-    // A programmatic write's echo is not user scrolling: it must neither
-    // extend the scroll-active window nor delay drift reconciliation.
+    // Own-write echo (REQ-VT-004): geometry only, no scroll-active marking.
     if (isProgrammaticScrollTop(current, current.scroller.scrollTop)) {
       current.viewportTop = current.scroller.scrollTop;
       if (current.preservedViewport) current.preservedViewport.top = current.viewportTop;
@@ -810,10 +802,8 @@ function VirtualTranscriptInner<T>(
 
   const reconcileTimerRef = useRef(0);
 
-  // Drift reconciliation: once scrolling has settled, fold accumulated drift
-  // back into true layout coordinates. pendingScrollDelta applies in a layout
-  // effect so the spacer change (this commit) and the scrollTop write land in
-  // the same paint.
+  // Drift reconciliation (REQ-VT-004). pendingScrollDelta applies in a
+  // layout effect: spacer change and scrollTop write must share one paint.
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
@@ -826,10 +816,7 @@ function VirtualTranscriptInner<T>(
       return;
     }
     if (current.drift !== 0) {
-      // The leading spacer can no longer represent the drift (the rendered
-      // range has reached the top of the layout): reconcile immediately via
-      // the direct-write fallback instead of letting the clamped spacer
-      // diverge from the layout model.
+      // Spacer exhausted: immediate direct-write fallback (REQ-VT-004).
       const firstOffset = current.range
         ? current.layout.itemAt(current.range.startIndex)?.offset ?? 0
         : 0;

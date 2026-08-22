@@ -375,14 +375,11 @@ to the user
 THE SYSTEM SHALL neither move the viewport nor create unread state
 
 WHEN an idle viewport is confirmed at the bottom — by the physical
-pinned-state notification, by downward movement whose geometry lands
-inside the pin-to-bottom threshold, or by a touch gesture ending while
-geometry is inside that threshold
+pinned-state notification, or by downward movement whose observed
+position lands inside the pin-to-bottom threshold
 THE SYSTEM SHALL restore tail-follow intent and clear unread state
-SO THAT the return to the tail is level-triggered on observed geometry:
-an exact-bottom pinned edge that fires once mid-gesture (and is never
-re-delivered) cannot strand the session in user ownership with a
-permanent unread affordance
+SO THAT a viewport coasting to rest at the tail returns to following
+without depending on an exact-bottom edge the viewport may never cross
 
 WHEN the user requests jump-to-newest
 THE SYSTEM SHALL enter a returning-to-tail mode and issue exactly one
@@ -399,9 +396,21 @@ THE SYSTEM SHALL transfer viewport ownership to the user even if no
 scroll event is emitted
 AND a bottom callback received during that moved touch SHALL NOT release
 user ownership while the gesture is active
-AND touch end or cancellation SHALL preserve user ownership when geometry
-is outside the pin-to-bottom threshold, and SHALL confirm the tail return
-when geometry is inside it
+AND SHALL be retained as evidence that the gesture reached the tail
+
+WHEN a gesture ends or is cancelled
+THE SYSTEM SHALL confirm the tail return if the gesture reached the tail
+at any point — by the pinned callback or by downward movement into the
+pin-to-bottom threshold — and SHALL otherwise preserve user ownership
+SO THAT a confirmation blocked mid-gesture is honoured at the lift rather
+than lost with the callback that produced it, while a deliberate drag
+that stops short of the tail keeps the viewport
+
+WHEN upward movement occurs during a gesture, or tail growth carries the
+tail beyond the pin-to-bottom threshold from a gesture that had reached it
+THE SYSTEM SHALL discard that arrival evidence
+SO THAT a stale arrival cannot confirm a return to a tail the viewport no
+longer rests at
 
 WHEN scroll movement is classified as upward or downward intent
 THE SYSTEM SHALL clamp the observed scroll position into the scrollable
@@ -415,6 +424,12 @@ THE SYSTEM SHALL update geometry baselines without classifying the
 movement as user intent
 SO THAT physical compensation inside the pin-to-bottom zone cannot be
 mistaken for a user tail return
+
+THE SYSTEM SHALL keep the physical tail edge and pin-to-bottom zone
+membership as separate observations with distinct owners: the edge is
+reported by the virtual transcript's pinned-state notification, and zone
+membership is derived from the scroll position carried by each event
+AND SHALL NOT record either as the other
 
 THE SYSTEM SHALL use VirtualTranscript pinned-state notification only as
 bottom geometry and explicit return-to-tail confirmation

@@ -400,7 +400,7 @@ describe('VirtualTranscript', () => {
 
       act(() => ref.current?.scrollToIndex(20, 'start'));
       act(() => {
-        fireEvent.touchStart(scroller!, { touches: [{}] });
+        fireEvent.touchStart(scroller!, { touches: [{}], targetTouches: [{}] });
         scroller!.scrollTop = 395;
         fireEvent.scroll(scroller!);
       });
@@ -416,7 +416,7 @@ describe('VirtualTranscript', () => {
       expect(scrollTopOf(scroller)).toBe(395);
 
       act(() => {
-        fireEvent.touchEnd(scroller!, { touches: [] });
+        fireEvent.touchEnd(scroller!, { touches: [], targetTouches: [] });
       });
       act(() => {
         vi.advanceTimersByTime(400);

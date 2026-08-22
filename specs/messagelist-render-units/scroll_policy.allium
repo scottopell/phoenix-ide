@@ -34,6 +34,12 @@ entity ScrollPolicy {
     navigation_phase: NavigationPhase
     navigation_pending: Boolean
     gesture_departed_bottom: Boolean
+    -- Tail arrival observed during the current gesture. Confirmation is
+    -- blocked while a gesture owns the viewport, so the evidence is carried
+    -- to the lift rather than lost with the callback that produced it.
+    gesture_arrived_at_tail: Boolean
+    -- Physical tail edge as reported by the virtual transcript. Pin-zone
+    -- membership is a separate, snapshot-derived question.
     at_bottom: Boolean
     unread: Boolean
     previous_total_height: Integer
@@ -126,9 +132,8 @@ rule ScrollerAttachmentUpdatesReadyGeometry {
 rule DownwardMovementUpdatesGeometryWithoutChangingOwnership {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle in { mount_rescue, live }
-    requires: snapshot.at_bottom = false
+    requires: snapshot.in_pin_zone = false
     ensures: policy.last_scroll_top = snapshot.scroll_top
-    ensures: policy.at_bottom = false
     ensures: policy.follow_mode = policy.follow_mode
 }
 
@@ -140,7 +145,7 @@ rule DownwardMovementUpdatesGeometryWithoutChangingOwnership {
 rule DownwardArrivalAtBottomConfirmsTailReturn {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = live
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode = idle
     requires: policy.follow_mode in { reading, returning_to_tail }
     ensures: policy.at_bottom = true
@@ -152,7 +157,7 @@ rule DownwardArrivalAtBottomConfirmsTailReturn {
 rule DownwardArrivalAtBottomCompletesManualNavigationReturn {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = live
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode = idle
     requires: policy.follow_mode = navigating
     requires: policy.navigation_phase = user_returning
@@ -165,30 +170,28 @@ rule DownwardArrivalAtBottomCompletesManualNavigationReturn {
 rule DownwardArrivalAtBottomDuringGestureOnlyUpdatesGeometry {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle in { mount_rescue, live }
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
-    ensures: policy.at_bottom = true
+    ensures: policy.gesture_arrived_at_tail = true
     ensures: policy.follow_mode = policy.follow_mode
 }
 
 rule DownwardArrivalAtBottomWhileFollowingOnlyUpdatesGeometry {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = live
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode = idle
     requires: policy.follow_mode = following
-    ensures: policy.at_bottom = true
     ensures: policy.follow_mode = following
 }
 
 rule DownwardArrivalAtBottomSurvivesNavigationPositioning {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = live
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode = idle
     requires: policy.follow_mode = navigating
     requires: policy.navigation_phase = positioning
-    ensures: policy.at_bottom = true
     ensures: policy.follow_mode = navigating
     ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
 }
@@ -196,10 +199,9 @@ rule DownwardArrivalAtBottomSurvivesNavigationPositioning {
 rule DownwardArrivalAtBottomKeepsMountRescueActive {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = mount_rescue
-    requires: snapshot.at_bottom = true
+    requires: snapshot.in_pin_zone = true
     requires: policy.gesture_mode = idle
     ensures: policy.lifecycle = mount_rescue
-    ensures: policy.at_bottom = true
 }
 
 rule NavigationBeforeMeasurementRemainsPending {
@@ -218,7 +220,7 @@ rule PendingNavigationMeasurementEntersLiveNavigation {
     ensures: policy.follow_mode = navigating
     ensures: policy.previous_total_height = total_height
     ensures: policy.navigation_pending = false
-    ensures: policy.at_bottom = snapshot.at_bottom
+    ensures: policy.at_bottom = snapshot.in_pin_zone
     ensures: policy.navigation_phase = positioning
     ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
     ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
@@ -317,7 +319,7 @@ rule UpwardIntentFromLiveTakesReadingOwnership {
     requires: policy.lifecycle = live
     requires: policy.follow_mode != navigating
     ensures: policy.follow_mode = reading
-    ensures: policy.at_bottom = snapshot.at_bottom
+    ensures: policy.gesture_arrived_at_tail = false
 }
 
 rule NavigationUpwardMovementPreservesNavigationOwnership {
@@ -325,8 +327,14 @@ rule NavigationUpwardMovementPreservesNavigationOwnership {
     requires: policy.lifecycle = live
     requires: policy.follow_mode = navigating
     ensures: policy.follow_mode = navigating
-    ensures: policy.at_bottom = snapshot.at_bottom
+    ensures: policy.gesture_arrived_at_tail = false
     ensures: policy.navigation_phase = policy.navigation_phase
+}
+
+rule UpwardIntentDuringGestureRevokesTailArrival {
+    when: UpwardIntent(policy, snapshot)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_arrived_at_tail = false
 }
 
 rule UpwardIntentExitsMountRescueIntoReading {
@@ -342,6 +350,7 @@ rule LiveTouchStartRemembersFollowMode {
     requires: policy.lifecycle = live
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = policy.follow_mode
+    ensures: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
 }
 
@@ -352,6 +361,7 @@ rule MountTouchStartExitsRescueAndRemembersFollowing {
     ensures: policy.follow_mode = following
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = following
+    ensures: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
@@ -372,27 +382,29 @@ rule TapEndRestoresPreGestureMode {
     ensures: policy.follow_mode = policy.mode_before_gesture
 }
 
-rule TapEndAwayFromBottomKeepsReading {
+rule TapEndWithoutTailArrivalKeepsReading {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
     requires: policy.mode_before_gesture = reading
-    requires: policy.at_bottom = false
+    requires: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
 
--- A gesture ending in the pin-to-bottom zone is an arrival at the tail.
--- The bottom confirmation that would normally release reading is an
--- exact-bottom edge and may have fired (blocked) mid-gesture with no
--- re-delivery, so gesture end must confirm the return itself; otherwise
--- the session strands in reading with a permanent unread indicator.
-rule TapEndAtBottomWhileReadingConfirmsTailReturn {
+-- Gesture end is where a blocked arrival is finally honoured. The bottom
+-- confirmation that would otherwise release reading may have fired while
+-- the gesture owned the viewport, and it is never re-delivered; without
+-- this the session strands in reading with a permanent unread indicator.
+-- Arrival evidence, not geometry at the moment of lift, is the trigger: a
+-- deliberate drag that stops inside the pin zone without ever reaching the
+-- tail keeps user ownership.
+rule TapEndAfterTailArrivalConfirmsTailReturn {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
     requires: policy.mode_before_gesture = reading
-    requires: policy.at_bottom = true
+    requires: policy.gesture_arrived_at_tail = true
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -403,16 +415,16 @@ rule MovedTouchEndPreservesReadingOwnership {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.at_bottom = false
+    requires: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
 
-rule MovedTouchEndAtBottomConfirmsTailReturn {
+rule MovedTouchEndAfterTailArrivalConfirmsTailReturn {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.at_bottom = true
+    requires: policy.gesture_arrived_at_tail = true
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -428,22 +440,22 @@ rule StationaryTouchCancellationRestoresPreGestureMode {
     ensures: policy.follow_mode = policy.mode_before_gesture
 }
 
-rule StationaryCancellationAwayFromBottomKeepsReading {
+rule StationaryCancellationWithoutTailArrivalKeepsReading {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
     requires: policy.mode_before_gesture = reading
-    requires: policy.at_bottom = false
+    requires: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
 
-rule StationaryCancellationAtBottomWhileReadingConfirmsTailReturn {
+rule StationaryCancellationAfterTailArrivalConfirmsTailReturn {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
     requires: policy.mode_before_gesture = reading
-    requires: policy.at_bottom = true
+    requires: policy.gesture_arrived_at_tail = true
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -454,16 +466,16 @@ rule MovedTouchCancellationPreservesReadingOwnership {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.at_bottom = false
+    requires: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
 
-rule MovedTouchCancellationAtBottomConfirmsTailReturn {
+rule MovedTouchCancellationAfterTailArrivalConfirmsTailReturn {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.at_bottom = true
+    requires: policy.gesture_arrived_at_tail = true
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -523,6 +535,7 @@ rule BottomDuringStationaryTouchOnlyUpdatesGeometry {
     requires: at_bottom = true
     requires: policy.gesture_mode = touch_stationary
     ensures: policy.at_bottom = true
+    ensures: policy.gesture_arrived_at_tail = true
 }
 
 rule BottomDuringMovedTouchCannotReleaseOwnership {
@@ -530,6 +543,7 @@ rule BottomDuringMovedTouchCannotReleaseOwnership {
     requires: at_bottom = true
     requires: policy.gesture_mode = touch_moved
     ensures: policy.at_bottom = true
+    ensures: policy.gesture_arrived_at_tail = true
     ensures: policy.follow_mode = reading
 }
 
@@ -598,7 +612,6 @@ rule FollowingHeightChangePreservesTail {
     requires: policy.gesture_mode != touch_moved
     requires: unit_count > 0
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
     ensures: policy.unread = false
     ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
 }
@@ -611,7 +624,6 @@ rule ReadingTailGrowthShowsUnreadWithoutScrolling {
     requires: cause = tail_activity
     requires: total_height > policy.previous_total_height
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
     ensures: policy.unread = true
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
 }
@@ -624,7 +636,6 @@ rule NavigatingTailGrowthShowsUnreadWithoutScrolling {
     requires: cause = tail_activity
     requires: total_height > policy.previous_total_height
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
     ensures: policy.unread = true
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
     ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
@@ -637,7 +648,6 @@ rule ReadingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     requires: unit_count > 0
     requires: cause = unrelated_layout
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
 }
 
 rule NavigatingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
@@ -647,8 +657,15 @@ rule NavigatingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     requires: unit_count > 0
     requires: cause = unrelated_layout
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
     ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+}
+
+rule TailGrowthPastPinZoneRevokesGestureArrival {
+    when: HeightChanged(policy, total_height, unit_count, snapshot, _)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: policy.gesture_arrived_at_tail = true
+    requires: snapshot.in_pin_zone = false
+    ensures: policy.gesture_arrived_at_tail = false
 }
 
 rule MountHeightChangeSchedulesBottomCorrection {
@@ -656,7 +673,6 @@ rule MountHeightChangeSchedulesBottomCorrection {
     requires: policy.lifecycle = mount_rescue
     requires: unit_count > 0
     ensures: policy.previous_total_height = total_height
-    ensures: policy.at_bottom = snapshot.at_bottom
     ensures: ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
 }
 
@@ -752,6 +768,11 @@ invariant DirectDomWritesBelongOnlyToMountRescue {
 invariant MountRescueHasBoundedDeadline {
     for policy in ScrollPolicy:
         policy.lifecycle = mount_rescue implies policy.settle_deadline > 0
+}
+
+invariant TailArrivalIsGestureScoped {
+    for policy in ScrollPolicy:
+        policy.gesture_mode = idle implies policy.gesture_arrived_at_tail = false
 }
 
 invariant MovedTouchOwnsViewport {

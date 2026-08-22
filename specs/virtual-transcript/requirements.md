@@ -2,7 +2,9 @@
 
 Virtual Transcript defines the platform-neutral behavioral contract for rendering and positioning a long conversation. A client may use DOM scrolling, a native collection view, or another physical mechanism, but it must expose the same semantic units and satisfy the same positioning postconditions.
 
-## REQ-VT-001: One Physical Layout Authority
+## Requirements
+
+### REQ-VT-001: One Physical Layout Authority
 
 WHEN a transcript view is mounted
 THE SYSTEM SHALL have exactly one typed physical executor responsible for the ordered layout model, measured unit extents, rendered window, spacers, target resolution against rendered units, and programmatic viewport writes
@@ -10,7 +12,7 @@ AND no other component shall maintain a competing height model or independently 
 
 In the Phoenix web implementation, `MessageList` owns this typed physical execution surface through its `VirtualTranscript` integration. The layout model is ephemeral to the mounted conversation. It is not persisted across visits.
 
-## REQ-VT-002: Stable Semantic Units
+### REQ-VT-002: Stable Semantic Units
 
 WHEN render units are supplied
 THE SYSTEM SHALL preserve their order and stable keys
@@ -19,21 +21,21 @@ AND SHALL expose navigation aliases separately from physical unit identity.
 
 A tool-result message identifier aliases its containing agent-turn unit. A non-rendered message has no physical target.
 
-## REQ-VT-003: Bounded Rendering
+### REQ-VT-003: Bounded Rendering
 
 WHEN transcript content exceeds the viewport
 THE SYSTEM SHALL mount only the visible contiguous unit range plus bounded leading and trailing overscan
 AND SHALL represent unmounted content using the authoritative layout model
 AND SHALL update the rendered range when viewport geometry, scroll position, unit order, or measured extents change.
 
-## REQ-VT-004: Measurement Reconciliation
+### REQ-VT-004: Measurement Reconciliation
 
 WHEN a mounted unit's measured block extent changes
 THE SYSTEM SHALL update the authoritative layout model from that measurement
 AND, if the changed extent precedes an active physical anchor, SHALL preserve that anchor's viewport-start offset
 AND SHALL NOT infer user intent from the measurement change.
 
-WHILE a user scroll or touch gesture is in flight — recent scroll events or any touch still down on the scroller
+WHILE a user scroll or touch gesture is in flight — recent scroll events, or any touch that began on the scroller and is still down
 WHEN preserving an anchor's viewport-start offset requires a position correction
 THE SYSTEM SHALL apply the correction by shifting the rendered block's leading spacer rather than writing the scroll position
 SO THAT native scroll momentum is never cancelled, and an active gesture never disturbed, by a compensation write
@@ -43,7 +45,7 @@ AND SHALL identify the scroll-event echoes of its own position writes so consume
 
 Reconciliation is triggered by layout measurements. It shall not poll or use elapsed time as evidence of positioning success; the scroll-settle wait governs only when an already-computed spacer shift is folded back into layout coordinates.
 
-## REQ-VT-005: Geometric Prefix Continuity
+### REQ-VT-005: Geometric Prefix Continuity
 
 WHEN the user requests earlier history while reading
 THE SYSTEM SHALL capture a physical anchor consisting of a stable unit key and its signed viewport-start offset
@@ -59,7 +61,7 @@ AND SHALL accept physical success only from observations at or after the issued 
 
 The anchor shall be a physically visible unit, not an overscanned range boundary.
 
-## REQ-VT-006: Semantic Navigation
+### REQ-VT-006: Semantic Navigation
 
 WHEN navigation targets a renderable message identifier
 THE SYSTEM SHALL resolve it to its physical render unit and position that unit according to the requested alignment
@@ -70,7 +72,7 @@ THE SYSTEM SHALL report the target as missing.
 
 Target resolution and missing-target detection are evidence supplied to the positioning reducer. The reducer shall not infer target presence from time, retries, or physical layout alone.
 
-## REQ-VT-007: Pure Position Command Ownership
+### REQ-VT-007: Pure Position Command Ownership
 
 THE SYSTEM SHALL model transcript positioning as a pure reducer over a closed input: either `idle(view)` or `positioning(command)`.
 
@@ -88,7 +90,7 @@ THE SYSTEM SHALL reset the terminal identity set for that view.
 
 Each command shall finish exactly once within a view as applied, target missing, or superseded.
 
-## REQ-VT-008: Durable Tail Following
+### REQ-VT-008: Durable Tail Following
 
 WHILE tail-follow ownership belongs to the system
 WHEN content or measured layout grows
@@ -100,7 +102,7 @@ THE SYSTEM SHALL preserve the reader's physical anchor, show unread-tail state, 
 
 Layout growth and proximity to the tail shall not independently transfer viewport ownership.
 
-## REQ-VT-009: Initial Placement and Conversation Isolation
+### REQ-VT-009: Initial Placement and Conversation Isolation
 
 WHEN a conversation with content first becomes measurable
 THE SYSTEM SHALL converge to the newest content unless user interaction first transfers viewport ownership.
@@ -108,14 +110,14 @@ THE SYSTEM SHALL converge to the newest content unless user interaction first tr
 WHEN conversation identity changes
 THE SYSTEM SHALL atomically discard the prior conversation's layout measurements, active transaction, geometry baselines, gesture state, and rendered window.
 
-## REQ-VT-010: Dynamic Content
+### REQ-VT-010: Dynamic Content
 
 WHEN streaming text, images, expanded tool output, system prompts, viewport resizing, or typography changes alter unit extents
 THE SYSTEM SHALL reconcile from measured geometry while preserving the active reader anchor or tail invariant according to viewport ownership.
 
 A streaming-to-finalized transition that retains the same render-unit key shall remain an in-place physical unit transition.
 
-## REQ-VT-011: Cross-Platform Conformance Fixtures
+### REQ-VT-011: Cross-Platform Conformance Fixtures
 
 THE SYSTEM SHALL maintain a platform-neutral fixture corpus at `fixtures/virtual-transcript/v1/` with a JSON Schema (`schema.json`) and scenario corpus (`scenarios.json`) describing ordered units, stable keys, navigation aliases, initial viewport state, operations, and geometric expectations.
 
@@ -123,7 +125,7 @@ The root `fixtures/virtual-transcript/v1/` schema and corpus SHALL be the shared
 
 Conformance SHALL include prefix insertion within a tall unit, dynamic resize above an anchor, semantic navigation through an alias, missing orphan targets, streaming growth while reading, streaming growth while following, and command supersession.
 
-## REQ-VT-012: Browser Conformance
+### REQ-VT-012: Browser Conformance
 
 The web implementation SHALL satisfy the Virtual Transcript postconditions in current stable Chromium, Safari, and Firefox.
 

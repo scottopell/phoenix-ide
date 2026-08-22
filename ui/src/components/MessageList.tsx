@@ -781,7 +781,7 @@ function MessageListImpl({
     return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
   }, []);
 
-  // Raw edge only — zone semantics live in scroll_policy.allium.
+  // Physical tail edge, forwarded verbatim (scroll_policy.allium).
   const handlePinnedStateChange = useCallback((pinned: boolean) => {
     dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom: pinned });
   }, []);
