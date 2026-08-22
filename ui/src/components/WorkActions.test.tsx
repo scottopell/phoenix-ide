@@ -1700,6 +1700,29 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
+  it('resets open details while the Work Actions bar is hidden during an LLM turn', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const renderBar = (phaseType: 'idle' | 'llm_requesting') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-hide-show" convModeLabel="Work" phaseType={phaseType} continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('idle'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    rerender(renderBar('llm_requesting'));
+    expect(screen.queryByTestId('mobile-work-fallback')).not.toBeInTheDocument();
+
+    rerender(renderBar('idle'));
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+  });
+
   it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
     enableMobile();
     const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (

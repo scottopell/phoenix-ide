@@ -282,12 +282,12 @@ export function WorkControlBar({
   const fallbackMenuIsOpen = fallbackPanel === 'menu' && fallbackMenuAction === fallbackOverflowAction;
 
   useEffect(() => {
-    if (!usesCompactLayout || canRepresentActiveSelection) {
+    if (!disposition.visible || !usesCompactLayout || canRepresentActiveSelection) {
       setFallbackPanel(null);
       return;
     }
     if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) setFallbackPanel(null);
-  }, [canRepresentActiveSelection, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
+  }, [canRepresentActiveSelection, disposition.visible, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
 
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
