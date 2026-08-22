@@ -1866,6 +1866,33 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR open');
   });
 
+  it('does not render a stale cached PR link beside an unresolved explicit selection', () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'draft',
+      check_state: 'pending',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stale-link" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    expect(resumeInference).toHaveBeenCalledTimes(1);
+  });
+
   it('does not target a stale cached PR beside an unresolved explicit selection', () => {
     enableMobile();
     const handle = prStatusHandle({

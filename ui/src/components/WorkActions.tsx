@@ -485,8 +485,28 @@ export function WorkControlBar({
               </button>
             )
           )}
-          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && (
+          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && !explicitSelectionUnresolved && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
+          )}
+          {disposition.primary === 'resolve' && disposition.resolve && disposition.resolve.kind !== 'address_feedback' && explicitSelectionUnresolved && (
+            actionablePrs.length > 0 ? (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                onClick={requestActivePrSelectorOpen}
+              >
+                Select active PR
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="mobile-pr-action mobile-pr-action--hero"
+                disabled={!prStatusHandle.resumeInference}
+                onClick={() => void resumePrInference()}
+              >
+                Resume PR inference
+              </button>
+            )
           )}
           {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && canAddressFeedback && (
             <button
