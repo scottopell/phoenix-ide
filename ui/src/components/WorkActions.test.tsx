@@ -1586,6 +1586,32 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     window.confirm = prevConfirm;
   });
 
+  it('keeps overflow open and focus in place when Abandon fails', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-abandon-failure"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    window.confirm = prevConfirm;
+  });
+
   it('returns Escape focus to the info trigger that opened the details panel', () => {
     enableMobile();
     renderWithProviders(
@@ -1686,6 +1712,38 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
+  });
+
+  it('keeps a direct review primary when the cached active PR cannot be targeted', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: selection().active_pr,
+      },
+      activePrSummary: null,
+      ambiguous: true,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-unresolved-active-summary"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Review workspace changes' })).toBeInTheDocument();
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
   it('prioritizes feedback status over cached workspace-change status', () => {

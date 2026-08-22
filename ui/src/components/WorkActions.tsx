@@ -336,7 +336,7 @@ export function WorkControlBar({
       return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to abandon task');
-      return true;
+      return false;
     } finally {
       setAbandoning(false);
     }
@@ -454,6 +454,16 @@ export function WorkControlBar({
             >
               <span>{capturing ? `Capturing ${activePrLabel}…` : `Address feedback${freshnessLabel ? ` · ${freshnessLabel}` : ''}`}</span>
               <CoverageMarker marker={coverageMarker} />
+            </button>
+          )}
+          {disposition.primary === 'resolve' && disposition.resolve?.kind === 'address_feedback' && !prSpecificActionsEnabled && (
+            <button
+              type="button"
+              className="mobile-pr-action mobile-pr-action--hero"
+              aria-label="Review workspace changes"
+              onClick={() => openDiffFullscreen('workspace')}
+            >
+              Review changes
             </button>
           )}
           {disposition.primary === 'review' && (
