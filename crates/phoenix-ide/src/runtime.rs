@@ -2163,8 +2163,11 @@ impl RuntimeManager {
         self.fatal_local_authority_fence.close(boundary);
     }
 
-    pub(crate) fn require_startup_local_authority(&self) -> Result<(), String> {
+    pub(crate) fn require_startup_local_authority(
+        &self,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
         self.require_local_authority_admission()
+            .map_err(|_| crate::FatalLocalAuthorityExit)
     }
 
     fn require_local_authority_admission(&self) -> Result<(), String> {
@@ -3128,15 +3131,29 @@ impl RuntimeManager {
         Ok(pass.await)
     }
 
-    pub async fn start_creation_worker(self: &Arc<Self>) {
+    pub async fn start_creation_worker(
+        self: &Arc<Self>,
+    ) -> Result<(), crate::FatalLocalAuthorityExit> {
+        self.start_creation_worker_with_startup_hook(|| {}).await
+    }
+
+    async fn start_creation_worker_with_startup_hook<F>(
+        self: &Arc<Self>,
+        startup_hook: F,
+    ) -> Result<(), crate::FatalLocalAuthorityExit>
+    where
+        F: FnOnce(),
+    {
         let rx = self.creation_kick_rx.write().await.take();
         let Some(mut rx) = rx else {
             tracing::debug!("creation worker already started; skipping");
-            return;
+            return self.require_startup_local_authority();
         };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let manager = Arc::clone(self);
         let mut fatal_local_authority_rx = self.fatal_local_authority_receiver();
         tokio::spawn(async move {
+            let _ = ready_tx.send(());
             loop {
                 if let Err(error) =
                     crate::runtime::creation_worker::drain_pending_jobs(&manager).await
@@ -3181,7 +3198,11 @@ impl RuntimeManager {
             }
             tracing::info!("Conversation creation worker stopped");
         });
+        ready_rx.await.map_err(|_| crate::FatalLocalAuthorityExit)?;
+        startup_hook();
+        self.require_startup_local_authority()?;
         self.kick_creation_worker();
+        Ok(())
     }
 
     pub fn kick_creation_worker(&self) {
@@ -7928,6 +7949,32 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn creation_worker_readiness_race_returns_typed_fatal_exit() {
+        let manager = Arc::new(test_manager().await);
+        let closer = Arc::clone(&manager);
+
+        let error = manager
+            .start_creation_worker_with_startup_hook(move || {
+                closer.signal_fatal_local_authority("test_creation_worker_readiness_race");
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+        assert!(manager.fatal_local_authority_is_latched());
+    }
+
+    #[tokio::test]
+    async fn continuation_startup_closure_returns_typed_fatal_exit() {
+        let manager = test_manager().await;
+        manager.signal_fatal_local_authority("test_continuation_startup_closure");
+
+        let error = manager.require_startup_local_authority().unwrap_err();
+
+        assert_eq!(error, crate::FatalLocalAuthorityExit);
+    }
+
+    #[tokio::test]
     async fn queued_admitted_assistant_retains_owner_until_reserved_range_release() {
         let fence = FatalLocalAuthorityFence::new();
         let broadcaster =
@@ -9348,11 +9395,11 @@ mod scope_liveness_tests {
         );
         barrier.wait().await;
 
-        materialization
+        let handle = materialization
             .await
             .expect("materialization joins")
             .expect("inherited materialization succeeds");
-        assert!(mgr.try_get_handle(conversation_id).await.is_some());
+        assert_eq!(handle.state_rx.borrow().presentation_mode(), "idle");
     }
 
     #[tokio::test]

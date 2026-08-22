@@ -1102,6 +1102,19 @@ impl WorkflowRepository {
         &self,
         input: &MaterializeAuthoritativeTurnInput,
     ) -> DbResult<MaterializeAuthoritativeTurnOutcome> {
+        let mut tx = self.begin_tx().await?;
+        let outcome = self
+            .classify_authoritative_turn_materialization_tx(&mut tx, input)
+            .await;
+        tx.rollback().await?;
+        outcome
+    }
+
+    async fn classify_authoritative_turn_materialization_tx(
+        &self,
+        tx: &mut super::WorkflowTx<'_>,
+        input: &MaterializeAuthoritativeTurnInput,
+    ) -> DbResult<MaterializeAuthoritativeTurnOutcome> {
         let row = sqlx::query(
             "SELECT dt.conversation_id, dt.prepared_fingerprint, dt.generation,
                     dt.terminal_kind, dt.canonical_message_id,
@@ -1160,7 +1173,7 @@ impl WorkflowRepository {
             DIRECT_TURN_MATERIALIZED_TRANSITION_ID,
             "direct_turn_materialized_transition_id",
         )?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx.tx)
         .await?;
         let Some(row) = row else {
             return Ok(MaterializeAuthoritativeTurnOutcome::StaleAuthority);
@@ -1219,7 +1232,7 @@ impl WorkflowRepository {
                     stored_path: row.get("stored_path"),
                 },
             )
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx.tx)
             .await?;
             let images = sqlx::query(
                 "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
@@ -1229,7 +1242,7 @@ impl WorkflowRepository {
                 data: row.get("data"),
                 media_type: row.get("media_type"),
             })
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx.tx)
             .await?;
             message.content.set_attachments(images, files);
             let expected_content = input.prepared.message_content_and_display_data();
@@ -4144,6 +4157,70 @@ mod tests {
             Err(DbError::Serialization(message))
                 if message.contains("canonical message payload mismatch")
         ));
+    }
+
+    #[tokio::test]
+    async fn materialization_classifier_uses_one_read_snapshot_for_canonical_rows() {
+        let (_dir, repo, second) = open_workflow_repo_pair().await;
+        let conversation = ConversationAuthority("conv-a".to_string());
+        let payload = prepared_payload_with_attachments("message-conv-a-snapshot");
+        let created = repo
+            .accept_authoritative_turn(&AcceptAuthoritativeTurn {
+                client_key: ClientTurnKey::new("classifier-snapshot").unwrap(),
+                prepared: PreparedTurn::from_exact_payload(
+                    &conversation,
+                    payload.to_exact_bytes().unwrap(),
+                ),
+                disposition: AcceptedDisposition::Runtime,
+                accepted_at: Timestamp(29),
+            })
+            .await
+            .unwrap();
+        let TurnOutcome::Created { turn_id, .. } = created.outcome else {
+            panic!("expected created turn")
+        };
+        let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
+        let authority = repo
+            .claim_authoritative_turn(&claim_input(workflow_id, turn_id, 30))
+            .await
+            .unwrap()
+            .authority
+            .unwrap();
+        let input = MaterializeAuthoritativeTurnInput {
+            turn_id,
+            authority,
+            prepared: payload,
+            sequence_id: 30,
+            created_at: Timestamp(30),
+            accepted_state: ConvState::LlmRequesting { attempt: 1 },
+            state_updated_at: timestamp_to_datetime(Timestamp(30)),
+            now: Timestamp(30),
+        };
+        assert!(matches!(
+            repo.materialize_authoritative_turn(&input).await,
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(
+                MaterializeAuthoritativeTurnOutcome::Materialized(_)
+            )
+        ));
+
+        let mut snapshot = repo.begin_tx().await.unwrap();
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM durable_turns")
+            .fetch_one(&mut *snapshot.tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM message_files WHERE message_id = ?1")
+            .bind(canonical_message_id("conv-a", "message-conv-a-snapshot"))
+            .execute(second.pool())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.classify_authoritative_turn_materialization_tx(&mut snapshot, &input)
+                .await
+                .unwrap(),
+            MaterializeAuthoritativeTurnOutcome::ClassifiedCommitted(_)
+        ));
+        snapshot.rollback().await.unwrap();
     }
 
     #[tokio::test]

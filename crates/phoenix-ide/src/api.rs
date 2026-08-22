@@ -175,30 +175,20 @@ impl AppState {
             .set_startup_obligated_conversations(db.terminal_obligated_conversation_ids().await?)
             .await;
         runtime.start_direct_turn_worker().await?;
-        runtime
-            .require_startup_local_authority()
-            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
         if AGENT_FACING_WAKE_REGISTRATION.0 {
             runtime
                 .start_wake_worker()
                 .await
                 .map_err(std::io::Error::other)?;
-            runtime
-                .require_startup_local_authority()
-                .map_err(std::io::Error::other)?;
+            runtime.require_startup_local_authority()?;
         }
-        runtime
-            .require_startup_local_authority()
-            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
-        runtime.start_creation_worker().await;
-        runtime
-            .require_startup_local_authority()
-            .map_err(std::io::Error::other)?;
+        runtime.start_creation_worker().await?;
+        runtime.require_startup_local_authority()?;
         reconcile_startup_continuations(&runtime).await?;
-        runtime
-            .require_startup_local_authority()
-            .map_err(std::io::Error::other)?;
+        runtime.require_startup_local_authority()?;
         handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and
