@@ -196,6 +196,7 @@ export function WorkControlBar({
   const fallbackDockRef = useRef<HTMLDivElement>(null);
   const fallbackInfoButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const fallbackWasVisibleRef = useRef(false);
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
@@ -297,6 +298,16 @@ export function WorkControlBar({
     }
     if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) setFallbackPanel(null);
   }, [canRepresentActiveSelection, disposition.visible, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
+
+  useEffect(() => {
+    const fallbackVisible = disposition.visible && usesCompactLayout && !canRepresentActiveSelection;
+    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection) {
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>('.mobile-pr-chip--active')?.focus();
+      });
+    }
+    fallbackWasVisibleRef.current = fallbackVisible;
+  }, [canRepresentActiveSelection, disposition.visible, usesCompactLayout]);
 
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
@@ -825,7 +836,7 @@ export function WorkControlBar({
         {explicitSelectionUnresolved && (
           <button
             type="button"
-            className="work-actions-btn work-actions-primary"
+            className="work-actions-btn work-actions-resolve work-actions-resolve--primary"
             disabled={!prStatusHandle.resumeInference}
             onClick={() => void resumePrInference()}
           >

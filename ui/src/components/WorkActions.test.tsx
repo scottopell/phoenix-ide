@@ -1756,6 +1756,36 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
   });
 
+  it('moves focus to the active PR chip when fallback details become a PR rail', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const railSelection = twoOpenPrSelection();
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: railSelection,
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-focus-transition" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    rerender(renderBar(railHandle));
+
+    const activeChip = screen.getByRole('button', { name: /#12/ });
+    await waitFor(() => expect(activeChip).toHaveFocus());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
   it('does not render a stale overflow menu after terminal actions disappear', () => {
     enableMobile();
     const renderBar = (continuedInConvId: string | null) => (
@@ -2059,6 +2089,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-resolve--primary');
   });
 
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
