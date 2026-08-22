@@ -1752,6 +1752,39 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
 
+  it('does not target a stale cached PR beside an unresolved explicit selection', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-explicit-summary-missing"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Address feedback. Select the active PR first.' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+  });
+
   it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
     enableMobile();
     const onSendMessage = vi.fn().mockResolvedValue(undefined);

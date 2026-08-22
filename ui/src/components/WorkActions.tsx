@@ -237,7 +237,10 @@ export function WorkControlBar({
     || prStatusHandle.ambiguous;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
-  const cachedPrCanTargetFeedback = !!prStatus?.found && prStatus.number != null && !prStatusHandle.ambiguous;
+  const cachedPrCanTargetFeedback = prStatusHandle.activeSelection?.active_pr == null
+    && !!prStatus?.found
+    && prStatus.number != null
+    && !prStatusHandle.ambiguous;
   const canAddressFeedback = prSpecificActionsEnabled || cachedPrCanTargetFeedback;
   const addressFeedbackPrLabel = activePrNumber != null
     ? `PR #${activePrNumber}`

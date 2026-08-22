@@ -60,7 +60,8 @@ function Probe({ conversationId, cached }: { conversationId: string | null; cach
   const associatedCount = handle.activeSelection?.associated_prs.length ?? 0;
   const activePrNumber = handle.activePrSummary?.pr_number ?? 'none';
   const ambiguous = handle.ambiguous ? 'yes' : 'no';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span><button type="button" onClick={() => void handle.refresh()}>Refresh</button><button type="button" onClick={() => void handle.refreshForSafety()}>Safety refresh</button><button type="button" onClick={() => void handle.resumeInference?.()}>Resume inference</button></div>;
+  const feedbackStatus = handle.state.status === 'ready' ? handle.state.prStatus.feedback_status ?? 'none' : 'none';
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="feedback-status">{feedbackStatus}</span><span data-testid="refresh-state">{refreshState}</span><span data-testid="associated-count">{associatedCount}</span><span data-testid="active-pr-number">{activePrNumber}</span><span data-testid="ambiguous">{ambiguous}</span><button type="button" onClick={() => void handle.refresh()}>Refresh</button><button type="button" onClick={() => void handle.refreshForSafety()}>Safety refresh</button><button type="button" onClick={() => void handle.resumeInference?.()}>Resume inference</button></div>;
 }
 
 describe('useConversationPrStatus', () => {
@@ -516,6 +517,16 @@ describe('useConversationPrStatus', () => {
       expect(screen.getByTestId('pr-number')).toHaveTextContent('8');
       expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
     });
+  });
+
+  it('preserves absent feedback status in a cached PR seed', async () => {
+    const fresh = deferred<PrStatusResponse>();
+    vi.mocked(api.getPrStatus).mockReturnValue(fresh.promise);
+
+    render(<Probe conversationId="conv-no-feedback" cached={cachedPr(7)} />);
+
+    expect(screen.getByTestId('feedback-status')).toHaveTextContent('none');
+    await waitFor(() => expect(api.getPrStatus).toHaveBeenCalledWith('conv-no-feedback'));
   });
 
   it('keeps cached PR selection display-only while the fresh status loads', async () => {
