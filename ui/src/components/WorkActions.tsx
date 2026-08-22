@@ -297,7 +297,13 @@ export function WorkControlBar({
       setFallbackPanel(null);
       return;
     }
-    if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) setFallbackPanel(null);
+    if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) {
+      const menuOwnedFocus = fallbackDockRef.current?.querySelector('#mobile-work-fallback-more-actions')?.contains(document.activeElement) ?? false;
+      setFallbackPanel(null);
+      if (menuOwnedFocus) {
+        requestAnimationFrame(() => (fallbackMenuButtonRef.current ?? fallbackInfoButtonRef.current)?.focus());
+      }
+    }
   }, [canRepresentActiveSelection, disposition.visible, fallbackMenuAction, fallbackOverflowAction, fallbackPanel, usesCompactLayout]);
 
   const fallbackVisible = disposition.visible && usesCompactLayout && !canRepresentActiveSelection;

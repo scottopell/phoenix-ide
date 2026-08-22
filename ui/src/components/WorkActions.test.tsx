@@ -1905,7 +1905,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
   });
 
-  it('closes overflow when its secondary terminal action changes identity', () => {
+  it('closes overflow when its secondary terminal action changes identity', async () => {
     enableMobile();
     const renderBar = (phaseType: 'idle' | 'stuck') => (
       <MemoryRouter>
@@ -1922,8 +1922,10 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
     const { rerender } = render(renderBar('idle'));
 
-    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
-    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+    const trigger = screen.getByRole('button', { name: 'More work actions' });
+    fireEvent.click(trigger);
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
     rerender(renderBar('stuck'));
 
     expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
