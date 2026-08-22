@@ -5,12 +5,14 @@ import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
+import type { SqliteWorkloadReportResponse } from '../generated/SqliteWorkloadReportResponse';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
     deploymentInfo: vi.fn(),
     deploymentDiskInfo: vi.fn(),
     deploymentResources: vi.fn(),
+    deploymentSqliteWorkload: vi.fn(),
     cleanupManagedWorktree: vi.fn(),
     revealPath: vi.fn(),
     releaseUpdateSnapshot: vi.fn(),
@@ -153,6 +155,24 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
   };
 }
 
+function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): SqliteWorkloadReportResponse {
+  return {
+    sampled_at: '2026-06-01T00:00:05Z',
+    window: 'one_hour',
+    bucket_count: 2,
+    restart_truncated: true,
+    process_started_at: '2026-06-01T00:00:00Z',
+    process_uptime_seconds: 125,
+    covered_uptime_seconds: 125,
+    covered_uptime_micros: 125_000_000,
+    coverage: { bucket_count: 2, fully_covered: false, label: '2m 5s covered across 2 buckets; requested 60m' },
+    classification: { classified_count: 0, other_count: 0, other_share_percent: null, abandoned_count: 0 },
+    writer_categories: [],
+    reads: [],
+    ...overrides,
+  };
+}
+
 function LocationProbe() {
   return <output aria-label="Current route">{useLocation().pathname}</output>;
 }
@@ -169,6 +189,7 @@ function renderPage(info: DeploymentInfo, disk: DeploymentDiskInfo = deploymentD
   apiMock.deploymentInfo.mockResolvedValue(info);
   apiMock.deploymentDiskInfo.mockResolvedValue(disk);
   apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+  apiMock.deploymentSqliteWorkload.mockResolvedValue(sqliteReport());
   return render(
     <MemoryRouter>
       <AboutDeploymentPage />
@@ -221,6 +242,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentInfo.mockReset();
     apiMock.deploymentDiskInfo.mockReset();
     apiMock.deploymentResources.mockReset();
+    apiMock.deploymentSqliteWorkload.mockReset().mockResolvedValue(sqliteReport());
     apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
     apiMock.releaseUpdateTransaction.mockReset().mockResolvedValue({ kind: 'none' });
@@ -241,6 +263,33 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.clearAllMocks();
+  });
+
+  it('loads SQLite workload and switches fixed report windows', async () => {
+    apiMock.deploymentSqliteWorkload
+      .mockResolvedValueOnce(sqliteReport())
+      .mockResolvedValueOnce(sqliteReport({ window: 'six_hours' }));
+
+    renderPage(deployment());
+
+    expect(await screen.findByRole('heading', { name: 'SQLite workload' })).toBeInTheDocument();
+    expect(screen.getByText('Restart truncated')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '6h' }));
+    expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
+    await screen.findByText('No SQLite write data for this window yet.');
+  });
+
+  it('keeps prior SQLite values visible and labels a failed refresh stale', async () => {
+    apiMock.deploymentSqliteWorkload
+      .mockResolvedValueOnce(sqliteReport())
+      .mockRejectedValueOnce(new Error('collector unavailable'));
+
+    renderPage(deployment());
+    await screen.findByText('Restart truncated');
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh SQLite report' }));
+
+    expect(await screen.findByText('SQLite report stale — collector unavailable')).toBeInTheDocument();
+    expect(screen.getByText('Restart truncated')).toBeInTheDocument();
   });
 
   it('presents running identity, ownership, and remote access as separate primary facts', async () => {

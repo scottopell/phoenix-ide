@@ -40,7 +40,8 @@ pub use retrieval::{
 };
 pub use schema::*;
 pub use sqlite_workload::{
-    BucketCategoryTotals, SqliteAccessKind, SqliteLatencyBin, SqliteOutcome, SqliteSnapshotWindow,
+    approximate_percentiles_from_histogram, BucketCategoryTotals, SqliteAccessKind,
+    SqliteLatencyBin, SqliteOutcome, SqlitePercentiles, SqliteSnapshotWindow,
     SqliteWorkloadAggregateReport, SqliteWorkloadCategory, SqliteWorkloadCollector,
     SqliteWorkloadSnapshot,
 };

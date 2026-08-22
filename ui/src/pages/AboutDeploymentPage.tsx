@@ -440,28 +440,35 @@ function SqliteDiagnostics({
           </button>
         </div>
       </div>
-      {state.error && <div className="settings-section__error">{report ? `SQLite report stale — ${state.error}` : state.error}</div>}
-      {!report && state.loading && <div className="settings-section__hint">Loading SQLite report…</div>}
+      {state.error && <div className="settings-section__error">{report ? `SQLite report stale — ${state.error}` : `SQLite report unavailable — ${state.error}`}</div>}
+      {state.loading && <div className="settings-section__hint">{report ? 'Refreshing SQLite report; displayed values are from the previous sample.' : 'Loading SQLite report…'}</div>}
       {report && (
         <>
-          <div className="about-sqlite-summary" aria-label="SQLite workload coverage">
+          <dl className="about-sqlite-summary" aria-label="SQLite workload coverage">
             <div className="about-sqlite-summary__card">
-              <span>Coverage</span>
-              <strong>{report.coverage.label}</strong>
+              <dt>Coverage</dt>
+              <dd>{report.coverage.label}</dd>
             </div>
             <div className="about-sqlite-summary__card">
-              <span>Process uptime</span>
-              <strong>{formatUptime(report.process_uptime_seconds)}</strong>
+              <dt>Process uptime</dt>
+              <dd>{formatUptime(report.process_uptime_seconds)}</dd>
             </div>
             <div className="about-sqlite-summary__card">
-              <span>Covered uptime</span>
-              <strong>{formatUptime(report.covered_uptime_seconds)}</strong>
+              <dt>Covered uptime</dt>
+              <dd>{formatUptime(report.covered_uptime_seconds)}</dd>
             </div>
-          </div>
+            <div className="about-sqlite-summary__card">
+              <dt>Confidence</dt>
+              <dd>{report.restart_truncated ? 'Restart truncated' : 'Full requested uptime available'}</dd>
+              <div className="settings-section__hint">
+                {report.classification.classified_count} classified · {report.classification.other_count} other{report.classification.other_share_percent != null ? ` (${formatPercent(report.classification.other_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned
+              </div>
+            </div>
+          </dl>
           <div className="about-sqlite-tables">
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">
-                <h4>Writer utilization by category</h4>
+                <h4>Writer transaction-envelope proxy by category</h4>
                 <span>{report.writer_categories.length} categories</span>
               </div>
               <table className="deploy-table about-sqlite-table">
@@ -469,19 +476,20 @@ function SqliteDiagnostics({
                   <tr>
                     <th>Category</th>
                     <th>Writes</th>
-                    <th>Utilization</th>
-                    <th>Wait avg</th>
+                    <th>Tx envelope %</th>
+                    <th>Pool / admission wait</th>
                     <th>Retries</th>
                     <th>Failures</th>
                   </tr>
                 </thead>
                 <tbody>
+                  {report.writer_categories.length === 0 && <tr><td colSpan={6}>No SQLite write data for this window yet.</td></tr>}
                   {report.writer_categories.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
                       <td>{formatNumber(row.operation_count)}</td>
-                      <td>{formatPercent(row.utilization_percent, 2)}</td>
-                      <td>{row.wait.avg_ms} ms</td>
+                      <td>{formatPercent(row.writer_transaction_envelope_percent, 2)}</td>
+                      <td>pool {row.pool_wait.avg_ms} ms · admit {row.admission_wait.avg_ms} ms</td>
                       <td>{formatNumber(row.retries.retry_count)}</td>
                       <td>busy {row.failures.busy} · locked {row.failures.locked} · timeout {row.failures.pool_timeout + row.failures.other_timeout} · fail {row.failures.other_failure} · abandoned {row.failures.abandoned}</td>
                     </tr>
@@ -499,13 +507,14 @@ function SqliteDiagnostics({
                   <tr>
                     <th>Category</th>
                     <th>Reads</th>
-                    <th>Total duration</th>
-                    <th>Avg duration</th>
+                    <th>Total connection time (ms)</th>
+                    <th>Average connection time (ms)</th>
                     <th>Peak concurrency</th>
                     <th>Retries / failures</th>
                   </tr>
                 </thead>
                 <tbody>
+                  {report.reads.length === 0 && <tr><td colSpan={6}>No SQLite read data for this window yet.</td></tr>}
                   {report.reads.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
@@ -513,7 +522,7 @@ function SqliteDiagnostics({
                       <td>{row.total_duration_ms} ms</td>
                       <td>{row.avg_duration_ms} ms</td>
                       <td>{formatNumber(row.peak_concurrency)}</td>
-                      <td>{row.retries.retry_count} retries · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
+                      <td>{row.retries.retry_count} retries · pool {row.pool_wait.avg_ms} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
                     </tr>
                   ))}
                 </tbody>

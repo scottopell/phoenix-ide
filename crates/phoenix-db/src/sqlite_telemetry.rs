@@ -140,6 +140,7 @@ impl SlowSqlitePhase {
 pub(crate) struct SuccessfulTransactionTiming {
     acquisition_elapsed: Duration,
     transaction_started_at: Instant,
+    admitted_transaction_start_elapsed: Duration,
 }
 
 #[must_use = "pool acquisition timing must be attached to its transaction"]
@@ -152,6 +153,7 @@ impl SuccessfulPoolAcquisitionTiming {
         SuccessfulTransactionTiming {
             acquisition_elapsed: self.acquisition_elapsed,
             transaction_started_at: Instant::now(),
+            admitted_transaction_start_elapsed: self.acquisition_elapsed,
         }
     }
 }
@@ -163,14 +165,27 @@ impl SuccessfulTransactionTiming {
             acquisition_elapsed: transaction_started_at
                 .saturating_duration_since(acquisition_started_at),
             transaction_started_at,
+            admitted_transaction_start_elapsed: transaction_started_at
+                .saturating_duration_since(acquisition_started_at),
         }
     }
 
-    fn complete_at(self, transaction_ended_at: Instant) -> CompletedTransactionTiming {
+    fn complete_at(
+        self,
+        transaction_ended_at: Instant,
+        total_elapsed: Duration,
+    ) -> CompletedTransactionTiming {
+        let transaction_elapsed =
+            transaction_ended_at.saturating_duration_since(self.transaction_started_at);
+        let admitted_transaction_envelope = self
+            .admitted_transaction_start_elapsed
+            .saturating_add(transaction_elapsed);
         CompletedTransactionTiming {
             acquisition_elapsed: self.acquisition_elapsed,
-            transaction_elapsed: transaction_ended_at
-                .saturating_duration_since(self.transaction_started_at),
+            write_admission_wait_elapsed: total_elapsed
+                .saturating_sub(self.acquisition_elapsed)
+                .saturating_sub(admitted_transaction_envelope),
+            transaction_elapsed,
         }
     }
 }
@@ -178,6 +193,7 @@ impl SuccessfulTransactionTiming {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompletedTransactionTiming {
     acquisition_elapsed: Duration,
+    write_admission_wait_elapsed: Duration,
     transaction_elapsed: Duration,
 }
 
@@ -356,23 +372,6 @@ impl SqliteTelemetry {
         .await
     }
 
-    pub(crate) fn finish_operation(&self, outcome: SqliteOutcome) {
-        self.record_observation(SqliteObservation {
-            completed_at_unix_micros: unix_now_micros(),
-            category: self.category,
-            access: self.access,
-            outcome,
-            latency: self.started_at.elapsed(),
-            pool_wait: Duration::ZERO,
-            writer_held: Duration::ZERO,
-            read_connection_time: Duration::ZERO,
-            retry_count: 0,
-            retry_backoff: Duration::ZERO,
-            writer_concurrency: 0,
-            read_concurrency: 0,
-        });
-    }
-
     fn finish_successful_transaction(
         &self,
         timing: CompletedTransactionTiming,
@@ -385,6 +384,7 @@ impl SqliteTelemetry {
             outcome: SqliteOutcome::Success,
             latency: self.started_at.elapsed(),
             pool_wait: timing.acquisition_elapsed,
+            write_admission_wait: timing.write_admission_wait_elapsed,
             writer_held: timing.transaction_elapsed,
             read_connection_time: Duration::ZERO,
             retry_count: 0,
@@ -403,7 +403,10 @@ impl SqliteTelemetry {
         operation: impl std::future::Future<Output = DbResult<T>>,
     ) -> DbResult<T> {
         let value = self.observe_db(phase, operation).await?;
-        self.finish_successful_transaction(timing.complete_at(Instant::now()), outcome);
+        self.finish_successful_transaction(
+            timing.complete_at(Instant::now(), self.started_at.elapsed()),
+            outcome,
+        );
         Ok(value)
     }
 
@@ -503,7 +506,29 @@ impl SqliteTelemetry {
                 "SQLite operation failed without a database result code"
             );
         }
-        self.finish_operation(classify_outcome(error));
+        self.record_observation(SqliteObservation {
+            completed_at_unix_micros: unix_now_micros(),
+            category: self.category,
+            access: self.access,
+            outcome: classify_outcome(error),
+            latency: self.started_at.elapsed(),
+            pool_wait: if phase == SqlitePhase::TransactionAcquisition {
+                phase_elapsed
+            } else {
+                Duration::ZERO
+            },
+            write_admission_wait: if phase == SqlitePhase::TransactionAcquisition {
+                Duration::ZERO
+            } else {
+                self.started_at.elapsed().saturating_sub(phase_elapsed)
+            },
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::ZERO,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: 0,
+        });
     }
 
     fn record_observation(&self, observation: SqliteObservation) {
@@ -702,7 +727,10 @@ mod tests {
             acquisition_started_at,
             transaction_started_at,
         )
-        .complete_at(transaction_started_at + Duration::from_millis(40));
+        .complete_at(
+            transaction_started_at + Duration::from_millis(40),
+            Duration::from_millis(160),
+        );
 
         assert_eq!(timing.acquisition_elapsed, Duration::from_millis(120));
         assert_eq!(timing.transaction_elapsed, Duration::from_millis(40));
@@ -719,6 +747,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: fast_acquisition,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: fast_transaction,
             }
             .slow_phase(),
@@ -727,6 +756,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: fast_transaction,
             }
             .slow_phase(),
@@ -735,6 +765,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: fast_acquisition,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: SLOW_TRANSACTION,
             }
             .slow_phase(),
@@ -743,6 +774,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: SLOW_TRANSACTION,
             }
             .slow_phase(),
@@ -759,6 +791,7 @@ mod tests {
                 .record_slow_success(
                     CompletedTransactionTiming {
                         acquisition_elapsed: fast_acquisition,
+                        write_admission_wait_elapsed: Duration::ZERO,
                         transaction_elapsed: fast_transaction,
                     },
                     SqliteTransactionOutcome::Committed,
@@ -780,6 +813,7 @@ mod tests {
                 .record_slow_success(
                     CompletedTransactionTiming {
                         acquisition_elapsed: Duration::from_millis(150),
+                        write_admission_wait_elapsed: Duration::ZERO,
                         transaction_elapsed: Duration::from_millis(300),
                     },
                     SqliteTransactionOutcome::RolledBack,

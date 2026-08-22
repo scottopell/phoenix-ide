@@ -311,9 +311,14 @@
   border-radius: 8px;
 }
 
-.about-sqlite-summary__card span {
+.about-sqlite-summary__card dt {
   color: var(--text-muted);
   font-size: 0.8rem;
+}
+
+.about-sqlite-summary__card dd {
+  margin: 0;
+  font-weight: 600;
 }
 
 .about-sqlite-tables {
