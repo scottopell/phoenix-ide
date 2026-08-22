@@ -321,7 +321,7 @@ rule ReadingOwnershipSurvivesDownwardGeometryChanges {
     when: DownwardMovement(policy, snapshot)
     requires: policy.lifecycle = live
     requires: policy.follow_mode = reading
-    requires: snapshot.at_bottom = false
+    requires: snapshot.in_pin_zone = false
     ensures: policy.follow_mode = reading
     ensures: policy.last_scroll_top = snapshot.scroll_top
     ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)

@@ -121,6 +121,8 @@ interface PhysicalStore<T> {
   activeTouchIds: Set<number>;
   /** Last touch activity (down or move) on this scroller. */
   lastGestureAtMs: number;
+  /** Whether the touches currently down have moved. */
+  gestureMoved: boolean;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
@@ -147,6 +149,32 @@ function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
   const now = Date.now();
   if (now - store.lastScrollAtMs < SCROLL_SETTLE_MS) return true;
   return store.activeTouchIds.size > 0 && now - store.lastGestureAtMs < GESTURE_STALE_MS;
+}
+
+/** A moved touch owns the viewport from the movement itself, before any
+ *  scroll event and while the position may still be within the pinned
+ *  epsilon. Tail-following must yield to it, or a measurement landing in
+ *  that window snaps a nascent drag back to the tail. */
+function gestureOwnsViewport<T>(store: PhysicalStore<T>): boolean {
+  return store.gestureMoved
+    && store.activeTouchIds.size > 0
+    && Date.now() - store.lastGestureAtMs < GESTURE_STALE_MS;
+}
+
+/** Whether a change should follow the tail rather than hold position. A
+ *  moved touch owns the viewport even while the physical layer still reads
+ *  as pinned. */
+function tailFollows<T>(store: PhysicalStore<T>): boolean {
+  return store.pinned && !gestureOwnsViewport(store);
+}
+
+/** Null selects tail-following; an anchor preserves the current position. */
+function anchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+  return tailFollows(store) ? null : (store.activeAnchor ?? captureTopAnchor(store));
+}
+
+function topAnchorForChange<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor | null {
+  return tailFollows(store) ? null : captureTopAnchor(store);
 }
 
 function clampNonNegative(value: number): number {
@@ -373,7 +401,8 @@ function updateMeasuredExtent<T>(store: PhysicalStore<T>, key: string, nextExten
 
 function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
-  if (store.scroller && (wasPinned || store.initialTailPending)) {
+  const followTail = wasPinned && !gestureOwnsViewport(store);
+  if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
   } else if (!store.initialTailPending) {
@@ -386,7 +415,7 @@ function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscri
 function handleResizeEntries<T>({ store, publish }: StorePublisher<T>, entries: ResizeObserverEntry[]): void {
   let physicalChanged = false;
   let viewportChanged = false;
-  const anchor = store.pinned ? null : (store.activeAnchor ?? captureTopAnchor(store));
+  const anchor = anchorForChange(store);
   const wasPinned = store.pinned;
 
   for (const entry of entries) {
@@ -479,6 +508,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     lastScrollAtMs: Number.NEGATIVE_INFINITY,
     activeTouchIds: new Set(),
     lastGestureAtMs: Number.NEGATIVE_INFINITY,
+    gestureMoved: false,
     pendingScrollDelta: null,
     pendingProgrammaticTop: null,
   };
@@ -524,7 +554,7 @@ function VirtualTranscriptInner<T>(
     store.estimatedExtent !== estimatedExtent ||
     store.overscan !== clampNonNegative(overscan)
   ) {
-    const anchor = store.pinned ? null : captureTopAnchor(store);
+    const anchor = topAnchorForChange(store);
     const wasPinned = store.pinned;
     store.items = items;
     store.getKey = getKey;
@@ -566,7 +596,7 @@ function VirtualTranscriptInner<T>(
       }
       if (!element) return;
       current.rowElements.set(key, element);
-      const anchor = current.pinned ? null : (current.activeAnchor ?? captureTopAnchor(current));
+      const anchor = anchorForChange(current);
       const wasPinned = current.pinned;
       const changed = updateMeasuredExtent(current, key, measureElementExtent(element));
       observeElement(current, publish, element);
@@ -604,7 +634,7 @@ function VirtualTranscriptInner<T>(
       unobserveElement(current, current.headerElement);
     }
     current.headerElement = element;
-    const anchor = current.pinned ? null : captureTopAnchor(current);
+    const anchor = topAnchorForChange(current);
     const wasPinned = current.pinned;
     const nextExtent = element ? measureElementExtent(element) : 0;
     const changed = current.headerExtent !== nextExtent;
@@ -627,6 +657,7 @@ function VirtualTranscriptInner<T>(
     detachTouchListenersRef.current?.();
     detachTouchListenersRef.current = null;
     current.activeTouchIds.clear();
+    current.gestureMoved = false;
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
@@ -655,7 +686,9 @@ function VirtualTranscriptInner<T>(
       };
       const onTouchMove = () => {
         const store = storeRef.current;
-        if (store) store.lastGestureAtMs = Date.now();
+        if (!store) return;
+        store.lastGestureAtMs = Date.now();
+        if (store.activeTouchIds.size > 0) store.gestureMoved = true;
       };
       const onTouchStop = (event: TouchEvent) => {
         const store = storeRef.current;
@@ -664,6 +697,7 @@ function VirtualTranscriptInner<T>(
           store.activeTouchIds.delete(touch.identifier);
         }
         pruneToLive(store, event);
+        if (store.activeTouchIds.size === 0) store.gestureMoved = false;
         store.lastGestureAtMs = Date.now();
       };
       element.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -694,7 +728,7 @@ function VirtualTranscriptInner<T>(
       current.preservedViewport = null;
       current.viewportTop = preserved.top;
     }
-    const anchor = prefixInserted || current.pinned ? null : captureTopAnchor(current);
+    const anchor = prefixInserted ? null : topAnchorForChange(current);
     const wasPinned = !prefixInserted && current.pinned;
     current.items = items;
     current.getKey = getKey;

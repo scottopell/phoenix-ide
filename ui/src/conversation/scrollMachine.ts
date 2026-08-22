@@ -398,9 +398,7 @@ export function reduceScrollMachine(
     case 'touchStarted': {
       if (!isReady(state)) return { state, effects: [] };
       const follow = state.kind === 'live' ? state.follow : FOLLOWING;
-      // An additional finger joins the interaction in progress rather than
-      // starting a new one: movement and arrival observed so far still
-      // describe it, and the pre-gesture mode is the one it began with.
+      // scroll_policy.allium AdditionalTouchExtendsGestureWithoutResettingEvidence
       const session: MeasuredSession = {
         conversationId: state.conversationId,
         geometry: state.geometry,

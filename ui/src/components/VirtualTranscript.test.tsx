@@ -537,6 +537,56 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it('does not tail-follow while a moved touch owns a still-pinned viewport', () => {
+    const ref = { current: null as VirtualTranscriptHandle | null };
+    let scroller: HTMLDivElement | null = null;
+
+    render(
+      <VirtualTranscript
+        ref={ref}
+        items={makeItems(30, 20)}
+        getKey={(item) => item.id}
+        estimatedExtent={20}
+        overscan={200}
+        initialTail
+        renderItem={renderRow}
+        scrollerRef={(element) => { scroller = element; }}
+      />,
+    );
+
+    const pinnedTop = scrollTopOf(scroller);
+    // The finger goes down at the tail and starts dragging. No scroll event
+    // has landed yet and the position is still inside the pinned epsilon, so
+    // the physical layer still considers itself pinned.
+    const row = document.querySelector<HTMLElement>('[data-virtual-key="item-29"]')!;
+    act(() => {
+      fireEvent.touchStart(row, { touches: [{ identifier: 3 }], changedTouches: [{ identifier: 3 }] });
+      fireEvent.touchMove(row, { touches: [{ identifier: 3 }] });
+    });
+
+    // A mounted row above the viewport grows in that window. Tail-following
+    // here would write scrollTop and snap the nascent drag to the bottom;
+    // holding the anchor absorbs the growth into the spacer instead.
+    const grown = document.querySelector<HTMLElement>('[data-virtual-key="item-16"]')!;
+    expect(grown).not.toBeNull();
+    act(() => resizeObservers[0]!.triggerEntries([[grown, 60]]));
+    expect(scrollTopOf(scroller)).toBe(pinnedTop);
+
+    // The growth left the viewport genuinely off the tail, so holding
+    // position stays correct until something returns it there. Once the
+    // gesture is over and the viewport is pinned again, tail-following
+    // resumes rather than being disabled for good.
+    act(() => {
+      fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 3 }] });
+    });
+    act(() => ref.current?.scrollToTail());
+    const repinnedTop = scrollTopOf(scroller);
+    const grownAgain = document.querySelector<HTMLElement>('[data-virtual-key="item-17"]')!;
+    expect(grownAgain).not.toBeNull();
+    act(() => resizeObservers[0]!.triggerEntries([[grownAgain, 60]]));
+    expect(scrollTopOf(scroller)).toBeGreaterThan(repinnedTop ?? 0);
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {
