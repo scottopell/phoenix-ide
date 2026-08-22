@@ -212,6 +212,60 @@ describe('scrollMachine durable follow policy', () => {
     expect(navigated.kind === 'live' && navigated.follow.kind === 'navigating' && navigated.follow.phase).toBe('user-returning');
   });
 
+  it('a second finger extends the gesture instead of discarding its arrival', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    // A second finger lands. The physical edge is already true, so no new
+    // callback will fire; restarting the gesture would lose the arrival for
+    // good and strand the unread chip.
+    state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
+    expect(state.kind === 'live' && state.gesture.kind === 'touch' && state.gesture.moved).toBe(true);
+
+    state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 1 }).state;
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'following');
+    expect(result.state.kind === 'live' && result.state.unread).toBe(false);
+  });
+
+  it('a navigation jump revokes arrival recorded by a gesture still in progress', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    // Navigation takes the viewport mid-gesture. Its own scroll is a
+    // programmatic echo that raises no upward intent, so this is the only
+    // place the stale arrival can be revoked.
+    state = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+    expectLiveMode(state, 'navigating');
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+    expect(effectTypes(result.effects)).not.toContain('clearUnread');
+  });
+
+  it('a pending navigation measurement leaves the physical edge unobserved', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      // 1000 - 550 - 400 = 50: inside the pin zone, but no pinned callback
+      // has been observed, so the edge must not be asserted from it.
+      snapshot: snap(1_000, 550, 400),
+      nowMs: 1_000,
+    });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.state.kind === 'live' && result.state.geometry.atBottom).toBe(false);
+
+    // Otherwise the first interaction would release navigation ownership.
+    const interacted = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expectLiveMode(interacted.state, 'navigating');
+  });
+
   it('downward movement in the pin zone during a moved touch defers to gesture end', () => {
     let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
     state = reduceScrollMachine(state, { type: 'touchMoved' }).state;

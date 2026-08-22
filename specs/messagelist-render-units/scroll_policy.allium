@@ -223,7 +223,7 @@ rule PendingNavigationMeasurementEntersLiveNavigation {
     ensures: policy.follow_mode = navigating
     ensures: policy.previous_total_height = total_height
     ensures: policy.navigation_pending = false
-    ensures: policy.at_bottom = snapshot.in_pin_zone
+    ensures: policy.at_bottom = false
     ensures: policy.navigation_phase = positioning
     ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
     ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
@@ -284,6 +284,17 @@ rule NavigationFromLiveTakesDurableOwnership {
     requires: policy.lifecycle = live
     ensures: policy.follow_mode = navigating
     ensures: policy.navigation_phase = positioning
+}
+
+-- Navigation takes the viewport, so an arrival recorded by a gesture still
+-- in progress no longer describes where that gesture will end. The jump's
+-- own scroll is a programmatic echo and raises no upward intent, so nothing
+-- else would revoke it.
+rule NavigationJumpRevokesTailArrival {
+    when: NavigationJumped(policy)
+    requires: policy.lifecycle in { mount_rescue, live }
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_arrived_at_tail = false
 }
 
 rule NavigationExitsMountRescueIntoReading {
@@ -351,10 +362,23 @@ rule UpwardIntentExitsMountRescueIntoReading {
 rule LiveTouchStartRemembersFollowMode {
     when: TouchStarted(policy)
     requires: policy.lifecycle = live
+    requires: policy.gesture_mode = idle
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = policy.follow_mode
     ensures: policy.gesture_arrived_at_tail = false
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
+}
+
+-- An additional finger extends the interaction already in progress. Movement
+-- and arrival observed so far still describe it, and the mode it began with
+-- is the one a stationary end restores; restarting the gesture would discard
+-- an arrival that no further callback would re-deliver.
+rule AdditionalTouchExtendsGestureWithoutResettingEvidence {
+    when: TouchStarted(policy)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_mode = policy.gesture_mode
+    ensures: policy.gesture_arrived_at_tail = policy.gesture_arrived_at_tail
+    ensures: policy.mode_before_gesture = policy.mode_before_gesture
 }
 
 rule MountTouchStartExitsRescueAndRemembersFollowing {

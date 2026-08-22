@@ -202,12 +202,8 @@ function requestTailReturn(
   };
 }
 
-// Confirms follow intent and clears unread. It deliberately does not touch
-// `geometry.atBottom`: that field is the physical pinned edge's, and this
-// runs for zone arrivals and gesture-end evidence that never crossed it.
-// Recording zone membership as the edge would leave a stale `true` that no
-// later false edge corrects, which a subsequent navigation would read as
-// permission to resume following (scroll_policy.allium).
+// Does not write geometry.atBottom — that field is the pinned callback's
+// (scroll_policy.allium, ScrollPolicy.at_bottom).
 function confirmTailReturn(
   state: ReadySession,
 ): Reduction {
@@ -327,7 +323,7 @@ export function reduceScrollMachine(
             kind: 'live',
             conversationId: event.conversationId,
             follow: { kind: 'navigating', phase: 'positioning' },
-            geometry: { ...geometryFrom(event.snapshot, event.totalHeight), atBottom: snapshotIsPinned(event.snapshot) },
+            geometry: { ...geometryFrom(event.snapshot, event.totalHeight), atBottom: false },
             gesture: IDLE,
             unread: false,
           },
@@ -402,16 +398,21 @@ export function reduceScrollMachine(
     case 'touchStarted': {
       if (!isReady(state)) return { state, effects: [] };
       const follow = state.kind === 'live' ? state.follow : FOLLOWING;
+      // An additional finger joins the interaction in progress rather than
+      // starting a new one: movement and arrival observed so far still
+      // describe it, and the pre-gesture mode is the one it began with.
       const session: MeasuredSession = {
         conversationId: state.conversationId,
         geometry: state.geometry,
-        gesture: {
-          kind: 'touch',
-          moved: false,
-          departedBottom: !state.geometry.atBottom,
-          arrivedAtTail: false,
-          modeBeforeGesture: follow,
-        },
+        gesture: state.gesture.kind === 'touch'
+          ? state.gesture
+          : {
+              kind: 'touch',
+              moved: false,
+              departedBottom: !state.geometry.atBottom,
+              arrivedAtTail: false,
+              modeBeforeGesture: follow,
+            },
         unread: state.unread,
       };
       return {
@@ -461,10 +462,17 @@ export function reduceScrollMachine(
       return takeUserOwnership(departed, event.snapshot);
     }
 
-    case 'navigationJumped':
+    case 'navigationJumped': {
       if (!isReady(state)) return { state: { ...state, navigationPending: true }, effects: [] };
-      if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode());
-      return { state: { ...state, follow: navigationMode() }, effects: [] };
+      // Navigation takes the viewport, so any arrival the gesture recorded no
+      // longer describes where it will end
+      // (scroll_policy.allium NavigationJumpRevokesTailArrival).
+      const owned: ReadySession = state.gesture.kind === 'touch' && state.gesture.arrivedAtTail
+        ? { ...state, gesture: { ...state.gesture, arrivedAtTail: false } }
+        : state;
+      if (owned.kind === 'mount-rescue') return exitMountRescue(owned, navigationMode());
+      return { state: { ...owned, follow: navigationMode() }, effects: [] };
+    }
 
     case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
