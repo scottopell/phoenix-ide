@@ -893,6 +893,9 @@ LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
 LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
+LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
+LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
+LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -9570,6 +9573,8 @@ def launchd_prod_deploy(
             "deployed_sha_path": str(PROD_SHA_PATH),
             "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
+            "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+            "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
@@ -9630,7 +9635,12 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Rollback failure: {deploy['rollback_failure']}")
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
-            if age.total_seconds() > 120:
+            stale_after = (
+                4 * LAUNCHD_TRANSITION_TIMEOUT_SECS
+                + 2 * LAUNCHD_HEALTH_TIMEOUT_SECS
+                + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
+            )
+            if age.total_seconds() > stale_after:
                 print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
     except Exception as exc:
         print(f"  Last deploy: unreadable status ({type(exc).__name__})")

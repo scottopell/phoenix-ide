@@ -4,8 +4,8 @@
 
 config {
     transition_timeout_seconds: Integer = 30
-    health_timeout_seconds: Integer = 30
-    stale_after_seconds: Integer = 120
+    health_timeout_seconds: Integer = 120
+    stale_after_seconds: Integer = 390
 }
 
 enum SourceKind { local_head | published_release }
