@@ -98,6 +98,8 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         }
 
         def probe(command, **_kwargs):
+            if command[0] == "rustup":
+                return (True, "rustc 1.95.0 (test)") if "rustc" in command else (True, "cargo 1.95.0")
             return versions.get(command[0], (True, "ok"))
 
         with (
@@ -117,6 +119,35 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         with mock.patch.object(self.dev.os, "execvpe") as execvpe:
             self.dev._ensure_taskmd_for_command("doctor")
         execvpe.assert_not_called()
+
+    def test_doctor_is_recognized_after_global_options(self):
+        self.assertEqual("doctor", self.dev._requested_command(["--pretty", "doctor"]))
+
+    def test_doctor_pnpm_probe_disables_corepack_network(self):
+        seen_environment = None
+
+        def probe(command, **kwargs):
+            nonlocal seen_environment
+            if command[0] == "pnpm":
+                seen_environment = kwargs["env"]
+            return True, {
+                "node": "v26.0.0",
+                "corepack": "0.35.0",
+                "pnpm": "11.0.8",
+                "rustup": "rustc 1.95.0 (test)" if "rustc" in command else "cargo 1.95.0",
+                "cargo": "cargo 1.95.0",
+            }.get(command[0], "ok")
+
+        with (
+            mock.patch.object(self.dev, "_doctor_version", side_effect=probe),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=Path("/chrome")),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(self.dev.os, "access", return_value=True),
+            mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/strip"),
+        ):
+            self.dev.collect_doctor_results()
+
+        self.assertEqual("0", seen_environment["COREPACK_ENABLE_NETWORK"])
 
     def test_doctor_fails_only_for_missing_required_prerequisites(self):
         results = [

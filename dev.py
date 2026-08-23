@@ -3690,8 +3690,11 @@ def _doctor_version(
 
 
 def collect_doctor_results() -> list[DoctorResult]:
-    node_environment = node_env()
+    node_environment = {**node_env(), "COREPACK_ENABLE_NETWORK": "0"}
     results: list[DoctorResult] = []
+
+    git_ok, git_version = _doctor_version(["git", "--version"])
+    results.append(DoctorResult("git", git_ok, git_version))
 
     node_ok, node_version = _doctor_version(["node", "--version"], env=node_environment)
     requested_node = (ROOT / ".node-version").read_text().strip().split(".")[0]
@@ -3738,18 +3741,33 @@ def collect_doctor_results() -> list[DoctorResult]:
     rust_ok = rust_ok and f"rustc {pinned_rust} " in f"{rust_version} "
     results.append(DoctorResult("rustc", rust_ok, f"{rust_version} (requires {pinned_rust})"))
 
+    ambient_cargo_ok, ambient_cargo = _doctor_version(
+        ["cargo", "--version"], env=rust_environment,
+    )
+    pinned_cargo_ok, pinned_cargo = _doctor_version(
+        ["rustup", "run", pinned_rust, "cargo", "--version"],
+        env=rust_environment,
+    )
+    cargo_ok = ambient_cargo_ok and pinned_cargo_ok and ambient_cargo == pinned_cargo
+    results.append(DoctorResult(
+        "cargo", cargo_ok,
+        ambient_cargo if cargo_ok else f"ambient {ambient_cargo}; pinned {pinned_cargo}",
+    ))
     for name, command in (
-        ("cargo", ["cargo", "--version"]),
-        ("rustfmt", ["cargo", "fmt", "--version"]),
-        ("clippy", ["cargo", "clippy", "--version"]),
+        ("rustfmt", ["rustup", "run", pinned_rust, "cargo", "fmt", "--version"]),
+        ("clippy", ["rustup", "run", pinned_rust, "cargo", "clippy", "--version"]),
     ):
         ok, detail = _doctor_version(command, env=rust_environment)
         results.append(DoctorResult(name, ok, detail))
 
     if platform.system() == "Linux":
-        ok, detail = _doctor_version(["musl-gcc", "--version"])
-        results.append(DoctorResult("musl-gcc", ok, detail))
-        target = "x86_64-unknown-linux-musl"
+        target = _linux_musl_target()
+        linker_env = f"CC_{target.replace('-', '_')}"
+        linker = os.environ.get(linker_env) or (
+            "aarch64-linux-musl-gcc" if target.startswith("aarch64-") else "musl-gcc"
+        )
+        ok, detail = _doctor_version([linker, "--version"])
+        results.append(DoctorResult("musl-linker", ok, f"{linker}: {detail}"))
         target_ok, _targets = _doctor_version(
             ["rustup", "target", "list", "--installed", "--toolchain", pinned_rust],
             env=rust_environment,
@@ -3773,13 +3791,13 @@ def collect_doctor_results() -> list[DoctorResult]:
         str(browser) if browser is not None else "not found",
     ))
 
-    for name, command in (
-        ("cargo-nextest", ["cargo", "nextest", "--version"]),
-        ("allium", ["allium", "--version"]),
-        ("ripgrep", ["rg", "--version"]),
-        ("ast-grep", ["ast-grep", "--version"]),
+    for name, command, environment in (
+        ("cargo-nextest", ["rustup", "run", pinned_rust, "cargo", "nextest", "--version"], rust_environment),
+        ("allium", ["allium", "--version"], None),
+        ("ripgrep", ["rg", "--version"], None),
+        ("ast-grep", ["ast-grep", "--version"], None),
     ):
-        ok, detail = _doctor_version(command)
+        ok, detail = _doctor_version(command, env=environment)
         results.append(DoctorResult(name, ok, detail, required=False))
 
     return results
@@ -9829,6 +9847,10 @@ def _bootstrap_rich() -> None:
     )
 
 
+def _requested_command(argv: list[str]) -> str | None:
+    return next((arg for arg in argv if not arg.startswith("-")), None)
+
+
 def _ensure_taskmd_for_command(command: str | None) -> None:
     if command == "doctor" or os.environ.get("PHOENIX_TASKMD_BOOTSTRAPPED") == "1":
         return
@@ -9849,7 +9871,8 @@ def _ensure_taskmd_for_command(command: str | None) -> None:
 
 
 def main():
-    _ensure_taskmd_for_command(sys.argv[1] if len(sys.argv) >= 2 else None)
+    requested_command = _requested_command(sys.argv[1:])
+    _ensure_taskmd_for_command(requested_command)
 
     # Verbatim passthrough commands are intercepted before argparse so their
     # flags (especially --help) reach the underlying CLI unchanged.
@@ -10093,13 +10116,14 @@ def main():
 
     # --pretty composes from the global flag and the per-subcommand flag.
     pretty = args.pretty_global or getattr(args, "pretty", False)
-    if pretty:
+    if pretty and args.command != "doctor":
         _bootstrap_rich()
 
     global _CHECK_PROFILE
     if args.command == "check" and getattr(args, "profile_work_dir", None):
         args.profile_work = True
-    _bootstrap_dev_tracing()
+    if args.command != "doctor":
+        _bootstrap_dev_tracing()
     if args.command == "check" and getattr(args, "profile_work", False):
         # Provider imports/initialization are outside the measured check interval.
         _init_dev_tracing()
@@ -10110,7 +10134,8 @@ def main():
         except ValueError as error:
             print(f"error: {error}", file=sys.stderr)
             sys.exit(2)
-    _start_dev_command_tracing(args.command)
+    if args.command != "doctor":
+        _start_dev_command_tracing(args.command)
     if _CHECK_PROFILE is not None and _DEV_TRACING is None:
         print(
             "  ⚠ CPU artifacts will be recorded, but dev tracing is unavailable; "
