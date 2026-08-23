@@ -3792,7 +3792,7 @@ def collect_doctor_results() -> list[DoctorResult]:
         ("ast-grep", ["ast-grep", "--version"], None),
     ):
         ok, detail = _doctor_version(command, env=environment)
-        results.append(DoctorResult(name, ok, detail))
+        results.append(DoctorResult(name, ok, detail, required=False))
 
     return results
 
