@@ -2831,7 +2831,9 @@ async fn insert_canonical_message_tx(
         crate::retrieval::fts_upsert_conn(
             &mut tx.tx,
             &message,
-            crate::retrieval::FtsObservation::ParentTransaction,
+            crate::retrieval::FtsObservation::ParentTransaction(
+                crate::sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+            ),
         )
         .await?;
         Ok(message)

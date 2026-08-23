@@ -21,6 +21,7 @@ pub(crate) enum SqliteOperation {
     FtsReconcileUpsert,
     FtsUpsert,
     UpdateMessageDisplayData,
+    WakePendingDeliveryMaterialization,
 }
 
 impl SqliteOperation {
@@ -32,6 +33,7 @@ impl SqliteOperation {
             Self::FtsReconcileUpsert => "fts.reconcile_upsert",
             Self::FtsUpsert => "fts.upsert",
             Self::UpdateMessageDisplayData => "message.update_display_data",
+            Self::WakePendingDeliveryMaterialization => "wake.pending_delivery_materialization",
         }
     }
 }
@@ -265,6 +267,31 @@ impl ProvenWaits {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ParentSqliteObserver<'a> {
+    Instrumented(&'a SqliteTelemetry),
+    UninstrumentedNested,
+}
+
+impl ParentSqliteObserver<'_> {
+    pub(crate) async fn observe<T>(
+        self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        match self {
+            Self::Instrumented(telemetry) => telemetry.observe_nested_sqlx(phase, operation).await,
+            Self::UninstrumentedNested => {
+                let result = operation.await;
+                if let Err(error) = &result {
+                    emit_uninstrumented_nested_failure(phase, error);
+                }
+                result
+            }
+        }
+    }
+}
+
 pub(crate) struct SqliteTelemetry {
     operation: SqliteOperation,
     category: SqliteWorkloadCategory,
@@ -342,6 +369,10 @@ impl SqliteTelemetry {
         }
     }
 
+    pub(crate) fn parent_observer(&self) -> ParentSqliteObserver<'_> {
+        ParentSqliteObserver::Instrumented(self)
+    }
+
     pub(crate) async fn observe_sqlx<T>(
         &self,
         phase: SqlitePhase,
@@ -359,6 +390,23 @@ impl SqliteTelemetry {
             }
             Err(error) => self.record_failure(phase, phase_started_at.elapsed(), error),
             Ok(_) => {}
+        }
+        result
+    }
+
+    pub(crate) async fn observe_nested_sqlx<T>(
+        &self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
+        let phase_started_at = Instant::now();
+        let result = operation.await;
+        if let Err(error) = &result {
+            self.record_sparse_failure(phase, phase_started_at.elapsed(), error);
         }
         result
     }
@@ -591,8 +639,30 @@ impl SqliteTelemetry {
         );
     }
 
+    fn record_sparse_failure(
+        &self,
+        phase: SqlitePhase,
+        phase_elapsed: Duration,
+        error: &sqlx::Error,
+    ) {
+        self.emit_failure(phase, phase_elapsed, error);
+    }
+
     fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
         self.lifecycle_completed.store(true, Ordering::Release);
+        self.emit_failure(phase, phase_elapsed, error);
+        self.record_typed_outcome(TypedOutcomeObservation {
+            category: self.category,
+            access: self.access,
+            latency: self.started_at.elapsed(),
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            outcome: classify_outcome(error),
+            waits: self.proven_waits().measurement(),
+        });
+    }
+
+    fn emit_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
         let codes = SqliteResultCodes::from_error(error);
@@ -649,15 +719,6 @@ impl SqliteTelemetry {
                 "SQLite operation failed without a database result code"
             );
         }
-        self.record_typed_outcome(TypedOutcomeObservation {
-            category: self.category,
-            access: self.access,
-            latency: self.started_at.elapsed(),
-            retry_count: 0,
-            retry_backoff: Duration::ZERO,
-            outcome: classify_outcome(error),
-            waits: self.proven_waits().measurement(),
-        });
     }
 
     fn proven_waits(&self) -> ProvenWaits {
@@ -719,6 +780,20 @@ fn classify_outcome(error: &sqlx::Error) -> SqliteOutcome {
         #[allow(unreachable_patterns)]
         _ => SqliteOutcome::OtherFailure,
     }
+}
+
+fn emit_uninstrumented_nested_failure(phase: SqlitePhase, error: &sqlx::Error) {
+    let codes = SqliteResultCodes::from_error(error);
+    tracing::error!(
+        target: "phoenix_db::observability",
+        db_system = "sqlite",
+        db_operation = "fts.uninstrumented_nested",
+        db_phase = phase.as_str(),
+        db_error_kind = sqlx_error_kind(error),
+        db_sqlite_primary_code = codes.map(|value| value.primary),
+        db_sqlite_extended_code = codes.map(|value| value.extended),
+        "nested SQLite operation failed under an uninstrumented parent transaction"
+    );
 }
 
 fn elapsed_millis(duration: Duration) -> u64 {

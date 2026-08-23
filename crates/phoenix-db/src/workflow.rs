@@ -492,7 +492,7 @@ pub(crate) struct WorkflowTx<'a> {
 }
 
 impl<'a> WorkflowTx<'a> {
-    fn new(tx: SqliteTx<'a>) -> Self {
+    pub(crate) fn new(tx: SqliteTx<'a>) -> Self {
         Self { tx }
     }
 

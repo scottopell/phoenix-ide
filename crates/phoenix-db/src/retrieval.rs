@@ -24,7 +24,9 @@ struct SourceSnapshotTestBarrier {
     release: tokio::sync::Notify,
 }
 
-use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use crate::sqlite_telemetry::{
+    ParentSqliteObserver, SqliteOperation, SqlitePhase, SqliteTelemetry,
+};
 use crate::sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -806,7 +808,7 @@ pub async fn fts_upsert(
 #[derive(Clone, Copy)]
 pub(crate) enum FtsObservation<'a> {
     Standalone(&'a SqliteTelemetry),
-    ParentTransaction,
+    ParentTransaction(ParentSqliteObserver<'a>),
 }
 
 impl FtsObservation<'_> {
@@ -817,7 +819,7 @@ impl FtsObservation<'_> {
     ) -> Result<T, sqlx::Error> {
         match self {
             Self::Standalone(telemetry) => telemetry.observe_sqlx(phase, operation).await,
-            Self::ParentTransaction => operation.await,
+            Self::ParentTransaction(observer) => observer.observe(phase, operation).await,
         }
     }
 }
@@ -1054,8 +1056,14 @@ pub async fn fts_reconcile_upsert(
 pub(crate) async fn fts_index_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id, FtsObservation::ParentTransaction).await?;
+    delete_message_rows(
+        tx,
+        &message.message_id,
+        FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
     let text = index_text(message);
     let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
         .bind(&text)
@@ -1066,7 +1074,7 @@ pub(crate) async fn fts_index_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(&text),
-        FtsObservation::ParentTransaction,
+        FtsObservation::ParentTransaction(observer),
     )
     .await
 }
@@ -1074,8 +1082,14 @@ pub(crate) async fn fts_index_message_tx(
 pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id, FtsObservation::ParentTransaction).await?;
+    delete_message_rows(
+        tx,
+        &message.message_id,
+        FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
     let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES ('')")
         .execute(&mut **tx)
         .await?;
@@ -1084,7 +1098,7 @@ pub(crate) async fn fts_hide_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(""),
-        FtsObservation::ParentTransaction,
+        FtsObservation::ParentTransaction(observer),
     )
     .await
 }

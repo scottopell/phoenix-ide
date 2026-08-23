@@ -7947,7 +7947,9 @@ impl Database {
                 retrieval::fts_upsert_conn(
                     &mut tx,
                     &updated_message,
-                    retrieval::FtsObservation::ParentTransaction,
+                    retrieval::FtsObservation::ParentTransaction(
+                        sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                    ),
                 )
                 .await?;
                 Some(
@@ -9169,7 +9171,9 @@ impl Database {
             retrieval::fts_upsert_conn(
                 &mut tx,
                 &updated_message,
-                retrieval::FtsObservation::ParentTransaction,
+                retrieval::FtsObservation::ParentTransaction(
+                    sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                ),
             )
             .await?;
         } else {
@@ -10517,9 +10521,11 @@ impl Database {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if hidden {
-                retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+                retrieval::fts_hide_message_tx(&mut tx, &message, telemetry.parent_observer())
+                    .await?;
             } else {
-                retrieval::fts_index_message_tx(&mut tx, &message).await?;
+                retrieval::fts_index_message_tx(&mut tx, &message, telemetry.parent_observer())
+                    .await?;
             }
             Ok::<_, DbError>(Some(transcript_generation))
         }
@@ -12045,6 +12051,7 @@ async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
 ) -> DbResult<()> {
+    let observer = sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested;
     let content_str = serde_json::to_string(&msg.content.to_stored_json())
         .map_err(|e| DbError::Serialization(e.to_string()))?;
     let display_str = msg
@@ -12098,7 +12105,12 @@ async fn insert_message_tx(
                 msg.message_id
             )));
         }
-        retrieval::fts_upsert_conn(tx, msg, retrieval::FtsObservation::ParentTransaction).await?;
+        retrieval::fts_upsert_conn(
+            tx,
+            msg,
+            retrieval::FtsObservation::ParentTransaction(observer),
+        )
+        .await?;
         return Ok(());
     }
     insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
@@ -12107,7 +12119,12 @@ async fn insert_message_tx(
     // same FTS coverage as `add_message_with_seq` — no message reaches a chain
     // unindexed before the startup reconcile (specs/conversation-retrieval/
     // REQ-RET-003).
-    retrieval::fts_upsert_conn(tx, msg, retrieval::FtsObservation::ParentTransaction).await?;
+    retrieval::fts_upsert_conn(
+        tx,
+        msg,
+        retrieval::FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
     Ok(())
 }
 
