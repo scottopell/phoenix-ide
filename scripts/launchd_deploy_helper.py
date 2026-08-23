@@ -78,7 +78,7 @@ class Manifest:
     claim_lock_path: str
     created_at: str
     transition_timeout_secs: float = 30.0
-    health_timeout_secs: float = 30.0
+    health_timeout_secs: float = 120.0
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -297,14 +297,21 @@ def wait_for_identity(
     health_url: Optional[str] = None,
     health_insecure_tls: Optional[bool] = None,
     health_json: bool = True,
+    monotonic: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    fetch: Optional[Callable[..., Identity]] = None,
 ) -> None:
-    deadline = time.monotonic() + manifest.health_timeout_secs
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
+    fetch = fetch or fetch_identity
+    started_at = monotonic()
+    deadline = started_at + manifest.health_timeout_secs
     url = health_url or manifest.health_url
     insecure_tls = manifest.health_insecure_tls if health_insecure_tls is None else health_insecure_tls
     last = "not responding"
-    while time.monotonic() < deadline:
+    while monotonic() < deadline:
         try:
-            actual = fetch_identity(
+            actual = fetch(
                 url,
                 insecure_tls=insecure_tls,
                 expected_git_sha=None if health_json else expected.git_sha,
@@ -313,10 +320,13 @@ def wait_for_identity(
             if actual == expected:
                 return
         except Exception as exc:
-            last = type(exc).__name__
-        time.sleep(0.2)
+            last = f"{type(exc).__name__}: {exc}"
+        sleep(0.2)
+    elapsed = monotonic() - started_at
     raise ActivationError(
-        f"exact health verification failed: expected version={expected.version} git_sha={expected.git_sha}; observed {last}"
+        "exact health verification failed after "
+        f"{elapsed:.1f}s (budget={manifest.health_timeout_secs:.1f}s, deadline={deadline:.3f} monotonic): "
+        f"expected version={expected.version} git_sha={expected.git_sha}; observed {last}"
     )
 
 

@@ -26,6 +26,17 @@ def load(path, name):
 helper = load(ROOT / "scripts" / "launchd_deploy_helper.py", "launchd_deploy_helper_test")
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.now += duration
+
+
 class FakeLaunchctl:
     events = []
     fail_start = False
@@ -607,6 +618,105 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual("http://localhost:9123/version", url)
         self.assertFalse(insecure)
 
+    def test_launchd_manifest_defaults_to_bounded_120_second_health_budget(self):
+        defaults = {
+            field.name: field.default
+            for field in helper.dataclasses.fields(helper.Manifest)
+        }
+        self.assertEqual(30.0, defaults["transition_timeout_secs"])
+        self.assertEqual(120.0, defaults["health_timeout_secs"])
+        self.assertEqual(
+            defaults["transition_timeout_secs"],
+            self.dev.LAUNCHD_TRANSITION_TIMEOUT_SECS,
+        )
+        self.assertEqual(
+            defaults["health_timeout_secs"],
+            self.dev.LAUNCHD_HEALTH_TIMEOUT_SECS,
+        )
+        self.assertEqual(
+            390.0,
+            4 * self.dev.LAUNCHD_TRANSITION_TIMEOUT_SECS
+            + 2 * self.dev.LAUNCHD_HEALTH_TIMEOUT_SECS
+            + self.dev.LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS,
+        )
+
+    def test_exact_identity_after_30_seconds_within_default_budget_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = helper.dataclasses.replace(
+                make_manifest(Path(td)),
+                health_timeout_secs=120.0,
+            )
+            clock = FakeClock()
+            observations = []
+
+            def fetch(_url, **_kwargs):
+                observations.append(clock.now)
+                if clock.now < 35.8:
+                    raise TimeoutError("HTTPS listener not ready")
+                return manifest.expected
+
+            helper.wait_for_identity(
+                manifest,
+                manifest.expected,
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                fetch=fetch,
+            )
+
+        self.assertGreater(clock.now, 30.0)
+        self.assertLess(clock.now, 120.0)
+        self.assertGreater(len(observations), 1)
+
+    def test_exact_identity_budget_expiry_reports_elapsed_deadline_and_last_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = helper.dataclasses.replace(
+                make_manifest(Path(td)),
+                health_timeout_secs=40.0,
+            )
+            clock = FakeClock()
+            fetch_times = []
+
+            def fetch(_url, **_kwargs):
+                fetch_times.append(clock.now)
+                raise TimeoutError("still starting")
+
+            with self.assertRaisesRegex(
+                helper.ActivationError,
+                r"after 40\.0s .*budget=40\.0s, deadline=40\.000 monotonic.*TimeoutError: still starting",
+            ):
+                helper.wait_for_identity(
+                    manifest,
+                    manifest.expected,
+                    monotonic=clock.monotonic,
+                    sleep=clock.sleep,
+                    fetch=fetch,
+                )
+
+        self.assertTrue(fetch_times)
+        self.assertTrue(all(observed < 40.0 for observed in fetch_times))
+        self.assertGreaterEqual(clock.now, 40.0)
+
+    def test_exact_identity_mismatch_never_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            manifest = helper.dataclasses.replace(
+                make_manifest(Path(td)),
+                health_timeout_secs=5.0,
+            )
+            clock = FakeClock()
+            wrong = helper.Identity(manifest.expected.version, "wrong-full-sha")
+
+            with self.assertRaisesRegex(
+                helper.ActivationError,
+                r"observed version=2\.0\.0 git_sha=wrong-full-sha",
+            ):
+                helper.wait_for_identity(
+                    manifest,
+                    manifest.expected,
+                    monotonic=clock.monotonic,
+                    sleep=clock.sleep,
+                    fetch=lambda _url, **_kwargs: wrong,
+                )
+
     def test_helper_normalizes_legacy_version_before_exact_rollback_comparison(self):
         class Response:
             def __enter__(self): return self
@@ -941,8 +1051,23 @@ class PreparationTests(unittest.TestCase):
         self.assertIn("unknown v1.2.3", rendered)
         self.assertNotIn("unreadable status", rendered)
 
+    def test_active_transaction_within_complete_activation_budget_is_not_stale(self):
+        active = (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=360)
+        ).isoformat()
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
+             mock.patch("builtins.print") as output:
+            self.dev.LAUNCHD_DEPLOY_STATUS_PATH.write_text(json.dumps({
+                "transaction_id": "tx", "state": "activating", "source_kind": "local_head",
+                "expected_version": "1.0.0", "expected_git_sha": "abc", "updated_at": active,
+            }))
+            self.dev._print_launchd_deploy_status()
+        self.assertFalse(any("STALE:" in str(call) for call in output.call_args_list))
+
     def test_preparing_transaction_reports_stale_recovery(self):
-        stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat()
+        stale = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=7)).isoformat()
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.object(self.dev, "LAUNCHD_DEPLOY_STATUS_PATH", Path(td) / "status.json"), \
              mock.patch("builtins.print") as output:
