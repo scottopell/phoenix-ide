@@ -196,6 +196,8 @@ export function WorkControlBar({
   const fallbackDockRef = useRef<HTMLDivElement>(null);
   const fallbackInfoButtonRef = useRef<HTMLButtonElement>(null);
   const fallbackMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const fallbackMenuRef = useRef<HTMLDivElement>(null);
+  const fallbackSelectorOriginRef = useRef(false);
   const fallbackWasVisibleRef = useRef(false);
   const fallbackOwnedFocusRef = useRef(false);
   const usesCompactLayout = useIsCompactLayout();
@@ -340,7 +342,7 @@ export function WorkControlBar({
       return;
     }
     if (fallbackPanel === 'menu' && fallbackMenuAction !== fallbackOverflowAction) {
-      const menuOwnedFocus = fallbackOwnedFocusRef.current;
+      const menuOwnedFocus = fallbackMenuRef.current?.contains(document.activeElement) ?? false;
       setFallbackPanel(null);
       if (menuOwnedFocus) {
         requestAnimationFrame(() => (fallbackMenuButtonRef.current ?? fallbackInfoButtonRef.current)?.focus());
@@ -360,14 +362,18 @@ export function WorkControlBar({
   }, [fallbackVisible]);
 
   useEffect(() => {
-    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection && fallbackOwnedFocusRef.current) {
+    const shouldTransferFocus = fallbackOwnedFocusRef.current || fallbackSelectorOriginRef.current;
+    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection && shouldTransferFocus) {
       requestAnimationFrame(() => {
         const activeChip = document.querySelector<HTMLElement>('.mobile-pr-chip--active');
         const firstChip = document.querySelector<HTMLElement>('.mobile-pr-chip');
         (activeChip ?? firstChip)?.focus();
       });
     }
-    if (!fallbackVisible) fallbackOwnedFocusRef.current = false;
+    if (!fallbackVisible) {
+      fallbackOwnedFocusRef.current = false;
+      fallbackSelectorOriginRef.current = false;
+    }
     fallbackWasVisibleRef.current = fallbackVisible;
   }, [canRepresentActiveSelection, fallbackVisible]);
 
@@ -600,10 +606,12 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                aria-label="Address feedback. Select the active PR first."
-                onClick={requestActivePrSelectorOpen}
+                onClick={() => {
+                  fallbackSelectorOriginRef.current = true;
+                  requestActivePrSelectorOpen();
+                }}
               >
-                Address feedback
+                Select active PR
               </button>
             ) : (
               <button
@@ -703,7 +711,7 @@ export function WorkControlBar({
           </div>
         )}
         {fallbackMenuIsOpen && fallbackHasOverflowActions && (
-          <div id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
+          <div ref={fallbackMenuRef} id="mobile-work-fallback-more-actions" className="mobile-work-fallback-menu" aria-label="More work actions">
             {disposition.showCleanUp && disposition.primary !== 'clean_up' && !cleanupBlockedByAmbiguity && (
               <button
                 type="button"

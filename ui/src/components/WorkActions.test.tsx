@@ -1972,7 +1972,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
   });
 
-  it('keeps Address feedback primary and requests PR selection when its target is unresolved', () => {
+  it('replaces Address feedback with PR selection recovery when its target is unresolved', () => {
     enableMobile();
     const handle = prStatusHandle({
       found: true,
@@ -2000,7 +2000,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Address feedback. Select the active PR first.' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
@@ -2226,7 +2226,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Address feedback. Select the active PR first.' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
     expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
   });
@@ -2261,7 +2261,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    expect(screen.queryByRole('button', { name: 'Address feedback. Select the active PR first.' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
     await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
   });
