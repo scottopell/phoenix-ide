@@ -342,6 +342,32 @@ describe('scrollMachine durable follow policy', () => {
     expectLiveMode(result.state, 'reading');
   });
 
+  it('an abandoned gesture keeps ownership and drops its evidence', () => {
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'downwardMovement', snapshot: snap(1_000, 450, 400) }).state;
+
+    // The lift is never observed, so there is no position to confirm from.
+    // Ownership stays where the movement put it and the evidence is dropped.
+    const abandoned = reduceScrollMachine(state, { type: 'gestureAbandoned' });
+    expectLiveMode(abandoned.state, 'reading');
+    expect(abandoned.state.kind === 'live' && abandoned.state.gesture.kind).toBe('idle');
+    expect(effectTypes(abandoned.effects)).toEqual([]);
+
+    // A later gesture that ends in the return zone without travelling of its
+    // own cannot borrow the abandoned one's.
+    let next: ScrollMachineState = reduceScrollMachine(abandoned.state, { type: 'touchStarted' }).state;
+    next = reduceScrollMachine(next, { type: 'touchMoved' }).state;
+    next = reduceScrollMachine(next, {
+      type: 'heightChanged',
+      totalHeight: 900,
+      unitCount: 5,
+      snapshot: snap(900, 450, 400),
+      tailActivity: 'none',
+    }).state;
+    expectLiveMode(reduceScrollMachine(next, { type: 'touchEnded', remainingTouches: 0 }).state, 'reading');
+  });
+
   it('a gesture that departs the tail and returns to it confirms on lift', () => {
     // The same start and end position as the case above; only the travel in
     // between distinguishes them, which is why the maximum is recorded.

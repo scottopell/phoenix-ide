@@ -128,6 +128,7 @@ surface ScrollPolicyAdapter {
         TouchMoved(policy)
         TouchEnded(policy, remaining_touches)
         TouchCancelled(policy, remaining_touches)
+        GestureAbandoned(policy)
         UpwardIntent(policy, snapshot)
         NavigationJumped(policy)
         TailContentAdvanced(policy)
@@ -143,6 +144,13 @@ surface ScrollPolicyEffectSink {
         effect.policy
         effect.kind
 }
+
+-- Snapshot predicate (black-box, pure over the event's snapshot):
+--   carries_geometry(snapshot) => the event arrived with a viewport
+--     measurement. Upward intent raised by a wheel notch or an arrow key has
+--     no scroll event behind it, and a height change can be reported before
+--     anything is measurable; those carry none, and the last measurement
+--     stands until one does.
 
 -- The neutral geometry channel: attachment, and the echoes of the executor's
 -- own position writes, which move the viewport without the reader moving it.
@@ -239,8 +247,17 @@ rule DownwardObservationRecordsTravelTowardTail {
 rule UpwardObservationPreservesTravelEvidence {
     when: UpwardIntent(policy, snapshot)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: carries_geometry(snapshot)
     ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
     ensures: policy.distance_from_tail = snapshot.distance_from_tail
+}
+
+rule UnmeasuredObservationPreservesGeometry {
+    when: UpwardIntent(policy, snapshot)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: not carries_geometry(snapshot)
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
+    ensures: policy.distance_from_tail = policy.distance_from_tail
 }
 
 -- A height change moves the tail, not the viewport. Crediting it would let
@@ -253,6 +270,7 @@ rule UpwardObservationPreservesTravelEvidence {
 rule LayoutObservationPreservesTravelEvidence {
     when: HeightChanged(policy, total_height, unit_count, snapshot, tail_activity)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: carries_geometry(snapshot)
     ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
     ensures: policy.distance_from_tail = snapshot.distance_from_tail
 }
@@ -562,6 +580,20 @@ rule MovedTouchCancellationOutsideReturnZoneKeepsOwnership {
     ensures: policy.follow_mode = reading
 }
 
+-- A gesture whose end event never arrives — the touch target unmounted
+-- mid-drag, so touchend was dispatched at a detached node — is discovered
+-- only when the next interaction begins. It cannot be resolved then: the
+-- position it ended at was never observed, and the current one describes a
+-- later moment. Ownership stands where the interaction left it, and only the
+-- evidence is dropped, so the next gesture starts with none of it.
+rule AbandonedGestureDiscardsEvidenceWithoutConfirming {
+    when: GestureAbandoned(policy)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_mode = idle
+    ensures: policy.travelled_toward_tail = false
+    ensures: policy.follow_mode = policy.follow_mode
+}
+
 rule TouchEndWithRemainingTouchesPreservesGesture {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches > 0
@@ -851,9 +883,13 @@ invariant MountRescueHasBoundedDeadline {
 -- moves the tail independently of the reader, so any bound over current
 -- geometry would oblige the evidence to follow content it must ignore.
 
+-- A moved touch always takes the viewport from the system, but navigation
+-- can take it from the reader mid-gesture and is released only by its own
+-- rules — so `navigating` outlives the movement that preceded it.
 invariant MovedTouchOwnsViewport {
     for policy in ScrollPolicy:
-        policy.gesture_mode = touch_moved implies policy.follow_mode = reading
+        policy.gesture_mode = touch_moved implies
+            policy.follow_mode in { reading, navigating }
 }
 
 invariant EffectsBelongToPolicy {

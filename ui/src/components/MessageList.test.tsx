@@ -3280,6 +3280,56 @@ describe('handleTotalListHeightChanged', () => {
     expect(grants.every((allowed) => allowed === false)).toBe(true);
   });
 
+  it('a replacement touch does not inherit evidence from a gesture whose lift was never seen', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-abandoned-gesture"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    // Reading well above the tail, with streamed growth showing the chip.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A touch drags toward the tail but stops well short of the return zone,
+    // so it earns travel evidence without earning a confirmation.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 500, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Its row is virtualized away and the finger lifts against a detached
+    // node, so no touchend is ever observed. Content then reflows shorter,
+    // leaving the viewport inside the return zone without the reader moving.
+    setupScroller(scroller, { scrollHeight: 950, scrollTop: 500, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(950));
+
+    // A fresh tap: down and up with no movement. The browser reports only the
+    // new finger, so the previous one is gone. Joining that stale interaction
+    // would let its travel confirm a return the reader never made.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 2 }], changedTouches: [{ identifier: 2 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 2 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

@@ -82,6 +82,9 @@ export type ScrollEvent =
   | { type: 'touchMoved' }
   | { type: 'touchEnded'; remainingTouches: number }
   | { type: 'touchCancelled'; remainingTouches: number }
+  // The interaction ended without its end event ever being observed; see
+  // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming.
+  | { type: 'gestureAbandoned' }
   | { type: 'upwardIntent'; snapshot?: ScrollSnapshot }
   | { type: 'downwardMovement'; snapshot: ScrollSnapshot }
   | { type: 'navigationJumped' }
@@ -481,6 +484,15 @@ export function reduceScrollMachine(
     case 'touchCancelled':
       if (!isReady(state)) return { state, effects: [] };
       return resolveTouch(state, event.remainingTouches);
+
+    case 'gestureAbandoned': {
+      if (!isReady(state) || state.gesture.kind !== 'touch') return { state, effects: [] };
+      // No lift was seen, so there is no position at which the gesture ended
+      // and nothing to confirm from. Ownership stands where the interaction
+      // left it: a moved touch already took it, and a stationary one never
+      // did. Only the evidence is dropped.
+      return { state: { ...state, gesture: IDLE }, effects: [] };
+    }
 
     case 'upwardIntent': {
       if (!isReady(state)) return { state, effects: [] };

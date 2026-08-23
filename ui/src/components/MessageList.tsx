@@ -920,6 +920,14 @@ function MessageListImpl({
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
         }
+        // Nothing this scroller owned is still down, so any gesture the policy
+        // still holds ended without its end event being seen — the detached
+        // touchend case. A new touch must not inherit its evidence, and the
+        // gesture cannot be resolved either: the position it ended at was
+        // never observed, and the current one belongs to a later moment.
+        if (scrollerTouchIdsRef.current.size === 0) {
+          dispatchScrollEvent({ type: 'gestureAbandoned' });
+        }
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }
