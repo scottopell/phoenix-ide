@@ -158,6 +158,17 @@ impl NativeStatementCallbackContext {
         }
     }
 
+    fn start_native_read(&mut self, statement_identity: usize, category: SqliteWorkloadCategory) {
+        if !self.active_read_tokens.is_empty() {
+            self.active_read_tokens.clear();
+            self.collector.record_classification_gap();
+        }
+        self.active_read_tokens.insert(
+            statement_identity,
+            self.collector.begin_native_read(category),
+        );
+    }
+
     fn finish_native_read(&mut self, statement_identity: usize) -> u32 {
         self.active_read_tokens
             .remove(&statement_identity)
@@ -191,7 +202,11 @@ impl NativeStatementCallbackContext {
     }
 
     fn note_statement_kind(&mut self, kind: StatementKind) {
-        if !self.prepare_pending {
+        let stale_domain_prepare = self.prepare_pending
+            && self.prepare_state.kind == StatementKind::Ordinary
+            && (self.prepare_state.category != SqliteWorkloadCategory::Other
+                || self.prepare_state.access.is_some());
+        if !self.prepare_pending || stale_domain_prepare {
             self.begin_prepare();
         }
         self.prepare_state.kind = kind;
@@ -575,14 +590,7 @@ unsafe extern "C" fn profile_callback(
             }
         });
         if access == SqliteAccessKind::Read {
-            let token = context.collector.begin_native_read(metadata.category);
-            if context
-                .active_read_tokens
-                .insert(statement_identity, token)
-                .is_some()
-            {
-                context.collector.record_classification_gap();
-            }
+            context.start_native_read(statement_identity, metadata.category);
         }
         return 0;
     }
@@ -1285,6 +1293,24 @@ mod tests {
     }
 
     #[test]
+    fn transaction_control_is_hard_boundary_after_unexecuted_domain_prepare() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::PrProjectData,
+            Some(SqliteAccessKind::Read),
+        );
+
+        context.note_statement_kind(StatementKind::TransactionControl);
+        let metadata = context.metadata_for_statement_run(8, 0, 0);
+
+        assert_eq!(metadata.category, SqliteWorkloadCategory::Other);
+        assert_eq!(metadata.access, None);
+        assert_eq!(metadata.kind, StatementKind::TransactionControl);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
     fn metadata_free_boundary_retires_prior_pending_prepare() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
@@ -1632,6 +1658,39 @@ mod tests {
         let after = report_now(&collector);
         assert_eq!(collector.active_native_reads_for_test(), 0);
         assert!(after.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[test]
+    fn repeated_stmt_without_profile_retires_stale_read_without_fabricating_concurrency() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+
+        context.start_native_read(7, SqliteWorkloadCategory::RuntimeState);
+        assert_eq!(collector.active_native_reads_for_test(), 1);
+        context.start_native_read(7, SqliteWorkloadCategory::RuntimeState);
+
+        assert_eq!(collector.active_native_reads_for_test(), 1);
+        assert_eq!(context.finish_native_read(7), 1);
+        assert_eq!(
+            report_now(&collector).totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::RuntimeState.index()]
+            .read_concurrency_peak,
+            1,
+        );
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn different_stmt_after_missing_profile_retires_ghost_and_stays_unobserved() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+
+        context.start_native_read(7, SqliteWorkloadCategory::RuntimeState);
+        context.start_native_read(9, SqliteWorkloadCategory::Fts);
+
+        assert_eq!(collector.active_native_reads_for_test(), 1);
+        assert_eq!(context.finish_native_read(9), 1);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
 
     #[test]

@@ -495,6 +495,18 @@ impl InnerCollector {
 struct ActiveNativeReads {
     next_identity: u64,
     categories_by_identity: HashMap<u64, SqliteWorkloadCategory>,
+    state_started_at_unix_micros: Option<u64>,
+}
+
+impl ActiveNativeReads {
+    fn current_state(&self) -> (u32, [bool; SqliteWorkloadCategory::ALL.len()]) {
+        let concurrency = u32::try_from(self.categories_by_identity.len()).unwrap_or(u32::MAX);
+        let mut categories = [false; SqliteWorkloadCategory::ALL.len()];
+        for category in self.categories_by_identity.values() {
+            categories[category.index()] = true;
+        }
+        (concurrency, categories)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -595,23 +607,23 @@ impl SqliteWorkloadCollector {
     }
 
     pub(crate) fn begin_native_read(&self, category: SqliteWorkloadCategory) -> NativeReadToken {
-        let (identity, concurrency, active_categories) = {
+        let now = self.clock.unix_now_micros();
+        let (identity, prior, concurrency, active_categories) = {
             let mut active = self
                 .active_native_reads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = active
+                .state_started_at_unix_micros
+                .map(|started_at| (started_at, active.current_state()));
             active.next_identity = active.next_identity.wrapping_add(1);
             let identity = active.next_identity;
             active.categories_by_identity.insert(identity, category);
-            let concurrency =
-                u32::try_from(active.categories_by_identity.len()).unwrap_or(u32::MAX);
-            let mut active_categories = [false; SqliteWorkloadCategory::ALL.len()];
-            for category in active.categories_by_identity.values() {
-                active_categories[category.index()] = true;
-            }
-            (identity, concurrency, active_categories)
+            active.state_started_at_unix_micros = Some(now);
+            let (concurrency, active_categories) = active.current_state();
+            (identity, prior, concurrency, active_categories)
         };
-        self.record_native_read_transition(concurrency, active_categories);
+        self.record_native_read_transition(now, prior, concurrency, active_categories);
         NativeReadToken {
             collector: self.clone(),
             identity,
@@ -621,35 +633,51 @@ impl SqliteWorkloadCollector {
     }
 
     fn end_native_read(&self, identity: u64) {
-        let (concurrency, active_categories) = {
+        let now = self.clock.unix_now_micros();
+        let (prior, concurrency, active_categories) = {
             let mut active = self
                 .active_native_reads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prior = active
+                .state_started_at_unix_micros
+                .map(|started_at| (started_at, active.current_state()));
             active.categories_by_identity.remove(&identity);
-            let concurrency =
-                u32::try_from(active.categories_by_identity.len()).unwrap_or(u32::MAX);
-            let mut active_categories = [false; SqliteWorkloadCategory::ALL.len()];
-            for category in active.categories_by_identity.values() {
-                active_categories[category.index()] = true;
-            }
-            (concurrency, active_categories)
+            active.state_started_at_unix_micros =
+                (!active.categories_by_identity.is_empty()).then_some(now);
+            let (concurrency, active_categories) = active.current_state();
+            (prior, concurrency, active_categories)
         };
-        self.record_native_read_transition(concurrency, active_categories);
+        self.record_native_read_transition(now, prior, concurrency, active_categories);
     }
 
     fn record_native_read_transition(
         &self,
+        now: u64,
+        prior: Option<(u64, (u32, [bool; SqliteWorkloadCategory::ALL.len()]))>,
         concurrency: u32,
         active_categories: [bool; SqliteWorkloadCategory::ALL.len()],
     ) {
-        let now = self.clock.unix_now_micros();
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bucket = inner.bucket_mut(minute_start(now));
         let read = SqliteAccessKind::Read.index();
+        if let Some((started_at, (prior_concurrency, prior_categories))) = prior {
+            let mut minute = minute_start(started_at);
+            while minute <= minute_start(now.saturating_sub(1)) {
+                let bucket = inner.bucket_mut(minute);
+                for category in SqliteWorkloadCategory::ALL {
+                    if prior_categories[category.index()] {
+                        let totals = &mut bucket.totals[read][category.index()];
+                        totals.read_concurrency_peak =
+                            totals.read_concurrency_peak.max(prior_concurrency);
+                    }
+                }
+                minute = minute.saturating_add(MICROS_PER_MINUTE);
+            }
+        }
+        let bucket = inner.bucket_mut(minute_start(now));
         for category in SqliteWorkloadCategory::ALL {
             if active_categories[category.index()] {
                 let totals = &mut bucket.totals[read][category.index()];
@@ -907,9 +935,6 @@ impl InnerCollector {
             InnerObservationCounting::BaselineStatement => {
                 totals.baseline_statement_count += 1;
                 totals.native_statement_latency_micros += duration_to_micros(observation.latency);
-                totals.read_concurrency_peak = totals
-                    .read_concurrency_peak
-                    .max(observation.read_concurrency);
                 bucket.native_statement_latency_histogram[access_index][category_index]
                     [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
             }
@@ -920,9 +945,6 @@ impl InnerCollector {
                 totals.writer_concurrency_peak = totals
                     .writer_concurrency_peak
                     .max(observation.writer_concurrency);
-                totals.read_concurrency_peak = totals
-                    .read_concurrency_peak
-                    .max(observation.read_concurrency);
                 bucket.outcomes[access_index][category_index][outcome.index()] += 1;
                 bucket.typed_attempt_latency_histogram[access_index][category_index]
                     [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
@@ -978,7 +1000,7 @@ impl InnerCollector {
             observation.read_connection_time,
             observation.access,
             observation.category,
-            observation.read_concurrency,
+            0,
             false,
         );
     }
@@ -1383,7 +1405,7 @@ mod tests {
                 (peak > 0).then_some((bucket.minute_start_unix_micros, peak))
             })
             .collect();
-        assert_eq!(peaks, vec![(2 * M, 2), (3 * M, 2)]);
+        assert!(peaks.is_empty());
     }
 
     #[test]
@@ -1473,6 +1495,49 @@ mod tests {
         assert_eq!(snapshot.covered_uptime_micros, 1);
         assert_eq!(snapshot.bucket_count, 1);
         assert_eq!(snapshot.buckets[0].minute_start_unix_micros, 100 * M,);
+    }
+
+    #[test]
+    fn read_transition_peak_does_not_leak_start_concurrency_across_minute_boundary() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let now = Arc::new(AtomicU64::new(M - 20));
+        let instant = Instant::now();
+        let collector = SqliteWorkloadCollector::with_test_clock(
+            {
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            },
+            move || instant,
+        );
+        let first = collector.begin_native_read(SqliteWorkloadCategory::RuntimeState);
+        now.store(M - 10, Ordering::SeqCst);
+        let second = collector.begin_native_read(SqliteWorkloadCategory::RuntimeState);
+        first.finish();
+        now.store(M + 10, Ordering::SeqCst);
+        collector.record_native_statement(NativeStatementObservation {
+            category: SqliteWorkloadCategory::RuntimeState,
+            access: SqliteAccessKind::Read,
+            statement_latency: Duration::from_micros(20),
+            read_connection_time: Duration::from_micros(20),
+            read_concurrency: second.concurrency(),
+        });
+        second.finish();
+
+        let inner = collector
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let read = SqliteAccessKind::Read.index();
+        let category = SqliteWorkloadCategory::RuntimeState.index();
+        assert_eq!(
+            inner.buckets[slot_for(0)].totals[read][category].read_concurrency_peak,
+            2,
+        );
+        assert_eq!(
+            inner.buckets[slot_for(M)].totals[read][category].read_concurrency_peak,
+            1,
+        );
     }
 
     #[test]

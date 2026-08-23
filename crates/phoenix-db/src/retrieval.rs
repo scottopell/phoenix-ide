@@ -1065,9 +1065,13 @@ pub(crate) async fn fts_index_message_tx(
     )
     .await?;
     let text = index_text(message);
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
-        .bind(&text)
-        .execute(&mut **tx)
+    let inserted = observer
+        .observe(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
+                .bind(&text)
+                .execute(&mut **tx),
+        )
         .await?;
     record_fts_row(
         tx,
@@ -1090,8 +1094,11 @@ pub(crate) async fn fts_hide_message_tx(
         FtsObservation::ParentTransaction(observer),
     )
     .await?;
-    let inserted = sqlx::query("INSERT INTO message_fts (text) VALUES ('')")
-        .execute(&mut **tx)
+    let inserted = observer
+        .observe(
+            SqlitePhase::FtsInsert,
+            sqlx::query("INSERT INTO message_fts (text) VALUES ('')").execute(&mut **tx),
+        )
         .await?;
     record_fts_row(
         tx,
@@ -1106,6 +1113,7 @@ pub(crate) async fn fts_hide_message_tx(
 pub(crate) async fn fts_delete_conversation_conn(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
     let rowids: Vec<i64> =
         sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
@@ -1113,14 +1121,22 @@ pub(crate) async fn fts_delete_conversation_conn(
             .fetch_all(&mut *conn)
             .await?;
     for rowid in rowids {
-        sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
-            .bind(rowid)
-            .execute(&mut *conn)
+        observer
+            .observe(
+                SqlitePhase::FtsRowDelete,
+                sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
+                    .bind(rowid)
+                    .execute(&mut *conn),
+            )
             .await?;
     }
-    sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
-        .bind(conversation_id)
-        .execute(&mut *conn)
+    observer
+        .observe(
+            SqlitePhase::LocatorDelete,
+            sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .execute(&mut *conn),
+        )
         .await?;
     Ok(())
 }

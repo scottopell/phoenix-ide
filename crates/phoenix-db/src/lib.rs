@@ -8639,7 +8639,12 @@ impl Database {
             if result.rows_affected() == 0 {
                 return Ok(false);
             }
-            retrieval::fts_delete_conversation_conn(&mut connection, id).await?;
+            retrieval::fts_delete_conversation_conn(
+                &mut connection,
+                id,
+                telemetry.parent_observer(),
+            )
+            .await?;
             Ok::<_, DbError>(true)
         }
         .await;

@@ -1543,6 +1543,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_owned_fts_insert_failure_emits_sparse_phase_and_one_parent_failure() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("display-fts-failure", "Display", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "display-fts-failure-message",
+            "display-fts-failure",
+            &MessageContent::tool("tool", "result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
+            .bind("display-fts-failure-message")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE message_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let before = message_persistence_outcomes(&db);
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        db.update_message_display_data(
+            "display-fts-failure-message",
+            &serde_json::json!({"hidden": false}),
+        )
+        .await
+        .unwrap_err();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("fts_insert")
+        );
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("message.update_display_data"),
+        );
+    }
+
+    #[tokio::test]
     async fn update_display_data_missing_rolls_back_with_one_failure_outcome() {
         let db = Database::open_in_memory().await.unwrap();
         let before = message_persistence_outcomes(&db);
