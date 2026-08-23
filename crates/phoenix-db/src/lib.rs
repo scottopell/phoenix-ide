@@ -42,9 +42,9 @@ pub use retrieval::{
 pub use schema::*;
 pub use sqlite_workload::{
     abandoned_count, approximate_percentiles_from_histogram, operation_count, BucketCategoryTotals,
-    SqliteAccessKind, SqliteLatencyBin, SqliteOutcome, SqlitePercentiles, SqliteSnapshotWindow,
-    SqliteWorkloadAggregateReport, SqliteWorkloadCategory, SqliteWorkloadCollector,
-    SqliteWorkloadSnapshot,
+    SampledSqliteWorkloadAggregateReport, SqliteAccessKind, SqliteLatencyBin, SqliteOutcome,
+    SqlitePercentiles, SqliteSnapshotWindow, SqliteWorkloadAggregateReport, SqliteWorkloadCategory,
+    SqliteWorkloadCollector, SqliteWorkloadSnapshot,
 };
 pub use workflow::*;
 
@@ -1381,6 +1381,14 @@ impl Database {
     ) -> SqliteWorkloadAggregateReport {
         self.sqlite_workload_collector
             .aggregate_report(window, now_unix_micros)
+    }
+
+    #[must_use]
+    pub fn sample_sqlite_workload_aggregate_report(
+        &self,
+        window: SqliteSnapshotWindow,
+    ) -> SampledSqliteWorkloadAggregateReport {
+        self.sqlite_workload_collector.aggregate_report_now(window)
     }
 
     fn sqlite_telemetry(

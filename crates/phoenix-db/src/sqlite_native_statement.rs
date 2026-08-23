@@ -27,6 +27,8 @@ pub(crate) struct NativeStatementCallbackContext {
     active_read_concurrency: u32,
     prepare_state: PrepareState,
     prepare_pending: bool,
+    prepare_boundary_seen: bool,
+    prepare_ambiguous: bool,
     statement_metadata: [CachedStatementMetadata; STATEMENT_CACHE_SIZE],
     writer_admitted_at: Option<Instant>,
     current_writer_category: SqliteWorkloadCategory,
@@ -69,6 +71,8 @@ impl NativeStatementCallbackContext {
             active_read_concurrency: 0,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
+            prepare_boundary_seen: false,
+            prepare_ambiguous: false,
             statement_metadata: [CachedStatementMetadata::EMPTY; STATEMENT_CACHE_SIZE],
             writer_admitted_at: None,
             current_writer_category: SqliteWorkloadCategory::Other,
@@ -87,6 +91,8 @@ impl NativeStatementCallbackContext {
             active_read_concurrency: 0,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
+            prepare_boundary_seen: false,
+            prepare_ambiguous: false,
             statement_metadata: [CachedStatementMetadata::EMPTY; STATEMENT_CACHE_SIZE],
             writer_admitted_at: None,
             current_writer_category: SqliteWorkloadCategory::Other,
@@ -98,12 +104,27 @@ impl NativeStatementCallbackContext {
         self.prepare_state = PrepareState::EMPTY;
     }
 
+    fn begin_prepare(&mut self) {
+        if self.prepare_pending {
+            self.collector.record_classification_gap();
+        }
+        self.reset_prepare_state();
+        self.prepare_pending = true;
+        self.prepare_boundary_seen = false;
+        self.prepare_ambiguous = false;
+    }
+
     fn note_prepare_metadata(
         &mut self,
         category: SqliteWorkloadCategory,
         access: Option<SqliteAccessKind>,
     ) {
-        self.prepare_pending = true;
+        if !self.prepare_pending {
+            self.begin_prepare();
+        } else if self.prepare_boundary_seen {
+            self.prepare_ambiguous = true;
+            self.prepare_boundary_seen = false;
+        }
         self.prepare_state.category = category_precedence(self.prepare_state.category, category);
         self.prepare_state.access = access_precedence(self.prepare_state.access, access);
     }
@@ -143,17 +164,56 @@ impl NativeStatementCallbackContext {
         (entry.statement_identity == statement_identity).then_some(entry)
     }
 
+    fn metadata_for_statement_run(
+        &mut self,
+        statement_identity: usize,
+        run_count: u32,
+    ) -> CachedStatementMetadata {
+        if run_count == 0 {
+            if self.prepare_pending {
+                return self.take_prepare_metadata_for_statement(statement_identity);
+            }
+            self.collector.record_classification_gap();
+            self.cache_statement_metadata(statement_identity, SqliteWorkloadCategory::Other, None);
+            return self
+                .lookup_statement_metadata(statement_identity)
+                .expect("metadata was just cached");
+        }
+        self.lookup_statement_metadata(statement_identity)
+            .unwrap_or_else(|| {
+                self.collector.record_classification_gap();
+                self.cache_statement_metadata(
+                    statement_identity,
+                    SqliteWorkloadCategory::Other,
+                    None,
+                );
+                self.lookup_statement_metadata(statement_identity)
+                    .expect("metadata was just cached")
+            })
+    }
+
     fn take_prepare_metadata_for_statement(
         &mut self,
         statement_identity: usize,
     ) -> CachedStatementMetadata {
-        let metadata = CachedStatementMetadata {
-            statement_identity,
-            category: self.prepare_state.category,
-            access: self.prepare_state.access,
+        let metadata = if self.prepare_ambiguous {
+            self.collector.record_classification_gap();
+            CachedStatementMetadata {
+                statement_identity,
+                category: SqliteWorkloadCategory::Other,
+                access: None,
+            }
+        } else {
+            CachedStatementMetadata {
+                statement_identity,
+                category: self.prepare_state.category,
+                access: self.prepare_state.access,
+            }
         };
         self.reset_prepare_state();
         self.prepare_pending = false;
+        self.prepare_boundary_seen = false;
+        self.prepare_ambiguous = false;
         self.cache_statement_metadata(statement_identity, metadata.category, metadata.access);
         metadata
     }
@@ -194,6 +254,10 @@ impl NativeStatementCallbackContext {
 
 impl Drop for NativeStatementCallbackContext {
     fn drop(&mut self) {
+        if self.writer_admitted_at.is_some() {
+            self.finish_writer_transaction();
+            self.collector.record_writer_occupancy_gap();
+        }
         #[cfg(test)]
         if let Some(counter) = &self.drop_counter {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -309,6 +373,7 @@ unsafe extern "C" fn authorizer_callback(
     }
     let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
     if action_code == ffi::SQLITE_SELECT {
+        context.prepare_boundary_seen = context.prepare_pending;
         return ffi::SQLITE_OK;
     }
     if let Some((category, access)) = classify_authorizer_action(action_code, arg1) {
@@ -331,13 +396,11 @@ unsafe extern "C" fn profile_callback(
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT {
-        let metadata = if context.prepare_pending {
-            context.take_prepare_metadata_for_statement(statement_identity)
-        } else {
-            context
-                .lookup_statement_metadata(statement_identity)
-                .unwrap_or_else(|| context.take_prepare_metadata_for_statement(statement_identity))
-        };
+        let run_count =
+            unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_RUN, 0) }
+                .max(0)
+                .cast_unsigned();
+        let metadata = context.metadata_for_statement_run(statement_identity, run_count);
         let access = metadata.access.unwrap_or({
             if readonly {
                 SqliteAccessKind::Read
@@ -399,8 +462,6 @@ unsafe extern "C" fn profile_callback(
         category,
         access,
         latency,
-        pool_wait: Duration::ZERO,
-        write_admission_wait: Duration::ZERO,
         writer_held: Duration::ZERO,
         read_connection_time,
         retry_count: 0,
@@ -831,6 +892,103 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_prepare_does_not_taint_unrelated_statement() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        sqlx::query("SELECT id, no_such_column FROM conversations")
+            .fetch_all(db.pool())
+            .await
+            .unwrap_err();
+        sqlx::query("SELECT canonical_path FROM projects WHERE id = 'failed-prepare-regression'")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+        let after =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        assert!(after.classification_gap_count > before.classification_gap_count);
+        let read = SqliteAccessKind::Read.index();
+        assert_eq!(
+            after.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
+            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 1
+        );
+        for category in SqliteWorkloadCategory::ALL {
+            if category != SqliteWorkloadCategory::Other {
+                assert_eq!(
+                    after.totals[read][category.index()].baseline_statement_count,
+                    before.totals[read][category.index()].baseline_statement_count
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_prepared_statements_do_not_reuse_stale_pointer_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let before =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let projects = connection
+            .prepare(sqlx::query::<sqlx::Sqlite>("SELECT COUNT(*) FROM projects").sql())
+            .await
+            .unwrap();
+        let conversations = connection
+            .prepare(sqlx::query::<sqlx::Sqlite>("SELECT COUNT(*) FROM conversations").sql())
+            .await
+            .unwrap();
+        projects.query().fetch_one(&mut *connection).await.unwrap();
+        conversations
+            .query()
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        projects.query().fetch_one(&mut *connection).await.unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let read = SqliteAccessKind::Read.index();
+        assert_eq!(
+            report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
+            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 3
+        );
+        for category in SqliteWorkloadCategory::ALL {
+            if category != SqliteWorkloadCategory::Other {
+                assert_eq!(
+                    report.totals[read][category.index()].baseline_statement_count,
+                    before.totals[read][category.index()].baseline_statement_count
+                );
+            }
+        }
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn nested_select_preserves_outer_higher_precedence_category() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        sqlx::query("SELECT p.id FROM projects p WHERE EXISTS (SELECT 1 FROM conversations c WHERE c.project_id = p.id)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let read = SqliteAccessKind::Read.index();
+        assert_eq!(
+            report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
+            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 1
+        );
+        for category in SqliteWorkloadCategory::ALL {
+            if category != SqliteWorkloadCategory::Other {
+                assert_eq!(
+                    report.totals[read][category.index()].baseline_statement_count,
+                    before.totals[read][category.index()].baseline_statement_count
+                );
+            }
+        }
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
     #[test]
     fn mixed_statement_uses_fts_precedence() {
         let collector = SqliteWorkloadCollector::new();
@@ -898,6 +1056,30 @@ mod tests {
         assert_eq!(metadata.category, SqliteWorkloadCategory::Fts);
         assert_eq!(metadata.access, Some(SqliteAccessKind::Read));
         assert_eq!(context.lookup_statement_metadata(8), Some(metadata));
+    }
+
+    #[test]
+    fn first_run_without_fresh_metadata_replaces_reused_pointer_with_other() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.cache_statement_metadata(8, SqliteWorkloadCategory::PrProjectData, None);
+
+        let metadata = context.metadata_for_statement_run(8, 0);
+        assert_eq!(metadata.category, SqliteWorkloadCategory::Other);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn superseded_pending_prepare_is_a_gap_and_new_metadata_isolated() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.note_prepare_metadata(SqliteWorkloadCategory::PrProjectData, None);
+        context.begin_prepare();
+        context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
+
+        let metadata = context.metadata_for_statement_run(16, 0);
+        assert_eq!(metadata.category, SqliteWorkloadCategory::Fts);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
 
     #[tokio::test]
@@ -981,8 +1163,6 @@ mod tests {
             category: SqliteWorkloadCategory::Other,
             access: SqliteAccessKind::Write,
             latency: Duration::from_millis(3),
-            pool_wait: Duration::from_millis(7),
-            write_admission_wait: Duration::from_millis(11),
             writer_held: Duration::ZERO,
             read_connection_time: Duration::ZERO,
             retry_count: 0,
@@ -1219,6 +1399,51 @@ mod tests {
         );
         assert!(totals.writer_held_micros > 0);
         assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn closing_connection_with_immediate_writer_reconciles_occupancy_and_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("close-writer.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('close','/tmp/close','main','2026-01-01T00:00:00Z')")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let totals = report.totals[SqliteAccessKind::Write.index()]
+            [SqliteWorkloadCategory::PrProjectData.index()];
+        assert!(totals.writer_held_micros > 0);
+        assert_eq!(totals.writer_concurrency_peak, 1);
+        assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[test]
+    fn dropping_context_reconciles_open_writer_occupancy_and_gap() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.writer_admitted_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
+        context.current_writer_category = SqliteWorkloadCategory::MessagePersistence;
+        drop(context);
+
+        let report = report_now(&collector);
+        let write = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::MessagePersistence.index();
+        assert!(report.totals[write][category].writer_held_micros > 0);
+        assert_eq!(report.totals[write][category].writer_concurrency_peak, 1);
+        assert_eq!(report.writer_occupancy_gap_count, 1);
     }
 
     #[tokio::test]

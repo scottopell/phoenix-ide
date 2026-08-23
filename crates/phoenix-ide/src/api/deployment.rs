@@ -229,9 +229,10 @@ pub struct SqliteWriterCategoryReport {
     pub label: String,
     pub operation_count: u64,
     pub writer_occupancy_percent: f64,
+    pub peak_concurrency: u32,
     pub latency: SqliteWaitSummary,
-    pub pool_wait: SqliteWaitSummary,
-    pub admission_wait: SqliteWaitSummary,
+    pub pool_wait: Option<SqliteWaitSummary>,
+    pub admission_wait: Option<SqliteWaitSummary>,
     pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
 }
@@ -246,8 +247,8 @@ pub struct SqliteReadCategoryReport {
     pub avg_duration_ms: Option<u64>,
     pub peak_concurrency: u32,
     pub latency: SqliteWaitSummary,
-    pub pool_wait: SqliteWaitSummary,
-    pub admission_wait: SqliteWaitSummary,
+    pub pool_wait: Option<SqliteWaitSummary>,
+    pub admission_wait: Option<SqliteWaitSummary>,
     pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
 }
@@ -629,11 +630,14 @@ fn sample_sqlite_workload_report(
 ) -> SqliteWorkloadReportResponse {
     use crate::db::{SqliteAccessKind, SqliteSnapshotWindow, SqliteWorkloadCategory};
 
-    let sampled_at = Utc::now();
-    let now_micros = sampled_at.timestamp_micros().max(0).cast_unsigned();
-    let report = state
+    let sampled = state
         .db
-        .sqlite_workload_aggregate_report(window.into(), now_micros);
+        .sample_sqlite_workload_aggregate_report(window.into());
+    let sampled_at = DateTime::<Utc>::from_timestamp_micros(
+        i64::try_from(sampled.sampled_at_unix_micros).unwrap_or(i64::MAX),
+    )
+    .unwrap_or_else(Utc::now);
+    let report = sampled.report;
     let covered_seconds = report.covered_uptime_micros / 1_000_000;
     let process_uptime_seconds = report.process_uptime_micros / 1_000_000;
     let requested_minutes = match report.requested_window {
@@ -646,9 +650,14 @@ fn sample_sqlite_workload_report(
         i64::try_from(report.process_started_at_unix_micros).unwrap_or(i64::MAX),
     )
     .unwrap_or(sampled_at);
+    let requested_window_micros =
+        u64::try_from(requested_minutes).unwrap_or_default() * 60 * 1_000_000;
     let coverage = SqliteWorkloadCoverage {
         bucket_count: covered,
-        fully_covered: !report.restart_truncated,
+        fully_covered: has_full_sqlite_coverage(
+            report.covered_uptime_micros,
+            requested_window_micros,
+        ),
         label: format!(
             "{} covered across {covered} bucket(s); requested {requested_minutes}m",
             format_uptime_seconds(covered_seconds)
@@ -673,15 +682,16 @@ fn sample_sqlite_workload_report(
                 label: sqlite_category_label(category).to_string(),
                 operation_count,
                 writer_occupancy_percent: utilization_percent,
+                peak_concurrency: totals.writer_concurrency_peak,
                 latency: wait_summary(
                     &report.latency_histogram[SqliteAccessKind::Write.index()][category.index()],
                     totals.latency_micros,
                 ),
-                pool_wait: wait_summary(
+                pool_wait: available_wait_summary(
                     &report.pool_wait_histogram[SqliteAccessKind::Write.index()][category.index()],
                     totals.pool_wait_micros,
                 ),
-                admission_wait: wait_summary(
+                admission_wait: available_wait_summary(
                     &report.write_admission_wait_histogram[SqliteAccessKind::Write.index()]
                         [category.index()],
                     totals.write_admission_wait_micros,
@@ -712,11 +722,11 @@ fn sample_sqlite_workload_report(
                     &report.latency_histogram[SqliteAccessKind::Read.index()][category.index()],
                     totals.latency_micros,
                 ),
-                pool_wait: wait_summary(
+                pool_wait: available_wait_summary(
                     &report.pool_wait_histogram[SqliteAccessKind::Read.index()][category.index()],
                     totals.pool_wait_micros,
                 ),
-                admission_wait: wait_summary(&[0; crate::db::SqliteLatencyBin::ALL.len()], 0),
+                admission_wait: None,
                 retries: retry_summary(totals.retry_count, totals.retry_backoff_micros),
                 failures: failure_summary(outcomes),
             }
@@ -737,6 +747,17 @@ fn sample_sqlite_workload_report(
         writer_categories,
         reads,
     }
+}
+
+fn has_full_sqlite_coverage(covered_uptime_micros: u64, requested_window_micros: u64) -> bool {
+    covered_uptime_micros == requested_window_micros
+}
+
+fn available_wait_summary(
+    histogram: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+    total_wait_micros: u64,
+) -> Option<SqliteWaitSummary> {
+    (histogram.iter().copied().sum::<u64>() > 0).then(|| wait_summary(histogram, total_wait_micros))
 }
 
 fn wait_summary(
@@ -1516,6 +1537,20 @@ mod tests {
         assert_eq!(summary.sample_count, 0);
         assert_eq!(summary.avg_ms, None);
         assert_eq!(summary.p50_upper_bound_ms, None);
+    }
+
+    #[test]
+    fn unaligned_sufficient_uptime_is_not_fully_covered() {
+        let requested = 60 * 60 * 1_000_000;
+        let covered = requested - 1;
+        assert!(!has_full_sqlite_coverage(covered, requested));
+        let label = format!(
+            "{} covered across {} bucket(s); requested {}m",
+            format_uptime_seconds(covered / 1_000_000),
+            60,
+            60
+        );
+        assert_eq!(label, "59m 59s covered across 60 bucket(s); requested 60m");
     }
 
     fn loc(path: PathBuf, mode: MeasureMode) -> DiskLocation {

@@ -162,6 +162,7 @@ function sqliteCategory(category: SqliteReportCategory, label: string) {
     label,
     operation_count: 0,
     writer_occupancy_percent: 0,
+    peak_concurrency: 0,
     latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     admission_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
@@ -216,11 +217,15 @@ function deferredReleaseSnapshot() {
   return { promise, resolve };
 }
 
-function renderPage(info: DeploymentInfo, disk: DeploymentDiskInfo = deploymentDisk()) {
+function renderPage(
+  info: DeploymentInfo,
+  disk: DeploymentDiskInfo = deploymentDisk(),
+  sqlite: SqliteWorkloadReportResponse = sqliteReport(),
+) {
   apiMock.deploymentInfo.mockResolvedValue(info);
   apiMock.deploymentDiskInfo.mockResolvedValue(disk);
   apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
-  apiMock.deploymentSqliteWorkload.mockResolvedValue(sqliteReport());
+  apiMock.deploymentSqliteWorkload.mockResolvedValue(sqlite);
   return render(
     <MemoryRouter>
       <AboutDeploymentPage />
@@ -371,6 +376,23 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     expect(await screen.findAllByText('No SQLite samples captured for this window yet.')).toHaveLength(2);
     expect(screen.getAllByText('Message persistence')).toHaveLength(2);
+  });
+
+  it('treats baseline-only SQLite reports as sampled', async () => {
+    renderPage(deployment(), deploymentDisk(), sqliteReport({
+      classification: { ...sqliteReport().classification, baseline_statement_count: 1 },
+    }));
+    await screen.findByRole('heading', { name: 'SQLite workload' });
+    expect(screen.queryAllByText('No SQLite samples captured for this window yet.')).toHaveLength(0);
+  });
+
+  it('labels alignment-shortened coverage without claiming the full window', async () => {
+    renderPage(deployment(), deploymentDisk(), sqliteReport({
+      restart_truncated: false,
+      coverage: { bucket_count: 59, fully_covered: false, label: '59m covered across 59 buckets; requested 60m' },
+    }));
+    expect(await screen.findByText('Alignment-shortened coverage')).toBeInTheDocument();
+    expect(screen.queryByText('Full requested uptime available')).not.toBeInTheDocument();
   });
 
   it('presents running identity, ownership, and remote access as separate primary facts', async () => {
@@ -755,6 +777,26 @@ describe('AboutDeploymentPage disk usage health', () => {
       await Promise.resolve();
     });
 
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it.each(['resolve', 'reject'] as const)('ignores deferred SQLite %s after unmount', async (outcome) => {
+    let resolveSqlite!: (value: SqliteWorkloadReportResponse) => void;
+    let rejectSqlite!: (reason: Error) => void;
+    apiMock.deploymentSqliteWorkload.mockImplementationOnce(() => new Promise((resolve, reject) => {
+      resolveSqlite = resolve;
+      rejectSqlite = reject;
+    }));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const view = renderPage(deployment());
+    expect(apiMock.deploymentSqliteWorkload).toHaveBeenCalledTimes(1);
+    view.unmount();
+    await act(async () => {
+      if (outcome === 'resolve') resolveSqlite(sqliteReport());
+      else rejectSqlite(new Error('late sqlite failure'));
+      await Promise.resolve();
+    });
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
