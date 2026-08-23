@@ -1,9 +1,7 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.12"
-# dependencies = [
-#   "taskmd>=1.0,<2",
-# ]
+# dependencies = []
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -697,8 +695,9 @@ def _node_env() -> dict:
     def node_matches(node_bin: Path) -> bool:
         try:
             import subprocess as _sp
-            ver_out = _sp.check_output([str(node_bin), "--version"],
-                                       text=True).strip()  # e.g. "v24.1.0"
+            ver_out = _sp.check_output(
+                [str(node_bin), "--version"], text=True, timeout=10,
+            ).strip()  # e.g. "v24.1.0"
             found_major = ver_out.lstrip("v").split(".")[0]
             # Accept the candidate if it meets or exceeds the requested major
             return int(found_major) >= int(major)
@@ -710,8 +709,10 @@ def _node_env() -> dict:
         try:
             import subprocess as _sp
             import re as _re
-            out = _sp.check_output(["corepack", "--version"], env={**env, "PATH": path},
-                                   text=True).strip()
+            out = _sp.check_output(
+                ["corepack", "--version"], env={**env, "PATH": path},
+                text=True, timeout=10,
+            ).strip()
             match = _re.search(r"(\d+)\.(\d+)", out)
             if not match:
                 return False
@@ -3662,21 +3663,30 @@ class DoctorResult:
     required: bool = True
 
 
-def _doctor_version(command: list[str], *, env: dict | None = None) -> tuple[bool, str]:
+def _doctor_version(
+    command: list[str], *, env: dict | None = None, cwd: Path | None = None,
+    required_line: str | None = None,
+) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
             env=env,
+            cwd=cwd,
             timeout=10,
             check=False,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-        return False, "not found" if isinstance(error, FileNotFoundError) else "timed out"
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except OSError as error:
+        return False, f"cannot execute: {error.strerror or error}"
     output = (completed.stdout or completed.stderr).strip().splitlines()
     detail = output[0] if output else f"exit {completed.returncode}"
-    return completed.returncode == 0, detail
+    ok = completed.returncode == 0
+    if required_line is not None:
+        ok = ok and required_line in output
+    return ok, detail
 
 
 def collect_doctor_results() -> list[DoctorResult]:
@@ -3707,7 +3717,9 @@ def collect_doctor_results() -> list[DoctorResult]:
         f"{corepack_version} (requires >= {'.'.join(map(str, _MIN_COREPACK))})",
     ))
 
-    pnpm_ok, pnpm_version = _doctor_version(["pnpm", "--version"], env=node_environment)
+    pnpm_ok, pnpm_version = _doctor_version(
+        ["pnpm", "--version"], env=node_environment, cwd=UI_DIR,
+    )
     pinned_pnpm = _read_pnpm_pin()
     pnpm_ok = pnpm_ok and pnpm_version == pinned_pnpm
     results.append(DoctorResult("pnpm", pnpm_ok, f"{pnpm_version} (requires {pinned_pnpm})"))
@@ -3718,7 +3730,11 @@ def collect_doctor_results() -> list[DoctorResult]:
         flags=re.MULTILINE,
     )
     pinned_rust = pinned_rust_match.group(1) if pinned_rust_match else "repository pin"
-    rust_ok, rust_version = _doctor_version(["rustc", "--version"])
+    rust_environment = {**os.environ, "RUSTUP_AUTO_INSTALL": "0"}
+    rust_ok, rust_version = _doctor_version(
+        ["rustup", "run", pinned_rust, "rustc", "--version"],
+        env=rust_environment,
+    )
     rust_ok = rust_ok and f"rustc {pinned_rust} " in f"{rust_version} "
     results.append(DoctorResult("rustc", rust_ok, f"{rust_version} (requires {pinned_rust})"))
 
@@ -3727,10 +3743,30 @@ def collect_doctor_results() -> list[DoctorResult]:
         ("rustfmt", ["cargo", "fmt", "--version"]),
         ("clippy", ["cargo", "clippy", "--version"]),
     ):
-        ok, detail = _doctor_version(command)
+        ok, detail = _doctor_version(command, env=rust_environment)
         results.append(DoctorResult(name, ok, detail))
 
-    browser = _find_chromium_binary()
+    if platform.system() == "Linux":
+        ok, detail = _doctor_version(["musl-gcc", "--version"])
+        results.append(DoctorResult("musl-gcc", ok, detail))
+        target = "x86_64-unknown-linux-musl"
+        target_ok, _targets = _doctor_version(
+            ["rustup", "target", "list", "--installed", "--toolchain", pinned_rust],
+            env=rust_environment,
+            required_line=target,
+        )
+        results.append(DoctorResult(
+            "rust-musl-target", target_ok,
+            f"{target} installed" if target_ok else f"{target} not installed",
+        ))
+
+    strip_path = shutil.which("strip")
+    results.append(DoctorResult("strip", strip_path is not None, strip_path or "not found"))
+
+    configured_browser = os.environ.get("PHOENIX_CHROME_EXECUTABLE")
+    browser = Path(configured_browser).expanduser() if configured_browser else _find_chromium_binary()
+    if browser is not None and not (browser.is_file() and os.access(browser, os.X_OK)):
+        browser = None
     results.append(DoctorResult(
         "chrome",
         browser is not None,
@@ -9793,7 +9829,28 @@ def _bootstrap_rich() -> None:
     )
 
 
+def _ensure_taskmd_for_command(command: str | None) -> None:
+    if command == "doctor" or os.environ.get("PHOENIX_TASKMD_BOOTSTRAPPED") == "1":
+        return
+    try:
+        import taskmd  # noqa: F401
+        return
+    except ImportError:
+        pass
+    env = {**os.environ, "PHOENIX_TASKMD_BOOTSTRAPPED": "1"}
+    os.execvpe(
+        "uv",
+        [
+            "uv", "run", "--with", "taskmd>=1.0,<2",
+            str(Path(__file__).resolve()), *sys.argv[1:],
+        ],
+        env,
+    )
+
+
 def main():
+    _ensure_taskmd_for_command(sys.argv[1] if len(sys.argv) >= 2 else None)
+
     # Verbatim passthrough commands are intercepted before argparse so their
     # flags (especially --help) reach the underlying CLI unchanged.
     if len(sys.argv) >= 2 and sys.argv[1] == "taskmd":
