@@ -537,7 +537,7 @@ describe('VirtualTranscript', () => {
     }
   });
 
-  it('does not tail-follow while a moved touch owns a still-pinned viewport', () => {
+  it('does not tail-follow while the policy withholds the intent from a still-pinned viewport', () => {
     const ref = { current: null as VirtualTranscriptHandle | null };
     let scroller: HTMLDivElement | null = null;
 
@@ -557,11 +557,14 @@ describe('VirtualTranscript', () => {
     const pinnedTop = scrollTopOf(scroller);
     // The finger goes down at the tail and starts dragging. No scroll event
     // has landed yet and the position is still inside the pinned epsilon, so
-    // the physical layer still considers itself pinned.
+    // the physical layer still considers itself pinned. The policy is what
+    // notices the moved touch and withdraws the tail-follow grant; the
+    // physical layer never infers that from its own geometry.
     const row = document.querySelector<HTMLElement>('[data-virtual-key="item-29"]')!;
     act(() => {
       fireEvent.touchStart(row, { touches: [{ identifier: 3 }], changedTouches: [{ identifier: 3 }] });
       fireEvent.touchMove(row, { touches: [{ identifier: 3 }] });
+      ref.current?.setTailFollowAllowed(false);
     });
 
     // A mounted row above the viewport grows in that window. Tail-following
@@ -574,10 +577,11 @@ describe('VirtualTranscript', () => {
 
     // The growth left the viewport genuinely off the tail, so holding
     // position stays correct until something returns it there. Once the
-    // gesture is over and the viewport is pinned again, tail-following
-    // resumes rather than being disabled for good.
+    // policy restores the grant and the viewport is pinned again,
+    // tail-following resumes rather than being disabled for good.
     act(() => {
       fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 3 }] });
+      ref.current?.setTailFollowAllowed(true);
     });
     act(() => ref.current?.scrollToTail());
     const repinnedTop = scrollTopOf(scroller);

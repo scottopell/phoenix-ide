@@ -398,19 +398,22 @@ AND a bottom callback received during that moved touch SHALL NOT release
 user ownership while the gesture is active
 AND SHALL be retained as evidence that the gesture reached the tail
 
-WHEN a gesture ends or is cancelled
-THE SYSTEM SHALL confirm the tail return if the gesture reached the tail
-at any point — by the pinned callback or by downward movement into the
-pin-to-bottom threshold — and SHALL otherwise preserve user ownership
+WHEN a gesture ends or is cancelled inside the pin-to-bottom threshold,
+having been farther from the tail at some point during that gesture
+THE SYSTEM SHALL confirm the tail return
+AND SHALL otherwise preserve user ownership
 SO THAT a confirmation blocked mid-gesture is honoured at the lift rather
-than lost with the callback that produced it, while a deliberate drag
-that stops short of the tail keeps the viewport
+than lost with the callback that produced it, while a drag that stops short
+of the tail — or one that never moved the viewport at all, which iOS
+produces whenever touch movement outruns scroll events — keeps the viewport
 
-WHEN upward movement occurs during a gesture, or tail growth carries the
-tail beyond the pin-to-bottom threshold from a gesture that had reached it
-THE SYSTEM SHALL discard that arrival evidence
-SO THAT a stale arrival cannot confirm a return to a tail the viewport no
-longer rests at
+THE SYSTEM SHALL derive that condition at the lift from the distance the
+viewport travelled, recording only the greatest distance from the tail
+reached during the gesture
+AND SHALL NOT maintain revocable evidence of having arrived
+SO THAT no event is responsible for invalidating state it did not create:
+the recorded maximum only grows within a gesture, and an update missed
+anywhere can withhold a confirmation but never manufacture one
 
 WHEN scroll movement is classified as upward or downward intent
 THE SYSTEM SHALL clamp the observed scroll position into the scrollable

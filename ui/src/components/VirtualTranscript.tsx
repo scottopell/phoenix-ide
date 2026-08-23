@@ -49,6 +49,9 @@ export interface VirtualTranscriptHandle {
     targetSelector?: string,
   ): void;
   scrollToTail(): void;
+  /** Grant or withdraw tail-following. The scroll policy owns this intent;
+   *  the physical layer only executes it when the viewport is at the tail. */
+  setTailFollowAllowed(allowed: boolean): void;
   /** Whether a scroll event at this scrollTop is the echo of a write this
    *  component made (anchor compensation, drift reconcile, tail snap) rather
    *  than user movement. */
@@ -121,8 +124,11 @@ interface PhysicalStore<T> {
   activeTouchIds: Set<number>;
   /** Last touch activity (down or move) on this scroller. */
   lastGestureAtMs: number;
-  /** Whether the touches currently down have moved. */
-  gestureMoved: boolean;
+  /** Whether the scroll policy currently grants tail-following. The physical
+   *  layer does not infer this: `pinned` describes where the viewport is, not
+   *  who owns it, and the two disagree whenever a reader is holding a
+   *  position that happens to still be at the tail. */
+  tailFollowAllowed: boolean;
   /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
    *  effect so the spacer change and the scrollTop write land in one paint. */
   pendingScrollDelta: number | null;
@@ -151,21 +157,10 @@ function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
   return store.activeTouchIds.size > 0 && now - store.lastGestureAtMs < GESTURE_STALE_MS;
 }
 
-/** A moved touch owns the viewport from the movement itself, before any
- *  scroll event and while the position may still be within the pinned
- *  epsilon. Tail-following must yield to it, or a measurement landing in
- *  that window snaps a nascent drag back to the tail. */
-function gestureOwnsViewport<T>(store: PhysicalStore<T>): boolean {
-  return store.gestureMoved
-    && store.activeTouchIds.size > 0
-    && Date.now() - store.lastGestureAtMs < GESTURE_STALE_MS;
-}
-
-/** Whether a change should follow the tail rather than hold position. A
- *  moved touch owns the viewport even while the physical layer still reads
- *  as pinned. */
+/** Whether a change should follow the tail rather than hold position: the
+ *  viewport is at the tail and the policy still owns it. */
 function tailFollows<T>(store: PhysicalStore<T>): boolean {
-  return store.pinned && !gestureOwnsViewport(store);
+  return store.pinned && store.tailFollowAllowed;
 }
 
 /** Null selects tail-following; an anchor preserves the current position. */
@@ -401,7 +396,7 @@ function updateMeasuredExtent<T>(store: PhysicalStore<T>, key: string, nextExten
 
 function applyPhysicalChange<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null, wasPinned: boolean): void {
   store.layout = buildStoreLayout(store);
-  const followTail = wasPinned && !gestureOwnsViewport(store);
+  const followTail = wasPinned && store.tailFollowAllowed;
   if (store.scroller && (followTail || store.initialTailPending)) {
     store.initialTailPending = false;
     setScrollerScrollTop(store, totalPhysicalExtent(store));
@@ -508,7 +503,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     lastScrollAtMs: Number.NEGATIVE_INFINITY,
     activeTouchIds: new Set(),
     lastGestureAtMs: Number.NEGATIVE_INFINITY,
-    gestureMoved: false,
+    tailFollowAllowed: true,
     pendingScrollDelta: null,
     pendingProgrammaticTop: null,
   };
@@ -657,7 +652,7 @@ function VirtualTranscriptInner<T>(
     detachTouchListenersRef.current?.();
     detachTouchListenersRef.current = null;
     current.activeTouchIds.clear();
-    current.gestureMoved = false;
+
     current.scroller = element;
     if (element) {
       current.viewportTop = element.scrollTop;
@@ -688,7 +683,6 @@ function VirtualTranscriptInner<T>(
         const store = storeRef.current;
         if (!store) return;
         store.lastGestureAtMs = Date.now();
-        if (store.activeTouchIds.size > 0) store.gestureMoved = true;
       };
       const onTouchStop = (event: TouchEvent) => {
         const store = storeRef.current;
@@ -697,7 +691,6 @@ function VirtualTranscriptInner<T>(
           store.activeTouchIds.delete(touch.identifier);
         }
         pruneToLive(store, event);
-        if (store.activeTouchIds.size === 0) store.gestureMoved = false;
         store.lastGestureAtMs = Date.now();
       };
       element.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -808,6 +801,10 @@ function VirtualTranscriptInner<T>(
       setScrollerScrollTop(current, totalPhysicalExtent(current));
       recompute(current);
       publish();
+    },
+    setTailFollowAllowed(allowed) {
+      const current = storeRef.current;
+      if (current) current.tailFollowAllowed = allowed;
     },
     isProgrammaticScroll(scrollTop) {
       const current = storeRef.current;

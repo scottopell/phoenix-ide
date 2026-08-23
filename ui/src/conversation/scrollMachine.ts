@@ -22,7 +22,12 @@ export type Gesture =
       kind: 'touch';
       moved: boolean;
       departedBottom: boolean;
-      arrivedAtTail: boolean;
+      /** Farthest the viewport has been from the tail during this
+       *  interaction. Monotone: it only ever grows, so there is no revocation
+       *  to forget and a missed update can only withhold a confirmation,
+       *  never manufacture one. Ending nearer the tail than this maximum is
+       *  what makes an arrival distinguishable from never having moved. */
+      maxDistanceFromTail: number;
       modeBeforeGesture: FollowMode;
     };
 
@@ -116,6 +121,15 @@ export function snapshotIsPinned(snapshot: ScrollSnapshot): boolean {
   return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD;
 }
 
+/** Distance from the tail, preferring the direct measurement each event
+ *  carries over the pinned callback: a snapshot cannot go stale waiting for
+ *  an edge that is never delivered. */
+function distanceFromTail(geometry: ScrollGeometry): number {
+  const snapshot = geometry.lastSnapshot;
+  if (!snapshot) return geometry.atBottom ? 0 : Number.POSITIVE_INFINITY;
+  return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight;
+}
+
 function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): ScrollGeometry {
   return {
     atBottom: true,
@@ -123,6 +137,25 @@ function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): Scr
     previousTotalHeight: totalHeight,
     previousScrollHeight: snapshot?.scrollHeight ?? 0,
     previousClientHeight: snapshot?.clientHeight ?? 0,
+  };
+}
+
+function observe(
+  state: ReadySession,
+  snapshot: ScrollSnapshot | null,
+  totalHeight?: number,
+): ReadySession {
+  const geometry = totalHeight === undefined
+    ? updateGeometry(state.geometry, snapshot)
+    : updateGeometry(state.geometry, snapshot, totalHeight);
+  if (state.gesture.kind !== 'touch') return { ...state, geometry };
+  return {
+    ...state,
+    geometry,
+    gesture: {
+      ...state.gesture,
+      maxDistanceFromTail: Math.max(state.gesture.maxDistanceFromTail, distanceFromTail(geometry)),
+    },
   };
 }
 
@@ -180,11 +213,12 @@ function takeUserOwnership(
   state: ReadySession,
   snapshot?: ScrollSnapshot,
 ): Reduction {
+  const observed = snapshot ? observe(state, snapshot) : state;
   const session: MeasuredSession = {
-    conversationId: state.conversationId,
-    geometry: snapshot ? updateGeometry(state.geometry, snapshot) : state.geometry,
-    gesture: state.gesture,
-    unread: state.unread,
+    conversationId: observed.conversationId,
+    geometry: observed.geometry,
+    gesture: observed.gesture,
+    unread: observed.unread,
   };
   return {
     state: liveFrom(session, READING),
@@ -256,15 +290,28 @@ function resolveTouch(
   if (state.gesture.kind !== 'touch' || remainingTouches > 0) {
     return { state, effects: [] };
   }
-  const follow = state.gesture.moved ? READING : state.gesture.modeBeforeGesture;
+  // Navigation ownership is released by its own rules, never by a gesture
+  // ending (scroll_policy.allium NavigationOwnershipSurvivesGestureEnd).
+  const navigating = state.kind === 'live' && state.follow.kind === 'navigating';
+  const follow = navigating
+    ? state.follow
+    : state.gesture.moved ? READING : state.gesture.modeBeforeGesture;
   const session: MeasuredSession = {
     conversationId: state.conversationId,
     geometry: state.geometry,
     gesture: IDLE,
     unread: state.unread,
   };
-  // Gesture-end tail confirmation: scroll_policy.allium GestureEndAfterTailArrivalConfirmsTailReturn
-  if (follow.kind === 'reading' && state.gesture.arrivedAtTail) {
+  // A gesture that ends inside the return zone having travelled toward the
+  // tail is an arrival; one that ends there having travelled away from it is
+  // a reader who stopped short (scroll_policy.allium
+  // GestureEndTowardTailConfirmsTailReturn).
+  const endDistance = distanceFromTail(state.geometry);
+  if (
+    follow.kind === 'reading'
+    && endDistance <= PIN_TO_BOTTOM_THRESHOLD
+    && endDistance < state.gesture.maxDistanceFromTail
+  ) {
     return confirmTailReturn({ ...session, kind: 'live', follow });
   }
   return { state: liveFrom(session, follow), effects: [] };
@@ -352,17 +399,15 @@ export function reduceScrollMachine(
     case 'scrollerAttached':
       if (!isReady(state)) return { state, effects: [] };
       return {
-        state: { ...state, geometry: updateGeometry(state.geometry, event.snapshot) },
+        state: observe(state, event.snapshot),
         effects: [],
       };
 
     case 'viewportPinnedChanged': {
       if (!isReady(state)) return { state, effects: [] };
       const geometry = { ...state.geometry, atBottom: event.atBottom };
-      const gesture = state.gesture.kind === 'touch'
-        ? event.atBottom
-          ? { ...state.gesture, arrivedAtTail: true }
-          : { ...state.gesture, departedBottom: true }
+      const gesture = state.gesture.kind === 'touch' && !event.atBottom
+        ? { ...state.gesture, departedBottom: true }
         : state.gesture;
       const next: ReadySession = state.kind === 'live'
         ? {
@@ -408,7 +453,7 @@ export function reduceScrollMachine(
               kind: 'touch',
               moved: false,
               departedBottom: !state.geometry.atBottom,
-              arrivedAtTail: false,
+              maxDistanceFromTail: distanceFromTail(state.geometry),
               modeBeforeGesture: follow,
             },
         unread: state.unread,
@@ -441,47 +486,23 @@ export function reduceScrollMachine(
 
     case 'upwardIntent': {
       if (!isReady(state)) return { state, effects: [] };
-      // Revoked for every upward move, navigating included: the gesture is
-      // heading away from the tail whoever owns the viewport
-      // (scroll_policy.allium UpwardIntentDuringGestureRevokesTailArrival).
-      const departed: ReadySession = state.gesture.kind === 'touch' && state.gesture.arrivedAtTail
-        ? { ...state, gesture: { ...state.gesture, arrivedAtTail: false } }
-        : state;
+      const departed: ReadySession = state;
       if (departed.kind === 'live' && departed.follow.kind === 'navigating') {
-        return {
-          state: {
-            ...departed,
-            geometry: updateGeometry(departed.geometry, event.snapshot ?? null),
-            follow: departed.follow,
-          },
-          effects: [],
-        };
+        return { state: observe(departed, event.snapshot ?? null), effects: [] };
       }
       return takeUserOwnership(departed, event.snapshot);
     }
 
     case 'navigationJumped': {
       if (!isReady(state)) return { state: { ...state, navigationPending: true }, effects: [] };
-      // Navigation takes the viewport, so any arrival the gesture recorded no
-      // longer describes where it will end
-      // (scroll_policy.allium NavigationJumpRevokesTailArrival).
-      const owned: ReadySession = state.gesture.kind === 'touch' && state.gesture.arrivedAtTail
-        ? { ...state, gesture: { ...state.gesture, arrivedAtTail: false } }
-        : state;
-      if (owned.kind === 'mount-rescue') return exitMountRescue(owned, navigationMode());
-      return { state: { ...owned, follow: navigationMode() }, effects: [] };
+      if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode());
+      return { state: { ...state, follow: navigationMode() }, effects: [] };
     }
 
     case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
       const arrived = snapshotIsPinned(event.snapshot);
-      const next: ReadySession = {
-        ...state,
-        geometry: updateGeometry(state.geometry, event.snapshot),
-        gesture: state.gesture.kind === 'touch' && arrived
-          ? { ...state.gesture, arrivedAtTail: true }
-          : state.gesture,
-      };
+      const next: ReadySession = observe(state, event.snapshot);
       // Level-triggered: scroll_policy.allium DownwardArrivalAtBottomConfirmsTailReturn
       if (
         next.kind === 'live' &&
@@ -503,18 +524,7 @@ export function reduceScrollMachine(
     case 'heightChanged': {
       if (!isReady(state)) return { state, effects: [] };
       const previousTotalHeight = state.geometry.previousTotalHeight;
-      const nextState = {
-        ...state,
-        geometry: updateGeometry(state.geometry, event.snapshot, event.totalHeight),
-        // Growth can carry the tail away from a finger that had reached it;
-        // the arrival no longer describes where the gesture will end.
-        gesture: state.gesture.kind === 'touch'
-          && state.gesture.arrivedAtTail
-          && event.snapshot !== null
-          && !snapshotIsPinned(event.snapshot)
-          ? { ...state.gesture, arrivedAtTail: false }
-          : state.gesture,
-      };
+      const nextState = observe(state, event.snapshot, event.totalHeight);
       if (event.unitCount === 0 || event.snapshot === null) {
         return { state: nextState, effects: [] };
       }
@@ -551,10 +561,7 @@ export function reduceScrollMachine(
         event.snapshot.scrollHeight - event.snapshot.scrollTop - event.snapshot.clientHeight > 1
       ) {
         return {
-          state: {
-            ...state,
-            geometry: updateGeometry(state.geometry, event.snapshot),
-          },
+          state: observe(state, event.snapshot),
           effects: [{ type: 'writeDomBottom' }],
         };
       }

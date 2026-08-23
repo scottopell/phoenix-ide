@@ -104,6 +104,11 @@ THE SYSTEM SHALL preserve the reader's physical anchor, show unread-tail state, 
 
 Layout growth and proximity to the tail shall not independently transfer viewport ownership.
 
+THE SYSTEM SHALL take tail-follow intent from the scroll policy rather than infer it from its own geometry
+AND the physical executor SHALL follow the tail only while the policy grants that intent and the viewport rests at the tail.
+
+Being at the tail describes where the viewport is, not who owns it. A reader holding a position that happens to coincide with the tail — during a touch that has moved but produced no scroll event yet, or after such a touch lifts — retains ownership, and an executor inferring intent from its own pinned state would move that viewport out from under them.
+
 ### REQ-VT-009: Initial Placement and Conversation Isolation
 
 WHEN a conversation with content first becomes measurable

@@ -70,6 +70,7 @@ import {
   reduceScrollMachine,
   type ScrollEffect,
   type ScrollEvent,
+  type ScrollMachineState,
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
@@ -95,6 +96,17 @@ const ChevronDown = () => (
 );
 
 const RESTORE_OFFSET_TOLERANCE_PX = 2;
+
+/** The policy grants tail-following unless the user owns the viewport —
+ *  either through a follow mode that holds position, or a touch that has
+ *  moved, which takes ownership from the movement itself rather than from a
+ *  scroll event (REQ-MLRU-014). */
+function tailFollowGranted(state: ScrollMachineState): boolean {
+  if (state.kind !== 'live' && state.kind !== 'mount-rescue') return true;
+  if (state.gesture.kind === 'touch' && state.gesture.moved) return false;
+  if (state.kind === 'mount-rescue') return true;
+  return state.follow.kind === 'following' || state.follow.kind === 'returning-to-tail';
+}
 
 function historyViewKey(view: HistoryView): string {
   return `${view.conversationId}:${view.generation}:${view.transcriptGeneration}`;
@@ -879,6 +891,10 @@ function MessageListImpl({
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
     scrollMachineRef.current = next.state;
+    // The policy owns tail-follow intent; the physical layer executes it.
+    // Syncing here, after every reduction, is what keeps the two from
+    // holding separate opinions (scroll_policy.allium, REQ-VT-008).
+    transcriptRef.current?.setTailFollowAllowed(tailFollowGranted(next.state));
     applyScrollEffects(next.effects);
   }, [applyScrollEffects]);
   dispatchScrollEventRef.current = dispatchScrollEvent;

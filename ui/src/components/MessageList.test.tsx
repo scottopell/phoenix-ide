@@ -130,6 +130,7 @@ vi.mock('./MessageContextMenu', () => ({
 const virtualTranscriptMock = {
   scrollToIndex: vi.fn(),
   scrollToTail: vi.fn(),
+  setTailFollowAllowed: vi.fn(),
   isProgrammaticScroll: vi.fn(),
   captureVisibleAnchor: vi.fn(),
   preserveViewportOnNextItemsChange: vi.fn(),
@@ -151,6 +152,7 @@ function indexOrZero(index: number): number {
 beforeEach(() => {
   virtualTranscriptMock.scrollToIndex = vi.fn();
   virtualTranscriptMock.scrollToTail = vi.fn();
+  virtualTranscriptMock.setTailFollowAllowed = vi.fn();
   virtualTranscriptMock.isProgrammaticScroll = vi.fn(() => false);
   virtualTranscriptMock.captureVisibleAnchor = vi.fn(() => null);
   virtualTranscriptMock.preserveViewportOnNextItemsChange = vi.fn();
@@ -196,7 +198,7 @@ vi.mock('./VirtualTranscript', async () => {
       onRangeChange?: (snapshot: VirtualTranscriptRangeChange) => void;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
+    }, ref: React.Ref<{ scrollToIndex: (index: number, align: 'start' | 'end', viewportStartOffset?: number) => void; scrollToTail: () => void; setTailFollowAllowed: (allowed: boolean) => void; isProgrammaticScroll: (scrollTop: number) => boolean; captureVisibleAnchor: () => unknown; preserveViewportOnNextItemsChange: () => void; measureOffsetForIndex: (index: number) => number | null; measureOffsetForIndexAtSnapshot: (index: number, snapshot: VirtualTranscriptPhysicalSnapshot) => number | null; layoutRevision: () => number; physicalSnapshot: (targetIndex?: number) => VirtualTranscriptPhysicalSnapshot }>) => {
       const containerRef = useRef<HTMLDivElement>(null);
       if (onTotalExtentChange) {
         virtualTranscriptMock.totalExtentChanged = onTotalExtentChange;
@@ -213,6 +215,7 @@ vi.mock('./VirtualTranscript', async () => {
       useImperativeHandle(ref, () => ({
         scrollToIndex: virtualTranscriptMock.scrollToIndex,
         scrollToTail: virtualTranscriptMock.scrollToTail,
+        setTailFollowAllowed: virtualTranscriptMock.setTailFollowAllowed,
         isProgrammaticScroll: virtualTranscriptMock.isProgrammaticScroll,
         captureVisibleAnchor: virtualTranscriptMock.captureVisibleAnchor,
         preserveViewportOnNextItemsChange: virtualTranscriptMock.preserveViewportOnNextItemsChange,
@@ -3051,10 +3054,13 @@ describe('handleTotalListHeightChanged', () => {
       fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
       vi.setSystemTime(1060);
       fireEvent.touchMove(scroller, { touches: [{}] });
-      // The at-bottom confirmation is blocked while the moved touch owns the
-      // viewport…
-      act(() => virtualTranscriptMock.pinnedChanged?.(true));
+      // The drag leaves the tail and comes back to it. The at-bottom
+      // confirmation is blocked while the moved touch owns the viewport…
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 20, clientHeight: 400 });
+      fireEvent.scroll(scroller);
       setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtualTranscriptMock.pinnedChanged?.(true));
       act(() => virtualTranscriptMock.totalExtentChanged?.(500));
       expect(virtualTranscriptMock.scrollToTail).not.toHaveBeenCalled();
 
