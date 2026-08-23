@@ -289,6 +289,33 @@ describe('scrollMachine durable follow policy', () => {
     expectLiveMode(result.state, 'reading');
   });
 
+  it('tail growth under a held touch is not travel and does not confirm on lift', () => {
+    // The viewport never moves here: content grows away beneath a stationary
+    // finger and then reflows back. Distance-from-tail rises and falls, but
+    // the reader travelled nothing, so this must resolve exactly like the
+    // never-moved case above. Letting layout raise the travel maximum would
+    // manufacture the one precondition the lift derivation depends on.
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_400,
+      unitCount: 5,
+      snapshot: snap(1_400, 600, 400),
+      tailActivity: 'active',
+    }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 600, 400),
+      tailActivity: 'active',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+  });
+
   it('a gesture that departs the tail and returns to it confirms on lift', () => {
     // The same start and end position as the case above; only the travel in
     // between distinguishes them, which is why the maximum is recorded.

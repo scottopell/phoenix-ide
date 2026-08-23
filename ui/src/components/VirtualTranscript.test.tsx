@@ -591,6 +591,64 @@ describe('VirtualTranscript', () => {
     expect(scrollTopOf(scroller)).toBeGreaterThan(repinnedTop ?? 0);
   });
 
+  it('never publishes a pinned state the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const pinnedStates: boolean[] = [];
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onPinnedChange={(pinned) => pinnedStates.push(pinned)}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      // Reading 20px off the tail: 1500 of content, a 100px viewport, so the
+      // maximum scroll position is 1400.
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 9 }], changedTouches: [{ identifier: 9 }] });
+      });
+      pinnedStates.length = 0;
+
+      // A row above the anchor shrinks by 30. The gesture defers the
+      // correction into the spacer, which keeps the total extent — and so the
+      // pinned answer — exactly where it was.
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      expect(scrollTopOf(scroller)).toBe(1380);
+
+      // Reconciliation removes the spacer shift and writes the equivalent
+      // scroll position. Those are two halves of one position-preserving
+      // operation: between them the extent has shrunk while the viewport has
+      // not yet moved, which reads as pinned even though the reader stays
+      // 20px off the tail throughout. Publishing that intermediate would hand
+      // tail-follow back to a reader who never asked for it.
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 9 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      expect(scrollTopOf(scroller)).toBe(1350);
+      expect(pinnedStates).not.toContain(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {

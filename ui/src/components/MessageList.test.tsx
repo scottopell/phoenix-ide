@@ -3228,10 +3228,56 @@ describe('handleTotalListHeightChanged', () => {
     fireEvent.scroll(scroller);
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
 
-    // The same geometry arrived at by real user movement confirms the return.
+    // Real user movement further into the pin zone confirms the return. It
+    // has to actually move: re-firing at the echo's own position is a
+    // standstill, and a standstill is not evidence of a tail return.
     virtualTranscriptMock.isProgrammaticScroll.mockReturnValue(false);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 660, clientHeight: 400 });
     fireEvent.scroll(scroller);
     expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
+  it('a bottom rubber-band frame that clamps to a standstill does not confirm a tail return', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-rubber-band-standstill"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    // Resting at the exact maximum scroll position, so a rubber-band frame's
+    // clamped position equals the last one: nothing moved.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    fireEvent.scroll(scroller);
+
+    // A moved touch takes ownership and lifts without travelling, which
+    // leaves the reader holding a viewport that happens to sit at the tail.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+    virtualTranscriptMock.setTailFollowAllowed.mockClear();
+
+    // iOS keeps emitting scroll frames as the bottom rubber-band relaxes.
+    // Their raw scrollTop is past the maximum, so clamping collapses them
+    // onto the position already held. Treating a standstill as downward
+    // movement would hand the viewport back with no travel behind it.
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 680, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 655, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    const grants = virtualTranscriptMock.setTailFollowAllowed.mock.calls.map(([allowed]) => allowed);
+    expect(grants.every((allowed) => allowed === false)).toBe(true);
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {

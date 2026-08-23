@@ -215,12 +215,11 @@ rule DownwardArrivalAtBottomKeepsMountRescueActive {
     ensures: policy.lifecycle = mount_rescue
 }
 
--- One rule covers every observation, so the maximum cannot drift from the
--- geometry it summarises.
-rule GeometryObservationRaisesGestureTravelMaximum {
+-- The maximum measures where the reader took the viewport, so only the two
+-- events that report viewport movement may raise it.
+rule DownwardObservationRaisesGestureTravelMaximum {
     when: DownwardMovement(policy, snapshot)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
-    ensures: policy.gesture_max_distance_from_tail >= policy.gesture_max_distance_from_tail
     ensures: policy.gesture_max_distance_from_tail >= snapshot.distance_from_tail
 }
 
@@ -228,6 +227,17 @@ rule UpwardObservationRaisesGestureTravelMaximum {
     when: UpwardIntent(policy, snapshot)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     ensures: policy.gesture_max_distance_from_tail >= snapshot.distance_from_tail
+}
+
+-- Distance from the tail also grows when the tail grows away from a
+-- stationary finger, and shrinks again when that content reflows. Crediting
+-- either to the gesture would let layout manufacture the strict inequality
+-- the lift derivation reads as proof the reader departed and came back, so a
+-- height change records geometry and leaves the maximum alone.
+rule LayoutObservationPreservesGestureTravelMaximum {
+    when: HeightChanged(policy, total_height, unit_count, snapshot, tail_activity)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_max_distance_from_tail = policy.gesture_max_distance_from_tail
 }
 
 rule NavigationBeforeMeasurementRemainsPending {
@@ -755,13 +765,16 @@ invariant MountRescueHasBoundedDeadline {
 }
 
 -- The travelled maximum is never lowered within an interaction; only a new
--- interaction reseeds it. This is what makes it safe to read at the lift
+-- interaction reseeds it. That is what makes it safe to read at the lift
 -- without any event having been responsible for keeping it current.
-invariant GestureTravelMaximumIsMonotone {
-    for policy in ScrollPolicy:
-        policy.gesture_mode != idle implies
-            policy.gesture_max_distance_from_tail >= policy.distance_from_tail
-}
+--
+-- Monotonicity is a property of which transitions may write the maximum, not
+-- of any single state, and it is carried by the three observation rules
+-- above rather than by a predicate here. It deliberately cannot be stated as
+-- `maximum >= distance_from_tail`: layout moves the tail independently of
+-- the reader, so a stationary finger under growing content sits farther from
+-- the tail than it ever travelled, and a bound over current geometry would
+-- oblige the maximum to follow content it must ignore.
 
 invariant MovedTouchOwnsViewport {
     for policy in ScrollPolicy:

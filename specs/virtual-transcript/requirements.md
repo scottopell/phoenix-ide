@@ -43,7 +43,9 @@ AND SHALL reconcile the accumulated shift back into authoritative layout coordin
 AND SHALL bound how long a touch alone may defer reconciliation, so that a lift the platform never reports — a touch whose target was unmounted mid-gesture has its end event dispatched at a detached node, and its pointer counterpart is cancelled when the pan begins and never reports release — cannot defer it indefinitely. A touch resting beyond that bound without movement or scrolling has no momentum left for a correction to cancel
 AND SHALL treat a touch the platform no longer reports as down as released, whether or not its own end event was observed
 AND SHALL reconcile immediately via the direct-write fallback the moment the leading spacer can no longer represent the shift, so the rendered spacer never diverges from the layout model
-AND SHALL identify the scroll-event echoes of its own position writes so consumers can distinguish physical compensation from user movement.
+AND SHALL identify the scroll-event echoes of its own position writes so consumers can distinguish physical compensation from user movement
+AND SHALL report tail proximity continuously across a reconciliation, counting a computed correction that has not yet been written as already applied
+SO THAT the intermediate state between removing the spacer shift and writing the equivalent scroll position — where the transcript has lost extent the viewport has not yet given back — is never observable as a change in tail proximity that the reconciled position does not hold.
 
 Reconciliation is triggered by layout measurements. It shall not poll or use elapsed time as evidence of positioning success; the scroll-settle wait governs only when an already-computed spacer shift is folded back into layout coordinates.
 

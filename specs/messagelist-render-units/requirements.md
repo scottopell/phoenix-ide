@@ -415,11 +415,22 @@ SO THAT no event is responsible for invalidating state it did not create:
 the recorded maximum only grows within a gesture, and an update missed
 anywhere can withhold a confirmation but never manufacture one
 
+THE SYSTEM SHALL raise that maximum only from observations that report the
+viewport moving under the reader
+AND SHALL NOT raise it from layout changes, settle probes, or echoes of its
+own position writes
+SO THAT content growing away from a stationary finger — which increases
+distance from the tail without the reader travelling anywhere — cannot
+supply the departure the lift derivation treats as proof of a return
+
 WHEN scroll movement is classified as upward or downward intent
 THE SYSTEM SHALL clamp the observed scroll position into the scrollable
 range before comparing against the previous position
+AND SHALL classify a clamped position equal to the previous one as neither
+direction, recording its geometry without inferring intent
 SO THAT overscroll rubber-band bounce-back at either edge is never
-classified as user reading intent
+classified as user reading intent, and the standstill that clamping
+produces at an edge is never mistaken for movement toward the tail
 
 WHEN a scroll event is the echo of a position write VirtualTranscript
 itself made — anchor compensation, drift reconciliation, or a tail snap

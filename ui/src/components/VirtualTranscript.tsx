@@ -314,7 +314,14 @@ function itemPhysicalEnd<T>(store: PhysicalStore<T>, index: number): number | un
 
 function computePinned<T>(store: PhysicalStore<T>): boolean {
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
-  return maxScrollTop - store.viewportTop <= PINNED_EPSILON;
+  // Drift reconciliation clears the spacer shift and writes the equivalent
+  // scroll position in two commits. Reading viewportTop raw between them
+  // measures a viewport that has lost the extent but not yet moved, which
+  // reports pinned for a reader who never approached the tail. The pending
+  // delta is exactly the move still owed, so counting it keeps the answer
+  // continuous across a correction that preserves position by construction.
+  const settledTop = store.viewportTop + (store.pendingScrollDelta ?? 0);
+  return maxScrollTop - settledTop <= PINNED_EPSILON;
 }
 
 function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {

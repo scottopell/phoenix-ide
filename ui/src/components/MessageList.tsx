@@ -994,12 +994,18 @@ function MessageListImpl({
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
           ? Math.min(machine.geometry.lastSnapshot?.scrollTop ?? clampedTop, maxScrollTop)
           : clampedTop;
-        dispatchScrollEvent(
-          clampedTop < previousTop
-            ? { type: 'upwardIntent', snapshot }
-            : { type: 'downwardMovement', snapshot },
-        );
-        if (clampedTop < previousTop) requestFromUpwardIntent();
+        // Three outcomes, not two. Clamping collapses rubber-band frames onto
+        // the position already held, and a standstill is not movement in
+        // either direction: folding it into downward would let the bounce at
+        // an edge confirm a tail return the reader never travelled to.
+        if (clampedTop === previousTop) {
+          dispatchScrollEvent({ type: 'scrollerAttached', snapshot });
+        } else if (clampedTop < previousTop) {
+          dispatchScrollEvent({ type: 'upwardIntent', snapshot });
+          requestFromUpwardIntent();
+        } else {
+          dispatchScrollEvent({ type: 'downwardMovement', snapshot });
+        }
         updateEarlierHistoryRestoreRef.current();
       };
       const onKeyDown = (e: KeyboardEvent) => {

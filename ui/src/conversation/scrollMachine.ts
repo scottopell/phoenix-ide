@@ -140,7 +140,13 @@ function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): Scr
   };
 }
 
-function observe(
+/** Record geometry from an event that did not move the viewport under the
+ *  reader: a layout change, a settle probe, an echo of the executor's own
+ *  write. The travel maximum is deliberately left alone. Distance from the
+ *  tail also grows when the tail grows away from a stationary finger, and
+ *  crediting that as travel would manufacture the very evidence the lift
+ *  derivation treats as proof the reader went somewhere and came back. */
+function observeLayout(
   state: ReadySession,
   snapshot: ScrollSnapshot | null,
   totalHeight?: number,
@@ -148,13 +154,27 @@ function observe(
   const geometry = totalHeight === undefined
     ? updateGeometry(state.geometry, snapshot)
     : updateGeometry(state.geometry, snapshot, totalHeight);
-  if (state.gesture.kind !== 'touch') return { ...state, geometry };
+  return { ...state, geometry };
+}
+
+/** Record geometry from an event that moved the viewport under the reader,
+ *  raising the gesture's travel maximum to match. Only user movement reaches
+ *  here, so the maximum stays a measure of where the reader took the
+ *  viewport rather than of what the content did around it. */
+function observeTravel(
+  state: ReadySession,
+  snapshot: ScrollSnapshot | null,
+): ReadySession {
+  const observed = observeLayout(state, snapshot);
+  if (observed.gesture.kind !== 'touch') return observed;
   return {
-    ...state,
-    geometry,
+    ...observed,
     gesture: {
-      ...state.gesture,
-      maxDistanceFromTail: Math.max(state.gesture.maxDistanceFromTail, distanceFromTail(geometry)),
+      ...observed.gesture,
+      maxDistanceFromTail: Math.max(
+        observed.gesture.maxDistanceFromTail,
+        distanceFromTail(observed.geometry),
+      ),
     },
   };
 }
@@ -213,7 +233,7 @@ function takeUserOwnership(
   state: ReadySession,
   snapshot?: ScrollSnapshot,
 ): Reduction {
-  const observed = snapshot ? observe(state, snapshot) : state;
+  const observed = snapshot ? observeTravel(state, snapshot) : state;
   const session: MeasuredSession = {
     conversationId: observed.conversationId,
     geometry: observed.geometry,
@@ -399,7 +419,7 @@ export function reduceScrollMachine(
     case 'scrollerAttached':
       if (!isReady(state)) return { state, effects: [] };
       return {
-        state: observe(state, event.snapshot),
+        state: observeLayout(state, event.snapshot),
         effects: [],
       };
 
@@ -488,7 +508,7 @@ export function reduceScrollMachine(
       if (!isReady(state)) return { state, effects: [] };
       const departed: ReadySession = state;
       if (departed.kind === 'live' && departed.follow.kind === 'navigating') {
-        return { state: observe(departed, event.snapshot ?? null), effects: [] };
+        return { state: observeTravel(departed, event.snapshot ?? null), effects: [] };
       }
       return takeUserOwnership(departed, event.snapshot);
     }
@@ -502,7 +522,7 @@ export function reduceScrollMachine(
     case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
       const arrived = snapshotIsPinned(event.snapshot);
-      const next: ReadySession = observe(state, event.snapshot);
+      const next: ReadySession = observeTravel(state, event.snapshot);
       // Level-triggered: scroll_policy.allium DownwardArrivalAtBottomConfirmsTailReturn
       if (
         next.kind === 'live' &&
@@ -524,7 +544,7 @@ export function reduceScrollMachine(
     case 'heightChanged': {
       if (!isReady(state)) return { state, effects: [] };
       const previousTotalHeight = state.geometry.previousTotalHeight;
-      const nextState = observe(state, event.snapshot, event.totalHeight);
+      const nextState = observeLayout(state, event.snapshot, event.totalHeight);
       if (event.unitCount === 0 || event.snapshot === null) {
         return { state: nextState, effects: [] };
       }
@@ -561,7 +581,7 @@ export function reduceScrollMachine(
         event.snapshot.scrollHeight - event.snapshot.scrollTop - event.snapshot.clientHeight > 1
       ) {
         return {
-          state: observe(state, event.snapshot),
+          state: observeLayout(state, event.snapshot),
           effects: [{ type: 'writeDomBottom' }],
         };
       }
