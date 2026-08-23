@@ -8905,100 +8905,91 @@ fn strip_unavailable_tool_blocks(
 ) -> Vec<LlmMessage> {
     use phoenix_llm::ContentBlock;
 
-    // First pass: collect IDs of tool_use blocks we're going to strip.
-    // Historical commission_review results remain useful context even when the
-    // tool is hidden for new calls; preserve their result text without sending
-    // undeclared tool_use/tool_result blocks to the provider.
-    let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut flatten_result_calls: std::collections::HashMap<String, (String, serde_json::Value)> =
-        std::collections::HashMap::new();
-    for msg in &messages {
-        for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                if !available_tools.contains(name.as_str()) {
-                    stripped_ids.insert(id.clone());
-                    if flatten_results || name == "commission_review" {
-                        flatten_result_calls.insert(id.clone(), (name.clone(), input.clone()));
-                    }
+    #[derive(Clone)]
+    enum StrippedToolUse {
+        Drop,
+        Flatten {
+            name: String,
+            input: serde_json::Value,
+        },
+    }
+
+    let mut stripped_count = 0usize;
+    let mut pending_results = std::collections::HashMap::<String, StrippedToolUse>::new();
+    let mut normalized = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let mut next_results = std::collections::HashMap::<String, StrippedToolUse>::new();
+        let mut filtered = Vec::with_capacity(msg.content.len());
+        for block in msg.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input }
+                    if !available_tools.contains(name.as_str()) =>
+                {
+                    stripped_count += 1;
+                    let disposition = if flatten_results || name == "commission_review" {
+                        StrippedToolUse::Flatten { name, input }
+                    } else {
+                        StrippedToolUse::Drop
+                    };
+                    next_results.insert(id, disposition);
                 }
-            }
-        }
-    }
-
-    if !stripped_ids.is_empty() {
-        tracing::debug!(
-            count = stripped_ids.len(),
-            "Stripping tool_use/tool_result blocks for unavailable tools"
-        );
-    }
-
-    // Second pass: filter out stripped tool_use/tool_result blocks.
-    // For ToolSearchToolResult, remove individual bad references but keep the block
-    // paired with its ServerToolUse until terminal normalization flattens both.
-    let normalized: Vec<LlmMessage> = messages
-        .into_iter()
-        .map(|msg| {
-            let filtered: Vec<ContentBlock> = msg
-                .content
-                .into_iter()
-                .flat_map(|block| match block {
-                    ContentBlock::ToolUse { ref id, .. } if stripped_ids.contains(id) => Vec::new(),
-                    ContentBlock::ToolResult {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    images,
+                    is_error,
+                } => match pending_results.remove(&tool_use_id) {
+                    Some(StrippedToolUse::Flatten { name, input }) => {
+                        filtered.push(ContentBlock::Text {
+                            text: format!(
+                                "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
+                                if is_error { "error" } else { "success" }
+                            ),
+                        });
+                        filtered.extend(
+                            images
+                                .into_iter()
+                                .map(|source| ContentBlock::Image { source }),
+                        );
+                    }
+                    Some(StrippedToolUse::Drop) => {}
+                    None => filtered.push(ContentBlock::ToolResult {
                         tool_use_id,
                         content,
                         images,
                         is_error,
-                    } => {
-                        if let Some((name, input)) = flatten_result_calls.get(&tool_use_id) {
-                            let mut flattened = Vec::with_capacity(1 + images.len());
-                            flattened.push(ContentBlock::Text {
-                                text: format!(
-                                    "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
-                                    if is_error { "error" } else { "success" }
-                                ),
-                            });
-                            flattened.extend(
-                                images
-                                    .into_iter()
-                                    .map(|source| ContentBlock::Image { source }),
-                            );
-                            flattened
-                        } else if stripped_ids.contains(&tool_use_id) {
-                            Vec::new()
-                        } else {
-                            vec![ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                images,
-                                is_error,
-                            }]
-                        }
-                    }
-                    // Filter individual unavailable references but keep the block
-                    ContentBlock::ToolSearchToolResult {
+                    }),
+                },
+                ContentBlock::ToolSearchToolResult {
+                    tool_use_id,
+                    mut content,
+                } => {
+                    content
+                        .tool_references
+                        .retain(|reference| available_tools.contains(reference.tool_name.as_str()));
+                    filtered.push(ContentBlock::ToolSearchToolResult {
                         tool_use_id,
-                        mut content,
-                    } => {
-                        content
-                            .tool_references
-                            .retain(|r| available_tools.contains(r.tool_name.as_str()));
-                        vec![ContentBlock::ToolSearchToolResult {
-                            tool_use_id,
-                            content,
-                        }]
-                    }
-                    // ServerToolUse blocks are server-side — never strip
-                    _ => vec![block],
-                })
-                .collect();
-            LlmMessage {
+                        content,
+                    });
+                }
+                block => filtered.push(block),
+            }
+        }
+        pending_results = next_results;
+        if !filtered.is_empty() {
+            normalized.push(LlmMessage {
                 role: msg.role,
                 content: filtered,
-            }
-        })
-        // Drop messages that became empty after filtering
-        .filter(|msg| !msg.content.is_empty())
-        .collect();
+            });
+        }
+    }
+
+    if stripped_count > 0 {
+        tracing::debug!(
+            count = stripped_count,
+            "Stripping tool_use/tool_result blocks for unavailable tools"
+        );
+    }
 
     if flatten_results {
         flatten_tool_blocks(normalized)
@@ -9591,6 +9582,45 @@ mod strip_tool_blocks_tests {
         assert!(
             matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
         );
+    }
+
+    #[test]
+    fn repeated_tool_id_in_later_available_turn_is_not_flattened() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let messages = vec![
+            assistant(vec![tool_use("reused", "commission_review")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "historical review".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            assistant(vec![tool_use("reused", "bash")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "current bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(messages, &available, false);
+
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical review") && text.contains("commission_review")
+        ));
+        assert!(matches!(
+            &out[1].content[0],
+            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
+        ));
+        assert!(matches!(
+            &out[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "reused" && content == "current bash output"
+        ));
     }
 
     #[test]
