@@ -64,6 +64,34 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         build.assert_called_once_with()
         start.assert_called_once_with(port=8041, release=False, tls=False)
 
+    def test_doctor_fails_only_for_missing_required_prerequisites(self):
+        results = [
+            self.dev.DoctorResult("cargo", False, "not found"),
+            self.dev.DoctorResult("allium", False, "not found", required=False),
+        ]
+
+        with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
+            with mock.patch("builtins.print") as output:
+                self.assertFalse(self.dev.cmd_doctor())
+
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("✗ cargo: not found", rendered)
+        self.assertIn("- allium (optional): not found", rendered)
+        self.assertIn("Missing required prerequisites: cargo", rendered)
+
+    def test_doctor_succeeds_when_only_optional_tools_are_missing(self):
+        results = [
+            self.dev.DoctorResult("cargo", True, "cargo 1.95.0"),
+            self.dev.DoctorResult("ast-grep", False, "not found", required=False),
+        ]
+
+        with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
+            with mock.patch("builtins.print") as output:
+                self.assertTrue(self.dev.cmd_doctor())
+
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("Ready for full local development and deployment checks.", rendered)
+
     def test_chromium_discovery_prefers_native_signed_chrome_over_path_chromium(self):
         signed_chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         path_chromium = Path("/opt/homebrew/bin/chromium")

@@ -3654,6 +3654,116 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
 
 
+@dataclasses.dataclass(frozen=True)
+class DoctorResult:
+    name: str
+    ok: bool
+    detail: str
+    required: bool = True
+
+
+def _doctor_version(command: list[str], *, env: dict | None = None) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return False, "not found" if isinstance(error, FileNotFoundError) else "timed out"
+    output = (completed.stdout or completed.stderr).strip().splitlines()
+    detail = output[0] if output else f"exit {completed.returncode}"
+    return completed.returncode == 0, detail
+
+
+def collect_doctor_results() -> list[DoctorResult]:
+    node_environment = node_env()
+    results: list[DoctorResult] = []
+
+    node_ok, node_version = _doctor_version(["node", "--version"], env=node_environment)
+    requested_node = (ROOT / ".node-version").read_text().strip().split(".")[0]
+    if node_ok:
+        try:
+            node_ok = int(node_version.lstrip("v").split(".")[0]) >= int(requested_node)
+        except ValueError:
+            node_ok = False
+    results.append(DoctorResult("node", node_ok, f"{node_version} (requires >= {requested_node})"))
+
+    corepack_ok, corepack_version = _doctor_version(
+        ["corepack", "--version"], env=node_environment,
+    )
+    if corepack_ok:
+        try:
+            parsed = tuple(int(part) for part in corepack_version.split(".")[:2])
+            corepack_ok = parsed >= _MIN_COREPACK
+        except ValueError:
+            corepack_ok = False
+    results.append(DoctorResult(
+        "corepack",
+        corepack_ok,
+        f"{corepack_version} (requires >= {'.'.join(map(str, _MIN_COREPACK))})",
+    ))
+
+    pnpm_ok, pnpm_version = _doctor_version(["pnpm", "--version"], env=node_environment)
+    pinned_pnpm = _read_pnpm_pin()
+    pnpm_ok = pnpm_ok and pnpm_version == pinned_pnpm
+    results.append(DoctorResult("pnpm", pnpm_ok, f"{pnpm_version} (requires {pinned_pnpm})"))
+
+    pinned_rust_match = re.search(
+        r'^channel\s*=\s*"([^"]+)"',
+        (ROOT / "rust-toolchain.toml").read_text(),
+        flags=re.MULTILINE,
+    )
+    pinned_rust = pinned_rust_match.group(1) if pinned_rust_match else "repository pin"
+    rust_ok, rust_version = _doctor_version(["rustc", "--version"])
+    rust_ok = rust_ok and f"rustc {pinned_rust} " in f"{rust_version} "
+    results.append(DoctorResult("rustc", rust_ok, f"{rust_version} (requires {pinned_rust})"))
+
+    for name, command in (
+        ("cargo", ["cargo", "--version"]),
+        ("rustfmt", ["cargo", "fmt", "--version"]),
+        ("clippy", ["cargo", "clippy", "--version"]),
+    ):
+        ok, detail = _doctor_version(command)
+        results.append(DoctorResult(name, ok, detail))
+
+    browser = _find_chromium_binary()
+    results.append(DoctorResult(
+        "chrome",
+        browser is not None,
+        str(browser) if browser is not None else "not found",
+    ))
+
+    for name, command in (
+        ("cargo-nextest", ["cargo", "nextest", "--version"]),
+        ("allium", ["allium", "--version"]),
+        ("ripgrep", ["rg", "--version"]),
+        ("ast-grep", ["ast-grep", "--version"]),
+    ):
+        ok, detail = _doctor_version(command)
+        results.append(DoctorResult(name, ok, detail, required=False))
+
+    return results
+
+
+def cmd_doctor() -> bool:
+    results = collect_doctor_results()
+    for result in results:
+        marker = "✓" if result.ok else ("✗" if result.required else "-")
+        role = "" if result.required else " (optional)"
+        print(f"{marker} {result.name}{role}: {result.detail}")
+
+    missing = [result.name for result in results if result.required and not result.ok]
+    if missing:
+        print(f"\nMissing required prerequisites: {', '.join(missing)}")
+        return False
+    print("\nReady for full local development and deployment checks.")
+    return True
+
+
 def cmd_status():
     """Check what's running."""
     phoenix_pid = get_pid(PHOENIX_PID_FILE)
@@ -9729,6 +9839,8 @@ def main():
     # status
     sub.add_parser("status", help="Check what's running")
 
+    sub.add_parser("doctor", help="Diagnose local development and deployment prerequisites")
+
     # check
     check_parser = sub.add_parser("check", help="Run lint, fmt check, and tests")
     check_parser.add_argument(
@@ -9964,6 +10076,9 @@ def main():
         cmd_restart(phoenix_port=args.port, tls=args.https)
     elif args.command == "status":
         cmd_status()
+    elif args.command == "doctor":
+        if not cmd_doctor():
+            sys.exit(1)
     elif args.command == "check":
         cmd_check(
             gate=not args.check_all,
