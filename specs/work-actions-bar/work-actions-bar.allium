@@ -688,8 +688,9 @@ rule CompactFallbackDockPresentedWhenMobilePrRailUnavailable {
     @guidance
         -- An unresolved explicit selection is recovered from the fallback dock,
         -- but the fallback does not become the active-selection authority.
-        -- Keep the disposition's primary verb in the single action row. A
-        -- non-primary terminal verb may move into overflow. The status row is
+        -- Selection recovery replaces the otherwise derived primary verb because
+        -- PR-targeted and terminal actions are unsafe without a resolved target.
+        -- A non-primary terminal verb may move into overflow. The status row is
         -- concise; full disposition and terminal guidance remains available
         -- through an operable disclosure rather than wrapping beside actions.
 }

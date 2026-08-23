@@ -72,7 +72,7 @@
 
 .mobile-work-fallback-info-button::before {
   position: absolute;
-  inset: -10px -8px;
+  inset: -10px -8px 0;
   content: '';
 }
 
