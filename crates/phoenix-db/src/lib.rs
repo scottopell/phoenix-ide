@@ -8595,56 +8595,90 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let fts_telemetry = self.sqlite_telemetry(
+        let telemetry = self.sqlite_telemetry(
             SqliteOperation::ConversationDelete,
             SqliteWorkloadCategory::MessagePersistence,
             SqliteAccessKind::Write,
         );
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let (mut connection, acquisition) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query(
-                    "DELETE FROM workflows
-             WHERE workflow_id IN (
-                 SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
-             )",
-                )
+        let ((), timing) = telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *connection)
+                    .await
+                    .map(|_| ())
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let body = async {
+            sqlx::query(
+                "DELETE FROM workflows
+                 WHERE workflow_id IN (
+                     SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
+                 SELECT turn_id, conversation_id FROM durable_turns
+                 WHERE conversation_id = ?1 AND disposition = 'Runtime'",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+            let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
                 .bind(id)
-                .execute(&mut *tx),
-            )
-            .await?;
-        fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query(
-                    "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
-                     SELECT turn_id, conversation_id FROM durable_turns
-                     WHERE conversation_id = ?1 AND disposition = 'Runtime'",
-                )
-                .bind(id)
-                .execute(&mut *tx),
-            )
-            .await?;
-        let result = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query("DELETE FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .execute(&mut *tx),
-            )
-            .await?;
-        if result.rows_affected() == 0 {
-            // tx dropped without commit → rollback.
-            return Err(DbError::ConversationNotFound(id.to_string()));
+                .execute(&mut *connection)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Ok(false);
+            }
+            retrieval::fts_delete_conversation_conn(&mut connection, id).await?;
+            Ok::<_, DbError>(true)
         }
-        retrieval::fts_delete_conversation_conn_with_telemetry(&mut tx, id, &fts_telemetry).await?;
-        fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
-            .await?;
-        Ok(())
+        .await;
+
+        match body {
+            Ok(true) => {
+                telemetry
+                    .observe_commit_db(timing, async {
+                        sqlx::query("COMMIT")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await
+            }
+            Ok(false) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await?;
+                Err(DbError::ConversationNotFound(id.to_string()))
+            }
+            Err(error) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Rename conversation (update slug)
@@ -10429,62 +10463,88 @@ impl Database {
         message_id: &str,
         display_data: &serde_json::Value,
     ) -> DbResult<i64> {
-        let display_str = serde_json::to_string(display_data)
-            .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let mut message = self.get_message_by_id(message_id).await?;
-        message.display_data = Some(display_data.clone());
-        let hidden = display_data
-            .get("hidden")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let fts_telemetry = self.sqlite_telemetry(
+        let telemetry = self.sqlite_telemetry(
             SqliteOperation::UpdateMessageDisplayData,
             SqliteWorkloadCategory::MessagePersistence,
             SqliteAccessKind::Write,
         );
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let (mut connection, acquisition) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let conversation_id: Option<String> = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query_scalar(
-                    "UPDATE messages
-             SET display_data = ?1
-             WHERE message_id = ?2
-             RETURNING conversation_id",
-                )
-                .bind(&display_str)
-                .bind(message_id)
-                .fetch_optional(&mut *tx),
+        let (mut tx, timing) = telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+            })
+            .await?;
+        let body = async {
+            let mut message = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                        display_data, usage_data, created_at
+                 FROM messages WHERE message_id = ?1",
             )
+            .bind(message_id)
+            .try_map(parse_message_row)
+            .fetch_optional(&mut *tx)
             .await?;
-        let Some(conversation_id) = conversation_id else {
-            tx.rollback().await?;
-            return Err(DbError::MessageNotFound(message_id.to_string()));
-        };
-        let transcript_generation: i64 = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query_scalar(
-                    "UPDATE conversations
-             SET transcript_generation = transcript_generation + 1
-             WHERE id = ?1
-             RETURNING transcript_generation",
-                )
-                .bind(conversation_id)
-                .fetch_one(&mut *tx),
+            let Some(mut message) = message.take() else {
+                return Ok(None);
+            };
+            hydrate_attachments_conn(&mut tx, std::slice::from_mut(&mut message)).await?;
+            message.display_data = Some(display_data.clone());
+            let display_str = serde_json::to_string(display_data)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let conversation_id: String = sqlx::query_scalar(
+                "UPDATE messages
+                 SET display_data = ?1
+                 WHERE message_id = ?2
+                 RETURNING conversation_id",
             )
+            .bind(&display_str)
+            .bind(message_id)
+            .fetch_one(&mut *tx)
             .await?;
-        if hidden {
-            retrieval::fts_hide_message_tx(&mut tx, &message, &fts_telemetry).await?;
-        } else {
-            retrieval::fts_index_message_tx(&mut tx, &message, &fts_telemetry).await?;
+            let transcript_generation: i64 = sqlx::query_scalar(
+                "UPDATE conversations
+                 SET transcript_generation = transcript_generation + 1
+                 WHERE id = ?1
+                 RETURNING transcript_generation",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let hidden = display_data
+                .get("hidden")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if hidden {
+                retrieval::fts_hide_message_tx(&mut tx, &message).await?;
+            } else {
+                retrieval::fts_index_message_tx(&mut tx, &message).await?;
+            }
+            Ok::<_, DbError>(Some(transcript_generation))
         }
-        fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
-            .await?;
-        Ok(transcript_generation)
+        .await;
+
+        match body {
+            Ok(Some(transcript_generation)) => {
+                telemetry
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
+                    .await?;
+                Ok(transcript_generation)
+            }
+            Ok(None) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
+                    .await?;
+                Err(DbError::MessageNotFound(message_id.to_string()))
+            }
+            Err(error) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Update the `content` text field inside a tool result message's JSON.

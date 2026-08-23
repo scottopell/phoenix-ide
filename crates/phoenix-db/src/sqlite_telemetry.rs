@@ -347,6 +347,10 @@ impl SqliteTelemetry {
         phase: SqlitePhase,
         operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
     ) -> Result<T, sqlx::Error> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
         let phase_started_at = Instant::now();
         let result = operation.await;
         match &result {
@@ -364,6 +368,10 @@ impl SqliteTelemetry {
         phase: SqlitePhase,
         operation: impl std::future::Future<Output = DbResult<T>>,
     ) -> DbResult<T> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
         let phase_started_at = Instant::now();
         let result = operation.await;
         match &result {
@@ -448,6 +456,7 @@ impl SqliteTelemetry {
             timing,
             SqlitePhase::Commit,
             SqliteTransactionOutcome::Committed,
+            SqliteOutcome::Success,
             operation,
         )
         .await
@@ -462,6 +471,22 @@ impl SqliteTelemetry {
             timing,
             SqlitePhase::Rollback,
             SqliteTransactionOutcome::RolledBack,
+            SqliteOutcome::Success,
+            operation,
+        )
+        .await
+    }
+
+    pub(crate) async fn observe_failure_rollback_db<T>(
+        &self,
+        timing: SuccessfulTransactionTiming,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        self.observe_transaction_completion_db(
+            timing,
+            SqlitePhase::Rollback,
+            SqliteTransactionOutcome::RolledBack,
+            SqliteOutcome::OtherFailure,
             operation,
         )
         .await
@@ -470,7 +495,8 @@ impl SqliteTelemetry {
     fn finish_successful_transaction(
         &self,
         timing: CompletedTransactionTiming,
-        outcome: SqliteTransactionOutcome,
+        transaction_outcome: SqliteTransactionOutcome,
+        operation_outcome: SqliteOutcome,
     ) {
         self.lifecycle_completed.store(true, Ordering::Release);
         self.record_typed_outcome(TypedOutcomeObservation {
@@ -479,25 +505,51 @@ impl SqliteTelemetry {
             latency: self.started_at.elapsed(),
             retry_count: 0,
             retry_backoff: Duration::ZERO,
-            outcome: SqliteOutcome::Success,
+            outcome: operation_outcome,
             waits: SqliteWaitMeasurement::PoolAndAdmission {
                 pool_wait: timing.acquisition_elapsed,
                 admission_wait: timing.write_admission_wait_elapsed,
             },
         });
-        self.record_slow_success(timing, outcome);
+        self.record_slow_success(timing, transaction_outcome);
     }
 
     async fn observe_transaction_completion_db<T>(
         &self,
         timing: SuccessfulTransactionTiming,
         phase: SqlitePhase,
-        outcome: SqliteTransactionOutcome,
+        transaction_outcome: SqliteTransactionOutcome,
+        operation_outcome: SqliteOutcome,
         operation: impl std::future::Future<Output = DbResult<T>>,
     ) -> DbResult<T> {
-        let value = self.observe_db(phase, operation).await?;
-        self.finish_successful_transaction(timing.complete_at(Instant::now()), outcome);
-        Ok(value)
+        let phase_started_at = Instant::now();
+        match operation.await {
+            Ok(value) => {
+                self.finish_successful_transaction(
+                    timing.complete_at(Instant::now()),
+                    transaction_outcome,
+                    operation_outcome,
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                if let DbError::Sqlx(sqlx_error) = &error {
+                    self.record_failure(phase, phase_started_at.elapsed(), sqlx_error);
+                } else {
+                    self.lifecycle_completed.store(true, Ordering::Release);
+                    self.record_typed_outcome(TypedOutcomeObservation {
+                        category: self.category,
+                        access: self.access,
+                        latency: self.started_at.elapsed(),
+                        retry_count: 0,
+                        retry_backoff: Duration::ZERO,
+                        outcome: SqliteOutcome::OtherFailure,
+                        waits: self.proven_waits().measurement(),
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     fn record_slow_success(
@@ -1154,8 +1206,13 @@ mod tests {
             SqliteAccessKind::Write,
             collector.clone(),
         );
+        let timing = SuccessfulTransactionTiming::from_durations(
+            Duration::ZERO,
+            Duration::ZERO,
+            Instant::now(),
+        );
         telemetry
-            .observe_db(SqlitePhase::Commit, async { Ok::<(), DbError>(()) })
+            .observe_commit_db(timing, async { Ok::<(), DbError>(()) })
             .await
             .unwrap();
         drop(telemetry);
@@ -1167,6 +1224,16 @@ mod tests {
             snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
             0
         );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "transaction terminals require typed commit/rollback observation")]
+    async fn generic_observation_rejects_transaction_terminals() {
+        let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+        telemetry
+            .observe_db(SqlitePhase::Commit, async { Ok::<(), DbError>(()) })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1316,6 +1383,108 @@ mod tests {
         assert_wait_samples(&collector, 1, 1);
     }
 
+    fn message_persistence_outcomes(db: &Database) -> [u64; SqliteOutcome::ALL.len()] {
+        db.sqlite_workload_collector
+            .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros())
+            .outcomes[SqliteAccessKind::Write.index()]
+            [SqliteWorkloadCategory::MessagePersistence.index()]
+    }
+
+    fn assert_one_outcome_delta(
+        before: [u64; SqliteOutcome::ALL.len()],
+        after: [u64; SqliteOutcome::ALL.len()],
+        expected: SqliteOutcome,
+    ) {
+        for outcome in SqliteOutcome::ALL {
+            assert_eq!(
+                after[outcome.index()] - before[outcome.index()],
+                u64::from(outcome == expected),
+                "unexpected {outcome:?} delta",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_commit_records_exactly_one_success() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("delete-success", "Delete", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        db.delete_conversation("delete-success").await.unwrap();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::Success,
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_missing_rolls_back_with_one_failure_outcome() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        let error = db.delete_conversation("delete-missing").await.unwrap_err();
+
+        assert!(matches!(error, DbError::ConversationNotFound(id) if id == "delete-missing"));
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
+    }
+
+    #[tokio::test]
+    async fn update_display_data_commit_records_exactly_one_success() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("display-success", "Display", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "display-success-message",
+            "display-success",
+            &MessageContent::tool("tool", "result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        db.update_message_display_data(
+            "display-success-message",
+            &serde_json::json!({"hidden": false}),
+        )
+        .await
+        .unwrap();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::Success,
+        );
+    }
+
+    #[tokio::test]
+    async fn update_display_data_missing_rolls_back_with_one_failure_outcome() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        let error = db
+            .update_message_display_data("display-missing", &serde_json::json!({"hidden": false}))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::MessageNotFound(id) if id == "display-missing"));
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn caller_owned_fts_transaction_records_acquisition_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -1348,6 +1517,10 @@ mod tests {
             error,
             Err(crate::DbError::Sqlx(sqlx::Error::PoolClosed))
         ));
+        let outcomes = message_persistence_outcomes(&db);
+        assert_eq!(operation_count(&outcomes), 1);
+        assert_eq!(outcomes[SqliteOutcome::OtherFailure.index()], 1);
+        assert_eq!(outcomes[SqliteOutcome::Abandoned.index()], 0);
         let events = capture.events();
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1365,7 +1538,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn caller_owned_fts_transaction_records_first_source_write_failure() {
+    async fn display_update_records_transaction_admission_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("caller-owned-statement.db");
         let setup = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -1414,6 +1587,10 @@ mod tests {
         sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
 
         assert!(matches!(error, Err(crate::DbError::Sqlx(_))));
+        let outcomes = message_persistence_outcomes(&db);
+        assert_eq!(operation_count(&outcomes), 1);
+        assert_eq!(outcomes[SqliteOutcome::Busy.index()], 1);
+        assert_eq!(outcomes[SqliteOutcome::Abandoned.index()], 0);
         let events = capture.events();
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -1422,7 +1599,7 @@ mod tests {
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
-            Some("statement")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             events[0].get("db_sqlite_primary_code").map(String::as_str),
