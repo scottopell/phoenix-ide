@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
@@ -6,6 +6,7 @@ import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 import type { SqliteWorkloadReportResponse } from '../generated/SqliteWorkloadReportResponse';
+import type { SqliteReportCategory } from '../generated/SqliteReportCategory';
 
 const { apiMock } = vi.hoisted(() => ({
   apiMock: {
@@ -155,6 +156,36 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
   };
 }
 
+function sqliteCategory(category: SqliteReportCategory, label: string) {
+  return {
+    category,
+    label,
+    operation_count: 0,
+    writer_occupancy_percent: 0,
+    latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    admission_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    retries: null,
+    failures: { busy: 0, locked: 0, pool_timeout: 0, other_timeout: 0, other_failure: 0, abandoned: 0 },
+  };
+}
+
+function sqliteReadCategory(category: SqliteReportCategory, label: string) {
+  return {
+    category,
+    label,
+    operation_count: 0,
+    total_duration_ms: 0,
+    avg_duration_ms: null,
+    peak_concurrency: 0,
+    latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    admission_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    retries: null,
+    failures: { busy: 0, locked: 0, pool_timeout: 0, other_timeout: 0, other_failure: 0, abandoned: 0 },
+  };
+}
+
 function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): SqliteWorkloadReportResponse {
   return {
     sampled_at: '2026-06-01T00:00:05Z',
@@ -167,8 +198,8 @@ function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): Sq
     covered_uptime_micros: 125_000_000,
     coverage: { bucket_count: 2, fully_covered: false, label: '2m 5s covered across 2 buckets; requested 60m' },
     classification: { classified_operation_count: 0, baseline_statement_count: 0, other_operation_count: 0, other_operation_share_percent: null, abandoned_count: 0, classification_gap_count: 0, writer_occupancy_gap_count: 0 },
-    writer_categories: [],
-    reads: [],
+    writer_categories: [sqliteCategory('message_persistence', 'Message persistence')],
+    reads: [sqliteReadCategory('message_persistence', 'Message persistence')],
     ...overrides,
   };
 }
@@ -276,7 +307,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText('Restart truncated')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
-    await screen.findByText('No SQLite write data for this window yet.');
+    await screen.findAllByText('No SQLite samples captured for this window yet.');
   });
 
   it('keeps prior SQLite values visible and labels a failed refresh stale', async () => {
@@ -290,6 +321,56 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     expect(await screen.findByText('SQLite report stale — collector unavailable')).toBeInTheDocument();
     expect(screen.getByText('Restart truncated')).toBeInTheDocument();
+  });
+
+  it('ignores an older SQLite response that resolves after a newer window selection', async () => {
+    let resolveOneHour: ((value: SqliteWorkloadReportResponse) => void) | undefined;
+    let resolveSixHours: ((value: SqliteWorkloadReportResponse) => void) | undefined;
+    renderPage(deployment());
+    apiMock.deploymentSqliteWorkload.mockReset().mockImplementation((window: string) => {
+      if (window === 'one_hour') {
+        return new Promise<SqliteWorkloadReportResponse>((resolve) => { resolveOneHour = resolve; });
+      }
+      if (window === 'six_hours') {
+        return new Promise<SqliteWorkloadReportResponse>((resolve) => { resolveSixHours = resolve; });
+      }
+      return Promise.resolve(sqliteReport({ window: window as SqliteWorkloadReportResponse['window'] }));
+    });
+    expect(await screen.findByRole('heading', { name: 'SQLite workload' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh SQLite report' }));
+    fireEvent.click(screen.getByRole('button', { name: '6h' }));
+    await waitFor(() => {
+      expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
+    });
+
+    const newer = resolveSixHours;
+    const older = resolveOneHour;
+    if (!newer || !older) throw new Error('expected both SQLite requests to be pending');
+
+    await act(async () => {
+      newer(sqliteReport({ window: 'six_hours', coverage: { bucket_count: 12, fully_covered: true, label: '6h covered across 12 buckets; requested 360m' } }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('6h covered across 12 buckets; requested 360m')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '6h' })).toHaveClass('about-sqlite-window-button--active');
+
+    await act(async () => {
+      older(sqliteReport({ window: 'one_hour', coverage: { bucket_count: 2, fully_covered: false, label: '1h stale response should be ignored' } }));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText('1h stale response should be ignored')).not.toBeInTheDocument();
+    expect(screen.getByText('6h covered across 12 buckets; requested 360m')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '6h' })).toHaveClass('about-sqlite-window-button--active');
+  });
+
+  it('shows a no-samples state when the API returns category rows with zero counts', async () => {
+    apiMock.deploymentSqliteWorkload.mockReset().mockResolvedValue(sqliteReport());
+
+    renderPage(deployment());
+
+    expect(await screen.findAllByText('No SQLite samples captured for this window yet.')).toHaveLength(2);
+    expect(screen.getAllByText('Message persistence')).toHaveLength(2);
   });
 
   it('presents running identity, ownership, and remote access as separate primary facts', async () => {

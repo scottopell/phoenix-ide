@@ -410,7 +410,7 @@ pub async fn archive_chain_handler(
             ))));
         }
     }
-    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo
             .has_owed_work_for_conversation(id)
@@ -484,7 +484,7 @@ pub async fn delete_chain_handler(
             ))));
         }
     }
-    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo
             .has_owed_work_for_conversation(id)

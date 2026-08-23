@@ -1162,7 +1162,7 @@ impl MessageStore for DatabaseStorage {
         {
             Ok(message) => TerminalEvidenceEstablishment::Established(Box::new(message)),
             Err(write_error) => {
-                let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+                let repo = self.db.workflow_repository();
                 match repo
                     .probe_terminal_evidence(conv_id, message_id, &obligation)
                     .await
@@ -1298,9 +1298,9 @@ impl MessageStore for DatabaseStorage {
         payload: &phoenix_core::domain::sm_event::PreparedDirectTurnPayload,
         now: phoenix_workflow::Timestamp,
     ) -> Result<phoenix_db::workflow::DirectTurnMaterializationEligibility, String> {
-        use phoenix_db::workflow::{PreflightDirectTurnMaterializationInput, WorkflowRepository};
+        use phoenix_db::workflow::PreflightDirectTurnMaterializationInput;
         use phoenix_workflow::TurnAuthorityId;
-        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(authority);
         repo.preflight_direct_turn_materialization(&PreflightDirectTurnMaterializationInput {
             turn_id: TurnAuthorityId(authority.turn_id.0),
@@ -1318,10 +1318,10 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<AuthoritativeUserMessageMaterialization, String> {
         use phoenix_db::workflow::{
             LocalAuthorityResult, MaterializeAuthoritativeTurnInput,
-            MaterializeAuthoritativeTurnOutcome, WorkflowRepository,
+            MaterializeAuthoritativeTurnOutcome,
         };
         use phoenix_workflow::TurnAuthorityId;
-        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let local_authority = direct_turn_local_authority(&input.authority);
         let materialized = repo
             .materialize_authoritative_turn(&MaterializeAuthoritativeTurnInput {
@@ -1379,7 +1379,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         conversation_id: &str,
     ) -> Result<Option<LoadedActiveDirectTurn>, String> {
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         repo.load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
         ))
@@ -1413,7 +1413,7 @@ impl MessageStore for DatabaseStorage {
     ) -> TerminalMutationEstablishment {
         let obligation =
             terminal_obligation(settlement, response_message_id.map(ToString::to_string));
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         match repo.persist_terminal_obligation(&obligation).await {
             Ok(()) => TerminalMutationEstablishment::Established {
                 transcript_generation: None,
@@ -1437,7 +1437,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         settlement: &ActiveDirectTurnSettlement,
     ) -> Result<(), String> {
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         repo.terminalize_authoritative_turn(
             &phoenix_db::workflow::TerminalizeAuthoritativeTurnInput {
                 command: direct_turn_terminal_command(
@@ -1459,7 +1459,7 @@ impl MessageStore for DatabaseStorage {
         &self,
         settlement: &ContinuationDirectTurnSettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         repo.settle_continuation_direct_turn_atomically(
             &phoenix_db::workflow::AtomicContinuationSettlementInput {
                 conversation_id: settlement.message.conversation_id.clone(),
@@ -1653,7 +1653,7 @@ async fn classify_terminal_mutation(
     command_error: String,
     _transcript_generation: Option<i64>,
 ) -> TerminalMutationEstablishment {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(db.pool().clone());
+    let repo = db.workflow_repository();
     match repo
         .probe_exact_terminal_evidence(evidence, obligation)
         .await
@@ -1764,7 +1764,7 @@ impl StateStore for DatabaseStorage {
         settlement: &ContinuationStartRecoverySettlement,
     ) -> Result<crate::db::ContinuationCommitOutcome, String> {
         if let (Some(turn), Some(terminal)) = (&settlement.turn, &settlement.terminal) {
-            let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+            let repo = self.db.workflow_repository();
             repo.settle_failed_continuation_start_atomically(
                 &phoenix_db::workflow::AtomicContinuationSettlementInput {
                     conversation_id: settlement.message.conversation_id.clone(),

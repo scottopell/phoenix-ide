@@ -120,7 +120,7 @@ pub(crate) async fn run(
     ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let worker = WakeWorker::new(
-        WakeRepository::new(manager.db().pool().clone()),
+        manager.db().wake_repository(),
         Arc::new(RuntimeRegistryInspector::new(
             manager.bash_handles().clone(),
             manager.tmux_registry().clone(),
@@ -452,13 +452,14 @@ async fn deliver_pending(
             let _message_acceptance = manager
                 .lock_message_acceptance(&current.conversation_id)
                 .await;
-            let active_direct_turn =
-                phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone())
-                    .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
-                        current.conversation_id.clone(),
-                    ))
-                    .await
-                    .map_err(|error| error.to_string())?;
+            let active_direct_turn = manager
+                .db()
+                .workflow_repository()
+                .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                    current.conversation_id.clone(),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
             if active_direct_turn.is_some_and(|turn| {
                 matches!(
                     turn.materialization,
@@ -1004,7 +1005,7 @@ mod tests {
                 .as_str()
                 .to_string(),
         );
-        (db.clone(), WakeRepository::new(db.pool().clone()), scope)
+        (db.clone(), db.wake_repository(), scope)
     }
 
     async fn register_bash(

@@ -4,6 +4,7 @@ import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
+import type { SqliteReportWindow } from './generated/SqliteReportWindow';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
 import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
@@ -1313,7 +1314,7 @@ export const api = {
     return resp.json();
   },
 
-  async deploymentSqliteWorkload(window: 'one_hour' | 'six_hours' | 'twenty_four_hours'): Promise<SqliteWorkloadReportResponse> {
+  async deploymentSqliteWorkload(window: SqliteReportWindow): Promise<SqliteWorkloadReportResponse> {
     const resp = await fetch(`/api/deployment/sqlite-workload?window=${encodeURIComponent(window)}`);
     if (!resp.ok) throw new Error('Failed to load sqlite workload report');
     return resp.json();

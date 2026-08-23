@@ -157,7 +157,8 @@ impl AppState {
             credential_helper.clone(),
             &runtime_env,
         ));
-        let retired_wakes = phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone())
+        let retired_wakes = db
+            .wake_repository()
             .retire_all_registrations(phoenix_workflow::Timestamp(
                 u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default(),
             ))

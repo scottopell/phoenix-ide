@@ -1,5 +1,5 @@
 use super::WorkflowRepository;
-use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -1460,7 +1460,7 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
@@ -1518,7 +1518,7 @@ impl WorkflowRepository {
         conversation_id: &str,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<Option<String>> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
@@ -1577,7 +1577,7 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
@@ -1973,7 +1973,7 @@ impl WorkflowRepository {
         input: &TerminalizeAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;

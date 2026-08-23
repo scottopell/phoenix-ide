@@ -466,6 +466,22 @@ impl WakeRepository {
         }
     }
 
+    pub(crate) fn with_sqlite_workload_collector(
+        pool: sqlx::SqlitePool,
+        sqlite_workload_collector: crate::SqliteWorkloadCollector,
+    ) -> Self {
+        Self {
+            workflow_repo: WorkflowRepository::with_sqlite_workload_collector(
+                pool,
+                sqlite_workload_collector,
+            ),
+            #[cfg(test)]
+            failpoint_namespace: next_failpoint_namespace(),
+            #[cfg(test)]
+            write_intent_test_latch: None,
+        }
+    }
+
     async fn begin_authoritative_tx(&self) -> DbResult<WorkflowTx<'_>> {
         #[cfg(test)]
         if let Some(latch) = &self.write_intent_test_latch {

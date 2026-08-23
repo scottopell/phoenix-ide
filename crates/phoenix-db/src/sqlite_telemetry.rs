@@ -263,11 +263,14 @@ pub(crate) struct SqliteTelemetry {
     collector: Option<SqliteWorkloadCollector>,
     started_at: Instant,
     outcome_recorded: AtomicBool,
+    lifecycle_completed: AtomicBool,
 }
 
 impl Drop for SqliteTelemetry {
     fn drop(&mut self) {
-        if self.outcome_recorded.swap(true, Ordering::AcqRel) {
+        if self.lifecycle_completed.load(Ordering::Acquire)
+            || self.outcome_recorded.swap(true, Ordering::AcqRel)
+        {
             return;
         }
         let Some(collector) = &self.collector else {
@@ -316,6 +319,7 @@ impl SqliteTelemetry {
             collector: Some(collector),
             started_at: Instant::now(),
             outcome_recorded: AtomicBool::new(false),
+            lifecycle_completed: AtomicBool::new(false),
         }
     }
 
@@ -331,6 +335,7 @@ impl SqliteTelemetry {
             collector: None,
             started_at: Instant::now(),
             outcome_recorded: AtomicBool::new(false),
+            lifecycle_completed: AtomicBool::new(false),
         }
     }
 
@@ -341,9 +346,14 @@ impl SqliteTelemetry {
     ) -> Result<T, sqlx::Error> {
         let phase_started_at = Instant::now();
         let result = operation.await;
-        result.inspect_err(|error| {
-            self.record_failure(phase, phase_started_at.elapsed(), error);
-        })
+        match &result {
+            Ok(_) if matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback) => {
+                self.lifecycle_completed.store(true, Ordering::Release);
+            }
+            Err(error) => self.record_failure(phase, phase_started_at.elapsed(), error),
+            Ok(_) => {}
+        }
+        result
     }
 
     pub(crate) async fn observe_db<T>(
@@ -353,11 +363,16 @@ impl SqliteTelemetry {
     ) -> DbResult<T> {
         let phase_started_at = Instant::now();
         let result = operation.await;
-        result.inspect_err(|error| {
-            if let DbError::Sqlx(sqlx_error) = error {
-                self.record_failure(phase, phase_started_at.elapsed(), sqlx_error);
+        match &result {
+            Ok(_) if matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback) => {
+                self.lifecycle_completed.store(true, Ordering::Release);
             }
-        })
+            Err(DbError::Sqlx(error)) => {
+                self.record_failure(phase, phase_started_at.elapsed(), error);
+            }
+            Err(_) | Ok(_) => {}
+        }
+        result
     }
 
     pub(crate) async fn observe_pool_acquisition_sqlx<T>(
@@ -409,6 +424,7 @@ impl SqliteTelemetry {
         timing: CompletedTransactionTiming,
         outcome: SqliteTransactionOutcome,
     ) {
+        self.lifecycle_completed.store(true, Ordering::Release);
         self.record_observation(SqliteObservation {
             completed_at_unix_micros: unix_now_micros(),
             category: self.category,
@@ -485,6 +501,7 @@ impl SqliteTelemetry {
     }
 
     fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
+        self.lifecycle_completed.store(true, Ordering::Release);
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
         let codes = SqliteResultCodes::from_error(error);
@@ -1099,6 +1116,30 @@ mod tests {
         let rendered = format!("{event:?}");
         assert!(!rendered.contains("sensitive-message-id"));
         assert!(!rendered.contains("sensitive payload sentinel"));
+    }
+
+    #[tokio::test]
+    async fn successful_commit_disarms_abandoned_outcome() {
+        let collector = SqliteWorkloadCollector::new();
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::FtsUpsert,
+            SqliteWorkloadCategory::Fts,
+            SqliteAccessKind::Write,
+            collector.clone(),
+        );
+        telemetry
+            .observe_db(SqlitePhase::Commit, async { Ok::<(), DbError>(()) })
+            .await
+            .unwrap();
+        drop(telemetry);
+
+        let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::Fts.index();
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            0
+        );
     }
 
     #[test]

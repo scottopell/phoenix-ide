@@ -41,8 +41,8 @@ pub use retrieval::{
 };
 pub use schema::*;
 pub use sqlite_workload::{
-    approximate_percentiles_from_histogram, BucketCategoryTotals, SqliteAccessKind,
-    SqliteLatencyBin, SqliteOutcome, SqlitePercentiles, SqliteSnapshotWindow,
+    abandoned_count, approximate_percentiles_from_histogram, operation_count, BucketCategoryTotals,
+    SqliteAccessKind, SqliteLatencyBin, SqliteOutcome, SqlitePercentiles, SqliteSnapshotWindow,
     SqliteWorkloadAggregateReport, SqliteWorkloadCategory, SqliteWorkloadCollector,
     SqliteWorkloadSnapshot,
 };
@@ -1355,6 +1355,22 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    #[must_use]
+    pub fn workflow_repository(&self) -> workflow::WorkflowRepository {
+        workflow::WorkflowRepository::with_sqlite_workload_collector(
+            self.pool.clone(),
+            self.sqlite_workload_collector.clone(),
+        )
+    }
+
+    #[must_use]
+    pub fn wake_repository(&self) -> workflow::wake::WakeRepository {
+        workflow::wake::WakeRepository::with_sqlite_workload_collector(
+            self.pool.clone(),
+            self.sqlite_workload_collector.clone(),
+        )
     }
 
     #[must_use]

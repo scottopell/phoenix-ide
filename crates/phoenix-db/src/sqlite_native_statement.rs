@@ -998,7 +998,10 @@ mod tests {
         let access = SqliteAccessKind::Write.index();
         let category = SqliteWorkloadCategory::Other.index();
         let totals = report.totals[access][category];
-        assert_eq!(operation_count(&report.outcomes[access][category]), 0);
+        assert_eq!(
+            report.outcomes[access][category],
+            [0; SqliteOutcome::ALL.len()]
+        );
         assert_eq!(totals.pool_wait_micros, 0);
         assert_eq!(totals.write_admission_wait_micros, 0);
         assert_eq!(

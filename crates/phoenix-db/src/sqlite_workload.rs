@@ -82,7 +82,6 @@ impl SqliteOutcome {
 }
 
 #[must_use]
-#[cfg(test)]
 pub const fn operation_count(outcomes: &[u64; SqliteOutcome::ALL.len()]) -> u64 {
     let mut total: u64 = 0;
     let mut index = 0;
@@ -94,7 +93,6 @@ pub const fn operation_count(outcomes: &[u64; SqliteOutcome::ALL.len()]) -> u64 
 }
 
 #[must_use]
-#[cfg(test)]
 pub const fn abandoned_count(outcomes: &[u64; SqliteOutcome::ALL.len()]) -> u64 {
     outcomes[SqliteOutcome::Abandoned.index()]
 }

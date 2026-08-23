@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { api } from '../api';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
+import type { SqliteReportWindow } from '../generated/SqliteReportWindow';
 import type { SqliteWorkloadReportResponse } from '../generated/SqliteWorkloadReportResponse';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
@@ -58,14 +59,17 @@ type ActiveResourceRequest = {
   abort: () => void;
 };
 
-type SqliteWindow = 'one_hour' | 'six_hours' | 'twenty_four_hours';
-
 type SqliteState = {
-  window: SqliteWindow;
+  window: SqliteReportWindow;
   report: SqliteWorkloadReportResponse | null;
   loading: boolean;
   error: string | null;
   stale: boolean;
+};
+
+type SqliteWindowRequest = {
+  generation: number;
+  window: SqliteReportWindow;
 };
 
 const EMPTY_RESOURCES: ResourceState = {
@@ -116,6 +120,14 @@ function formatNumber(value: number): string {
 function formatRatio(value: number, total: number): string {
   if (total <= 0) return '0%';
   return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function sqliteCategoryHasSamples(row: { operation_count: number; failures: { abandoned: number } }): boolean {
+  return row.operation_count > 0 || row.failures.abandoned > 0;
+}
+
+function sqliteReportHasSamples(report: SqliteWorkloadReportResponse): boolean {
+  return report.writer_categories.some(sqliteCategoryHasSamples) || report.reads.some(sqliteCategoryHasSamples);
 }
 
 function formatUptime(seconds: number): string {
@@ -394,7 +406,7 @@ function ResourceTooltip({ active, payload, label }: { active?: boolean; payload
   );
 }
 
-const SQLITE_WINDOWS: Array<{ value: SqliteWindow; label: string }> = [
+const SQLITE_WINDOWS: Array<{ value: SqliteReportWindow; label: string }> = [
   { value: 'one_hour', label: '1h' },
   { value: 'six_hours', label: '6h' },
   { value: 'twenty_four_hours', label: '24h' },
@@ -406,10 +418,11 @@ function SqliteDiagnostics({
   refresh,
 }: {
   state: SqliteState;
-  selectWindow: (window: SqliteWindow) => void;
+  selectWindow: (window: SqliteReportWindow) => void;
   refresh: () => void;
 }) {
   const report = state.report;
+  const hasSamples = report ? sqliteReportHasSamples(report) : false;
   return (
     <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
       <div className="settings-section__title-row">
@@ -483,7 +496,7 @@ function SqliteDiagnostics({
                   </tr>
                 </thead>
                 <tbody>
-                  {report.writer_categories.length === 0 && <tr><td colSpan={6}>No SQLite write data for this window yet.</td></tr>}
+                  {!hasSamples && <tr><td colSpan={6}>No SQLite samples captured for this window yet.</td></tr>}
                   {report.writer_categories.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
@@ -514,7 +527,7 @@ function SqliteDiagnostics({
                   </tr>
                 </thead>
                 <tbody>
-                  {report.reads.length === 0 && <tr><td colSpan={6}>No SQLite read data for this window yet.</td></tr>}
+                  {!hasSamples && <tr><td colSpan={6}>No SQLite samples captured for this window yet.</td></tr>}
                   {report.reads.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
@@ -818,6 +831,7 @@ export function AboutDeploymentPage() {
   const resourcesInFlightRef = useRef(false);
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
+  const sqliteRequestRef = useRef<SqliteWindowRequest>({ generation: 0, window: 'one_hour' });
   const resourcesGenerationRef = useRef(0);
   const identityRefreshRef = useRef<string | null>(null);
   const infoRef = useRef<DeploymentInfo | null>(null);
@@ -994,13 +1008,17 @@ export function AboutDeploymentPage() {
     };
   }, [fetchResources, invalidateActiveResourceRequest]);
 
-  const loadSqlite = useCallback((window: SqliteWindow) => {
+  const loadSqlite = useCallback((window: SqliteReportWindow) => {
+    const generation = sqliteRequestRef.current.generation + 1;
+    sqliteRequestRef.current = { generation, window };
     setSqlite((current) => ({ ...current, window, loading: true, error: null }));
     void api.deploymentSqliteWorkload(window)
       .then((report) => {
+        if (sqliteRequestRef.current.generation !== generation || sqliteRequestRef.current.window !== window) return;
         setSqlite({ window, report, loading: false, error: null, stale: false });
       })
       .catch((cause) => {
+        if (sqliteRequestRef.current.generation !== generation || sqliteRequestRef.current.window !== window) return;
         const message = cause instanceof Error ? cause.message : String(cause);
         setSqlite((current) => ({
           ...current,

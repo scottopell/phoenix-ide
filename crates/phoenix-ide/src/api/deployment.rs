@@ -166,6 +166,19 @@ pub enum SqliteReportWindow {
     TwentyFourHours,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum SqliteReportCategory {
+    MessagePersistence,
+    DurableWorkflows,
+    Fts,
+    RuntimeState,
+    PrProjectData,
+    Maintenance,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteWorkloadReportQuery {
@@ -212,7 +225,7 @@ pub struct SqliteClassificationSummary {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteWriterCategoryReport {
-    pub category: String,
+    pub category: SqliteReportCategory,
     pub label: String,
     pub operation_count: u64,
     pub writer_occupancy_percent: f64,
@@ -226,7 +239,7 @@ pub struct SqliteWriterCategoryReport {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteReadCategoryReport {
-    pub category: String,
+    pub category: SqliteReportCategory,
     pub label: String,
     pub operation_count: u64,
     pub total_duration_ms: u64,
@@ -656,7 +669,7 @@ fn sample_sqlite_workload_report(
                 (totals.writer_held_micros as f64) / (writer_window_micros as f64) * 100.0
             };
             SqliteWriterCategoryReport {
-                category: sqlite_category_key(category).to_string(),
+                category: SqliteReportCategory::from(category),
                 label: sqlite_category_label(category).to_string(),
                 operation_count,
                 writer_occupancy_percent: utilization_percent,
@@ -687,10 +700,9 @@ fn sample_sqlite_workload_report(
             let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
             let operation_count = crate::db::operation_count(outcomes);
             let total_duration_ms = totals.read_connection_micros / 1_000;
-            let avg_duration_ms =
-                (operation_count > 0).then_some(total_duration_ms / operation_count);
+            let avg_duration_ms = total_duration_ms.checked_div(operation_count);
             SqliteReadCategoryReport {
-                category: sqlite_category_key(category).to_string(),
+                category: SqliteReportCategory::from(category),
                 label: sqlite_category_label(category).to_string(),
                 operation_count,
                 total_duration_ms,
@@ -816,18 +828,6 @@ fn failure_summary(outcomes: &[u64; crate::db::SqliteOutcome::ALL.len()]) -> Sql
     }
 }
 
-fn sqlite_category_key(category: crate::db::SqliteWorkloadCategory) -> &'static str {
-    match category {
-        crate::db::SqliteWorkloadCategory::MessagePersistence => "message_persistence",
-        crate::db::SqliteWorkloadCategory::DurableWorkflows => "durable_workflows",
-        crate::db::SqliteWorkloadCategory::Fts => "fts",
-        crate::db::SqliteWorkloadCategory::RuntimeState => "runtime_state",
-        crate::db::SqliteWorkloadCategory::PrProjectData => "pr_project_data",
-        crate::db::SqliteWorkloadCategory::Maintenance => "maintenance",
-        crate::db::SqliteWorkloadCategory::Other => "other",
-    }
-}
-
 fn sqlite_category_label(category: crate::db::SqliteWorkloadCategory) -> &'static str {
     match category {
         crate::db::SqliteWorkloadCategory::MessagePersistence => "Message persistence",
@@ -837,6 +837,20 @@ fn sqlite_category_label(category: crate::db::SqliteWorkloadCategory) -> &'stati
         crate::db::SqliteWorkloadCategory::PrProjectData => "PR/project data",
         crate::db::SqliteWorkloadCategory::Maintenance => "Maintenance",
         crate::db::SqliteWorkloadCategory::Other => "Other",
+    }
+}
+
+impl From<crate::db::SqliteWorkloadCategory> for SqliteReportCategory {
+    fn from(value: crate::db::SqliteWorkloadCategory) -> Self {
+        match value {
+            crate::db::SqliteWorkloadCategory::MessagePersistence => Self::MessagePersistence,
+            crate::db::SqliteWorkloadCategory::DurableWorkflows => Self::DurableWorkflows,
+            crate::db::SqliteWorkloadCategory::Fts => Self::Fts,
+            crate::db::SqliteWorkloadCategory::RuntimeState => Self::RuntimeState,
+            crate::db::SqliteWorkloadCategory::PrProjectData => Self::PrProjectData,
+            crate::db::SqliteWorkloadCategory::Maintenance => Self::Maintenance,
+            crate::db::SqliteWorkloadCategory::Other => Self::Other,
+        }
     }
 }
 

@@ -320,7 +320,9 @@ pub(crate) async fn abandon_task(
             "task abandonment rejected after fatal local authority closure".to_string(),
         )
     })?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -624,7 +626,9 @@ pub(crate) async fn mark_merged(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
