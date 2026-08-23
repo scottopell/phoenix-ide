@@ -365,8 +365,8 @@ export function WorkControlBar({
   }, [canRepresentActiveSelection, fallbackVisible]);
 
 
-  const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
-  const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
+  const freshnessLabel = dispositionPrStatus ? prFeedbackFreshnessLabel(dispositionPrStatus) : null;
+  const coverageMarker = dispositionPrStatus ? prFeedbackCoverageMarker(dispositionPrStatus) : null;
 
   const handleAddressFeedback = async () => {
     if (!onSendMessage) return;
@@ -532,7 +532,7 @@ export function WorkControlBar({
           </button>
         </div>
 
-        {fallbackPanel !== 'info' && (disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
+        {(disposition.primary !== 'none' || fallbackHasOverflowActions) && <div className="mobile-work-fallback-actions">
           {cleanupBlockedByAmbiguity && (disposition.primary === 'clean_up' || disposition.primary === 'abandon') && (
             actionablePrs.length > 0 ? (
               <button

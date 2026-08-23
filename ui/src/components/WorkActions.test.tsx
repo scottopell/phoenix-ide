@@ -2093,6 +2093,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       url: 'https://github.com/o/r/pull/12',
       display_state: 'merged',
       check_state: 'passing',
+      feedback_freshness: { state: 'new', count: 4 },
+      feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
     }, {
       activeSelection: {
         associated_prs: [inferredPr],
@@ -2108,6 +2110,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Open PR #13/ })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Merge on GitHub #13/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/4 new feedback/)).not.toBeInTheDocument();
+    expect(document.querySelector('.work-actions-pr-coverage')).not.toBeInTheDocument();
   });
 
   it('does not reuse cached status for a same-number active PR in another repository', () => {
@@ -2504,7 +2508,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('status').nextElementSibling).toBe(screen.getByRole('alert'));
   });
 
-  it('removes covered actions from the interaction tree while details are open', () => {
+  it('keeps the primary and overflow actions available while details are open', () => {
     enableMobile();
     renderWithProviders(
       <WorkControlBar
@@ -2520,8 +2524,8 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
     expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
   });
 
   it('describes an unrepresentable PR resolve action instead of cleanup', () => {
