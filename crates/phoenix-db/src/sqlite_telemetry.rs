@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::sqlite_workload::operation_count;
 use crate::sqlite_workload::{
-    operation_count, SqliteAccessKind, SqliteObservation, SqliteObservationCounting,
-    SqliteOutcome, SqliteWorkloadCategory, SqliteWorkloadCollector,
+    SqliteAccessKind, SqliteObservation, SqliteObservationCounting, SqliteOutcome,
+    SqliteWorkloadCategory, SqliteWorkloadCollector,
 };
 use crate::{DbError, DbResult};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -275,7 +277,6 @@ impl Drop for SqliteTelemetry {
             completed_at_unix_micros: unix_now_micros(),
             category: self.category,
             access: self.access,
-            outcome: SqliteOutcome::Abandoned,
             latency: self.started_at.elapsed(),
             pool_wait: Duration::ZERO,
             write_admission_wait: Duration::ZERO,
@@ -285,9 +286,9 @@ impl Drop for SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::Counted {
-                baseline_statement_count: 0,
-                include_histograms: true,
+            counting: SqliteObservationCounting::TypedOutcome {
+                outcome: SqliteOutcome::Abandoned,
+                include_wait_histograms: true,
             },
         });
     }
@@ -412,7 +413,6 @@ impl SqliteTelemetry {
             completed_at_unix_micros: unix_now_micros(),
             category: self.category,
             access: self.access,
-            outcome: SqliteOutcome::Success,
             latency: self.started_at.elapsed(),
             pool_wait: timing.acquisition_elapsed,
             write_admission_wait: timing.write_admission_wait_elapsed,
@@ -422,9 +422,9 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::Counted {
-                baseline_statement_count: 0,
-                include_histograms: true,
+            counting: SqliteObservationCounting::TypedOutcome {
+                outcome: SqliteOutcome::Success,
+                include_wait_histograms: true,
             },
         });
         self.record_slow_success(timing, outcome);
@@ -545,7 +545,6 @@ impl SqliteTelemetry {
             completed_at_unix_micros: unix_now_micros(),
             category: self.category,
             access: self.access,
-            outcome: classify_outcome(error),
             latency: self.started_at.elapsed(),
             pool_wait: if phase == SqlitePhase::TransactionAcquisition {
                 phase_elapsed
@@ -563,9 +562,9 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::Counted {
-                baseline_statement_count: 0,
-                include_histograms: true,
+            counting: SqliteObservationCounting::TypedOutcome {
+                outcome: classify_outcome(error),
+                include_wait_histograms: true,
             },
         });
     }
@@ -1116,7 +1115,10 @@ mod tests {
         let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let access = SqliteAccessKind::Write.index();
         let category = SqliteWorkloadCategory::Fts.index();
-        assert_eq!(snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()], 1);
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            1
+        );
         assert_eq!(
             snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
             1

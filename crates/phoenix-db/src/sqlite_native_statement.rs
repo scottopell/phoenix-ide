@@ -1,6 +1,6 @@
 use crate::sqlite_workload::{
-    SqliteAccessKind, SqliteObservation, SqliteObservationCounting, SqliteOutcome,
-    SqliteWorkloadCategory, SqliteWorkloadCollector,
+    SqliteAccessKind, SqliteObservation, SqliteObservationCounting, SqliteWorkloadCategory,
+    SqliteWorkloadCollector,
 };
 use libsqlite3_sys as ffi;
 #[cfg(test)]
@@ -25,8 +25,9 @@ const STATEMENT_CACHE_SIZE: usize = 256;
 pub(crate) struct NativeStatementCallbackContext {
     collector: SqliteWorkloadCollector,
     active_read_concurrency: u32,
-    prepare_category: SqliteWorkloadCategory,
-    statement_categories: [CachedStatementCategory; STATEMENT_CACHE_SIZE],
+    prepare_state: PrepareState,
+    prepare_pending: bool,
+    statement_metadata: [CachedStatementMetadata; STATEMENT_CACHE_SIZE],
     writer_admitted_at: Option<Instant>,
     current_writer_category: SqliteWorkloadCategory,
     #[cfg(test)]
@@ -34,15 +35,30 @@ pub(crate) struct NativeStatementCallbackContext {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CachedStatementCategory {
-    statement_identity: usize,
+struct PrepareState {
     category: SqliteWorkloadCategory,
+    access: Option<SqliteAccessKind>,
 }
 
-impl CachedStatementCategory {
+impl PrepareState {
+    const EMPTY: Self = Self {
+        category: SqliteWorkloadCategory::Other,
+        access: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedStatementMetadata {
+    statement_identity: usize,
+    category: SqliteWorkloadCategory,
+    access: Option<SqliteAccessKind>,
+}
+
+impl CachedStatementMetadata {
     const EMPTY: Self = Self {
         statement_identity: 0,
         category: SqliteWorkloadCategory::Other,
+        access: None,
     };
 }
 
@@ -51,8 +67,9 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
-            prepare_category: SqliteWorkloadCategory::Other,
-            statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
+            prepare_state: PrepareState::EMPTY,
+            prepare_pending: false,
+            statement_metadata: [CachedStatementMetadata::EMPTY; STATEMENT_CACHE_SIZE],
             writer_admitted_at: None,
             current_writer_category: SqliteWorkloadCategory::Other,
             #[cfg(test)]
@@ -68,8 +85,9 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
-            prepare_category: SqliteWorkloadCategory::Other,
-            statement_categories: [CachedStatementCategory::EMPTY; STATEMENT_CACHE_SIZE],
+            prepare_state: PrepareState::EMPTY,
+            prepare_pending: false,
+            statement_metadata: [CachedStatementMetadata::EMPTY; STATEMENT_CACHE_SIZE],
             writer_admitted_at: None,
             current_writer_category: SqliteWorkloadCategory::Other,
             drop_counter: Some(drop_counter),
@@ -77,50 +95,67 @@ impl NativeStatementCallbackContext {
     }
 
     fn reset_prepare_state(&mut self) {
-        self.prepare_category = SqliteWorkloadCategory::Other;
+        self.prepare_state = PrepareState::EMPTY;
     }
 
-    fn note_prepare_category(&mut self, category: SqliteWorkloadCategory) {
-        self.prepare_category = category_precedence(self.prepare_category, category);
+    fn note_prepare_metadata(
+        &mut self,
+        category: SqliteWorkloadCategory,
+        access: Option<SqliteAccessKind>,
+    ) {
+        self.prepare_pending = true;
+        self.prepare_state.category = category_precedence(self.prepare_state.category, category);
+        self.prepare_state.access = access_precedence(self.prepare_state.access, access);
     }
 
-    fn cache_statement_category(
+    fn cache_statement_metadata(
         &mut self,
         statement_identity: usize,
         category: SqliteWorkloadCategory,
+        access: Option<SqliteAccessKind>,
     ) {
         let slot = statement_cache_slot(statement_identity);
-        let entry = &mut self.statement_categories[slot];
-        if entry.statement_identity == 0 || entry.statement_identity == statement_identity {
-            *entry = CachedStatementCategory {
+        let entry = &mut self.statement_metadata[slot];
+        if entry.statement_identity == 0
+            || entry.statement_identity == statement_identity
+            || self.prepare_pending
+        {
+            *entry = CachedStatementMetadata {
                 statement_identity,
                 category,
+                access,
             };
         } else {
-            *entry = CachedStatementCategory {
+            *entry = CachedStatementMetadata {
                 statement_identity,
                 category: SqliteWorkloadCategory::Other,
+                access: None,
             };
             self.collector.record_classification_gap();
         }
     }
 
-    fn lookup_statement_category(
+    fn lookup_statement_metadata(
         &self,
         statement_identity: usize,
-    ) -> Option<SqliteWorkloadCategory> {
-        let entry = self.statement_categories[statement_cache_slot(statement_identity)];
-        (entry.statement_identity == statement_identity).then_some(entry.category)
+    ) -> Option<CachedStatementMetadata> {
+        let entry = self.statement_metadata[statement_cache_slot(statement_identity)];
+        (entry.statement_identity == statement_identity).then_some(entry)
     }
 
-    fn take_prepare_category_for_statement(
+    fn take_prepare_metadata_for_statement(
         &mut self,
         statement_identity: usize,
-    ) -> SqliteWorkloadCategory {
-        let category = self.prepare_category;
+    ) -> CachedStatementMetadata {
+        let metadata = CachedStatementMetadata {
+            statement_identity,
+            category: self.prepare_state.category,
+            access: self.prepare_state.access,
+        };
         self.reset_prepare_state();
-        self.cache_statement_category(statement_identity, category);
-        category
+        self.prepare_pending = false;
+        self.cache_statement_metadata(statement_identity, metadata.category, metadata.access);
+        metadata
     }
 
     fn note_writer_statement(
@@ -274,11 +309,10 @@ unsafe extern "C" fn authorizer_callback(
     }
     let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
     if action_code == ffi::SQLITE_SELECT {
-        context.reset_prepare_state();
         return ffi::SQLITE_OK;
     }
-    if let Some(category) = classify_authorizer_action(action_code, arg1) {
-        context.note_prepare_category(category);
+    if let Some((category, access)) = classify_authorizer_action(action_code, arg1) {
+        context.note_prepare_metadata(category, access);
     }
     ffi::SQLITE_OK
 }
@@ -297,10 +331,21 @@ unsafe extern "C" fn profile_callback(
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT {
-        let _category = context
-            .lookup_statement_category(statement_identity)
-            .unwrap_or_else(|| context.take_prepare_category_for_statement(statement_identity));
-        if readonly {
+        let metadata = if context.prepare_pending {
+            context.take_prepare_metadata_for_statement(statement_identity)
+        } else {
+            context
+                .lookup_statement_metadata(statement_identity)
+                .unwrap_or_else(|| context.take_prepare_metadata_for_statement(statement_identity))
+        };
+        let access = metadata.access.unwrap_or_else(|| {
+            if readonly {
+                SqliteAccessKind::Read
+            } else {
+                SqliteAccessKind::Write
+            }
+        });
+        if access == SqliteAccessKind::Read {
             context.active_read_concurrency = context.collector.begin_native_read();
         }
         return 0;
@@ -310,26 +355,24 @@ unsafe extern "C" fn profile_callback(
     }
     let nanos = unsafe { *(elapsed_nanos.cast::<ffi::sqlite3_int64>()) };
     let latency = Duration::from_nanos(u64::try_from(nanos).unwrap_or_default());
-    let access = if readonly {
-        SqliteAccessKind::Read
+    let metadata = context.lookup_statement_metadata(statement_identity);
+    let access = metadata
+        .and_then(|metadata| metadata.access)
+        .unwrap_or_else(|| {
+            if readonly {
+                SqliteAccessKind::Read
+            } else {
+                SqliteAccessKind::Write
+            }
+        });
+    let read_connection_time = if access == SqliteAccessKind::Read {
+        latency
     } else {
-        SqliteAccessKind::Write
+        Duration::ZERO
     };
-    let read_connection_time = if readonly { latency } else { Duration::ZERO };
     let db = unsafe { ffi::sqlite3_db_handle(statement) };
-    let primary_code = if db.is_null() {
-        ffi::SQLITE_ERROR
-    } else {
-        (unsafe { ffi::sqlite3_errcode(db) }) & 0xff
-    };
-    let outcome = match primary_code {
-        ffi::SQLITE_OK | ffi::SQLITE_ROW | ffi::SQLITE_DONE => SqliteOutcome::Success,
-        ffi::SQLITE_BUSY => SqliteOutcome::Busy,
-        ffi::SQLITE_LOCKED => SqliteOutcome::Locked,
-        _ => SqliteOutcome::OtherFailure,
-    };
-    let category = context
-        .lookup_statement_category(statement_identity)
+    let category = metadata
+        .map(|metadata| metadata.category)
         .unwrap_or(SqliteWorkloadCategory::Other);
     let txn_state = if db.is_null() {
         ffi::SQLITE_TXN_NONE
@@ -338,18 +381,18 @@ unsafe extern "C" fn profile_callback(
     };
     if txn_state == ffi::SQLITE_TXN_WRITE {
         let first_write_admission = context.note_writer_statement(category, txn_state);
-        if first_write_admission && !readonly {
+        if first_write_admission && access == SqliteAccessKind::Write {
             context.collector.record_writer_occupancy_gap();
         }
     } else if txn_state == ffi::SQLITE_TXN_NONE {
         if context.writer_admitted_at.is_some() {
             context.finish_writer_transaction();
-        } else if !readonly && outcome == SqliteOutcome::Success {
+        } else if access == SqliteAccessKind::Write {
             context.record_writer_gap();
         }
     }
     let read_concurrency = context.active_read_concurrency;
-    if readonly {
+    if access == SqliteAccessKind::Read {
         context.collector.end_native_read();
         context.active_read_concurrency = 0;
     }
@@ -357,26 +400,16 @@ unsafe extern "C" fn profile_callback(
         completed_at_unix_micros: unix_now_micros(),
         category,
         access,
-        outcome,
         latency,
         pool_wait: Duration::ZERO,
-        write_admission_wait: if !readonly
-            && matches!(outcome, SqliteOutcome::Busy | SqliteOutcome::Locked)
-        {
-            latency
-        } else {
-            Duration::ZERO
-        },
+        write_admission_wait: Duration::ZERO,
         writer_held: Duration::ZERO,
         read_connection_time,
         retry_count: 0,
         retry_backoff: Duration::ZERO,
         writer_concurrency: 0,
         read_concurrency,
-        counting: SqliteObservationCounting::Counted {
-            baseline_statement_count: 1,
-            include_histograms: true,
-        },
+        counting: SqliteObservationCounting::BaselineStatement,
     };
     context.collector.record(observation);
     0
@@ -389,13 +422,21 @@ fn statement_cache_slot(statement_identity: usize) -> usize {
 fn classify_authorizer_action(
     action_code: c_int,
     object_name: *const c_char,
-) -> Option<SqliteWorkloadCategory> {
+) -> Option<(SqliteWorkloadCategory, Option<SqliteAccessKind>)> {
     match action_code {
-        ffi::SQLITE_READ | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE => {
-            Some(classify_schema_object(object_name))
-        }
-        ffi::SQLITE_TRANSACTION
-        | ffi::SQLITE_SAVEPOINT
+        ffi::SQLITE_READ => Some((
+            classify_schema_object(object_name),
+            Some(SqliteAccessKind::Read),
+        )),
+        ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE => Some((
+            classify_schema_object(object_name),
+            Some(SqliteAccessKind::Write),
+        )),
+        ffi::SQLITE_TRANSACTION => Some((
+            SqliteWorkloadCategory::Maintenance,
+            classify_transaction_access(object_name),
+        )),
+        ffi::SQLITE_SAVEPOINT
         | ffi::SQLITE_PRAGMA
         | ffi::SQLITE_ANALYZE
         | ffi::SQLITE_ATTACH
@@ -411,7 +452,7 @@ fn classify_authorizer_action(
         | ffi::SQLITE_DROP_INDEX
         | ffi::SQLITE_DROP_TRIGGER
         | ffi::SQLITE_DROP_VIEW
-        | ffi::SQLITE_DROP_VTABLE => Some(SqliteWorkloadCategory::Maintenance),
+        | ffi::SQLITE_DROP_VTABLE => Some((SqliteWorkloadCategory::Maintenance, None)),
         _ => None,
     }
 }
@@ -420,7 +461,7 @@ fn classify_schema_object(object_name: *const c_char) -> SqliteWorkloadCategory 
     if object_name.is_null() {
         return SqliteWorkloadCategory::Other;
     }
-    let Ok(name) = (unsafe { CStr::from_ptr(object_name) }).to_str() else {
+    let Some(name) = c_string(object_name) else {
         return SqliteWorkloadCategory::Other;
     };
     if is_fts_name(name) {
@@ -474,6 +515,24 @@ fn is_workflow_name(name: &str) -> bool {
         || name.starts_with("workflow_")
         || name.starts_with("wake_")
         || name.starts_with("direct_turn_")
+        || name.starts_with("durable_turn")
+}
+
+fn classify_transaction_access(object_name: *const c_char) -> Option<SqliteAccessKind> {
+    let Some(name) = c_string(object_name) else {
+        return None;
+    };
+    match name {
+        "BEGIN" | "COMMIT" | "ROLLBACK" => Some(SqliteAccessKind::Write),
+        _ => None,
+    }
+}
+
+fn c_string<'a>(raw: *const c_char) -> Option<&'a str> {
+    if raw.is_null() {
+        return None;
+    }
+    (unsafe { CStr::from_ptr(raw) }).to_str().ok()
 }
 
 fn is_runtime_state_name(name: &str) -> bool {
@@ -520,6 +579,21 @@ fn category_precedence(
     }
 }
 
+const fn access_precedence(
+    current: Option<SqliteAccessKind>,
+    incoming: Option<SqliteAccessKind>,
+) -> Option<SqliteAccessKind> {
+    match (current, incoming) {
+        (Some(SqliteAccessKind::Write), _) | (_, Some(SqliteAccessKind::Write)) => {
+            Some(SqliteAccessKind::Write)
+        }
+        (Some(SqliteAccessKind::Read), _) | (_, Some(SqliteAccessKind::Read)) => {
+            Some(SqliteAccessKind::Read)
+        }
+        (None, None) => None,
+    }
+}
+
 const fn category_rank(category: SqliteWorkloadCategory) -> u8 {
     match category {
         SqliteWorkloadCategory::Fts => 0,
@@ -559,7 +633,8 @@ fn unix_now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite_workload::operation_count;
+    use crate::SqliteLatencyBin;
+    use crate::SqliteOutcome;
     use crate::{Database, SqliteSnapshotWindow, SqliteWorkloadAggregateReport};
     use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
     use sqlx::{Connection, Execute, Executor, Statement};
@@ -702,6 +777,21 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn classifies_durable_turn_tables_as_durable_workflows() {
+        let durable_turn_state = CString::new("durable_turn_state").unwrap();
+        let durable_turn_events = CString::new("durable_turn_events").unwrap();
+
+        assert_eq!(
+            classify_schema_object(durable_turn_state.as_ptr()),
+            SqliteWorkloadCategory::DurableWorkflows
+        );
+        assert_eq!(
+            classify_schema_object(durable_turn_events.as_ptr()),
+            SqliteWorkloadCategory::DurableWorkflows
+        );
+    }
+
     #[tokio::test]
     async fn classifies_representative_domain_tables() {
         let db = Database::open_in_memory().await.unwrap();
@@ -724,22 +814,22 @@ mod tests {
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         assert!(
-            operation_count(
-                &report.outcomes
-                    [SqliteAccessKind::Read.index()][SqliteWorkloadCategory::RuntimeState.index()]
-            ) >= 1
+            report.totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::RuntimeState.index()]
+            .baseline_statement_count
+                >= 1
         );
         assert!(
-            operation_count(
-                &report.outcomes
-                    [SqliteAccessKind::Write.index()][SqliteWorkloadCategory::PrProjectData.index()]
-            ) >= 1
+            report.totals[SqliteAccessKind::Write.index()]
+                [SqliteWorkloadCategory::PrProjectData.index()]
+            .baseline_statement_count
+                >= 1
         );
         assert!(
-            operation_count(
-                &report.outcomes[SqliteAccessKind::Write.index()]
-                    [SqliteWorkloadCategory::DurableWorkflows.index()]
-            ) >= 1
+            report.totals[SqliteAccessKind::Write.index()]
+                [SqliteWorkloadCategory::DurableWorkflows.index()]
+            .baseline_statement_count
+                >= 1
         );
     }
 
@@ -747,14 +837,69 @@ mod tests {
     fn mixed_statement_uses_fts_precedence() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector);
-        context.note_prepare_category(SqliteWorkloadCategory::PrProjectData);
-        context.note_prepare_category(SqliteWorkloadCategory::MessagePersistence);
-        context.note_prepare_category(SqliteWorkloadCategory::Fts);
+        context.note_prepare_metadata(SqliteWorkloadCategory::PrProjectData, None);
+        context.note_prepare_metadata(SqliteWorkloadCategory::MessagePersistence, None);
+        context.note_prepare_metadata(SqliteWorkloadCategory::Fts, None);
 
         assert_eq!(
-            context.take_prepare_category_for_statement(8),
+            context.take_prepare_metadata_for_statement(8).category,
             SqliteWorkloadCategory::Fts
         );
+    }
+
+    #[test]
+    fn nested_select_callbacks_preserve_outer_prepare_category() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector);
+        context.note_prepare_metadata(SqliteWorkloadCategory::PrProjectData, None);
+        context.note_prepare_metadata(SqliteWorkloadCategory::Other, None);
+
+        assert_eq!(
+            context.take_prepare_metadata_for_statement(9).category,
+            SqliteWorkloadCategory::PrProjectData
+        );
+    }
+
+    #[test]
+    fn begin_commit_and_rollback_classify_as_write_access() {
+        let begin = CString::new("BEGIN").unwrap();
+        let commit = CString::new("COMMIT").unwrap();
+        let rollback = CString::new("ROLLBACK").unwrap();
+
+        assert_eq!(
+            classify_authorizer_action(ffi::SQLITE_TRANSACTION, begin.as_ptr()),
+            Some((
+                SqliteWorkloadCategory::Maintenance,
+                Some(SqliteAccessKind::Write)
+            ))
+        );
+        assert_eq!(
+            classify_authorizer_action(ffi::SQLITE_TRANSACTION, commit.as_ptr()),
+            Some((
+                SqliteWorkloadCategory::Maintenance,
+                Some(SqliteAccessKind::Write)
+            ))
+        );
+        assert_eq!(
+            classify_authorizer_action(ffi::SQLITE_TRANSACTION, rollback.as_ptr()),
+            Some((
+                SqliteWorkloadCategory::Maintenance,
+                Some(SqliteAccessKind::Write)
+            ))
+        );
+    }
+
+    #[test]
+    fn new_prepare_generation_replaces_metadata_at_reused_pointer() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector);
+        context.cache_statement_metadata(8, SqliteWorkloadCategory::PrProjectData, None);
+        context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
+
+        let metadata = context.take_prepare_metadata_for_statement(8);
+        assert_eq!(metadata.category, SqliteWorkloadCategory::Fts);
+        assert_eq!(metadata.access, Some(SqliteAccessKind::Read));
+        assert_eq!(context.lookup_statement_metadata(8), Some(metadata));
     }
 
     #[tokio::test]
@@ -779,10 +924,10 @@ mod tests {
         stmt.query().fetch_all(&mut conn).await.unwrap();
         let report = report_now(&collector);
         assert!(
-            operation_count(
-                &report.outcomes
-                    [SqliteAccessKind::Read.index()][SqliteWorkloadCategory::PrProjectData.index()]
-            ) >= 2
+            report.totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::PrProjectData.index()]
+            .baseline_statement_count
+                >= 2
         );
     }
 
@@ -805,10 +950,9 @@ mod tests {
             .unwrap();
         let report = report_now(&collector);
         assert!(
-            operation_count(
-                &report.outcomes[SqliteAccessKind::Write.index()]
-                    [SqliteWorkloadCategory::Other.index()]
-            ) >= 1
+            report.totals[SqliteAccessKind::Write.index()][SqliteWorkloadCategory::Other.index()]
+                .baseline_statement_count
+                >= 1
         );
     }
 
@@ -818,15 +962,140 @@ mod tests {
         let mut context = NativeStatementCallbackContext::new(collector.clone());
         let first = 8usize;
         let collision = first + (STATEMENT_CACHE_SIZE << 3);
-        context.cache_statement_category(first, SqliteWorkloadCategory::Fts);
-        context.cache_statement_category(collision, SqliteWorkloadCategory::DurableWorkflows);
+        context.cache_statement_metadata(first, SqliteWorkloadCategory::Fts, None);
+        context.cache_statement_metadata(collision, SqliteWorkloadCategory::DurableWorkflows, None);
 
-        assert_eq!(context.lookup_statement_category(first), None);
+        assert!(context.lookup_statement_metadata(first).is_none());
         assert_eq!(
-            context.lookup_statement_category(collision),
+            context
+                .lookup_statement_metadata(collision)
+                .map(|metadata| metadata.category),
             Some(SqliteWorkloadCategory::Other)
         );
         assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn native_profile_records_baseline_without_outcome_or_unmeasured_waits() {
+        let collector = SqliteWorkloadCollector::new();
+        collector.record(SqliteObservation {
+            completed_at_unix_micros: unix_now_micros(),
+            category: SqliteWorkloadCategory::Other,
+            access: SqliteAccessKind::Write,
+            latency: Duration::from_millis(3),
+            pool_wait: Duration::from_millis(7),
+            write_admission_wait: Duration::from_millis(11),
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::ZERO,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: 0,
+            counting: SqliteObservationCounting::BaselineStatement,
+        });
+
+        let report = report_now(&collector);
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::Other.index();
+        let totals = report.totals[access][category];
+        assert_eq!(operation_count(&report.outcomes[access][category]), 0);
+        assert_eq!(totals.pool_wait_micros, 0);
+        assert_eq!(totals.write_admission_wait_micros, 0);
+        assert_eq!(
+            report.pool_wait_histogram[access][category]
+                [SqliteLatencyBin::from_duration(Duration::from_millis(7)).index()],
+            0
+        );
+        assert_eq!(
+            report.write_admission_wait_histogram[access][category]
+                [SqliteLatencyBin::from_duration(Duration::from_millis(11)).index()],
+            0
+        );
+        assert_eq!(
+            report.latency_histogram[access][category]
+                [SqliteLatencyBin::from_duration(Duration::from_millis(3)).index()],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn native_constraint_failure_does_not_fabricate_success_outcome() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut conn, collector.clone())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE constrained (id INTEGER PRIMARY KEY, value TEXT UNIQUE)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO constrained (value) VALUES ('same')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let before = report_now(&collector);
+        assert!(
+            sqlx::query("INSERT INTO constrained (value) VALUES ('same')")
+                .execute(&mut conn)
+                .await
+                .is_err()
+        );
+        let after = report_now(&collector);
+        let success_before: u64 = before
+            .outcomes
+            .iter()
+            .flat_map(|categories| categories.iter())
+            .map(|outcomes| outcomes[SqliteOutcome::Success.index()])
+            .sum();
+        let success_after: u64 = after
+            .outcomes
+            .iter()
+            .flat_map(|categories| categories.iter())
+            .map(|outcomes| outcomes[SqliteOutcome::Success.index()])
+            .sum();
+        assert_eq!(success_after, success_before);
+        assert!(
+            after
+                .totals
+                .iter()
+                .flat_map(|categories| categories.iter())
+                .map(|totals| totals.baseline_statement_count)
+                .sum::<u64>()
+                >= before
+                    .totals
+                    .iter()
+                    .flat_map(|categories| categories.iter())
+                    .map(|totals| totals.baseline_statement_count)
+                    .sum::<u64>()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_control_profiles_as_write_access() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut conn, collector.clone())
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let report = report_now(&collector);
+        let write_baseline: u64 = report.totals[SqliteAccessKind::Write.index()]
+            .iter()
+            .map(|totals| totals.baseline_statement_count)
+            .sum();
+        assert!(write_baseline >= 2);
     }
 
     #[tokio::test]

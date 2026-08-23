@@ -758,15 +758,13 @@ fn classification_summary(
             let totals = report.totals[access.index()][category.index()];
             let outcomes = &report.outcomes[access.index()][category.index()];
             let operation_count = crate::db::operation_count(outcomes);
-            classified_operation_count =
-                classified_operation_count.saturating_add(operation_count);
+            classified_operation_count = classified_operation_count.saturating_add(operation_count);
             baseline_statement_count =
                 baseline_statement_count.saturating_add(totals.baseline_statement_count);
-            abandoned_count = abandoned_count
-                .saturating_add(outcomes[SqliteOutcome::Abandoned.index()]);
+            abandoned_count =
+                abandoned_count.saturating_add(outcomes[SqliteOutcome::Abandoned.index()]);
             if category == SqliteWorkloadCategory::Other {
-                other_operation_count =
-                    other_operation_count.saturating_add(operation_count);
+                other_operation_count = other_operation_count.saturating_add(operation_count);
             }
         }
     }
