@@ -22,12 +22,18 @@ export type Gesture =
       kind: 'touch';
       moved: boolean;
       departedBottom: boolean;
-      /** Farthest the viewport has been from the tail during this
-       *  interaction. Monotone: it only ever grows, so there is no revocation
-       *  to forget and a missed update can only withhold a confirmation,
-       *  never manufacture one. Ending nearer the tail than this maximum is
-       *  what makes an arrival distinguishable from never having moved. */
-      maxDistanceFromTail: number;
+      /** Whether the reader has moved the viewport toward the tail during
+       *  this interaction. Monotone: it is only ever set, so there is no
+       *  revocation to forget and a missed update can withhold a
+       *  confirmation but never manufacture one.
+       *
+       *  This is a fact about observed movement, not about geometry. Distance
+       *  from the tail is not, on its own, evidence of anything the reader
+       *  did: content growing or collapsing moves the tail independently of
+       *  the viewport, so comparing distances measured at two moments cannot
+       *  distinguish a reader who travelled from a reader who stood still
+       *  while the content rearranged itself around them. */
+      travelledTowardTail: boolean;
       modeBeforeGesture: FollowMode;
     };
 
@@ -140,13 +146,9 @@ function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): Scr
   };
 }
 
-/** Record geometry from an event that did not move the viewport under the
- *  reader: a layout change, a settle probe, an echo of the executor's own
- *  write. The travel maximum is deliberately left alone. Distance from the
- *  tail also grows when the tail grows away from a stationary finger, and
- *  crediting that as travel would manufacture the very evidence the lift
- *  derivation treats as proof the reader went somewhere and came back. */
-function observeLayout(
+/** Record geometry without asserting anything about what the reader did.
+ *  Every event that is not observed downward movement lands here. */
+function observeGeometry(
   state: ReadySession,
   snapshot: ScrollSnapshot | null,
   totalHeight?: number,
@@ -157,26 +159,16 @@ function observeLayout(
   return { ...state, geometry };
 }
 
-/** Record geometry from an event that moved the viewport under the reader,
- *  raising the gesture's travel maximum to match. Only user movement reaches
- *  here, so the maximum stays a measure of where the reader took the
- *  viewport rather than of what the content did around it. */
-function observeTravel(
+/** Record geometry from movement that carried the viewport toward the tail.
+ *  This is the sole writer of the gesture's travel evidence, so no layout
+ *  change, settle probe, or echo of the executor's own writes can supply it. */
+function observeTravelTowardTail(
   state: ReadySession,
   snapshot: ScrollSnapshot | null,
 ): ReadySession {
-  const observed = observeLayout(state, snapshot);
+  const observed = observeGeometry(state, snapshot);
   if (observed.gesture.kind !== 'touch') return observed;
-  return {
-    ...observed,
-    gesture: {
-      ...observed.gesture,
-      maxDistanceFromTail: Math.max(
-        observed.gesture.maxDistanceFromTail,
-        distanceFromTail(observed.geometry),
-      ),
-    },
-  };
+  return { ...observed, gesture: { ...observed.gesture, travelledTowardTail: true } };
 }
 
 function updateGeometry(
@@ -233,7 +225,7 @@ function takeUserOwnership(
   state: ReadySession,
   snapshot?: ScrollSnapshot,
 ): Reduction {
-  const observed = snapshot ? observeTravel(state, snapshot) : state;
+  const observed = snapshot ? observeGeometry(state, snapshot) : state;
   const session: MeasuredSession = {
     conversationId: observed.conversationId,
     geometry: observed.geometry,
@@ -322,15 +314,15 @@ function resolveTouch(
     gesture: IDLE,
     unread: state.unread,
   };
-  // A gesture that ends inside the return zone having travelled toward the
-  // tail is an arrival; one that ends there having travelled away from it is
-  // a reader who stopped short (scroll_policy.allium
+  // A gesture that moved the viewport toward the tail and ends inside the
+  // return zone is an arrival; one that ends there without having travelled
+  // is a reader the content drifted underneath, or one whose finger never
+  // shifted anything (scroll_policy.allium
   // GestureEndTowardTailConfirmsTailReturn).
-  const endDistance = distanceFromTail(state.geometry);
   if (
     follow.kind === 'reading'
-    && endDistance <= PIN_TO_BOTTOM_THRESHOLD
-    && endDistance < state.gesture.maxDistanceFromTail
+    && state.gesture.travelledTowardTail
+    && distanceFromTail(state.geometry) <= PIN_TO_BOTTOM_THRESHOLD
   ) {
     return confirmTailReturn({ ...session, kind: 'live', follow });
   }
@@ -419,7 +411,7 @@ export function reduceScrollMachine(
     case 'scrollerAttached':
       if (!isReady(state)) return { state, effects: [] };
       return {
-        state: observeLayout(state, event.snapshot),
+        state: observeGeometry(state, event.snapshot),
         effects: [],
       };
 
@@ -473,7 +465,7 @@ export function reduceScrollMachine(
               kind: 'touch',
               moved: false,
               departedBottom: !state.geometry.atBottom,
-              maxDistanceFromTail: distanceFromTail(state.geometry),
+              travelledTowardTail: false,
               modeBeforeGesture: follow,
             },
         unread: state.unread,
@@ -508,7 +500,7 @@ export function reduceScrollMachine(
       if (!isReady(state)) return { state, effects: [] };
       const departed: ReadySession = state;
       if (departed.kind === 'live' && departed.follow.kind === 'navigating') {
-        return { state: observeTravel(departed, event.snapshot ?? null), effects: [] };
+        return { state: observeGeometry(departed, event.snapshot ?? null), effects: [] };
       }
       return takeUserOwnership(departed, event.snapshot);
     }
@@ -522,7 +514,7 @@ export function reduceScrollMachine(
     case 'downwardMovement': {
       if (!isReady(state)) return { state, effects: [] };
       const arrived = snapshotIsPinned(event.snapshot);
-      const next: ReadySession = observeTravel(state, event.snapshot);
+      const next: ReadySession = observeTravelTowardTail(state, event.snapshot);
       // Level-triggered: scroll_policy.allium DownwardArrivalAtBottomConfirmsTailReturn
       if (
         next.kind === 'live' &&
@@ -544,7 +536,7 @@ export function reduceScrollMachine(
     case 'heightChanged': {
       if (!isReady(state)) return { state, effects: [] };
       const previousTotalHeight = state.geometry.previousTotalHeight;
-      const nextState = observeLayout(state, event.snapshot, event.totalHeight);
+      const nextState = observeGeometry(state, event.snapshot, event.totalHeight);
       if (event.unitCount === 0 || event.snapshot === null) {
         return { state: nextState, effects: [] };
       }
@@ -581,7 +573,7 @@ export function reduceScrollMachine(
         event.snapshot.scrollHeight - event.snapshot.scrollTop - event.snapshot.clientHeight > 1
       ) {
         return {
-          state: observeLayout(state, event.snapshot),
+          state: observeGeometry(state, event.snapshot),
           effects: [{ type: 'writeDomBottom' }],
         };
       }

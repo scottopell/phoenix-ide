@@ -316,6 +316,25 @@ describe('scrollMachine durable follow policy', () => {
     expectLiveMode(result.state, 'reading');
   });
 
+  it('content shrinking toward a held touch is not travel and does not confirm on lift', () => {
+    // The mirror of the growth case: the reader is 500px up, holds still, and
+    // content below them collapses until the tail is 50px away. The viewport
+    // never moved, so the gesture ending near the tail is the content's doing
+    // and must not hand the viewport back.
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 550,
+      unitCount: 5,
+      snapshot: snap(550, 100, 400),
+      tailActivity: 'none',
+    }).state;
+
+    const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
+    expectLiveMode(result.state, 'reading');
+  });
+
   it('a gesture that departs the tail and returns to it confirms on lift', () => {
     // The same start and end position as the case above; only the travel in
     // between distinguishes them, which is why the maximum is recorded.

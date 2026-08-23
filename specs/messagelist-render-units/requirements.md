@@ -407,21 +407,23 @@ than lost with the callback that produced it, while a drag that stops short
 of the tail — or one that never moved the viewport at all, which iOS
 produces whenever touch movement outruns scroll events — keeps the viewport
 
-THE SYSTEM SHALL derive that condition at the lift from the distance the
-viewport travelled, recording only the greatest distance from the tail
-reached during the gesture
+THE SYSTEM SHALL derive that condition at the lift from whether observed
+movement carried the viewport toward the tail during the gesture
 AND SHALL NOT maintain revocable evidence of having arrived
 SO THAT no event is responsible for invalidating state it did not create:
-the recorded maximum only grows within a gesture, and an update missed
+the evidence is only ever set within a gesture, and an update missed
 anywhere can withhold a confirmation but never manufacture one
 
-THE SYSTEM SHALL raise that maximum only from observations that report the
-viewport moving under the reader
-AND SHALL NOT raise it from layout changes, settle probes, or echoes of its
+THE SYSTEM SHALL record that evidence only from observed movement toward the
+tail
+AND SHALL NOT record it from layout changes, settle probes, or echoes of its
 own position writes
-SO THAT content growing away from a stationary finger — which increases
-distance from the tail without the reader travelling anywhere — cannot
-supply the departure the lift derivation treats as proof of a return
+AND SHALL NOT infer it from distance to the tail measured at two moments
+SO THAT content moving beneath a stationary finger — growing away from the
+reader, or collapsing until the tail is close — cannot supply the travel the
+lift derivation treats as proof of a return, since the tail moves
+independently of the viewport and a change in distance is therefore not
+evidence of anything the reader did
 
 WHEN scroll movement is classified as upward or downward intent
 THE SYSTEM SHALL clamp the observed scroll position into the scrollable

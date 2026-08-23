@@ -39,14 +39,21 @@ entity ScrollPolicy {
     -- current event carries rather than from the pinned callback: a snapshot
     -- cannot go stale waiting for an edge that is never delivered.
     distance_from_tail: Integer
-    -- Farthest the viewport has been from the tail during the current
-    -- interaction. Monotone within a gesture: it only grows, so no event has
-    -- to remember to revoke it, and a missed update can only withhold a
-    -- confirmation rather than manufacture one. Ending nearer the tail than
-    -- this maximum is what separates an arrival from a gesture that never
-    -- moved the viewport at all — the two are otherwise indistinguishable by
-    -- position, since both can begin and end at the tail.
-    gesture_max_distance_from_tail: Integer
+    -- Whether observed movement has carried the viewport toward the tail
+    -- during the current interaction. Monotone within a gesture: it is only
+    -- ever set, so no event has to remember to revoke it, and a missed
+    -- update can only withhold a confirmation rather than manufacture one.
+    -- This is what separates an arrival from a gesture that never moved the
+    -- viewport at all — the two are otherwise indistinguishable by position,
+    -- since both can begin and end at the tail.
+    --
+    -- It records movement rather than geometry deliberately. Distance from
+    -- the tail is not evidence of anything the reader did: content growing
+    -- or collapsing moves the tail independently of the viewport, so
+    -- comparing distances measured at two moments cannot tell a reader who
+    -- travelled from one who stood still while the content rearranged itself
+    -- around them.
+    travelled_toward_tail: Boolean
     -- Physical tail edge, mirroring the virtual transcript's pinned
     -- callback and written by nothing else. Pin-zone membership is a
     -- separate question, derived per event from that event's snapshot at
@@ -215,29 +222,37 @@ rule DownwardArrivalAtBottomKeepsMountRescueActive {
     ensures: policy.lifecycle = mount_rescue
 }
 
--- The maximum measures where the reader took the viewport, so only the two
--- events that report viewport movement may raise it.
-rule DownwardObservationRaisesGestureTravelMaximum {
+-- Observed downward movement is the sole writer of the gesture's travel
+-- evidence. Every other event either reports movement away from the tail or
+-- reports no movement at all, and neither is evidence of a return.
+rule DownwardObservationRecordsTravelTowardTail {
     when: DownwardMovement(policy, snapshot)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
-    ensures: policy.gesture_max_distance_from_tail >= snapshot.distance_from_tail
+    ensures: policy.travelled_toward_tail = true
 }
 
-rule UpwardObservationRaisesGestureTravelMaximum {
+rule UpwardObservationPreservesTravelEvidence {
     when: UpwardIntent(policy, snapshot)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
-    ensures: policy.gesture_max_distance_from_tail >= snapshot.distance_from_tail
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
 }
 
--- Distance from the tail also grows when the tail grows away from a
--- stationary finger, and shrinks again when that content reflows. Crediting
--- either to the gesture would let layout manufacture the strict inequality
--- the lift derivation reads as proof the reader departed and came back, so a
--- height change records geometry and leaves the maximum alone.
-rule LayoutObservationPreservesGestureTravelMaximum {
+-- A height change moves the tail, not the viewport. Crediting it would let
+-- content collapsing below a held finger — or growing and reflowing back
+-- above one — supply the evidence the lift reads as proof the reader
+-- travelled, so layout records geometry and leaves the evidence alone.
+rule LayoutObservationPreservesTravelEvidence {
     when: HeightChanged(policy, total_height, unit_count, snapshot, tail_activity)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
-    ensures: policy.gesture_max_distance_from_tail = policy.gesture_max_distance_from_tail
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
+}
+
+-- Once set, the evidence stands for the rest of the interaction: a later
+-- observation nearer the tail cannot retract a departure that was seen.
+rule TravelEvidenceIsNeverWithdrawnWithinAGesture {
+    when: DownwardMovement(policy, snapshot)
+    requires: policy.travelled_toward_tail = true
+    ensures: policy.travelled_toward_tail = true
 }
 
 rule NavigationBeforeMeasurementRemainsPending {
@@ -379,7 +394,7 @@ rule LiveTouchStartRemembersFollowMode {
     requires: policy.gesture_mode = idle
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = policy.follow_mode
-    ensures: policy.gesture_max_distance_from_tail = policy.distance_from_tail
+    ensures: policy.travelled_toward_tail = false
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
 }
 
@@ -391,7 +406,7 @@ rule AdditionalTouchExtendsGestureWithoutResettingEvidence {
     when: TouchStarted(policy)
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     ensures: policy.gesture_mode = policy.gesture_mode
-    ensures: policy.gesture_max_distance_from_tail = policy.gesture_max_distance_from_tail
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
     ensures: policy.mode_before_gesture = policy.mode_before_gesture
 }
 
@@ -402,7 +417,7 @@ rule MountTouchStartExitsRescueAndRemembersFollowing {
     ensures: policy.follow_mode = following
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = following
-    ensures: policy.gesture_max_distance_from_tail = policy.distance_from_tail
+    ensures: policy.travelled_toward_tail = false
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
@@ -414,11 +429,17 @@ rule TouchMovementTakesReadingOwnership {
     ensures: policy.follow_mode = reading
 }
 
+-- A stationary lift restores what the gesture began with, including reading:
+-- a tap is not a reason to take a reader's viewport, and it is not a reason
+-- to give one back either. The exception is a stationary touch that braked a
+-- moving viewport into the return zone, which the confirmation rule below
+-- claims; the preconditions are complementary, so exactly one applies.
 rule TapEndRestoresPreGestureMode {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
-    requires: policy.mode_before_gesture != reading
+    requires: policy.travelled_toward_tail = false
+             or policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = policy.mode_before_gesture
 }
@@ -434,8 +455,24 @@ rule GestureEndTowardTailConfirmsTailReturn {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
+    requires: policy.travelled_toward_tail = true
     requires: policy.distance_from_tail <= config.pin_to_bottom_threshold
-    requires: policy.distance_from_tail < policy.gesture_max_distance_from_tail
+    ensures: policy.gesture_mode = idle
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+-- A cancellation ends the interaction exactly as a lift does. The platform
+-- chooses between them for reasons of its own — a system gesture taking
+-- over, a scroll container claiming the pan — and none of those reasons is
+-- about where the reader left the viewport.
+rule GestureCancellationTowardTailConfirmsTailReturn {
+    when: TouchCancelled(policy, remaining_touches)
+    requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
+    requires: policy.travelled_toward_tail = true
+    requires: policy.distance_from_tail <= config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
@@ -446,7 +483,7 @@ rule GestureEndWithoutTravelTowardTailKeepsOwnership {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.distance_from_tail >= policy.gesture_max_distance_from_tail
+    requires: policy.travelled_toward_tail = false
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
@@ -472,7 +509,8 @@ rule StationaryTouchCancellationRestoresPreGestureMode {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_stationary
-    requires: policy.mode_before_gesture != reading
+    requires: policy.travelled_toward_tail = false
+             or policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = policy.mode_before_gesture
 }
@@ -481,7 +519,16 @@ rule MovedTouchCancellationPreservesReadingOwnership {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
-    requires: policy.distance_from_tail >= policy.gesture_max_distance_from_tail
+    requires: policy.travelled_toward_tail = false
+    ensures: policy.gesture_mode = idle
+    ensures: policy.follow_mode = reading
+}
+
+rule MovedTouchCancellationOutsideReturnZoneKeepsOwnership {
+    when: TouchCancelled(policy, remaining_touches)
+    requires: remaining_touches = 0
+    requires: policy.gesture_mode = touch_moved
+    requires: policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
@@ -764,17 +811,16 @@ invariant MountRescueHasBoundedDeadline {
         policy.lifecycle = mount_rescue implies policy.settle_deadline > 0
 }
 
--- The travelled maximum is never lowered within an interaction; only a new
--- interaction reseeds it. That is what makes it safe to read at the lift
+-- Travel evidence is never withdrawn within an interaction; only a new
+-- interaction clears it. That is what makes it safe to read at the lift
 -- without any event having been responsible for keeping it current.
 --
--- Monotonicity is a property of which transitions may write the maximum, not
--- of any single state, and it is carried by the three observation rules
--- above rather than by a predicate here. It deliberately cannot be stated as
--- `maximum >= distance_from_tail`: layout moves the tail independently of
--- the reader, so a stationary finger under growing content sits farther from
--- the tail than it ever travelled, and a bound over current geometry would
--- oblige the maximum to follow content it must ignore.
+-- Monotonicity is a property of which transitions may write the evidence,
+-- not of any single state, so it is carried by the observation rules above
+-- rather than by a predicate here. There is deliberately no invariant
+-- relating the evidence to distance_from_tail in either direction: layout
+-- moves the tail independently of the reader, so any bound over current
+-- geometry would oblige the evidence to follow content it must ignore.
 
 invariant MovedTouchOwnsViewport {
     for policy in ScrollPolicy:

@@ -181,8 +181,9 @@ function normalizeRange(range: TranscriptRange | null): VirtualTranscriptRange |
 }
 
 function computeVisibleRange<T>(store: PhysicalStore<T>): TranscriptRange | null {
-  const viewportStart = Math.max(store.viewportTop, store.headerExtent + store.drift);
-  const viewportEnd = Math.min(store.viewportTop + store.viewportExtent, totalPhysicalExtent(store));
+  const settledTop = settledViewportTop(store);
+  const viewportStart = Math.max(settledTop, store.headerExtent + store.drift);
+  const viewportEnd = Math.min(settledTop + store.viewportExtent, totalPhysicalExtent(store));
   const clippedExtent = viewportEnd - viewportStart;
   if (clippedExtent <= 0) return null;
   return store.layout.rangeForViewport({
@@ -220,7 +221,7 @@ function buildPhysicalSnapshot<T>(
   return {
     ...baseSnapshot,
     targetIndex,
-    targetOffset: offset === undefined ? null : offset - store.viewportTop,
+    targetOffset: offset === undefined ? null : offset - settledViewportTop(store),
     targetMeasured: store.measuredExtents.has(key) && (!targetSelector || targetElement !== null),
   };
 }
@@ -298,8 +299,23 @@ function totalPhysicalExtent<T>(store: PhysicalStore<T>): number {
   return store.headerExtent + store.layout.totalExtent + store.drift;
 }
 
+/** Where the viewport comes to rest once the correction it is already owed
+ *  has been written.
+ *
+ *  Drift reconciliation removes the spacer shift and writes the equivalent
+ *  scroll position in two commits, and between them the transcript has lost
+ *  extent the viewport has not yet given back. Every question about where
+ *  the reader is relative to the content — tail proximity, which rows are
+ *  visible, how far a target sits from the viewport start — must be answered
+ *  about the settled position, or the intermediate becomes observable as a
+ *  move the reader never made. Only the writer of the scroll position reads
+ *  the raw field. */
+function settledViewportTop<T>(store: PhysicalStore<T>): number {
+  return store.viewportTop + (store.pendingScrollDelta ?? 0);
+}
+
 function rowViewportOffset<T>(store: PhysicalStore<T>): number {
-  return Math.max(0, store.viewportTop - store.headerExtent - store.drift);
+  return Math.max(0, settledViewportTop(store) - store.headerExtent - store.drift);
 }
 
 function itemPhysicalOffset<T>(store: PhysicalStore<T>, index: number): number | undefined {
@@ -314,14 +330,7 @@ function itemPhysicalEnd<T>(store: PhysicalStore<T>, index: number): number | un
 
 function computePinned<T>(store: PhysicalStore<T>): boolean {
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
-  // Drift reconciliation clears the spacer shift and writes the equivalent
-  // scroll position in two commits. Reading viewportTop raw between them
-  // measures a viewport that has lost the extent but not yet moved, which
-  // reports pinned for a reader who never approached the tail. The pending
-  // delta is exactly the move still owed, so counting it keeps the answer
-  // continuous across a correction that preserves position by construction.
-  const settledTop = store.viewportTop + (store.pendingScrollDelta ?? 0);
-  return maxScrollTop - settledTop <= PINNED_EPSILON;
+  return maxScrollTop - settledViewportTop(store) <= PINNED_EPSILON;
 }
 
 function computeRange<T>(store: PhysicalStore<T>): TranscriptRange | null {

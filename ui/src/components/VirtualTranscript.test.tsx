@@ -649,6 +649,57 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it('never publishes a visible range the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      const ranges: Array<{ startIndex: number; endIndex: number } | null> = [];
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onRangeChange={(snapshot) => ranges.push(snapshot.visibleRange)}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 4 }], changedTouches: [{ identifier: 4 }] });
+      });
+      const settled = ranges.at(-1);
+      ranges.length = 0;
+
+      // The same position-preserving correction as the pinned case. The
+      // reader sees the same rows throughout, so the published range must say
+      // so at every step: an intermediate range is evidence a positioning
+      // command can be acknowledged from, and REQ-VT-005 admits only
+      // observations of the position that actually holds.
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 4 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      expect(scrollTopOf(scroller)).toBe(1350);
+      expect(ranges.every((range) => JSON.stringify(range) === JSON.stringify(settled))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {
