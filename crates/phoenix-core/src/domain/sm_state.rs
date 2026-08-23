@@ -69,56 +69,6 @@ pub struct SubmitErrorInput {
     pub error: String,
 }
 
-/// Input for the `commission_review` tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommissionReviewInput {
-    pub brief: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub focus: Option<String>,
-}
-
-/// Runtime-owned execution payload for an approved `commission_review` request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovedCommissionReviewInput {
-    #[serde(flatten)]
-    pub request: CommissionReviewInput,
-    pub runtime_base_branch: Option<String>,
-    pub approved_working_dir: String,
-    pub approved_worktree_path: Option<String>,
-    pub approved_head: Option<String>,
-    pub approved_base: Option<String>,
-}
-
-/// Inferred scope shown before a `commission_review` approval decision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommissionReviewApprovalScope {
-    pub kind: String,
-    pub repo_root: String,
-    pub base: String,
-    pub head: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved_head: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved_base: Option<String>,
-    pub dirty: bool,
-    pub changed_files: usize,
-    pub insertions: u64,
-    pub deletions: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommissionReviewApprovalAvailability {
-    Available(CommissionReviewApprovalScope),
-    Unavailable { reason: String },
-}
-
-/// User decision for a pending `commission_review` request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CommissionReviewApprovalOutcome {
-    Approved,
-    Rejected,
-}
-
 /// Input for the `propose_task` tool (task approval workflow).
 ///
 /// The agent passes a path (relative to the repo root) to an existing task
@@ -188,8 +138,6 @@ pub enum ToolInput {
     SpawnAgents(SpawnAgentsInput),
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
-    CommissionReview(CommissionReviewInput),
-    ApprovedCommissionReview(ApprovedCommissionReviewInput),
     ProposeTask(ProposeTaskInput),
     AskUserQuestion(AskUserQuestionInput),
     /// The tool name did not match any registered tool. Carries the original
@@ -325,12 +273,6 @@ impl<'de> Deserialize<'de> for ToolInput {
             "submit_error" => {
                 parse_tool_input_or_malformed::<SubmitErrorInput>("submit_error", payload)
             }
-            "commission_review" => {
-                parse_tool_input_or_malformed::<CommissionReviewInput>("commission_review", payload)
-            }
-            "approved_commission_review" => parse_tool_input_or_malformed::<
-                ApprovedCommissionReviewInput,
-            >("approved_commission_review", payload),
             "propose_task" => {
                 parse_tool_input_or_malformed::<ProposeTaskInput>("propose_task", payload)
             }
@@ -399,16 +341,6 @@ impl From<SubmitErrorInput> for ToolInput {
         ToolInput::SubmitError(input)
     }
 }
-impl From<CommissionReviewInput> for ToolInput {
-    fn from(input: CommissionReviewInput) -> Self {
-        ToolInput::CommissionReview(input)
-    }
-}
-impl From<ApprovedCommissionReviewInput> for ToolInput {
-    fn from(input: ApprovedCommissionReviewInput) -> Self {
-        ToolInput::ApprovedCommissionReview(input)
-    }
-}
 impl From<ProposeTaskInput> for ToolInput {
     fn from(input: ProposeTaskInput) -> Self {
         ToolInput::ProposeTask(input)
@@ -439,9 +371,6 @@ impl ToolInput {
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
-            ToolInput::CommissionReview(_) | ToolInput::ApprovedCommissionReview(_) => {
-                "commission_review"
-            }
             ToolInput::ProposeTask(_) => "propose_task",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
             ToolInput::Unknown { name, .. } | ToolInput::Malformed { name, .. } => name,
@@ -466,12 +395,6 @@ impl ToolInput {
             ToolInput::SpawnAgents(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
-            ToolInput::CommissionReview(input) => {
-                serde_json::to_value(input).unwrap_or(Value::Null)
-            }
-            ToolInput::ApprovedCommissionReview(input) => {
-                serde_json::to_value(input).unwrap_or(Value::Null)
-            }
             ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::Unknown { input, .. } | ToolInput::Malformed { input, .. } => input.clone(),
@@ -535,8 +458,6 @@ impl ToolInput {
             "spawn_agents" => parse::<SpawnAgentsInput>(name, value),
             "submit_result" => parse::<SubmitResultInput>(name, value),
             "submit_error" => parse::<SubmitErrorInput>(name, value),
-            "commission_review" => parse::<CommissionReviewInput>(name, value),
-            "approved_commission_review" => parse::<ApprovedCommissionReviewInput>(name, value),
             "propose_task" => parse::<ProposeTaskInput>(name, value),
             "ask_user_question" => parse::<AskUserQuestionInput>(name, value),
             _ => ToolInput::Unknown {
@@ -588,6 +509,19 @@ mod tests {
         assert_eq!(name, "bash");
         assert_eq!(input["op"], "run");
         assert_eq!(input["command"], "bad");
+    }
+
+    #[test]
+    fn retired_commission_review_input_is_an_unknown_tool() {
+        let payload = serde_json::json!({"brief": "Review before merge"});
+        let parsed = ToolInput::from_name_and_value("commission_review", payload.clone());
+        assert_eq!(
+            parsed,
+            ToolInput::Unknown {
+                name: "commission_review".to_string(),
+                input: payload,
+            }
+        );
     }
 
     #[test]
@@ -942,7 +876,6 @@ mod tests {
                 | ConvState::AwaitingContinuation { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
-                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
                 | ConvState::Terminal => false,
@@ -1303,14 +1236,6 @@ pub enum ConvState {
         tool_use_id: String,
     },
 
-    /// Awaiting human approval before spending review tokens for `commission_review`.
-    AwaitingCommissionReviewApproval {
-        tool_use_id: String,
-        request: CommissionReviewInput,
-        scope: CommissionReviewApprovalScope,
-        assistant_message: AssistantMessage,
-    },
-
     /// Context window exhausted - conversation is read-only
     ContextExhausted {
         /// The continuation summary
@@ -1412,12 +1337,6 @@ pub enum ParentState {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
     },
-    AwaitingCommissionReviewApproval {
-        tool_use_id: String,
-        request: CommissionReviewInput,
-        scope: CommissionReviewApprovalScope,
-        assistant_message: AssistantMessage,
-    },
     ContextExhausted {
         summary: String,
     },
@@ -1478,17 +1397,6 @@ impl From<ParentState> for ConvState {
             } => ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
-            },
-            ParentState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                scope,
-                assistant_message,
-            } => ConvState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                scope,
-                assistant_message,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
             ParentState::HandedOff { successor_conv_id } => {
@@ -1703,17 +1611,6 @@ impl TryFrom<ConvState> for ParentState {
                 questions,
                 tool_use_id,
             }),
-            ConvState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                scope,
-                assistant_message,
-            } => Ok(ParentState::AwaitingCommissionReviewApproval {
-                tool_use_id,
-                request,
-                scope,
-                assistant_message,
-            }),
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })
             }
@@ -1820,7 +1717,6 @@ impl TryFrom<ConvState> for SubAgentState {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal => Err(StateConversionError {
@@ -1858,9 +1754,6 @@ impl ParentState {
             ParentState::AwaitingRecovery { .. } => "AwaitingRecovery",
             ParentState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ParentState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
-            ParentState::AwaitingCommissionReviewApproval { .. } => {
-                "AwaitingCommissionReviewApproval"
-            }
             ParentState::ContextExhausted { .. } => "ContextExhausted",
             ParentState::HandedOff { .. } => "HandedOff",
             ParentState::Terminal => "Terminal",
@@ -2025,7 +1918,6 @@ impl ConvState {
                 | ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::AwaitingTaskApproval { .. }
-                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::AwaitingRecovery { .. }
         )
     }
@@ -2076,7 +1968,6 @@ impl ConvState {
             | Self::AwaitingContinuation { .. }
             | Self::AwaitingTaskApproval { .. }
             | Self::AwaitingUserResponse { .. }
-            | Self::AwaitingCommissionReviewApproval { .. }
             | Self::ContextExhausted { .. }
             | Self::HandedOff { .. }
             | Self::Terminal => None,
@@ -2112,9 +2003,6 @@ impl ConvState {
             ConvState::HandedOff { .. } => "HandedOff",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
-            ConvState::AwaitingCommissionReviewApproval { .. } => {
-                "AwaitingCommissionReviewApproval"
-            }
             ConvState::Terminal => "Terminal",
         }
     }
@@ -2156,8 +2044,7 @@ impl ConvState {
             | ConvState::AwaitingContinuation { .. }
             | ConvState::RecoverableContinuationFailure { .. }
             | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. } => StepResult::Continue,
+            | ConvState::AwaitingUserResponse { .. } => StepResult::Continue,
         }
     }
 
@@ -2176,7 +2063,6 @@ impl ConvState {
             | ConvState::RecoverableContinuationFailure { .. } => "error",
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
             ConvState::CreationCancelled { .. }
             | ConvState::HandedOff { .. }
@@ -2204,9 +2090,9 @@ impl ConvState {
             ConvState::CreationFailed { .. }
             | ConvState::Error { .. }
             | ConvState::RecoverableContinuationFailure { .. } => DisplayState::Error,
-            ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,
+            ConvState::AwaitingTaskApproval { .. } | ConvState::AwaitingUserResponse { .. } => {
+                DisplayState::AwaitingApproval
+            }
             ConvState::CreationCancelled { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
@@ -2362,7 +2248,6 @@ pub struct ConvContext {
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
     pub mode_context: Option<crate::domain::mode_context::ModeContext>,
-    pub commission_review_approval: Option<CommissionReviewApprovalAvailability>,
     /// Explore-mode bash authority surfaced to the system prompt. This is a
     /// typed capability (not inferred from tool names) so sandboxed and
     /// unavailable bash cannot be conflated.
@@ -2436,7 +2321,6 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,
@@ -2505,7 +2389,6 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
-            commission_review_approval: None,
             explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,

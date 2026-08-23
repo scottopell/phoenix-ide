@@ -26,8 +26,7 @@ use super::{
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
-    CommissionReviewApprovalAvailability, CommissionReviewApprovalScope, SubAgentMode,
-    SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
+    SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
@@ -45,10 +44,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-
-const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.";
-const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
-const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
 
 enum AuthoritativeEffect {
     BroadcastAssistantMessage {
@@ -414,540 +409,6 @@ async fn wait_for_optional_cancellation(cancellation: Option<CancellationToken>)
     match cancellation {
         Some(cancellation) => cancellation.cancelled().await,
         None => std::future::pending::<()>().await,
-    }
-}
-
-fn refresh_commission_review_approval_for_outcome(
-    context: &mut ConvContext,
-    outcome: &EffectOutcome,
-) {
-    let EffectOutcome::Llm(LlmOutcome::Response { tool_calls, .. }) = outcome else {
-        return;
-    };
-    if !tool_calls
-        .iter()
-        .any(|tool| valid_commission_review_tool_input(&tool.input))
-    {
-        return;
-    }
-    if context.execution_environment.working_dir().is_none() {
-        context.commission_review_approval = None;
-        return;
-    }
-
-    context.commission_review_approval = Some(resolve_commission_review_approval(context));
-}
-
-fn valid_commission_review_tool_input(input: &ToolInput) -> bool {
-    matches!(
-        input,
-        ToolInput::CommissionReview(request) if !request.brief.trim().is_empty()
-    )
-}
-
-fn maybe_precompute_commission_review_tools(
-    working_dir: &Path,
-    mode_context: Option<&ModeContext>,
-    tools: &mut Vec<phoenix_llm::ToolDefinition>,
-) -> Option<CommissionReviewApprovalAvailability> {
-    if !tools.iter().any(|tool| tool.name == "commission_review") {
-        return None;
-    }
-
-    let availability = resolve_commission_review_approval_from_parts(working_dir, mode_context);
-    if matches!(
-        availability,
-        CommissionReviewApprovalAvailability::Unavailable { .. }
-    ) {
-        tools.retain(|tool| tool.name != "commission_review");
-    }
-    Some(availability)
-}
-
-fn resolve_commission_review_approval(
-    context: &ConvContext,
-) -> CommissionReviewApprovalAvailability {
-    resolve_commission_review_approval_from_parts(
-        context.filesystem_root(),
-        context.mode_context.as_ref(),
-    )
-}
-
-fn resolve_commission_review_approval_from_parts(
-    working_dir: &Path,
-    mode_context: Option<&ModeContext>,
-) -> CommissionReviewApprovalAvailability {
-    let repo_root = match git_capture(working_dir, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => std::path::PathBuf::from(root.trim()),
-        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
-    };
-
-    if let Err(reason) = git_worktree_clean(&repo_root) {
-        return CommissionReviewApprovalAvailability::Unavailable { reason };
-    }
-
-    let (base, head, diff_head) = if let Some(
-        ModeContext::Work {
-            base_branch,
-            branch_name,
-            ..
-        }
-        | ModeContext::Branch {
-            base_branch,
-            branch_name,
-            ..
-        },
-    ) = mode_context
-    {
-        let current_branch = match git_capture(&repo_root, &["branch", "--show-current"]) {
-            Ok(branch) => branch.trim().to_string(),
-            Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
-        };
-        if current_branch != *branch_name {
-            return CommissionReviewApprovalAvailability::Unavailable {
-                reason: format!(
-                    "commission_review target changed before approval: expected work branch `{branch_name}` but current branch is `{current_branch}`. Switch back to `{branch_name}` before requesting review."
-                ),
-            };
-        }
-
-        let base_ref = normalize_commission_review_origin_base(base_branch);
-        if !git_ref_exists(&repo_root, &base_ref) {
-            return CommissionReviewApprovalAvailability::Unavailable {
-                reason: format!(
-                    "commission_review is unavailable: this conversation does not have fetched approved base ref `{base_ref}` for a committed branch diff. Fetch origin before requesting review."
-                ),
-            };
-        }
-        (base_ref, branch_name.clone(), "HEAD".to_string())
-    } else {
-        let remote = match git_capture(
-            &repo_root,
-            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-        ) {
-            Ok(remote) => remote.trim().to_string(),
-            Err(_) => {
-                return CommissionReviewApprovalAvailability::Unavailable {
-                    reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
-                };
-            }
-        };
-        let Some(default_branch) = remote.strip_prefix("refs/remotes/origin/") else {
-            return CommissionReviewApprovalAvailability::Unavailable {
-                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
-            };
-        };
-        let base_ref = format!("refs/remotes/origin/{default_branch}");
-        if !git_ref_exists(&repo_root, &base_ref) {
-            return CommissionReviewApprovalAvailability::Unavailable {
-                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
-            };
-        }
-        (base_ref, "HEAD".to_string(), "HEAD".to_string())
-    };
-
-    let approved_head = match git_capture(&repo_root, &["rev-parse", "HEAD^{commit}"]) {
-        Ok(head) => head,
-        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
-    };
-    let approved_base = match git_merge_base(&repo_root, &base, &diff_head) {
-        Ok(base) => Some(base),
-        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
-    };
-    let (changed_files, insertions, deletions) = match diff_numstat(&repo_root, &base, &diff_head) {
-        Ok(stats) => stats,
-        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
-    };
-
-    CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
-        kind: "committed_branch_diff".to_string(),
-        repo_root: repo_root.display().to_string(),
-        base,
-        head,
-        approved_head: Some(approved_head),
-        approved_base,
-        dirty: false,
-        changed_files,
-        insertions,
-        deletions,
-    })
-}
-
-fn normalize_commission_review_origin_base(base_branch: &str) -> String {
-    let branch = base_branch
-        .trim()
-        .strip_prefix("refs/remotes/origin/")
-        .or_else(|| base_branch.trim().strip_prefix("origin/"))
-        .unwrap_or_else(|| base_branch.trim());
-    format!("refs/remotes/origin/{branch}")
-}
-
-fn diff_numstat(repo: &Path, base: &str, head: &str) -> Result<(usize, u64, u64), String> {
-    let numstat = git_capture(
-        repo,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--numstat",
-            &format!("{base}...{head}"),
-        ],
-    )?;
-    let mut changed_files = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-    for line in numstat.lines() {
-        let parts: Vec<_> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            changed_files += 1;
-            if parts[0] != "-" {
-                insertions += parts[0].parse::<u64>().unwrap_or(0);
-            }
-            if parts[1] != "-" {
-                deletions += parts[1].parse::<u64>().unwrap_or(0);
-            }
-        }
-    }
-    Ok((changed_files, insertions, deletions))
-}
-
-fn git_merge_base(repo: &Path, base: &str, head: &str) -> Result<String, String> {
-    git_capture(repo, &["merge-base", base, head]).map_err(|reason| {
-        if reason == COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE {
-            format!("commission_review is unavailable: no merge base between `{base}` and `{head}`")
-        } else {
-            reason
-        }
-    })
-}
-
-fn git_worktree_clean(repo: &Path) -> Result<(), String> {
-    let output = git_capture(repo, &["status", "--porcelain"])?;
-    if !output.is_empty() {
-        return Err(COMMISSION_REVIEW_DIRTY_WORKTREE.to_string());
-    }
-    Ok(())
-}
-
-fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
-    git_capture(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{git_ref}^{{commit}}"),
-        ],
-    )
-    .is_ok()
-}
-
-fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = phoenix_core::git::command()
-        .arg("--no-optional-locks")
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .current_dir(repo)
-        .output()
-        .map_err(|_| COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string())?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(if detail.is_empty() {
-            COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string()
-        } else {
-            format!("{COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE}: {detail}")
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-#[cfg(test)]
-mod commission_review_approval_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn git_ok(repo: &Path, args: &[&str]) {
-        let status = phoenix_core::git::command()
-            .args(args)
-            .current_dir(repo)
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn git_output(repo: &Path, args: &[&str]) -> String {
-        let output = phoenix_core::git::command()
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .expect("git runs");
-        assert!(output.status.success(), "git {args:?} failed");
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn repo_context(repo: &Path) -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from(repo), "test-model", 200_000)
-    }
-
-    fn init_repo(repo: &Path) {
-        git_ok(repo, &["init", "-q"]);
-        git_ok(repo, &["config", "user.email", "t@t.t"]);
-        git_ok(repo, &["config", "user.name", "t"]);
-        git_ok(repo, &["config", "commit.gpgsign", "false"]);
-        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
-    }
-
-    #[test]
-    fn commission_review_approval_rejects_dirty_worktree_before_approval() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/main", &head],
-        );
-        std::fs::write(dir.path().join("dirty.rs"), "uncommitted\n").expect("write dirty file");
-
-        let availability = resolve_commission_review_approval(&repo_context(dir.path()));
-        assert_eq!(
-            availability,
-            CommissionReviewApprovalAvailability::Unavailable {
-                reason: COMMISSION_REVIEW_DIRTY_WORKTREE.to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn commission_review_approval_requires_work_mode_origin_base_ref() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let mut context = repo_context(dir.path());
-        git_ok(dir.path(), &["checkout", "-qb", "task"]);
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "develop".to_string(),
-            worktree_path: dir.path().display().to_string(),
-        });
-
-        let availability = resolve_commission_review_approval(&context);
-        assert_eq!(
-            availability,
-            CommissionReviewApprovalAvailability::Unavailable {
-                reason: "commission_review is unavailable: this conversation does not have fetched approved base ref `refs/remotes/origin/develop` for a committed branch diff. Fetch origin before requesting review.".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn commission_review_approval_rejects_dangling_origin_head() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        git_ok(
-            dir.path(),
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
-
-        let availability = resolve_commission_review_approval(&repo_context(dir.path()));
-        assert_eq!(
-            availability,
-            CommissionReviewApprovalAvailability::Unavailable {
-                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn commission_review_approval_uses_repo_root_from_subdirectory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/main", &head],
-        );
-        git_ok(
-            dir.path(),
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
-        let subdir = dir.path().join("nested");
-        std::fs::create_dir(&subdir).expect("create subdir");
-
-        let availability = resolve_commission_review_approval(&repo_context(&subdir));
-        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
-            panic!("expected available review scope");
-        };
-        assert_eq!(
-            std::fs::canonicalize(&scope.repo_root).expect("canonical scope root"),
-            std::fs::canonicalize(dir.path()).expect("canonical temp root")
-        );
-    }
-
-    #[test]
-    fn commission_review_approval_normalizes_explicit_origin_base() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        git_ok(dir.path(), &["checkout", "-qb", "task"]);
-        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/release", &head],
-        );
-        let mut context = repo_context(dir.path());
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "origin/release".to_string(),
-            worktree_path: dir.path().display().to_string(),
-        });
-
-        let availability = resolve_commission_review_approval(&context);
-        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
-            panic!("expected available review scope");
-        };
-        assert_eq!(scope.base, "refs/remotes/origin/release");
-    }
-
-    #[test]
-    fn commission_review_approval_rejects_stale_recorded_work_branch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/main", &head],
-        );
-        let current_branch = git_output(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
-        let mut context = repo_context(dir.path());
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "main".to_string(),
-            worktree_path: dir.path().display().to_string(),
-        });
-
-        let availability = resolve_commission_review_approval(&context);
-        assert_eq!(
-            availability,
-            CommissionReviewApprovalAvailability::Unavailable {
-                reason: format!(
-                    "commission_review target changed before approval: expected work branch `task` but current branch is `{current_branch}`. Switch back to `task` before requesting review."
-                )
-            }
-        );
-    }
-
-    #[test]
-    fn commission_review_approval_computes_diff_stats() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let base = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/main", &base],
-        );
-        git_ok(dir.path(), &["tag", "task"]);
-        git_ok(dir.path(), &["checkout", "-qb", "task"]);
-        std::fs::write(dir.path().join("src.txt"), "one\ntwo\n").expect("write file");
-
-        git_ok(dir.path(), &["add", "src.txt"]);
-        git_ok(dir.path(), &["commit", "-qm", "change"]);
-        let mut context = repo_context(dir.path());
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "main".to_string(),
-            worktree_path: dir.path().display().to_string(),
-        });
-
-        let availability = resolve_commission_review_approval(&context);
-        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
-            panic!("expected available review scope, got {availability:?}");
-        };
-        assert_eq!(scope.changed_files, 1);
-        assert_eq!(
-            scope.approved_head.as_deref(),
-            Some(git_output(dir.path(), &["rev-parse", "HEAD^{commit}"]).as_str())
-        );
-        assert_eq!(scope.approved_base.as_deref(), Some(base.as_str()));
-        assert_eq!(scope.insertions, 2);
-        assert_eq!(scope.deletions, 0);
-    }
-
-    #[test]
-    fn commission_review_approval_rejects_uncollectable_diff_range() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        let base = git_output(dir.path(), &["rev-parse", "HEAD"]);
-        git_ok(
-            dir.path(),
-            &["update-ref", "refs/remotes/origin/main", &base],
-        );
-        git_ok(dir.path(), &["checkout", "--orphan", "task"]);
-        std::fs::write(dir.path().join("orphan.txt"), "orphan\n").expect("write orphan file");
-        git_ok(dir.path(), &["add", "orphan.txt"]);
-        git_ok(dir.path(), &["commit", "-qm", "orphan"]);
-        let mut context = repo_context(dir.path());
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "main".to_string(),
-            worktree_path: dir.path().display().to_string(),
-        });
-
-        let availability = resolve_commission_review_approval(&context);
-        let CommissionReviewApprovalAvailability::Unavailable { reason } = availability else {
-            panic!("expected unavailable review scope");
-        };
-        assert!(reason.contains("no merge base"), "reason was {reason}");
-    }
-
-    #[test]
-    fn commission_review_tool_is_removed_when_scope_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        init_repo(dir.path());
-        std::fs::write(dir.path().join("dirty.rs"), "uncommitted\n").expect("write dirty file");
-        let mut tools = vec![phoenix_llm::ToolDefinition {
-            name: "commission_review".to_string(),
-            description: "review".to_string(),
-            input_schema: serde_json::json!({"type":"object"}),
-            defer_loading: false,
-        }];
-
-        let availability = maybe_precompute_commission_review_tools(dir.path(), None, &mut tools);
-        assert!(matches!(
-            availability,
-            Some(CommissionReviewApprovalAvailability::Unavailable { .. })
-        ));
-        assert!(tools.is_empty());
-    }
-
-    #[test]
-    fn invalid_commission_review_output_does_not_resolve_git_scope() {
-        let mut context = repo_context(Path::new("/definitely/not/a/repo"));
-        let outcome = EffectOutcome::Llm(LlmOutcome::Response {
-            content: Vec::new(),
-            tool_calls: vec![ToolCall::new(
-                "tool-review-1",
-                ToolInput::CommissionReview(crate::state_machine::state::CommissionReviewInput {
-                    brief: "   ".to_string(),
-                    focus: None,
-                }),
-            )],
-            end_turn: false,
-            usage: phoenix_llm::Usage::default(),
-            request_id: "req".to_string(),
-        });
-
-        refresh_commission_review_approval_for_outcome(&mut context, &outcome);
-        assert_eq!(context.commission_review_approval, None);
     }
 }
 
@@ -3214,8 +2675,6 @@ where
         if matches!(outcome, EffectOutcome::RetryTimeout { .. }) {
             self.retry_timer_handle = None;
         }
-
-        refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
 
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
@@ -7297,14 +6756,7 @@ where
 
             // Build tool definitions before the mode prompt so Explore prose can
             // describe the same tool surface the model receives.
-            let mut available_tools = tool_executor.definitions_for_language(llm_language).await;
-            let _commission_review_approval = working_dir.as_deref().and_then(|working_dir| {
-                maybe_precompute_commission_review_tools(
-                    working_dir,
-                    mode_context.as_ref(),
-                    &mut available_tools,
-                )
-            });
+            let available_tools = tool_executor.definitions_for_language(llm_language).await;
             let explore_bash_capability =
                 if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
                     explore_bash
@@ -7377,13 +6829,7 @@ where
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = if name == "approved_commission_review" {
-                                ToolInput::Malformed {
-                                    name: name.to_string(),
-                                    input: input.clone(),
-                                    error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
-                                }
-                            } else if is_coordinator {
+                            let typed_input = if is_coordinator {
                                 ToolInput::from_name_and_value_with_work_scope_target(name, input.clone())
                             } else {
                                 ToolInput::from_name_and_value(name, input.clone())
@@ -9459,100 +8905,102 @@ fn strip_unavailable_tool_blocks(
 ) -> Vec<LlmMessage> {
     use phoenix_llm::ContentBlock;
 
-    // First pass: collect IDs of tool_use blocks we're going to strip.
-    // Historical commission_review results remain useful context even when the
-    // tool is hidden for new calls; preserve their result text without sending
-    // undeclared tool_use/tool_result blocks to the provider.
-    let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut flatten_result_calls: std::collections::HashMap<String, (String, serde_json::Value)> =
-        std::collections::HashMap::new();
-    for msg in &messages {
-        for block in &msg.content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                if !available_tools.contains(name.as_str()) {
-                    stripped_ids.insert(id.clone());
-                    if flatten_results || name == "commission_review" {
-                        flatten_result_calls.insert(id.clone(), (name.clone(), input.clone()));
-                    }
-                }
-            }
+    #[derive(Clone)]
+    enum StrippedToolUse {
+        Drop,
+        Flatten {
+            name: String,
+            input: serde_json::Value,
+        },
+    }
+
+    let mut stripped_count = 0usize;
+    let mut pending_results = std::collections::HashMap::<String, StrippedToolUse>::new();
+    let mut normalized = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let mut next_results = std::collections::HashMap::<String, StrippedToolUse>::new();
+        let carries_tool_results = msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+        if !carries_tool_results {
+            pending_results.clear();
         }
-    }
-
-    if !stripped_ids.is_empty() {
-        tracing::debug!(
-            count = stripped_ids.len(),
-            "Stripping tool_use/tool_result blocks for unavailable tools"
-        );
-    }
-
-    // Second pass: filter out stripped tool_use/tool_result blocks.
-    // For ToolSearchToolResult, remove individual bad references but keep the block
-    // paired with its ServerToolUse until terminal normalization flattens both.
-    let normalized: Vec<LlmMessage> = messages
-        .into_iter()
-        .map(|msg| {
-            let filtered: Vec<ContentBlock> = msg
-                .content
-                .into_iter()
-                .flat_map(|block| match block {
-                    ContentBlock::ToolUse { ref id, .. } if stripped_ids.contains(id) => Vec::new(),
-                    ContentBlock::ToolResult {
+        let mut filtered = Vec::with_capacity(msg.content.len());
+        for block in msg.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input }
+                    if !available_tools.contains(name.as_str()) =>
+                {
+                    stripped_count += 1;
+                    let disposition = if flatten_results || name == "commission_review" {
+                        StrippedToolUse::Flatten { name, input }
+                    } else {
+                        StrippedToolUse::Drop
+                    };
+                    next_results.insert(id, disposition);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    images,
+                    is_error,
+                } => match pending_results.remove(&tool_use_id) {
+                    Some(StrippedToolUse::Flatten { name, input }) => {
+                        filtered.push(ContentBlock::Text {
+                            text: format!(
+                                "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
+                                if is_error { "error" } else { "success" }
+                            ),
+                        });
+                        filtered.extend(
+                            images
+                                .into_iter()
+                                .map(|source| ContentBlock::Image { source }),
+                        );
+                    }
+                    Some(StrippedToolUse::Drop) => {}
+                    None => filtered.push(ContentBlock::ToolResult {
                         tool_use_id,
                         content,
                         images,
                         is_error,
-                    } => {
-                        if let Some((name, input)) = flatten_result_calls.get(&tool_use_id) {
-                            let mut flattened = Vec::with_capacity(1 + images.len());
-                            flattened.push(ContentBlock::Text {
-                                text: format!(
-                                    "[historical tool result]\ntool: {name}\ninput: {input}\nstatus: {}\noutput:\n{content}",
-                                    if is_error { "error" } else { "success" }
-                                ),
-                            });
-                            flattened.extend(
-                                images
-                                    .into_iter()
-                                    .map(|source| ContentBlock::Image { source }),
-                            );
-                            flattened
-                        } else if stripped_ids.contains(&tool_use_id) {
-                            Vec::new()
-                        } else {
-                            vec![ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                images,
-                                is_error,
-                            }]
-                        }
-                    }
-                    // Filter individual unavailable references but keep the block
-                    ContentBlock::ToolSearchToolResult {
+                    }),
+                },
+                ContentBlock::ToolSearchToolResult {
+                    tool_use_id,
+                    mut content,
+                } => {
+                    content
+                        .tool_references
+                        .retain(|reference| available_tools.contains(reference.tool_name.as_str()));
+                    filtered.push(ContentBlock::ToolSearchToolResult {
                         tool_use_id,
-                        mut content,
-                    } => {
-                        content
-                            .tool_references
-                            .retain(|r| available_tools.contains(r.tool_name.as_str()));
-                        vec![ContentBlock::ToolSearchToolResult {
-                            tool_use_id,
-                            content,
-                        }]
-                    }
-                    // ServerToolUse blocks are server-side — never strip
-                    _ => vec![block],
-                })
-                .collect();
-            LlmMessage {
+                        content,
+                    });
+                }
+                block => filtered.push(block),
+            }
+        }
+        if !next_results.is_empty() {
+            pending_results = next_results;
+        } else if !carries_tool_results {
+            pending_results.clear();
+        }
+        if !filtered.is_empty() {
+            normalized.push(LlmMessage {
                 role: msg.role,
                 content: filtered,
-            }
-        })
-        // Drop messages that became empty after filtering
-        .filter(|msg| !msg.content.is_empty())
-        .collect();
+            });
+        }
+    }
+
+    if stripped_count > 0 {
+        tracing::debug!(
+            count = stripped_count,
+            "Stripping tool_use/tool_result blocks for unavailable tools"
+        );
+    }
 
     if flatten_results {
         flatten_tool_blocks(normalized)
@@ -10145,6 +9593,93 @@ mod strip_tool_blocks_tests {
         assert!(
             matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
         );
+    }
+
+    #[test]
+    fn stripped_round_spans_consecutive_result_messages_before_id_reuse() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let messages = vec![
+            assistant(vec![
+                tool_use("kept", "bash"),
+                tool_use("reused", "commission_review"),
+            ]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "kept".to_string(),
+                content: "historical bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "historical review".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            assistant(vec![tool_use("reused", "bash")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "current bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(messages, &available, false);
+
+        assert_eq!(out.len(), 5);
+        assert!(matches!(
+            &out[2].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical review") && text.contains("commission_review")
+        ));
+        assert!(matches!(
+            &out[3].content[0],
+            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
+        ));
+        assert!(matches!(
+            &out[4].content[0],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "reused" && content == "current bash output"
+        ));
+    }
+
+    #[test]
+    fn repeated_tool_id_in_later_available_turn_is_not_flattened() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let messages = vec![
+            assistant(vec![tool_use("reused", "commission_review")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "historical review".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            assistant(vec![tool_use("reused", "bash")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "current bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(messages, &available, false);
+
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical review") && text.contains("commission_review")
+        ));
+        assert!(matches!(
+            &out[1].content[0],
+            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
+        ));
+        assert!(matches!(
+            &out[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "reused" && content == "current bash output"
+        ));
     }
 
     #[test]

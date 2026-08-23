@@ -93,13 +93,9 @@ final class ConversationStateTests: XCTestCase {
 
     func testCancellableParentStatesRemainTyped() {
         XCTAssertEqual(
-            parse("{\"type\":\"awaiting_commission_review_approval\"}"),
-            .awaitingCommissionReviewApproval)
-        XCTAssertEqual(
             parse("{\"type\":\"awaiting_recovery\",\"message\":\"Retrying\"}"),
             .awaitingRecovery(message: "Retrying"))
         XCTAssertEqual(parse("{\"type\":\"provisioning\"}"), .provisioning)
-        XCTAssertTrue(ConversationState.awaitingCommissionReviewApproval.isCancellable)
         XCTAssertTrue(ConversationState.awaitingRecovery(message: "Retrying").isCancellable)
         XCTAssertTrue(ConversationState.provisioning.isCancellable)
     }
@@ -251,17 +247,6 @@ final class ConversationStateTests: XCTestCase {
     func testTaskFeedbackIsNonEmptyByConstruction() {
         XCTAssertNil(TaskFeedback(" \n "))
         XCTAssertEqual(TaskFeedback("  revise this  ")?.text, "revise this")
-    }
-
-    func testAgentDoneClearsCommissionApprovalOnlyAfterCancellation() {
-        XCTAssertFalse(ConversationSession.shouldMoveToIdleOnAgentDone(
-            presentationMode: "needs_action",
-            typedState: .awaitingCommissionReviewApproval,
-            cancelledCommissionApproval: false))
-        XCTAssertTrue(ConversationSession.shouldMoveToIdleOnAgentDone(
-            presentationMode: "needs_action",
-            typedState: .awaitingCommissionReviewApproval,
-            cancelledCommissionApproval: true))
     }
 
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {

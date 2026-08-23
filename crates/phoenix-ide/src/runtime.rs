@@ -4764,7 +4764,7 @@ impl RuntimeManager {
                             if phoenix_core::git::detect_git_repo_root(context.filesystem_root())
                                 .is_some()
                             {
-                                registry.with_propose_task().with_commission_review()
+                                registry.with_propose_task()
                             } else {
                                 registry
                             };
@@ -4783,7 +4783,6 @@ impl RuntimeManager {
                                 available_model_ids.clone(),
                             )
                             .with_propose_task()
-                            .with_commission_review()
                             .try_with_writing_conversation_tools(writing_tools)?,
                             None,
                         )
@@ -5731,7 +5730,6 @@ impl RuntimeManager {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
-            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::SeededLlmRequesting { .. } => {
                 tracing::debug!(
                     conv_id = %conversation_id,
@@ -5768,7 +5766,12 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let decision = recovery::should_auto_continue(&messages);
+        let tail_status = self
+            .db
+            .get_recovery_tail_status(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let decision = recovery::decide_recovery(&messages, &tail_status);
 
         tracing::debug!(
             conv_id = %conversation_id,
@@ -9323,6 +9326,76 @@ mod scope_liveness_tests {
             .expect("materialization joins")
             .expect("materialization succeeds");
         assert!(first.same_channel(&handle.broadcast_tx));
+    }
+
+    #[tokio::test]
+    async fn send_waits_for_recovery_publication_before_classifying_new_turn() {
+        let llm = Arc::new(RecordingLlm {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = Arc::new(test_manager_with_recording_llm(Arc::clone(&llm)).await);
+        let conversation_id = "send-during-recovery-publication";
+        manager
+            .db()
+            .create_conversation(conversation_id, "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        manager
+            .db()
+            .add_message(
+                "interrupted-user",
+                conversation_id,
+                &crate::db::MessageContent::user("resume interrupted work"),
+                None,
+                None,
+            )
+            .await
+            .expect("seed interrupted transcript");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        manager
+            .runtime_materialization_barriers
+            .lock()
+            .await
+            .insert(conversation_id.to_string(), Arc::clone(&barrier));
+        let send = {
+            let service = crate::send_chat_service::SendChatApplicationService::new(
+                manager.db().clone(),
+                Arc::clone(&manager),
+            );
+            tokio::spawn(async move {
+                service
+                    .send(crate::send_chat_service::SendChatRequest {
+                        conversation_id: conversation_id.to_string(),
+                        text: "new message during recovery".to_string(),
+                        message_id: "new-message".to_string(),
+                        images: Vec::new(),
+                        files: Vec::new(),
+                        user_agent: None,
+                        expansion_policy:
+                            crate::send_chat_service::MessageExpansionPolicy::LiteralText,
+                    })
+                    .await
+            })
+        };
+        barrier.wait().await;
+
+        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        assert!(repository
+            .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
+                conversation_id.to_string(),
+            ))
+            .await
+            .expect("load turn while materialization is blocked")
+            .is_none());
+        assert!(manager.try_get_handle(conversation_id).await.is_none());
+        assert!(!send.is_finished());
+        barrier.wait().await;
+
+        assert_eq!(
+            send.await.expect("send task joins").expect("send succeeds"),
+            crate::send_chat_service::SendChatOutcome::Delivered
+        );
+        assert!(manager.try_get_handle(conversation_id).await.is_some());
     }
 
     #[tokio::test]

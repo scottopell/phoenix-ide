@@ -46,7 +46,6 @@ function phaseFocusDisposition(state: ConversationState): PhaseFocusDisposition 
       return 'defer';
     case 'recoverable_continuation_failure':
     case 'awaiting_task_approval':
-    case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
     case 'context_exhausted':
     case 'handed_off':
@@ -64,7 +63,6 @@ function phaseFocusDisposition(state: ConversationState): PhaseFocusDisposition 
 const TRANSIENT_ROUTE_SCOPES = new Set([
   'question-panel',
   'task-approval',
-  'commission-review-approval',
   'fork-proposal-review',
 ]);
 

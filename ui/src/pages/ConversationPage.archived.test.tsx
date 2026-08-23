@@ -15,7 +15,6 @@ import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScop
 import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
-const navStackProps = vi.hoisted(() => ({ onOpenCommissionReview: undefined as ((sequenceId: number) => void) | undefined }));
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -122,7 +121,6 @@ vi.mock('../components/ConversationNavStack', () => ({
     loadingOlderMessages,
     transcriptPositioning,
     olderHistoryError,
-    onOpenCommissionReview,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -137,9 +135,7 @@ vi.mock('../components/ConversationNavStack', () => ({
       view?: { conversationId: string; generation: number; transcriptGeneration: number };
     };
     olderHistoryError?: string | null;
-    onOpenCommissionReview?: (sequenceId: number) => void;
   }) => {
-    navStackProps.onOpenCommissionReview = onOpenCommissionReview;
     return (
       <div>
         <div data-testid="message-history">
@@ -385,13 +381,7 @@ describe('ConversationPage route focus', () => {
     anchor.focus();
 
     renderPage(makeConversation({
-      state: {
-        type: 'awaiting_commission_review_approval',
-        brief: 'Review this commission',
-        focus: null,
-        scope: undefined,
-      },
-    }));
+      state: { type: 'idle' },    }));
 
     await screen.findByTestId('message-history');
     expect(anchor).toHaveFocus();
@@ -1325,22 +1315,6 @@ describe('ConversationPage archived read-only rendering', () => {
     await waitFor(() => expect(screen.getByTestId('route-location')).toHaveTextContent(
       '/c/canonical-route?keep=route-state#message-missing-target',
     ));
-  });
-
-  it('keeps commission review actions available for non-terminal narrow layouts', async () => {
-    viewportFlags.isWideDesktop = false;
-    renderPage(makeConversation());
-    await waitFor(() => {
-      expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
-    });
-  });
-
-  it('hides commission review actions when the conversation cannot open sidepanels', async () => {
-    navStackProps.onOpenCommissionReview = vi.fn();
-    renderPage(makeConversation({ archived: true }));
-    await waitFor(() => {
-      expect(navStackProps.onOpenCommissionReview).toBeUndefined();
-    });
   });
 
   it('uses the authoritative route owner when the cached slug owner changed', async () => {

@@ -11,6 +11,8 @@ use phoenix_core::work_scope::WorkScopeId;
 
 use super::{DbError, DbResult, ProjectSeedId};
 
+mod retire_commission_review;
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -353,6 +355,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_startup_parent_actions",
         sql: MIGRATION_067,
     },
+    Migration {
+        version: 68,
+        name: "retire_commission_review_approvals",
+        sql: MIGRATION_068,
+    },
+    Migration {
+        version: 69,
+        name: "settle_retired_tool_recovery",
+        sql: MIGRATION_069,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -432,6 +444,10 @@ pub(crate) fn r1_expected_table_definitions() -> std::collections::BTreeMap<&'st
 pub(crate) fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+const MIGRATION_069: &str = "";
+
+const MIGRATION_068: &str = "";
 
 const MIGRATION_067: &str = r"
 CREATE TABLE startup_parent_actions (
@@ -5574,6 +5590,19 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             name = migration.name,
             "Applying database migration"
         );
+
+        if migration.version == 68 {
+            retire_commission_review::run(pool, migration.version, migration.name).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 69 {
+            retire_commission_review::backfill_settlements(pool, migration.version, migration.name)
+                .await?;
+            applied += 1;
+            continue;
+        }
 
         // Apply the migration body and its version record in one transaction so
         // a crash mid-migration leaves the database all-or-nothing: a partially

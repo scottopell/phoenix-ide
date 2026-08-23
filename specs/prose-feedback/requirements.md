@@ -428,5 +428,4 @@ THE SYSTEM SHALL keep the Markdown viewer usable as an overlay
 AND SHALL NOT show a pane/fullscreen presentation control
 
 Finalized conversation-message Markdown SHALL provide the same focused-review and bounded-feedback behavior with message-scoped annotation anchors.
-Commission-review results SHALL provide the same pane/fullscreen presentation without annotation support.
 Task approval and fork-proposal review SHALL remain purpose-built decision surfaces outside this viewer-slot presentation flow.

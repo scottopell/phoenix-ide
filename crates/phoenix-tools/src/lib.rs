@@ -6,7 +6,6 @@ mod ask_user_question;
 pub mod bash;
 pub mod bash_check;
 pub mod browser;
-mod commission_review;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
@@ -36,7 +35,6 @@ pub use browser::{
     BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
     BrowserWaitForSelectorTool,
 };
-pub use commission_review::CommissionReviewTool;
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
@@ -1100,14 +1098,6 @@ impl ToolRegistry {
         self
     }
 
-    /// Add `commission_review` where Phoenix can infer a git-backed review target
-    /// and gate execution through parent approval.
-    #[must_use]
-    pub fn with_commission_review(mut self) -> Self {
-        self.tools.push(Arc::new(CommissionReviewTool));
-        self
-    }
-
     /// Tool registry for Explore-mode sub-agents using the OS-enforced
     /// read-only bash sandbox.
     #[must_use]
@@ -1496,13 +1486,9 @@ mod tests {
         // always, Direct-in-a-git-repo conditionally — REQ-PROJ-036). Adds
         // propose_task on top of the full suite; the base `direct()` stays
         // propose_task-free above.
-        let direct_fork = names(
-            &ToolRegistry::direct(Vec::new(), Vec::new())
-                .with_propose_task()
-                .with_commission_review(),
-        );
+        let direct_fork = names(&ToolRegistry::direct(Vec::new(), Vec::new()).with_propose_task());
         assert!(direct_fork.contains("propose_task"));
-        assert!(direct_fork.contains("commission_review"));
+        assert!(!direct_fork.contains("commission_review"));
         assert!(direct_fork.contains("bash"));
         assert!(direct_fork.contains("patch"));
 

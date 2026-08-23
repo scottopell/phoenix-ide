@@ -2142,8 +2142,7 @@ impl ToolExecutor for ToolRegistryExecutor {
         // Reuse the frozen catalog so the upgraded registry advertises the same
         // agent_type enum the executor resolves against (REQ-AG-008).
         let mut registry =
-            ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec())
-                .with_commission_review();
+            ToolRegistry::direct(self.agent_catalog.to_vec(), self.model_ids.to_vec());
         if let Some(tools) = self.writing_tools.clone() {
             registry = registry
                 .try_with_writing_conversation_tools(tools)

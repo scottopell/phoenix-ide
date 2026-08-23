@@ -41,8 +41,6 @@ import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput,
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
-import { CommissionReviewInputView, CommissionReviewSummaryCard } from '../features/commissionReview/CommissionReviewSummary';
-import { parseCommissionReviewInput, parseCommissionReviewResult } from '../features/commissionReview/model';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 import './ReadFileResultView.css';
@@ -790,7 +788,6 @@ interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
-  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -820,7 +817,6 @@ interface ToolOnlyAgentTurnGroupProps {
   members: readonly AgentTurnUnit[];
   liveBashProgress?: import('../conversation/atom').ConversationAtom['liveBashProgress'];
   onOpenFile?: AgentMessageProps['onOpenFile'];
-  onOpenCommissionReview?: AgentMessageProps['onOpenCommissionReview'];
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
   activeToolUseId?: string | undefined;
@@ -861,7 +857,6 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
   members,
   liveBashProgress = {},
   onOpenFile,
-  onOpenCommissionReview,
   filePathRootDir,
   workScopeKey,
   activeToolUseId,
@@ -946,7 +941,6 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
                 toolResults={expandedMember.toolResultsByUseId}
                 liveBashProgress={liveBashProgress}
                 onOpenFile={onOpenFile}
-                onOpenCommissionReview={onOpenCommissionReview}
                 filePathRootDir={filePathRootDir}
                 workScopeKey={workScopeKey}
                 activeToolUseId={activeToolUseId}
@@ -975,7 +969,6 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
       toolResults={member.toolResultsByUseId}
       liveBashProgress={liveBashProgress}
       onOpenFile={onOpenFile}
-      onOpenCommissionReview={onOpenCommissionReview}
       filePathRootDir={filePathRootDir}
       workScopeKey={workScopeKey}
       activeToolUseId={activeToolUseId}
@@ -996,7 +989,7 @@ export const ToolOnlyAgentTurnGroup = memo(function ToolOnlyAgentTurnGroup({
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionReview, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, liveBashProgress = {}, isFirstInTurn = true, forceExpandedText = false, forceExpandedTools = false, visibleToolUseId, isLatestAgentMessage = false, unitKey, revealRequest = null, activeHighlight = null, onRevealHandled }: AgentMessageProps) {
   const blocks = useMemo(
     () => (Array.isArray(message.content) ? (message.content as ContentBlock[]) : []),
     [message.content],
@@ -1298,8 +1291,6 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, onOpenCommissionRe
                     block={block}
                     result={result}
                     onOpenFile={onOpenFile}
-                    onOpenCommissionReview={onOpenCommissionReview}
-                    requestSequenceId={message.sequence_id}
                     workScopeKey={workScopeKey}
                     knownResultIds={knownResultIds}
                     toolStartedAtMs={toolStartedAtMs}
@@ -1367,8 +1358,6 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
-  onOpenCommissionReview?: ((requestSequenceId: number) => void) | undefined;
-  requestSequenceId?: number | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
   revealRequest?: AgentTextRevealRequest | null;
@@ -2499,7 +2488,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, requestSequenceId, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStartedAtMs, showMissingResult, liveBashProgress, revealRequest = null, activeHighlight = null, onRevealHandled }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = useMemo(() => block.input || {}, [block.input]);
   const toolId = block.id || '';
@@ -2617,7 +2606,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       || subAgentFragments.some((fragment) => fragment.fragmentId === activeHighlight.fragmentId)
       || (name === 'browser_profile' && activeHighlight.fragmentId === 'browser-profile-visible')
       || (name === 'skill' && activeHighlight.fragmentId === 'skill-result-visible')
-      || (name === 'commission_review' && activeHighlight.fragmentId.startsWith('commission-review-')))
+)
     ? activeHighlight
     : null;
   const inputActiveHighlight = activeHighlight?.owner === 'tool-input'
@@ -2682,7 +2671,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       return;
     }
     if (revealRequest.revealTarget.kind === 'tool-result-browser-profile'
-      || revealRequest.revealTarget.kind === 'tool-result-commission-review') {
+) {
       if (revealRequest.revealTarget.toolUseId === toolId) onRevealHandled?.(revealRequest);
       return;
     }
@@ -2785,12 +2774,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
     ? 'Copy operation'
     : 'Copy command';
 
-  const commissionReviewDisplayData = name === 'commission_review'
-    ? parseCommissionReviewResult(result?.display_data, resultText)
-    : null;
-  const commissionReviewInput = name === 'commission_review'
-    ? parseCommissionReviewInput(input as Record<string, unknown>)
-    : null;
 
   return (
     <div className="tool-block" data-tool-id={toolId}>
@@ -2801,10 +2784,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
       </div>
 
       {/* Tool input - always visible */}
-      {commissionReviewInput ? (
-        <CommissionReviewInputView input={commissionReviewInput} activeHighlight={inputActiveHighlight} />
-      ) : (
-        <div
+      <div
           className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}
           data-fragment-id="tool-use-input"
         >
@@ -2813,7 +2793,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
             : inputDisplay}
           <CopyButton text={rawInput} title={bashCopyTitle} />
         </div>
-      )}
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
       {name === 'bash' && !result && liveBashProgress && (
@@ -2887,14 +2866,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, onOpenCommissionReview, r
               diff={toolActiveHighlight ? resultText : displayResult}
               toolUseId={toolId}
               activeHighlight={toolActiveHighlight}
-            />
-          ) : commissionReviewDisplayData ? (
-            <CommissionReviewSummaryCard
-              data={commissionReviewDisplayData}
-              activeHighlight={toolActiveHighlight}
-              formatDuration={formatToolDuration}
-              requestSequenceId={requestSequenceId}
-              onOpenFullReview={onOpenCommissionReview}
             />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse

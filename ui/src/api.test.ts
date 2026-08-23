@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
-import { parseConversationState, canCancelConversationState } from './utils';
+import { canCancelConversationState } from './utils';
 
 describe('api.continueConversation', () => {
   beforeEach(() => {
@@ -333,7 +333,6 @@ describe('canCancelConversationState', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
-    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, scope: undefined }, true],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, true],
@@ -346,67 +345,6 @@ describe('canCancelConversationState', () => {
 
   it.each(cases)('%o -> %s', (state, expected) => {
     expect(canCancelConversationState(state)).toBe(expected);
-  });
-});
-
-describe('parseConversationState commission review approval', () => {
-  it('parses valid commission review approval state', () => {
-    expect(parseConversationState({
-      type: 'awaiting_commission_review_approval',
-      request: {
-        brief: 'Ready for review',
-        focus: 'security',
-      },
-      scope: {
-        kind: 'committed_branch_diff',
-        repo_root: '/repo',
-        base: 'refs/remotes/origin/main',
-        head: 'task',
-        dirty: false,
-        changed_files: 0,
-        insertions: 0,
-        deletions: 0,
-      },
-    })).toEqual({
-      type: 'awaiting_commission_review_approval',
-      brief: 'Ready for review',
-      focus: 'security',
-      scope: {
-        kind: 'committed_branch_diff',
-        repo_root: '/repo',
-        base: 'refs/remotes/origin/main',
-        head: 'task',
-        dirty: false,
-        changed_files: 0,
-        insertions: 0,
-        deletions: 0,
-      },
-    });
-  });
-
-  it('rejects invalid commission review payloads', () => {
-    for (const raw of [
-      { type: 'awaiting_commission_review_approval', request: {} },
-      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', focus: 42 } },
-    ]) {
-      expect(parseConversationState(raw).type).toBe('error');
-    }
-  });
-
-  it('parses provisioning, failed, and cancelled creation states', () => {
-    expect(parseConversationState({ type: 'provisioning', prompt: 'ship it' })).toEqual({
-      type: 'provisioning',
-      prompt: 'ship it',
-    });
-    expect(parseConversationState({ type: 'creation_failed', message: 'boom', prompt: 'ship it' })).toEqual({
-      type: 'creation_failed',
-      message: 'boom',
-      prompt: 'ship it',
-    });
-    expect(parseConversationState({ type: 'creation_cancelled', prompt: 'ship it' })).toEqual({
-      type: 'creation_cancelled',
-      prompt: 'ship it',
-    });
   });
 });
 
@@ -426,7 +364,6 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, false],
-    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, scope: undefined }, false],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],

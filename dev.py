@@ -3419,20 +3419,6 @@ def cmd_qa_work_actions() -> None:
     )
 
 
-def cmd_qa_commission_review() -> None:
-    """Capture commission review Ladle screenshots at desktop and mobile sizes."""
-    subprocess.run(
-        ["pnpm", "qa:commission-review"],
-        cwd=ROOT / "ui",
-        check=True,
-        env=node_env(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# TLS
-# ---------------------------------------------------------------------------
-
 def _tls_helper(args: list[str]) -> str:
     result = subprocess.run(
         ["cargo", "run", "--quiet", "--bin", "phoenix-tls", "--", *args],
@@ -9837,7 +9823,6 @@ def main():
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
     qa_sub.add_parser("tool-results", help="Capture tool-result Ladle screenshots at desktop and mobile sizes")
     qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
-    qa_sub.add_parser("commission-review", help="Capture commission review Ladle screenshots at desktop and mobile sizes")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -10010,8 +9995,6 @@ def main():
             cmd_qa_tool_results()
         elif args.qa_command == "work-actions":
             cmd_qa_work_actions()
-        elif args.qa_command == "commission-review":
-            cmd_qa_commission_review()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)
