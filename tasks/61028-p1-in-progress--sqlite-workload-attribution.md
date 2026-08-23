@@ -180,3 +180,14 @@ Persistence/recovery edge: collector history intentionally ends at process resta
 - Claiming cross-restart 24-hour history; uptime and truncation are part of confidence.
 - Diagnosing or changing SQLite tuning, pool size, WAL/checkpoint policy, busy timeout, or workflow retry policy before attribution data identifies a cause.
 - Treating summed caller latency or read connection-seconds as single-writer occupancy.
+
+
+## Post-review correction scope
+
+- Fix native prepare-metadata ownership across cache eviction, nested/reentrant identity-owned read tokens, and metadata-free `SELECT 1` boundary cleanup, each with a discriminating regression.
+- Record profiled-read concurrency from begin/end transitions so asymmetric overlap has truthful per-minute peaks; keep broader connection-held semantics explicitly out of scope.
+- Replace the two residual generic transaction terminals and known alternate paths with measured acquisition/admission and typed commit/rollback outcomes.
+- Make parent transaction ownership structural for nested FTS telemetry at every production callsite; nested work may report failure but never pre-commit child success.
+- Capture physical completion before collector-lock delay, scope C-string borrows behind `unsafe`, replace touched sleep-based overlap synchronization with causal signals, and keep executive statuses truthful.
+- Add non-minute-aligned fixed-window regressions, but do not implement an exact-edge representation rewrite: rolling versus completed-minute/alignment-shortened semantics requires a user/product policy choice before normative or API behavior changes.
+- Exclude deployment, ProductConversation, Chain retirement, and unrelated architecture. Do not push until full validation and a clean independent exact-SHA review; never merge.

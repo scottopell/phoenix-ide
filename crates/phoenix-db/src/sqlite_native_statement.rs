@@ -1,10 +1,12 @@
 use crate::sqlite_workload::{
-    NativeStatementObservation, SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector,
+    NativeReadToken, NativeStatementObservation, SqliteAccessKind, SqliteWorkloadCategory,
+    SqliteWorkloadCollector,
 };
 use libsqlite3_sys as ffi;
 #[cfg(test)]
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteConnection;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -29,7 +31,7 @@ struct AwaitingReprepare {
 #[derive(Debug)]
 pub(crate) struct NativeStatementCallbackContext {
     collector: SqliteWorkloadCollector,
-    active_read_concurrency: u32,
+    active_read_tokens: HashMap<usize, NativeReadToken>,
     awaiting_reprepare: Option<AwaitingReprepare>,
     prepare_state: PrepareState,
     prepare_pending: bool,
@@ -89,7 +91,7 @@ impl NativeStatementCallbackContext {
     fn new(collector: SqliteWorkloadCollector) -> Self {
         Self {
             collector,
-            active_read_concurrency: 0,
+            active_read_tokens: HashMap::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -112,7 +114,7 @@ impl NativeStatementCallbackContext {
     ) -> Self {
         Self {
             collector,
-            active_read_concurrency: 0,
+            active_read_tokens: HashMap::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -133,7 +135,7 @@ impl NativeStatementCallbackContext {
     ) -> Self {
         Self {
             collector,
-            active_read_concurrency: 0,
+            active_read_tokens: HashMap::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -147,16 +149,23 @@ impl NativeStatementCallbackContext {
         }
     }
 
-    fn reconcile_incomplete_read(&mut self) {
+    fn reconcile_incomplete_reads(&mut self) {
         let awaiting_reprepare = self.awaiting_reprepare.take().is_some();
-        let active_read = self.active_read_concurrency > 0;
-        if active_read {
-            self.collector.end_native_read();
-            self.active_read_concurrency = 0;
-        }
-        if awaiting_reprepare || active_read {
+        let active_reads = !self.active_read_tokens.is_empty();
+        self.active_read_tokens.clear();
+        if awaiting_reprepare || active_reads {
             self.collector.record_classification_gap();
         }
+    }
+
+    fn finish_native_read(&mut self, statement_identity: usize) -> u32 {
+        self.active_read_tokens
+            .remove(&statement_identity)
+            .map_or(0, |token| {
+                let concurrency = token.concurrency();
+                token.finish();
+                concurrency
+            })
     }
 
     fn reset_prepare_state(&mut self) {
@@ -173,7 +182,12 @@ impl NativeStatementCallbackContext {
     }
 
     fn note_prepare_boundary(&mut self) {
-        self.prepare_boundary_seen = true;
+        if self.prepare_pending {
+            self.begin_prepare();
+            self.prepare_boundary_seen = false;
+        } else {
+            self.prepare_boundary_seen = true;
+        }
     }
 
     fn note_statement_kind(&mut self, kind: StatementKind) {
@@ -246,9 +260,6 @@ impl NativeStatementCallbackContext {
         reprepare_count: u32,
     ) -> CachedStatementMetadata {
         let cached = self.lookup_statement_metadata(statement_identity);
-        if cached.is_none() && self.prepare_pending {
-            return self.take_prepare_metadata_for_statement(statement_identity, reprepare_count);
-        }
         let new_generation =
             run_count == 0 || cached.is_some_and(|entry| entry.reprepare_count != reprepare_count);
         if new_generation {
@@ -352,7 +363,7 @@ impl NativeStatementCallbackContext {
 
 impl Drop for NativeStatementCallbackContext {
     fn drop(&mut self) {
-        self.reconcile_incomplete_read();
+        self.reconcile_incomplete_reads();
         if self.prepare_pending {
             self.collector.record_classification_gap();
         }
@@ -542,7 +553,6 @@ unsafe extern "C" fn profile_callback(
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT {
-        context.reconcile_incomplete_read();
         let run_count =
             unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_RUN, 0) }
                 .max(0)
@@ -565,7 +575,14 @@ unsafe extern "C" fn profile_callback(
             }
         });
         if access == SqliteAccessKind::Read {
-            context.active_read_concurrency = context.collector.begin_native_read();
+            let token = context.collector.begin_native_read(metadata.category);
+            if context
+                .active_read_tokens
+                .insert(statement_identity, token)
+                .is_some()
+            {
+                context.collector.record_classification_gap();
+            }
         }
         return 0;
     }
@@ -584,6 +601,7 @@ unsafe extern "C" fn profile_callback(
             statement_identity,
             prior_reprepare_count,
         });
+        let read_concurrency = context.finish_native_read(statement_identity);
         context
             .collector
             .record_native_statement(NativeStatementObservation {
@@ -595,7 +613,7 @@ unsafe extern "C" fn profile_callback(
                 },
                 statement_latency: latency,
                 read_connection_time: if readonly { latency } else { Duration::ZERO },
-                read_concurrency: context.active_read_concurrency,
+                read_concurrency,
             });
         return 0;
     }
@@ -609,11 +627,7 @@ unsafe extern "C" fn profile_callback(
     if let Some(awaiting) = context.awaiting_reprepare.take() {
         if !reprepare_generation_advanced(awaiting, statement_identity, reprepare_count) {
             context.collector.record_classification_gap();
-            let read_concurrency = context.active_read_concurrency;
-            if read_concurrency > 0 {
-                context.collector.end_native_read();
-                context.active_read_concurrency = 0;
-            }
+            let read_concurrency = context.finish_native_read(statement_identity);
             context
                 .collector
                 .record_native_statement(NativeStatementObservation {
@@ -674,11 +688,11 @@ unsafe extern "C" fn profile_callback(
             context.record_writer_gap();
         }
     }
-    let read_concurrency = context.active_read_concurrency;
-    if access == SqliteAccessKind::Read {
-        context.collector.end_native_read();
-        context.active_read_concurrency = 0;
-    }
+    let read_concurrency = if access == SqliteAccessKind::Read {
+        context.finish_native_read(statement_identity)
+    } else {
+        0
+    };
     context
         .collector
         .record_native_statement(NativeStatementObservation {
@@ -737,31 +751,30 @@ fn classify_authorizer_action(
 }
 
 fn classify_schema_object(object_name: *const c_char) -> SqliteWorkloadCategory {
-    if object_name.is_null() {
-        return SqliteWorkloadCategory::Other;
-    }
-    let Some(name) = c_string(object_name) else {
-        return SqliteWorkloadCategory::Other;
-    };
-    if is_fts_name(name) {
-        return SqliteWorkloadCategory::Fts;
-    }
-    if is_message_persistence_name(name) {
-        return SqliteWorkloadCategory::MessagePersistence;
-    }
-    if is_workflow_name(name) {
-        return SqliteWorkloadCategory::DurableWorkflows;
-    }
-    if is_runtime_state_name(name) {
-        return SqliteWorkloadCategory::RuntimeState;
-    }
-    if is_pr_project_name(name) {
-        return SqliteWorkloadCategory::PrProjectData;
-    }
-    if is_maintenance_name(name) {
-        return SqliteWorkloadCategory::Maintenance;
-    }
-    SqliteWorkloadCategory::Other
+    with_c_string(object_name, |name| {
+        let Some(name) = name else {
+            return SqliteWorkloadCategory::Other;
+        };
+        if is_fts_name(name) {
+            return SqliteWorkloadCategory::Fts;
+        }
+        if is_message_persistence_name(name) {
+            return SqliteWorkloadCategory::MessagePersistence;
+        }
+        if is_workflow_name(name) {
+            return SqliteWorkloadCategory::DurableWorkflows;
+        }
+        if is_runtime_state_name(name) {
+            return SqliteWorkloadCategory::RuntimeState;
+        }
+        if is_pr_project_name(name) {
+            return SqliteWorkloadCategory::PrProjectData;
+        }
+        if is_maintenance_name(name) {
+            return SqliteWorkloadCategory::Maintenance;
+        }
+        SqliteWorkloadCategory::Other
+    })
 }
 
 fn is_fts_name(name: &str) -> bool {
@@ -798,20 +811,19 @@ fn is_workflow_name(name: &str) -> bool {
 }
 
 fn classify_transaction_access(object_name: *const c_char) -> Option<SqliteAccessKind> {
-    let Some(name) = c_string(object_name) else {
-        return None;
-    };
-    match name {
-        "BEGIN" | "COMMIT" | "ROLLBACK" => Some(SqliteAccessKind::Write),
+    with_c_string(object_name, |name| match name {
+        Some("BEGIN" | "COMMIT" | "ROLLBACK") => Some(SqliteAccessKind::Write),
         _ => None,
-    }
+    })
 }
 
-fn c_string<'a>(raw: *const c_char) -> Option<&'a str> {
-    if raw.is_null() {
-        return None;
-    }
-    (unsafe { CStr::from_ptr(raw) }).to_str().ok()
+fn with_c_string<T>(raw: *const c_char, use_value: impl FnOnce(Option<&str>) -> T) -> T {
+    let value = if raw.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(raw) }.to_str().ok()
+    };
+    use_value(value)
 }
 
 fn is_runtime_state_name(name: &str) -> bool {
@@ -912,6 +924,7 @@ mod tests {
     use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
     use sqlx::{Connection, Execute, Executor, Statement};
     use std::str::FromStr;
+    use std::sync::{Arc, Barrier};
     use tokio::sync::oneshot;
     use tokio::time::sleep;
 
@@ -953,33 +966,46 @@ mod tests {
             .unwrap()
     }
 
-    unsafe extern "C" fn test_hold_function(
+    unsafe extern "C" fn test_overlap_barrier_function(
         context: *mut ffi::sqlite3_context,
-        value_count: c_int,
-        value_arguments: *mut *mut ffi::sqlite3_value,
+        _value_count: c_int,
+        _value_arguments: *mut *mut ffi::sqlite3_value,
     ) {
-        if value_count == 1 {
-            let millis = unsafe { ffi::sqlite3_value_int64(*value_arguments) };
-            // test-timing-allow: elapsed native statement occupancy is the behavior under test
-            std::thread::sleep(Duration::from_millis(millis.max(0).cast_unsigned()));
+        let barrier = unsafe {
+            ffi::sqlite3_user_data(context)
+                .cast::<Arc<Barrier>>()
+                .as_ref()
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait();
         }
         unsafe { ffi::sqlite3_result_null(context) };
     }
 
-    async fn install_test_hold(connection: &mut SqliteConnection) {
+    unsafe extern "C" fn destroy_test_overlap_barrier(data: *mut c_void) {
+        if !data.is_null() {
+            unsafe { drop(Box::from_raw(data.cast::<Arc<Barrier>>())) };
+        }
+    }
+
+    async fn install_test_overlap_barrier(
+        connection: &mut SqliteConnection,
+        barrier: Arc<Barrier>,
+    ) {
         let mut locked = connection.lock_handle().await.unwrap();
-        let name = CString::new("phoenix_test_hold").unwrap();
+        let name = CString::new("phoenix_test_overlap_barrier").unwrap();
+        let barrier = Box::into_raw(Box::new(barrier)).cast();
         let rc = unsafe {
             ffi::sqlite3_create_function_v2(
                 locked.as_raw_handle().as_ptr(),
                 name.as_ptr(),
-                1,
+                0,
                 ffi::SQLITE_UTF8,
-                ptr::null_mut(),
-                Some(test_hold_function),
+                barrier,
+                Some(test_overlap_barrier_function),
                 None,
                 None,
-                None,
+                Some(destroy_test_overlap_barrier),
             )
         };
         assert_eq!(rc, ffi::SQLITE_OK);
@@ -993,30 +1019,24 @@ mod tests {
             .unwrap();
         let mut first = db.pool().acquire().await.unwrap();
         let mut second = db.pool().acquire().await.unwrap();
-        install_test_hold(&mut first).await;
-        install_test_hold(&mut second).await;
+        let overlap_barrier = Arc::new(Barrier::new(2));
+        install_test_overlap_barrier(&mut first, Arc::clone(&overlap_barrier)).await;
+        install_test_overlap_barrier(&mut second, overlap_barrier).await;
         sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('read-overlap','/tmp/read-overlap','main','2026-01-01T00:00:00Z')")
             .execute(&mut *first)
             .await
             .unwrap();
         let before = report_now(&db.sqlite_workload_collector);
         let (first_result, second_result) = tokio::join!(
-            sqlx::query("SELECT phoenix_test_hold(100), id FROM projects LIMIT 1")
+            sqlx::query("SELECT phoenix_test_overlap_barrier(), id FROM projects LIMIT 1")
                 .fetch_optional(&mut *first),
-            sqlx::query("SELECT phoenix_test_hold(100), id FROM projects LIMIT 1")
+            sqlx::query("SELECT phoenix_test_overlap_barrier(), id FROM projects LIMIT 1")
                 .fetch_optional(&mut *second),
         );
         first_result.unwrap();
         second_result.unwrap();
         let report = report_now(&db.sqlite_workload_collector);
         let read = SqliteAccessKind::Read.index();
-        let total_duration: u64 = SqliteWorkloadCategory::ALL
-            .into_iter()
-            .map(|category| {
-                report.totals[read][category.index()].read_connection_micros
-                    - before.totals[read][category.index()].read_connection_micros
-            })
-            .sum();
         let peak = SqliteWorkloadCategory::ALL
             .into_iter()
             .map(|category| report.totals[read][category.index()].read_concurrency_peak)
@@ -1034,7 +1054,6 @@ mod tests {
                 report.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
             })
             .sum();
-        assert!(total_duration >= 190_000);
         assert!(peak > 1);
         assert_eq!(writer_after, writer_before);
     }
@@ -1261,6 +1280,72 @@ mod tests {
             after.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
             before.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count
                 + 1,
+        );
+        assert!(after.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[test]
+    fn metadata_free_boundary_retires_prior_pending_prepare() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::PrProjectData,
+            Some(SqliteAccessKind::Read),
+        );
+
+        context.note_prepare_boundary();
+        let metadata_free = context.metadata_for_statement_run(8, 0, 0);
+        assert_eq!(metadata_free.category, SqliteWorkloadCategory::Other);
+        assert_eq!(metadata_free.access, None);
+
+        context.note_prepare_boundary();
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::RuntimeState,
+            Some(SqliteAccessKind::Read),
+        );
+        let following = context.metadata_for_statement_run(16, 0, 0);
+        assert_eq!(following.category, SqliteWorkloadCategory::RuntimeState);
+        assert_eq!(following.access, Some(SqliteAccessKind::Read));
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_free_select_closes_prior_prepare_boundary() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let _unexecuted = connection
+            .prepare(
+                sqlx::query::<sqlx::Sqlite>(
+                    "SELECT canonical_path FROM projects WHERE id = 'stale-boundary'",
+                )
+                .sql(),
+            )
+            .await
+            .unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+
+        sqlx::query("SELECT 1")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM conversations WHERE id = 'after-boundary'")
+            .fetch_optional(&mut *connection)
+            .await
+            .unwrap();
+
+        let after = report_now(&db.sqlite_workload_collector);
+        let read = SqliteAccessKind::Read.index();
+        assert!(
+            after.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count
+                > before.totals[read][SqliteWorkloadCategory::Other.index()]
+                    .baseline_statement_count,
+        );
+        assert_eq!(
+            after.totals[read][SqliteWorkloadCategory::PrProjectData.index()]
+                .baseline_statement_count,
+            before.totals[read][SqliteWorkloadCategory::PrProjectData.index()]
+                .baseline_statement_count,
+            "metadata-free SELECT must not inherit the prior prepare's category",
         );
         assert!(after.classification_gap_count > before.classification_gap_count);
     }
@@ -1519,7 +1604,10 @@ mod tests {
     async fn context_drop_reconciles_active_read_without_reprepare_marker() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
-        context.active_read_concurrency = collector.begin_native_read();
+        context.active_read_tokens.insert(
+            1,
+            collector.begin_native_read(SqliteWorkloadCategory::Other),
+        );
         let before = report_now(&collector);
         drop(context);
         let after = report_now(&collector);
@@ -1531,7 +1619,10 @@ mod tests {
     async fn context_drop_reconciles_read_awaiting_reprepare() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
-        context.active_read_concurrency = collector.begin_native_read();
+        context.active_read_tokens.insert(
+            1,
+            collector.begin_native_read(SqliteWorkloadCategory::Other),
+        );
         context.awaiting_reprepare = Some(AwaitingReprepare {
             statement_identity: 1,
             prior_reprepare_count: 0,
@@ -1541,6 +1632,23 @@ mod tests {
         let after = report_now(&collector);
         assert_eq!(collector.active_native_reads_for_test(), 0);
         assert!(after.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[test]
+    fn context_drop_reconciles_nested_native_reads() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.active_read_tokens.insert(
+            1,
+            collector.begin_native_read(SqliteWorkloadCategory::RuntimeState),
+        );
+        context
+            .active_read_tokens
+            .insert(2, collector.begin_native_read(SqliteWorkloadCategory::Fts));
+
+        drop(context);
+
+        assert_eq!(collector.active_native_reads_for_test(), 0);
     }
 
     #[tokio::test]
@@ -1802,6 +1910,41 @@ mod tests {
             Some(SqliteWorkloadCategory::Other)
         );
         assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn cache_evicted_statement_does_not_steal_pending_prepare_metadata() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        let evicted = 8usize;
+        let collision = evicted + (STATEMENT_CACHE_SIZE << 3);
+        let pending_owner = 24usize;
+        context.cache_statement_metadata(
+            evicted,
+            SqliteWorkloadCategory::PrProjectData,
+            Some(SqliteAccessKind::Read),
+            0,
+            StatementKind::Ordinary,
+        );
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::DurableWorkflows,
+            Some(SqliteAccessKind::Read),
+        );
+        assert_eq!(
+            context.metadata_for_statement_run(collision, 0, 0).category,
+            SqliteWorkloadCategory::DurableWorkflows,
+        );
+        assert!(context.lookup_statement_metadata(evicted).is_none());
+
+        context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
+        let stale = context.metadata_for_statement_run(evicted, 1, 0);
+        assert_eq!(stale.category, SqliteWorkloadCategory::Other);
+        assert_eq!(stale.access, None);
+
+        let owner = context.metadata_for_statement_run(pending_owner, 0, 0);
+        assert_eq!(owner.category, SqliteWorkloadCategory::Fts);
+        assert_eq!(owner.access, Some(SqliteAccessKind::Read));
+        assert!(report_now(&collector).classification_gap_count >= 2);
     }
 
     #[test]
