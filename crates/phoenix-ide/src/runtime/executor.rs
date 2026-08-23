@@ -8919,6 +8919,13 @@ fn strip_unavailable_tool_blocks(
     let mut normalized = Vec::with_capacity(messages.len());
     for msg in messages {
         let mut next_results = std::collections::HashMap::<String, StrippedToolUse>::new();
+        let carries_tool_results = msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+        if !carries_tool_results {
+            pending_results.clear();
+        }
         let mut filtered = Vec::with_capacity(msg.content.len());
         for block in msg.content {
             match block {
@@ -8975,7 +8982,11 @@ fn strip_unavailable_tool_blocks(
                 block => filtered.push(block),
             }
         }
-        pending_results = next_results;
+        if !next_results.is_empty() {
+            pending_results = next_results;
+        } else if !carries_tool_results {
+            pending_results.clear();
+        }
         if !filtered.is_empty() {
             normalized.push(LlmMessage {
                 role: msg.role,
@@ -9582,6 +9593,54 @@ mod strip_tool_blocks_tests {
         assert!(
             matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
         );
+    }
+
+    #[test]
+    fn stripped_round_spans_consecutive_result_messages_before_id_reuse() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let messages = vec![
+            assistant(vec![
+                tool_use("kept", "bash"),
+                tool_use("reused", "commission_review"),
+            ]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "kept".to_string(),
+                content: "historical bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "historical review".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+            assistant(vec![tool_use("reused", "bash")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "reused".to_string(),
+                content: "current bash output".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(messages, &available, false);
+
+        assert_eq!(out.len(), 5);
+        assert!(matches!(
+            &out[2].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical review") && text.contains("commission_review")
+        ));
+        assert!(matches!(
+            &out[3].content[0],
+            ContentBlock::ToolUse { id, name, .. } if id == "reused" && name == "bash"
+        ));
+        assert!(matches!(
+            &out[4].content[0],
+            ContentBlock::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "reused" && content == "current bash output"
+        ));
     }
 
     #[test]

@@ -74,12 +74,19 @@ impl RecoveryDecision {
 
 #[must_use]
 pub fn decide_recovery(messages: &[Message], tail_status: &RecoveryTailStatus) -> RecoveryDecision {
-    let projected_tail = messages.last().map(|message| message.message_id.as_str());
-    let persisted_tail = tail_status.terminal_message_id.as_deref();
-    if projected_tail != persisted_tail {
-        return RecoveryDecision::idle(RecoveryReason::TranscriptChanged);
+    match (messages.last(), tail_status) {
+        (None, RecoveryTailStatus::Empty) => should_auto_continue(messages, None),
+        (
+            Some(projected_tail),
+            RecoveryTailStatus::Tail {
+                message_id,
+                settlement,
+            },
+        ) if projected_tail.message_id == *message_id => {
+            should_auto_continue(messages, *settlement)
+        }
+        _ => RecoveryDecision::idle(RecoveryReason::TranscriptChanged),
     }
-    should_auto_continue(messages, tail_status.settlement)
 }
 
 /// Analyze messages to determine if a conversation needs auto-continuation.
@@ -409,6 +416,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_tail_status_matches_empty_projection() {
+        let decision = decide_recovery(&[], &RecoveryTailStatus::Empty);
+
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::EmptyConversation);
+    }
+
+    #[test]
+    fn current_settled_tail_does_not_dispatch() {
+        let messages = vec![
+            user_msg(1, "Review this"),
+            agent_tool_use_only(2, &["commission_review"]),
+            tool_result(3, "tool-2-0", "capability retired"),
+        ];
+        let decision = decide_recovery(
+            &messages,
+            &RecoveryTailStatus::Tail {
+                message_id: messages.last().unwrap().message_id.clone(),
+                settlement: Some(RecoverySettlementReason::RetiredToolCall),
+            },
+        );
+
+        assert_eq!(decision.state, ConvState::Idle);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::RetiredToolCallSettled);
+    }
+
+    #[test]
     fn transcript_tail_change_does_not_dispatch_from_stale_projection() {
         let messages = vec![
             user_msg(1, "Run it"),
@@ -418,8 +454,8 @@ mod tests {
 
         let decision = decide_recovery(
             &messages,
-            &RecoveryTailStatus {
-                terminal_message_id: Some("later-message".to_string()),
+            &RecoveryTailStatus::Tail {
+                message_id: "later-message".to_string(),
                 settlement: None,
             },
         );

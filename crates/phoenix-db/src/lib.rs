@@ -9953,11 +9953,8 @@ impl Database {
         .bind(conversation_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((terminal_message_id, reason)) = row else {
-            return Ok(phoenix_core::domain::db_schema::RecoveryTailStatus {
-                terminal_message_id: None,
-                settlement: None,
-            });
+        let Some((message_id, reason)) = row else {
+            return Ok(phoenix_core::domain::db_schema::RecoveryTailStatus::Empty);
         };
         let settlement = reason
             .map(|value| {
@@ -9969,8 +9966,8 @@ impl Database {
                     })
             })
             .transpose()?;
-        Ok(phoenix_core::domain::db_schema::RecoveryTailStatus {
-            terminal_message_id: Some(terminal_message_id),
+        Ok(phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+            message_id,
             settlement,
         })
     }
@@ -12519,11 +12516,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.get_recovery_tail_status("settled")
-                .await
-                .unwrap()
-                .settlement,
-            Some(phoenix_core::domain::db_schema::RecoverySettlementReason::RetiredToolCall)
+            db.get_recovery_tail_status("settled").await.unwrap(),
+            phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+                message_id: "terminal-result".to_string(),
+                settlement: Some(
+                    phoenix_core::domain::db_schema::RecoverySettlementReason::RetiredToolCall,
+                ),
+            }
         );
 
         db.add_message(
@@ -12536,11 +12535,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.get_recovery_tail_status("settled")
-                .await
-                .unwrap()
-                .settlement,
-            None
+            db.get_recovery_tail_status("settled").await.unwrap(),
+            phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+                message_id: "later-user".to_string(),
+                settlement: None,
+            }
         );
     }
 

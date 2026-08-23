@@ -1449,9 +1449,12 @@ pub enum RecoverySettlementReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryTailStatus {
-    pub terminal_message_id: Option<String>,
-    pub settlement: Option<RecoverySettlementReason>,
+pub enum RecoveryTailStatus {
+    Empty,
+    Tail {
+        message_id: String,
+        settlement: Option<RecoverySettlementReason>,
+    },
 }
 
 impl RecoverySettlementReason {

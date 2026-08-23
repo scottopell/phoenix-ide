@@ -735,7 +735,6 @@ surface ConversationViewer {
             when not slot.conversation.is_terminal
         UserOpensMessage(slot, message, presentation)
             when not slot.conversation.is_terminal
-            when not slot.conversation.is_terminal
         UserChangesViewerPresentation(slot, presentation)
             when slot.kind = prose or slot.kind = message
         UserClosesViewer(slot)
