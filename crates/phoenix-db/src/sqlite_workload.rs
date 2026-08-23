@@ -675,8 +675,9 @@ impl InnerCollector {
         let available_start = effective_now_unix_micros
             .saturating_sub(total_uptime_micros)
             .max(effective_now_unix_micros.saturating_sub(requested_covered_uptime_micros));
-        let first_complete_minute = minute_start(available_start)
-            .saturating_add((available_start % MICROS_PER_MINUTE != 0) as u64 * MICROS_PER_MINUTE);
+        let first_complete_minute = minute_start(available_start).saturating_add(
+            u64::from(!available_start.is_multiple_of(MICROS_PER_MINUTE)) * MICROS_PER_MINUTE,
+        );
         let start_minute = if first_complete_minute >= effective_now_unix_micros {
             minute_start(effective_now_unix_micros)
         } else {

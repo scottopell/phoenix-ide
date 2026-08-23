@@ -338,7 +338,7 @@ unsafe extern "C" fn profile_callback(
                 .lookup_statement_metadata(statement_identity)
                 .unwrap_or_else(|| context.take_prepare_metadata_for_statement(statement_identity))
         };
-        let access = metadata.access.unwrap_or_else(|| {
+        let access = metadata.access.unwrap_or({
             if readonly {
                 SqliteAccessKind::Read
             } else {
@@ -356,15 +356,13 @@ unsafe extern "C" fn profile_callback(
     let nanos = unsafe { *(elapsed_nanos.cast::<ffi::sqlite3_int64>()) };
     let latency = Duration::from_nanos(u64::try_from(nanos).unwrap_or_default());
     let metadata = context.lookup_statement_metadata(statement_identity);
-    let access = metadata
-        .and_then(|metadata| metadata.access)
-        .unwrap_or_else(|| {
-            if readonly {
-                SqliteAccessKind::Read
-            } else {
-                SqliteAccessKind::Write
-            }
-        });
+    let access = metadata.and_then(|metadata| metadata.access).unwrap_or({
+        if readonly {
+            SqliteAccessKind::Read
+        } else {
+            SqliteAccessKind::Write
+        }
+    });
     let read_connection_time = if access == SqliteAccessKind::Read {
         latency
     } else {
