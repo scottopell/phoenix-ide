@@ -1424,6 +1424,58 @@ mod tests {
     }
 
     #[test]
+    fn non_minute_aligned_fixed_window_discards_leading_partial_minute() {
+        for offset in [1, 30_000_000, M - 1] {
+            let now = 100 * M + offset;
+            let collector = collector_started_at(1, Duration::from_secs(24 * 60 * 60));
+
+            let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, now);
+
+            assert!(!snapshot.restart_truncated);
+            assert_eq!(snapshot.bucket_count, 60, "offset={offset}");
+            assert_eq!(
+                snapshot.covered_uptime_micros,
+                59 * M + offset,
+                "offset={offset}",
+            );
+            assert_eq!(
+                snapshot.buckets.first().unwrap().minute_start_unix_micros,
+                41 * M,
+                "offset={offset}",
+            );
+            assert_eq!(
+                snapshot.buckets.last().unwrap().minute_start_unix_micros,
+                100 * M,
+                "offset={offset}",
+            );
+        }
+    }
+
+    #[test]
+    fn restart_boundary_coverage_begins_at_first_complete_minute_boundary() {
+        let now = 100 * M + 1;
+        let collector = collector_started_at(100 * M - 1, Duration::from_micros(2));
+
+        let snapshot = {
+            let inner = collector
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.snapshot(
+                SqliteSnapshotWindow::OneHour,
+                now,
+                inner.process_started_at + Duration::from_micros(2),
+            )
+        };
+
+        assert!(snapshot.restart_truncated);
+        assert_eq!(snapshot.process_uptime_micros, 2);
+        assert_eq!(snapshot.covered_uptime_micros, 1);
+        assert_eq!(snapshot.bucket_count, 1);
+        assert_eq!(snapshot.buckets[0].minute_start_unix_micros, 100 * M,);
+    }
+
+    #[test]
     fn snapshot_clips_coverage_to_process_uptime() {
         let collector = SqliteWorkloadCollector::new();
         {
@@ -1771,6 +1823,7 @@ mod tests {
                 let now = Arc::clone(&now);
                 let completion_signal = Arc::clone(&completion_signal);
                 move || {
+                    let captured = now.load(Ordering::SeqCst);
                     if let Some(signal) = completion_signal
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1778,7 +1831,7 @@ mod tests {
                     {
                         signal.send(()).unwrap();
                     }
-                    now.load(Ordering::SeqCst)
+                    captured
                 }
             },
             {
