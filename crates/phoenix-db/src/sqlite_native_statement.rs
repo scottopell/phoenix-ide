@@ -6,7 +6,7 @@ use libsqlite3_sys as ffi;
 #[cfg(test)]
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteConnection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -32,6 +32,7 @@ struct AwaitingReprepare {
 pub(crate) struct NativeStatementCallbackContext {
     collector: SqliteWorkloadCollector,
     active_read_tokens: HashMap<usize, NativeReadToken>,
+    unobserved_read_statements: HashSet<usize>,
     awaiting_reprepare: Option<AwaitingReprepare>,
     prepare_state: PrepareState,
     prepare_pending: bool,
@@ -92,6 +93,7 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_tokens: HashMap::new(),
+            unobserved_read_statements: HashSet::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -115,6 +117,7 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_tokens: HashMap::new(),
+            unobserved_read_statements: HashSet::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -136,6 +139,7 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_tokens: HashMap::new(),
+            unobserved_read_statements: HashSet::new(),
             awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
@@ -151,17 +155,24 @@ impl NativeStatementCallbackContext {
 
     fn reconcile_incomplete_reads(&mut self) {
         let awaiting_reprepare = self.awaiting_reprepare.take().is_some();
-        let active_reads = !self.active_read_tokens.is_empty();
+        let active_reads =
+            !self.active_read_tokens.is_empty() || !self.unobserved_read_statements.is_empty();
         self.active_read_tokens.clear();
+        self.unobserved_read_statements.clear();
         if awaiting_reprepare || active_reads {
             self.collector.record_classification_gap();
         }
     }
 
     fn start_native_read(&mut self, statement_identity: usize, category: SqliteWorkloadCategory) {
-        if !self.active_read_tokens.is_empty() {
-            self.active_read_tokens.clear();
+        if let Some(stale) = self.active_read_tokens.remove(&statement_identity) {
+            stale.finish();
             self.collector.record_classification_gap();
+        } else if !self.active_read_tokens.is_empty() || !self.unobserved_read_statements.is_empty()
+        {
+            self.unobserved_read_statements.insert(statement_identity);
+            self.collector.record_classification_gap();
+            return;
         }
         self.active_read_tokens.insert(
             statement_identity,
@@ -170,6 +181,9 @@ impl NativeStatementCallbackContext {
     }
 
     fn finish_native_read(&mut self, statement_identity: usize) -> u32 {
+        if self.unobserved_read_statements.remove(&statement_identity) {
+            return 0;
+        }
         self.active_read_tokens
             .remove(&statement_identity)
             .map_or(0, |token| {
@@ -1681,16 +1695,32 @@ mod tests {
     }
 
     #[test]
-    fn different_stmt_after_missing_profile_retires_ghost_and_stays_unobserved() {
+    fn distinct_nested_stmt_preserves_outer_ownership_without_fabricating_connection_concurrency() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
 
         context.start_native_read(7, SqliteWorkloadCategory::RuntimeState);
         context.start_native_read(9, SqliteWorkloadCategory::Fts);
+        let inner_concurrency = context.finish_native_read(9);
 
+        assert_eq!(inner_concurrency, 0);
+        assert!(context.active_read_tokens.contains_key(&7));
         assert_eq!(collector.active_native_reads_for_test(), 1);
-        assert_eq!(context.finish_native_read(9), 1);
+        assert_eq!(context.finish_native_read(7), 1);
+        assert_eq!(collector.active_native_reads_for_test(), 0);
         assert_eq!(report_now(&collector).classification_gap_count, 1);
+        assert_eq!(
+            report_now(&collector).totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::RuntimeState.index()]
+            .read_concurrency_peak,
+            1,
+        );
+        assert_eq!(
+            report_now(&collector).totals[SqliteAccessKind::Read.index()]
+                [SqliteWorkloadCategory::Fts.index()]
+            .read_concurrency_peak,
+            0,
+        );
     }
 
     #[test]
