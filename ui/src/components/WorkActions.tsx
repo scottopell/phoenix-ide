@@ -363,11 +363,13 @@ export function WorkControlBar({
 
   useEffect(() => {
     const shouldTransferFocus = fallbackOwnedFocusRef.current || fallbackSelectorOriginRef.current;
-    if (fallbackWasVisibleRef.current && !fallbackVisible && canRepresentActiveSelection && shouldTransferFocus) {
+    const fallbackWasReplaced = canRepresentActiveSelection || !usesCompactLayout;
+    if (fallbackWasVisibleRef.current && !fallbackVisible && fallbackWasReplaced && shouldTransferFocus) {
       requestAnimationFrame(() => {
         const activeChip = document.querySelector<HTMLElement>('.mobile-pr-chip--active');
         const firstChip = document.querySelector<HTMLElement>('.mobile-pr-chip');
-        (activeChip ?? firstChip)?.focus();
+        const desktopControl = document.querySelector<HTMLElement>('[data-testid="desktop-work-controls"] button');
+        (activeChip ?? firstChip ?? desktopControl)?.focus();
       });
     }
     if (!fallbackVisible) {
@@ -375,7 +377,7 @@ export function WorkControlBar({
       fallbackSelectorOriginRef.current = false;
     }
     fallbackWasVisibleRef.current = fallbackVisible;
-  }, [canRepresentActiveSelection, fallbackVisible]);
+  }, [canRepresentActiveSelection, fallbackVisible, usesCompactLayout]);
 
 
   const freshnessLabel = dispositionPrStatus ? prFeedbackFreshnessLabel(dispositionPrStatus) : null;
