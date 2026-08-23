@@ -663,42 +663,37 @@ impl InnerCollector {
         let wall_elapsed_micros =
             effective_now_unix_micros.saturating_sub(self.process_started_at_unix_micros);
         let total_uptime_micros = wall_elapsed_micros.min(process_uptime_micros);
-        let covered_uptime_micros = total_uptime_micros.min(requested_covered_uptime_micros);
+        let available_start = effective_now_unix_micros
+            .saturating_sub(total_uptime_micros)
+            .max(effective_now_unix_micros.saturating_sub(requested_covered_uptime_micros));
+        let start_minute = minute_start(available_start)
+            .saturating_add((available_start % MICROS_PER_MINUTE != 0) as u64 * MICROS_PER_MINUTE);
+        let covered_uptime_micros = effective_now_unix_micros.saturating_sub(start_minute);
         let restart_truncated = total_uptime_micros < requested_covered_uptime_micros;
-        let window_start_unix_micros =
-            effective_now_unix_micros.saturating_sub(covered_uptime_micros);
         let bucket_count = if covered_uptime_micros == 0 {
             0
         } else {
-            let first_minute_start = minute_start(window_start_unix_micros);
-            let last_observed_micros = effective_now_unix_micros.saturating_sub(1);
-            let last_minute_start = minute_start(last_observed_micros);
-            usize::try_from(
-                (last_minute_start.saturating_sub(first_minute_start)) / MICROS_PER_MINUTE,
-            )
-            .unwrap_or(usize::MAX)
-            .saturating_add(1)
-            .min(BUCKET_COUNT)
+            let last_minute_start = minute_start(effective_now_unix_micros.saturating_sub(1));
+            usize::try_from((last_minute_start.saturating_sub(start_minute)) / MICROS_PER_MINUTE)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+                .min(BUCKET_COUNT)
         };
-        let start_minute = minute_start(window_start_unix_micros);
         let mut buckets = Vec::with_capacity(bucket_count);
         for offset in 0..bucket_count {
             let minute_start_unix_micros = start_minute + (offset as u64) * MICROS_PER_MINUTE;
-            let bucket_end_unix_micros = minute_start_unix_micros.saturating_add(MICROS_PER_MINUTE);
-            let clipped_start = minute_start_unix_micros.max(window_start_unix_micros);
-            let clipped_end = bucket_end_unix_micros.min(effective_now_unix_micros);
             let bucket = &self.buckets[slot_for(minute_start_unix_micros)];
-            let mut snapshot = if bucket.minute_start_unix_micros == minute_start_unix_micros {
-                bucket.snapshot()
+            if bucket.minute_start_unix_micros == minute_start_unix_micros {
+                buckets.push(bucket.snapshot());
             } else {
-                SqliteBucket {
-                    minute_start_unix_micros,
-                    ..SqliteBucket::default()
-                }
-                .snapshot()
-            };
-            clip_bucket_durations(&mut snapshot, clipped_start, clipped_end);
-            buckets.push(snapshot);
+                buckets.push(
+                    SqliteBucket {
+                        minute_start_unix_micros,
+                        ..SqliteBucket::default()
+                    }
+                    .snapshot(),
+                );
+            }
         }
         SqliteWorkloadSnapshot {
             window,
@@ -731,21 +726,6 @@ fn slot_for(minute_start_unix_micros: u64) -> usize {
 
 fn duration_to_micros(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
-}
-
-fn clip_bucket_durations(bucket: &mut SqliteBucketSnapshot, clipped_start: u64, clipped_end: u64) {
-    let bucket_start = bucket.minute_start_unix_micros;
-    let clipped_width = clipped_end.saturating_sub(clipped_start);
-    if clipped_start == bucket_start && clipped_width == MICROS_PER_MINUTE {
-        return;
-    }
-    for access in SqliteAccessKind::ALL {
-        for category in SqliteWorkloadCategory::ALL {
-            let totals = &mut bucket.totals[access.index()][category.index()];
-            totals.writer_held_micros = totals.writer_held_micros.min(clipped_width);
-            totals.read_connection_micros = totals.read_connection_micros.min(clipped_width);
-        }
-    }
 }
 
 fn unix_now_micros() -> u64 {
@@ -995,13 +975,12 @@ mod tests {
         }
 
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, 20 * M);
-        assert_eq!(snapshot.bucket_count, 3);
+        assert_eq!(snapshot.bucket_count, 2);
         assert!(snapshot.restart_truncated);
-        assert!(snapshot.covered_uptime_micros >= 150_000_000);
-        assert!(snapshot.covered_uptime_micros < 151_000_000);
+        assert_eq!(snapshot.covered_uptime_micros, 2 * M);
         assert_eq!(
             snapshot.buckets.first().unwrap().minute_start_unix_micros,
-            17 * M
+            18 * M
         );
         assert_eq!(
             snapshot.buckets.last().unwrap().minute_start_unix_micros,
@@ -1150,19 +1129,19 @@ mod tests {
         );
     }
     #[test]
-    fn partial_edge_buckets_clip_durations_to_exact_window() {
+    fn minute_aligned_window_keeps_concurrent_read_duration_additive() {
         let collector = collector_started_at(0, Duration::from_secs(20 * 60));
         let completed_at = (10 * M) + 30_000_000;
         collector.record(SqliteObservation {
             completed_at_unix_micros: completed_at,
             category: SqliteWorkloadCategory::Fts,
-            access: SqliteAccessKind::Write,
+            access: SqliteAccessKind::Read,
             outcome: SqliteOutcome::Success,
             latency: Duration::from_millis(1),
             pool_wait: Duration::ZERO,
             write_admission_wait: Duration::ZERO,
-            writer_held: Duration::from_secs(70),
-            read_connection_time: Duration::ZERO,
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::from_secs(70),
             retry_count: 0,
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
@@ -1173,7 +1152,7 @@ mod tests {
             },
         });
         let snapshot = collector.snapshot(SqliteSnapshotWindow::OneHour, completed_at);
-        let write = SqliteAccessKind::Write.index();
+        let read = SqliteAccessKind::Read.index();
         let fts = SqliteWorkloadCategory::Fts.index();
         let relevant: Vec<(u64, u64)> = snapshot
             .buckets
@@ -1181,7 +1160,7 @@ mod tests {
             .map(|bucket| {
                 (
                     bucket.minute_start_unix_micros,
-                    bucket.totals[write][fts].writer_held_micros,
+                    bucket.totals[read][fts].read_connection_micros,
                 )
             })
             .filter(|(_, micros)| *micros > 0)
