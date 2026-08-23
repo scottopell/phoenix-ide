@@ -3700,20 +3700,37 @@ def cmd_status():
             pass
 
 
+def _native_chromium_candidates() -> tuple[Path, ...]:
+    if sys.platform == "darwin":
+        return (
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            Path.home() / "Applications/Chromium.app/Contents/MacOS/Chromium",
+        )
+    return ()
+
+
 def _find_chromium_binary() -> Path | None:
     """Locate a usable Chromium/Chrome binary, in this order:
 
-    1. `PATH` (`google-chrome`, `chromium`, `chromium-browser`, `chrome`).
-    2. Playwright's standard install dir at `/opt/pw-browsers/chromium-*/chrome-linux*/chrome`.
-    3. Playwright's per-user cache at `~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`.
-    4. Puppeteer's per-user cache at `~/.cache/puppeteer/chrome/*/chrome-linux*/chrome`.
-    5. chromiumoxide's own cache at `~/.local/share/chromiumoxide/`.
+    1. Native platform application locations (signed Google Chrome before
+       Chromium on macOS).
+    2. `PATH` (`google-chrome`, `chromium`, `chromium-browser`, `chrome`).
+    3. Playwright's standard install dir at `/opt/pw-browsers/chromium-*/chrome-linux*/chrome`.
+    4. Playwright's per-user cache at `~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`.
+    5. Puppeteer's per-user cache at `~/.cache/puppeteer/chrome/*/chrome-linux*/chrome`.
+    6. chromiumoxide's own cache at `~/.local/share/chromiumoxide/`.
 
     Returns the first existing executable, or `None`. The result flows
     into `PHOENIX_CHROME_EXECUTABLE` so `BrowserSession::new()` can use
     the binary directly without invoking the fetcher.
     """
     import shutil
+
+    for candidate in _native_chromium_candidates():
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     for name in ("google-chrome", "chromium", "chromium-browser", "chrome", "google-chrome-stable"):
         p = shutil.which(name)
         if p:

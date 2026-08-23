@@ -64,6 +64,32 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         build.assert_called_once_with()
         start.assert_called_once_with(port=8041, release=False, tls=False)
 
+    def test_chromium_discovery_prefers_native_signed_chrome_over_path_chromium(self):
+        signed_chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        path_chromium = Path("/opt/homebrew/bin/chromium")
+
+        with (
+            mock.patch.object(self.dev, "_native_chromium_candidates", return_value=(signed_chrome,)),
+            mock.patch.object(Path, "is_file", autospec=True, side_effect=lambda path: path == signed_chrome),
+            mock.patch.object(self.dev.os, "access", return_value=True),
+            mock.patch("shutil.which", return_value=str(path_chromium)) as which,
+        ):
+            selected = self.dev._find_chromium_binary()
+
+        self.assertEqual(signed_chrome, selected)
+        which.assert_not_called()
+
+    def test_chromium_discovery_falls_back_to_path(self):
+        path_chromium = Path("/opt/homebrew/bin/chromium")
+
+        with (
+            mock.patch.object(self.dev, "_native_chromium_candidates", return_value=()),
+            mock.patch("shutil.which", side_effect=lambda name: str(path_chromium) if name == "chromium" else None),
+        ):
+            selected = self.dev._find_chromium_binary()
+
+        self.assertEqual(path_chromium, selected)
+
     def test_verification_cargo_environment_disables_incremental(self):
         self.assertEqual({"CARGO_INCREMENTAL": "0"}, self.dev._verification_cargo_env())
 
