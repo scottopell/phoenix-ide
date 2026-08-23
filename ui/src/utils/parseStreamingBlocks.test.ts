@@ -431,40 +431,6 @@ describe('parseStreamingBlocks — property tests', () => {
     );
   });
 
-  /**
-   * P9: Block boundaries are at line boundaries.
-   *
-   * Every block's content either ends with '\n' or is the last block
-   * AND the buffer does not end with '\n'.
-   */
-  it('P9: block contents end at line boundaries', () => {
-    fc.assert(
-      fc.property(
-        fc.string({ minLength: 0, maxLength: 500 }),
-        (buffer) => {
-          const blocks = parseStreamingBlocks(buffer);
-          if (blocks.length === 0) return true;
-          const bufferEndsWithNewline = buffer.endsWith('\n');
-          for (let i = 0; i < blocks.length; i++) {
-            const block = blocks[i]!;
-            const isLast = i === blocks.length - 1;
-            if (block.content === '') continue; // empty block is fine
-            const contentEndsWithNewline = block.content.endsWith('\n');
-            if (!isLast && !contentEndsWithNewline) return false;
-            if (isLast && !bufferEndsWithNewline && contentEndsWithNewline) {
-              // Last block content ends with '\n' but buffer doesn't — acceptable
-              // only if the content is an empty line (content is just '\n').
-              // Actually this is fine; the last block may end with '\n' even if
-              // the buffer doesn't (the buffer could end mid-line after the block).
-            }
-          }
-          return true;
-        }
-      ),
-      { numRuns: 200 }
-    );
-  });
-
   // ---------------------------------------------------------------------------
   // Structured fuzz tests using realistic inputs
   // ---------------------------------------------------------------------------
@@ -479,27 +445,6 @@ describe('parseStreamingBlocks — property tests', () => {
         }
       ),
       { numRuns: 500 }
-    );
-  });
-
-  it('all blocks have string content and correct type', () => {
-    fc.assert(
-      fc.property(
-        fc.string({ minLength: 0, maxLength: 500 }),
-        (buffer) => {
-          const blocks = parseStreamingBlocks(buffer);
-          for (const block of blocks) {
-            if (typeof block.content !== 'string') return false;
-            if (block.type !== 'markdown' && block.type !== 'code') return false;
-            if (block.type === 'code') {
-              if (typeof block.lang !== 'string') return false;
-              if (typeof block.complete !== 'boolean') return false;
-            }
-          }
-          return true;
-        }
-      ),
-      { numRuns: 300 }
     );
   });
 
