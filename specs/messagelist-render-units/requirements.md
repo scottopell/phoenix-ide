@@ -391,6 +391,17 @@ WHEN a touch begins
 THE SYSTEM SHALL remember the pre-gesture follow mode
 AND a touch that ends without movement SHALL restore that mode
 
+WHEN a gesture the platform never reports as ended is discovered — at the
+next interaction, or once a finger reported down has outlasted the
+gesture-staleness bound without an event of its own
+THE SYSTEM SHALL end that gesture without confirming a tail return
+AND SHALL discard its travel evidence rather than carrying it into the next
+gesture
+AND SHALL leave viewport ownership where the interaction placed it
+SO THAT an interaction whose end position was never observed can neither
+confirm from geometry belonging to a later moment nor defer every subsequent
+confirmation to a lift that is not coming
+
 WHEN a touch moves
 THE SYSTEM SHALL transfer viewport ownership to the user even if no
 scroll event is emitted

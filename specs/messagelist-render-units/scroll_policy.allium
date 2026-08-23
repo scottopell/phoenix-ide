@@ -582,7 +582,9 @@ rule MovedTouchCancellationOutsideReturnZoneKeepsOwnership {
 
 -- A gesture whose end event never arrives — the touch target unmounted
 -- mid-drag, so touchend was dispatched at a detached node — is discovered
--- only when the next interaction begins. It cannot be resolved then: the
+-- when the next interaction begins, or when a finger reported down has gone
+-- longer than the gesture-staleness bound without an event of its own while
+-- other input drives the viewport. It cannot be resolved then: the
 -- position it ended at was never observed, and the current one describes a
 -- later moment. Ownership stands where the interaction left it, and only the
 -- evidence is dropped, so the next gesture starts with none of it.

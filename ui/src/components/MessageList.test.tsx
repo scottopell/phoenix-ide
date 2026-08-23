@@ -4,6 +4,7 @@ import { createRef, forwardRef, StrictMode, useEffect, useImperativeHandle, useL
 import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScope';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, screen } from '@testing-library/react';
+import { GESTURE_STALE_MS } from './VirtualTranscript';
 import type { VirtualTranscriptPhysicalSnapshot, VirtualTranscriptRangeChange } from './VirtualTranscript';
 import type { ConversationState, Message } from '../api';
 import type { AgentTextHighlight, AgentTextRevealRequest } from './MessageComponents';
@@ -3328,6 +3329,53 @@ describe('handleTotalListHeightChanged', () => {
     fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 2 }] });
 
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
+  it('a gesture whose lift was never seen stops blocking confirmations from other input', () => {
+    vi.useFakeTimers();
+    try {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-stale-gesture-blocks"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A touch drags, its row is virtualized away, and the lift is never
+    // reported. The policy still believes a finger is down.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+
+    // The reader finishes the journey on a trackpad and comes to rest at the
+    // tail. A held gesture defers confirmation to its own lift — but this one
+    // has no lift coming, so deferring means the chip never clears.
+    vi.advanceTimersByTime(GESTURE_STALE_MS + 1);
+    fireEvent.wheel(scroller, { deltaY: 120 });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {

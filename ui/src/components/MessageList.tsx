@@ -25,6 +25,7 @@ import {
 } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
 import {
+  GESTURE_STALE_MS,
   VirtualTranscript,
   type VirtualTranscriptHandle,
   type VirtualTranscriptPhysicalSnapshot,
@@ -785,6 +786,7 @@ function MessageListImpl({
    *  elsewhere on the page. The intersection is both scoped and self-healing,
    *  since a vanished touch is absent from every later event's list. */
   const scrollerTouchIdsRef = useRef(new Set<number>());
+  const lastTouchAtMs = useRef(0);
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -915,7 +917,20 @@ function MessageListImpl({
       const requestFromUpwardIntent = () => {
         if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
+      // A gesture the platform never reports as ended would otherwise defer
+      // every confirmation to a lift that is not coming, so the chip outlives
+      // the interaction that raised it. A finger still down after this long
+      // with no touch event of its own is not the one driving the viewport —
+      // the same bound, for the same reason, as VirtualTranscript's.
+      const abandonStaleGesture = () => {
+        if (scrollerTouchIdsRef.current.size === 0) return;
+        if (Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+        scrollerTouchIdsRef.current.clear();
+        touchStartYRef.current = null;
+        dispatchScrollEvent({ type: 'gestureAbandoned' });
+      };
       const onTouchStart = (e: TouchEvent) => {
+        lastTouchAtMs.current = Date.now();
         const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
@@ -936,6 +951,7 @@ function MessageListImpl({
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = (e: TouchEvent) => {
+        lastTouchAtMs.current = Date.now();
         dispatchScrollEvent({ type: 'touchMoved' });
         const currentY = e.touches[0]?.clientY;
         if (currentY !== undefined && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
@@ -943,6 +959,7 @@ function MessageListImpl({
         }
       };
       const resolveTouchStop = (e: TouchEvent, type: 'touchEnded' | 'touchCancelled') => {
+        lastTouchAtMs.current = Date.now();
         let owned = false;
         for (const touch of Array.from(e.changedTouches)) {
           if (scrollerTouchIdsRef.current.delete(touch.identifier)) owned = true;
@@ -961,6 +978,7 @@ function MessageListImpl({
       const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
       const onTouchCancel = (e: TouchEvent) => resolveTouchStop(e, 'touchCancelled');
       const onWheel = (e: WheelEvent) => {
+        abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         if (e.deltaY < 0) {
@@ -1017,6 +1035,7 @@ function MessageListImpl({
         updateEarlierHistoryRestoreRef.current();
       };
       const onKeyDown = (e: KeyboardEvent) => {
+        abandonStaleGesture();
         const target = e.target;
         const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
         if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
