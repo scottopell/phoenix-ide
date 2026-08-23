@@ -437,6 +437,7 @@ rule TouchMovementTakesReadingOwnership {
 rule TapEndRestoresPreGestureMode {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_stationary
     requires: policy.travelled_toward_tail = false
              or policy.distance_from_tail > config.pin_to_bottom_threshold
@@ -482,6 +483,7 @@ rule GestureCancellationTowardTailConfirmsTailReturn {
 rule GestureEndWithoutTravelTowardTailKeepsOwnership {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
     requires: policy.travelled_toward_tail = false
     ensures: policy.gesture_mode = idle
@@ -491,15 +493,25 @@ rule GestureEndWithoutTravelTowardTailKeepsOwnership {
 rule GestureEndOutsideReturnZoneKeepsOwnership {
     when: TouchEnded(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
     requires: policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
 }
 
--- Navigation ownership is released only by its own rules, never by a lift.
+-- Navigation ownership is released only by its own rules, never by an
+-- interaction ending. Every other end and cancel rule excludes navigating for
+-- the same reason, so exactly one of them applies to any given ending.
 rule NavigationOwnershipSurvivesGestureEnd {
     when: TouchEnded(policy, remaining_touches)
+    requires: remaining_touches = 0
+    requires: policy.follow_mode = navigating
+    ensures: policy.follow_mode = navigating
+}
+
+rule NavigationOwnershipSurvivesGestureCancellation {
+    when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.follow_mode = navigating
     ensures: policy.follow_mode = navigating
@@ -508,6 +520,7 @@ rule NavigationOwnershipSurvivesGestureEnd {
 rule StationaryTouchCancellationRestoresPreGestureMode {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_stationary
     requires: policy.travelled_toward_tail = false
              or policy.distance_from_tail > config.pin_to_bottom_threshold
@@ -518,6 +531,7 @@ rule StationaryTouchCancellationRestoresPreGestureMode {
 rule MovedTouchCancellationPreservesReadingOwnership {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
     requires: policy.travelled_toward_tail = false
     ensures: policy.gesture_mode = idle
@@ -527,6 +541,7 @@ rule MovedTouchCancellationPreservesReadingOwnership {
 rule MovedTouchCancellationOutsideReturnZoneKeepsOwnership {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
+    requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
     requires: policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle

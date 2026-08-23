@@ -22,17 +22,8 @@ export type Gesture =
       kind: 'touch';
       moved: boolean;
       departedBottom: boolean;
-      /** Whether the reader has moved the viewport toward the tail during
-       *  this interaction. Monotone: it is only ever set, so there is no
-       *  revocation to forget and a missed update can withhold a
-       *  confirmation but never manufacture one.
-       *
-       *  This is a fact about observed movement, not about geometry. Distance
-       *  from the tail is not, on its own, evidence of anything the reader
-       *  did: content growing or collapsing moves the tail independently of
-       *  the viewport, so comparing distances measured at two moments cannot
-       *  distinguish a reader who travelled from a reader who stood still
-       *  while the content rearranged itself around them. */
+      /** Set only by observed downward movement; see scroll_policy.allium
+       *  travelled_toward_tail. */
       travelledTowardTail: boolean;
       modeBeforeGesture: FollowMode;
     };
@@ -146,8 +137,8 @@ function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): Scr
   };
 }
 
-/** Record geometry without asserting anything about what the reader did.
- *  Every event that is not observed downward movement lands here. */
+/** Records geometry only. Every event but observed downward movement lands
+ *  here (scroll_policy.allium *PreservesTravelEvidence). */
 function observeGeometry(
   state: ReadySession,
   snapshot: ScrollSnapshot | null,
@@ -159,9 +150,8 @@ function observeGeometry(
   return { ...state, geometry };
 }
 
-/** Record geometry from movement that carried the viewport toward the tail.
- *  This is the sole writer of the gesture's travel evidence, so no layout
- *  change, settle probe, or echo of the executor's own writes can supply it. */
+/** Sole writer of the gesture's travel evidence (scroll_policy.allium
+ *  DownwardObservationRecordsTravelTowardTail). */
 function observeTravelTowardTail(
   state: ReadySession,
   snapshot: ScrollSnapshot | null,
@@ -314,11 +304,7 @@ function resolveTouch(
     gesture: IDLE,
     unread: state.unread,
   };
-  // A gesture that moved the viewport toward the tail and ends inside the
-  // return zone is an arrival; one that ends there without having travelled
-  // is a reader the content drifted underneath, or one whose finger never
-  // shifted anything (scroll_policy.allium
-  // GestureEndTowardTailConfirmsTailReturn).
+  // scroll_policy.allium GestureEndTowardTailConfirmsTailReturn
   if (
     follow.kind === 'reading'
     && state.gesture.travelledTowardTail

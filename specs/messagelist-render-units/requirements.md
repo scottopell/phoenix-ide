@@ -396,10 +396,10 @@ THE SYSTEM SHALL transfer viewport ownership to the user even if no
 scroll event is emitted
 AND a bottom callback received during that moved touch SHALL NOT release
 user ownership while the gesture is active
-AND SHALL be retained as evidence that the gesture reached the tail
+SO THAT a callback describing where the viewport is cannot decide who owns it
 
 WHEN a gesture ends or is cancelled inside the pin-to-bottom threshold,
-having been farther from the tail at some point during that gesture
+having moved the viewport toward the tail during that gesture
 THE SYSTEM SHALL confirm the tail return
 AND SHALL otherwise preserve user ownership
 SO THAT a confirmation blocked mid-gesture is honoured at the lift rather

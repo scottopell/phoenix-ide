@@ -700,6 +700,58 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it('discards a pending correction that an absolute reposition has superseded', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      let followTail = false;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onTotalExtentChange={() => { if (followTail) ref.current?.scrollToTail(); }}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 7 }], changedTouches: [{ identifier: 7 }] });
+      });
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+
+      // The gesture ends and the policy hands tail-follow back before the
+      // deferred correction has been written. Clearing the drift changes the
+      // total extent, and the extent callback is dispatched from an effect
+      // declared ahead of reconciliation — so the tail snap lands first.
+      followTail = true;
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 7 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      // The correction was computed against the position the snap replaced.
+      // Applying it on top would leave a following viewport short of the
+      // tail by exactly the drift.
+      const maxScrollTop = 30 * 50 - 30 - 100;
+      expect(scrollTopOf(scroller)).toBe(maxScrollTop);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {

@@ -256,6 +256,13 @@ describe('scrollMachine durable follow policy', () => {
     const result = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 });
     expectLiveMode(result.state, 'navigating');
     expect(effectTypes(result.effects)).not.toContain('clearUnread');
+
+    // A cancellation ends the interaction for reasons of the platform's own —
+    // a system gesture, a container claiming the pan — none of which say
+    // anything about ownership either.
+    const cancelled = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 0 });
+    expectLiveMode(cancelled.state, 'navigating');
+    expect(effectTypes(cancelled.effects)).not.toContain('clearUnread');
   });
 
   it('a pending navigation measurement leaves the physical edge unobserved', () => {

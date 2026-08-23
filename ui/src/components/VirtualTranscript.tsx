@@ -345,6 +345,11 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   const scroller = store.scroller;
   const maxScrollTop = Math.max(0, totalPhysicalExtent(store) - store.viewportExtent);
   const scrollTop = Math.max(0, Math.min(nextTop, maxScrollTop));
+  // A pending correction is relative to the position it was computed against.
+  // Placing the viewport somewhere absolute retires that position, so the
+  // correction goes with it — applied afterwards it would displace the
+  // caller's chosen position by the drift (REQ-VT-004).
+  store.pendingScrollDelta = null;
   store.viewportTop = scrollTop;
   if (scroller && scroller.scrollTop !== scrollTop) {
     store.pendingProgrammaticTop = scrollTop;
