@@ -1,6 +1,5 @@
 use crate::sqlite_workload::{
-    SqliteAccessKind, SqliteObservation, SqliteObservationCounting, SqliteWorkloadCategory,
-    SqliteWorkloadCollector,
+    NativeStatementObservation, SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector,
 };
 use libsqlite3_sys as ffi;
 #[cfg(test)]
@@ -9,7 +8,7 @@ use sqlx::sqlite::SqliteConnection;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,8 +109,11 @@ impl NativeStatementCallbackContext {
         }
         self.reset_prepare_state();
         self.prepare_pending = true;
-        self.prepare_boundary_seen = false;
         self.prepare_ambiguous = false;
+    }
+
+    fn note_prepare_boundary(&mut self) {
+        self.prepare_boundary_seen = true;
     }
 
     fn note_prepare_metadata(
@@ -121,10 +123,13 @@ impl NativeStatementCallbackContext {
     ) {
         if !self.prepare_pending {
             self.begin_prepare();
-        } else if self.prepare_boundary_seen {
+        } else if self.prepare_boundary_seen
+            && self.prepare_state.category != SqliteWorkloadCategory::Other
+            && category != self.prepare_state.category
+        {
             self.prepare_ambiguous = true;
-            self.prepare_boundary_seen = false;
         }
+        self.prepare_boundary_seen = false;
         self.prepare_state.category = category_precedence(self.prepare_state.category, category);
         self.prepare_state.access = access_precedence(self.prepare_state.access, access);
     }
@@ -238,11 +243,8 @@ impl NativeStatementCallbackContext {
         let Some(writer_admitted_at) = self.writer_admitted_at.take() else {
             return;
         };
-        self.collector.record_writer_occupancy(
-            unix_now_micros(),
-            self.current_writer_category,
-            writer_admitted_at.elapsed(),
-        );
+        self.collector
+            .record_writer_occupancy(self.current_writer_category, writer_admitted_at.elapsed());
         self.current_writer_category = SqliteWorkloadCategory::Other;
     }
 
@@ -372,9 +374,14 @@ unsafe extern "C" fn authorizer_callback(
         return ffi::SQLITE_OK;
     }
     let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
-    if action_code == ffi::SQLITE_SELECT {
-        context.prepare_boundary_seen = context.prepare_pending;
-        return ffi::SQLITE_OK;
+    if matches!(
+        action_code,
+        ffi::SQLITE_SELECT | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE
+    ) {
+        context.note_prepare_boundary();
+        if action_code == ffi::SQLITE_SELECT {
+            return ffi::SQLITE_OK;
+        }
     }
     if let Some((category, access)) = classify_authorizer_action(action_code, arg1) {
         context.note_prepare_metadata(category, access);
@@ -457,20 +464,15 @@ unsafe extern "C" fn profile_callback(
         context.collector.end_native_read();
         context.active_read_concurrency = 0;
     }
-    let observation = SqliteObservation {
-        completed_at_unix_micros: unix_now_micros(),
-        category,
-        access,
-        latency,
-        writer_held: Duration::ZERO,
-        read_connection_time,
-        retry_count: 0,
-        retry_backoff: Duration::ZERO,
-        writer_concurrency: 0,
-        read_concurrency,
-        counting: SqliteObservationCounting::BaselineStatement,
-    };
-    context.collector.record(observation);
+    context
+        .collector
+        .record_native_statement(NativeStatementObservation {
+            category,
+            access,
+            statement_latency: latency,
+            read_connection_time,
+            read_concurrency,
+        });
     0
 }
 
@@ -682,16 +684,10 @@ unsafe extern "C" fn destroy_context(context: *mut c_void) {
     }
 }
 
-fn unix_now_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite_workload::unix_now_micros;
     use crate::SqliteLatencyBin;
     use crate::SqliteOutcome;
     use crate::{Database, SqliteSnapshotWindow, SqliteWorkloadAggregateReport};
@@ -802,7 +798,10 @@ mod tests {
         assert_eq!(writes.writer_held_micros, 0);
         assert_eq!(writes.write_admission_wait_micros, 0);
         assert_eq!(reads.write_admission_wait_micros, 0);
-        assert!(reads.read_connection_micros >= reads.latency_micros.saturating_sub(5_000));
+        assert!(
+            reads.read_connection_micros
+                >= reads.native_statement_latency_micros.saturating_sub(5_000)
+        );
     }
 
     #[tokio::test]
@@ -858,10 +857,13 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap_err();
-        sqlx::query("SELECT COUNT(*) FROM conversations")
-            .fetch_one(db.pool())
+        let mut read_connection = db.pool().acquire().await.unwrap();
+        let read = read_connection
+            .prepare(sqlx::query::<sqlx::Sqlite>("SELECT COUNT(*) FROM conversations").sql())
             .await
             .unwrap();
+        read.query().fetch_one(&mut *read_connection).await.unwrap();
+        drop(read_connection);
         sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('p1','/tmp/p1','main','2026-01-01T00:00:00Z')")
             .execute(db.pool())
             .await
@@ -872,12 +874,17 @@ mod tests {
             .unwrap();
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let read = SqliteAccessKind::Read.index();
         assert!(
-            report.totals[SqliteAccessKind::Read.index()]
-                [SqliteWorkloadCategory::RuntimeState.index()]
-            .baseline_statement_count
+            report.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count
+                + report.totals[read][SqliteWorkloadCategory::Other.index()]
+                    .baseline_statement_count
                 >= 1
         );
+        if report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count > 0 {
+            assert!(report.classification_gap_count > 0);
+        }
         assert!(
             report.totals[SqliteAccessKind::Write.index()]
                 [SqliteWorkloadCategory::PrProjectData.index()]
@@ -956,6 +963,45 @@ mod tests {
                 assert_eq!(
                     report.totals[read][category.index()].baseline_statement_count,
                     before.totals[read][category.index()].baseline_statement_count
+                );
+            }
+        }
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn unexecuted_dml_prepare_then_dml_prepare_degrades_to_other() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let before =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let _fts = connection
+            .prepare(sqlx::query::<sqlx::Sqlite>("DELETE FROM message_fts WHERE rowid = -1").sql())
+            .await
+            .unwrap();
+        let message = connection
+            .prepare(
+                sqlx::query::<sqlx::Sqlite>(
+                    "UPDATE conversations SET title = title WHERE id = 'dml-ambiguity'",
+                )
+                .sql(),
+            )
+            .await
+            .unwrap();
+        message.query().execute(&mut *connection).await.unwrap();
+        let report =
+            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let write = SqliteAccessKind::Write.index();
+        assert_eq!(
+            report.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
+            before.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count
+                + 1
+        );
+        for category in SqliteWorkloadCategory::ALL {
+            if category != SqliteWorkloadCategory::Other {
+                assert_eq!(
+                    report.totals[write][category.index()].baseline_statement_count,
+                    before.totals[write][category.index()].baseline_statement_count
                 );
             }
         }
@@ -1158,18 +1204,12 @@ mod tests {
     #[test]
     fn native_profile_records_baseline_without_outcome_or_unmeasured_waits() {
         let collector = SqliteWorkloadCollector::new();
-        collector.record(SqliteObservation {
-            completed_at_unix_micros: unix_now_micros(),
+        collector.record_native_statement(NativeStatementObservation {
             category: SqliteWorkloadCategory::Other,
             access: SqliteAccessKind::Write,
-            latency: Duration::from_millis(3),
-            writer_held: Duration::ZERO,
+            statement_latency: Duration::from_millis(3),
             read_connection_time: Duration::ZERO,
-            retry_count: 0,
-            retry_backoff: Duration::ZERO,
-            writer_concurrency: 0,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::BaselineStatement,
         });
 
         let report = report_now(&collector);
@@ -1193,7 +1233,7 @@ mod tests {
             0
         );
         assert_eq!(
-            report.latency_histogram[access][category]
+            report.native_statement_latency_histogram[access][category]
                 [SqliteLatencyBin::from_duration(Duration::from_millis(3)).index()],
             1
         );
@@ -1419,10 +1459,16 @@ mod tests {
         connection.close().await.unwrap();
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
-        let totals = report.totals[SqliteAccessKind::Write.index()]
-            [SqliteWorkloadCategory::PrProjectData.index()];
-        assert!(totals.writer_held_micros > 0);
-        assert_eq!(totals.writer_concurrency_peak, 1);
+        let write = SqliteAccessKind::Write.index();
+        let occupied: Vec<_> = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .filter_map(|category| {
+                let totals = report.totals[write][category.index()];
+                (totals.writer_held_micros > 0).then_some((category, totals))
+            })
+            .collect();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].1.writer_concurrency_peak, 1);
         assert!(report.writer_occupancy_gap_count >= 1);
     }
 

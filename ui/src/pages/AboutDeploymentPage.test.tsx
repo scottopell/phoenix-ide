@@ -156,14 +156,23 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
   };
 }
 
+function sqliteBaselineCategory(category: SqliteReportCategory, label: string) {
+  return {
+    category,
+    label,
+    baseline_statement_count: 0,
+    native_statement_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+  };
+}
+
 function sqliteCategory(category: SqliteReportCategory, label: string) {
   return {
     category,
     label,
-    operation_count: 0,
+    typed_operation_count: 0,
+    typed_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     writer_occupancy_percent: 0,
     peak_concurrency: 0,
-    latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     admission_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     retries: null,
@@ -175,13 +184,12 @@ function sqliteReadCategory(category: SqliteReportCategory, label: string) {
   return {
     category,
     label,
-    operation_count: 0,
-    total_duration_ms: 0,
-    avg_duration_ms: null,
+    typed_operation_count: 0,
+    typed_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
+    total_connection_time_ms: 0,
+    profiled_statement_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     peak_concurrency: 0,
-    latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
-    admission_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     retries: null,
     failures: { busy: 0, locked: 0, pool_timeout: 0, other_timeout: 0, other_failure: 0, abandoned: 0 },
   };
@@ -198,7 +206,16 @@ function sqliteReport(overrides: Partial<SqliteWorkloadReportResponse> = {}): Sq
     covered_uptime_seconds: 125,
     covered_uptime_micros: 125_000_000,
     coverage: { bucket_count: 2, fully_covered: false, label: '2m 5s covered across 2 buckets; requested 60m' },
-    classification: { classified_operation_count: 0, baseline_statement_count: 0, other_operation_count: 0, other_operation_share_percent: null, abandoned_count: 0, classification_gap_count: 0, writer_occupancy_gap_count: 0 },
+    classification: { typed_outcome_count: 0,
+      typed_other_outcome_count: 0,
+      typed_other_outcome_share_percent: null,
+      baseline_statement_count: 0,
+      baseline_other_statement_count: 0,
+      baseline_other_statement_share_percent: null,
+      abandoned_count: 0,
+      classification_gap_count: 0,
+      writer_occupancy_gap_count: 0 },
+    baseline_categories: [sqliteBaselineCategory('message_persistence', 'Message persistence')],
     writer_categories: [sqliteCategory('message_persistence', 'Message persistence')],
     reads: [sqliteReadCategory('message_persistence', 'Message persistence')],
     ...overrides,
@@ -312,7 +329,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText('Restart truncated')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
-    await screen.findAllByText('No SQLite samples captured for this window yet.');
+    await screen.findAllByText(/No (native baseline|instrumented contention|native read load)/);
   });
 
   it('keeps prior SQLite values visible and labels a failed refresh stale', async () => {
@@ -374,8 +391,8 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     renderPage(deployment());
 
-    expect(await screen.findAllByText('No SQLite samples captured for this window yet.')).toHaveLength(2);
-    expect(screen.getAllByText('Message persistence')).toHaveLength(2);
+    expect(await screen.findAllByText(/No (native baseline|instrumented contention|native read load)/)).toHaveLength(3);
+    expect(screen.getAllByText('Message persistence')).toHaveLength(3);
   });
 
   it('treats baseline-only SQLite reports as sampled', async () => {
@@ -384,6 +401,38 @@ describe('AboutDeploymentPage disk usage health', () => {
     }));
     await screen.findByRole('heading', { name: 'SQLite workload' });
     expect(screen.queryAllByText('No SQLite samples captured for this window yet.')).toHaveLength(0);
+  });
+
+  it('treats occupancy-only SQLite reports as sampled', async () => {
+    const report = sqliteReport();
+    renderPage(deployment(), deploymentDisk(), sqliteReport({
+      writer_categories: report.writer_categories.map((row, index) => index === 0
+        ? { ...row, writer_occupancy_percent: 0.5, peak_concurrency: 1 }
+        : row),
+    }));
+    await screen.findByRole('heading', { name: 'SQLite workload' });
+    expect(screen.queryAllByText('No SQLite samples captured for this window yet.')).toHaveLength(0);
+  });
+
+  it('keeps mixed native, typed, and occupancy authorities separate', async () => {
+    const report = sqliteReport();
+    renderPage(deployment(), deploymentDisk(), sqliteReport({
+      classification: {
+        ...report.classification,
+        typed_outcome_count: 1,
+        baseline_statement_count: 1,
+      },
+      baseline_categories: report.baseline_categories.map((row, index) => index === 0
+        ? { ...row, baseline_statement_count: 1, native_statement_latency: { sample_count: 1, total_ms: 12, avg_ms: 12, p50_upper_bound_ms: 20, p95_upper_bound_ms: 20, p99_upper_bound_ms: 20 } }
+        : row),
+      writer_categories: report.writer_categories.map((row, index) => index === 0
+        ? { ...row, typed_operation_count: 1, typed_latency: { sample_count: 1, total_ms: 45, avg_ms: 45, p50_upper_bound_ms: 50, p95_upper_bound_ms: 50, p99_upper_bound_ms: 50 }, writer_occupancy_percent: 2, peak_concurrency: 1 }
+        : row),
+    }));
+    expect(await screen.findByText(/avg 12 ms · p95≤ 20 ms/)).toBeInTheDocument();
+    expect(screen.getByText('1 native statements')).toBeInTheDocument();
+    expect(screen.getByText(/avg 45 ms · n=1 typed writes/)).toBeInTheDocument();
+    expect(screen.queryByText(/Average connection time/)).not.toBeInTheDocument();
   });
 
   it('labels alignment-shortened coverage without claiming the full window', async () => {

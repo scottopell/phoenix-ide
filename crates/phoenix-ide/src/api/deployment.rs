@@ -198,6 +198,7 @@ pub struct SqliteWorkloadReportResponse {
     pub covered_uptime_micros: u64,
     pub coverage: SqliteWorkloadCoverage,
     pub classification: SqliteClassificationSummary,
+    pub baseline_categories: Vec<SqliteBaselineCategoryReport>,
     pub writer_categories: Vec<SqliteWriterCategoryReport>,
     pub reads: Vec<SqliteReadCategoryReport>,
 }
@@ -213,10 +214,12 @@ pub struct SqliteWorkloadCoverage {
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteClassificationSummary {
-    pub classified_operation_count: u64,
+    pub typed_outcome_count: u64,
+    pub typed_other_outcome_count: u64,
+    pub typed_other_outcome_share_percent: Option<f64>,
     pub baseline_statement_count: u64,
-    pub other_operation_count: u64,
-    pub other_operation_share_percent: Option<f64>,
+    pub baseline_other_statement_count: u64,
+    pub baseline_other_statement_share_percent: Option<f64>,
     pub abandoned_count: u64,
     pub classification_gap_count: u64,
     pub writer_occupancy_gap_count: u64,
@@ -224,13 +227,22 @@ pub struct SqliteClassificationSummary {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteBaselineCategoryReport {
+    pub category: SqliteReportCategory,
+    pub label: String,
+    pub baseline_statement_count: u64,
+    pub native_statement_latency: SqliteWaitSummary,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SqliteWriterCategoryReport {
     pub category: SqliteReportCategory,
     pub label: String,
-    pub operation_count: u64,
+    pub typed_operation_count: u64,
+    pub typed_latency: SqliteWaitSummary,
     pub writer_occupancy_percent: f64,
     pub peak_concurrency: u32,
-    pub latency: SqliteWaitSummary,
     pub pool_wait: Option<SqliteWaitSummary>,
     pub admission_wait: Option<SqliteWaitSummary>,
     pub retries: Option<SqliteRetrySummary>,
@@ -242,13 +254,12 @@ pub struct SqliteWriterCategoryReport {
 pub struct SqliteReadCategoryReport {
     pub category: SqliteReportCategory,
     pub label: String,
-    pub operation_count: u64,
-    pub total_duration_ms: u64,
-    pub avg_duration_ms: Option<u64>,
+    pub typed_operation_count: u64,
+    pub typed_latency: SqliteWaitSummary,
+    pub total_connection_time_ms: u64,
+    pub profiled_statement_latency: SqliteWaitSummary,
     pub peak_concurrency: u32,
-    pub latency: SqliteWaitSummary,
     pub pool_wait: Option<SqliteWaitSummary>,
-    pub admission_wait: Option<SqliteWaitSummary>,
     pub retries: Option<SqliteRetrySummary>,
     pub failures: SqliteFailureSummary,
 }
@@ -665,6 +676,33 @@ fn sample_sqlite_workload_report(
     };
     let writer_window_micros = report.covered_uptime_micros;
 
+    let baseline_categories = SqliteWorkloadCategory::ALL
+        .iter()
+        .copied()
+        .map(|category| {
+            let totals = report.totals[SqliteAccessKind::Write.index()][category.index()];
+            let read_totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
+            SqliteBaselineCategoryReport {
+                category: SqliteReportCategory::from(category),
+                label: sqlite_category_label(category).to_string(),
+                baseline_statement_count: totals
+                    .baseline_statement_count
+                    .saturating_add(read_totals.baseline_statement_count),
+                native_statement_latency: wait_summary(
+                    &sum_latency_histograms(
+                        &report.native_statement_latency_histogram[SqliteAccessKind::Write.index()]
+                            [category.index()],
+                        &report.native_statement_latency_histogram[SqliteAccessKind::Read.index()]
+                            [category.index()],
+                    ),
+                    totals
+                        .native_statement_latency_micros
+                        .saturating_add(read_totals.native_statement_latency_micros),
+                ),
+            }
+        })
+        .collect();
+
     let writer_categories = SqliteWorkloadCategory::ALL
         .iter()
         .copied()
@@ -680,13 +718,14 @@ fn sample_sqlite_workload_report(
             SqliteWriterCategoryReport {
                 category: SqliteReportCategory::from(category),
                 label: sqlite_category_label(category).to_string(),
-                operation_count,
+                typed_operation_count: operation_count,
+                typed_latency: wait_summary(
+                    &report.typed_attempt_latency_histogram[SqliteAccessKind::Write.index()]
+                        [category.index()],
+                    totals.typed_attempt_latency_micros,
+                ),
                 writer_occupancy_percent: utilization_percent,
                 peak_concurrency: totals.writer_concurrency_peak,
-                latency: wait_summary(
-                    &report.latency_histogram[SqliteAccessKind::Write.index()][category.index()],
-                    totals.latency_micros,
-                ),
                 pool_wait: available_wait_summary(
                     &report.pool_wait_histogram[SqliteAccessKind::Write.index()][category.index()],
                     totals.pool_wait_micros,
@@ -709,24 +748,27 @@ fn sample_sqlite_workload_report(
             let totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
             let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
             let operation_count = crate::db::operation_count(outcomes);
-            let total_duration_ms = totals.read_connection_micros / 1_000;
-            let avg_duration_ms = total_duration_ms.checked_div(operation_count);
+            let total_connection_time_ms = totals.read_connection_micros / 1_000;
             SqliteReadCategoryReport {
                 category: SqliteReportCategory::from(category),
                 label: sqlite_category_label(category).to_string(),
-                operation_count,
-                total_duration_ms,
-                avg_duration_ms,
-                peak_concurrency: totals.read_concurrency_peak,
-                latency: wait_summary(
-                    &report.latency_histogram[SqliteAccessKind::Read.index()][category.index()],
-                    totals.latency_micros,
+                typed_operation_count: operation_count,
+                typed_latency: wait_summary(
+                    &report.typed_attempt_latency_histogram[SqliteAccessKind::Read.index()]
+                        [category.index()],
+                    totals.typed_attempt_latency_micros,
                 ),
+                total_connection_time_ms,
+                profiled_statement_latency: wait_summary(
+                    &report.native_statement_latency_histogram[SqliteAccessKind::Read.index()]
+                        [category.index()],
+                    totals.native_statement_latency_micros,
+                ),
+                peak_concurrency: totals.read_concurrency_peak,
                 pool_wait: available_wait_summary(
                     &report.pool_wait_histogram[SqliteAccessKind::Read.index()][category.index()],
                     totals.pool_wait_micros,
                 ),
-                admission_wait: None,
                 retries: retry_summary(totals.retry_count, totals.retry_backoff_micros),
                 failures: failure_summary(outcomes),
             }
@@ -744,6 +786,7 @@ fn sample_sqlite_workload_report(
         covered_uptime_micros: report.covered_uptime_micros,
         coverage,
         classification: classification_summary(&report),
+        baseline_categories,
         writer_categories,
         reads,
     }
@@ -758,6 +801,13 @@ fn available_wait_summary(
     total_wait_micros: u64,
 ) -> Option<SqliteWaitSummary> {
     (histogram.iter().copied().sum::<u64>() > 0).then(|| wait_summary(histogram, total_wait_micros))
+}
+
+fn sum_latency_histograms(
+    left: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+    right: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+) -> [u64; crate::db::SqliteLatencyBin::ALL.len()] {
+    std::array::from_fn(|index| left[index].saturating_add(right[index]))
 }
 
 fn wait_summary(
@@ -782,34 +832,40 @@ fn classification_summary(
 ) -> SqliteClassificationSummary {
     use crate::db::{SqliteAccessKind, SqliteOutcome, SqliteWorkloadCategory};
 
-    let mut classified_operation_count = 0u64;
+    let mut typed_outcome_count = 0u64;
+    let mut typed_other_outcome_count = 0u64;
     let mut baseline_statement_count = 0u64;
-    let mut other_operation_count = 0u64;
+    let mut baseline_other_statement_count = 0u64;
     let mut abandoned_count = 0u64;
     for access in SqliteAccessKind::ALL {
         for category in SqliteWorkloadCategory::ALL {
             let totals = report.totals[access.index()][category.index()];
             let outcomes = &report.outcomes[access.index()][category.index()];
             let operation_count = crate::db::operation_count(outcomes);
-            classified_operation_count = classified_operation_count.saturating_add(operation_count);
+            typed_outcome_count = typed_outcome_count.saturating_add(operation_count);
             baseline_statement_count =
                 baseline_statement_count.saturating_add(totals.baseline_statement_count);
             abandoned_count =
                 abandoned_count.saturating_add(outcomes[SqliteOutcome::Abandoned.index()]);
             if category == SqliteWorkloadCategory::Other {
-                other_operation_count = other_operation_count.saturating_add(operation_count);
+                typed_other_outcome_count =
+                    typed_other_outcome_count.saturating_add(operation_count);
+                baseline_other_statement_count = baseline_other_statement_count.saturating_add(
+                    report.totals[access.index()][category.index()].baseline_statement_count,
+                );
             }
         }
     }
     SqliteClassificationSummary {
-        classified_operation_count,
+        typed_outcome_count,
+        typed_other_outcome_count,
+        typed_other_outcome_share_percent: (typed_outcome_count > 0)
+            .then(|| typed_other_outcome_count as f64 * 100.0 / typed_outcome_count as f64),
         baseline_statement_count,
-        other_operation_count,
-        other_operation_share_percent: if classified_operation_count == 0 {
-            None
-        } else {
-            Some(other_operation_count as f64 * 100.0 / classified_operation_count as f64)
-        },
+        baseline_other_statement_count,
+        baseline_other_statement_share_percent: (baseline_statement_count > 0).then(|| {
+            baseline_other_statement_count as f64 * 100.0 / baseline_statement_count as f64
+        }),
         abandoned_count,
         classification_gap_count: report.classification_gap_count,
         writer_occupancy_gap_count: report.writer_occupancy_gap_count,

@@ -166,7 +166,27 @@ impl SqliteLatencyBin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SqliteObservation {
+pub(crate) struct NativeStatementObservation {
+    pub(crate) category: SqliteWorkloadCategory,
+    pub(crate) access: SqliteAccessKind,
+    pub(crate) statement_latency: Duration,
+    pub(crate) read_connection_time: Duration,
+    pub(crate) read_concurrency: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypedOutcomeObservation {
+    pub(crate) category: SqliteWorkloadCategory,
+    pub(crate) access: SqliteAccessKind,
+    pub(crate) latency: Duration,
+    pub(crate) retry_count: u64,
+    pub(crate) retry_backoff: Duration,
+    pub(crate) outcome: SqliteOutcome,
+    pub(crate) waits: SqliteWaitMeasurement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InnerObservation {
     pub(crate) completed_at_unix_micros: u64,
     pub(crate) category: SqliteWorkloadCategory,
     pub(crate) access: SqliteAccessKind,
@@ -177,11 +197,11 @@ pub(crate) struct SqliteObservation {
     pub(crate) retry_backoff: Duration,
     pub(crate) writer_concurrency: u32,
     pub(crate) read_concurrency: u32,
-    pub(crate) counting: SqliteObservationCounting,
+    pub(crate) counting: InnerObservationCounting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SqliteObservationCounting {
+enum InnerObservationCounting {
     BaselineStatement,
     TypedOutcome {
         outcome: SqliteOutcome,
@@ -205,7 +225,8 @@ pub(crate) enum SqliteWaitMeasurement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BucketCategoryTotals {
     pub baseline_statement_count: u64,
-    pub latency_micros: u64,
+    pub native_statement_latency_micros: u64,
+    pub typed_attempt_latency_micros: u64,
     pub pool_wait_micros: u64,
     pub write_admission_wait_micros: u64,
     pub writer_held_micros: u64,
@@ -228,7 +249,11 @@ pub struct SqliteBucketSnapshot {
         [[[u64; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-    pub latency_histogram: Box<
+    pub native_statement_latency_histogram: Box<
+        [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
+            SqliteAccessKind::ALL.len()],
+    >,
+    pub typed_attempt_latency_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
@@ -270,7 +295,11 @@ pub struct SqliteWorkloadAggregateReport {
         [[[u64; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-    pub latency_histogram: Box<
+    pub native_statement_latency_histogram: Box<
+        [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
+            SqliteAccessKind::ALL.len()],
+    >,
+    pub typed_attempt_latency_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
@@ -290,6 +319,42 @@ pub struct SampledSqliteWorkloadAggregateReport {
     pub report: SqliteWorkloadAggregateReport,
 }
 
+#[derive(Clone)]
+struct CollectorClock {
+    unix_now_micros: Arc<dyn Fn() -> u64 + Send + Sync>,
+    instant_now: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl std::fmt::Debug for CollectorClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectorClock").finish_non_exhaustive()
+    }
+}
+
+impl Default for CollectorClock {
+    fn default() -> Self {
+        Self {
+            unix_now_micros: Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(duration_to_micros)
+                    .unwrap_or(0)
+            }),
+            instant_now: Arc::new(Instant::now),
+        }
+    }
+}
+
+impl CollectorClock {
+    fn unix_now_micros(&self) -> u64 {
+        (self.unix_now_micros)()
+    }
+
+    fn instant_now(&self) -> Instant {
+        (self.instant_now)()
+    }
+}
+
 #[derive(Debug)]
 struct SqliteBucket {
     minute_start_unix_micros: u64,
@@ -302,10 +367,15 @@ struct SqliteBucket {
         [[[u64; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
-    latency_histogram: Box<
+    native_statement_latency_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
     >,
+    typed_attempt_latency_histogram: Box<
+        [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
+            SqliteAccessKind::ALL.len()],
+    >,
+
     pool_wait_histogram: Box<
         [[[u64; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
             SqliteAccessKind::ALL.len()],
@@ -330,7 +400,11 @@ impl Default for SqliteBucket {
                 [[[0; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                     SqliteAccessKind::ALL.len()],
             ),
-            latency_histogram: Box::new(
+            native_statement_latency_histogram: Box::new(
+                [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
+                    SqliteAccessKind::ALL.len()],
+            ),
+            typed_attempt_latency_histogram: Box::new(
                 [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                     SqliteAccessKind::ALL.len()],
             ),
@@ -361,7 +435,8 @@ impl SqliteBucket {
             writer_occupancy_gap_count: self.writer_occupancy_gap_count,
             totals: self.totals.clone(),
             outcomes: self.outcomes.clone(),
-            latency_histogram: self.latency_histogram.clone(),
+            native_statement_latency_histogram: self.native_statement_latency_histogram.clone(),
+            typed_attempt_latency_histogram: self.typed_attempt_latency_histogram.clone(),
             pool_wait_histogram: self.pool_wait_histogram.clone(),
             write_admission_wait_histogram: self.write_admission_wait_histogram.clone(),
         }
@@ -375,26 +450,41 @@ struct InnerCollector {
     buckets: Box<[SqliteBucket; BUCKET_COUNT]>,
 }
 
-impl Default for InnerCollector {
-    fn default() -> Self {
+impl InnerCollector {
+    fn new(clock: &CollectorClock) -> Self {
         Self {
-            process_started_at_unix_micros: unix_now_micros(),
-            process_started_at: Instant::now(),
+            process_started_at_unix_micros: clock.unix_now_micros(),
+            process_started_at: clock.instant_now(),
             buckets: Box::new(std::array::from_fn(|_| SqliteBucket::default())),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SqliteWorkloadCollector {
     inner: Arc<Mutex<InnerCollector>>,
     active_native_reads: Arc<AtomicU32>,
+    clock: CollectorClock,
+}
+
+impl Default for SqliteWorkloadCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqliteWorkloadCollector {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_clock(CollectorClock::default())
+    }
+
+    fn with_clock(clock: CollectorClock) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(InnerCollector::new(&clock))),
+            active_native_reads: Arc::new(AtomicU32::new(0)),
+            clock,
+        }
     }
 
     #[cfg(test)]
@@ -402,12 +492,58 @@ impl SqliteWorkloadCollector {
         Arc::as_ptr(&self.inner) as usize
     }
 
-    pub(crate) fn record(&self, observation: SqliteObservation) {
+    #[cfg(test)]
+    fn record(&self, observation: InnerObservation) {
         let mut inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.record(observation);
+    }
+
+    pub(crate) fn record_native_statement(&self, observation: NativeStatementObservation) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completed_at_unix_micros = self.clock.unix_now_micros();
+        inner.record(InnerObservation {
+            completed_at_unix_micros,
+            category: observation.category,
+            access: observation.access,
+            latency: observation.statement_latency,
+            writer_held: Duration::ZERO,
+            read_connection_time: observation.read_connection_time,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: observation.read_concurrency,
+            counting: InnerObservationCounting::BaselineStatement,
+        });
+    }
+
+    pub(crate) fn record_typed_outcome(&self, observation: TypedOutcomeObservation) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completed_at_unix_micros = self.clock.unix_now_micros();
+        inner.record(InnerObservation {
+            completed_at_unix_micros,
+            category: observation.category,
+            access: observation.access,
+            latency: observation.latency,
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::ZERO,
+            retry_count: observation.retry_count,
+            retry_backoff: observation.retry_backoff,
+            writer_concurrency: 0,
+            read_concurrency: 0,
+            counting: InnerObservationCounting::TypedOutcome {
+                outcome: observation.outcome,
+                waits: observation.waits,
+            },
+        });
     }
 
     pub(crate) fn begin_native_read(&self) -> u32 {
@@ -426,8 +562,8 @@ impl SqliteWorkloadCollector {
         let mut inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
-        let now = unix_now_micros();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.unix_now_micros();
         let bucket = inner.bucket_mut(minute_start(now));
         bucket.classification_gap_count = bucket.classification_gap_count.saturating_add(1);
     }
@@ -436,19 +572,23 @@ impl SqliteWorkloadCollector {
         let mut inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
-        let now = unix_now_micros();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.unix_now_micros();
         let bucket = inner.bucket_mut(minute_start(now));
         bucket.writer_occupancy_gap_count = bucket.writer_occupancy_gap_count.saturating_add(1);
     }
 
     pub(crate) fn record_writer_occupancy(
         &self,
-        completed_at_unix_micros: u64,
         category: SqliteWorkloadCategory,
         writer_held: Duration,
     ) {
-        self.record(SqliteObservation {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let completed_at_unix_micros = self.clock.unix_now_micros();
+        inner.record(InnerObservation {
             completed_at_unix_micros,
             category,
             access: SqliteAccessKind::Write,
@@ -459,31 +599,35 @@ impl SqliteWorkloadCollector {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::OccupancyOnly,
+            counting: InnerObservationCounting::OccupancyOnly,
         });
     }
 
-    /// # Panics
-    ///
-    /// Panics if a previous collector update poisoned the bounded ring mutex.
     #[must_use]
     pub fn snapshot(
         &self,
         window: SqliteSnapshotWindow,
         now_unix_micros: u64,
     ) -> SqliteWorkloadSnapshot {
+        let now_instant = self.clock.instant_now();
+        self.snapshot_at(window, now_unix_micros, now_instant)
+    }
+
+    fn snapshot_at(
+        &self,
+        window: SqliteSnapshotWindow,
+        now_unix_micros: u64,
+        now_instant: Instant,
+    ) -> SqliteWorkloadSnapshot {
         let inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
-        inner.snapshot(window, now_unix_micros)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.snapshot(window, now_unix_micros, now_instant)
     }
 
     /// Captures the report cutoff while holding the collector lock used by recorders.
     ///
-    /// # Panics
-    ///
-    /// Panics if a previous collector update poisoned the bounded ring mutex.
     #[must_use]
     pub fn aggregate_report_now(
         &self,
@@ -492,9 +636,9 @@ impl SqliteWorkloadCollector {
         let inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
-        let sampled_at_unix_micros = unix_now_micros();
-        let snapshot = inner.snapshot(window, sampled_at_unix_micros);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sampled_at_unix_micros = self.clock.unix_now_micros();
+        let snapshot = inner.snapshot(window, sampled_at_unix_micros, self.clock.instant_now());
         drop(inner);
         SampledSqliteWorkloadAggregateReport {
             sampled_at_unix_micros,
@@ -511,9 +655,9 @@ impl SqliteWorkloadCollector {
         let inner = self
             .inner
             .lock()
-            .expect("sqlite workload collector mutex poisoned");
-        let sampled_at_unix_micros = unix_now_micros();
-        let snapshot = inner.snapshot(window, sampled_at_unix_micros);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sampled_at_unix_micros = self.clock.unix_now_micros();
+        let snapshot = inner.snapshot(window, sampled_at_unix_micros, self.clock.instant_now());
         hook(sampled_at_unix_micros);
         drop(inner);
         SampledSqliteWorkloadAggregateReport {
@@ -522,16 +666,14 @@ impl SqliteWorkloadCollector {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if a previous collector update poisoned the bounded ring mutex.
     #[must_use]
     pub fn aggregate_report(
         &self,
         window: SqliteSnapshotWindow,
         now_unix_micros: u64,
     ) -> SqliteWorkloadAggregateReport {
-        Self::aggregate_snapshot(&self.snapshot(window, now_unix_micros))
+        let now_instant = self.clock.instant_now();
+        Self::aggregate_snapshot(&self.snapshot_at(window, now_unix_micros, now_instant))
     }
 
     fn aggregate_snapshot(snapshot: &SqliteWorkloadSnapshot) -> SqliteWorkloadAggregateReport {
@@ -543,7 +685,11 @@ impl SqliteWorkloadCollector {
             [[[0; SqliteOutcome::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                 SqliteAccessKind::ALL.len()],
         );
-        let mut latency_histogram = Box::new(
+        let mut native_statement_latency_histogram = Box::new(
+            [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
+                SqliteAccessKind::ALL.len()],
+        );
+        let mut typed_attempt_latency_histogram = Box::new(
             [[[0; SqliteLatencyBin::ALL.len()]; SqliteWorkloadCategory::ALL.len()];
                 SqliteAccessKind::ALL.len()],
         );
@@ -567,7 +713,8 @@ impl SqliteWorkloadCollector {
                     let dst = &mut totals[a][c];
                     let src = bucket.totals[a][c];
                     dst.baseline_statement_count += src.baseline_statement_count;
-                    dst.latency_micros += src.latency_micros;
+                    dst.native_statement_latency_micros += src.native_statement_latency_micros;
+                    dst.typed_attempt_latency_micros += src.typed_attempt_latency_micros;
                     dst.pool_wait_micros += src.pool_wait_micros;
                     dst.write_admission_wait_micros += src.write_admission_wait_micros;
                     dst.writer_held_micros += src.writer_held_micros;
@@ -582,8 +729,10 @@ impl SqliteWorkloadCollector {
                         outcomes[a][c][outcome.index()] += bucket.outcomes[a][c][outcome.index()];
                     }
                     for bin in SqliteLatencyBin::ALL {
-                        latency_histogram[a][c][bin.index()] +=
-                            bucket.latency_histogram[a][c][bin.index()];
+                        native_statement_latency_histogram[a][c][bin.index()] +=
+                            bucket.native_statement_latency_histogram[a][c][bin.index()];
+                        typed_attempt_latency_histogram[a][c][bin.index()] +=
+                            bucket.typed_attempt_latency_histogram[a][c][bin.index()];
                         pool_wait_histogram[a][c][bin.index()] +=
                             bucket.pool_wait_histogram[a][c][bin.index()];
                         write_admission_wait_histogram[a][c][bin.index()] +=
@@ -603,7 +752,8 @@ impl SqliteWorkloadCollector {
             writer_occupancy_gap_count,
             totals,
             outcomes,
-            latency_histogram,
+            native_statement_latency_histogram,
+            typed_attempt_latency_histogram,
             pool_wait_histogram,
             write_admission_wait_histogram,
         }
@@ -611,24 +761,24 @@ impl SqliteWorkloadCollector {
 }
 
 impl InnerCollector {
-    fn record(&mut self, observation: SqliteObservation) {
+    fn record(&mut self, observation: InnerObservation) {
         let completed_minute_start = minute_start(observation.completed_at_unix_micros);
         let bucket = self.bucket_mut(completed_minute_start);
         let access_index = observation.access.index();
         let category_index = observation.category.index();
         let totals = &mut bucket.totals[access_index][category_index];
         match observation.counting {
-            SqliteObservationCounting::BaselineStatement => {
+            InnerObservationCounting::BaselineStatement => {
                 totals.baseline_statement_count += 1;
-                totals.latency_micros += duration_to_micros(observation.latency);
+                totals.native_statement_latency_micros += duration_to_micros(observation.latency);
                 totals.read_concurrency_peak = totals
                     .read_concurrency_peak
                     .max(observation.read_concurrency);
-                bucket.latency_histogram[access_index][category_index]
+                bucket.native_statement_latency_histogram[access_index][category_index]
                     [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
             }
-            SqliteObservationCounting::TypedOutcome { outcome, waits } => {
-                totals.latency_micros += duration_to_micros(observation.latency);
+            InnerObservationCounting::TypedOutcome { outcome, waits } => {
+                totals.typed_attempt_latency_micros += duration_to_micros(observation.latency);
                 totals.retry_count += observation.retry_count;
                 totals.retry_backoff_micros += duration_to_micros(observation.retry_backoff);
                 totals.writer_concurrency_peak = totals
@@ -638,7 +788,7 @@ impl InnerCollector {
                     .read_concurrency_peak
                     .max(observation.read_concurrency);
                 bucket.outcomes[access_index][category_index][outcome.index()] += 1;
-                bucket.latency_histogram[access_index][category_index]
+                bucket.typed_attempt_latency_histogram[access_index][category_index]
                     [SqliteLatencyBin::from_duration(observation.latency).index()] += 1;
                 match waits {
                     SqliteWaitMeasurement::Unavailable => {}
@@ -672,7 +822,7 @@ impl InnerCollector {
                     }
                 }
             }
-            SqliteObservationCounting::OccupancyOnly => {
+            InnerObservationCounting::OccupancyOnly => {
                 totals.writer_concurrency_peak = totals
                     .writer_concurrency_peak
                     .max(observation.writer_concurrency);
@@ -684,6 +834,7 @@ impl InnerCollector {
             observation.writer_held,
             observation.access,
             observation.category,
+            observation.writer_concurrency,
             true,
         );
         self.distribute_duration(
@@ -691,6 +842,7 @@ impl InnerCollector {
             observation.read_connection_time,
             observation.access,
             observation.category,
+            observation.read_concurrency,
             false,
         );
     }
@@ -701,6 +853,7 @@ impl InnerCollector {
         duration: Duration,
         access: SqliteAccessKind,
         category: SqliteWorkloadCategory,
+        concurrency: u32,
         writer: bool,
     ) {
         let total = duration_to_micros(duration);
@@ -729,9 +882,10 @@ impl InnerCollector {
             let totals = &mut bucket.totals[access_index][category_index];
             if writer {
                 totals.writer_held_micros += used_in_bucket;
-                totals.writer_concurrency_peak = totals.writer_concurrency_peak.max(1);
+                totals.writer_concurrency_peak = totals.writer_concurrency_peak.max(concurrency);
             } else {
                 totals.read_connection_micros += used_in_bucket;
+                totals.read_concurrency_peak = totals.read_concurrency_peak.max(concurrency);
             }
             remaining -= used_in_bucket;
             if remaining == 0 || bucket_start == 0 {
@@ -745,8 +899,10 @@ impl InnerCollector {
         &self,
         window: SqliteSnapshotWindow,
         now_unix_micros: u64,
+        now_instant: Instant,
     ) -> SqliteWorkloadSnapshot {
-        let process_uptime_micros = duration_to_micros(self.process_started_at.elapsed());
+        let process_uptime_micros =
+            duration_to_micros(now_instant.saturating_duration_since(self.process_started_at));
         let effective_now_unix_micros = now_unix_micros;
         let requested_covered_uptime_micros =
             (window.minutes() as u64).saturating_mul(MICROS_PER_MINUTE);
@@ -845,7 +1001,8 @@ fn duration_to_micros(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
-fn unix_now_micros() -> u64 {
+#[cfg(test)]
+pub(crate) fn unix_now_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(duration_to_micros)
@@ -907,6 +1064,19 @@ fn approximate_percentile(
 }
 
 #[cfg(test)]
+impl SqliteWorkloadCollector {
+    fn with_test_clock(
+        unix_now_micros: impl Fn() -> u64 + Send + Sync + 'static,
+        instant_now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_clock(CollectorClock {
+            unix_now_micros: Arc::new(unix_now_micros),
+            instant_now: Arc::new(instant_now),
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Database;
@@ -924,7 +1094,7 @@ mod tests {
             let mut inner = collector
                 .inner
                 .lock()
-                .expect("sqlite workload collector mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.process_started_at_unix_micros = started_at_unix_micros;
             inner.process_started_at = Instant::now().checked_sub(uptime).unwrap();
         }
@@ -979,7 +1149,7 @@ mod tests {
     #[test]
     fn writer_duration_splits_from_exact_completion_timestamp() {
         let collector = collector_started_at(0, Duration::from_secs(3 * 60));
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: (2 * M) + 10_000_000,
             category: SqliteWorkloadCategory::Fts,
             access: SqliteAccessKind::Write,
@@ -990,7 +1160,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Success,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1026,7 +1196,7 @@ mod tests {
     #[test]
     fn read_duration_splits_without_affecting_writer_occupancy() {
         let collector = collector_started_at(0, Duration::from_secs(4 * 60));
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: (3 * M) + 5_000_000,
             category: SqliteWorkloadCategory::RuntimeState,
             access: SqliteAccessKind::Read,
@@ -1037,7 +1207,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 2,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Success,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1069,6 +1239,15 @@ mod tests {
             vec![(2 * M, 60_000_000), (3 * M, 5_000_000)]
         );
         assert_eq!(current.totals[read][cat].writer_held_micros, 0);
+        let peaks: Vec<(u64, u32)> = snapshot
+            .buckets
+            .iter()
+            .filter_map(|bucket| {
+                let peak = bucket.totals[read][cat].read_concurrency_peak;
+                (peak > 0).then_some((bucket.minute_start_unix_micros, peak))
+            })
+            .collect();
+        assert_eq!(peaks, vec![(2 * M, 2), (3 * M, 2)]);
     }
 
     #[test]
@@ -1078,7 +1257,7 @@ mod tests {
             let mut inner = collector
                 .inner
                 .lock()
-                .expect("sqlite workload collector mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.process_started_at_unix_micros = 10 * M;
             inner.process_started_at = Instant::now()
                 .checked_sub(Duration::from_secs(150))
@@ -1109,7 +1288,7 @@ mod tests {
             let mut inner = collector
                 .inner
                 .lock()
-                .expect("sqlite workload collector mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.process_started_at_unix_micros = 10 * M;
             inner.process_started_at = Instant::now()
                 .checked_sub(Duration::from_secs(200 * 60))
@@ -1133,7 +1312,7 @@ mod tests {
     #[test]
     fn snapshot_windows_are_fixed_and_cover_available_history() {
         let collector = collector_started_at(999 * M, Duration::from_secs(2 * 60));
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: (1_000 * M) - 1,
             category: SqliteWorkloadCategory::Maintenance,
             access: SqliteAccessKind::Write,
@@ -1144,7 +1323,7 @@ mod tests {
             retry_backoff: Duration::from_millis(20),
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Busy,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1188,7 +1367,7 @@ mod tests {
     fn completion_bucket_receives_count_outcome_histogram_and_aggregates() {
         let collector = collector_started_at(3 * M, Duration::from_secs(2 * 60));
         let completed_at = (4 * M) + 42;
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: completed_at,
             category: SqliteWorkloadCategory::MessagePersistence,
             access: SqliteAccessKind::Write,
@@ -1199,7 +1378,7 @@ mod tests {
             retry_backoff: Duration::from_millis(15),
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Locked,
                 waits: SqliteWaitMeasurement::PoolAndAdmission {
                     pool_wait: Duration::from_millis(7),
@@ -1224,8 +1403,22 @@ mod tests {
             1
         );
         assert_eq!(
-            bucket.latency_histogram[access][category][SqliteLatencyBin::Ms100To249.index()],
+            bucket.native_statement_latency_histogram[access][category]
+                [SqliteLatencyBin::Ms100To249.index()],
+            0
+        );
+        assert_eq!(
+            bucket.typed_attempt_latency_histogram[access][category]
+                [SqliteLatencyBin::Ms100To249.index()],
             1
+        );
+        assert_eq!(
+            bucket.totals[access][category].native_statement_latency_micros,
+            0
+        );
+        assert_eq!(
+            bucket.totals[access][category].typed_attempt_latency_micros,
+            130_000
         );
 
         let report = collector.aggregate_report(SqliteSnapshotWindow::OneHour, completed_at);
@@ -1235,11 +1428,75 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn mixed_sources_keep_latency_authorities_disjoint() {
+        let collector = collector_started_at(0, Duration::from_secs(60));
+        collector.record(InnerObservation {
+            completed_at_unix_micros: M - 2,
+            category: SqliteWorkloadCategory::RuntimeState,
+            access: SqliteAccessKind::Read,
+            latency: Duration::from_millis(12),
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::from_millis(30),
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: 2,
+            counting: InnerObservationCounting::BaselineStatement,
+        });
+        collector.record(InnerObservation {
+            completed_at_unix_micros: M - 1,
+            category: SqliteWorkloadCategory::RuntimeState,
+            access: SqliteAccessKind::Read,
+            latency: Duration::from_millis(45),
+            writer_held: Duration::ZERO,
+            read_connection_time: Duration::ZERO,
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            writer_concurrency: 0,
+            read_concurrency: 0,
+            counting: InnerObservationCounting::TypedOutcome {
+                outcome: SqliteOutcome::Success,
+                waits: SqliteWaitMeasurement::Unavailable,
+            },
+        });
+        collector.record_writer_occupancy(
+            SqliteWorkloadCategory::RuntimeState,
+            Duration::from_millis(20),
+        );
+        let report = collector.aggregate_report(SqliteSnapshotWindow::OneHour, M);
+        let read = SqliteAccessKind::Read.index();
+        let category = SqliteWorkloadCategory::RuntimeState.index();
+        assert_eq!(report.totals[read][category].baseline_statement_count, 1);
+        assert_eq!(operation_count(&report.outcomes[read][category]), 1);
+        assert_eq!(
+            report.totals[read][category].native_statement_latency_micros,
+            12_000
+        );
+        assert_eq!(
+            report.totals[read][category].typed_attempt_latency_micros,
+            45_000
+        );
+        assert_eq!(
+            report.native_statement_latency_histogram[read][category]
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            report.typed_attempt_latency_histogram[read][category]
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+    }
+
     #[test]
     fn minute_aligned_window_keeps_concurrent_read_duration_additive() {
         let collector = collector_started_at(0, Duration::from_secs(20 * 60));
         let completed_at = (10 * M) + 30_000_000;
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: completed_at,
             category: SqliteWorkloadCategory::Fts,
             access: SqliteAccessKind::Read,
@@ -1250,7 +1507,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Success,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1296,18 +1553,12 @@ mod tests {
         let cutoff = snapshot_taken_rx.recv().unwrap();
         let recorder = collector.clone();
         let record_thread = thread::spawn(move || {
-            recorder.record(SqliteObservation {
-                completed_at_unix_micros: cutoff,
+            recorder.record_native_statement(NativeStatementObservation {
                 category: SqliteWorkloadCategory::RuntimeState,
                 access: SqliteAccessKind::Write,
-                latency: Duration::ZERO,
-                writer_held: Duration::ZERO,
+                statement_latency: Duration::ZERO,
                 read_connection_time: Duration::ZERO,
-                retry_count: 0,
-                retry_backoff: Duration::ZERO,
-                writer_concurrency: 0,
                 read_concurrency: 0,
-                counting: SqliteObservationCounting::BaselineStatement,
             });
         });
         release_tx.send(()).unwrap();
@@ -1332,9 +1583,62 @@ mod tests {
     }
 
     #[test]
+    fn recorder_that_wins_lock_is_included_before_sample_cutoff() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::thread;
+
+        use std::sync::atomic::AtomicU64;
+        let now = Arc::new(AtomicU64::new(5 * M));
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let instant = Instant::now();
+        let collector = SqliteWorkloadCollector::with_test_clock(
+            {
+                let now = Arc::clone(&now);
+                move || now.load(Ordering::SeqCst)
+            },
+            {
+                let elapsed = Arc::clone(&elapsed);
+                move || instant + Duration::from_micros(elapsed.load(Ordering::SeqCst))
+            },
+        );
+        now.store(7 * M, Ordering::SeqCst);
+        elapsed.store(2 * M, Ordering::SeqCst);
+        let guard = collector.inner.lock().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (recorded_tx, recorded_rx) = mpsc::channel();
+        let recorder = collector.clone();
+        let recorder_barrier = Arc::clone(&barrier);
+        let record_thread = thread::spawn(move || {
+            recorder_barrier.wait();
+            recorder.record_native_statement(NativeStatementObservation {
+                category: SqliteWorkloadCategory::RuntimeState,
+                access: SqliteAccessKind::Write,
+                statement_latency: Duration::ZERO,
+                read_connection_time: Duration::ZERO,
+                read_concurrency: 0,
+            });
+            recorded_tx.send(()).unwrap();
+        });
+        barrier.wait();
+        drop(guard);
+        recorded_rx.recv().unwrap();
+        now.store(7 * M + 1, Ordering::SeqCst);
+        elapsed.store(2 * M + 1, Ordering::SeqCst);
+        let sampled = collector.aggregate_report_now(SqliteSnapshotWindow::OneHour);
+        record_thread.join().unwrap();
+        assert_eq!(sampled.sampled_at_unix_micros, 7 * M + 1);
+        assert_eq!(
+            sampled.report.totals[SqliteAccessKind::Write.index()]
+                [SqliteWorkloadCategory::RuntimeState.index()]
+            .baseline_statement_count,
+            1
+        );
+    }
+
+    #[test]
     fn pool_only_wait_does_not_fabricate_admission_sample() {
         let collector = collector_started_at(0, Duration::from_secs(60));
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: M - 1,
             category: SqliteWorkloadCategory::DurableWorkflows,
             access: SqliteAccessKind::Write,
@@ -1345,7 +1649,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::PoolTimeout,
                 waits: SqliteWaitMeasurement::PoolOnly {
                     pool_wait: Duration::from_millis(9),
@@ -1372,7 +1676,7 @@ mod tests {
     #[test]
     fn unavailable_waits_add_neither_wait_total_nor_sample() {
         let collector = collector_started_at(0, Duration::from_secs(60));
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: M - 1,
             category: SqliteWorkloadCategory::RuntimeState,
             access: SqliteAccessKind::Write,
@@ -1383,7 +1687,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Abandoned,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1411,6 +1715,23 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_collector_lock_recovers_for_callback_recording() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let collector = SqliteWorkloadCollector::new();
+        let poison = collector.clone();
+        let _ = catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poison.inner.lock().unwrap();
+            panic!("poison collector for regression");
+        }));
+        collector.record_classification_gap();
+        let report = collector
+            .aggregate_report_now(SqliteSnapshotWindow::OneHour)
+            .report;
+        assert_eq!(report.classification_gap_count, 1);
+    }
+
+    #[test]
     fn expired_gap_counters_do_not_appear_in_new_window_reports() {
         let collector = collector_started_at(0, Duration::from_secs(2000 * 60));
         {
@@ -1429,7 +1750,7 @@ mod tests {
         let collector =
             collector_started_at(0, Duration::from_secs((BUCKET_COUNT as u64 + 10) * 60));
         let completed_at = (2_000 * M) + 1;
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: completed_at,
             category: SqliteWorkloadCategory::RuntimeState,
             access: SqliteAccessKind::Read,
@@ -1440,7 +1761,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 1,
-            counting: SqliteObservationCounting::TypedOutcome {
+            counting: InnerObservationCounting::TypedOutcome {
                 outcome: SqliteOutcome::Success,
                 waits: SqliteWaitMeasurement::Unavailable,
             },
@@ -1463,7 +1784,7 @@ mod tests {
     fn occupancy_only_observations_do_not_create_count_authorities() {
         let collector = collector_started_at(0, Duration::from_secs(5 * 60));
         let completed_at = 4 * M;
-        collector.record(SqliteObservation {
+        collector.record(InnerObservation {
             completed_at_unix_micros: completed_at,
             category: SqliteWorkloadCategory::Maintenance,
             access: SqliteAccessKind::Write,
@@ -1474,7 +1795,7 @@ mod tests {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            counting: SqliteObservationCounting::OccupancyOnly,
+            counting: InnerObservationCounting::OccupancyOnly,
         });
         let report = collector.aggregate_report(SqliteSnapshotWindow::OneHour, completed_at + 1);
         let access = SqliteAccessKind::Write.index();

@@ -1464,12 +1464,11 @@ impl WorkflowRepository {
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::persist_continuation_start_tx(
@@ -1522,12 +1521,11 @@ impl WorkflowRepository {
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let summary = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let summary = crate::reconcile_legacy_half_committed_continuation_tx(
@@ -1581,12 +1579,11 @@ impl WorkflowRepository {
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::commit_continuation_tx(
@@ -1977,14 +1974,13 @@ impl WorkflowRepository {
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(
                     connection.begin_with("BEGIN IMMEDIATE").await?,
                 ))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let step = telemetry
             .observe_db(
                 SqlitePhase::Statement,

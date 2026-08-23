@@ -122,14 +122,8 @@ function formatRatio(value: number, total: number): string {
   return `${((value / total) * 100).toFixed(1)}%`;
 }
 
-function sqliteCategoryHasSamples(row: { operation_count: number; failures: { abandoned: number } }): boolean {
-  return row.operation_count > 0 || row.failures.abandoned > 0;
-}
-
-function sqliteReportHasSamples(report: SqliteWorkloadReportResponse): boolean {
-  return report.classification.baseline_statement_count > 0
-    || report.writer_categories.some(sqliteCategoryHasSamples)
-    || report.reads.some(sqliteCategoryHasSamples);
+function formatConfidenceDenominator(value: number, noun: string): string {
+  return `${formatNumber(value)} ${noun}`;
 }
 
 function formatUptime(seconds: number): string {
@@ -424,7 +418,10 @@ function SqliteDiagnostics({
   refresh: () => void;
 }) {
   const report = state.report;
-  const hasSamples = report ? sqliteReportHasSamples(report) : false;
+  const hasBaselineSamples = (report?.classification.baseline_statement_count ?? 0) > 0;
+  const hasTypedSamples = (report?.classification.typed_outcome_count ?? 0) > 0;
+  const hasNativeLoad = report?.reads.some((row) => row.total_connection_time_ms > 0 || row.peak_concurrency > 0) ?? false;
+  const hasWriterOccupancy = report?.writer_categories.some((row) => row.writer_occupancy_percent > 0 || row.peak_concurrency > 0) ?? false;
   return (
     <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
       <div className="settings-section__title-row">
@@ -434,7 +431,7 @@ function SqliteDiagnostics({
             state={state.stale && report ? 'stale' : state.loading ? 'loading' : report ? 'current' : 'unavailable'}
             sampledAt={report?.sampled_at}
           />
-          <div className="settings-section__hint">Read-only aggregate snapshot from in-memory collector buckets.</div>
+          <div className="settings-section__hint">Read-only aggregate snapshot from in-memory collector buckets. Native baseline, typed outcomes, and occupancy are shown as separate source-qualified tables.</div>
         </div>
         <div className="about-sqlite-toolbar">
           <div className="about-sqlite-window-buttons" role="group" aria-label="SQLite report window">
@@ -476,21 +473,49 @@ function SqliteDiagnostics({
               <dt>Confidence</dt>
               <dd>{report.coverage.fully_covered ? 'Full requested uptime available' : report.restart_truncated ? 'Restart truncated' : 'Alignment-shortened coverage'}</dd>
               <div className="settings-section__hint">
-                {report.classification.classified_operation_count} classified · {report.classification.baseline_statement_count} baseline statements · {report.classification.other_operation_count} other{report.classification.other_operation_share_percent != null ? ` (${formatPercent(report.classification.other_operation_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned · {report.classification.classification_gap_count} classification gaps · {report.classification.writer_occupancy_gap_count} writer occupancy gaps
+                {report.classification.typed_outcome_count} typed outcomes · {report.classification.typed_other_outcome_count} typed Other{report.classification.typed_other_outcome_share_percent != null ? ` (${formatPercent(report.classification.typed_other_outcome_share_percent, 1)})` : ''} · {report.classification.baseline_statement_count} native baseline statements · {report.classification.baseline_other_statement_count} baseline Other{report.classification.baseline_other_statement_share_percent != null ? ` (${formatPercent(report.classification.baseline_other_statement_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned · {report.classification.classification_gap_count} classification gaps · {report.classification.writer_occupancy_gap_count} writer occupancy gaps
               </div>
             </div>
           </dl>
           <div className="about-sqlite-tables">
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">
-                <h4>Writer occupancy by category</h4>
+                <h4>Native baseline statements by category</h4>
+                <span>{report.baseline_categories.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Native baseline statements</th>
+                    <th>Native statement latency</th>
+                    <th>Confidence denominator</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!hasBaselineSamples && <tr><td colSpan={4}>No native baseline statements captured for this window yet.</td></tr>}
+                  {report.baseline_categories.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.baseline_statement_count)}</td>
+                      <td>avg {row.native_statement_latency.avg_ms ?? '—'} ms · p95≤ {row.native_statement_latency.p95_upper_bound_ms ?? '—'} ms</td>
+                      <td>{formatConfidenceDenominator(row.native_statement_latency.sample_count, 'native statements')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Typed write outcomes and occupancy by category</h4>
                 <span>{report.writer_categories.length} categories</span>
               </div>
               <table className="deploy-table about-sqlite-table">
                 <thead>
                   <tr>
                     <th>Category</th>
-                    <th>Writes</th>
+                    <th>Typed writes</th>
+                    <th>Typed latency</th>
                     <th>Writer occupancy</th>
                     <th>Peak concurrency</th>
                     <th>Pool / admission wait</th>
@@ -499,12 +524,13 @@ function SqliteDiagnostics({
                   </tr>
                 </thead>
                 <tbody>
-                  {!hasSamples && <tr><td colSpan={7}>No SQLite samples captured for this window yet.</td></tr>}
+                  {!hasTypedSamples && !hasWriterOccupancy && <tr><td colSpan={8}>No instrumented contention or writer occupancy samples captured for this window yet.</td></tr>}
                   {report.writer_categories.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
-                      <td>{formatNumber(row.operation_count)}</td>
-                      <td>{formatPercent(row.writer_occupancy_percent, 2)}</td>
+                      <td>{formatNumber(row.typed_operation_count)}</td>
+                      <td>avg {row.typed_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.typed_latency.sample_count, 'typed writes')}</td>
+                      <td>{formatPercent(row.writer_occupancy_percent, 2)} · n={formatConfidenceDenominator(report.bucket_count, 'covered buckets')}</td>
                       <td>{formatNumber(row.peak_concurrency)}</td>
                       <td>pool {row.pool_wait?.avg_ms ?? '—'} ms · admit {row.admission_wait?.avg_ms ?? '—'} ms</td>
                       <td>{row.retries ? formatNumber(row.retries.retry_count) : '—'}</td>
@@ -516,28 +542,30 @@ function SqliteDiagnostics({
             </section>
             <section className="about-resources-chart-card">
               <div className="about-resources-chart-card__head">
-                <h4>Read activity by category</h4>
+                <h4>Native read load and instrumented contention by category</h4>
                 <span>{report.reads.length} categories</span>
               </div>
               <table className="deploy-table about-sqlite-table">
                 <thead>
                   <tr>
                     <th>Category</th>
-                    <th>Reads</th>
-                    <th>Total connection time (ms)</th>
-                    <th>Average connection time (ms)</th>
+                    <th>Typed reads</th>
+                    <th>Typed latency</th>
+                    <th>Native connection time</th>
+                    <th>Profiled statement latency</th>
                     <th>Peak concurrency</th>
                     <th>Retries / failures</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {!hasSamples && <tr><td colSpan={6}>No SQLite samples captured for this window yet.</td></tr>}
+                  {!hasTypedSamples && !hasNativeLoad && <tr><td colSpan={7}>No native read load or instrumented read samples captured for this window yet.</td></tr>}
                   {report.reads.map((row) => (
                     <tr key={row.category}>
                       <td>{row.label}</td>
-                      <td>{formatNumber(row.operation_count)}</td>
-                      <td>{row.total_duration_ms} ms</td>
-                      <td>{row.avg_duration_ms == null ? '—' : `${row.avg_duration_ms} ms`}</td>
+                      <td>{formatNumber(row.typed_operation_count)}</td>
+                      <td>avg {row.typed_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.typed_latency.sample_count, 'typed reads')}</td>
+                      <td>{row.total_connection_time_ms} ms</td>
+                      <td>avg {row.profiled_statement_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.profiled_statement_latency.sample_count, 'profiled statements')}</td>
                       <td>{formatNumber(row.peak_concurrency)}</td>
                       <td>{row.retries ? `${row.retries.retry_count} retries` : 'retries —'} · pool {row.pool_wait?.avg_ms ?? '—'} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
                     </tr>
