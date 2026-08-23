@@ -25,6 +25,7 @@ import { WorkControlBar } from './WorkActions';
 import { StateBar } from './StateBar';
 import { api, type AssociatedPrStatusEnvelope, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
+import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 
 // WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
 // URL contract.
@@ -42,6 +43,11 @@ function CaptureSlot({ onSlot }: { onSlot: (slot: ReturnType<typeof useViewerSlo
   useEffect(() => { onSlot(slot); }, [slot, onSlot]);
   return null;
 }
+
+vi.mock('./activePrSelectorIntent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./activePrSelectorIntent')>();
+  return { ...actual, requestActivePrSelectorOpen: vi.fn() };
+});
 
 vi.mock('../api', () => ({
   api: {
@@ -93,7 +99,24 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     work_change: cleanWorkChange(),
     ...prStatus,
   };
-  const selectionValue = (status.selection ?? selection()) as NonNullable<PrStatusResponse['selection']>;
+  const defaultSelection = status.found && status.number !== undefined
+    ? selection({
+        associated_prs: [{
+          ...selection().associated_prs[0]!,
+          pr_number: status.number,
+          title: status.title ?? selection().associated_prs[0]!.title,
+          url: status.url ?? `https://github.com/o/r/pull/${status.number}`,
+          state: status.state ?? selection().associated_prs[0]!.state,
+          draft: status.draft ?? false,
+          display_state: status.display_state ?? selection().associated_prs[0]!.display_state,
+          base: status.base ?? selection().associated_prs[0]!.base,
+          head: status.head ?? selection().associated_prs[0]!.head,
+          ...(status.feedback_status === undefined ? {} : { feedback_status: status.feedback_status }),
+        }],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: status.number }, provenance: 'inferred' },
+      })
+    : selection();
+  const selectionValue = (status.selection ?? defaultSelection) as NonNullable<PrStatusResponse['selection']>;
   const committedStatus = selectionValue ? { ...status, selection: selectionValue } : status;
   const associated = selectionValue?.associated_prs ?? [];
   return {
@@ -1511,6 +1534,1043 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 
+  it('keeps dirty no-PR guidance compact and discloses secondary actions', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: false,
+      work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+      selection: { associated_prs: [] },
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-dirty" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    const dock = screen.getByTestId('mobile-work-fallback');
+    expect(dock).toHaveTextContent('Uncommitted changes');
+    expect(screen.getByRole('button', { name: 'Review workspace changes' })).toHaveTextContent('Review changes');
+    expect(screen.queryByText(/Review, commit, and push/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    const details = screen.getByRole('status');
+    expect(details).toHaveTextContent('Review, commit, and push before opening a PR.');
+    expect(details).toHaveTextContent('Captures a diff snapshot');
+    const infoTrigger = screen.getByRole('button', { name: 'Work status details' });
+    fireEvent.click(infoTrigger);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.click(infoTrigger);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByRole('button', { name: /^Abandon\./ })).toBeInTheDocument();
+  });
+
+  it('closes the fallback overflow with Escape and returns focus to its trigger', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-menu"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    const trigger = screen.getByRole('button', { name: 'More work actions' });
+    fireEvent.click(trigger);
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it('keeps overflow open and focus in place when Abandon confirmation is declined', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    const confirmSpy = vi.fn(() => false);
+    window.confirm = confirmSpy;
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-cancel"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1));
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+    window.confirm = prevConfirm;
+  });
+
+  it('keeps overflow open and focus in place when Abandon fails', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    vi.mocked(api.abandonTask).mockRejectedValueOnce(new Error('abandon failed'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-abandon-failure"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('abandon failed');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    window.confirm = prevConfirm;
+  });
+
+  it('keeps overflow open when Abandon safety refresh requires PR selection', async () => {
+    enableMobile();
+    const prevConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    const handle = prStatusHandle(
+      { found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } },
+      {
+        refreshForSafety: vi.fn().mockResolvedValue({
+          found: false,
+          associated_prs: twoOpenPrSelection(false).associated_prs,
+        }),
+      },
+    );
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-abandon-safety"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.click(abandon);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Select an active PR');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(abandon).toHaveFocus();
+    expect(api.abandonTask).not.toHaveBeenCalled();
+    window.confirm = prevConfirm;
+  });
+
+  it('returns Escape focus to the info trigger that opened the details panel', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-mobile-info"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    const globalEscapeHandler = vi.fn();
+    window.addEventListener('keydown', globalEscapeHandler);
+    const trigger = screen.getByRole('button', { name: 'Work status details' });
+    fireEvent.click(trigger);
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(globalEscapeHandler).not.toHaveBeenCalled();
+    window.removeEventListener('keydown', globalEscapeHandler);
+  });
+
+  it('resets an open fallback panel when the conversation identity changes', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const { rerender } = renderWithProviders(
+      <WorkControlBar conversationId="conv-a" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-b" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+  });
+
+  it('restores owned overflow focus after the conversation identity changes', async () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const renderBar = (conversationId: string) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId={conversationId} convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('conv-focus-a'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.focusIn(abandon);
+    rerender(renderBar('conv-focus-b'));
+
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Work status details' })).toHaveFocus());
+  });
+
+  it('resets open details while the Work Actions bar is hidden during an LLM turn', () => {
+    enableMobile();
+    const handle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const renderBar = (phaseType: 'idle' | 'llm_requesting') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-hide-show" convModeLabel="Work" phaseType={phaseType} continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('idle'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    rerender(renderBar('llm_requesting'));
+    expect(screen.queryByTestId('mobile-work-fallback')).not.toBeInTheDocument();
+
+    rerender(renderBar('idle'));
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+  });
+
+  it('does not reopen overflow after the PR rail temporarily replaces the fallback', () => {
+    enableMobile();
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-stable" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: twoOpenPrSelection(),
+    });
+    rerender(renderBar(railHandle));
+    expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+
+    rerender(renderBar(fallbackHandle));
+    expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+  });
+
+  it('moves focus to the active PR chip when fallback details become a PR rail', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const railSelection = twoOpenPrSelection();
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: railSelection,
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-focus-transition" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const detailsTrigger = screen.getByRole('button', { name: 'Work status details' });
+    detailsTrigger.focus();
+    fireEvent.click(detailsTrigger);
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    rerender(renderBar(railHandle));
+
+    const activeChip = screen.getByRole('button', { name: /#12/ });
+    await waitFor(() => expect(activeChip).toHaveFocus());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('prefers the active PR chip when it follows another chip in the rail', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const selectionWithSecondActive: AssociatedPrStatusEnvelope = {
+      ...twoOpenPrSelection(false),
+      active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 13 }, provenance: 'pinned' },
+    };
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 13,
+      url: 'https://github.com/o/r/pull/13',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: selectionWithSecondActive,
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-second-active-focus" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const trigger = screen.getByRole('button', { name: 'Work status details' });
+    trigger.focus();
+    rerender(renderBar(railHandle));
+
+    const activeChip = screen.getByRole('button', { name: /#13/ });
+    await waitFor(() => expect(activeChip).toHaveFocus());
+    expect(screen.getByRole('button', { name: /#12/ })).not.toHaveFocus();
+  });
+
+  it('moves owned fallback focus to the first PR chip when the rail has no active selection', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: twoOpenPrSelection(false),
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar conversationId="conv-no-active-focus" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const trigger = screen.getByRole('button', { name: 'Work status details' });
+    trigger.focus();
+    rerender(renderBar(railHandle));
+
+    const firstChip = screen.getAllByRole('button', { name: /#/ })[0]!;
+    await waitFor(() => expect(firstChip).toHaveFocus());
+  });
+
+  it('does not steal unrelated focus when a background refresh replaces the fallback', async () => {
+    enableMobile();
+    const fallbackHandle = prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } });
+    const railHandle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      selection: twoOpenPrSelection(),
+    });
+    const renderBar = (handle: ReturnType<typeof prStatusHandle>) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <input aria-label="Composer" />
+          <WorkControlBar conversationId="conv-no-focus-steal" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(fallbackHandle));
+
+    const composer = screen.getByRole('textbox', { name: 'Composer' });
+    composer.focus();
+    rerender(renderBar(railHandle));
+
+    await waitFor(() => expect(screen.getByLabelText('Open pull requests')).toBeInTheDocument());
+    expect(composer).toHaveFocus();
+  });
+
+  it('does not render a stale overflow menu after terminal actions disappear', () => {
+    enableMobile();
+    const renderBar = (continuedInConvId: string | null) => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-stable"
+            convModeLabel="Work"
+            phaseType="idle"
+            continuedInConvId={continuedInConvId}
+            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar(null));
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    rerender(renderBar('conv-next'));
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Continued elsewhere');
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveClass('mobile-work-fallback--status-only');
+    expect(screen.queryByRole('button', { name: 'More work actions' })).not.toBeInTheDocument();
+  });
+
+  it('closes overflow when its secondary terminal action changes identity', async () => {
+    enableMobile();
+    const renderBar = (phaseType: 'idle' | 'stuck') => (
+      <MemoryRouter>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <WorkControlBar
+            conversationId="conv-changing-secondary"
+            convModeLabel="Work"
+            phaseType={phaseType}
+            continuedInConvId={null}
+            prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>
+    );
+    const { rerender } = render(renderBar('idle'));
+
+    const trigger = screen.getByRole('button', { name: 'More work actions' });
+    fireEvent.click(trigger);
+    const abandon = screen.getByRole('button', { name: /^Abandon\./ });
+    abandon.focus();
+    fireEvent.focusIn(abandon);
+    rerender(renderBar('stuck'));
+
+    expect(screen.queryByLabelText('More work actions', { selector: 'div' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
+  });
+
+  it('replaces Address feedback with PR selection recovery when its target is unresolved', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: selection().active_pr,
+      },
+      activePrSummary: null,
+      ambiguous: true,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-unresolved-active-summary"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+  });
+
+  it('recovers unresolved selection from review disposition without cached PR guidance', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+      work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-review-recovery" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toHaveTextContent('The selected PR is unavailable.');
+    expect(screen.getByRole('status')).not.toHaveTextContent('Open PR #12');
+    expect(screen.queryByRole('button', { name: 'Review workspace changes' })).not.toBeInTheDocument();
+  });
+
+  it('derives compact status from the resolved explicit PR instead of stale cached status', () => {
+    enableMobile();
+    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, display_state: 'merged' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [explicitPr],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: explicitPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-explicit-status" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR open');
+  });
+
+  it('derives terminal actions from the resolved explicit PR instead of stale cached status', () => {
+    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, url: 'https://github.com/o/r/pull/13', display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [explicitPr],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: explicitPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-explicit-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #13/ })).toBeInTheDocument();
+  });
+
+  it('uses every resolved inferred active PR without borrowing cached checks', () => {
+    const inferredPr = { ...selection().associated_prs[0]!, pr_number: 13, url: 'https://github.com/o/r/pull/13', display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+      feedback_freshness: { state: 'new', count: 4 },
+      feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+    }, {
+      activeSelection: {
+        associated_prs: [inferredPr],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 13 }, provenance: 'inferred' },
+      },
+      activePrSummary: inferredPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-inferred-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #13/ })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #13/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/4 new feedback/)).not.toBeInTheDocument();
+    expect(document.querySelector('.work-actions-pr-coverage')).not.toBeInTheDocument();
+  });
+
+  it('uses the active summary when same-identity cached state is stale', () => {
+    const activePr = { ...selection().associated_prs[0]!, display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: selection({ associated_prs: [activePr] }),
+      activePrSummary: activePr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stale-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #12/ })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #12/ })).not.toBeInTheDocument();
+  });
+
+  it('does not reuse cached status for a same-number active PR in another repository', () => {
+    const activePr = {
+      ...selection().associated_prs[0]!,
+      repo_owner: 'other-owner',
+      repo_name: 'other-repo',
+      url: 'https://github.com/other-owner/other-repo/pull/12',
+      display_state: 'open' as const,
+    };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [activePr],
+        active_pr: {
+          pr: { repo_owner: 'other-owner', repo_name: 'other-repo', pr_number: 12 },
+          provenance: 'pinned',
+        },
+      },
+      activePrSummary: activePr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-cross-repo-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    const openPr = screen.getByRole('link', { name: /Open PR #12/ });
+    expect(openPr).toHaveAttribute('href', 'https://github.com/other-owner/other-repo/pull/12');
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #12/ })).not.toBeInTheDocument();
+  });
+
+  it('does not render a stale cached PR link beside an unresolved explicit selection', () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'draft',
+      check_state: 'pending',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stale-link" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    expect(resumeInference).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not target a stale cached PR beside an unresolved explicit selection', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-explicit-summary-missing"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+  });
+
+  it('resumes inference for unresolved feedback selection without actionable PR choices', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-feedback-no-options"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+  });
+
+  it('blocks cached-derived cleanup while an explicit selected PR summary is unresolved', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [{ ...selection().associated_prs[0]!, pr_number: 13 }],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-merged-cache"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /^Clean up\./ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('Active PR unavailable');
+    fireEvent.click(screen.getByRole('button', { name: 'Select active PR' }));
+    expect(requestActivePrSelectorOpen).toHaveBeenCalledTimes(1);
+    expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
+  it('resumes inference when an unresolved selection has no actionable PR choices', async () => {
+    enableMobile();
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-unresolved-no-options"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Select active PR' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    expect(api.markMerged).not.toHaveBeenCalled();
+  });
+
+  it('suppresses desktop recovery after the conversation continues elsewhere', () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference: vi.fn().mockResolvedValue(undefined),
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-desktop-continued"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId="conv-next"
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Resume PR inference' })).not.toBeInTheDocument();
+    expect(screen.getByText('Continued — actions belong on the continuation.')).toBeInTheDocument();
+  });
+
+  it('offers desktop inference recovery for an unresolved explicit selection', async () => {
+    const resumeInference = vi.fn().mockResolvedValue(undefined);
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [],
+        active_pr: { mode: 'explicit', pr_number: 13, active_source: 'user_pinned' },
+      },
+      activePrSummary: null,
+      ambiguous: false,
+      resumeInference,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-desktop-unresolved"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume PR inference' }));
+    await waitFor(() => expect(resumeInference).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Open PR #12/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('view-diff-button')).not.toHaveClass('work-actions-btn--primary');
+    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByRole('link', { name: /Merge PR #12|Open PR #12/ })).not.toBeInTheDocument();
+  });
+
+  it('does not target cached feedback when the live PR envelope is empty', () => {
+    enableMobile();
+    const onSendMessage = vi.fn();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+    }, {
+      activeSelection: { associated_prs: [] },
+      activePrSummary: null,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-empty-envelope"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={onSendMessage}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toBeInTheDocument();
+    expect(onSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('prioritizes feedback status over cached workspace-change status', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      feedback_status: 'open',
+      feedback_freshness: { state: 'new', count: 1 },
+      work_change: { kind: 'loading' },
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-feedback"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR feedback ready');
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('Checking changes');
+  });
+
+  it('does not claim actionable feedback from review state alone', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+      work_change: { kind: 'loading' },
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-no-feedback"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={handle}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR open');
+    expect(screen.getByTestId('mobile-primary-address-feedback')).toBeInTheDocument();
+    expect(screen.getByTestId('mobile-work-fallback')).not.toHaveTextContent('PR feedback ready');
+  });
+
+  it('keeps overflow cleanup and focus available when cleanup fails', async () => {
+    enableMobile();
+    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup failed'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cleanup-failure"
+        convModeLabel="Work"
+        phaseType="error"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'More work actions' }));
+    const cleanup = screen.getByRole('button', { name: /^Clean up\./ });
+    cleanup.focus();
+    fireEvent.click(cleanup);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup failed');
+    expect(screen.getByLabelText('More work actions', { selector: 'div' })).toBeInTheDocument();
+    expect(cleanup).toHaveFocus();
+  });
+
+  it('keeps a terminal-action error visible while details are open', async () => {
+    enableMobile();
+    vi.mocked(api.markMerged).mockRejectedValueOnce(new Error('cleanup remains visible'));
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-error-details"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Clean up\./ }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('cleanup remains visible');
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('cleanup remains visible');
+    expect(screen.getByRole('status').nextElementSibling).toBe(screen.getByRole('alert'));
+  });
+
+  it('keeps the primary and overflow actions available while details are open', () => {
+    enableMobile();
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-covered-actions"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, work_change: { kind: 'clean' }, selection: { associated_prs: [] } })}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Clean up\./ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
+  });
+
+  it('describes an unrepresentable PR resolve action instead of cleanup', () => {
+    enableMobile();
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'open',
+      check_state: 'failing',
+    }, { activeSelection: null, activePrSummary: null });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-mobile-open-link" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.getByRole('link', { name: /Open PR #12/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Work status details' }));
+    const details = screen.getByRole('status');
+    expect(details).toHaveTextContent('Open PR #12 on GitHub to review its current state.');
+    expect(details).toHaveTextContent('Captures a diff snapshot');
+    expect(details).not.toHaveTextContent('Mark as merged');
+  });
+
   it('keeps cleanup presence aligned with WorkDisposition for an open PR', () => {
     enableMobile();
     const handle = prStatusHandle({
@@ -1642,6 +2702,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByRole('button', { name: /^Clean up\./ })).toHaveClass('mobile-pr-action--hero');
+    expect(screen.getByTestId('mobile-work-fallback')).toHaveTextContent('PR merged');
+    expect(screen.getByRole('button', { name: 'More work actions' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Abandon\./ })).not.toBeInTheDocument();
   });
 
   it('lets a pinned mobile selection resume automatic inference', async () => {

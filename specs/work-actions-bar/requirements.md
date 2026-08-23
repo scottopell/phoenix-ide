@@ -83,9 +83,10 @@ THE SYSTEM SHALL dispatch the typed `UserRequestsCloseConversation` command agai
 AND SHALL treat any local `user_close_started`-style UI state only as a projection or acknowledgement of that dispatched command
 AND SHALL NOT treat the bar as an independent close authority or as a lifecycle-mutating state machine.
 
-WHEN the conversation is presented in a narrow mobile viewport
+WHEN the conversation is presented in a narrow mobile viewport and has actionable associated PRs
+that the PR rail can represent
 THE SYSTEM SHALL replace the persistent multi-zone action bar with one thin horizontally scrollable
-rail containing the actionable associated PRs and their current status.
+rail containing those actionable associated PRs and their current status.
 THE SYSTEM SHALL keep the transcript dominant while the rail is collapsed.
 
 WHEN a desktop conversation has multiple actionable associated PRs and its active PR is either
@@ -101,8 +102,19 @@ WHEN a desktop conversation has fewer than two actionable associated PRs, its ac
 represented by the PR-selector rail, or PR metadata is still loading
 THE SYSTEM SHALL preserve the StateBar active-PR selector fallback and present the derived Work
 Actions verbs in one thin, horizontally scrollable rail. The system SHALL NOT render a larger
-intermediate action bar while PR metadata loads. Loading, single-PR, terminal-PR, and no-PR states
-SHALL use the same compact rail geometry so metadata refresh does not cause a large layout shift.
+intermediate action bar while PR metadata loads. Loading and single-PR states SHALL use the same
+compact rail geometry so metadata refresh does not cause a large layout shift.
+
+WHEN a mobile conversation has no actionable associated PR that the PR rail can represent
+THE SYSTEM SHALL present a compact fallback dock with a concise status row. For non-continued
+dispositions, the status row SHALL appear above one action row that keeps the disposition's primary
+verb directly available, except that an unresolved explicit active-PR selection SHALL replace an
+unsafe PR-targeted or terminal primary with selection recovery. The action row MAY place non-primary
+terminal verbs in an overflow menu. A continued disposition SHALL remain status-only because it has
+no legal primary or terminal verbs. Full
+disposition guidance and terminal intent SHALL remain available through a touch- and
+keyboard-operable disclosure. The collapsed dock SHALL bound status text to one line and SHALL NOT
+render full guidance as a wrapping sibling of its actions.
 
 WHEN the user activates a PR in the rail
 THE SYSTEM SHALL make that PR the explicit active PR through `pr-association` and expand an action
@@ -314,7 +326,7 @@ server-side legality gate.
 
 ### REQ-WAB-011: Mobile Active-PR Rail
 
-WHEN actionable associated PRs exist on mobile
+WHEN actionable associated PRs exist on mobile and the active PR selection can be represented by those PRs
 THE SYSTEM SHALL render a thin PR rail directly above the conversation input that:
 
 - contains only open or draft actionable PRs, never closed or merged history;

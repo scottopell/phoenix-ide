@@ -1,0 +1,136 @@
+.work-actions-conversation-fixture {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+}
+
+.work-actions-conversation-header {
+  min-height: 46px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.work-actions-conversation-header > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-actions-conversation-header-state {
+  margin-left: auto;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.work-actions-conversation-header-state::first-letter,
+.work-actions-conversation-ready::first-letter {
+  color: var(--success-color);
+}
+
+.work-actions-conversation-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  padding: 22px 12px 16px;
+  display: flex;
+  align-items: flex-end;
+}
+
+.work-actions-conversation-message {
+  width: 100%;
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.work-actions-conversation-message p {
+  margin: 0 0 14px;
+}
+
+.work-actions-conversation-message p:last-child {
+  margin-bottom: 0;
+}
+
+.work-actions-conversation-message h2 {
+  margin: 20px 0 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.work-actions-conversation-input {
+  margin: 10px 10px 14px;
+  min-height: 54px;
+  padding: 6px 6px 6px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-primary);
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+}
+
+.work-actions-conversation-input > span:first-child {
+  flex: 1 1 auto;
+}
+
+.work-actions-conversation-input button {
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent-blue);
+  color: white;
+  font-size: 17px;
+}
+
+.work-actions-conversation-statebar {
+  min-height: 58px;
+  padding: 0 14px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.work-actions-conversation-statebar > strong {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-actions-conversation-ready {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+@media (width > 1024px) {
+  .work-actions-conversation-fixture {
+    max-width: 960px;
+    margin: 0 auto;
+    border-right: 1px solid var(--border-color);
+    border-left: 1px solid var(--border-color);
+  }
+}

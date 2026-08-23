@@ -35,7 +35,6 @@ function displayStateToGhState(displayState: CachedPrSummary['display_state']): 
 function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().toISOString()): PrStatusResponse {
   const draft = cachedPr.display_state === 'draft';
   const state = displayStateToGhState(cachedPr.display_state);
-  const feedbackStatus = cachedPr.feedback_status ?? 'open';
   return {
     found: true,
     number: cachedPr.number,
@@ -46,7 +45,7 @@ function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().to
     base: cachedPr.base,
     head: cachedPr.head,
     display_state: cachedPr.display_state,
-    feedback_status: feedbackStatus,
+    ...(cachedPr.feedback_status !== undefined ? { feedback_status: cachedPr.feedback_status } : {}),
     pr: {
       number: cachedPr.number,
       title: cachedPr.title,
