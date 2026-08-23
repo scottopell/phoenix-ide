@@ -63,6 +63,11 @@ value BrowserSessionLifecycleEvent {
     kind: BrowserLifecycleKind
 }
 
+value BrowserSessionStateEvent {
+    conversation: bedrock/Conversation
+    active: Boolean
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -411,9 +416,9 @@ rule LifecycleEventFannedOut {
     ensures: for c in bedrock/Conversation
              where resolve_work_scope(c) = scope
              and live_runtime_exists(c):
-        SseEvent.BrowserSessionState.delivered(
-            c,
-            kind = active or kind = teardown_pending
+        BrowserSessionStateEvent.emitted(
+            conversation: c,
+            active: kind = active or kind = teardown_pending
         )
 
     @guidance

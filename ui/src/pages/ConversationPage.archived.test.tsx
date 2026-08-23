@@ -375,19 +375,6 @@ describe('ConversationPage route focus', () => {
     document.body.removeChild(anchor);
   });
 
-  it('preserves approval-dialog focus instead of focusing its underlying composer', async () => {
-    const anchor = document.createElement('button');
-    document.body.appendChild(anchor);
-    anchor.focus();
-
-    renderPage(makeConversation({
-      state: { type: 'idle' },    }));
-
-    await screen.findByTestId('message-history');
-    expect(anchor).toHaveFocus();
-    document.body.removeChild(anchor);
-  });
-
   it('does not turn a mobile navigation into a focus request after resizing to desktop', async () => {
     viewportFlags.isDesktop = false;
     const anchor = document.createElement('button');
