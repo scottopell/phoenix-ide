@@ -280,7 +280,7 @@ export function WorkControlBar({
   }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
   const activePrDiffersFromCached = !!activePr
     && prStatus?.found === true
-    && prStatus.number !== activePr.pr_number;
+    && (prStatus.number !== activePr.pr_number || prStatus.url !== activePr.url);
   const dispositionPrStatus: PrStatusResponse | null = activePrDiffersFromCached && activePr && prStatus
     ? {
         found: true,

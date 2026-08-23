@@ -2110,6 +2110,41 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('link', { name: /Merge on GitHub #13/ })).not.toBeInTheDocument();
   });
 
+  it('does not reuse cached status for a same-number active PR in another repository', () => {
+    const activePr = {
+      ...selection().associated_prs[0]!,
+      repo_owner: 'other-owner',
+      repo_name: 'other-repo',
+      url: 'https://github.com/other-owner/other-repo/pull/12',
+      display_state: 'open' as const,
+    };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [activePr],
+        active_pr: {
+          pr: { repo_owner: 'other-owner', repo_name: 'other-repo', pr_number: 12 },
+          provenance: 'pinned',
+        },
+      },
+      activePrSummary: activePr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-cross-repo-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    const openPr = screen.getByRole('link', { name: /Open PR #12/ });
+    expect(openPr).toHaveAttribute('href', 'https://github.com/other-owner/other-repo/pull/12');
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #12/ })).not.toBeInTheDocument();
+  });
+
   it('does not render a stale cached PR link beside an unresolved explicit selection', () => {
     enableMobile();
     const resumeInference = vi.fn().mockResolvedValue(undefined);
