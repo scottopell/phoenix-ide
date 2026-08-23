@@ -256,7 +256,7 @@ pub struct SqliteReadCategoryReport {
     pub label: String,
     pub typed_operation_count: u64,
     pub typed_latency: SqliteWaitSummary,
-    pub total_connection_time_ms: u64,
+    pub total_profiled_read_execution_ms: u64,
     pub profiled_statement_latency: SqliteWaitSummary,
     pub peak_concurrency: u32,
     pub pool_wait: Option<SqliteWaitSummary>,
@@ -748,7 +748,7 @@ fn sample_sqlite_workload_report(
             let totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
             let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
             let operation_count = crate::db::operation_count(outcomes);
-            let total_connection_time_ms = totals.read_connection_micros / 1_000;
+            let total_profiled_read_execution_ms = totals.read_connection_micros / 1_000;
             SqliteReadCategoryReport {
                 category: SqliteReportCategory::from(category),
                 label: sqlite_category_label(category).to_string(),
@@ -758,7 +758,7 @@ fn sample_sqlite_workload_report(
                         [category.index()],
                     totals.typed_attempt_latency_micros,
                 ),
-                total_connection_time_ms,
+                total_profiled_read_execution_ms,
                 profiled_statement_latency: wait_summary(
                     &report.native_statement_latency_histogram[SqliteAccessKind::Read.index()]
                         [category.index()],

@@ -186,7 +186,7 @@ function sqliteReadCategory(category: SqliteReportCategory, label: string) {
     label,
     typed_operation_count: 0,
     typed_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
-    total_connection_time_ms: 0,
+    total_profiled_read_execution_ms: 0,
     profiled_statement_latency: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
     peak_concurrency: 0,
     pool_wait: { sample_count: 0, total_ms: 0, avg_ms: null, p50_upper_bound_ms: null, p95_upper_bound_ms: null, p99_upper_bound_ms: null },
@@ -229,6 +229,14 @@ function LocationProbe() {
 function deferredReleaseSnapshot() {
   let resolve!: (snapshot: ReleaseUpdateSnapshot) => void;
   const promise = new Promise<ReleaseUpdateSnapshot>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
     resolve = done;
   });
   return { promise, resolve };
@@ -330,6 +338,31 @@ describe('AboutDeploymentPage disk usage health', () => {
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(apiMock.deploymentSqliteWorkload).toHaveBeenLastCalledWith('six_hours');
     await screen.findAllByText(/No (native baseline|instrumented contention|native read load)/);
+  });
+
+  it('clears the prior window report while a newly selected window loads', async () => {
+    const sixHours = deferred<SqliteWorkloadReportResponse>();
+    apiMock.deploymentSqliteWorkload
+      .mockResolvedValueOnce(sqliteReport({ coverage: { bucket_count: 2, fully_covered: false, label: 'one-hour-only label' } }))
+      .mockImplementationOnce(() => sixHours.promise);
+    renderPage(deployment());
+    expect(await screen.findByText('one-hour-only label')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '6h' }));
+    expect(screen.queryByText('one-hour-only label')).not.toBeInTheDocument();
+    expect(screen.getByText('Loading SQLite report…')).toBeInTheDocument();
+    await act(async () => {
+      sixHours.resolve(sqliteReport({ window: 'six_hours', coverage: { bucket_count: 6, fully_covered: false, label: 'six-hour label' } }));
+    });
+    expect(await screen.findByText('six-hour label')).toBeInTheDocument();
+  });
+
+  it('renders zero coverage as warm-up unavailable instead of normal zero rows', async () => {
+    renderPage(deployment(), deploymentDisk(), sqliteReport({
+      covered_uptime_micros: 0,
+      coverage: { bucket_count: 0, fully_covered: false, label: '0s covered across 0 buckets; requested 60m' },
+    }));
+    expect(await screen.findByText('SQLite workload coverage is warming up; no covered interval is available yet.')).toBeInTheDocument();
+    expect(screen.queryByText('Native statement baseline by category')).not.toBeInTheDocument();
   });
 
   it('keeps prior SQLite values visible and labels a failed refresh stale', async () => {

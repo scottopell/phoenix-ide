@@ -39,7 +39,7 @@ pub(crate) use handlers::validate_submitted_attachments;
 pub use types::*;
 
 use crate::chain_qa::ChainQa;
-use crate::db::{Database, Fts5Retriever, MessageRetriever};
+use crate::db::{Database, MessageRetriever};
 use crate::discovery::DiscoveryRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
@@ -146,7 +146,7 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path.
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let message_retriever: Arc<dyn MessageRetriever> = retriever.clone();
         let runtime = Arc::new(RuntimeManager::new_with_message_retriever_and_runtime_env(
             db.clone(),

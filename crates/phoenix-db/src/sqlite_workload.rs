@@ -493,6 +493,11 @@ impl SqliteWorkloadCollector {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_native_reads_for_test(&self) -> u32 {
+        self.active_native_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn record(&self, observation: InnerObservation) {
         let mut inner = self
             .inner
@@ -647,6 +652,41 @@ impl SqliteWorkloadCollector {
     }
 
     #[cfg(test)]
+    #[must_use]
+    pub(crate) fn aggregate_fresh_collector_for_test(&self) -> SqliteWorkloadAggregateReport {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.unix_now_micros();
+        let process_uptime_micros = now.saturating_sub(inner.process_started_at_unix_micros);
+        assert!(
+            process_uptime_micros
+                <= (SqliteSnapshotWindow::OneHour.minutes() as u64)
+                    .saturating_mul(MICROS_PER_MINUTE),
+            "fresh-collector test aggregation requires a collector younger than one hour"
+        );
+        let process_started_at_unix_micros = inner.process_started_at_unix_micros;
+        let buckets: Vec<_> = inner
+            .buckets
+            .iter()
+            .filter(|bucket| bucket.minute_start_unix_micros != 0)
+            .map(SqliteBucket::snapshot)
+            .collect();
+        drop(inner);
+        let snapshot = SqliteWorkloadSnapshot {
+            window: SqliteSnapshotWindow::OneHour,
+            bucket_count: buckets.len(),
+            restart_truncated: false,
+            process_started_at_unix_micros,
+            process_uptime_micros,
+            covered_uptime_micros: process_uptime_micros,
+            buckets,
+        };
+        Self::aggregate_snapshot(&snapshot)
+    }
+
+    #[cfg(test)]
     fn aggregate_report_now_with_snapshot_hook(
         &self,
         window: SqliteSnapshotWindow,
@@ -666,6 +706,7 @@ impl SqliteWorkloadCollector {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn aggregate_report(
         &self,

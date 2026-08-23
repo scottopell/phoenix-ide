@@ -8749,7 +8749,7 @@ pub(crate) mod hard_delete_cascade_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -13931,7 +13931,7 @@ mod regenerate_conversation_name_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14137,7 +14137,7 @@ mod upgrade_model_state_guard_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14418,7 +14418,7 @@ mod file_read_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -15196,8 +15196,7 @@ mod chat_authority_tests {
             None,
         ));
         let terminals = runtime.terminals.clone();
-        let message_retriever: Arc<dyn crate::db::MessageRetriever> =
-            Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever: Arc<dyn crate::db::MessageRetriever> = Arc::new(db.fts_retriever());
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             llm_registry.clone(),
@@ -15525,7 +15524,7 @@ mod wake_handler_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -15729,7 +15728,7 @@ mod wake_handler_tests {
     async fn conversation_search_returns_warming_when_live_index_is_stale() {
         let mut state = make_test_state().await;
         seed_conversation(&state, "conv-stale-search").await;
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15784,7 +15783,7 @@ mod wake_handler_tests {
             )
             .await
             .unwrap();
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15898,7 +15897,7 @@ mod wake_handler_tests {
             .archive_conversation("conv-arch")
             .await
             .expect("archive");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -15964,7 +15963,7 @@ mod wake_handler_tests {
                 .await
                 .expect("add limit message");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16041,7 +16040,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add other");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16171,7 +16170,7 @@ mod wake_handler_tests {
             .await
             .expect("create creation jobs view");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16215,7 +16214,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add prefix message");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);

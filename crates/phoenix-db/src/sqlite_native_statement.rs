@@ -20,10 +20,17 @@ const CONTEXT_FUNCTION_NAME: &str = "__phoenix_native_statement_context";
 const MAIN_DB_NAME: &[u8] = b"main\0";
 const STATEMENT_CACHE_SIZE: usize = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AwaitingReprepare {
+    statement_identity: usize,
+    prior_reprepare_count: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeStatementCallbackContext {
     collector: SqliteWorkloadCollector,
     active_read_concurrency: u32,
+    awaiting_reprepare: Option<AwaitingReprepare>,
     prepare_state: PrepareState,
     prepare_pending: bool,
     prepare_boundary_seen: bool,
@@ -33,18 +40,29 @@ pub(crate) struct NativeStatementCallbackContext {
     current_writer_category: SqliteWorkloadCategory,
     #[cfg(test)]
     drop_counter: Option<Arc<AtomicUsize>>,
+    #[cfg(test)]
+    observed_reprepare_count: Option<Arc<AtomicUsize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementKind {
+    Ordinary,
+    TransactionControl,
+    SavepointControl,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PrepareState {
     category: SqliteWorkloadCategory,
     access: Option<SqliteAccessKind>,
+    kind: StatementKind,
 }
 
 impl PrepareState {
     const EMPTY: Self = Self {
         category: SqliteWorkloadCategory::Other,
         access: None,
+        kind: StatementKind::Ordinary,
     };
 }
 
@@ -53,6 +71,8 @@ struct CachedStatementMetadata {
     statement_identity: usize,
     category: SqliteWorkloadCategory,
     access: Option<SqliteAccessKind>,
+    reprepare_count: u32,
+    kind: StatementKind,
 }
 
 impl CachedStatementMetadata {
@@ -60,6 +80,8 @@ impl CachedStatementMetadata {
         statement_identity: 0,
         category: SqliteWorkloadCategory::Other,
         access: None,
+        reprepare_count: 0,
+        kind: StatementKind::Ordinary,
     };
 }
 
@@ -68,6 +90,7 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
+            awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
             prepare_boundary_seen: false,
@@ -77,6 +100,8 @@ impl NativeStatementCallbackContext {
             current_writer_category: SqliteWorkloadCategory::Other,
             #[cfg(test)]
             drop_counter: None,
+            #[cfg(test)]
+            observed_reprepare_count: None,
         }
     }
 
@@ -88,6 +113,7 @@ impl NativeStatementCallbackContext {
         Self {
             collector,
             active_read_concurrency: 0,
+            awaiting_reprepare: None,
             prepare_state: PrepareState::EMPTY,
             prepare_pending: false,
             prepare_boundary_seen: false,
@@ -96,6 +122,40 @@ impl NativeStatementCallbackContext {
             writer_admitted_at: None,
             current_writer_category: SqliteWorkloadCategory::Other,
             drop_counter: Some(drop_counter),
+            observed_reprepare_count: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reprepare_counter(
+        collector: SqliteWorkloadCollector,
+        observed_reprepare_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            collector,
+            active_read_concurrency: 0,
+            awaiting_reprepare: None,
+            prepare_state: PrepareState::EMPTY,
+            prepare_pending: false,
+            prepare_boundary_seen: false,
+            prepare_ambiguous: false,
+            statement_metadata: [CachedStatementMetadata::EMPTY; STATEMENT_CACHE_SIZE],
+            writer_admitted_at: None,
+            current_writer_category: SqliteWorkloadCategory::Other,
+            drop_counter: None,
+            observed_reprepare_count: Some(observed_reprepare_count),
+        }
+    }
+
+    fn reconcile_incomplete_read(&mut self) {
+        let awaiting_reprepare = self.awaiting_reprepare.take().is_some();
+        let active_read = self.active_read_concurrency > 0;
+        if active_read {
+            self.collector.end_native_read();
+            self.active_read_concurrency = 0;
+        }
+        if awaiting_reprepare || active_read {
+            self.collector.record_classification_gap();
         }
     }
 
@@ -116,6 +176,13 @@ impl NativeStatementCallbackContext {
         self.prepare_boundary_seen = true;
     }
 
+    fn note_statement_kind(&mut self, kind: StatementKind) {
+        if !self.prepare_pending {
+            self.begin_prepare();
+        }
+        self.prepare_state.kind = kind;
+    }
+
     fn note_prepare_metadata(
         &mut self,
         category: SqliteWorkloadCategory,
@@ -123,10 +190,7 @@ impl NativeStatementCallbackContext {
     ) {
         if !self.prepare_pending {
             self.begin_prepare();
-        } else if self.prepare_boundary_seen
-            && self.prepare_state.category != SqliteWorkloadCategory::Other
-            && category != self.prepare_state.category
-        {
+        } else if self.prepare_boundary_seen {
             self.prepare_ambiguous = true;
         }
         self.prepare_boundary_seen = false;
@@ -139,6 +203,8 @@ impl NativeStatementCallbackContext {
         statement_identity: usize,
         category: SqliteWorkloadCategory,
         access: Option<SqliteAccessKind>,
+        reprepare_count: u32,
+        kind: StatementKind,
     ) {
         let slot = statement_cache_slot(statement_identity);
         let entry = &mut self.statement_metadata[slot];
@@ -150,12 +216,16 @@ impl NativeStatementCallbackContext {
                 statement_identity,
                 category,
                 access,
+                reprepare_count,
+                kind,
             };
         } else {
             *entry = CachedStatementMetadata {
                 statement_identity,
                 category: SqliteWorkloadCategory::Other,
                 access: None,
+                reprepare_count,
+                kind: StatementKind::Ordinary,
             };
             self.collector.record_classification_gap();
         }
@@ -173,33 +243,49 @@ impl NativeStatementCallbackContext {
         &mut self,
         statement_identity: usize,
         run_count: u32,
+        reprepare_count: u32,
     ) -> CachedStatementMetadata {
-        if run_count == 0 {
+        let cached = self.lookup_statement_metadata(statement_identity);
+        if cached.is_none() && self.prepare_pending {
+            return self.take_prepare_metadata_for_statement(statement_identity, reprepare_count);
+        }
+        let new_generation =
+            run_count == 0 || cached.is_some_and(|entry| entry.reprepare_count != reprepare_count);
+        if new_generation {
             if self.prepare_pending {
-                return self.take_prepare_metadata_for_statement(statement_identity);
+                return self
+                    .take_prepare_metadata_for_statement(statement_identity, reprepare_count);
             }
             self.collector.record_classification_gap();
-            self.cache_statement_metadata(statement_identity, SqliteWorkloadCategory::Other, None);
+            self.cache_statement_metadata(
+                statement_identity,
+                SqliteWorkloadCategory::Other,
+                None,
+                reprepare_count,
+                StatementKind::Ordinary,
+            );
             return self
                 .lookup_statement_metadata(statement_identity)
                 .expect("metadata was just cached");
         }
-        self.lookup_statement_metadata(statement_identity)
-            .unwrap_or_else(|| {
-                self.collector.record_classification_gap();
-                self.cache_statement_metadata(
-                    statement_identity,
-                    SqliteWorkloadCategory::Other,
-                    None,
-                );
-                self.lookup_statement_metadata(statement_identity)
-                    .expect("metadata was just cached")
-            })
+        cached.unwrap_or_else(|| {
+            self.collector.record_classification_gap();
+            self.cache_statement_metadata(
+                statement_identity,
+                SqliteWorkloadCategory::Other,
+                None,
+                reprepare_count,
+                StatementKind::Ordinary,
+            );
+            self.lookup_statement_metadata(statement_identity)
+                .expect("metadata was just cached")
+        })
     }
 
     fn take_prepare_metadata_for_statement(
         &mut self,
         statement_identity: usize,
+        reprepare_count: u32,
     ) -> CachedStatementMetadata {
         let metadata = if self.prepare_ambiguous {
             self.collector.record_classification_gap();
@@ -207,19 +293,29 @@ impl NativeStatementCallbackContext {
                 statement_identity,
                 category: SqliteWorkloadCategory::Other,
                 access: None,
+                reprepare_count,
+                kind: StatementKind::Ordinary,
             }
         } else {
             CachedStatementMetadata {
                 statement_identity,
                 category: self.prepare_state.category,
                 access: self.prepare_state.access,
+                reprepare_count,
+                kind: self.prepare_state.kind,
             }
         };
         self.reset_prepare_state();
         self.prepare_pending = false;
         self.prepare_boundary_seen = false;
         self.prepare_ambiguous = false;
-        self.cache_statement_metadata(statement_identity, metadata.category, metadata.access);
+        self.cache_statement_metadata(
+            statement_identity,
+            metadata.category,
+            metadata.access,
+            reprepare_count,
+            metadata.kind,
+        );
         metadata
     }
 
@@ -256,6 +352,10 @@ impl NativeStatementCallbackContext {
 
 impl Drop for NativeStatementCallbackContext {
     fn drop(&mut self) {
+        self.reconcile_incomplete_read();
+        if self.prepare_pending {
+            self.collector.record_classification_gap();
+        }
         if self.writer_admitted_at.is_some() {
             self.finish_writer_transaction();
             self.collector.record_writer_occupancy_gap();
@@ -287,6 +387,19 @@ pub(crate) async fn install_native_statement_baseline_with_drop_counter(
     install_native_statement_baseline_with_context(
         conn,
         NativeStatementCallbackContext::with_drop_counter(collector, drop_counter),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn install_native_statement_baseline_with_reprepare_counter(
+    conn: &mut SqliteConnection,
+    collector: SqliteWorkloadCollector,
+    observed_reprepare_count: Arc<AtomicUsize>,
+) -> Result<(), sqlx::Error> {
+    install_native_statement_baseline_with_context(
+        conn,
+        NativeStatementCallbackContext::with_reprepare_counter(collector, observed_reprepare_count),
     )
     .await
 }
@@ -368,16 +481,24 @@ unsafe extern "C" fn authorizer_callback(
     arg1: *const c_char,
     _arg2: *const c_char,
     _db_name: *const c_char,
-    _trigger_or_view: *const c_char,
+    trigger_or_view: *const c_char,
 ) -> c_int {
     if context.is_null() {
         return ffi::SQLITE_OK;
     }
     let context = unsafe { &mut *(context.cast::<NativeStatementCallbackContext>()) };
-    if matches!(
-        action_code,
-        ffi::SQLITE_SELECT | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE
-    ) {
+    match action_code {
+        ffi::SQLITE_TRANSACTION => context.note_statement_kind(StatementKind::TransactionControl),
+        ffi::SQLITE_SAVEPOINT => context.note_statement_kind(StatementKind::SavepointControl),
+        _ => {}
+    }
+    let top_level = trigger_or_view.is_null();
+    if top_level
+        && matches!(
+            action_code,
+            ffi::SQLITE_SELECT | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE
+        )
+    {
         context.note_prepare_boundary();
         if action_code == ffi::SQLITE_SELECT {
             return ffi::SQLITE_OK;
@@ -389,6 +510,24 @@ unsafe extern "C" fn authorizer_callback(
     ffi::SQLITE_OK
 }
 
+fn reprepare_generation_advanced(
+    awaiting: AwaitingReprepare,
+    statement_identity: usize,
+    reprepare_count: u32,
+) -> bool {
+    awaiting.statement_identity == statement_identity
+        && reprepare_count > awaiting.prior_reprepare_count
+}
+
+fn invalid_final_read_concurrency(readonly: bool, active_read_concurrency: u32) -> u32 {
+    if readonly {
+        active_read_concurrency
+    } else {
+        0
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one callback owns the STMT/PROFILE generation lifecycle
 unsafe extern "C" fn profile_callback(
     trace: u32,
     context: *mut c_void,
@@ -403,11 +542,21 @@ unsafe extern "C" fn profile_callback(
     let statement_identity = statement as usize;
     let readonly = unsafe { ffi::sqlite3_stmt_readonly(statement) } == 1;
     if trace == ffi::SQLITE_TRACE_STMT {
+        context.reconcile_incomplete_read();
         let run_count =
             unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_RUN, 0) }
                 .max(0)
                 .cast_unsigned();
-        let metadata = context.metadata_for_statement_run(statement_identity, run_count);
+        let reprepare_count =
+            unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_REPREPARE, 0) }
+                .max(0)
+                .cast_unsigned();
+        #[cfg(test)]
+        if let Some(observed) = &context.observed_reprepare_count {
+            observed.fetch_max(reprepare_count as usize, Ordering::SeqCst);
+        }
+        let metadata =
+            context.metadata_for_statement_run(statement_identity, run_count, reprepare_count);
         let access = metadata.access.unwrap_or({
             if readonly {
                 SqliteAccessKind::Read
@@ -425,7 +574,68 @@ unsafe extern "C" fn profile_callback(
     }
     let nanos = unsafe { *(elapsed_nanos.cast::<ffi::sqlite3_int64>()) };
     let latency = Duration::from_nanos(u64::try_from(nanos).unwrap_or_default());
-    let metadata = context.lookup_statement_metadata(statement_identity);
+    if unsafe { ffi::sqlite3_expired(statement) } != 0 {
+        context.collector.record_classification_gap();
+        let prior_reprepare_count =
+            unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_REPREPARE, 0) }
+                .max(0)
+                .cast_unsigned();
+        context.awaiting_reprepare = Some(AwaitingReprepare {
+            statement_identity,
+            prior_reprepare_count,
+        });
+        context
+            .collector
+            .record_native_statement(NativeStatementObservation {
+                category: SqliteWorkloadCategory::Other,
+                access: if readonly {
+                    SqliteAccessKind::Read
+                } else {
+                    SqliteAccessKind::Write
+                },
+                statement_latency: latency,
+                read_connection_time: if readonly { latency } else { Duration::ZERO },
+                read_concurrency: context.active_read_concurrency,
+            });
+        return 0;
+    }
+    let run_count = unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_RUN, 0) }
+        .max(0)
+        .cast_unsigned();
+    let reprepare_count =
+        unsafe { ffi::sqlite3_stmt_status(statement, ffi::SQLITE_STMTSTATUS_REPREPARE, 0) }
+            .max(0)
+            .cast_unsigned();
+    if let Some(awaiting) = context.awaiting_reprepare.take() {
+        if !reprepare_generation_advanced(awaiting, statement_identity, reprepare_count) {
+            context.collector.record_classification_gap();
+            let read_concurrency = context.active_read_concurrency;
+            if read_concurrency > 0 {
+                context.collector.end_native_read();
+                context.active_read_concurrency = 0;
+            }
+            context
+                .collector
+                .record_native_statement(NativeStatementObservation {
+                    category: SqliteWorkloadCategory::Other,
+                    access: if readonly {
+                        SqliteAccessKind::Read
+                    } else {
+                        SqliteAccessKind::Write
+                    },
+                    statement_latency: latency,
+                    read_connection_time: if readonly { latency } else { Duration::ZERO },
+                    read_concurrency: invalid_final_read_concurrency(readonly, read_concurrency),
+                });
+            return 0;
+        }
+    }
+    #[cfg(test)]
+    if let Some(observed) = &context.observed_reprepare_count {
+        observed.fetch_max(reprepare_count as usize, Ordering::SeqCst);
+    }
+    let metadata =
+        Some(context.metadata_for_statement_run(statement_identity, run_count, reprepare_count));
     let access = metadata.and_then(|metadata| metadata.access).unwrap_or({
         if readonly {
             SqliteAccessKind::Read
@@ -455,7 +665,12 @@ unsafe extern "C" fn profile_callback(
     } else if txn_state == ffi::SQLITE_TXN_NONE {
         if context.writer_admitted_at.is_some() {
             context.finish_writer_transaction();
-        } else if access == SqliteAccessKind::Write {
+        } else if access == SqliteAccessKind::Write
+            && !matches!(
+                metadata.map(|metadata| metadata.kind),
+                Some(StatementKind::TransactionControl | StatementKind::SavepointControl)
+            )
+        {
             context.record_writer_gap();
         }
     }
@@ -497,8 +712,11 @@ fn classify_authorizer_action(
             SqliteWorkloadCategory::Maintenance,
             classify_transaction_access(object_name),
         )),
-        ffi::SQLITE_SAVEPOINT
-        | ffi::SQLITE_PRAGMA
+        ffi::SQLITE_SAVEPOINT => Some((
+            SqliteWorkloadCategory::Maintenance,
+            Some(SqliteAccessKind::Write),
+        )),
+        ffi::SQLITE_PRAGMA
         | ffi::SQLITE_ANALYZE
         | ffi::SQLITE_ATTACH
         | ffi::SQLITE_DETACH
@@ -706,6 +924,10 @@ mod tests {
     }
 
     fn report_now(collector: &SqliteWorkloadCollector) -> SqliteWorkloadAggregateReport {
+        collector.aggregate_fresh_collector_for_test()
+    }
+
+    fn report_real_window(collector: &SqliteWorkloadCollector) -> SqliteWorkloadAggregateReport {
         collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros())
     }
 
@@ -731,39 +953,120 @@ mod tests {
             .unwrap()
     }
 
+    unsafe extern "C" fn test_hold_function(
+        context: *mut ffi::sqlite3_context,
+        value_count: c_int,
+        value_arguments: *mut *mut ffi::sqlite3_value,
+    ) {
+        if value_count == 1 {
+            let millis = unsafe { ffi::sqlite3_value_int64(*value_arguments) };
+            // test-timing-allow: elapsed native statement occupancy is the behavior under test
+            std::thread::sleep(Duration::from_millis(millis.max(0).cast_unsigned()));
+        }
+        unsafe { ffi::sqlite3_result_null(context) };
+    }
+
+    async fn install_test_hold(connection: &mut SqliteConnection) {
+        let mut locked = connection.lock_handle().await.unwrap();
+        let name = CString::new("phoenix_test_hold").unwrap();
+        let rc = unsafe {
+            ffi::sqlite3_create_function_v2(
+                locked.as_raw_handle().as_ptr(),
+                name.as_ptr(),
+                1,
+                ffi::SQLITE_UTF8,
+                ptr::null_mut(),
+                Some(test_hold_function),
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+    }
+
+    #[tokio::test]
+    async fn two_connections_record_overlapping_native_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("read-overlap.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut first = db.pool().acquire().await.unwrap();
+        let mut second = db.pool().acquire().await.unwrap();
+        install_test_hold(&mut first).await;
+        install_test_hold(&mut second).await;
+        sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('read-overlap','/tmp/read-overlap','main','2026-01-01T00:00:00Z')")
+            .execute(&mut *first)
+            .await
+            .unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+        let (first_result, second_result) = tokio::join!(
+            sqlx::query("SELECT phoenix_test_hold(100), id FROM projects LIMIT 1")
+                .fetch_optional(&mut *first),
+            sqlx::query("SELECT phoenix_test_hold(100), id FROM projects LIMIT 1")
+                .fetch_optional(&mut *second),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        let report = report_now(&db.sqlite_workload_collector);
+        let read = SqliteAccessKind::Read.index();
+        let total_duration: u64 = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[read][category.index()].read_connection_micros
+                    - before.totals[read][category.index()].read_connection_micros
+            })
+            .sum();
+        let peak = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| report.totals[read][category.index()].read_concurrency_peak)
+            .max()
+            .unwrap();
+        let writer_before: u64 = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                before.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
+            })
+            .sum();
+        let writer_after: u64 = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[SqliteAccessKind::Write.index()][category.index()].writer_held_micros
+            })
+            .sum();
+        assert!(total_duration >= 190_000);
+        assert!(peak > 1);
+        assert_eq!(writer_after, writer_before);
+    }
+
     #[tokio::test]
     async fn native_statement_profile_records_read_and_write_baseline() {
         let collector = SqliteWorkloadCollector::new();
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect({
-                let collector = collector.clone();
-                move |conn, _meta| {
-                    let collector = collector.clone();
-                    Box::pin(
-                        async move { install_native_statement_baseline(conn, collector).await },
-                    )
-                }
-            })
-            .connect_with(opts)
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        connection
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+            .await
+            .unwrap();
+        install_native_statement_baseline(&mut connection, collector.clone())
             .await
             .unwrap();
 
-        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
-            .execute(&pool)
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
             .await
             .unwrap();
+        connection.execute("SAVEPOINT baseline").await.unwrap();
+        connection.execute("RELEASE baseline").await.unwrap();
         sqlx::query("INSERT INTO t (v) VALUES ('x')")
-            .execute(&pool)
+            .execute(&mut connection)
             .await
             .unwrap();
         let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
-            .fetch_one(&pool)
+            .fetch_one(&mut connection)
             .await
             .unwrap();
 
@@ -785,11 +1088,11 @@ mod tests {
         );
         assert!(
             writes.baseline_statement_count >= 1,
-            "expected create baseline write"
+            "expected maintenance savepoint-control write"
         );
         assert!(
             other_writes.baseline_statement_count >= 1,
-            "expected insert write"
+            "expected unknown-table insert write"
         );
         assert!(
             reads.baseline_statement_count >= 1,
@@ -798,6 +1101,10 @@ mod tests {
         assert_eq!(writes.writer_held_micros, 0);
         assert_eq!(writes.write_admission_wait_micros, 0);
         assert_eq!(reads.write_admission_wait_micros, 0);
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .unwrap();
         assert!(
             reads.read_connection_micros
                 >= reads.native_statement_latency_micros.saturating_sub(5_000)
@@ -851,52 +1158,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classifies_representative_domain_tables() {
-        let db = Database::open_in_memory().await.unwrap();
-        sqlx::query("INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, created_at) VALUES ('m1','c1',1,'user','{}','2026-01-01T00:00:00Z')")
-            .execute(db.pool())
-            .await
-            .unwrap_err();
-        let mut read_connection = db.pool().acquire().await.unwrap();
-        let read = read_connection
-            .prepare(sqlx::query::<sqlx::Sqlite>("SELECT COUNT(*) FROM conversations").sql())
-            .await
-            .unwrap();
-        read.query().fetch_one(&mut *read_connection).await.unwrap();
-        drop(read_connection);
-        sqlx::query("INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES ('p1','/tmp/p1','main','2026-01-01T00:00:00Z')")
-            .execute(db.pool())
+    async fn classifies_representative_domain_tables_with_exact_access() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        connection
+            .execute("CREATE TABLE conversations (id TEXT PRIMARY KEY)")
             .await
             .unwrap();
-        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (1,'wake',1,1,0,0,0,'Active','wake',1,X'00',1,1)")
-            .execute(db.pool())
+        connection
+            .execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
             .await
             .unwrap();
-        let report =
-            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
-        let read = SqliteAccessKind::Read.index();
-        assert!(
-            report.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
-                .baseline_statement_count
-                + report.totals[read][SqliteWorkloadCategory::Other.index()]
-                    .baseline_statement_count
-                >= 1
-        );
-        if report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count > 0 {
-            assert!(report.classification_gap_count > 0);
+        connection
+            .execute("CREATE TABLE workflows (workflow_id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        install_native_statement_baseline(&mut connection, collector.clone())
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let before = report_now(&collector);
+        sqlx::query("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects (id) VALUES ('p1')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workflows (workflow_id) VALUES (1)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let report = report_now(&collector);
+        let expected = [
+            (SqliteAccessKind::Read, SqliteWorkloadCategory::RuntimeState),
+            (
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::PrProjectData,
+            ),
+            (
+                SqliteAccessKind::Write,
+                SqliteWorkloadCategory::DurableWorkflows,
+            ),
+        ];
+        for access in SqliteAccessKind::ALL {
+            for category in SqliteWorkloadCategory::ALL {
+                let expected_delta = u64::from(expected.contains(&(access, category)));
+                assert_eq!(
+                    report.totals[access.index()][category.index()].baseline_statement_count,
+                    before.totals[access.index()][category.index()].baseline_statement_count
+                        + expected_delta,
+                    "unexpected native classification for {access:?}/{category:?}",
+                );
+            }
         }
-        assert!(
-            report.totals[SqliteAccessKind::Write.index()]
-                [SqliteWorkloadCategory::PrProjectData.index()]
-            .baseline_statement_count
-                >= 1
+        assert_eq!(
+            report.classification_gap_count,
+            before.classification_gap_count,
         );
-        assert!(
-            report.totals[SqliteAccessKind::Write.index()]
-                [SqliteWorkloadCategory::DurableWorkflows.index()]
-            .baseline_statement_count
-                >= 1
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrated_pool_stale_prepare_degrades_instead_of_misattributing_workflow() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let _unexecuted = connection
+            .prepare(
+                sqlx::query::<sqlx::Sqlite>(
+                    "SELECT canonical_path FROM projects WHERE id = 'stale'",
+                )
+                .sql(),
+            )
+            .await
+            .unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+        sqlx::query("INSERT INTO workflows (workflow_id, profile_kind, profile_version, runtime_acceptance_enabled, external_acceptance_enabled, version, generation, status, snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at) VALUES (1,'wake',1,1,0,0,0,'Active','wake',1,X'00',1,1)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let after = report_now(&db.sqlite_workload_collector);
+        let write = SqliteAccessKind::Write.index();
+        assert_eq!(
+            after.totals[write][SqliteWorkloadCategory::DurableWorkflows.index()]
+                .baseline_statement_count,
+            before.totals[write][SqliteWorkloadCategory::DurableWorkflows.index()]
+                .baseline_statement_count,
+            "stale pending metadata must not become a known workflow attribution",
         );
+        assert_eq!(
+            after.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
+            before.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count
+                + 1,
+        );
+        assert!(after.classification_gap_count > before.classification_gap_count);
     }
 
     #[tokio::test]
@@ -1009,6 +1375,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_category_read_write_interleave_degrades_without_wrong_access() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+        let read = connection
+            .prepare(
+                sqlx::query::<sqlx::Sqlite>(
+                    "SELECT id FROM conversations WHERE id = 'same-category'",
+                )
+                .sql(),
+            )
+            .await
+            .unwrap();
+        let _write = connection
+            .prepare(
+                sqlx::query::<sqlx::Sqlite>(
+                    "UPDATE conversations SET title = title WHERE id = 'same-category'",
+                )
+                .sql(),
+            )
+            .await
+            .unwrap();
+        read.query().fetch_optional(&mut *connection).await.unwrap();
+        let report = report_now(&db.sqlite_workload_collector);
+        let read_index = SqliteAccessKind::Read.index();
+        let write_index = SqliteAccessKind::Write.index();
+        assert_eq!(
+            report.totals[read_index][SqliteWorkloadCategory::Other.index()]
+                .baseline_statement_count,
+            before.totals[read_index][SqliteWorkloadCategory::Other.index()]
+                .baseline_statement_count
+                + 1
+        );
+        assert_eq!(
+            report.totals[write_index][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count,
+            before.totals[write_index][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count
+        );
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn schema_reprepare_never_reuses_stale_generation_metadata() {
+        let collector = SqliteWorkloadCollector::new();
+        let observed_reprepare_count = Arc::new(AtomicUsize::new(0));
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE conversations(id TEXT PRIMARY KEY)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE projects(id TEXT PRIMARY KEY)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW reprepare_view AS SELECT id FROM conversations")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        install_native_statement_baseline_with_reprepare_counter(
+            &mut connection,
+            collector.clone(),
+            observed_reprepare_count.clone(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("SELECT id FROM reprepare_view WHERE id = ?")
+            .bind("reprepare")
+            .fetch_optional(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP VIEW reprepare_view")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE VIEW reprepare_view AS SELECT id FROM projects")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        observed_reprepare_count.store(0, Ordering::SeqCst);
+        let before = report_now(&collector);
+        sqlx::query("SELECT id FROM reprepare_view WHERE id = ?")
+            .bind("reprepare")
+            .fetch_optional(&mut connection)
+            .await
+            .unwrap();
+        let report = report_now(&collector);
+        assert!(
+            observed_reprepare_count.load(Ordering::SeqCst) > 0,
+            "schema change must force SQLite to reprepare the cached statement"
+        );
+        let read = SqliteAccessKind::Read.index();
+        let delta_other = report.totals[read][SqliteWorkloadCategory::Other.index()]
+            .baseline_statement_count
+            - before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count;
+        let delta_projects = report.totals[read][SqliteWorkloadCategory::PrProjectData.index()]
+            .baseline_statement_count
+            - before.totals[read][SqliteWorkloadCategory::PrProjectData.index()]
+                .baseline_statement_count;
+        let delta_runtime = report.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
+            .baseline_statement_count
+            - before.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count;
+        assert_eq!(delta_runtime, 0, "stale RuntimeState metadata was reused");
+        assert_eq!(delta_projects, 1);
+        assert_eq!(delta_other, 1);
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[test]
+    fn unchanged_reprepare_generation_is_not_trusted() {
+        let awaiting = AwaitingReprepare {
+            statement_identity: 7,
+            prior_reprepare_count: 3,
+        };
+        assert!(!reprepare_generation_advanced(awaiting, 7, 3));
+        assert!(!reprepare_generation_advanced(awaiting, 8, 4));
+        assert!(reprepare_generation_advanced(awaiting, 7, 4));
+        let after_multiple_prior_reprepares = AwaitingReprepare {
+            statement_identity: 7,
+            prior_reprepare_count: 9,
+        };
+        assert!(!reprepare_generation_advanced(
+            after_multiple_prior_reprepares,
+            7,
+            9
+        ));
+        assert!(reprepare_generation_advanced(
+            after_multiple_prior_reprepares,
+            7,
+            10
+        ));
+        assert_eq!(invalid_final_read_concurrency(true, 3), 3);
+        assert_eq!(invalid_final_read_concurrency(false, 3), 0);
+    }
+
+    #[tokio::test]
+    async fn context_drop_reconciles_active_read_without_reprepare_marker() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.active_read_concurrency = collector.begin_native_read();
+        let before = report_now(&collector);
+        drop(context);
+        let after = report_now(&collector);
+        assert_eq!(collector.active_native_reads_for_test(), 0);
+        assert!(after.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn context_drop_reconciles_read_awaiting_reprepare() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.active_read_concurrency = collector.begin_native_read();
+        context.awaiting_reprepare = Some(AwaitingReprepare {
+            statement_identity: 1,
+            prior_reprepare_count: 0,
+        });
+        let before = report_now(&collector);
+        drop(context);
+        let after = report_now(&collector);
+        assert_eq!(collector.active_native_reads_for_test(), 0);
+        assert!(after.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn failed_prepare_then_same_category_success_is_conservative() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+        sqlx::query("SELECT id, missing_column FROM conversations")
+            .fetch_all(db.pool())
+            .await
+            .unwrap_err();
+        sqlx::query("SELECT id FROM conversations WHERE id = 'after-failure'")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+        let report = report_now(&db.sqlite_workload_collector);
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[tokio::test]
+    async fn failed_prepare_then_close_records_gap() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let before = report_now(&db.sqlite_workload_collector);
+        sqlx::query("SELECT id, missing_column FROM conversations")
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap_err();
+        connection.close().await.unwrap();
+        let report = report_now(&db.sqlite_workload_collector);
+        assert!(report.classification_gap_count > before.classification_gap_count);
+    }
+
+    #[test]
+    fn savepoint_controls_are_maintenance_writes() {
+        for control in ["BEGIN", "RELEASE", "ROLLBACK"] {
+            let control = CString::new(control).unwrap();
+            assert_eq!(
+                classify_authorizer_action(ffi::SQLITE_SAVEPOINT, control.as_ptr()),
+                Some((
+                    SqliteWorkloadCategory::Maintenance,
+                    Some(SqliteAccessKind::Write),
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn nested_select_preserves_outer_higher_precedence_category() {
         let db = Database::open_in_memory().await.unwrap();
         let before =
@@ -1044,7 +1623,7 @@ mod tests {
         context.note_prepare_metadata(SqliteWorkloadCategory::Fts, None);
 
         assert_eq!(
-            context.take_prepare_metadata_for_statement(8).category,
+            context.take_prepare_metadata_for_statement(8, 0).category,
             SqliteWorkloadCategory::Fts
         );
     }
@@ -1057,7 +1636,7 @@ mod tests {
         context.note_prepare_metadata(SqliteWorkloadCategory::Other, None);
 
         assert_eq!(
-            context.take_prepare_metadata_for_statement(9).category,
+            context.take_prepare_metadata_for_statement(9, 0).category,
             SqliteWorkloadCategory::PrProjectData
         );
     }
@@ -1095,10 +1674,16 @@ mod tests {
     fn new_prepare_generation_replaces_metadata_at_reused_pointer() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector);
-        context.cache_statement_metadata(8, SqliteWorkloadCategory::PrProjectData, None);
+        context.cache_statement_metadata(
+            8,
+            SqliteWorkloadCategory::PrProjectData,
+            None,
+            0,
+            StatementKind::Ordinary,
+        );
         context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
 
-        let metadata = context.take_prepare_metadata_for_statement(8);
+        let metadata = context.take_prepare_metadata_for_statement(8, 0);
         assert_eq!(metadata.category, SqliteWorkloadCategory::Fts);
         assert_eq!(metadata.access, Some(SqliteAccessKind::Read));
         assert_eq!(context.lookup_statement_metadata(8), Some(metadata));
@@ -1108,9 +1693,15 @@ mod tests {
     fn first_run_without_fresh_metadata_replaces_reused_pointer_with_other() {
         let collector = SqliteWorkloadCollector::new();
         let mut context = NativeStatementCallbackContext::new(collector.clone());
-        context.cache_statement_metadata(8, SqliteWorkloadCategory::PrProjectData, None);
+        context.cache_statement_metadata(
+            8,
+            SqliteWorkloadCategory::PrProjectData,
+            None,
+            0,
+            StatementKind::Ordinary,
+        );
 
-        let metadata = context.metadata_for_statement_run(8, 0);
+        let metadata = context.metadata_for_statement_run(8, 0, 0);
         assert_eq!(metadata.category, SqliteWorkloadCategory::Other);
         assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
@@ -1123,23 +1714,23 @@ mod tests {
         context.begin_prepare();
         context.note_prepare_metadata(SqliteWorkloadCategory::Fts, Some(SqliteAccessKind::Read));
 
-        let metadata = context.metadata_for_statement_run(16, 0);
+        let metadata = context.metadata_for_statement_run(16, 0, 0);
         assert_eq!(metadata.category, SqliteWorkloadCategory::Fts);
         assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
 
     #[tokio::test]
-    async fn cached_statement_reuse_keeps_category() {
+    async fn cached_statement_reuse_keeps_exact_category_and_access() {
         let collector = SqliteWorkloadCollector::new();
         let mut conn = SqliteConnection::connect_with(
             &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
         )
         .await
         .unwrap();
-        install_native_statement_baseline(&mut conn, collector.clone())
+        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
             .await
             .unwrap();
-        conn.execute("CREATE TABLE projects (id TEXT PRIMARY KEY)")
+        install_native_statement_baseline(&mut conn, collector.clone())
             .await
             .unwrap();
         let stmt = conn
@@ -1149,10 +1740,10 @@ mod tests {
         stmt.query().fetch_all(&mut conn).await.unwrap();
         stmt.query().fetch_all(&mut conn).await.unwrap();
         let report = report_now(&collector);
+        let read = SqliteAccessKind::Read.index();
         assert!(
-            report.totals[SqliteAccessKind::Read.index()]
-                [SqliteWorkloadCategory::PrProjectData.index()]
-            .baseline_statement_count
+            report.totals[read][SqliteWorkloadCategory::PrProjectData.index()]
+                .baseline_statement_count
                 >= 2
         );
     }
@@ -1188,8 +1779,20 @@ mod tests {
         let mut context = NativeStatementCallbackContext::new(collector.clone());
         let first = 8usize;
         let collision = first + (STATEMENT_CACHE_SIZE << 3);
-        context.cache_statement_metadata(first, SqliteWorkloadCategory::Fts, None);
-        context.cache_statement_metadata(collision, SqliteWorkloadCategory::DurableWorkflows, None);
+        context.cache_statement_metadata(
+            first,
+            SqliteWorkloadCategory::Fts,
+            None,
+            0,
+            StatementKind::Ordinary,
+        );
+        context.cache_statement_metadata(
+            collision,
+            SqliteWorkloadCategory::DurableWorkflows,
+            None,
+            0,
+            StatementKind::Ordinary,
+        );
 
         assert!(context.lookup_statement_metadata(first).is_none());
         assert_eq!(
@@ -1296,6 +1899,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_read_only_transaction_does_not_create_writer_gap() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut connection, collector.clone())
+            .await
+            .unwrap();
+        let before = report_now(&collector);
+        sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
+        sqlx::query("SELECT 1")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let report = report_now(&collector);
+        assert_eq!(
+            report.writer_occupancy_gap_count,
+            before.writer_occupancy_gap_count
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_transaction_records_admission_evidence() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::from_str("sqlite::memory:").unwrap(),
+        )
+        .await
+        .unwrap();
+        install_native_statement_baseline(&mut connection, collector.clone())
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let report = report_now(&collector);
+        assert!(report.writer_occupancy_gap_count >= 1);
+    }
+
+    #[tokio::test]
     async fn transaction_control_profiles_as_write_access() {
         let collector = SqliteWorkloadCollector::new();
         let mut conn = SqliteConnection::connect_with(
@@ -1316,7 +1970,12 @@ mod tests {
             .iter()
             .map(|totals| totals.baseline_statement_count)
             .sum();
+        let read_baseline: u64 = report.totals[SqliteAccessKind::Read.index()]
+            .iter()
+            .map(|totals| totals.baseline_statement_count)
+            .sum();
         assert!(write_baseline >= 2);
+        assert_eq!(read_baseline, 0);
     }
 
     #[tokio::test]
@@ -1432,12 +2091,16 @@ mod tests {
             .unwrap();
 
         let report = report_now(&collector);
-        let totals = category_totals(
-            &report,
-            SqliteAccessKind::Write,
-            SqliteWorkloadCategory::MessagePersistence,
-        );
-        assert!(totals.writer_held_micros > 0);
+        let write = SqliteAccessKind::Write.index();
+        let occupied: Vec<_> = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .filter_map(|category| {
+                let totals = report.totals[write][category.index()];
+                (totals.writer_held_micros > 0).then_some((category, totals))
+            })
+            .collect();
+        assert_eq!(occupied.len(), 1);
+        assert_eq!(occupied[0].1.writer_concurrency_peak, 1);
         assert!(report.writer_occupancy_gap_count >= 1);
     }
 
@@ -1600,7 +2263,7 @@ mod tests {
         sleep(Duration::from_millis(20)).await;
         sqlx::query("ROLLBACK").execute(&pool).await.unwrap();
 
-        let report = report_now(&collector);
+        let report = report_real_window(&collector);
         let total_writer_held: u64 = SqliteWorkloadCategory::ALL
             .iter()
             .map(|category| {

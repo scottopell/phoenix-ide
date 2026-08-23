@@ -1358,6 +1358,11 @@ impl Database {
     }
 
     #[must_use]
+    pub fn fts_retriever(&self) -> retrieval::Fts5Retriever {
+        retrieval::Fts5Retriever::new(self.pool.clone(), self.sqlite_workload_collector.clone())
+    }
+
+    #[must_use]
     pub fn workflow_repository(&self) -> workflow::WorkflowRepository {
         workflow::WorkflowRepository::with_sqlite_workload_collector(
             self.pool.clone(),
@@ -1373,6 +1378,7 @@ impl Database {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn sqlite_workload_aggregate_report(
         &self,
@@ -5784,7 +5790,10 @@ impl Database {
             usage_data: usage_data.cloned(),
             created_at: now,
         };
-        if let Err(error) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(message_id, %error, "failed to index creation message; startup reconcile will repair");
         }
         Ok(CreationRuntimeMaterialization::Materialized(Box::new(
@@ -6822,8 +6831,13 @@ impl Database {
             SqliteWorkloadCategory::MessagePersistence,
             SqliteAccessKind::Write,
         );
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let (mut connection, pool_timing) = fts_telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
+            .await?;
+        let (mut tx, transaction_timing) = fts_telemetry
+            .observe_transaction_admission_db(pool_timing, async {
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+            })
             .await?;
         fts_telemetry
             .observe_sqlx(
@@ -6998,11 +7012,21 @@ impl Database {
             usage_data: None,
             created_at: now,
         };
-        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &seed_msg, &fts_telemetry).await?;
-        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &handoff_msg, &fts_telemetry).await?;
+        retrieval::fts_upsert_conn(
+            &mut tx,
+            &seed_msg,
+            retrieval::FtsObservation::Standalone(&fts_telemetry),
+        )
+        .await?;
+        retrieval::fts_upsert_conn(
+            &mut tx,
+            &handoff_msg,
+            retrieval::FtsObservation::Standalone(&fts_telemetry),
+        )
+        .await?;
 
         fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .observe_commit_db(transaction_timing, async { Ok(tx.commit().await?) })
             .await?;
 
         Ok(Conversation {
@@ -7920,7 +7944,12 @@ impl Database {
                 .try_map(parse_message_row)
                 .fetch_one(&mut *tx)
                 .await?;
-                retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+                retrieval::fts_upsert_conn(
+                    &mut tx,
+                    &updated_message,
+                    retrieval::FtsObservation::ParentTransaction,
+                )
+                .await?;
                 Some(
                     sqlx::query_scalar(
                         "UPDATE conversations
@@ -9103,7 +9132,12 @@ impl Database {
             .try_map(parse_message_row)
             .fetch_one(&mut *tx)
             .await?;
-            retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+            retrieval::fts_upsert_conn(
+                &mut tx,
+                &updated_message,
+                retrieval::FtsObservation::ParentTransaction,
+            )
+            .await?;
         } else {
             let sequence_id: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(MAX(sequence_id), 0) + 1
@@ -9763,7 +9797,10 @@ impl Database {
             usage_data: usage_data.cloned(),
             created_at: now,
         };
-        if let Err(error) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id,
                 error = %error,
@@ -9850,7 +9887,10 @@ impl Database {
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
         // The startup reconcile is the backstop if this ever fails after the
         // message row commits.
-        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(e) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id, error = %e,
                 "failed to index message for retrieval; startup reconcile will repair",
@@ -9930,7 +9970,10 @@ impl Database {
             created_at,
         };
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
-        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(e) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id, error = %e,
                 "failed to index message for retrieval; startup reconcile will repair",
@@ -10494,7 +10537,10 @@ impl Database {
         if let Some(mut message) = updated {
             // Hydrate attachments so the re-indexed text keeps file-context tags.
             hydrate_attachments(&self.pool, std::slice::from_mut(&mut message)).await?;
-            if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            if let Err(e) =
+                retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                    .await
+            {
                 tracing::warn!(
                     message_id = %message.message_id, error = %e,
                     "failed to index message for retrieval; startup reconcile will repair",
@@ -11992,7 +12038,7 @@ async fn insert_message_tx(
                 msg.message_id
             )));
         }
-        retrieval::fts_upsert_conn(tx, msg).await?;
+        retrieval::fts_upsert_conn(tx, msg, retrieval::FtsObservation::ParentTransaction).await?;
         return Ok(());
     }
     insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
@@ -12001,7 +12047,7 @@ async fn insert_message_tx(
     // same FTS coverage as `add_message_with_seq` — no message reaches a chain
     // unindexed before the startup reconcile (specs/conversation-retrieval/
     // REQ-RET-003).
-    retrieval::fts_upsert_conn(tx, msg).await?;
+    retrieval::fts_upsert_conn(tx, msg, retrieval::FtsObservation::ParentTransaction).await?;
     Ok(())
 }
 

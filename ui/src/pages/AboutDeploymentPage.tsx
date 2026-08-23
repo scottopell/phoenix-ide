@@ -420,8 +420,9 @@ function SqliteDiagnostics({
   const report = state.report;
   const hasBaselineSamples = (report?.classification.baseline_statement_count ?? 0) > 0;
   const hasTypedSamples = (report?.classification.typed_outcome_count ?? 0) > 0;
-  const hasNativeLoad = report?.reads.some((row) => row.total_connection_time_ms > 0 || row.peak_concurrency > 0) ?? false;
+  const hasNativeLoad = report?.reads.some((row) => row.total_profiled_read_execution_ms > 0 || row.peak_concurrency > 0) ?? false;
   const hasWriterOccupancy = report?.writer_categories.some((row) => row.writer_occupancy_percent > 0 || row.peak_concurrency > 0) ?? false;
+  const hasCoverage = (report?.covered_uptime_micros ?? 0) > 0;
   return (
     <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
       <div className="settings-section__title-row">
@@ -454,7 +455,10 @@ function SqliteDiagnostics({
       </div>
       {state.error && <div className="settings-section__error">{report ? `SQLite report stale — ${state.error}` : `SQLite report unavailable — ${state.error}`}</div>}
       {state.loading && <div className="settings-section__hint">{report ? 'Refreshing SQLite report; displayed values are from the previous sample.' : 'Loading SQLite report…'}</div>}
-      {report && (
+      {report && !hasCoverage && (
+        <div className="about-sqlite-empty">SQLite workload coverage is warming up; no covered interval is available yet.</div>
+      )}
+      {report && hasCoverage && (
         <>
           <dl className="about-sqlite-summary" aria-label="SQLite workload coverage">
             <div className="about-sqlite-summary__card">
@@ -551,7 +555,7 @@ function SqliteDiagnostics({
                     <th>Category</th>
                     <th>Typed reads</th>
                     <th>Typed latency</th>
-                    <th>Native connection time</th>
+                    <th>Native profiled read execution</th>
                     <th>Profiled statement latency</th>
                     <th>Peak concurrency</th>
                     <th>Retries / failures</th>
@@ -564,7 +568,7 @@ function SqliteDiagnostics({
                       <td>{row.label}</td>
                       <td>{formatNumber(row.typed_operation_count)}</td>
                       <td>avg {row.typed_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.typed_latency.sample_count, 'typed reads')}</td>
-                      <td>{row.total_connection_time_ms} ms</td>
+                      <td>{row.total_profiled_read_execution_ms} ms</td>
                       <td>avg {row.profiled_statement_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.profiled_statement_latency.sample_count, 'profiled statements')}</td>
                       <td>{formatNumber(row.peak_concurrency)}</td>
                       <td>{row.retries ? `${row.retries.retry_count} retries` : 'retries —'} · pool {row.pool_wait?.avg_ms ?? '—'} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
@@ -1044,7 +1048,14 @@ export function AboutDeploymentPage() {
   const loadSqlite = useCallback((window: SqliteReportWindow) => {
     const generation = sqliteRequestRef.current.generation + 1;
     sqliteRequestRef.current = { generation, window };
-    setSqlite((current) => ({ ...current, window, loading: true, error: null }));
+    setSqlite((current) => ({
+      ...current,
+      window,
+      report: current.window === window ? current.report : null,
+      stale: current.window === window && current.stale,
+      loading: true,
+      error: null,
+    }));
     void api.deploymentSqliteWorkload(window)
       .then((report) => {
         if (!sqliteMountedRef.current || sqliteRequestRef.current.generation !== generation || sqliteRequestRef.current.window !== window) return;

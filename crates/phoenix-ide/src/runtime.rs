@@ -2000,7 +2000,7 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
-        let message_retriever = Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever = Arc::new(db.fts_retriever());
         Self::new_with_message_retriever(
             db,
             llm_registry,

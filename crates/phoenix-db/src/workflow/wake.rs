@@ -2351,7 +2351,12 @@ impl WakeRepository {
             created_at,
         };
         if has_message_fts_tx(&mut tx).await? {
-            crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+            crate::retrieval::fts_upsert_conn(
+                &mut tx.tx,
+                &message,
+                crate::retrieval::FtsObservation::ParentTransaction,
+            )
+            .await?;
         }
         sqlx::query(
             "INSERT INTO wake_delivery_messages (

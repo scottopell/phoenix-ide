@@ -1133,7 +1133,6 @@ mod tests {
         message_id_fragment, parse_conv_handle, render_full_message_text, split_fragment,
         GlobalMessageTargetError, GlobalReadService,
     };
-    use phoenix_db::retrieval::Fts5Retriever;
     use std::sync::Arc;
 
     #[test]
@@ -1215,7 +1214,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let snapshot = GlobalReadService::new(db, retriever)
             .coordinator_snapshot()
             .await
@@ -1262,7 +1261,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let service = GlobalReadService::new(db.clone(), retriever);
         let work_scope_id = db
             .get_conversation("scope-owner")

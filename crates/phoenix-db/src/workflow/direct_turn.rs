@@ -2828,7 +2828,12 @@ async fn insert_canonical_message_tx(
             usage_data: None,
             created_at: created_at_dt,
         };
-        crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+        crate::retrieval::fts_upsert_conn(
+            &mut tx.tx,
+            &message,
+            crate::retrieval::FtsObservation::ParentTransaction,
+        )
+        .await?;
         Ok(message)
     } else {
         Ok(Message {

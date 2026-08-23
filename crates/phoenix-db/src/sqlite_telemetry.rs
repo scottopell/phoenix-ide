@@ -18,8 +18,6 @@ pub(crate) enum SqliteOperation {
     ConversationDelete,
     CreateTaskApprovalHandoff,
     DirectTurnTerminalSettlement,
-    FtsDeleteConversation,
-    FtsDeleteMessage,
     FtsReconcileUpsert,
     FtsUpsert,
     UpdateMessageDisplayData,
@@ -31,8 +29,6 @@ impl SqliteOperation {
             Self::ConversationDelete => "conversation.delete",
             Self::CreateTaskApprovalHandoff => "conversation.task_approval_handoff",
             Self::DirectTurnTerminalSettlement => "direct_turn.terminal_settlement",
-            Self::FtsDeleteConversation => "fts.delete_conversation",
-            Self::FtsDeleteMessage => "fts.delete_message",
             Self::FtsReconcileUpsert => "fts.reconcile_upsert",
             Self::FtsUpsert => "fts.upsert",
             Self::UpdateMessageDisplayData => "message.update_display_data",
@@ -1110,6 +1106,7 @@ mod tests {
                 usage_data: None,
                 created_at: Utc::now(),
             },
+            db.sqlite_workload_collector.clone(),
         )
         .await
         .unwrap_err();
@@ -1127,7 +1124,7 @@ mod tests {
         );
         assert_eq!(
             event.get("db_phase").map(String::as_str),
-            Some("locator_delete")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             event.get("db_sqlite_primary_code").map(String::as_str),
