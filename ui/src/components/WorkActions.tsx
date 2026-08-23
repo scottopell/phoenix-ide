@@ -203,6 +203,10 @@ export function WorkControlBar({
   const usesCompactLayout = useIsCompactLayout();
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
+  const openSelectorFromFallback = () => {
+    fallbackSelectorOriginRef.current = true;
+    requestActivePrSelectorOpen();
+  };
 
   useEffect(() => {
     const fallbackOwnedFocus = fallbackOwnedFocusRef.current;
@@ -553,7 +557,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                onClick={requestActivePrSelectorOpen}
+                onClick={openSelectorFromFallback}
               >
                 Select active PR
               </button>
@@ -576,7 +580,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                onClick={requestActivePrSelectorOpen}
+                onClick={openSelectorFromFallback}
               >
                 Select active PR
               </button>
@@ -608,10 +612,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                onClick={() => {
-                  fallbackSelectorOriginRef.current = true;
-                  requestActivePrSelectorOpen();
-                }}
+                onClick={openSelectorFromFallback}
               >
                 Select active PR
               </button>
@@ -641,7 +642,7 @@ export function WorkControlBar({
               <button
                 type="button"
                 className="mobile-pr-action mobile-pr-action--hero"
-                onClick={requestActivePrSelectorOpen}
+                onClick={openSelectorFromFallback}
               >
                 Select active PR
               </button>
