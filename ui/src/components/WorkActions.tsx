@@ -278,12 +278,12 @@ export function WorkControlBar({
     requestActivePrSelectorOpen();
     setOpenSelectorAfterRefresh(false);
   }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
-  const activeSelectionProvenance = prStatusHandle.activeSelection?.active_pr?.provenance
-    ?? (prStatusHandle.activeSelection?.active_pr as unknown as { active_source?: string } | undefined)?.active_source;
-  const explicitActivePrResolved = activePr !== null && (activeSelectionProvenance === 'pinned' || activeSelectionProvenance === 'user_pinned');
-  const dispositionPrStatus = explicitActivePrResolved && activePr && prStatus
+  const activePrDiffersFromCached = !!activePr
+    && prStatus?.found === true
+    && prStatus.number !== activePr.pr_number;
+  const dispositionPrStatus: PrStatusResponse | null = activePrDiffersFromCached && activePr && prStatus
     ? {
-        ...prStatus,
+        found: true,
         number: activePr.pr_number,
         title: activePr.title,
         url: activePr.url,
@@ -293,6 +293,9 @@ export function WorkControlBar({
         head: activePr.head,
         display_state: activePr.display_state,
         feedback_status: activePr.feedback_status,
+        check_state: 'unknown',
+        refresh: { ...prStatus.refresh, state: 'unavailable' },
+        work_change: prStatus.work_change,
         pr: {
           number: activePr.pr_number,
           title: activePr.title,

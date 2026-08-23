@@ -99,7 +99,24 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     work_change: cleanWorkChange(),
     ...prStatus,
   };
-  const selectionValue = (status.selection ?? selection()) as NonNullable<PrStatusResponse['selection']>;
+  const defaultSelection = status.found && status.number !== undefined
+    ? selection({
+        associated_prs: [{
+          ...selection().associated_prs[0]!,
+          pr_number: status.number,
+          title: status.title ?? selection().associated_prs[0]!.title,
+          url: status.url ?? `https://github.com/o/r/pull/${status.number}`,
+          state: status.state ?? selection().associated_prs[0]!.state,
+          draft: status.draft ?? false,
+          display_state: status.display_state ?? selection().associated_prs[0]!.display_state,
+          base: status.base ?? selection().associated_prs[0]!.base,
+          head: status.head ?? selection().associated_prs[0]!.head,
+          ...(status.feedback_status === undefined ? {} : { feedback_status: status.feedback_status }),
+        }],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: status.number }, provenance: 'inferred' },
+      })
+    : selection();
+  const selectionValue = (status.selection ?? defaultSelection) as NonNullable<PrStatusResponse['selection']>;
   const committedStatus = selectionValue ? { ...status, selection: selectionValue } : status;
   const associated = selectionValue?.associated_prs ?? [];
   return {
@@ -2045,7 +2062,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
   });
 
   it('derives terminal actions from the resolved explicit PR instead of stale cached status', () => {
-    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, display_state: 'open' as const };
+    const explicitPr = { ...selection().associated_prs[0]!, pr_number: 13, url: 'https://github.com/o/r/pull/13', display_state: 'open' as const };
     const handle = prStatusHandle({
       found: true,
       number: 12,
@@ -2065,7 +2082,32 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Merge on GitHub #13/ })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #13/ })).toBeInTheDocument();
+  });
+
+  it('uses every resolved inferred active PR without borrowing cached checks', () => {
+    const inferredPr = { ...selection().associated_prs[0]!, pr_number: 13, url: 'https://github.com/o/r/pull/13', display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: {
+        associated_prs: [inferredPr],
+        active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 13 }, provenance: 'inferred' },
+      },
+      activePrSummary: inferredPr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-inferred-actions" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #13/ })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #13/ })).not.toBeInTheDocument();
   });
 
   it('does not render a stale cached PR link beside an unresolved explicit selection', () => {
