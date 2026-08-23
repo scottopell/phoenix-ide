@@ -752,6 +752,60 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it('never captures an anchor offset the reconciled position does not hold', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 8 }], changedTouches: [{ identifier: 8 }] });
+      });
+      const before = ref.current?.captureVisibleAnchor() ?? null;
+
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 8 }] });
+      });
+
+      // Run the settle timer without flushing React, leaving the correction
+      // computed but not yet written — the window in which a range change can
+      // synchronously ask for an anchor to acquire history from.
+      vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      const during = ref.current?.captureVisibleAnchor() ?? null;
+
+      act(() => {});
+      const after = ref.current?.captureVisibleAnchor() ?? null;
+
+      // Prefix restoration replays this offset to put the same row back in the
+      // same place, so an anchor taken mid-correction makes history
+      // acquisition jump by exactly the drift (REQ-VT-005).
+      expect(during).toEqual(before);
+      expect(after).toEqual(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {

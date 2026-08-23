@@ -299,17 +299,9 @@ function totalPhysicalExtent<T>(store: PhysicalStore<T>): number {
   return store.headerExtent + store.layout.totalExtent + store.drift;
 }
 
-/** Where the viewport comes to rest once the correction it is already owed
- *  has been written.
- *
- *  Drift reconciliation removes the spacer shift and writes the equivalent
- *  scroll position in two commits, and between them the transcript has lost
- *  extent the viewport has not yet given back. Every question about where
- *  the reader is relative to the content — tail proximity, which rows are
- *  visible, how far a target sits from the viewport start — must be answered
- *  about the settled position, or the intermediate becomes observable as a
- *  move the reader never made. Only the writer of the scroll position reads
- *  the raw field. */
+/** Viewport position with any correction still owed counted as applied. Read
+ *  this, not `viewportTop`, for anything describing where the reader sits
+ *  relative to content (REQ-VT-004). */
 function settledViewportTop<T>(store: PhysicalStore<T>): number {
   return store.viewportTop + (store.pendingScrollDelta ?? 0);
 }
@@ -370,24 +362,26 @@ function captureTopAnchor<T>(store: PhysicalStore<T>): VirtualTranscriptAnchor |
   return {
     index,
     key: unit.key,
-    offset: store.headerExtent + unit.offset + store.drift - store.viewportTop,
+    offset: store.headerExtent + unit.offset + store.drift - settledViewportTop(store),
   };
 }
 
 function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor | null): void {
   if (!anchor) {
-    setScrollerScrollTop(store, store.viewportTop);
+    setScrollerScrollTop(store, settledViewportTop(store));
     return;
   }
   const nextOffset = store.layout.offsetForKey(anchor.key);
   if (nextOffset === undefined) {
-    setScrollerScrollTop(store, store.viewportTop);
+    setScrollerScrollTop(store, settledViewportTop(store));
     return;
   }
   const target = store.headerExtent + nextOffset + store.drift - anchor.offset;
-  const delta = target - store.viewportTop;
-  if (delta !== 0 && scrollIsActive(store)) {
-    // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room.
+  const delta = target - settledViewportTop(store);
+  // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room and no
+  // correction already owed as a write — a correction lives in the spacer or
+  // in a pending write, never both.
+  if (delta !== 0 && scrollIsActive(store) && store.pendingScrollDelta === null) {
     const driftNext = store.drift - delta;
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
