@@ -649,6 +649,7 @@ fn sample_sqlite_workload_report(
         .map(|category| {
             let totals = report.totals[SqliteAccessKind::Write.index()][category.index()];
             let outcomes = &report.outcomes[SqliteAccessKind::Write.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
             let utilization_percent = if writer_window_micros == 0 {
                 0.0
             } else {
@@ -657,7 +658,7 @@ fn sample_sqlite_workload_report(
             SqliteWriterCategoryReport {
                 category: sqlite_category_key(category).to_string(),
                 label: sqlite_category_label(category).to_string(),
-                operation_count: totals.operation_count,
+                operation_count,
                 writer_occupancy_percent: utilization_percent,
                 latency: wait_summary(
                     &report.latency_histogram[SqliteAccessKind::Write.index()][category.index()],
@@ -684,13 +685,14 @@ fn sample_sqlite_workload_report(
         .map(|category| {
             let totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
             let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
             let total_duration_ms = totals.read_connection_micros / 1_000;
             let avg_duration_ms =
-                (totals.operation_count > 0).then_some(total_duration_ms / totals.operation_count);
+                (operation_count > 0).then_some(total_duration_ms / operation_count);
             SqliteReadCategoryReport {
                 category: sqlite_category_key(category).to_string(),
                 label: sqlite_category_label(category).to_string(),
-                operation_count: totals.operation_count,
+                operation_count,
                 total_duration_ms,
                 avg_duration_ms,
                 peak_concurrency: totals.read_concurrency_peak,
@@ -754,16 +756,17 @@ fn classification_summary(
     for access in SqliteAccessKind::ALL {
         for category in SqliteWorkloadCategory::ALL {
             let totals = report.totals[access.index()][category.index()];
+            let outcomes = &report.outcomes[access.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
             classified_operation_count =
-                classified_operation_count.saturating_add(totals.operation_count);
+                classified_operation_count.saturating_add(operation_count);
             baseline_statement_count =
                 baseline_statement_count.saturating_add(totals.baseline_statement_count);
-            abandoned_count = abandoned_count.saturating_add(
-                report.outcomes[access.index()][category.index()][SqliteOutcome::Abandoned.index()],
-            );
+            abandoned_count = abandoned_count
+                .saturating_add(outcomes[SqliteOutcome::Abandoned.index()]);
             if category == SqliteWorkloadCategory::Other {
                 other_operation_count =
-                    other_operation_count.saturating_add(totals.operation_count);
+                    other_operation_count.saturating_add(operation_count);
             }
         }
     }

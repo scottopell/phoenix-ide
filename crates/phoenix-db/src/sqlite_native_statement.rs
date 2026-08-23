@@ -1,6 +1,6 @@
 use crate::sqlite_workload::{
-    SqliteAccessKind, SqliteObservation, SqliteOutcome, SqliteWorkloadCategory,
-    SqliteWorkloadCollector,
+    SqliteAccessKind, SqliteObservation, SqliteObservationCounting, SqliteOutcome,
+    SqliteWorkloadCategory, SqliteWorkloadCollector,
 };
 use libsqlite3_sys as ffi;
 #[cfg(test)]
@@ -373,10 +373,10 @@ unsafe extern "C" fn profile_callback(
         retry_backoff: Duration::ZERO,
         writer_concurrency: 0,
         read_concurrency,
-        baseline_statement_count: 1,
-        counted_operation: true,
-        counted_outcome: true,
-        counted_histograms: true,
+        counting: SqliteObservationCounting::Counted {
+            baseline_statement_count: 1,
+            include_histograms: true,
+        },
     };
     context.collector.record(observation);
     0
@@ -559,6 +559,7 @@ fn unix_now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite_workload::operation_count;
     use crate::{Database, SqliteSnapshotWindow, SqliteWorkloadAggregateReport};
     use sqlx::sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
     use sqlx::{Connection, Execute, Executor, Statement};
@@ -723,49 +724,36 @@ mod tests {
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         assert!(
-            category_totals(
-                &report,
-                SqliteAccessKind::Read,
-                SqliteWorkloadCategory::RuntimeState
-            )
-            .operation_count
-                >= 1
+            operation_count(
+                &report.outcomes
+                    [SqliteAccessKind::Read.index()][SqliteWorkloadCategory::RuntimeState.index()]
+            ) >= 1
         );
         assert!(
-            category_totals(
-                &report,
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::PrProjectData
-            )
-            .operation_count
-                >= 1
+            operation_count(
+                &report.outcomes
+                    [SqliteAccessKind::Write.index()][SqliteWorkloadCategory::PrProjectData.index()]
+            ) >= 1
         );
         assert!(
-            category_totals(
-                &report,
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::DurableWorkflows
-            )
-            .operation_count
-                >= 1
+            operation_count(
+                &report.outcomes[SqliteAccessKind::Write.index()]
+                    [SqliteWorkloadCategory::DurableWorkflows.index()]
+            ) >= 1
         );
     }
 
-    #[tokio::test]
-    async fn mixed_statement_uses_fts_precedence() {
-        let db = Database::open_in_memory().await.unwrap();
-        let _: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(
-            "SELECT message_fts.rowid FROM message_fts JOIN message_fts_rows ON message_fts.rowid = message_fts_rows.fts_rowid",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        let report =
-            db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
-        assert!(
-            category_totals(&report, SqliteAccessKind::Read, SqliteWorkloadCategory::Fts)
-                .operation_count
-                >= 1
+    #[test]
+    fn mixed_statement_uses_fts_precedence() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector);
+        context.note_prepare_category(SqliteWorkloadCategory::PrProjectData);
+        context.note_prepare_category(SqliteWorkloadCategory::MessagePersistence);
+        context.note_prepare_category(SqliteWorkloadCategory::Fts);
+
+        assert_eq!(
+            context.take_prepare_category_for_statement(8),
+            SqliteWorkloadCategory::Fts
         );
     }
 
@@ -791,13 +779,10 @@ mod tests {
         stmt.query().fetch_all(&mut conn).await.unwrap();
         let report = report_now(&collector);
         assert!(
-            category_totals(
-                &report,
-                SqliteAccessKind::Read,
-                SqliteWorkloadCategory::PrProjectData
-            )
-            .operation_count
-                >= 2
+            operation_count(
+                &report.outcomes
+                    [SqliteAccessKind::Read.index()][SqliteWorkloadCategory::PrProjectData.index()]
+            ) >= 2
         );
     }
 
@@ -820,13 +805,10 @@ mod tests {
             .unwrap();
         let report = report_now(&collector);
         assert!(
-            category_totals(
-                &report,
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::Other
-            )
-            .operation_count
-                >= 1
+            operation_count(
+                &report.outcomes[SqliteAccessKind::Write.index()]
+                    [SqliteWorkloadCategory::Other.index()]
+            ) >= 1
         );
     }
 

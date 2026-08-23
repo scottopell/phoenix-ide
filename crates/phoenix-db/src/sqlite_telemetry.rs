@@ -1,6 +1,6 @@
 use crate::sqlite_workload::{
-    SqliteAccessKind, SqliteObservation, SqliteOutcome, SqliteWorkloadCategory,
-    SqliteWorkloadCollector,
+    operation_count, SqliteAccessKind, SqliteObservation, SqliteObservationCounting,
+    SqliteOutcome, SqliteWorkloadCategory, SqliteWorkloadCollector,
 };
 use crate::{DbError, DbResult};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -285,10 +285,10 @@ impl Drop for SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            baseline_statement_count: 0,
-            counted_operation: true,
-            counted_outcome: true,
-            counted_histograms: true,
+            counting: SqliteObservationCounting::Counted {
+                baseline_statement_count: 0,
+                include_histograms: true,
+            },
         });
     }
 }
@@ -422,10 +422,10 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 1,
             read_concurrency: 0,
-            baseline_statement_count: 0,
-            counted_operation: true,
-            counted_outcome: true,
-            counted_histograms: true,
+            counting: SqliteObservationCounting::Counted {
+                baseline_statement_count: 0,
+                include_histograms: true,
+            },
         });
         self.record_slow_success(timing, outcome);
     }
@@ -563,10 +563,10 @@ impl SqliteTelemetry {
             retry_backoff: Duration::ZERO,
             writer_concurrency: 0,
             read_concurrency: 0,
-            baseline_statement_count: 0,
-            counted_operation: true,
-            counted_outcome: true,
-            counted_histograms: true,
+            counting: SqliteObservationCounting::Counted {
+                baseline_statement_count: 0,
+                include_histograms: true,
+            },
         });
     }
 
@@ -1013,7 +1013,7 @@ mod tests {
             .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let access = SqliteAccessKind::Write.index();
         let category = SqliteWorkloadCategory::MessagePersistence.index();
-        assert_eq!(snapshot.totals[access][category].operation_count, 1);
+        assert_eq!(operation_count(&snapshot.outcomes[access][category]), 1);
         assert_eq!(
             snapshot.outcomes[access][category][SqliteOutcome::Success.index()],
             1
@@ -1116,7 +1116,7 @@ mod tests {
         let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let access = SqliteAccessKind::Write.index();
         let category = SqliteWorkloadCategory::Fts.index();
-        assert_eq!(snapshot.totals[access][category].abandoned_count, 1);
+        assert_eq!(snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()], 1);
         assert_eq!(
             snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
             1
@@ -1151,7 +1151,7 @@ mod tests {
             .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let access = SqliteAccessKind::Write.index();
         let category = SqliteWorkloadCategory::MessagePersistence.index();
-        assert_eq!(snapshot.totals[access][category].operation_count, 1);
+        assert_eq!(operation_count(&snapshot.outcomes[access][category]), 1);
         assert_eq!(
             snapshot.outcomes[access][category][SqliteOutcome::OtherFailure.index()],
             1
