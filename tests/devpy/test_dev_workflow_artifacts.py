@@ -115,14 +115,6 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         self.assertTrue(browser.ok)
         self.assertEqual(str(chrome), browser.detail)
 
-    def test_doctor_does_not_bootstrap_taskmd(self):
-        with mock.patch.object(self.dev.os, "execvpe") as execvpe:
-            self.dev._ensure_taskmd_for_command("doctor")
-        execvpe.assert_not_called()
-
-    def test_doctor_is_recognized_after_global_options(self):
-        self.assertEqual("doctor", self.dev._requested_command(["--pretty", "doctor"]))
-
     def test_doctor_pnpm_probe_disables_corepack_network(self):
         seen_environment = None
 
@@ -152,7 +144,7 @@ class DevWorkflowArtifactTests(unittest.TestCase):
     def test_doctor_fails_only_for_missing_required_prerequisites(self):
         results = [
             self.dev.DoctorResult("cargo", False, "not found"),
-            self.dev.DoctorResult("allium", False, "not found", required=False),
+            self.dev.DoctorResult("allium", False, "not found"),
         ]
 
         with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
@@ -161,14 +153,11 @@ class DevWorkflowArtifactTests(unittest.TestCase):
 
         rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
         self.assertIn("✗ cargo: not found", rendered)
-        self.assertIn("- allium (optional): not found", rendered)
-        self.assertIn("Missing required prerequisites: cargo", rendered)
+        self.assertIn("✗ allium: not found", rendered)
+        self.assertIn("Missing required prerequisites: cargo, allium", rendered)
 
-    def test_doctor_succeeds_when_only_optional_tools_are_missing(self):
-        results = [
-            self.dev.DoctorResult("cargo", True, "cargo 1.95.0"),
-            self.dev.DoctorResult("ast-grep", False, "not found", required=False),
-        ]
+    def test_doctor_succeeds_when_all_prerequisites_are_healthy(self):
+        results = [self.dev.DoctorResult("cargo", True, "cargo 1.95.0")]
 
         with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
             with mock.patch("builtins.print") as output:

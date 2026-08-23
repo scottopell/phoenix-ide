@@ -1,7 +1,9 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = [
+#   "taskmd>=1.0,<2",
+# ]
 # ///
 """Development tasks for phoenix-ide."""
 
@@ -3735,27 +3737,18 @@ def collect_doctor_results() -> list[DoctorResult]:
     pinned_rust = pinned_rust_match.group(1) if pinned_rust_match else "repository pin"
     rust_environment = {**os.environ, "RUSTUP_AUTO_INSTALL": "0"}
     rust_ok, rust_version = _doctor_version(
-        ["rustup", "run", pinned_rust, "rustc", "--version"],
-        env=rust_environment,
+        ["rustc", "--version"], env=rust_environment,
     )
     rust_ok = rust_ok and f"rustc {pinned_rust} " in f"{rust_version} "
     results.append(DoctorResult("rustc", rust_ok, f"{rust_version} (requires {pinned_rust})"))
 
-    ambient_cargo_ok, ambient_cargo = _doctor_version(
+    cargo_ok, cargo_version = _doctor_version(
         ["cargo", "--version"], env=rust_environment,
     )
-    pinned_cargo_ok, pinned_cargo = _doctor_version(
-        ["rustup", "run", pinned_rust, "cargo", "--version"],
-        env=rust_environment,
-    )
-    cargo_ok = ambient_cargo_ok and pinned_cargo_ok and ambient_cargo == pinned_cargo
-    results.append(DoctorResult(
-        "cargo", cargo_ok,
-        ambient_cargo if cargo_ok else f"ambient {ambient_cargo}; pinned {pinned_cargo}",
-    ))
+    results.append(DoctorResult("cargo", cargo_ok, cargo_version))
     for name, command in (
-        ("rustfmt", ["rustup", "run", pinned_rust, "cargo", "fmt", "--version"]),
-        ("clippy", ["rustup", "run", pinned_rust, "cargo", "clippy", "--version"]),
+        ("rustfmt", ["cargo", "fmt", "--version"]),
+        ("clippy", ["cargo", "clippy", "--version"]),
     ):
         ok, detail = _doctor_version(command, env=rust_environment)
         results.append(DoctorResult(name, ok, detail))
@@ -3778,8 +3771,9 @@ def collect_doctor_results() -> list[DoctorResult]:
             f"{target} installed" if target_ok else f"{target} not installed",
         ))
 
-    strip_path = shutil.which("strip")
-    results.append(DoctorResult("strip", strip_path is not None, strip_path or "not found"))
+    if platform.system() == "Linux":
+        strip_path = shutil.which("strip")
+        results.append(DoctorResult("strip", strip_path is not None, strip_path or "not found"))
 
     configured_browser = os.environ.get("PHOENIX_CHROME_EXECUTABLE")
     browser = Path(configured_browser).expanduser() if configured_browser else _find_chromium_binary()
@@ -3792,13 +3786,13 @@ def collect_doctor_results() -> list[DoctorResult]:
     ))
 
     for name, command, environment in (
-        ("cargo-nextest", ["rustup", "run", pinned_rust, "cargo", "nextest", "--version"], rust_environment),
+        ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
         ("allium", ["allium", "--version"], None),
         ("ripgrep", ["rg", "--version"], None),
         ("ast-grep", ["ast-grep", "--version"], None),
     ):
         ok, detail = _doctor_version(command, env=environment)
-        results.append(DoctorResult(name, ok, detail, required=False))
+        results.append(DoctorResult(name, ok, detail))
 
     return results
 
@@ -9847,33 +9841,7 @@ def _bootstrap_rich() -> None:
     )
 
 
-def _requested_command(argv: list[str]) -> str | None:
-    return next((arg for arg in argv if not arg.startswith("-")), None)
-
-
-def _ensure_taskmd_for_command(command: str | None) -> None:
-    if command == "doctor" or os.environ.get("PHOENIX_TASKMD_BOOTSTRAPPED") == "1":
-        return
-    try:
-        import taskmd  # noqa: F401
-        return
-    except ImportError:
-        pass
-    env = {**os.environ, "PHOENIX_TASKMD_BOOTSTRAPPED": "1"}
-    os.execvpe(
-        "uv",
-        [
-            "uv", "run", "--with", "taskmd>=1.0,<2",
-            str(Path(__file__).resolve()), *sys.argv[1:],
-        ],
-        env,
-    )
-
-
 def main():
-    requested_command = _requested_command(sys.argv[1:])
-    _ensure_taskmd_for_command(requested_command)
-
     # Verbatim passthrough commands are intercepted before argparse so their
     # flags (especially --help) reach the underlying CLI unchanged.
     if len(sys.argv) >= 2 and sys.argv[1] == "taskmd":
