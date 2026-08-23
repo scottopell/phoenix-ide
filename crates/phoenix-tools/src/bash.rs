@@ -27,7 +27,7 @@ pub mod sandbox;
 
 pub use handle::FinalCause;
 pub use handle::HandleId;
-pub use reaper::{install_reaper, shutdown_kill_tree};
+pub use reaper::{install_reaper, shutdown_kill_tree, shutdown_kill_tree_until};
 pub use registry::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecyclePhase, BashLifecycleSink,
     BashTerminalEffect, ResourceScopeKeyHandles,

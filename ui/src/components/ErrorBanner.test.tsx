@@ -59,6 +59,22 @@ describe('ErrorBanner', () => {
     expect(screen.getByText(/start a new conversation/i)).toBeInTheDocument();
   });
 
+  it('explains prompt rejection and keeps in-conversation recovery available', () => {
+    render(
+      <ErrorBanner
+        message="invalid_prompt: policy rejected the assembled prompt"
+        error={getErrorPresentation('prompt_rejected')}
+        onRetry={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Prompt rejected')).toBeInTheDocument();
+    expect(screen.getByText(/revise your next message/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry.*continue/i })).toBeInTheDocument();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
+  });
+
   it('still shows retry/continue affordance for transient errors', () => {
     render(
       <ErrorBanner

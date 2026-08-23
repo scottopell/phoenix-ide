@@ -1,5 +1,4 @@
 import type { BashToolInput } from '../generated/sse';
-import { formatCommissionReviewInput } from '../features/commissionReview/model';
 
 export function cleanToolThoughts(raw: string): string {
   let text = raw.replace(/^\s*<thinking>\s*/i, '');
@@ -123,7 +122,6 @@ export interface ToolInputDisplay {
 }
 
 export function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): ToolInputDisplay {
-  if (name === 'commission_review') return formatCommissionReviewInput(input);
   switch (name) {
     case 'skill': {
       const display = skillCommandFromInput(input);

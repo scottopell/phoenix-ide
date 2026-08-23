@@ -696,9 +696,6 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse { .. } => {
             "AwaitingUserResponse"
         }
-        phoenix_core::domain::sm_state::ConvState::AwaitingCommissionReviewApproval { .. } => {
-            "AwaitingCommissionReviewApproval"
-        }
         phoenix_core::domain::sm_state::ConvState::ContextExhausted { .. } => "ContextExhausted",
         phoenix_core::domain::sm_state::ConvState::HandedOff { .. } => "HandedOff",
         phoenix_core::domain::sm_state::ConvState::Terminal => "Terminal",

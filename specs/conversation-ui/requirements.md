@@ -535,14 +535,19 @@ WHEN a persisted conversation enters an error state whose typed error policy is 
 THE SYSTEM SHALL display a retry/resume affordance in the conversation error banner
 AND that affordance SHALL send `continue` through the normal chat message path
 
-WHEN a persisted conversation error is not user-resumable (for example usage-limit exhaustion or context exhaustion)
+WHEN a persisted conversation error is not user-resumable (for example a malformed request or context exhaustion)
 THE SYSTEM SHALL NOT display the same retry/resume affordance
 AND SHALL display recovery guidance appropriate to that error kind
 
 WHEN an authentication failure enters a persisted error state
 THE SYSTEM SHALL treat it as non-auto-retryable but user-resumable after credentials are refreshed or fixed
 
-**Rationale:** Runtime automatic retry safety and user-triggered resume are separate capabilities. Auth failures must not spin in an automatic retry loop, but users should not have to abandon a conversation after fixing credentials.
+WHEN a provider prompt rejection enters a persisted error state
+THE SYSTEM SHALL explain that the assembled prompt was rejected
+AND SHALL keep the message composer available for revised input
+AND SHALL offer an explicit `continue` retry without claiming that the identical rejected request will be replayed automatically
+
+**Rationale:** Runtime automatic retry safety and user-triggered resume are separate capabilities. Auth failures must not spin in an automatic retry loop, and prompt rejection must not automatically replay the same refused request, but neither condition should force users to abandon the conversation and its accumulated work.
 
 ---
 

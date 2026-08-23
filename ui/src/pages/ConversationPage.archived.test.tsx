@@ -15,7 +15,6 @@ import { FocusScopeProvider, useFocusScopeCommands } from '../hooks/useFocusScop
 import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
-const navStackProps = vi.hoisted(() => ({ onOpenCommissionReview: undefined as ((sequenceId: number) => void) | undefined }));
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -122,7 +121,6 @@ vi.mock('../components/ConversationNavStack', () => ({
     loadingOlderMessages,
     transcriptPositioning,
     olderHistoryError,
-    onOpenCommissionReview,
   }: {
     messages: Message[];
     hasOlderMessages?: boolean;
@@ -137,9 +135,7 @@ vi.mock('../components/ConversationNavStack', () => ({
       view?: { conversationId: string; generation: number; transcriptGeneration: number };
     };
     olderHistoryError?: string | null;
-    onOpenCommissionReview?: (sequenceId: number) => void;
   }) => {
-    navStackProps.onOpenCommissionReview = onOpenCommissionReview;
     return (
       <div>
         <div data-testid="message-history">
@@ -372,25 +368,6 @@ describe('ConversationPage route focus', () => {
 
     renderPage(makeConversation({
       state: { type: 'awaiting_user_response', questions: [] },
-    }));
-
-    await screen.findByTestId('message-history');
-    expect(anchor).toHaveFocus();
-    document.body.removeChild(anchor);
-  });
-
-  it('preserves approval-dialog focus instead of focusing its underlying composer', async () => {
-    const anchor = document.createElement('button');
-    document.body.appendChild(anchor);
-    anchor.focus();
-
-    renderPage(makeConversation({
-      state: {
-        type: 'awaiting_commission_review_approval',
-        brief: 'Review this commission',
-        focus: null,
-        scope: undefined,
-      },
     }));
 
     await screen.findByTestId('message-history');
@@ -641,16 +618,16 @@ describe('ConversationPage message delivery reconciliation', () => {
     await waitFor(() => expect(store.getSnapshot(slug).phase.type).toBe('idle'));
   });
 
-  it('optimistically leaves a resumable error while an accepted retry awaits SSE', async () => {
+  it('keeps the composer usable after a prompt rejection while the accepted recovery awaits SSE', async () => {
     const response = deferred<{ queued: boolean; steering: boolean }>();
     vi.spyOn(api, 'sendMessage').mockReturnValue(response.promise);
     const errorState = {
       type: 'error' as const,
-      message: 'retryable',
-      error_kind: 'server_overloaded' as const,
+      message: 'invalid_prompt: rejected',
+      error_kind: 'prompt_rejected' as const,
       error: {
-        kind: 'server_overloaded' as const,
-        can_auto_retry: true,
+        kind: 'prompt_rejected' as const,
+        can_auto_retry: false,
         can_user_resume: true,
       },
     };
@@ -673,6 +650,45 @@ describe('ConversationPage message delivery reconciliation', () => {
     response.resolve({ queued: true, steering: false });
     await response.promise;
     expect(store.getSnapshot(slug).phase.type).toBe('awaiting_llm');
+  });
+
+  it('sends quick prompt-rejection recovery as a new continue message', async () => {
+    const sendMessage = vi.spyOn(api, 'sendMessage').mockResolvedValue({
+      queued: true,
+      steering: false,
+    });
+    const errorState = {
+      type: 'error' as const,
+      message: 'invalid_prompt: rejected',
+      error_kind: 'prompt_rejected' as const,
+      error: {
+        kind: 'prompt_rejected' as const,
+        can_auto_retry: false,
+        can_user_resume: true,
+      },
+    };
+    renderPage(makeConversation({ state: errorState }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /retry.*continue/i }));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    expect(sendMessage.mock.calls[0]?.[1]).toBe('continue');
+  });
+
+  it('does not expose a composer for a terminal malformed request', async () => {
+    const errorState = {
+      type: 'error' as const,
+      message: 'unsupported request parameter',
+      error_kind: 'invalid_request' as const,
+      error: {
+        kind: 'invalid_request' as const,
+        can_auto_retry: false,
+        can_user_resume: false,
+      },
+    };
+    renderPage(makeConversation({ state: errorState }));
+
+    await screen.findByText(/start a new conversation/i);
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
   });
 
   it('rolls back an optimistic phase after a steering response despite non-phase SSE traffic', async () => {
@@ -1297,22 +1313,6 @@ describe('ConversationPage archived read-only rendering', () => {
     await waitFor(() => expect(screen.getByTestId('route-location')).toHaveTextContent(
       '/c/canonical-route?keep=route-state#message-missing-target',
     ));
-  });
-
-  it('keeps commission review actions available for non-terminal narrow layouts', async () => {
-    viewportFlags.isWideDesktop = false;
-    renderPage(makeConversation());
-    await waitFor(() => {
-      expect(navStackProps.onOpenCommissionReview).toEqual(expect.any(Function));
-    });
-  });
-
-  it('hides commission review actions when the conversation cannot open sidepanels', async () => {
-    navStackProps.onOpenCommissionReview = vi.fn();
-    renderPage(makeConversation({ archived: true }));
-    await waitFor(() => {
-      expect(navStackProps.onOpenCommissionReview).toBeUndefined();
-    });
   });
 
   it('uses the authoritative route owner when the cached slug owner changed', async () => {

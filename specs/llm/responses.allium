@@ -675,12 +675,18 @@ rule ResponsesSseErrorClassified {
                         message: "Selected model is at capacity. Try a different model.",
                         recovery_in_progress: false, has_quota: false)
                 else:
-                    ResponsesGenericErrorScan(code: lower, message: message)
+                    if lower = "invalid_prompt":
+                        llm/LlmError.created(kind: prompt_rejected, message: message,
+                            recovery_in_progress: false, has_quota: false)
+                    else:
+                        ResponsesGenericErrorScan(code: lower, message: message)
 
     @guidance
         -- classify_responses_error. `lowercase` is the ASCII lowercasing
         -- the implementation applies to `code` before matching. The SSE
-        -- path has no response headers, so a usage_limit_reached from a
+        -- `invalid_prompt` is also matched exactly before the generic
+        -- `invalid` bucket so its in-conversation recovery policy is retained.
+        -- The SSE path has no response headers, so a usage_limit_reached from a
         -- stream carries an all-None QuotaDetails — has_quota is still
         -- true (a details struct exists) and llm/QuotaBoundToUsageLimit
         -- holds. The plan-aware message formatter renders generic
@@ -731,7 +737,7 @@ rule ResponsesGenericErrorClassified {
         --   6. server_error            — no substring matched (retryable default)
         -- "quota" lands in branch 1 (rate_limit): only the exact code
         -- "usage_limit_reached" — matched before this rule — becomes the
-        -- terminal usage_limit_reached kind. See Q2.
+        -- terminal usage_limit_reached kind.
 }
 
 ------------------------------------------------------------

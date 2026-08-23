@@ -78,6 +78,10 @@ pub(crate) fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
         Just(ErrorKind::ServerError),
         Just(ErrorKind::Auth),
         Just(ErrorKind::InvalidRequest),
+        Just(ErrorKind::PromptRejected),
+        Just(ErrorKind::InvalidResponse),
+        Just(ErrorKind::UsageLimitReached),
+        Just(ErrorKind::ServerOverloaded),
         Just(ErrorKind::ContentFilter),
         Just(ErrorKind::ContextExhausted),
         Just(ErrorKind::TurnLimitExhausted),
@@ -479,12 +483,13 @@ proptest! {
         }
     }
 
-    // Invariant 2: Error state is always recoverable
+    // Invariant 2: Error-state message admission follows the typed resume policy
     #[test]
-    fn prop_error_always_recoverable(
+    fn prop_error_recovery_matches_user_resume_policy(
         message in "[a-zA-Z ]{1,30}",
         kind in arb_error_kind()
     ) {
+        let is_user_resumable = kind.is_user_resumable();
         let state = ConvState::Error {
             message,
             error_kind: kind,
@@ -501,11 +506,19 @@ proptest! {
         };
 
         let result = transition(&state, &test_context(), event);
-        prop_assert!(result.is_ok(), "Error recovery failed: {:?}", result);
-        prop_assert!(
-            matches!(result.unwrap().new_state, ConvState::LlmRequesting { .. }),
-            "Should transition to LlmRequesting"
-        );
+        if is_user_resumable {
+            prop_assert!(result.is_ok(), "resumable error recovery failed: {:?}", result);
+            prop_assert!(
+                matches!(result.unwrap().new_state, ConvState::LlmRequesting { .. }),
+                "resumable error should transition to LlmRequesting"
+            );
+        } else {
+            prop_assert!(
+                matches!(result, Err(TransitionError::NonResumableError)),
+                "non-resumable error accepted a user message: {:?}",
+                result
+            );
+        }
     }
 
     // Invariant 3: Cancel from any working state reaches a cancelling state
@@ -1957,7 +1970,7 @@ fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
 fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
     // Use selector + string to avoid Clone requirement on LlmOutcome.
     (
-        0..10u8,
+        0..12u8,
         proptest::collection::vec(arb_tool_call(), 0..3),
         "[a-zA-Z ]{1,20}",
     )
@@ -2011,6 +2024,8 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 message: msg,
             },
             8 => LlmOutcome::ServerOverloaded { message: msg },
+            9 => LlmOutcome::InvalidResponse { message: msg },
+            10 => LlmOutcome::PromptRejected { message: msg },
             _ => LlmOutcome::Cancelled,
         })
 }

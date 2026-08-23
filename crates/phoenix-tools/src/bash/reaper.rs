@@ -53,27 +53,41 @@ pub fn install_reaper() {
 /// SIGKILL rather than SIGTERM (REQ-BASH-007 rationale): Phoenix is
 /// exiting, so graceful-shutdown handlers in children would race with
 /// Phoenix's own exit. Reaping is the goal; courtesy is not.
-pub async fn shutdown_kill_tree(registry: &BashHandleRegistry) {
-    let pgids = registry.snapshot_live_pgids().await;
-    if pgids.is_empty() {
-        tracing::debug!("shutdown_kill_tree: no live bash handles");
-        return;
-    }
-    tracing::info!(
-        count = pgids.len(),
-        "shutdown_kill_tree: SIGKILLing live bash process groups"
-    );
-    #[cfg(unix)]
-    for pgid in &pgids {
-        // SAFETY: kill(2) with negative pid signals the process group;
-        // no memory implications. Errors (ESRCH) are expected — the
-        // group may have exited between snapshot and signal — and we
-        // don't surface them.
-        unsafe {
-            let _ = libc::kill(-*pgid, libc::SIGKILL);
+pub async fn shutdown_kill_tree_until(
+    deadline: tokio::time::Instant,
+    registry: &BashHandleRegistry,
+) {
+    let teardown = async {
+        let pgids = registry.snapshot_live_pgids().await;
+        if pgids.is_empty() {
+            tracing::debug!("shutdown_kill_tree: no live bash handles");
+            return;
         }
-    }
-    tokio::time::sleep(Duration::from_secs(SHUTDOWN_KILL_GRACE_SECONDS)).await;
+        tracing::info!(
+            count = pgids.len(),
+            "shutdown_kill_tree: SIGKILLing live bash process groups"
+        );
+        #[cfg(unix)]
+        for pgid in &pgids {
+            // SAFETY: kill(2) with negative pid signals the process group;
+            // no memory implications. Errors (ESRCH) are expected — the
+            // group may have exited between snapshot and signal — and we
+            // don't surface them.
+            unsafe {
+                let _ = libc::kill(-*pgid, libc::SIGKILL);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(SHUTDOWN_KILL_GRACE_SECONDS)).await;
+    };
+    let _ = tokio::time::timeout_at(deadline, teardown).await;
+}
+
+pub async fn shutdown_kill_tree(registry: &BashHandleRegistry) {
+    shutdown_kill_tree_until(
+        tokio::time::Instant::now() + Duration::from_secs(SHUTDOWN_KILL_GRACE_SECONDS),
+        registry,
+    )
+    .await;
 }
 
 #[cfg(test)]

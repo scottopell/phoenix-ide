@@ -1,5 +1,36 @@
 import Foundation
 
+enum ConversationErrorKind: String, Equatable {
+    case auth
+    case rateLimit = "rate_limit"
+    case usageLimitReached = "usage_limit_reached"
+    case network
+    case invalidRequest = "invalid_request"
+    case promptRejected = "prompt_rejected"
+    case invalidResponse = "invalid_response"
+    case serverError = "server_error"
+    case serverOverloaded = "server_overloaded"
+    case timedOut = "timed_out"
+    case cancelled
+    case subAgentError = "sub_agent_error"
+    case contextExhausted = "context_exhausted"
+    case turnLimitExhausted = "turn_limit_exhausted"
+    case contentFilter = "content_filter"
+    case unknown
+
+    var isUserResumable: Bool {
+        switch self {
+        case .auth, .rateLimit, .usageLimitReached, .network,
+             .promptRejected, .invalidResponse, .serverError,
+             .serverOverloaded, .timedOut:
+            return true
+        case .invalidRequest, .cancelled, .subAgentError, .contextExhausted,
+             .turnLimitExhausted, .contentFilter, .unknown:
+            return false
+        }
+    }
+}
+
 /// Typed view of the server's conversation state — the discriminated union
 /// `ConvState` (mirrored by `ConversationState` in ui/src/api.ts).
 ///
@@ -23,10 +54,9 @@ enum ConversationState: Equatable {
     case awaitingContinuation
     case awaitingUserResponse(questions: [UserQuestion])
     case awaitingTaskApproval(title: String, priority: String, plan: String)
-    case awaitingCommissionReviewApproval
     case awaitingRecovery(message: String)
     case provisioning
-    case error(message: String)
+    case error(message: String, kind: ConversationErrorKind)
     case creationFailed(message: String)
     case contextExhausted(summary: String?)
     case cancelling
@@ -75,15 +105,17 @@ enum ConversationState: Equatable {
             else { return .other(type: type) }
             return .awaitingTaskApproval(
                 title: title, priority: priority, plan: plan)
-        case "awaiting_commission_review_approval":
-            return .awaitingCommissionReviewApproval
         case "awaiting_recovery":
             return .awaitingRecovery(
                 message: json["message"]?.stringValue ?? "Recovery in progress")
         case "provisioning":
             return .provisioning
         case "error":
-            return .error(message: json["message"]?.stringValue ?? "Unknown error")
+            let errorKind = json["error_kind"]?.stringValue
+                .flatMap(ConversationErrorKind.init(rawValue:)) ?? .unknown
+            return .error(
+                message: json["message"]?.stringValue ?? "Unknown error",
+                kind: errorKind)
         case "creation_failed":
             return .creationFailed(
                 message: json["error"]?.stringValue
@@ -110,12 +142,14 @@ enum ConversationState: Equatable {
     /// still accept a follow-up for after the current turn.
     var acceptsChatMessage: Bool {
         switch self {
-        case .idle, .error, .llmRequesting, .toolExecuting,
+        case .idle, .llmRequesting, .toolExecuting,
              .awaitingSubAgents, .cancellingTool, .cancellingSubAgents:
             return true
+        case .error(_, let kind):
+            return kind.isUserResumable
         case .awaitingLlm, .awaitingContinuation, .cancelling,
              .awaitingUserResponse, .awaitingTaskApproval,
-             .awaitingCommissionReviewApproval, .awaitingRecovery, .provisioning,
+             .awaitingRecovery, .provisioning,
              .contextExhausted,
              .creationFailed, .terminal, .handedOff, .other, .unknown:
             return false
@@ -125,7 +159,7 @@ enum ConversationState: Equatable {
     var isCancellable: Bool {
         switch self {
         case .llmRequesting, .toolExecuting, .awaitingSubAgents,
-             .awaitingTaskApproval, .awaitingCommissionReviewApproval,
+             .awaitingTaskApproval,
              .awaitingRecovery, .provisioning:
             return true
         case .idle, .awaitingLlm, .awaitingContinuation,

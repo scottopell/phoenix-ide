@@ -764,7 +764,8 @@ pub enum CapturedConversationStateKind {
     AwaitingRecovery,
     AwaitingTaskApproval,
     AwaitingUserResponse,
-    AwaitingCommissionReviewApproval,
+    #[serde(rename = "awaiting_commission_review_approval")]
+    HistoricalAwaitingCommissionReviewApproval,
     ContextExhausted,
     HandedOff,
     Terminal,
@@ -792,7 +793,9 @@ impl CapturedConversationStateKind {
             "awaiting_recovery" => Self::AwaitingRecovery,
             "awaiting_task_approval" => Self::AwaitingTaskApproval,
             "awaiting_user_response" => Self::AwaitingUserResponse,
-            "awaiting_commission_review_approval" => Self::AwaitingCommissionReviewApproval,
+            "awaiting_commission_review_approval" => {
+                Self::HistoricalAwaitingCommissionReviewApproval
+            }
             "context_exhausted" => Self::ContextExhausted,
             "handed_off" => Self::HandedOff,
             "terminal" => Self::Terminal,
@@ -1227,6 +1230,21 @@ pub struct CloseRetiredResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn historical_commission_review_approval_snapshot_remains_readable() {
+        assert_eq!(
+            CapturedConversationStateKind::from_db_str("awaiting_commission_review_approval"),
+            Some(CapturedConversationStateKind::HistoricalAwaitingCommissionReviewApproval)
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &CapturedConversationStateKind::HistoricalAwaitingCommissionReviewApproval
+            )
+            .unwrap(),
+            "\"awaiting_commission_review_approval\""
+        );
+    }
+
     use super::*;
 
     #[test]

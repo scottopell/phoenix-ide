@@ -89,6 +89,14 @@ describe('parseStreamingBlocks', () => {
     expect(result[0]).toEqual({ type: 'code', lang: 'python', content: 'print("hi")\n', complete: true });
   });
 
+  it('keeps a tilde fence open when later backtick fences cannot close it', () => {
+    const buf = '~~~\n```js\n\n```\n';
+
+    expect(parseStreamingBlocks(buf)).toEqual([
+      { type: 'code', lang: '', content: '```js\n\n```\n', complete: false },
+    ]);
+  });
+
   it('handles fences without a language tag', () => {
     const buf = '```\nsome code\n```\n';
     const result = parseStreamingBlocks(buf);
@@ -495,32 +503,51 @@ describe('parseStreamingBlocks — property tests', () => {
     );
   });
 
-  it('complete code blocks only appear when buffer contains a matching close fence', () => {
-    // Structured generator: build well-formed buffers with fences
-    const fencedCodeArb = fc.record({
-      before: fc.string({ minLength: 0, maxLength: 50 }),
-      lang: fc.oneof(fc.constant(''), fc.constant('rust'), fc.constant('js'), fc.constant('python')),
-      code: fc.string({ minLength: 0, maxLength: 50 }),
+  it('parses generated single-fence documents exactly', () => {
+    const plainLineArb = fc
+      .array(fc.constantFrom('a', 'b', 'c', ' ', '0', '1'), { minLength: 0, maxLength: 20 })
+      .map((chars) => chars.join(''));
+    const fencedDocumentArb = fc.record({
+      before: fc.array(plainLineArb, { maxLength: 3 }),
+      fenceChar: fc.constantFrom('`', '~'),
+      openerLength: fc.integer({ min: 3, max: 6 }),
+      closerExtraLength: fc.integer({ min: 0, max: 3 }),
+      lang: fc.constantFrom('', 'rust', 'js', 'python'),
+      body: fc.array(plainLineArb, { maxLength: 4 }),
       closed: fc.boolean(),
-      after: fc.string({ minLength: 0, maxLength: 50 }),
+      after: fc.array(plainLineArb, { maxLength: 3 }),
     });
 
     fc.assert(
-      fc.property(fencedCodeArb, ({ before, lang, code, closed, after }) => {
-        const open = '```' + lang + '\n';
-        const close = '```\n';
-        const buf = before + '\n' + open + code + (closed ? '\n' + close : '') + after;
-        const blocks = parseStreamingBlocks(buf);
-        const codeBlocks = blocks.filter((b): b is Extract<StreamingBlock, { type: 'code' }> => b.type === 'code');
-        if (codeBlocks.length === 0) return true;
-        const lastCode = codeBlocks[codeBlocks.length - 1]!;
-        // If closed=true, at least one code block should be complete
-        if (closed && !codeBlocks.some((b) => b.complete)) return false;
-        // If closed=false, the last code block should be incomplete
-        if (!closed && lastCode.complete) return false;
-        return true;
+      fc.property(fencedDocumentArb, (document) => {
+        const before = document.before.map((line) => `${line}\n`).join('');
+        const opener = document.fenceChar.repeat(document.openerLength);
+        const body = document.body.map((line) => `${line}\n`).join('');
+        const closer = document.fenceChar.repeat(
+          document.openerLength + document.closerExtraLength
+        );
+        const after = document.after.map((line) => `${line}\n`).join('');
+        const buffer =
+          before +
+          `${opener}${document.lang}\n` +
+          body +
+          (document.closed ? `${closer}\n${after}` : after);
+
+        const expected: StreamingBlock[] = [];
+        if (before !== '') expected.push({ type: 'markdown', content: before });
+        expected.push({
+          type: 'code',
+          lang: document.lang,
+          content: body + (document.closed ? '' : after),
+          complete: document.closed,
+        });
+        if (document.closed && after !== '') {
+          expected.push({ type: 'markdown', content: after });
+        }
+
+        expect(parseStreamingBlocks(buffer)).toEqual(expected);
       }),
-      { numRuns: 200 }
+      { numRuns: 500 }
     );
   });
 });

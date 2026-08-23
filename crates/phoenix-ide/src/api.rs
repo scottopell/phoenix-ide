@@ -132,7 +132,7 @@ impl AppState {
     // platform, mcp, credentials, password, deployment facts, runtime env);
     // bundling them into a struct would only move the same fields behind one
     // more name.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn new(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
@@ -174,27 +174,69 @@ impl AppState {
         runtime
             .set_startup_obligated_conversations(db.terminal_obligated_conversation_ids().await?)
             .await;
-        runtime
-            .start_direct_turn_worker()
-            .await
-            .map_err(std::io::Error::other)?;
+        runtime.start_direct_turn_worker().await?;
+        runtime.require_startup_local_authority()?;
         if AGENT_FACING_WAKE_REGISTRATION.0 {
             runtime
                 .start_wake_worker()
                 .await
                 .map_err(std::io::Error::other)?;
+            runtime.require_startup_local_authority()?;
         }
+        runtime.require_startup_local_authority()?;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
-        runtime.start_creation_worker().await;
+        runtime.start_creation_worker().await?;
+        runtime.require_startup_local_authority()?;
         reconcile_startup_continuations(&runtime).await?;
-        handlers::start_attachment_cleanup_task(db.clone());
+        runtime.require_startup_local_authority()?;
+        handlers::start_attachment_cleanup_task(db.clone(), Arc::clone(&runtime));
         let terminals = runtime.terminals.clone();
         // Retrieval works on existing index rows while this sweep runs and
         // reports `index_reconciled()` when complete.
         {
             let retriever = retriever.clone();
+            let runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
-                match retriever.reconcile().await {
+                let result = async {
+                    use phoenix_db::retrieval::{
+                        Fts5Retriever, FtsMessageReconcileOutcome, ReconcileStats, RetrievalError,
+                    };
+                    let plan = retriever.discover_reconcile_plan().await?;
+                    let mut stats = ReconcileStats::default();
+                    if Fts5Retriever::locator_repair_required(&plan) {
+                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
+                            RetrievalError::Db(sqlx::Error::Protocol(
+                                "fatal local authority closed during retrieval reconciliation"
+                                    .to_string(),
+                            ))
+                        })?;
+                        retriever.repair_locator_rows().await?;
+                    }
+                    for message in Fts5Retriever::messages(plan) {
+                        let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
+                            RetrievalError::Db(sqlx::Error::Protocol(
+                                "fatal local authority closed during retrieval reconciliation"
+                                    .to_string(),
+                            ))
+                        })?;
+                        match retriever.reconcile_message(message).await? {
+                            FtsMessageReconcileOutcome::Unchanged => {}
+                            FtsMessageReconcileOutcome::Indexed => stats.indexed += 1,
+                            FtsMessageReconcileOutcome::Reindexed => stats.reindexed += 1,
+                        }
+                    }
+                    let _admitted = runtime.acquire_local_authority_pass().map_err(|()| {
+                        RetrievalError::Db(sqlx::Error::Protocol(
+                            "fatal local authority closed during retrieval reconciliation"
+                                .to_string(),
+                        ))
+                    })?;
+                    stats.pruned = retriever.prune_orphans().await?;
+                    retriever.mark_reconciled();
+                    Ok::<_, RetrievalError>(stats)
+                }
+                .await;
+                match result {
                     Ok(stats) => tracing::info!(
                         indexed = stats.indexed,
                         reindexed = stats.reindexed,

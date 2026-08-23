@@ -68,6 +68,10 @@ impl LlmError {
         Self::new(LlmErrorKind::InvalidRequest, message)
     }
 
+    pub fn prompt_rejected(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::PromptRejected, message)
+    }
+
     #[allow(dead_code)] // Will be used when providers detect content filter responses
     pub fn content_filter(message: impl Into<String>) -> Self {
         Self::new(LlmErrorKind::ContentFilter, message)

@@ -323,9 +323,13 @@ WHEN an in-flight conversation-turn LLM request fails with non-retryable error (
 THE SYSTEM SHALL transition to error state immediately
 AND display specific error message
 
-WHEN user sends message while in error state
+WHEN user sends a message while in an error state whose typed policy is user-resumable
 THE SYSTEM SHALL transition to awaiting LLM
 AND attempt to continue the conversation
+
+WHEN user sends a message while in an error state whose typed policy is not user-resumable
+THE SYSTEM SHALL reject the message through the same typed transition policy used by the conversation runtime
+AND SHALL NOT accept a chat request that the state machine will later discard
 
 **Rationale:** Users should not lose their conversation due to transient failures. Clear error states with specific messages enable recovery.
 

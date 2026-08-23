@@ -271,10 +271,15 @@ WHEN error indicates the selected model is at capacity (e.g. provider returns `s
 THE SYSTEM SHALL classify it as a terminal, non-retryable error category distinct from generic server errors
 AND SHALL surface a message suggesting the user try a different model
 
+WHEN the provider rejects the assembled prompt under its prompt policy (for example Responses API code `invalid_prompt`)
+THE SYSTEM SHALL classify it as a prompt-rejection category distinct from a malformed request
+AND SHALL NOT automatically replay the identical rejected request
+AND SHALL classify the persisted error as user-resumable so a revised message or explicit continuation can recover within the same conversation
+
 WHEN a new error condition is encountered
 THE SYSTEM SHALL require an explicit classification decision before it can be handled
 
-**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion and overloaded-model errors are distinct from transient throttles — automatic retrying them is wasted work and the user-facing recovery differs (wait for window reset / upgrade plan / pick another model). Automatic retry safety is not the same capability as user-triggered resume after external action; auth failures are non-auto-retryable but resumable after credentials are refreshed.
+**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion, overloaded-model errors, and prompt rejection are distinct from transient failures — automatically replaying them is wasted work or repeats a request the provider has already refused. Automatic retry safety is not the same capability as user-triggered resume after external action or revised input; auth failures and prompt rejections are non-auto-retryable but remain recoverable in place.
 
 ---
 

@@ -13,7 +13,7 @@ use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
 use crate::git_ops::capture_branch_diff;
 use crate::runtime::fork_resolve::ForkResolveError;
-use crate::state_machine::state::{CommissionReviewApprovalOutcome, TaskApprovalOutcome};
+use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
 
@@ -183,76 +183,6 @@ pub(crate) async fn task_feedback(
 }
 
 // ============================================================
-// Commission Review Approval (REQ-CR-003)
-// ============================================================
-
-fn ensure_commission_review_approval_state(conv: &Conversation) -> Result<(), AppError> {
-    if !matches!(
-        conv.state,
-        ConvState::AwaitingCommissionReviewApproval { .. }
-    ) {
-        return Err(AppError::BadRequest(
-            "Conversation is not awaiting commission review approval".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn approve_commission_review(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    ensure_commission_review_approval_state(&conv)?;
-
-    state
-        .runtime
-        .send_event(
-            &id,
-            Event::CommissionReviewApprovalDecided {
-                outcome: CommissionReviewApprovalOutcome::Approved,
-            },
-        )
-        .await
-        .map_err(AppError::BadRequest)?;
-
-    Ok(Json(SuccessResponse { success: true }))
-}
-
-pub(crate) async fn reject_commission_review(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    let conv = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    ensure_commission_review_approval_state(&conv)?;
-
-    state
-        .runtime
-        .send_event(
-            &id,
-            Event::CommissionReviewApprovalDecided {
-                outcome: CommissionReviewApprovalOutcome::Rejected,
-            },
-        )
-        .await
-        .map_err(AppError::BadRequest)?;
-
-    Ok(Json(SuccessResponse { success: true }))
-}
-
-// ============================================================
 // Fork proposal resolution (REQ-PROJ-034 / 037)
 // ============================================================
 
@@ -385,6 +315,11 @@ pub(crate) async fn abandon_task(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
+    let mut authority = state.runtime.acquire_local_authority_pass().map_err(|()| {
+        AppError::Internal(
+            "task abandonment rejected after fatal local authority closure".to_string(),
+        )
+    })?;
     if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
         .has_owed_work_for_conversation(&id)
         .await
@@ -631,7 +566,10 @@ pub(crate) async fn abandon_task(
     // 3. Broadcast diff snapshot (persisted above, before state transition).
     // Reuses the handle obtained during seq pre-allocation at step 2b.
     if let Some((handle, snap_msg)) = snapshot_msg {
-        let _ = handle.broadcast_tx.send_message(snap_msg);
+        let _ = handle
+            .broadcast_tx
+            .admitted_publication(&mut authority)
+            .persisted_message(snap_msg);
     }
 
     // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
@@ -848,38 +786,6 @@ mod tests {
         }
     }
 
-    fn commission_review_state() -> ConvState {
-        ConvState::AwaitingCommissionReviewApproval {
-            tool_use_id: "tool-review-1".to_string(),
-            request: crate::state_machine::state::CommissionReviewInput {
-                brief: "Ready for review".to_string(),
-                focus: None,
-            },
-            scope: crate::state_machine::state::CommissionReviewApprovalScope {
-                kind: "committed_branch_diff".to_string(),
-                repo_root: "/tmp".to_string(),
-                base: "refs/remotes/origin/HEAD".to_string(),
-                head: "HEAD".to_string(),
-                approved_head: None,
-                approved_base: None,
-                dirty: false,
-                changed_files: 0,
-                insertions: 0,
-                deletions: 0,
-            },
-            assistant_message: crate::state_machine::state::AssistantMessage::new(
-                "req".to_string(),
-                vec![],
-                None,
-                None,
-            ),
-        }
-    }
-
-    // ---- abandon gate -------------------------------------------------
-
-    /// Unblocked: `continued_in_conv_id = None` — gate passes, handler
-    /// proceeds with existing abandon logic.
     #[test]
     fn abandon_gate_passes_when_no_continuation() {
         let conv = fixture("parent-a", None);
@@ -1007,7 +913,6 @@ mod tests {
                     attempt: 1,
                 },
             },
-            commission_review_state(),
             ConvState::HandedOff {
                 successor_conv_id: "next".into(),
             },
@@ -1035,17 +940,5 @@ mod tests {
             "continued conversation must reject terminal action even from ContextExhausted",
         );
         assert!(matches!(err, AppError::Conflict(_)));
-    }
-
-    #[test]
-    fn commission_review_gate_passes_only_for_approval_state() {
-        let mut conv = fixture("commission-review", None);
-        conv.state = commission_review_state();
-        assert!(ensure_commission_review_approval_state(&conv).is_ok());
-
-        conv.state = ConvState::Idle;
-        let err = ensure_commission_review_approval_state(&conv)
-            .expect_err("idle conversation must not approve commission review");
-        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

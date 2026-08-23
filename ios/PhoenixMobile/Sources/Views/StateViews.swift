@@ -49,13 +49,6 @@ struct StateDetailView: View {
             TaskApprovalCard(
                 session: session, title: title, priority: priority, plan: plan)
 
-        case .awaitingCommissionReviewApproval:
-            needsActionCard(
-                icon: "checkmark.seal",
-                title: "Review approval needed",
-                detail: nil,
-                footnote: "Handle this review from the web UI.")
-
         case .awaitingRecovery(let message):
             workingRow {
                 Text(message)
@@ -70,7 +63,7 @@ struct StateDetailView: View {
                     .foregroundStyle(.secondary)
             }
 
-        case .error(let message):
+        case .error(let message, _):
             errorCard(message: message)
 
         case .creationFailed(let message):

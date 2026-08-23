@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS conversations (
             'awaiting_sub_agents', 'cancelling_sub_agents', 'error',
             'awaiting_continuation', 'recoverable_continuation_failure',
             'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response',
-            'awaiting_commission_review_approval', 'context_exhausted',
+            'context_exhausted',
             'handed_off', 'terminal', 'completed', 'failed', 'provisioning',
             'creation_failed', 'creation_cancelled', 'seeded_llm_requesting'
         )),

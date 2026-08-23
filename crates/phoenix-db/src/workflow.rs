@@ -23,6 +23,22 @@ pub mod direct_turn;
 pub mod wake;
 
 pub use direct_turn::*;
+
+#[derive(Debug)]
+pub enum LocalAuthorityResult<T> {
+    DurableFactEstablished(T),
+    DurableFactUnclassified,
+}
+
+impl<T> LocalAuthorityResult<T> {
+    #[must_use]
+    pub fn established(self) -> Option<T> {
+        match self {
+            Self::DurableFactEstablished(value) => Some(value),
+            Self::DurableFactUnclassified => None,
+        }
+    }
+}
 use phoenix_workflow::wake_profile;
 use sqlx::{Sqlite, Transaction};
 

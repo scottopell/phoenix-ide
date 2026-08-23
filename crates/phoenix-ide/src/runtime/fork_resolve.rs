@@ -25,7 +25,7 @@ use crate::git_ops::{
     materialize_branch, run_git, GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::executor::{promote_task_status_to_in_progress, TASK_APPROVAL_MUTEX};
-use crate::runtime::RuntimeManager;
+use crate::runtime::{AdmittedOperation, RuntimeManager};
 use phoenix_core::task_source::TaskSource;
 
 /// A fork-resolution operation routed to the single serialized fork-resolution
@@ -69,11 +69,37 @@ pub(crate) enum ForkCommand {
     /// serialization is what makes a fork-from-a-deleted-origin structurally
     /// impossible: any `Approve`/`RequestChanges` queued behind this command runs
     /// after it and finds the proposal non-`pending`, so it aborts before
-    /// creating a worktree. Best-effort; reply is `()`.
+    /// creating a worktree. Fatal admission rejection propagates to stop the
+    /// hard-delete cascade.
     CleanupOnHardDelete {
         origin_id: String,
-        reply: oneshot::Sender<()>,
+        authority: AdmittedOperation,
+        reply: oneshot::Sender<Result<AdmittedOperation, ForkResolveError>>,
     },
+}
+
+impl ForkCommand {
+    fn reject_after_fatal_authority(self) {
+        let error = || {
+            ForkResolveError::Internal(
+                "runtime admission closed after fatal local authority loss".to_string(),
+            )
+        };
+        match self {
+            Self::Approve { reply, .. } | Self::RequestChanges { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Self::Dismiss { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            Self::RetireForOrigin { reply, .. } => {
+                let _ = reply.send(());
+            }
+            Self::CleanupOnHardDelete { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+        }
+    }
 }
 
 /// Fixed namespace for deterministic fork/refinement conversation ids. A v5
@@ -398,9 +424,28 @@ impl RuntimeManager {
     /// so it shares that task's lifecycle and ends when every `fork_cmd_tx` clone
     /// drops (no standalone task, no reference cycle to leak).
     pub(crate) async fn handle_fork_command(self: &std::sync::Arc<Self>, cmd: ForkCommand) {
+        if let ForkCommand::CleanupOnHardDelete {
+            origin_id,
+            authority,
+            reply,
+        } = cmd
+        {
+            #[cfg(test)]
+            self.wait_at_fork_command_barrier().await;
+            handle_cleanup_on_hard_delete(&self.db, &origin_id).await;
+            let _ = reply.send(Ok(authority));
+            return;
+        }
+
+        let Ok(mut owner) = self.acquire_local_authority_pass() else {
+            cmd.reject_after_fatal_authority();
+            return;
+        };
+        #[cfg(test)]
+        self.wait_at_fork_command_barrier().await;
         match cmd {
             ForkCommand::Approve { proposal_id, reply } => {
-                let _ = reply.send(self.handle_approve(&proposal_id).await);
+                let _ = reply.send(self.handle_approve(&proposal_id, &mut owner).await);
             }
             ForkCommand::RequestChanges {
                 proposal_id,
@@ -408,7 +453,7 @@ impl RuntimeManager {
                 reply,
             } => {
                 let _ = reply.send(
-                    self.handle_request_changes(&proposal_id, change_request)
+                    self.handle_request_changes(&proposal_id, change_request, &mut owner)
                         .await,
                 );
             }
@@ -419,10 +464,17 @@ impl RuntimeManager {
                 handle_retire_for_origin(&self.db, &origin_id).await;
                 let _ = reply.send(());
             }
-            ForkCommand::CleanupOnHardDelete { origin_id, reply } => {
-                handle_cleanup_on_hard_delete(&self.db, &origin_id).await;
-                let _ = reply.send(());
+            ForkCommand::CleanupOnHardDelete { .. } => {
+                unreachable!("inherited hard-delete cleanup handled before fresh admission")
             }
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_at_fork_command_barrier(&self) {
+        if let Some(barrier) = self.fork_command_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
         }
     }
 
@@ -528,24 +580,21 @@ impl RuntimeManager {
     pub(crate) async fn cleanup_pending_fork_orphans_on_delete(
         self: &std::sync::Arc<Self>,
         origin_id: &str,
-    ) {
+        authority: AdmittedOperation,
+    ) -> Result<AdmittedOperation, ForkResolveError> {
         if !self.origin_has_pending_fork_proposal(origin_id).await {
-            return;
+            return Ok(authority);
         }
         let (reply, reply_rx) = oneshot::channel();
-        if self
-            .fork_cmd_tx
+        self.fork_cmd_tx
             .send(ForkCommand::CleanupOnHardDelete {
                 origin_id: origin_id.to_string(),
+                authority,
                 reply,
             })
             .await
-            .is_err()
-        {
-            tracing::warn!(conv_id = %origin_id, "fork orphan cleanup on delete: consumer gone; skipped");
-            return;
-        }
-        let _ = reply_rx.await;
+            .map_err(|_| fork_consumer_gone())?;
+        reply_rx.await.map_err(|_| fork_consumer_gone())?
     }
 }
 
@@ -910,6 +959,7 @@ impl RuntimeManager {
     async fn handle_approve(
         self: &std::sync::Arc<Self>,
         proposal_id: &str,
+        authority: &mut AdmittedOperation,
     ) -> Result<String, ForkResolveError> {
         // No lock: the fork-resolution consumer is single-threaded, so this
         // whole critical section (precondition check + git phase + DB resolve)
@@ -937,8 +987,13 @@ impl RuntimeManager {
             .resolve_fork_proposal_spawned(proposal_id, &prepared.conv, &[prepared.seed])
             .await
             .map_err(map_db_resolve_error)?;
+        #[cfg(test)]
+        if let Some(barrier) = self.fork_runtime_start_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
-        self.get_or_create(&fork_conv_id)
+        self.get_or_create_with_authority(&fork_conv_id, authority.reborrow())
             .await
             .map_err(ForkResolveError::Internal)?;
         Ok(fork_conv_id)
@@ -961,6 +1016,7 @@ impl RuntimeManager {
         self: &std::sync::Arc<Self>,
         proposal_id: &str,
         change_request: String,
+        authority: &mut AdmittedOperation,
     ) -> Result<String, ForkResolveError> {
         // No lock: serialized by the single fork-resolution consumer.
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
@@ -984,8 +1040,13 @@ impl RuntimeManager {
             .resolve_fork_proposal_promoted(proposal_id, &prepared.conv, &[prepared.seed])
             .await
             .map_err(map_db_resolve_error)?;
+        #[cfg(test)]
+        if let Some(barrier) = self.fork_runtime_start_barrier.lock().await.take() {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
-        self.get_or_create(&refinement_conv_id)
+        self.get_or_create_with_authority(&refinement_conv_id, authority.reborrow())
             .await
             .map_err(ForkResolveError::Internal)?;
         Ok(refinement_conv_id)
@@ -1655,6 +1716,113 @@ mod tests {
         rt
     }
 
+    #[tokio::test]
+    async fn queued_fork_command_is_rejected_after_fatal_closure() {
+        let rt = make_runtime(Database::open_in_memory().await.unwrap()).await;
+        rt.signal_fatal_local_authority("test_fork_boundary");
+        let (reply, reply_rx) = oneshot::channel();
+
+        rt.handle_fork_command(ForkCommand::Dismiss {
+            proposal_id: "queued-proposal".to_string(),
+            reply,
+        })
+        .await;
+
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(ForkResolveError::Internal(message))
+                if message.contains("fatal local authority loss")
+        ));
+    }
+
+    #[tokio::test]
+    async fn admitted_fork_command_remains_owned_until_settlement() {
+        let rt = make_runtime(Database::open_in_memory().await.unwrap()).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *rt.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
+        let (reply, reply_rx) = oneshot::channel();
+        let command = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move {
+                rt.handle_fork_command(ForkCommand::Dismiss {
+                    proposal_id: "admitted-proposal".to_string(),
+                    reply,
+                })
+                .await;
+            })
+        };
+
+        barrier.wait().await;
+        rt.signal_fatal_local_authority("test_fork_boundary");
+        assert_eq!(
+            rt.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+        command.await.unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Err(ForkResolveError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn hard_delete_cleanup_queued_behind_admitted_command_inherits_authority() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_project_id, origin_id) = seed_project_and_origin(&db, &repo).await;
+        let proposal_id = insert_pending(
+            &db,
+            &origin_id,
+            "tasks/12345-p1-ready--queued-cleanup.md",
+            "# Queued cleanup\n",
+        )
+        .await;
+        let rt = make_runtime(db.clone()).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *rt.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
+
+        let admitted = {
+            let rt = Arc::clone(&rt);
+            tokio::spawn(async move { rt.dismiss_fork_proposal("admitted-proposal").await })
+        };
+        barrier.wait().await;
+
+        let cleanup_authority = rt
+            .acquire_local_authority_pass()
+            .expect("hard-delete cascade admitted before closure");
+        let (cleanup_reply, cleanup_reply_rx) = oneshot::channel();
+        rt.fork_cmd_tx
+            .send(ForkCommand::CleanupOnHardDelete {
+                origin_id,
+                authority: cleanup_authority,
+                reply: cleanup_reply,
+            })
+            .await
+            .unwrap();
+
+        rt.signal_fatal_local_authority("test_fork_boundary");
+        assert_eq!(
+            rt.fatal_local_authority_fence.owners_at_first_close(),
+            Some(2)
+        );
+        barrier.wait().await;
+
+        assert!(matches!(
+            admitted.await.unwrap(),
+            Err(ForkResolveError::NotFound(_))
+        ));
+        cleanup_reply_rx.await.unwrap().unwrap();
+        assert_eq!(
+            db.get_fork_proposal(&proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Dismissed
+        );
+    }
+
     /// Create a project + a live Direct-mode origin conversation in it. Returns
     /// (`project_id`, `origin_id`).
     async fn seed_project_and_origin(db: &Database, repo: &Path) -> (String, String) {
@@ -1699,6 +1867,55 @@ mod tests {
         };
         db.insert_fork_proposal(&proposal).await.unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn admitted_fork_startup_survives_closure_after_resolution_commit() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_project_id, origin_id) = seed_project_and_origin(&db, &repo).await;
+        let proposal_id = insert_pending(
+            &db,
+            &origin_id,
+            "tasks/12345-p1-ready--inherited-startup.md",
+            "# Inherited startup\n",
+        )
+        .await;
+        let rt = make_runtime(db.clone()).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *rt.fork_runtime_start_barrier.lock().await = Some(Arc::clone(&barrier));
+        let approval = {
+            let rt = Arc::clone(&rt);
+            let proposal_id = proposal_id.clone();
+            tokio::spawn(async move { rt.approve_fork_proposal(&proposal_id).await })
+        };
+
+        barrier.wait().await;
+        assert_eq!(
+            db.get_fork_proposal(&proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkProposalStatus::Spawned
+        );
+        rt.signal_fatal_local_authority("test_fork_startup");
+        assert_eq!(
+            rt.fatal_local_authority_fence.owners_at_first_close(),
+            Some(1)
+        );
+        barrier.wait().await;
+
+        let fork_id = approval.await.unwrap().unwrap();
+        assert_eq!(
+            db.get_fork_proposal(&proposal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .fork_conversation_id
+                .as_deref(),
+            Some(fork_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -2709,7 +2926,10 @@ mod tests {
         let rt = make_runtime(db.clone()).await;
 
         // Hard-delete cleanup runs first: it dismisses the pending proposal.
-        rt.cleanup_pending_fork_orphans_on_delete(&origin).await;
+        let authority = rt.acquire_local_authority_pass().unwrap();
+        rt.cleanup_pending_fork_orphans_on_delete(&origin, authority)
+            .await
+            .unwrap();
 
         let after_cleanup = db.get_fork_proposal(&pid).await.unwrap().unwrap();
         assert_eq!(

@@ -93,21 +93,17 @@ final class ConversationStateTests: XCTestCase {
 
     func testCancellableParentStatesRemainTyped() {
         XCTAssertEqual(
-            parse("{\"type\":\"awaiting_commission_review_approval\"}"),
-            .awaitingCommissionReviewApproval)
-        XCTAssertEqual(
             parse("{\"type\":\"awaiting_recovery\",\"message\":\"Retrying\"}"),
             .awaitingRecovery(message: "Retrying"))
         XCTAssertEqual(parse("{\"type\":\"provisioning\"}"), .provisioning)
-        XCTAssertTrue(ConversationState.awaitingCommissionReviewApproval.isCancellable)
         XCTAssertTrue(ConversationState.awaitingRecovery(message: "Retrying").isCancellable)
         XCTAssertTrue(ConversationState.provisioning.isCancellable)
     }
 
     func testErrorCarriesMessage() {
         XCTAssertEqual(
-            parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"llm_rate_limit\"}"),
-            .error(message: "rate limited"))
+            parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"rate_limit\"}"),
+            .error(message: "rate limited", kind: .rateLimit))
     }
 
     func testCreationFailedCarriesServerError() {
@@ -224,7 +220,8 @@ final class ConversationStateTests: XCTestCase {
             parse("{\"type\":\"tool_executing\"}"),
             .toolExecuting(toolName: "tool", remainingCount: 0, completedCount: 0))
         XCTAssertEqual(
-            parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
+            parse("{\"type\":\"error\"}"),
+            .error(message: "Unknown error", kind: .unknown))
     }
     func testDeliveryPolicyCoversChatArchiveAndSessionActions() {
         XCTAssertEqual(ClientOperation.chat.policy, .outboxed)
@@ -252,17 +249,6 @@ final class ConversationStateTests: XCTestCase {
         XCTAssertEqual(TaskFeedback("  revise this  ")?.text, "revise this")
     }
 
-    func testAgentDoneClearsCommissionApprovalOnlyAfterCancellation() {
-        XCTAssertFalse(ConversationSession.shouldMoveToIdleOnAgentDone(
-            presentationMode: "needs_action",
-            typedState: .awaitingCommissionReviewApproval,
-            cancelledCommissionApproval: false))
-        XCTAssertTrue(ConversationSession.shouldMoveToIdleOnAgentDone(
-            presentationMode: "needs_action",
-            typedState: .awaitingCommissionReviewApproval,
-            cancelledCommissionApproval: true))
-    }
-
     func testQuestionActionUnlocksWhenPromptIdentityChanges() {
         let original = ConversationState.awaitingUserResponse(questions: [
             UserQuestion(question: "First?", header: "One", options: [], multiSelect: false),
@@ -280,7 +266,15 @@ final class ConversationStateTests: XCTestCase {
 
     func testChatEligibilityMatchesInteractiveStateFamilies() {
         XCTAssertTrue(ConversationState.idle.acceptsChatMessage)
-        XCTAssertTrue(ConversationState.error(message: "retryable").acceptsChatMessage)
+        XCTAssertTrue(
+            ConversationState.error(message: "retryable", kind: .serverError)
+                .acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.error(message: "terminal", kind: .invalidRequest)
+                .acceptsChatMessage)
+        XCTAssertFalse(
+            ConversationState.error(message: "unknown", kind: .unknown)
+                .acceptsChatMessage)
         XCTAssertTrue(ConversationState.llmRequesting(attempt: 1).acceptsChatMessage)
         XCTAssertFalse(
             ConversationState.awaitingUserResponse(questions: []).acceptsChatMessage)

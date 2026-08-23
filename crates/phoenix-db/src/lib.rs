@@ -8615,7 +8615,7 @@ impl Database {
         // prior user turn (REQ-BED-007, F1).
         let materialized = self.materialize_in_flight_tool_rounds(&now, None).await?;
         if !materialized.is_empty() {
-            self.reconcile_startup_obligated_parents(&materialized, true)
+            self.reconcile_startup_obligated_parents(&materialized)
                 .await?;
         }
 
@@ -8658,12 +8658,10 @@ impl Database {
         //     is in the JSON column and must survive restart
         //   - awaiting_user_response: user questions pending; state data (questions/tool_use_id)
         //     is in the JSON column and must survive restart
-        //   - awaiting_commission_review_approval: capital-spend review approval pending; state data
-        //     carries the unpersisted assistant message/tool_use and must survive restart
         //   - completed/failed/terminal: lifecycle ended — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
-             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+             WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
                    FROM durable_turns AS obligated_turn
@@ -9195,6 +9193,20 @@ impl Database {
         Ok(())
     }
 
+    /// Reconcile parents after process startup, when no pre-restart runtime can
+    /// still own an in-flight child or tool result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parent or child durable state cannot be read or
+    /// atomically persisted.
+    pub async fn reconcile_startup_obligated_parents(
+        &self,
+        conversation_ids: &std::collections::HashSet<String>,
+    ) -> DbResult<Vec<StartupParentReconciliation>> {
+        self.reconcile_startup_parents(conversation_ids).await
+    }
+
     /// Materialize parent progress that was deliberately preserved while a
     /// child terminal obligation still owned the exact outcome.
     ///
@@ -9203,10 +9215,9 @@ impl Database {
     /// Returns an error when any parent transcript or state cannot be read or
     /// atomically persisted.
     #[allow(clippy::too_many_lines)]
-    pub async fn reconcile_startup_obligated_parents(
+    async fn reconcile_startup_parents(
         &self,
         conversation_ids: &std::collections::HashSet<String>,
-        synthesize_startup_interruptions: bool,
     ) -> DbResult<Vec<StartupParentReconciliation>> {
         let now = Utc::now();
         let _ = self
@@ -9268,7 +9279,6 @@ impl Database {
                 | ConvState::RecoverableContinuationFailure { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
-                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
                 | ConvState::Terminal => None,
@@ -9282,13 +9292,6 @@ impl Database {
             )) = pending_fan_in
             {
                 let outcomes = self.resolve_pending_sub_agent_outcomes(&pending).await?;
-                if !synthesize_startup_interruptions
-                    && pending
-                        .iter()
-                        .any(|agent| !outcomes.contains_key(&agent.agent_id))
-                {
-                    continue;
-                }
                 for agent in pending {
                     let outcome = if let Some(outcome) = outcomes.get(&agent.agent_id).cloned() {
                         outcome
@@ -9352,9 +9355,7 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
                 if is_parent == 1 {
-                    if synthesize_startup_interruptions
-                        && matches!(conversation.state, ConvState::LlmRequesting { .. })
-                    {
+                    if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
                         sqlx::query(
                             "INSERT OR REPLACE INTO startup_parent_actions
                                  (conversation_id, action, transcript_generation,
@@ -9925,6 +9926,50 @@ impl Database {
         }
 
         Ok(rows)
+    }
+
+    /// Return the current transcript tail and its typed settlement, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persistence contains an unknown settlement reason.
+    pub async fn get_recovery_tail_status(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<phoenix_core::domain::db_schema::RecoveryTailStatus> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT tail.message_id, settlement.reason
+             FROM messages tail
+             LEFT JOIN conversation_recovery_settlements settlement
+               ON settlement.conversation_id = tail.conversation_id
+              AND settlement.terminal_message_id = tail.message_id
+             WHERE tail.conversation_id = ?1
+               AND tail.sequence_id = (
+                   SELECT MAX(candidate.sequence_id)
+                   FROM messages candidate
+                   WHERE candidate.conversation_id = tail.conversation_id
+               )",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((message_id, reason)) = row else {
+            return Ok(phoenix_core::domain::db_schema::RecoveryTailStatus::Empty);
+        };
+        let settlement = reason
+            .map(|value| {
+                phoenix_core::domain::db_schema::RecoverySettlementReason::from_db_str(&value)
+                    .ok_or_else(|| {
+                        DbError::Serialization(format!(
+                            "unknown recovery settlement reason: {value}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+            message_id,
+            settlement,
+        })
     }
 
     /// Get messages after a sequence ID
@@ -12107,6 +12152,14 @@ pub(crate) async fn hydrate_attachments(
     pool: &SqlitePool,
     messages: &mut [Message],
 ) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    hydrate_attachments_conn(&mut conn, messages).await
+}
+
+pub(crate) async fn hydrate_attachments_conn(
+    conn: &mut sqlx::SqliteConnection,
+    messages: &mut [Message],
+) -> Result<(), sqlx::Error> {
     for msg in messages.iter_mut() {
         if !matches!(msg.message_type, MessageType::User | MessageType::Skill) {
             continue;
@@ -12122,7 +12175,7 @@ pub(crate) async fn hydrate_attachments(
             size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
             stored_path: row.get("stored_path"),
         })
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // SkillContent has no images; skip the query for skill rows.
@@ -12135,7 +12188,7 @@ pub(crate) async fn hydrate_attachments(
                 data: row.get("data"),
                 media_type: row.get("media_type"),
             })
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?
         } else {
             Vec::new()
@@ -12246,7 +12299,6 @@ pub(crate) const fn conv_state_kind(state: &ConvState) -> &'static str {
         ConvState::AwaitingRecovery { .. } => "awaiting_recovery",
         ConvState::AwaitingTaskApproval { .. } => "awaiting_task_approval",
         ConvState::AwaitingUserResponse { .. } => "awaiting_user_response",
-        ConvState::AwaitingCommissionReviewApproval { .. } => "awaiting_commission_review_approval",
         ConvState::ContextExhausted { .. } => "context_exhausted",
         ConvState::HandedOff { .. } => "handed_off",
         ConvState::Terminal => "terminal",
@@ -12437,6 +12489,58 @@ mod tests {
         .await
         .unwrap()
         .expect("cleanup claim")
+    }
+
+    #[tokio::test]
+    async fn recovery_settlement_applies_only_while_terminal_message_is_tail() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("settled", "settled", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "terminal-result",
+            "settled",
+            &MessageContent::tool("tool-use", "retired", true),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_recovery_settlements (
+                 conversation_id, terminal_message_id, reason
+             ) VALUES ('settled', 'terminal-result', 'retired_tool_call')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_recovery_tail_status("settled").await.unwrap(),
+            phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+                message_id: "terminal-result".to_string(),
+                settlement: Some(
+                    phoenix_core::domain::db_schema::RecoverySettlementReason::RetiredToolCall,
+                ),
+            }
+        );
+
+        db.add_message(
+            "later-user",
+            "settled",
+            &MessageContent::user("continue"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_recovery_tail_status("settled").await.unwrap(),
+            phoenix_core::domain::db_schema::RecoveryTailStatus::Tail {
+                message_id: "later-user".to_string(),
+                settlement: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -17250,67 +17354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reset_preserves_awaiting_commission_review_approval_state() {
-        use phoenix_core::domain::llm_types::ContentBlock;
-        use phoenix_core::domain::sm_state::{
-            AssistantMessage, CommissionReviewApprovalScope, CommissionReviewInput,
-        };
-
-        let db = Database::open_in_memory().await.unwrap();
-
-        db.create_conversation(
-            "conv-commission",
-            "slug-commission",
-            "/tmp",
-            true,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let approval_state = ConvState::AwaitingCommissionReviewApproval {
-            tool_use_id: "tool-review-1".to_string(),
-            request: CommissionReviewInput {
-                brief: "Ready for review".to_string(),
-                focus: Some("correctness".to_string()),
-            },
-            scope: CommissionReviewApprovalScope {
-                kind: "committed_branch_diff".to_string(),
-                repo_root: "/tmp".to_string(),
-                base: "refs/remotes/origin/main".to_string(),
-                head: "task".to_string(),
-                approved_head: None,
-                approved_base: None,
-                dirty: false,
-                changed_files: 0,
-                insertions: 0,
-                deletions: 0,
-            },
-            assistant_message: AssistantMessage::new(
-                "req".to_string(),
-                vec![ContentBlock::text("requesting review")],
-                None,
-                None,
-            ),
-        };
-        db.update_conversation_state("conv-commission", &approval_state)
-            .await
-            .unwrap();
-
-        db.reset_all_to_idle().await.unwrap();
-
-        let conv_after = db.get_conversation("conv-commission").await.unwrap();
-        assert!(
-            matches!(
-                conv_after.state,
-                ConvState::AwaitingCommissionReviewApproval { .. }
-            ),
-            "AwaitingCommissionReviewApproval state should be preserved after reset"
-        );
-    }
-
-    #[tokio::test]
     async fn test_reset_repairs_orphaned_tool_use() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
@@ -18051,10 +18094,7 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        let reconciled = db
-            .reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
         let actions = db.list_startup_parent_actions().await.unwrap();
@@ -18081,10 +18121,7 @@ mod tests {
         assert!(content.content.contains("exact recovered result"));
         assert!(!content.content.contains("interrupted by server restart"));
 
-        let reconciled = db
-            .reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].conversation_id, parent_id);
         let actions = db.list_startup_parent_actions().await.unwrap();
@@ -18164,10 +18201,9 @@ mod tests {
         let original = db.list_startup_parent_actions().await.unwrap();
         assert_eq!(original.len(), 1);
 
-        db.reconcile_startup_obligated_parents(
-            &std::collections::HashSet::from([parent_id.to_string()]),
-            true,
-        )
+        db.reconcile_startup_obligated_parents(&std::collections::HashSet::from([
+            parent_id.to_string()
+        ]))
         .await
         .unwrap();
 
@@ -18282,10 +18318,9 @@ mod tests {
         let original = db.list_startup_parent_actions().await.unwrap();
         assert_eq!(original.len(), 1);
 
-        db.reconcile_startup_obligated_parents(
-            &std::collections::HashSet::from([conversation_id.to_string()]),
-            true,
-        )
+        db.reconcile_startup_obligated_parents(&std::collections::HashSet::from([
+            conversation_id.to_string()
+        ]))
         .await
         .unwrap();
 
@@ -18355,9 +18390,7 @@ mod tests {
         .unwrap();
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
-        db.reconcile_startup_obligated_parents(&ids, true)
-            .await
-            .unwrap();
+        db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert!(matches!(
             db.get_conversation(parent_id).await.unwrap().state,
             ConvState::LlmRequesting { attempt: 1 }
@@ -18479,7 +18512,7 @@ mod tests {
         let ids = std::collections::HashSet::from([parent_id.to_string()]);
 
         let error = db
-            .reconcile_startup_obligated_parents(&ids, true)
+            .reconcile_startup_obligated_parents(&ids)
             .await
             .expect_err("unreadable terminal evidence must remain retryable");
         assert!(error.to_string().contains("decode pending sub-agent"));
@@ -18537,10 +18570,7 @@ mod tests {
             .unwrap();
             let ids = std::collections::HashSet::from([parent_id.clone()]);
 
-            let reconciled = db
-                .reconcile_startup_obligated_parents(&ids, true)
-                .await
-                .unwrap();
+            let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
             assert_eq!(reconciled.len(), 1);
             let actions = db.list_startup_parent_actions().await.unwrap();
             assert_eq!(actions.len(), 1);

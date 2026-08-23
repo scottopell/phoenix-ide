@@ -45,7 +45,6 @@ pub enum StableOutcome {
     AwaitingRecovery,
     AwaitingTaskApproval,
     AwaitingUserResponse,
-    AwaitingCommissionReviewApproval,
     ContextExhausted,
     HandedOff,
     Terminal,
@@ -508,9 +507,6 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         }),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
-        ConvState::AwaitingCommissionReviewApproval { .. } => {
-            Some(StableOutcome::AwaitingCommissionReviewApproval)
-        }
         ConvState::ContextExhausted { .. } => Some(StableOutcome::ContextExhausted),
         ConvState::HandedOff { .. } => Some(StableOutcome::HandedOff),
         ConvState::Terminal | ConvState::CreationCancelled { .. } => Some(StableOutcome::Terminal),

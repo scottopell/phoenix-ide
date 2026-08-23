@@ -490,7 +490,6 @@ describe('InputArea cancellation affordance', () => {
 
   it.each([
     { type: 'awaiting_task_approval', title: 'Plan', priority: 'p1', plan: 'Do it' },
-    { type: 'awaiting_commission_review_approval', brief: 'Review', scope: undefined },
     { type: 'awaiting_user_response', questions: [] },
     { type: 'awaiting_recovery', message: 'Recover', recovery_kind: 'credential', resume: { type: 'conversation_turn' } },
     { type: 'context_exhausted', summary: 'Done' },

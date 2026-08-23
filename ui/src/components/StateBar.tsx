@@ -276,7 +276,6 @@ function modelLockReason(state: ConversationState): string | null {
   if (canChangeModelInState(state) || isTerminalConversationState(state)) return null;
   switch (state.type) {
     case 'awaiting_task_approval':
-    case 'awaiting_commission_review_approval':
     case 'awaiting_user_response':
       return 'Model, effort, and speed are locked while this conversation awaits your response or approval.';
     default:
@@ -799,8 +798,7 @@ export function StateBar({
                 : "completed";
             break;
           case 'awaiting_task_approval':
-          case 'awaiting_commission_review_approval':
-            dotClass += ' approval';
+                  dotClass += ' approval';
             stateText = 'awaiting approval';
             break;
           case "awaiting_user_response":
