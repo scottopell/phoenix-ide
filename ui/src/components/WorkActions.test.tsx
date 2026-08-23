@@ -2114,6 +2114,28 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(document.querySelector('.work-actions-pr-coverage')).not.toBeInTheDocument();
   });
 
+  it('uses the active summary when same-identity cached state is stale', () => {
+    const activePr = { ...selection().associated_prs[0]!, display_state: 'open' as const };
+    const handle = prStatusHandle({
+      found: true,
+      number: 12,
+      url: 'https://github.com/o/r/pull/12',
+      display_state: 'merged',
+      check_state: 'passing',
+    }, {
+      activeSelection: selection({ associated_prs: [activePr] }),
+      activePrSummary: activePr,
+      ambiguous: false,
+    });
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stale-state" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={handle} />,
+    );
+
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open PR #12/ })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Merge on GitHub #12/ })).not.toBeInTheDocument();
+  });
+
   it('does not reuse cached status for a same-number active PR in another repository', () => {
     const activePr = {
       ...selection().associated_prs[0]!,
@@ -2378,9 +2400,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     expect(screen.queryByRole('link', { name: /Merge PR #12|Open PR #12/ })).not.toBeInTheDocument();
   });
 
-  it('keeps cached Address feedback directly usable with an empty live PR envelope', async () => {
+  it('does not target cached feedback when the live PR envelope is empty', () => {
     enableMobile();
-    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onSendMessage = vi.fn();
     const handle = prStatusHandle({
       found: true,
       number: 12,
@@ -2404,9 +2426,9 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
       />,
     );
 
-    fireEvent.click(screen.getByTestId('mobile-primary-address-feedback'));
-    await waitFor(() => expect(onSendMessage).toHaveBeenCalledTimes(1));
-    expect(requestActivePrSelectorOpen).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('mobile-primary-address-feedback')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Resume PR inference' })).toBeInTheDocument();
+    expect(onSendMessage).not.toHaveBeenCalled();
   });
 
   it('prioritizes feedback status over cached workspace-change status', () => {

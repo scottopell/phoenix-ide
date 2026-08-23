@@ -249,7 +249,7 @@ export function WorkControlBar({
     || prStatusHandle.ambiguous;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
   const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
-  const cachedPrCanTargetFeedback = prStatusHandle.activeSelection?.active_pr == null
+  const cachedPrCanTargetFeedback = prStatusHandle.activeSelection == null
     && !!prStatus?.found
     && prStatus.number != null
     && !prStatusHandle.ambiguous;
@@ -278,11 +278,16 @@ export function WorkControlBar({
     requestActivePrSelectorOpen();
     setOpenSelectorAfterRefresh(false);
   }, [openSelectorAfterRefresh, prStatusHandle.ambiguous]);
-  const activePrDiffersFromCached = !!activePr
-    && prStatus?.found === true
-    && (prStatus.number !== activePr.pr_number || prStatus.url !== activePr.url);
-  const dispositionPrStatus: PrStatusResponse | null = activePrDiffersFromCached && activePr && prStatus
+  const activePrOverridesCached = !!activePr && prStatus?.found === true;
+  const activePrMatchesCachedIdentity = !!activePr
+    && prStatus?.number === activePr.pr_number
+    && prStatus.url === activePr.url;
+  const activePrMatchesCachedState = activePrMatchesCachedIdentity
+    && prStatus?.display_state === activePr?.display_state
+    && (prStatus.draft ?? false) === activePr.draft;
+  const dispositionPrStatus: PrStatusResponse | null = activePrOverridesCached && activePr && prStatus
     ? {
+        ...(activePrMatchesCachedIdentity ? prStatus : {}),
         found: true,
         number: activePr.pr_number,
         title: activePr.title,
@@ -293,8 +298,10 @@ export function WorkControlBar({
         head: activePr.head,
         display_state: activePr.display_state,
         feedback_status: activePr.feedback_status,
-        check_state: 'unknown',
-        refresh: { ...prStatus.refresh, state: 'unavailable' },
+        ...(activePrMatchesCachedState ? {} : { check_state: 'unknown' as const }),
+        refresh: activePrMatchesCachedState
+          ? prStatus.refresh
+          : { ...prStatus.refresh, state: 'unavailable' },
         work_change: prStatus.work_change,
         pr: {
           number: activePr.pr_number,
