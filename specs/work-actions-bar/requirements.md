@@ -108,8 +108,10 @@ compact rail geometry so metadata refresh does not cause a large layout shift.
 WHEN a mobile conversation has no actionable associated PR that the PR rail can represent
 THE SYSTEM SHALL present a compact fallback dock with a concise status row. For non-continued
 dispositions, the status row SHALL appear above one action row that keeps the disposition's primary
-verb directly available and MAY place non-primary terminal verbs in an overflow menu. A continued
-disposition SHALL remain status-only because it has no legal primary or terminal verbs. Full
+verb directly available, except that an unresolved explicit active-PR selection SHALL replace an
+unsafe PR-targeted or terminal primary with selection recovery. The action row MAY place non-primary
+terminal verbs in an overflow menu. A continued disposition SHALL remain status-only because it has
+no legal primary or terminal verbs. Full
 disposition guidance and terminal intent SHALL remain available through a touch- and
 keyboard-operable disclosure. The collapsed dock SHALL bound status text to one line and SHALL NOT
 render full guidance as a wrapping sibling of its actions.
