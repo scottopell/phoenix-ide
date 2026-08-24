@@ -204,6 +204,8 @@ pub enum DbError {
     SlugExists(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Continuation precondition failed: {0}")]
+    ContinuationPrecondition(String),
     #[error("Close foundation conflict: {0}")]
     CloseFoundationConflict(String),
     #[error("Close foundation precondition failed: {0}")]
@@ -5302,11 +5304,14 @@ impl Database {
                 ));
             }
         } else if cleanup.status == "deletion_pending" {
-            let work_scope_id: Option<String> =
-                sqlx::query_scalar("SELECT work_scope_id FROM conversations WHERE id = ?1")
-                    .bind(&cleanup.conversation_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let (work_scope_id, product_conversation_id): (Option<String>, String) =
+                sqlx::query_as(
+                    "SELECT work_scope_id, product_conversation_id
+                     FROM conversations WHERE id = ?1",
+                )
+                .bind(&cleanup.conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
             let deleted = sqlx::query(
                 "DELETE FROM conversations
                  WHERE id = ?1 AND EXISTS (
@@ -5331,6 +5336,17 @@ impl Database {
                     "creation cleanup claim was lost".to_string(),
                 ));
             }
+            sqlx::query(
+                "DELETE FROM product_conversations
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations
+                       WHERE product_conversation_id = ?1
+                   )",
+            )
+            .bind(product_conversation_id)
+            .execute(&mut *tx)
+            .await?;
             if let Some(work_scope_id) = work_scope_id {
                 sqlx::query(
                     "DELETE FROM work_scopes
@@ -7194,6 +7210,12 @@ impl Database {
             });
         }
 
+        if parent.runtime_role == RuntimeRole::SubAgent {
+            return Err(DbError::ContinuationPrecondition(
+                "subordinate executions cannot create continuation transcripts".to_string(),
+            ));
+        }
+
         let new_id = uuid::Uuid::new_v4().to_string();
 
         // Sequential slug: walk to chain root, count existing members, then
@@ -7286,12 +7308,10 @@ impl Database {
             .bind(if parent.runtime_role == RuntimeRole::Coordinator {
                 RuntimeRole::Coordinator.as_str()
             } else {
-                parent.runtime_role.as_str()
+                RuntimeRole::User.as_str()
             })
             .bind(continuation_work_scope_id.as_ref().map(WorkScopeId::as_str))
-            .bind(
-                (parent.runtime_role == RuntimeRole::SubAgent).then_some(parent.cwd.as_str()),
-            )
+            .bind::<Option<&str>>(None)
             .bind(parent.service_tier.as_wire_name())
             .bind(parent.product_conversation_id.as_str())
             .execute(&mut *tx)
@@ -8647,6 +8667,24 @@ impl Database {
         Ok(())
     }
 
+    async fn delete_product_conversation_if_empty(
+        connection: &mut sqlx::SqliteConnection,
+        product_conversation_id: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "DELETE FROM product_conversations
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations
+                   WHERE product_conversation_id = ?1
+               )",
+        )
+        .bind(product_conversation_id)
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
     /// Delete a conversation and all its messages
     ///
     /// # Errors
@@ -8694,12 +8732,21 @@ impl Database {
             .bind(id)
             .execute(&mut *connection)
             .await?;
+            let product_conversation_id: Option<String> = sqlx::query_scalar(
+                "SELECT product_conversation_id FROM conversations WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await?;
             let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
                 .bind(id)
                 .execute(&mut *connection)
                 .await?;
             if result.rows_affected() == 0 {
                 return Ok(false);
+            }
+            if let Some(owner) = product_conversation_id {
+                Self::delete_product_conversation_if_empty(&mut connection, &owner).await?;
             }
             retrieval::fts_delete_conversation_conn(
                 &mut connection,
@@ -21149,6 +21196,56 @@ mod tests {
         assert_eq!(link_exists, 0);
     }
 
+    #[tokio::test]
+    async fn delete_conversation_removes_only_an_empty_product_owner() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("delete-root", "delete-root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "continue".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let continuation = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation creation, got {other:?}")
+            }
+        };
+        assert_eq!(
+            continuation.product_conversation_id,
+            root.product_conversation_id
+        );
+
+        db.delete_conversation(&root.id).await.unwrap();
+        let owner_after_first_delete: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations WHERE id = ?1")
+                .bind(root.product_conversation_id.as_str())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner_after_first_delete, 1);
+
+        db.delete_conversation(&continuation.id).await.unwrap();
+        let owner_after_last_delete: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_conversations WHERE id = ?1")
+                .bind(root.product_conversation_id.as_str())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner_after_last_delete, 0);
+        assert!(matches!(
+            db.delete_conversation(&continuation.id).await,
+            Err(DbError::ConversationNotFound(id)) if id == continuation.id
+        ));
+    }
+
     // ==================== Fork Proposal Tests ====================
 
     fn fork_proposal_fixture(id: &str, origin: &str) -> ForkProposal {
@@ -22141,20 +22238,14 @@ mod tests {
         .await
         .unwrap();
 
-        let continuation = match db.continue_conversation(&child.id).await.unwrap() {
-            ContinueOutcome::Created(conversation) => conversation,
-            ContinueOutcome::AlreadyContinued(conversation) => {
-                panic!("unexpected existing continuation: {conversation:?}")
-            }
-            ContinueOutcome::ParentNotContextExhausted { state_variant } => {
-                panic!("parent unexpectedly not exhausted: {state_variant}")
-            }
-        };
-        assert_eq!(continuation.cwd, "/tmp/worktree/subdir");
-        assert_eq!(
-            db.get_conversation(&continuation.id).await.unwrap().cwd,
-            "/tmp/worktree/subdir"
-        );
+        assert!(matches!(
+            db.continue_conversation(&child.id).await,
+            Err(DbError::ContinuationPrecondition(message))
+                if message.contains("subordinate executions")
+        ));
+        let hydrated = db.get_conversation(&child.id).await.unwrap();
+        assert_eq!(hydrated.cwd, "/tmp/worktree/subdir");
+        assert!(hydrated.continued_in_conv_id.is_none());
     }
 
     #[tokio::test]
@@ -22603,12 +22694,29 @@ mod tests {
             &ConvState::Terminal,
         )
         .await;
-        retirement_fixture(&db, "active-child", RuntimeRole::SubAgent, &ConvState::Idle).await;
-        sqlx::query("UPDATE conversations SET work_scope_id = ?1 WHERE id = 'active-child'")
-            .bind(scope.as_str())
-            .execute(db.pool())
-            .await
-            .unwrap();
+        db.create_conversation_with_project(
+            "active-child",
+            "active-child",
+            "/tmp/retirement",
+            false,
+            Some("terminal-user"),
+            None,
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_conversation("active-child")
+                .await
+                .unwrap()
+                .attached_work_scope_id,
+            Some(scope.clone())
+        );
         assert_eq!(
             db.retire_work_scope(no_live_resource(scope), "cleanup")
                 .await

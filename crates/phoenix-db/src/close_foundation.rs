@@ -568,7 +568,7 @@ async fn read_topology_tx(
              FROM conversations candidate
              WHERE candidate.product_conversation_id = ?1
                AND candidate.parent_conversation_id IS NULL
-               AND candidate.runtime_role IN ('user', 'coordinator')
+               AND candidate.runtime_role = 'user'
                AND NOT EXISTS (
                    SELECT 1 FROM conversations predecessor
                    WHERE predecessor.continued_in_conv_id = candidate.id
@@ -993,9 +993,9 @@ impl Database {
         .ok_or_else(|| DbError::CloseFoundationNotFound(attempt_id.to_string()))
     }
 
-    pub async fn get_active_close_obligation_for_root(
+    pub async fn get_active_close_obligation_for_product(
         &self,
-        product_conversation_id: &str,
+        product_conversation_id: &ProductConversationId,
     ) -> DbResult<Option<CloseObligation>> {
         sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
@@ -1003,7 +1003,7 @@ impl Database {
              FROM close_obligations
              WHERE product_conversation_id = ?1 AND phase <> 'completed'",
         )
-        .bind(product_conversation_id)
+        .bind(product_conversation_id.as_str())
         .fetch_optional(&self.pool)
         .await?
         .map(parse_close_obligation_row)
@@ -1463,7 +1463,7 @@ impl Database {
             return Ok(resources);
         }
 
-        let root_id: String = sqlx::query_scalar(
+        let product_conversation_id: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM close_obligations WHERE attempt_id = ?1",
         )
         .bind(request.attempt_id.as_str())
@@ -1471,41 +1471,17 @@ impl Database {
         .await?;
         for target_scope in &target_scopes {
             let conflicting_owner: Option<String> = sqlx::query_scalar(
-                "WITH RECURSIVE open_candidates(id) AS (
-                     SELECT id FROM conversations
-                     WHERE work_scope_id = ?1
-                       AND runtime_role = 'user'
-                       AND parent_conversation_id IS NULL
-                       AND archived = 0
-                 ), ancestry(candidate_id, id, path) AS (
-                     SELECT id, id, json_array(id) FROM open_candidates
-                     UNION ALL
-                     SELECT ancestry.candidate_id, predecessor.id,
-                            json_insert(ancestry.path, '$[#]', predecessor.id)
-                     FROM ancestry
-                     JOIN conversations predecessor
-                       ON predecessor.continued_in_conv_id = ancestry.id
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM json_each(ancestry.path) visited
-                         WHERE visited.value = predecessor.id
-                     )
-                 ), resolved(candidate_id, root_id) AS (
-                     SELECT ancestry.candidate_id, ancestry.id
-                     FROM ancestry
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM conversations predecessor
-                         WHERE predecessor.continued_in_conv_id = ancestry.id
-                     )
-                 )
-                 SELECT candidate.id
-                 FROM open_candidates candidate
-                 LEFT JOIN resolved ON resolved.candidate_id = candidate.id
-                 GROUP BY candidate.id
-                 HAVING COUNT(resolved.root_id) <> 1 OR MAX(resolved.root_id) <> ?2
+                "SELECT candidate.product_conversation_id
+                 FROM conversations candidate
+                 WHERE candidate.work_scope_id = ?1
+                   AND candidate.runtime_role = 'user'
+                   AND candidate.parent_conversation_id IS NULL
+                   AND candidate.archived = 0
+                   AND candidate.product_conversation_id <> ?2
                  LIMIT 1",
             )
             .bind(target_scope.as_str())
-            .bind(&root_id)
+            .bind(&product_conversation_id)
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(owner) = conflicting_owner {
@@ -2325,15 +2301,6 @@ mod tests {
             .unwrap();
     }
 
-    async fn set_runtime_role(db: &Database, id: &str, role: RuntimeRole) {
-        sqlx::query("UPDATE conversations SET runtime_role = ?1 WHERE id = ?2")
-            .bind(role.as_str())
-            .bind(id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-    }
-
     async fn set_user_initiated(db: &Database, id: &str, user_initiated: bool) {
         sqlx::query("UPDATE conversations SET user_initiated = ?1 WHERE id = ?2")
             .bind(user_initiated)
@@ -2843,6 +2810,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_distinct_product_identity_admits_retirement_inventory() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "fresh-retirement-transcript",
+                "fresh-retirement-transcript",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            conversation.id,
+            conversation.product_conversation_id.as_str()
+        );
+        let scope = allocate_scope_worktree(&db, &conversation.id).await;
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            "fresh-retirement-attempt",
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            "fresh-retirement-attempt",
+            ClosePhase::RetirementRequested,
+        )
+        .await;
+        let snapshot = current_test_snapshot(&db, "fresh-retirement-attempt").await;
+
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: CloseAttemptId::parse("fresh-retirement-attempt").unwrap(),
+                snapshot,
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_product_ownership_rejects_null_and_reassignment() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_root(&db, "other").await;
+        db.begin_close_foundation(&product_id("root"), "attempt-owned")
+            .await
+            .unwrap();
+
+        for replacement in [None, Some("other")] {
+            assert!(sqlx::query(
+                "UPDATE close_obligations
+                 SET product_conversation_id = ?1
+                 WHERE attempt_id = 'attempt-owned'",
+            )
+            .bind(replacement)
+            .execute(db.pool())
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            db.get_close_obligation("attempt-owned")
+                .await
+                .unwrap()
+                .product_conversation_id(),
+            &product_id("root")
+        );
+    }
+
+    #[tokio::test]
     async fn three_unarchived_chain_latest_admits_and_reads_topology() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -2887,7 +2937,7 @@ mod tests {
         .is_err());
 
         let active = db
-            .get_active_close_obligation_for_root("root")
+            .get_active_close_obligation_for_product(&product_id("root"))
             .await
             .unwrap();
         assert_eq!(active.unwrap().attempt_id().as_str(), "attempt-1");
@@ -3668,14 +3718,39 @@ mod tests {
             DbError::CloseFoundationPrecondition(_)
         ));
 
-        create_root(&db, "subagent").await;
-        set_runtime_role(&db, "subagent", RuntimeRole::SubAgent).await;
-        assert!(matches!(
-            db.begin_close_foundation(&product_id("subagent"), "attempt-b")
-                .await
-                .unwrap_err(),
-            DbError::CloseFoundationNotFound(_)
-        ));
+        create_root(&db, "subagent-parent").await;
+        let parent = db.get_conversation("subagent-parent").await.unwrap();
+        db.create_conversation_with_project(
+            "subagent",
+            "subagent",
+            "/tmp",
+            false,
+            Some(&parent.id),
+            None,
+            None,
+            &phoenix_core::domain::db_schema::ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .begin_close_foundation(&parent.product_conversation_id, "attempt-b")
+            .await
+            .is_ok());
+        let member_ids: Vec<String> = db
+            .list_close_attempt_members("attempt-b")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|member| member.conversation_id.as_str().to_string())
+            .collect();
+        assert_eq!(member_ids, vec!["subagent-parent"]);
 
         create_root(&db, "not-user-init").await;
         set_user_initiated(&db, "not-user-init", false).await;
@@ -3693,16 +3768,18 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
         create_child(&db, "leaf", "mid").await;
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'root'")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        assert!(sqlx::query(
+            "UPDATE conversations SET continued_in_conv_id = 'root' WHERE id = 'leaf'",
+        )
+        .execute(db.pool())
+        .await
+        .is_err());
 
-        let err = db
+        let topology = db
             .close_foundation_topology(&product_id("root"))
             .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::CloseFoundationPrecondition(_)));
+            .unwrap();
+        assert_eq!(topology.member_ids(), vec!["root", "mid", "leaf"]);
     }
 
     #[tokio::test]

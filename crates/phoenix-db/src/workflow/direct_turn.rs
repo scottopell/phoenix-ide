@@ -4642,10 +4642,25 @@ mod tests {
     #[tokio::test]
     async fn child_terminal_reconcile_rotates_id_and_preserves_originating_authority() {
         let repo = repo().await;
-        sqlx::query(
-            "UPDATE conversations SET parent_conversation_id = 'conv-b' WHERE id = 'conv-a'",
+        let db = Database::from_pool_for_tests(repo.pool.clone(), String::new());
+        db.delete_conversation("conv-a").await.unwrap();
+        db.create_conversation_with_project(
+            "conv-a",
+            "A",
+            "/tmp",
+            false,
+            Some("conv-b"),
+            None,
+            None,
+            &phoenix_core::domain::db_schema::ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
         )
-        .execute(&repo.pool)
         .await
         .unwrap();
         let original_parent = repo

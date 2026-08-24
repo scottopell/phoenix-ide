@@ -1635,6 +1635,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
         | DbError::Serialization(_)
+        | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationRepairRequired(_)

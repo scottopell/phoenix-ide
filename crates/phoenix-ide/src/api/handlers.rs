@@ -4920,6 +4920,9 @@ async fn continue_conversation(
         .await
         .map_err(|e| match e {
             DbError::ConversationNotFound(msg) => AppError::NotFound(msg),
+            DbError::ContinuationPrecondition(msg) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(msg, "continuation_not_allowed"),
+            )),
             other => AppError::Internal(other.to_string()),
         })?;
 
