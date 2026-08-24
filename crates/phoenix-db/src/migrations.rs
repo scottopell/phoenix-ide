@@ -11520,7 +11520,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO _migrations (version, name)
-             VALUES (66, 'temporarily_skip_product_conversation_migration')",
+             VALUES (70, 'temporarily_skip_product_conversation_migration')",
         )
         .execute(&pool)
         .await
