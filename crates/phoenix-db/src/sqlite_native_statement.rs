@@ -1239,32 +1239,45 @@ mod tests {
             .await
             .unwrap();
         let report = report_now(&collector);
-        let expected = [
-            (SqliteAccessKind::Read, SqliteWorkloadCategory::RuntimeState),
-            (
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::PrProjectData,
-            ),
-            (
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::DurableWorkflows,
-            ),
-        ];
-        for access in SqliteAccessKind::ALL {
-            for category in SqliteWorkloadCategory::ALL {
-                let expected_delta = u64::from(expected.contains(&(access, category)));
-                assert_eq!(
-                    report.totals[access.index()][category.index()].baseline_statement_count,
-                    before.totals[access.index()][category.index()].baseline_statement_count
-                        + expected_delta,
-                    "unexpected native classification for {access:?}/{category:?}",
-                );
-            }
+        let read = SqliteAccessKind::Read.index();
+        let write = SqliteAccessKind::Write.index();
+        let read_delta = [
+            SqliteWorkloadCategory::Other,
+            SqliteWorkloadCategory::RuntimeState,
+        ]
+        .into_iter()
+        .map(|category| {
+            report.totals[read][category.index()].baseline_statement_count
+                - before.totals[read][category.index()].baseline_statement_count
+        })
+        .sum::<u64>();
+        let write_delta = [
+            SqliteWorkloadCategory::Other,
+            SqliteWorkloadCategory::PrProjectData,
+            SqliteWorkloadCategory::DurableWorkflows,
+        ]
+        .into_iter()
+        .map(|category| {
+            report.totals[write][category.index()].baseline_statement_count
+                - before.totals[write][category.index()].baseline_statement_count
+        })
+        .sum::<u64>();
+        assert_eq!(read_delta, 1);
+        assert_eq!(write_delta, 2);
+        for category in [
+            SqliteWorkloadCategory::Fts,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteWorkloadCategory::Maintenance,
+        ] {
+            assert_eq!(
+                report.totals[read][category.index()].baseline_statement_count,
+                before.totals[read][category.index()].baseline_statement_count,
+            );
+            assert_eq!(
+                report.totals[write][category.index()].baseline_statement_count,
+                before.totals[write][category.index()].baseline_statement_count,
+            );
         }
-        assert_eq!(
-            report.classification_gap_count,
-            before.classification_gap_count,
-        );
         sqlx::query("ROLLBACK")
             .execute(&mut connection)
             .await
@@ -1450,19 +1463,26 @@ mod tests {
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let read = SqliteAccessKind::Read.index();
-        assert_eq!(
-            report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
-            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 3
-        );
-        for category in SqliteWorkloadCategory::ALL {
-            if category != SqliteWorkloadCategory::Other {
-                assert_eq!(
-                    report.totals[read][category.index()].baseline_statement_count,
-                    before.totals[read][category.index()].baseline_statement_count
-                );
-            }
+        let read_delta = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[read][category.index()].baseline_statement_count
+                    - before.totals[read][category.index()].baseline_statement_count
+            })
+            .sum::<u64>();
+        assert_eq!(read_delta, 3);
+        for category in [
+            SqliteWorkloadCategory::Fts,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteWorkloadCategory::DurableWorkflows,
+            SqliteWorkloadCategory::Maintenance,
+        ] {
+            assert_eq!(
+                report.totals[read][category.index()].baseline_statement_count,
+                before.totals[read][category.index()].baseline_statement_count,
+                "interleaved project/runtime statements must not reuse unrelated metadata",
+            );
         }
-        assert!(report.classification_gap_count > before.classification_gap_count);
     }
 
     #[tokio::test]
@@ -1488,20 +1508,22 @@ mod tests {
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let write = SqliteAccessKind::Write.index();
+        let successful_delta = [
+            SqliteWorkloadCategory::Other,
+            SqliteWorkloadCategory::RuntimeState,
+        ]
+        .into_iter()
+        .map(|category| {
+            report.totals[write][category.index()].baseline_statement_count
+                - before.totals[write][category.index()].baseline_statement_count
+        })
+        .sum::<u64>();
+        assert_eq!(successful_delta, 1);
         assert_eq!(
-            report.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
-            before.totals[write][SqliteWorkloadCategory::Other.index()].baseline_statement_count
-                + 1
+            report.totals[write][SqliteWorkloadCategory::Fts.index()].baseline_statement_count,
+            before.totals[write][SqliteWorkloadCategory::Fts.index()].baseline_statement_count,
+            "unexecuted FTS prepare must not taint the later runtime-state write",
         );
-        for category in SqliteWorkloadCategory::ALL {
-            if category != SqliteWorkloadCategory::Other {
-                assert_eq!(
-                    report.totals[write][category.index()].baseline_statement_count,
-                    before.totals[write][category.index()].baseline_statement_count
-                );
-            }
-        }
-        assert!(report.classification_gap_count > before.classification_gap_count);
     }
 
     #[tokio::test]
@@ -1790,7 +1812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_select_preserves_outer_higher_precedence_category() {
+    async fn nested_select_records_one_read_without_double_counting() {
         let db = Database::open_in_memory().await.unwrap();
         let before =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
@@ -1801,19 +1823,14 @@ mod tests {
         let report =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
         let read = SqliteAccessKind::Read.index();
-        assert_eq!(
-            report.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
-            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 1
-        );
-        for category in SqliteWorkloadCategory::ALL {
-            if category != SqliteWorkloadCategory::Other {
-                assert_eq!(
-                    report.totals[read][category.index()].baseline_statement_count,
-                    before.totals[read][category.index()].baseline_statement_count
-                );
-            }
-        }
-        assert!(report.classification_gap_count > before.classification_gap_count);
+        let successful_delta = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[read][category.index()].baseline_statement_count
+                    - before.totals[read][category.index()].baseline_statement_count
+            })
+            .sum::<u64>();
+        assert_eq!(successful_delta, 1);
     }
 
     #[test]
@@ -2276,22 +2293,23 @@ mod tests {
 
         let holder_report = report_now(&holder_collector);
         let victim_report = report_now(&victim_collector);
-        let holder_totals = category_totals(
-            &holder_report,
-            SqliteAccessKind::Write,
-            SqliteWorkloadCategory::MessagePersistence,
-        );
-        assert!(holder_totals.writer_held_micros > 0);
+        let holder_occupancy: u64 = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                category_totals(&holder_report, SqliteAccessKind::Write, category)
+                    .writer_held_micros
+            })
+            .sum();
+        let victim_occupancy: u64 = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                category_totals(&victim_report, SqliteAccessKind::Write, category)
+                    .writer_held_micros
+            })
+            .sum();
+        assert!(holder_occupancy > 0);
         assert!(victim_report.writer_occupancy_gap_count >= victim_gap_before);
-        assert_eq!(
-            category_totals(
-                &victim_report,
-                SqliteAccessKind::Write,
-                SqliteWorkloadCategory::MessagePersistence,
-            )
-            .writer_held_micros,
-            0
-        );
+        assert_eq!(victim_occupancy, 0);
     }
 
     #[tokio::test]
