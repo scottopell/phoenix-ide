@@ -39,6 +39,14 @@ describe('ContextExhaustedHandoff', () => {
     await waitFor(() => expect(onContinue).toHaveBeenCalledWith(generated));
   });
 
+  it('does not reset an immediate edit interaction during mount effects', async () => {
+    renderHandoff();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit first' }));
+
+    expect(await screen.findByRole('textbox', { name: 'Edit handoff' })).toHaveValue(generated);
+  });
+
   it('keeps edits browser-local across cancel and remount', () => {
     const first = renderHandoff();
     fireEvent.click(screen.getByRole('button', { name: 'Edit first' }));
