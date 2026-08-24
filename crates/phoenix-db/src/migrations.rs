@@ -375,6 +375,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "correct_product_conversation_lifecycle_seed",
         sql: MIGRATION_071,
     },
+    Migration {
+        version: 72,
+        name: "retain_dormant_product_lifecycle_projection",
+        sql: MIGRATION_072,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -457,7 +462,10 @@ pub(crate) fn normalize_sql(sql: &str) -> String {
 
 const MIGRATION_070: &str = r"
 CREATE TABLE product_conversations (
-    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND trim(id) <> ''),
+    id TEXT PRIMARY KEY CHECK (
+        typeof(id) = 'text'
+        AND trim(id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ') <> ''
+    ),
     kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator')),
     ordinary_lifecycle TEXT CHECK (
         (kind = 'ordinary' AND ordinary_lifecycle IS NOT NULL
@@ -2060,6 +2068,12 @@ END;
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
 ";
 
+const MIGRATION_072: &str = r"
+DROP TRIGGER IF EXISTS product_conversation_lifecycle_after_insert;
+DROP TRIGGER IF EXISTS product_conversation_lifecycle_after_update;
+DROP TRIGGER IF EXISTS product_conversation_lifecycle_after_delete;
+";
+
 const MIGRATION_071: &str = r"
 UPDATE product_conversations
 SET ordinary_lifecycle = CASE WHEN EXISTS (
@@ -2074,14 +2088,14 @@ WHERE kind = 'ordinary';
 
 CREATE TRIGGER product_conversation_id_before_insert
 BEFORE INSERT ON product_conversations
-WHEN trim(NEW.id) = ''
+WHEN trim(NEW.id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ') = ''
 BEGIN
     SELECT RAISE(ABORT, 'product conversation id must not be blank');
 END;
 
 CREATE TRIGGER product_conversation_id_before_update
 BEFORE UPDATE OF id ON product_conversations
-WHEN trim(NEW.id) = ''
+WHEN trim(NEW.id, char(9) || char(10) || char(11) || char(12) || char(13) || ' ') = ''
 BEGIN
     SELECT RAISE(ABORT, 'product conversation id must not be blank');
 END;
@@ -11984,7 +11998,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO _migrations (version, name)
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction')",
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention')",
         )
         .execute(&pool)
         .await
@@ -12862,19 +12877,21 @@ mod tests {
         sqlx::query(
             "INSERT INTO _migrations (version, name)
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
-                    (71, 'temporarily_skip_product_conversation_lifecycle_correction')",
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
+                    (72, 'temporarily_skip_product_conversation_lifecycle_retention')",
         )
         .execute(pool)
         .await
         .unwrap();
         run_pending_migrations(pool).await.unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71)")
+        sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71, 72)")
             .execute(pool)
             .await
             .unwrap();
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_070_backfills_first_class_product_conversations_and_reanchors_close() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
@@ -12912,15 +12929,18 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
 
-        assert!(sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
-             VALUES ('   ', 'ordinary', 'open')",
-        )
-        .execute(&pool)
-        .await
-        .is_err());
+        for blank_id in ["   ", "\t", "\n", " \t\n "] {
+            assert!(sqlx::query(
+                "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+                 VALUES (?1, 'ordinary', 'open')",
+            )
+            .bind(blank_id)
+            .execute(&pool)
+            .await
+            .is_err());
+        }
 
         let memberships: Vec<(String, String)> =
             sqlx::query_as("SELECT id, product_conversation_id FROM conversations ORDER BY id")
@@ -12946,7 +12966,14 @@ mod tests {
             Some("history".into())
         )));
         assert!(aggregates.contains(&("coordinator".into(), "coordinator".into(), None)));
-
+        let synchronizers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name LIKE 'product_conversation_lifecycle_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(synchronizers, 0);
         let close_owner: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM close_obligations WHERE attempt_id = 'attempt-open'",
         )
@@ -12969,6 +12996,17 @@ mod tests {
         .unwrap();
         assert!(close_columns.contains(&"product_conversation_id".to_string()));
         assert!(!close_columns.contains(&"root_conversation_id".to_string()));
+        sqlx::query("UPDATE conversations SET archived = 0 WHERE id = 'archived'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dormant_lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'archived'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dormant_lifecycle, "history");
     }
 
     #[tokio::test]
@@ -12997,7 +13035,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )

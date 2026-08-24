@@ -1991,6 +1991,9 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => None,
     }) {
+        if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
+            return None;
+        }
         return Some(branch);
     }
     if !conversations.iter().any(|conv| {

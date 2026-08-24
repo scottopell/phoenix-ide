@@ -8377,6 +8377,23 @@ impl Database {
                     )
                     .await?;
 
+                    let authority = match mode {
+                        ConvMode::Explore { .. } => AuthorityKind::RestrictedExplore,
+                        ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                            AuthorityKind::Work
+                        }
+                    };
+                    sqlx::query(
+                        "UPDATE work_scopes
+                         SET authority_kind = ?1, updated_at = ?2
+                         WHERE id = ?3",
+                    )
+                    .bind(authority.as_str())
+                    .bind(&now)
+                    .bind(environment_scope.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+
                     let stage_updated = sqlx::query(
                         "UPDATE conversation_creation_jobs SET stage = ?1, updated_at = ?2
                          WHERE id = ?3 AND status = 'claimed' AND generation = ?4
@@ -13763,11 +13780,12 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, CreationCasOutcome::Applied);
 
-        let persisted: (String, String, String, String, String, String) = sqlx::query_as(
+        let persisted: (String, String, String, String, String, String, String) = sqlx::query_as(
             "SELECT c.cm_kind, e.cwd, e.environment_kind, e.worktree_path,
-                    e.branch_name, e.base_branch
+                    e.branch_name, e.base_branch, scope.authority_kind
              FROM conversations c
              JOIN work_scope_environments e ON e.work_scope_id = c.work_scope_id
+             JOIN work_scopes scope ON scope.id = c.work_scope_id
              WHERE c.id = 'conv-mode-environment'",
         )
         .fetch_one(&db.pool)
@@ -13782,6 +13800,7 @@ mod tests {
                 "/tmp/worktree-environment".into(),
                 "feature/environment".into(),
                 "main".into(),
+                "work".into(),
             )
         );
     }
@@ -20391,6 +20410,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+        assert!(matches!(
+            db.get_conversation("handoff-parent").await.unwrap().state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_handoff_creation_failure_rolls_back_source_settlement_and_target() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let awaiting = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/27004-p1-ready--rollback.md".to_string(),
+            title: "Rollback".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "reviewed".to_string(),
+        };
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'handoff-parent'",
+        )
+        .bind(serde_json::to_string(&awaiting).unwrap())
+        .bind(conv_state_kind(&awaiting))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "27004".to_string(),
+            task_title: "Rollback".to_string(),
+            branch_name: "task-27004-rollback".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            worktree_path: "/ignored".to_string(),
+            base_branch: "main".to_string(),
+            title: "Rollback".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "reviewed".to_string(),
+            task_file: "tasks/27004-p1-ready--rollback.md".to_string(),
+        };
+        sqlx::query("DROP TABLE conversation_creation_jobs")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db
+            .create_task_approval_handoff_creation_job("handoff-parent", &approval)
+            .await
+            .is_err());
+        assert!(matches!(
+            db.get_conversation("handoff-parent").await.unwrap().state,
+            ConvState::AwaitingTaskApproval { .. }
+        ));
+        let successors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id <> 'handoff-parent'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(successors, 0);
     }
 
     #[tokio::test]

@@ -2250,6 +2250,23 @@ pub(crate) fn validate_user_ref(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn validate_detached_task_worktree(
+    worktree_path: &std::path::Path,
+    approved_commit_oid: &str,
+) -> Result<(), String> {
+    let head = run_git(worktree_path, &["rev-parse", "HEAD"])?;
+    if head.trim() != approved_commit_oid {
+        return Err(format!(
+            "approved-task worktree HEAD {} does not match approved commit {approved_commit_oid}",
+            head.trim()
+        ));
+    }
+    if run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        return Err("approved-task worktree must remain detached".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn create_detached_task_worktree_blocking(
     repo_root: &str,
     target_path: &std::path::Path,
@@ -5893,7 +5910,15 @@ async fn cascade_project_target(
             branch_name,
             worktree_path,
             ..
-        } => Some((branch_name.to_string(), worktree_path.to_string(), true)),
+        } => Some((
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            crate::git_ops::run_git(
+                std::path::Path::new(worktree_path.as_str()),
+                &["symbolic-ref", "-q", "HEAD"],
+            )
+            .is_ok(),
+        )),
         ConvMode::Branch {
             branch_name,
             worktree_path,
@@ -16461,5 +16486,126 @@ mod wake_handler_tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
         assert_eq!(second.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod detached_task_worktree_tests {
+    use super::*;
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        run_git(path, args).unwrap()
+    }
+
+    fn detached_work_conversation(
+        path: &std::path::Path,
+    ) -> phoenix_core::domain::db_schema::Conversation {
+        use phoenix_core::domain::db_schema::{ConvMode, Conversation, NonEmptyString};
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
+        let now = chrono::Utc::now();
+        Conversation {
+            id: "detached".to_string(),
+            product_conversation_id: ProductConversationId::parse("detached").unwrap(),
+            slug: Some("detached".to_string()),
+            title: Some("Detached".to_string()),
+            cwd: path.to_string_lossy().to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Terminal,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: true,
+            model: None,
+            effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::Work {
+                branch_name: NonEmptyString::new("task-approved").unwrap(),
+                worktree_path: NonEmptyString::new(path.to_string_lossy().to_string()).unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("17002").unwrap(),
+                task_title: NonEmptyString::new("Detached").unwrap(),
+            },
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(WorkScopeId::parse("detached-scope").unwrap()),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn detached_task_cleanup_reaps_worktree_without_deleting_source_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "approved"]);
+        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "task-approved", &approved_oid]);
+        let target = repo.path().join(".phoenix/worktrees/detached-target");
+        create_detached_task_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            &target,
+            &approved_oid,
+        )
+        .unwrap_or_else(|_| panic!("create detached target"));
+        let conversation = detached_work_conversation(&target);
+        assert_eq!(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(&target, [&conversation]),
+            None
+        );
+        git(
+            repo.path(),
+            &["worktree", "remove", "--force", target.to_str().unwrap()],
+        );
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
+            approved_oid
+        );
+    }
+
+    #[test]
+    fn detached_task_target_is_pinned_to_approved_oid_after_branch_moves() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "approved"]);
+        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "task-approved", &approved_oid]);
+        std::fs::write(repo.path().join("task.md"), "moved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "source moved"]);
+        let moved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "-f", "task-approved", &moved_oid]);
+
+        let target = repo.path().join(".phoenix/worktrees/detached-target");
+        create_detached_task_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            &target,
+            &approved_oid,
+        )
+        .unwrap_or_else(|_| panic!("create detached approved target"));
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]).trim(), approved_oid);
+        validate_detached_task_worktree(&target, &approved_oid).unwrap();
+        assert!(validate_detached_task_worktree(&target, &moved_oid).is_err());
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
+            moved_oid
+        );
     }
 }

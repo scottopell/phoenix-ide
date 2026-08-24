@@ -1,7 +1,8 @@
 use crate::api::handlers::{
     create_branch_worktree_blocking, create_detached_task_worktree_blocking,
     create_managed_explore_worktree_blocking, generate_slug, slugify_label, title_from_text,
-    validate_user_ref, AppError, BranchWorktreeError, BranchWorktreeInfo, ManagedWorktreeError,
+    validate_detached_task_worktree, validate_user_ref, AppError, BranchWorktreeError,
+    BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
@@ -579,35 +580,15 @@ async fn provision_conversation(
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     if approved_task_creation {
-                        let approved_commit_oid = approved_task_snapshot
-                            .as_ref()
-                            .expect("approved_task mode has reviewed snapshot")
-                            .approved_commit_oid
-                            .as_str();
-                        let head = crate::git_ops::run_git(
+                        validate_detached_task_worktree(
                             &path_for_blocking,
-                            &["rev-parse", "HEAD"],
+                            approved_task_snapshot
+                                .as_ref()
+                                .expect("approved_task mode has reviewed snapshot")
+                                .approved_commit_oid
+                                .as_str(),
                         )
                         .map_err(|error| (error, ErrorKind::InvalidRequest))?;
-                        if head.trim() != approved_commit_oid {
-                            return Err((
-                                format!(
-                                    "approved-task worktree HEAD {} does not match approved commit {approved_commit_oid}",
-                                    head.trim()
-                                ),
-                                ErrorKind::InvalidRequest,
-                            ));
-                        }
-                        let symbolic_head = crate::git_ops::run_git(
-                            &path_for_blocking,
-                            &["symbolic-ref", "-q", "HEAD"],
-                        );
-                        if symbolic_head.is_ok() {
-                            return Err((
-                                "approved-task worktree must remain detached".to_string(),
-                                ErrorKind::InvalidRequest,
-                            ));
-                        }
                     } else {
                         validate_worktree_branch(&path_for_blocking, &branch_name)?;
                     }
