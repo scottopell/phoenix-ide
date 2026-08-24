@@ -2000,7 +2000,7 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
-        let message_retriever = Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever = Arc::new(db.fts_retriever());
         Self::new_with_message_retriever(
             db,
             llm_registry,
@@ -2068,7 +2068,7 @@ impl RuntimeManager {
         let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
-                phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
+                db.wake_repository(),
                 wake_kick_tx.clone(),
             ));
         Self {
@@ -3066,7 +3066,7 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repository = self.db.workflow_repository();
         self.run_authority_units(conversation_ids, move |conversation_id| {
             let repository = repository.clone();
             async move {
@@ -4138,7 +4138,7 @@ impl RuntimeManager {
             )
             .await;
         }
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let mut consumed_action_ids = HashSet::new();
         loop {
             let actions = self
@@ -4340,7 +4340,7 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<DatabaseTerminalRecovery, DatabaseTerminalRecoveryError> {
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let Some(obligation) = repo
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
@@ -5812,7 +5812,9 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<Option<phoenix_db::workflow::DirectTurnTerminalObligation>, String> {
-        let obligation = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+        let obligation = self
+            .db
+            .workflow_repository()
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
@@ -5858,7 +5860,8 @@ impl RuntimeManager {
             return Ok(true);
         }
 
-        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+        self.db
+            .workflow_repository()
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
@@ -7379,7 +7382,7 @@ mod scope_liveness_tests {
             .await
             .expect("create acceptance conversation");
         manager.signal_fatal_local_authority("test_acceptance_boundary");
-        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let repository = manager.db().workflow_repository();
         let prepared = phoenix_workflow::PreparedTurn::from_exact_payload(
             &phoenix_workflow::ConversationAuthority(conversation.id),
             b"closed acceptance".to_vec(),
@@ -9379,7 +9382,7 @@ mod scope_liveness_tests {
         };
         barrier.wait().await;
 
-        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let repository = manager.db().workflow_repository();
         assert!(repository
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
@@ -9691,8 +9694,7 @@ mod scope_liveness_tests {
             SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
         };
         use phoenix_db::workflow::{
-            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
-            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
         };
         use phoenix_workflow::{
             AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
@@ -9726,7 +9728,7 @@ mod scope_liveness_tests {
             },
         );
         let conversation = ConversationAuthority(conversation_id.to_string());
-        let repo = WorkflowRepository::new(mgr.db().pool().clone());
+        let repo = mgr.db().workflow_repository();
         let accepted = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 client_key: ClientTurnKey::new("direct-message").expect("client key"),

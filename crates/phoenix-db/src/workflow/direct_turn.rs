@@ -1,5 +1,5 @@
 use super::WorkflowRepository;
-use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
 use crate::{DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
@@ -1460,16 +1460,15 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::persist_continuation_start_tx(
@@ -1518,16 +1517,15 @@ impl WorkflowRepository {
         conversation_id: &str,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<Option<String>> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let summary = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let summary = crate::reconcile_legacy_half_committed_continuation_tx(
@@ -1577,16 +1575,15 @@ impl WorkflowRepository {
         &self,
         input: &AtomicContinuationSettlementInput,
     ) -> DbResult<crate::ContinuationCommitOutcome> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(connection.begin().await?))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let outcome = telemetry
             .observe_db(SqlitePhase::Statement, async {
                 let outcome = crate::commit_continuation_tx(
@@ -1973,18 +1970,17 @@ impl WorkflowRepository {
         input: &TerminalizeAuthoritativeTurnInput,
         cut: TransactionCut,
     ) -> DbResult<TurnStep> {
-        let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
+        let telemetry = self.sqlite_telemetry(SqliteOperation::DirectTurnTerminalSettlement);
         let (mut connection, pool_timing) = telemetry
             .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let mut tx = telemetry
-            .observe_db(SqlitePhase::TransactionAcquisition, async {
+        let (mut tx, transaction_timing) = telemetry
+            .observe_transaction_admission_db(pool_timing, async {
                 Ok(super::WorkflowTx::new(
                     connection.begin_with("BEGIN IMMEDIATE").await?,
                 ))
             })
             .await?;
-        let transaction_timing = pool_timing.transaction_started();
         let step = telemetry
             .observe_db(
                 SqlitePhase::Statement,
@@ -2832,7 +2828,14 @@ async fn insert_canonical_message_tx(
             usage_data: None,
             created_at: created_at_dt,
         };
-        crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+        crate::retrieval::fts_upsert_conn(
+            &mut tx.tx,
+            &message,
+            crate::retrieval::FtsObservation::ParentTransaction(
+                crate::sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+            ),
+        )
+        .await?;
         Ok(message)
     } else {
         Ok(Message {

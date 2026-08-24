@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './ContextExhaustedHandoff.css';
 
 const AlertTriangle = () => (
@@ -92,10 +92,14 @@ export function ContextExhaustedHandoff({
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [draftPersisted, setDraftPersisted] = useState(true);
+  const sourceRef = useRef({ parentId, generatedHandoff });
   const hasContinuation = continuedInConvId != null;
   const editorValue = editDraft ?? generatedHandoff;
 
   useEffect(() => {
+    const source = sourceRef.current;
+    if (source.parentId === parentId && source.generatedHandoff === generatedHandoff) return;
+    sourceRef.current = { parentId, generatedHandoff };
     setMode('reviewing');
     setEditDraft(loadEditDraft(parentId, generatedHandoff));
     setFeedback(null);

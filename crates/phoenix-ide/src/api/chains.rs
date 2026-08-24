@@ -410,7 +410,7 @@ pub async fn archive_chain_handler(
             ))));
         }
     }
-    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo
             .has_owed_work_for_conversation(id)
@@ -484,7 +484,7 @@ pub async fn delete_chain_handler(
             ))));
         }
     }
-    let wake_repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let wake_repo = state.db.wake_repository();
     for id in &member_ids {
         if wake_repo
             .has_owed_work_for_conversation(id)
@@ -902,7 +902,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "v-a").await.unwrap();
 
@@ -948,7 +948,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "wi-a").await.unwrap();
 
@@ -973,7 +973,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "wd-a").await.unwrap();
 
@@ -993,7 +993,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "dn-a").await.unwrap();
 
@@ -1012,7 +1012,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "fb-a").await.unwrap();
 
@@ -1060,7 +1060,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "ro-a").await.unwrap();
 
@@ -1100,7 +1100,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "fr-a").await.unwrap();
 
@@ -1138,7 +1138,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "mt-a").await.unwrap();
 
@@ -1157,7 +1157,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let err = build_view_for_test(&db, &chain_qa, "solo")
             .await
@@ -1178,7 +1178,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let err = build_view_for_test(&db, &chain_qa, "nr-b")
             .await
@@ -1195,7 +1195,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let err = build_view_for_test(&db, &chain_qa, "ghost")
             .await
@@ -1216,7 +1216,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let _ = chain_qa
             .submit_question_blocking("q-a", "what happened?")
@@ -1271,7 +1271,7 @@ mod tests {
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             registry_with_test_llm(),
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+            std::sync::Arc::new(db.fts_retriever()),
         );
         let view = build_view_for_test(&db, &chain_qa, "hw-a").await.unwrap();
 

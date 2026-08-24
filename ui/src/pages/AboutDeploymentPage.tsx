@@ -14,6 +14,8 @@ import {
 } from 'recharts';
 import { api } from '../api';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
+import type { SqliteReportWindow } from '../generated/SqliteReportWindow';
+import type { SqliteWorkloadReportResponse } from '../generated/SqliteWorkloadReportResponse';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { ReleaseUpdateSnapshot } from '../generated/ReleaseUpdateSnapshot';
 import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
@@ -57,12 +59,33 @@ type ActiveResourceRequest = {
   abort: () => void;
 };
 
+type SqliteState = {
+  window: SqliteReportWindow;
+  report: SqliteWorkloadReportResponse | null;
+  loading: boolean;
+  error: string | null;
+  stale: boolean;
+};
+
+type SqliteWindowRequest = {
+  generation: number;
+  window: SqliteReportWindow;
+};
+
 const EMPTY_RESOURCES: ResourceState = {
   sample: null,
   history: [],
   loading: true,
   stale: false,
   error: null,
+};
+
+const EMPTY_SQLITE: SqliteState = {
+  window: 'one_hour',
+  report: null,
+  loading: true,
+  error: null,
+  stale: false,
 };
 
 function formatBytes(bytes: number): string {
@@ -97,6 +120,10 @@ function formatNumber(value: number): string {
 function formatRatio(value: number, total: number): string {
   if (total <= 0) return '0%';
   return `${((value / total) * 100).toFixed(1)}%`;
+}
+
+function formatConfidenceDenominator(value: number, noun: string): string {
+  return `${formatNumber(value)} ${noun}`;
 }
 
 function formatUptime(seconds: number): string {
@@ -372,6 +399,188 @@ function ResourceTooltip({ active, payload, label }: { active?: boolean; payload
         </div>
       ))}
     </div>
+  );
+}
+
+const SQLITE_WINDOWS: Array<{ value: SqliteReportWindow; label: string }> = [
+  { value: 'one_hour', label: '1h' },
+  { value: 'six_hours', label: '6h' },
+  { value: 'twenty_four_hours', label: '24h' },
+];
+
+function SqliteDiagnostics({
+  state,
+  selectWindow,
+  refresh,
+}: {
+  state: SqliteState;
+  selectWindow: (window: SqliteReportWindow) => void;
+  refresh: () => void;
+}) {
+  const report = state.report;
+  const hasBaselineSamples = (report?.classification.baseline_statement_count ?? 0) > 0;
+  const hasTypedSamples = (report?.classification.typed_outcome_count ?? 0) > 0;
+  const hasNativeLoad = report?.reads.some((row) => row.total_profiled_read_execution_ms > 0 || row.peak_concurrency > 0) ?? false;
+  const hasWriterOccupancy = report?.writer_categories.some((row) => row.writer_occupancy_percent > 0 || row.peak_concurrency > 0) ?? false;
+  const hasCoverage = (report?.covered_uptime_micros ?? 0) > 0;
+  return (
+    <section className="settings-section about-sqlite-section" aria-labelledby="sqlite-diagnostics-title">
+      <div className="settings-section__title-row">
+        <div>
+          <h3 id="sqlite-diagnostics-title" className="settings-section__title">SQLite workload</h3>
+          <Freshness
+            state={state.stale && report ? 'stale' : state.loading ? 'loading' : report ? 'current' : 'unavailable'}
+            sampledAt={report?.sampled_at}
+          />
+          <div className="settings-section__hint">Read-only aggregate snapshot from in-memory collector buckets. Native baseline, typed outcomes, and occupancy are shown as separate source-qualified tables.</div>
+        </div>
+        <div className="about-sqlite-toolbar">
+          <div className="about-sqlite-window-buttons" role="group" aria-label="SQLite report window">
+            {SQLITE_WINDOWS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                className={`about-sqlite-window-button${state.window === option.value ? ' about-sqlite-window-button--active' : ''}`}
+                onClick={() => selectWindow(option.value)}
+                disabled={state.loading && state.window === option.value}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <button type="button" className="settings-inline-btn" onClick={refresh} disabled={state.loading}>
+            {state.loading ? 'Refreshing SQLite report…' : 'Refresh SQLite report'}
+          </button>
+        </div>
+      </div>
+      {state.error && <div className="settings-section__error">{report ? `SQLite report stale — ${state.error}` : `SQLite report unavailable — ${state.error}`}</div>}
+      {state.loading && <div className="settings-section__hint">{report ? 'Refreshing SQLite report; displayed values are from the previous sample.' : 'Loading SQLite report…'}</div>}
+      {report && !hasCoverage && (
+        <div className="about-sqlite-empty">SQLite workload coverage is warming up; no covered interval is available yet.</div>
+      )}
+      {report && hasCoverage && (
+        <>
+          <dl className="about-sqlite-summary" aria-label="SQLite workload coverage">
+            <div className="about-sqlite-summary__card">
+              <dt>Coverage</dt>
+              <dd>{report.coverage.label}</dd>
+            </div>
+            <div className="about-sqlite-summary__card">
+              <dt>Process uptime</dt>
+              <dd>{formatUptime(report.process_uptime_seconds)}</dd>
+            </div>
+            <div className="about-sqlite-summary__card">
+              <dt>Covered uptime</dt>
+              <dd>{formatUptime(report.covered_uptime_seconds)}</dd>
+            </div>
+            <div className="about-sqlite-summary__card">
+              <dt>Confidence</dt>
+              <dd>{report.coverage.fully_covered ? 'Full requested uptime available' : report.restart_truncated ? 'Restart truncated' : 'Alignment-shortened coverage'}</dd>
+              <div className="settings-section__hint">
+                {report.classification.typed_outcome_count} typed outcomes · {report.classification.typed_other_outcome_count} typed Other{report.classification.typed_other_outcome_share_percent != null ? ` (${formatPercent(report.classification.typed_other_outcome_share_percent, 1)})` : ''} · {report.classification.baseline_statement_count} native baseline statements · {report.classification.baseline_other_statement_count} baseline Other{report.classification.baseline_other_statement_share_percent != null ? ` (${formatPercent(report.classification.baseline_other_statement_share_percent, 1)})` : ''} · {report.classification.abandoned_count} abandoned · {report.classification.classification_gap_count} classification gaps · {report.classification.writer_occupancy_gap_count} writer occupancy gaps
+              </div>
+            </div>
+          </dl>
+          <div className="about-sqlite-tables">
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Native baseline statements by category</h4>
+                <span>{report.baseline_categories.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Native baseline statements</th>
+                    <th>Native statement latency</th>
+                    <th>Confidence denominator</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!hasBaselineSamples && <tr><td colSpan={4}>No native baseline statements captured for this window yet.</td></tr>}
+                  {report.baseline_categories.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.baseline_statement_count)}</td>
+                      <td>avg {row.native_statement_latency.avg_ms ?? '—'} ms · p95≤ {row.native_statement_latency.p95_upper_bound_ms ?? '—'} ms</td>
+                      <td>{formatConfidenceDenominator(row.native_statement_latency.sample_count, 'native statements')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Typed write outcomes and occupancy by category</h4>
+                <span>{report.writer_categories.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Typed writes</th>
+                    <th>Typed latency</th>
+                    <th>Writer occupancy</th>
+                    <th>Peak concurrency</th>
+                    <th>Pool / admission wait</th>
+                    <th>Retries</th>
+                    <th>Failures</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!hasTypedSamples && !hasWriterOccupancy && <tr><td colSpan={8}>No instrumented contention or writer occupancy samples captured for this window yet.</td></tr>}
+                  {report.writer_categories.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.typed_operation_count)}</td>
+                      <td>avg {row.typed_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.typed_latency.sample_count, 'typed writes')}</td>
+                      <td>{formatPercent(row.writer_occupancy_percent, 2)} · n={formatConfidenceDenominator(report.bucket_count, 'covered buckets')}</td>
+                      <td>{formatNumber(row.peak_concurrency)}</td>
+                      <td>pool {row.pool_wait?.avg_ms ?? '—'} ms · admit {row.admission_wait?.avg_ms ?? '—'} ms</td>
+                      <td>{row.retries ? formatNumber(row.retries.retry_count) : '—'}</td>
+                      <td>busy {row.failures.busy} · locked {row.failures.locked} · timeout {row.failures.pool_timeout + row.failures.other_timeout} · fail {row.failures.other_failure} · abandoned {row.failures.abandoned}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+            <section className="about-resources-chart-card">
+              <div className="about-resources-chart-card__head">
+                <h4>Native read load and instrumented contention by category</h4>
+                <span>{report.reads.length} categories</span>
+              </div>
+              <table className="deploy-table about-sqlite-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Typed reads</th>
+                    <th>Typed latency</th>
+                    <th>Native profiled read execution</th>
+                    <th>Profiled statement latency</th>
+                    <th>Peak concurrency</th>
+                    <th>Retries / failures</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!hasTypedSamples && !hasNativeLoad && <tr><td colSpan={7}>No native read load or instrumented read samples captured for this window yet.</td></tr>}
+                  {report.reads.map((row) => (
+                    <tr key={row.category}>
+                      <td>{row.label}</td>
+                      <td>{formatNumber(row.typed_operation_count)}</td>
+                      <td>avg {row.typed_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.typed_latency.sample_count, 'typed reads')}</td>
+                      <td>{row.total_profiled_read_execution_ms} ms</td>
+                      <td>avg {row.profiled_statement_latency.avg_ms ?? '—'} ms · n={formatConfidenceDenominator(row.profiled_statement_latency.sample_count, 'profiled statements')}</td>
+                      <td>{formatNumber(row.peak_concurrency)}</td>
+                      <td>{row.retries ? `${row.retries.retry_count} retries` : 'retries —'} · pool {row.pool_wait?.avg_ms ?? '—'} ms · busy {row.failures.busy} · locked {row.failures.locked} · fail {row.failures.other_failure}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -654,9 +863,12 @@ export function AboutDeploymentPage() {
   const [pendingDeploymentSignal, setPendingDeploymentSignal] = useState(0);
   const [cleanupPath, setCleanupPath] = useState<string | null>(null);
   const [resources, setResources] = useState<ResourceState>(EMPTY_RESOURCES);
+  const [sqlite, setSqlite] = useState<SqliteState>(EMPTY_SQLITE);
   const resourcesInFlightRef = useRef(false);
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
+  const sqliteRequestRef = useRef<SqliteWindowRequest>({ generation: 0, window: 'one_hour' });
+  const sqliteMountedRef = useRef(false);
   const resourcesGenerationRef = useRef(0);
   const identityRefreshRef = useRef<string | null>(null);
   const infoRef = useRef<DeploymentInfo | null>(null);
@@ -833,6 +1045,47 @@ export function AboutDeploymentPage() {
     };
   }, [fetchResources, invalidateActiveResourceRequest]);
 
+  const loadSqlite = useCallback((window: SqliteReportWindow) => {
+    const generation = sqliteRequestRef.current.generation + 1;
+    sqliteRequestRef.current = { generation, window };
+    setSqlite((current) => ({
+      ...current,
+      window,
+      report: current.window === window ? current.report : null,
+      stale: current.window === window && current.stale,
+      loading: true,
+      error: null,
+    }));
+    void api.deploymentSqliteWorkload(window)
+      .then((report) => {
+        if (!sqliteMountedRef.current || sqliteRequestRef.current.generation !== generation || sqliteRequestRef.current.window !== window) return;
+        setSqlite({ window, report, loading: false, error: null, stale: false });
+      })
+      .catch((cause) => {
+        if (!sqliteMountedRef.current || sqliteRequestRef.current.generation !== generation || sqliteRequestRef.current.window !== window) return;
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setSqlite((current) => ({
+          ...current,
+          window,
+          loading: false,
+          stale: current.report !== null,
+          error: message,
+        }));
+      });
+  }, []);
+
+  useEffect(() => {
+    sqliteMountedRef.current = true;
+    loadSqlite('one_hour');
+    return () => {
+      sqliteMountedRef.current = false;
+      sqliteRequestRef.current = {
+        ...sqliteRequestRef.current,
+        generation: sqliteRequestRef.current.generation + 1,
+      };
+    };
+  }, [loadSqlite]);
+
   const handleCleanup = useCallback((path: string) => {
     setCleanupPath(path);
     setCleanupError(null);
@@ -936,6 +1189,12 @@ export function AboutDeploymentPage() {
               )}
 
               <ResourceMonitor state={resources} refresh={() => { fetchResources(true); }} />
+
+              <SqliteDiagnostics
+                state={sqlite}
+                selectWindow={loadSqlite}
+                refresh={() => loadSqlite(sqlite.window)}
+              />
 
               <section className="settings-section">
                 <div className="settings-section__title-row">

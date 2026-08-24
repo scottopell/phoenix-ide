@@ -8,7 +8,9 @@ mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
 pub mod retrieval;
+mod sqlite_native_statement;
 mod sqlite_telemetry;
+mod sqlite_workload;
 pub mod workflow;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
@@ -38,6 +40,12 @@ pub use retrieval::{
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
 };
 pub use schema::*;
+pub use sqlite_workload::{
+    abandoned_count, approximate_percentiles_from_histogram, operation_count, BucketCategoryTotals,
+    SampledSqliteWorkloadAggregateReport, SqliteAccessKind, SqliteLatencyBin, SqliteOutcome,
+    SqlitePercentiles, SqliteSnapshotWindow, SqliteWorkloadAggregateReport, SqliteWorkloadCategory,
+    SqliteWorkloadCollector, SqliteWorkloadSnapshot,
+};
 pub use workflow::*;
 
 use chrono::{DateTime, Utc};
@@ -47,6 +55,7 @@ use phoenix_core::domain::llm_types::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use sqlite_native_statement::install_native_statement_baseline;
 use sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
@@ -1222,6 +1231,7 @@ impl SubAgentCreationTestLatch {
 
 pub struct Database {
     pool: SqlitePool,
+    sqlite_workload_collector: SqliteWorkloadCollector,
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
@@ -1235,6 +1245,7 @@ impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
+            sqlite_workload_collector: self.sqlite_workload_collector.clone(),
             path: self.path.clone(),
             dormant_git_repository_catchup_authority_state: self
                 .dormant_git_repository_catchup_authority_state
@@ -1346,6 +1357,60 @@ impl Database {
         &self.pool
     }
 
+    #[must_use]
+    pub fn fts_retriever(&self) -> retrieval::Fts5Retriever {
+        retrieval::Fts5Retriever::new(self.pool.clone(), self.sqlite_workload_collector.clone())
+    }
+
+    #[must_use]
+    pub fn workflow_repository(&self) -> workflow::WorkflowRepository {
+        workflow::WorkflowRepository::with_sqlite_workload_collector(
+            self.pool.clone(),
+            self.sqlite_workload_collector.clone(),
+        )
+    }
+
+    #[must_use]
+    pub fn wake_repository(&self) -> workflow::wake::WakeRepository {
+        workflow::wake::WakeRepository::with_sqlite_workload_collector(
+            self.pool.clone(),
+            self.sqlite_workload_collector.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn sqlite_workload_aggregate_report(
+        &self,
+        window: SqliteSnapshotWindow,
+        now_unix_micros: u64,
+    ) -> SqliteWorkloadAggregateReport {
+        self.sqlite_workload_collector
+            .aggregate_report(window, now_unix_micros)
+    }
+
+    #[must_use]
+    pub fn sample_sqlite_workload_aggregate_report(
+        &self,
+        window: SqliteSnapshotWindow,
+    ) -> SampledSqliteWorkloadAggregateReport {
+        self.sqlite_workload_collector.aggregate_report_now(window)
+    }
+
+    fn sqlite_telemetry(
+        &self,
+        operation: SqliteOperation,
+        category: SqliteWorkloadCategory,
+        access: SqliteAccessKind,
+    ) -> SqliteTelemetry {
+        SqliteTelemetry::with_collector(
+            operation,
+            category,
+            access,
+            self.sqlite_workload_collector.clone(),
+        )
+    }
+
     #[allow(
         dead_code,
         reason = "task 59004 consumes the existing dormant catch-up seam"
@@ -1375,9 +1440,14 @@ impl Database {
         )
     }
 
-    fn new_with_generated_target_binding(pool: SqlitePool, path: String) -> Self {
+    fn new_with_generated_target_binding(
+        pool: SqlitePool,
+        path: String,
+        sqlite_workload_collector: SqliteWorkloadCollector,
+    ) -> Self {
         Self {
             pool,
+            sqlite_workload_collector,
             path,
             dormant_git_repository_catchup_authority_state: std::sync::Arc::new(
                 git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState::default(),
@@ -1389,7 +1459,7 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn from_pool_for_tests(pool: SqlitePool, path: String) -> Self {
-        Self::new_with_generated_target_binding(pool, path)
+        Self::new_with_generated_target_binding(pool, path, SqliteWorkloadCollector::new())
     }
 
     /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
@@ -2701,13 +2771,29 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
+        let pool = SqlitePoolOptions::new()
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
+            .connect_with(opts)
+            .await?;
         // The DB (and its WAL sidecars) holds conversation history — command
         // output, secrets the agent saw. On a multi-user host the default umask
         // can leave it world-readable, so tighten to owner-only. Best-effort:
         // a chmod failure is logged, never fatal to startup.
         restrict_db_permissions(path);
-        let db = Self::new_with_generated_target_binding(pool, path.to_string());
+        let db = Self::new_with_generated_target_binding(
+            pool,
+            path.to_string(),
+            sqlite_workload_collector,
+        );
         db.run_migrations().await?;
         // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
         // early chmod above could not see. Re-tighten now they exist. The prod
@@ -2751,11 +2837,22 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         // In-memory SQLite DBs are per-connection, so limit to 1 connection
+        let sqlite_workload_collector = SqliteWorkloadCollector::new();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect({
+                let sqlite_workload_collector = sqlite_workload_collector.clone();
+                move |conn, _meta| {
+                    let sqlite_workload_collector = sqlite_workload_collector.clone();
+                    Box::pin(async move {
+                        install_native_statement_baseline(conn, sqlite_workload_collector).await
+                    })
+                }
+            })
             .connect_with(opts)
             .await?;
-        let db = Self::new_with_generated_target_binding(pool, String::new());
+        let db =
+            Self::new_with_generated_target_binding(pool, String::new(), sqlite_workload_collector);
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)
@@ -5693,7 +5790,10 @@ impl Database {
             usage_data: usage_data.cloned(),
             created_at: now,
         };
-        if let Err(error) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(message_id, %error, "failed to index creation message; startup reconcile will repair");
         }
         Ok(CreationRuntimeMaterialization::Materialized(Box::new(
@@ -6726,9 +6826,18 @@ impl Database {
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
         let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::CreateTaskApprovalHandoff);
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let fts_telemetry = self.sqlite_telemetry(
+            SqliteOperation::CreateTaskApprovalHandoff,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
+        let (mut connection, pool_timing) = fts_telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
+            .await?;
+        let (mut tx, transaction_timing) = fts_telemetry
+            .observe_transaction_admission_db(pool_timing, async {
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+            })
             .await?;
         fts_telemetry
             .observe_sqlx(
@@ -6903,11 +7012,21 @@ impl Database {
             usage_data: None,
             created_at: now,
         };
-        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &seed_msg, &fts_telemetry).await?;
-        retrieval::fts_upsert_conn_with_telemetry(&mut tx, &handoff_msg, &fts_telemetry).await?;
+        retrieval::fts_upsert_conn(
+            &mut tx,
+            &seed_msg,
+            retrieval::FtsObservation::Standalone(&fts_telemetry),
+        )
+        .await?;
+        retrieval::fts_upsert_conn(
+            &mut tx,
+            &handoff_msg,
+            retrieval::FtsObservation::Standalone(&fts_telemetry),
+        )
+        .await?;
 
         fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
+            .observe_commit_db(transaction_timing, async { Ok(tx.commit().await?) })
             .await?;
 
         Ok(Conversation {
@@ -7825,7 +7944,14 @@ impl Database {
                 .try_map(parse_message_row)
                 .fetch_one(&mut *tx)
                 .await?;
-                retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+                retrieval::fts_upsert_conn(
+                    &mut tx,
+                    &updated_message,
+                    retrieval::FtsObservation::ParentTransaction(
+                        sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                    ),
+                )
+                .await?;
                 Some(
                     sqlx::query_scalar(
                         "UPDATE conversations
@@ -8471,52 +8597,95 @@ impl Database {
         // conversations, so without the shared transaction a crash could leave
         // either orphaned index rows or invisible orphan workflow rows after a
         // hard delete.
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::ConversationDelete);
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let telemetry = self.sqlite_telemetry(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
+        let (mut connection, acquisition) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query(
-                    "DELETE FROM workflows
-             WHERE workflow_id IN (
-                 SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
-             )",
-                )
+        let ((), timing) = telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *connection)
+                    .await
+                    .map(|_| ())
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let body = async {
+            sqlx::query(
+                "DELETE FROM workflows
+                 WHERE workflow_id IN (
+                     SELECT workflow_id FROM wake_bindings WHERE conversation_id = ?1
+                 )",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
+                 SELECT turn_id, conversation_id FROM durable_turns
+                 WHERE conversation_id = ?1 AND disposition = 'Runtime'",
+            )
+            .bind(id)
+            .execute(&mut *connection)
+            .await?;
+            let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
                 .bind(id)
-                .execute(&mut *tx),
+                .execute(&mut *connection)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Ok(false);
+            }
+            retrieval::fts_delete_conversation_conn(
+                &mut connection,
+                id,
+                telemetry.parent_observer(),
             )
             .await?;
-        fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query(
-                    "INSERT OR IGNORE INTO direct_turn_retirements (turn_id, conversation_id)
-                     SELECT turn_id, conversation_id FROM durable_turns
-                     WHERE conversation_id = ?1 AND disposition = 'Runtime'",
-                )
-                .bind(id)
-                .execute(&mut *tx),
-            )
-            .await?;
-        let result = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query("DELETE FROM conversations WHERE id = ?1")
-                    .bind(id)
-                    .execute(&mut *tx),
-            )
-            .await?;
-        if result.rows_affected() == 0 {
-            // tx dropped without commit → rollback.
-            return Err(DbError::ConversationNotFound(id.to_string()));
+            Ok::<_, DbError>(true)
         }
-        retrieval::fts_delete_conversation_conn_with_telemetry(&mut tx, id, &fts_telemetry).await?;
-        fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
-            .await?;
-        Ok(())
+        .await;
+
+        match body {
+            Ok(true) => {
+                telemetry
+                    .observe_commit_db(timing, async {
+                        sqlx::query("COMMIT")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await
+            }
+            Ok(false) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await?;
+                Err(DbError::ConversationNotFound(id.to_string()))
+            }
+            Err(error) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut *connection)
+                            .await
+                            .map(|_| ())
+                            .map_err(DbError::from)
+                    })
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Rename conversation (update slug)
@@ -9004,7 +9173,14 @@ impl Database {
             .try_map(parse_message_row)
             .fetch_one(&mut *tx)
             .await?;
-            retrieval::fts_upsert_conn(&mut tx, &updated_message).await?;
+            retrieval::fts_upsert_conn(
+                &mut tx,
+                &updated_message,
+                retrieval::FtsObservation::ParentTransaction(
+                    sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested,
+                ),
+            )
+            .await?;
         } else {
             let sequence_id: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(MAX(sequence_id), 0) + 1
@@ -9664,7 +9840,10 @@ impl Database {
             usage_data: usage_data.cloned(),
             created_at: now,
         };
-        if let Err(error) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(error) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id,
                 error = %error,
@@ -9751,7 +9930,10 @@ impl Database {
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
         // The startup reconcile is the backstop if this ever fails after the
         // message row commits.
-        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(e) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id, error = %e,
                 "failed to index message for retrieval; startup reconcile will repair",
@@ -9831,7 +10013,10 @@ impl Database {
             created_at,
         };
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
-        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+        if let Err(e) =
+            retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                .await
+        {
             tracing::warn!(
                 message_id = %message.message_id, error = %e,
                 "failed to index message for retrieval; startup reconcile will repair",
@@ -10287,58 +10472,90 @@ impl Database {
         message_id: &str,
         display_data: &serde_json::Value,
     ) -> DbResult<i64> {
-        let display_str = serde_json::to_string(display_data)
-            .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let mut message = self.get_message_by_id(message_id).await?;
-        message.display_data = Some(display_data.clone());
-        let hidden = display_data
-            .get("hidden")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let fts_telemetry = SqliteTelemetry::new(SqliteOperation::UpdateMessageDisplayData);
-        let mut tx = fts_telemetry
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, self.pool.begin())
+        let telemetry = self.sqlite_telemetry(
+            SqliteOperation::UpdateMessageDisplayData,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+        );
+        let (mut connection, acquisition) = telemetry
+            .observe_pool_acquisition_sqlx(self.pool.acquire())
             .await?;
-        let conversation_id: Option<String> = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query_scalar(
-                    "UPDATE messages
-             SET display_data = ?1
-             WHERE message_id = ?2
-             RETURNING conversation_id",
-                )
-                .bind(&display_str)
-                .bind(message_id)
-                .fetch_optional(&mut *tx),
+        let (mut tx, timing) = telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+            })
+            .await?;
+        let body = async {
+            let mut message = sqlx::query(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                        display_data, usage_data, created_at
+                 FROM messages WHERE message_id = ?1",
             )
+            .bind(message_id)
+            .try_map(parse_message_row)
+            .fetch_optional(&mut *tx)
             .await?;
-        let Some(conversation_id) = conversation_id else {
-            tx.rollback().await?;
-            return Err(DbError::MessageNotFound(message_id.to_string()));
-        };
-        let transcript_generation: i64 = fts_telemetry
-            .observe_sqlx(
-                SqlitePhase::Statement,
-                sqlx::query_scalar(
-                    "UPDATE conversations
-             SET transcript_generation = transcript_generation + 1
-             WHERE id = ?1
-             RETURNING transcript_generation",
-                )
-                .bind(conversation_id)
-                .fetch_one(&mut *tx),
+            let Some(mut message) = message.take() else {
+                return Ok(None);
+            };
+            hydrate_attachments_conn(&mut tx, std::slice::from_mut(&mut message)).await?;
+            message.display_data = Some(display_data.clone());
+            let display_str = serde_json::to_string(display_data)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let conversation_id: String = sqlx::query_scalar(
+                "UPDATE messages
+                 SET display_data = ?1
+                 WHERE message_id = ?2
+                 RETURNING conversation_id",
             )
+            .bind(&display_str)
+            .bind(message_id)
+            .fetch_one(&mut *tx)
             .await?;
-        if hidden {
-            retrieval::fts_hide_message_tx(&mut tx, &message, &fts_telemetry).await?;
-        } else {
-            retrieval::fts_index_message_tx(&mut tx, &message, &fts_telemetry).await?;
+            let transcript_generation: i64 = sqlx::query_scalar(
+                "UPDATE conversations
+                 SET transcript_generation = transcript_generation + 1
+                 WHERE id = ?1
+                 RETURNING transcript_generation",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let hidden = display_data
+                .get("hidden")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if hidden {
+                retrieval::fts_hide_message_tx(&mut tx, &message, telemetry.parent_observer())
+                    .await?;
+            } else {
+                retrieval::fts_index_message_tx(&mut tx, &message, telemetry.parent_observer())
+                    .await?;
+            }
+            Ok::<_, DbError>(Some(transcript_generation))
         }
-        fts_telemetry
-            .observe_sqlx(SqlitePhase::Commit, tx.commit())
-            .await?;
-        Ok(transcript_generation)
+        .await;
+
+        match body {
+            Ok(Some(transcript_generation)) => {
+                telemetry
+                    .observe_commit_db(timing, async { Ok(tx.commit().await?) })
+                    .await?;
+                Ok(transcript_generation)
+            }
+            Ok(None) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
+                    .await?;
+                Err(DbError::MessageNotFound(message_id.to_string()))
+            }
+            Err(error) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, async { Ok(tx.rollback().await?) })
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Update the `content` text field inside a tool result message's JSON.
@@ -10391,7 +10608,10 @@ impl Database {
         if let Some(mut message) = updated {
             // Hydrate attachments so the re-indexed text keeps file-context tags.
             hydrate_attachments(&self.pool, std::slice::from_mut(&mut message)).await?;
-            if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            if let Err(e) =
+                retrieval::fts_upsert(&self.pool, &message, self.sqlite_workload_collector.clone())
+                    .await
+            {
                 tracing::warn!(
                     message_id = %message.message_id, error = %e,
                     "failed to index message for retrieval; startup reconcile will repair",
@@ -11836,6 +12056,7 @@ async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
 ) -> DbResult<()> {
+    let observer = sqlite_telemetry::ParentSqliteObserver::UninstrumentedNested;
     let content_str = serde_json::to_string(&msg.content.to_stored_json())
         .map_err(|e| DbError::Serialization(e.to_string()))?;
     let display_str = msg
@@ -11889,7 +12110,12 @@ async fn insert_message_tx(
                 msg.message_id
             )));
         }
-        retrieval::fts_upsert_conn(tx, msg).await?;
+        retrieval::fts_upsert_conn(
+            tx,
+            msg,
+            retrieval::FtsObservation::ParentTransaction(observer),
+        )
+        .await?;
         return Ok(());
     }
     insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
@@ -11898,7 +12124,12 @@ async fn insert_message_tx(
     // same FTS coverage as `add_message_with_seq` — no message reaches a chain
     // unindexed before the startup reconcile (specs/conversation-retrieval/
     // REQ-RET-003).
-    retrieval::fts_upsert_conn(tx, msg).await?;
+    retrieval::fts_upsert_conn(
+        tx,
+        msg,
+        retrieval::FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
     Ok(())
 }
 

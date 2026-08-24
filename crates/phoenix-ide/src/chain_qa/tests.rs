@@ -131,7 +131,7 @@ fn registry_with_service(service: Arc<dyn LlmService>) -> Arc<ModelRegistry> {
 /// An FTS5 retriever over the test db's pool, for the Q&A agent's
 /// `search_conversations` tool.
 fn test_retriever(db: &Database) -> Arc<dyn crate::db::MessageRetriever> {
-    Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()))
+    Arc::new(db.fts_retriever())
 }
 
 #[tokio::test]

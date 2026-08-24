@@ -1,4 +1,12 @@
+#[cfg(test)]
+use crate::sqlite_workload::operation_count;
+use crate::sqlite_workload::{
+    SqliteAccessKind, SqliteOutcome, SqliteWaitMeasurement, SqliteWorkloadCategory,
+    SqliteWorkloadCollector, TypedOutcomeObservation,
+};
 use crate::{DbError, DbResult};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::field;
 
@@ -10,11 +18,10 @@ pub(crate) enum SqliteOperation {
     ConversationDelete,
     CreateTaskApprovalHandoff,
     DirectTurnTerminalSettlement,
-    FtsDeleteConversation,
-    FtsDeleteMessage,
     FtsReconcileUpsert,
     FtsUpsert,
     UpdateMessageDisplayData,
+    WakePendingDeliveryMaterialization,
 }
 
 impl SqliteOperation {
@@ -23,11 +30,48 @@ impl SqliteOperation {
             Self::ConversationDelete => "conversation.delete",
             Self::CreateTaskApprovalHandoff => "conversation.task_approval_handoff",
             Self::DirectTurnTerminalSettlement => "direct_turn.terminal_settlement",
-            Self::FtsDeleteConversation => "fts.delete_conversation",
-            Self::FtsDeleteMessage => "fts.delete_message",
             Self::FtsReconcileUpsert => "fts.reconcile_upsert",
             Self::FtsUpsert => "fts.upsert",
             Self::UpdateMessageDisplayData => "message.update_display_data",
+            Self::WakePendingDeliveryMaterialization => "wake.pending_delivery_materialization",
+        }
+    }
+}
+
+impl SqliteWorkloadCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MessagePersistence => "message_persistence",
+            Self::DurableWorkflows => "durable_workflows",
+            Self::Fts => "fts",
+            Self::RuntimeState => "runtime_state",
+            Self::PrProjectData => "pr_project_data",
+            Self::Maintenance => "maintenance",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl SqliteAccessKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[cfg(test)]
+impl SqliteOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Busy => "busy",
+            Self::Locked => "locked",
+            Self::PoolTimeout => "pool_timeout",
+            Self::OtherTimeout => "other_timeout",
+            Self::OtherFailure => "other_failure",
+            Self::Abandoned => "abandoned",
         }
     }
 }
@@ -96,6 +140,7 @@ impl SlowSqlitePhase {
 #[must_use = "transaction timing must be completed with the transaction"]
 pub(crate) struct SuccessfulTransactionTiming {
     acquisition_elapsed: Duration,
+    admission_elapsed: Duration,
     transaction_started_at: Instant,
 }
 
@@ -105,9 +150,10 @@ pub(crate) struct SuccessfulPoolAcquisitionTiming {
 }
 
 impl SuccessfulPoolAcquisitionTiming {
-    pub(crate) fn transaction_started(self) -> SuccessfulTransactionTiming {
+    fn admitted(self, admission_elapsed: Duration) -> SuccessfulTransactionTiming {
         SuccessfulTransactionTiming {
             acquisition_elapsed: self.acquisition_elapsed,
+            admission_elapsed,
             transaction_started_at: Instant::now(),
         }
     }
@@ -115,10 +161,14 @@ impl SuccessfulPoolAcquisitionTiming {
 
 impl SuccessfulTransactionTiming {
     #[cfg(test)]
-    fn from_boundaries(acquisition_started_at: Instant, transaction_started_at: Instant) -> Self {
+    fn from_durations(
+        acquisition_elapsed: Duration,
+        admission_elapsed: Duration,
+        transaction_started_at: Instant,
+    ) -> Self {
         Self {
-            acquisition_elapsed: transaction_started_at
-                .saturating_duration_since(acquisition_started_at),
+            acquisition_elapsed,
+            admission_elapsed,
             transaction_started_at,
         }
     }
@@ -126,6 +176,7 @@ impl SuccessfulTransactionTiming {
     fn complete_at(self, transaction_ended_at: Instant) -> CompletedTransactionTiming {
         CompletedTransactionTiming {
             acquisition_elapsed: self.acquisition_elapsed,
+            write_admission_wait_elapsed: self.admission_elapsed,
             transaction_elapsed: transaction_ended_at
                 .saturating_duration_since(self.transaction_started_at),
         }
@@ -133,8 +184,10 @@ impl SuccessfulTransactionTiming {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
 struct CompletedTransactionTiming {
     acquisition_elapsed: Duration,
+    write_admission_wait_elapsed: Duration,
     transaction_elapsed: Duration,
 }
 
@@ -194,17 +247,130 @@ const fn sqlx_error_kind(error: &sqlx::Error) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvenWaits {
+    None,
+    Pool(Duration),
+    PoolAndAdmission { pool: Duration, admission: Duration },
+}
+
+impl ProvenWaits {
+    const fn measurement(self) -> SqliteWaitMeasurement {
+        match self {
+            Self::None => SqliteWaitMeasurement::Unavailable,
+            Self::Pool(pool_wait) => SqliteWaitMeasurement::PoolOnly { pool_wait },
+            Self::PoolAndAdmission { pool, admission } => SqliteWaitMeasurement::PoolAndAdmission {
+                pool_wait: pool,
+                admission_wait: admission,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ParentSqliteObserver<'a> {
+    Instrumented(&'a SqliteTelemetry),
+    UninstrumentedNested,
+}
+
+impl ParentSqliteObserver<'_> {
+    pub(crate) async fn observe<T>(
+        self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        match self {
+            Self::Instrumented(telemetry) => telemetry.observe_nested_sqlx(phase, operation).await,
+            Self::UninstrumentedNested => {
+                let result = operation.await;
+                if let Err(error) = &result {
+                    emit_uninstrumented_nested_failure(phase, error);
+                }
+                result
+            }
+        }
+    }
+}
+
 pub(crate) struct SqliteTelemetry {
     operation: SqliteOperation,
+    category: SqliteWorkloadCategory,
+    access: SqliteAccessKind,
+    collector: Option<SqliteWorkloadCollector>,
     started_at: Instant,
+    outcome_recorded: AtomicBool,
+    lifecycle_completed: AtomicBool,
+    proven_waits: Mutex<ProvenWaits>,
+}
+
+impl Drop for SqliteTelemetry {
+    fn drop(&mut self) {
+        if self.lifecycle_completed.load(Ordering::Acquire)
+            || self.outcome_recorded.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(collector) = &self.collector else {
+            return;
+        };
+        collector.record_typed_outcome(TypedOutcomeObservation {
+            category: self.category,
+            access: self.access,
+            latency: self.started_at.elapsed(),
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            outcome: SqliteOutcome::Abandoned,
+            waits: self.proven_waits().measurement(),
+        });
+    }
 }
 
 impl SqliteTelemetry {
     pub(crate) fn new(operation: SqliteOperation) -> Self {
+        Self::without_collector(
+            operation,
+            SqliteWorkloadCategory::Other,
+            SqliteAccessKind::Write,
+        )
+    }
+
+    pub(crate) fn with_collector(
+        operation: SqliteOperation,
+        category: SqliteWorkloadCategory,
+        access: SqliteAccessKind,
+        collector: SqliteWorkloadCollector,
+    ) -> Self {
         Self {
             operation,
+            category,
+            access,
+            collector: Some(collector),
             started_at: Instant::now(),
+            outcome_recorded: AtomicBool::new(false),
+            lifecycle_completed: AtomicBool::new(false),
+            proven_waits: Mutex::new(ProvenWaits::None),
         }
+    }
+
+    pub(crate) fn without_collector(
+        operation: SqliteOperation,
+        category: SqliteWorkloadCategory,
+        access: SqliteAccessKind,
+    ) -> Self {
+        Self {
+            operation,
+            category,
+            access,
+            collector: None,
+            started_at: Instant::now(),
+            outcome_recorded: AtomicBool::new(false),
+            lifecycle_completed: AtomicBool::new(false),
+            proven_waits: Mutex::new(ProvenWaits::None),
+        }
+    }
+
+    pub(crate) fn parent_observer(&self) -> ParentSqliteObserver<'_> {
+        ParentSqliteObserver::Instrumented(self)
     }
 
     pub(crate) async fn observe_sqlx<T>(
@@ -212,11 +378,37 @@ impl SqliteTelemetry {
         phase: SqlitePhase,
         operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
     ) -> Result<T, sqlx::Error> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
         let phase_started_at = Instant::now();
         let result = operation.await;
-        result.inspect_err(|error| {
-            self.record_failure(phase, phase_started_at.elapsed(), error);
-        })
+        match &result {
+            Ok(_) if matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback) => {
+                self.lifecycle_completed.store(true, Ordering::Release);
+            }
+            Err(error) => self.record_failure(phase, phase_started_at.elapsed(), error),
+            Ok(_) => {}
+        }
+        result
+    }
+
+    pub(crate) async fn observe_nested_sqlx<T>(
+        &self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
+        let phase_started_at = Instant::now();
+        let result = operation.await;
+        if let Err(error) = &result {
+            self.record_sparse_failure(phase, phase_started_at.elapsed(), error);
+        }
+        result
     }
 
     pub(crate) async fn observe_db<T>(
@@ -224,29 +416,83 @@ impl SqliteTelemetry {
         phase: SqlitePhase,
         operation: impl std::future::Future<Output = DbResult<T>>,
     ) -> DbResult<T> {
+        assert!(
+            !matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback),
+            "transaction terminals require typed commit/rollback observation",
+        );
         let phase_started_at = Instant::now();
         let result = operation.await;
-        result.inspect_err(|error| {
-            if let DbError::Sqlx(sqlx_error) = error {
-                self.record_failure(phase, phase_started_at.elapsed(), sqlx_error);
+        match &result {
+            Ok(_) if matches!(phase, SqlitePhase::Commit | SqlitePhase::Rollback) => {
+                self.lifecycle_completed.store(true, Ordering::Release);
             }
-        })
+            Err(DbError::Sqlx(error)) => {
+                self.record_failure(phase, phase_started_at.elapsed(), error);
+            }
+            Err(_) | Ok(_) => {}
+        }
+        result
     }
 
     pub(crate) async fn observe_pool_acquisition_sqlx<T>(
         &self,
         operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
     ) -> Result<(T, SuccessfulPoolAcquisitionTiming), sqlx::Error> {
-        let acquisition_started_at = Instant::now();
-        let value = self
-            .observe_sqlx(SqlitePhase::TransactionAcquisition, operation)
-            .await?;
-        Ok((
-            value,
-            SuccessfulPoolAcquisitionTiming {
-                acquisition_elapsed: acquisition_started_at.elapsed(),
-            },
-        ))
+        let started_at = Instant::now();
+        match operation.await {
+            Ok(value) => {
+                let acquisition_elapsed = started_at.elapsed();
+                self.set_proven_waits(ProvenWaits::Pool(acquisition_elapsed));
+                Ok((
+                    value,
+                    SuccessfulPoolAcquisitionTiming {
+                        acquisition_elapsed,
+                    },
+                ))
+            }
+            Err(error) => {
+                let acquisition_elapsed = started_at.elapsed();
+                self.set_proven_waits(ProvenWaits::Pool(acquisition_elapsed));
+                self.record_failure(
+                    SqlitePhase::TransactionAcquisition,
+                    acquisition_elapsed,
+                    &error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn observe_transaction_admission_db<T>(
+        &self,
+        pool: SuccessfulPoolAcquisitionTiming,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<(T, SuccessfulTransactionTiming)> {
+        let started_at = Instant::now();
+        match operation.await {
+            Ok(value) => {
+                let admission_elapsed = started_at.elapsed();
+                self.set_proven_waits(ProvenWaits::PoolAndAdmission {
+                    pool: pool.acquisition_elapsed,
+                    admission: admission_elapsed,
+                });
+                Ok((value, pool.admitted(admission_elapsed)))
+            }
+            Err(DbError::Sqlx(error)) => {
+                let admission_elapsed = started_at.elapsed();
+                self.set_proven_waits(ProvenWaits::PoolAndAdmission {
+                    pool: pool.acquisition_elapsed,
+                    admission: admission_elapsed,
+                });
+                self.record_failure(
+                    SqlitePhase::TransactionAcquisition,
+                    admission_elapsed,
+                    &error,
+                );
+                Err(DbError::Sqlx(error))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn observe_commit_db<T>(
@@ -258,6 +504,7 @@ impl SqliteTelemetry {
             timing,
             SqlitePhase::Commit,
             SqliteTransactionOutcome::Committed,
+            SqliteOutcome::Success,
             operation,
         )
         .await
@@ -272,21 +519,85 @@ impl SqliteTelemetry {
             timing,
             SqlitePhase::Rollback,
             SqliteTransactionOutcome::RolledBack,
+            SqliteOutcome::Success,
             operation,
         )
         .await
+    }
+
+    pub(crate) async fn observe_failure_rollback_db<T>(
+        &self,
+        timing: SuccessfulTransactionTiming,
+        operation: impl std::future::Future<Output = DbResult<T>>,
+    ) -> DbResult<T> {
+        self.observe_transaction_completion_db(
+            timing,
+            SqlitePhase::Rollback,
+            SqliteTransactionOutcome::RolledBack,
+            SqliteOutcome::OtherFailure,
+            operation,
+        )
+        .await
+    }
+
+    fn finish_successful_transaction(
+        &self,
+        timing: CompletedTransactionTiming,
+        transaction_outcome: SqliteTransactionOutcome,
+        operation_outcome: SqliteOutcome,
+    ) {
+        self.lifecycle_completed.store(true, Ordering::Release);
+        self.record_typed_outcome(TypedOutcomeObservation {
+            category: self.category,
+            access: self.access,
+            latency: self.started_at.elapsed(),
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            outcome: operation_outcome,
+            waits: SqliteWaitMeasurement::PoolAndAdmission {
+                pool_wait: timing.acquisition_elapsed,
+                admission_wait: timing.write_admission_wait_elapsed,
+            },
+        });
+        self.record_slow_success(timing, transaction_outcome);
     }
 
     async fn observe_transaction_completion_db<T>(
         &self,
         timing: SuccessfulTransactionTiming,
         phase: SqlitePhase,
-        outcome: SqliteTransactionOutcome,
+        transaction_outcome: SqliteTransactionOutcome,
+        operation_outcome: SqliteOutcome,
         operation: impl std::future::Future<Output = DbResult<T>>,
     ) -> DbResult<T> {
-        let value = self.observe_db(phase, operation).await?;
-        self.record_slow_success(timing.complete_at(Instant::now()), outcome);
-        Ok(value)
+        let phase_started_at = Instant::now();
+        match operation.await {
+            Ok(value) => {
+                self.finish_successful_transaction(
+                    timing.complete_at(Instant::now()),
+                    transaction_outcome,
+                    operation_outcome,
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                if let DbError::Sqlx(sqlx_error) = &error {
+                    self.record_failure(phase, phase_started_at.elapsed(), sqlx_error);
+                } else {
+                    self.lifecycle_completed.store(true, Ordering::Release);
+                    self.record_typed_outcome(TypedOutcomeObservation {
+                        category: self.category,
+                        access: self.access,
+                        latency: self.started_at.elapsed(),
+                        retry_count: 0,
+                        retry_backoff: Duration::ZERO,
+                        outcome: SqliteOutcome::OtherFailure,
+                        waits: self.proven_waits().measurement(),
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     fn record_slow_success(
@@ -306,6 +617,8 @@ impl SqliteTelemetry {
             "db.slow_operation",
             db.system = "sqlite",
             db.operation = self.operation.as_str(),
+            db.category = self.category.as_str(),
+            db.access = self.access.as_str(),
             db.outcome = outcome.as_str(),
             db.slow_phase = slow_phase.as_str(),
             db.pool_acquisition_ms = trace_millis(pool_acquisition_ms),
@@ -316,6 +629,8 @@ impl SqliteTelemetry {
             target: "phoenix_db::observability",
             db_system = "sqlite",
             db_operation = self.operation.as_str(),
+            db_category = self.category.as_str(),
+            db_access = self.access.as_str(),
             db_outcome = outcome.as_str(),
             db_slow_phase = slow_phase.as_str(),
             db_pool_acquisition_ms = pool_acquisition_ms,
@@ -324,7 +639,30 @@ impl SqliteTelemetry {
         );
     }
 
+    fn record_sparse_failure(
+        &self,
+        phase: SqlitePhase,
+        phase_elapsed: Duration,
+        error: &sqlx::Error,
+    ) {
+        self.emit_failure(phase, phase_elapsed, error);
+    }
+
     fn record_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
+        self.lifecycle_completed.store(true, Ordering::Release);
+        self.emit_failure(phase, phase_elapsed, error);
+        self.record_typed_outcome(TypedOutcomeObservation {
+            category: self.category,
+            access: self.access,
+            latency: self.started_at.elapsed(),
+            retry_count: 0,
+            retry_backoff: Duration::ZERO,
+            outcome: classify_outcome(error),
+            waits: self.proven_waits().measurement(),
+        });
+    }
+
+    fn emit_failure(&self, phase: SqlitePhase, phase_elapsed: Duration, error: &sqlx::Error) {
         let elapsed_ms = elapsed_millis(self.started_at.elapsed());
         let phase_elapsed_ms = elapsed_millis(phase_elapsed);
         let codes = SqliteResultCodes::from_error(error);
@@ -338,6 +676,8 @@ impl SqliteTelemetry {
             db.operation = self.operation.as_str(),
             db.phase = phase.as_str(),
             db.error.kind = error_kind,
+            db.category = self.category.as_str(),
+            db.access = self.access.as_str(),
             db.elapsed_ms = trace_millis(elapsed_ms),
             db.phase_elapsed_ms = trace_millis(phase_elapsed_ms),
             db.sqlite.primary_code = field::Empty,
@@ -356,6 +696,8 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
+                db_category = self.category.as_str(),
+                db_access = self.access.as_str(),
                 db_error_kind = error_kind,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
@@ -369,6 +711,8 @@ impl SqliteTelemetry {
                 db_system = "sqlite",
                 db_operation = self.operation.as_str(),
                 db_phase = phase.as_str(),
+                db_category = self.category.as_str(),
+                db_access = self.access.as_str(),
                 db_error_kind = error_kind,
                 db_elapsed_ms = elapsed_ms,
                 db_phase_elapsed_ms = phase_elapsed_ms,
@@ -376,6 +720,80 @@ impl SqliteTelemetry {
             );
         }
     }
+
+    fn proven_waits(&self) -> ProvenWaits {
+        *self
+            .proven_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_proven_waits(&self, waits: ProvenWaits) {
+        *self
+            .proven_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = waits;
+    }
+
+    fn record_typed_outcome(&self, observation: TypedOutcomeObservation) {
+        if self.outcome_recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(collector) = &self.collector {
+            collector.record_typed_outcome(observation);
+        }
+    }
+}
+
+#[allow(clippy::match_same_arms)]
+fn classify_outcome(error: &sqlx::Error) -> SqliteOutcome {
+    match error {
+        sqlx::Error::PoolTimedOut => SqliteOutcome::PoolTimeout,
+        sqlx::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            SqliteOutcome::OtherTimeout
+        }
+        sqlx::Error::Database(_) => {
+            match SqliteResultCodes::from_error(error).map(|codes| codes.primary) {
+                Some(5) => SqliteOutcome::Busy,
+                Some(6) => SqliteOutcome::Locked,
+                _ => SqliteOutcome::OtherFailure,
+            }
+        }
+        sqlx::Error::Configuration(_)
+        | sqlx::Error::InvalidArgument(_)
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::RowNotFound
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Encode(_)
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::AnyDriverError(_)
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Migrate(_)
+        | sqlx::Error::InvalidSavePointStatement
+        | sqlx::Error::BeginFailed => SqliteOutcome::OtherFailure,
+        #[allow(unreachable_patterns)]
+        _ => SqliteOutcome::OtherFailure,
+    }
+}
+
+fn emit_uninstrumented_nested_failure(phase: SqlitePhase, error: &sqlx::Error) {
+    let codes = SqliteResultCodes::from_error(error);
+    tracing::error!(
+        target: "phoenix_db::observability",
+        db_system = "sqlite",
+        db_operation = "fts.uninstrumented_nested",
+        db_phase = phase.as_str(),
+        db_error_kind = sqlx_error_kind(error),
+        db_sqlite_primary_code = codes.map(|value| value.primary),
+        db_sqlite_extended_code = codes.map(|value| value.extended),
+        "nested SQLite operation failed under an uninstrumented parent transaction"
+    );
 }
 
 fn elapsed_millis(duration: Duration) -> u64 {
@@ -473,6 +891,8 @@ mod tests {
     use super::test_support::{EventCapture, SpanCapture};
     use super::*;
     use crate::retrieval::fts_upsert;
+    use crate::sqlite_workload::unix_now_micros;
+    use crate::sqlite_workload::SqliteSnapshotWindow;
     use crate::{Database, Message, MessageContent, MessageType};
     use chrono::Utc;
     use libsqlite3_sys as ffi;
@@ -488,6 +908,14 @@ mod tests {
         };
         assert_eq!(codes.primary, ffi::SQLITE_BUSY);
         assert_eq!(codes.extended, ffi::SQLITE_BUSY_SNAPSHOT);
+    }
+
+    #[test]
+    fn workload_outcome_vocabulary_is_bounded() {
+        assert_eq!(SqliteOutcome::Busy.as_str(), "busy");
+        assert_eq!(SqliteOutcome::Locked.as_str(), "locked");
+        assert_eq!(ffi::SQLITE_BUSY_SNAPSHOT & 0xff, ffi::SQLITE_BUSY);
+        assert_eq!(ffi::SQLITE_LOCKED_SHAREDCACHE & 0xff, ffi::SQLITE_LOCKED);
     }
 
     #[test]
@@ -523,22 +951,20 @@ mod tests {
 
     #[test]
     fn transaction_timing_separates_pool_wait_and_excludes_retry_backoff() {
-        let origin = Instant::now();
-        let retry_backoff = Duration::from_secs(5);
-        let acquisition_started_at = origin + retry_backoff;
-        let transaction_started_at = acquisition_started_at + Duration::from_millis(120);
-        let timing = SuccessfulTransactionTiming::from_boundaries(
-            acquisition_started_at,
+        let transaction_started_at = Instant::now();
+        let timing = SuccessfulTransactionTiming::from_durations(
+            Duration::from_millis(120),
+            Duration::from_millis(35),
             transaction_started_at,
         )
         .complete_at(transaction_started_at + Duration::from_millis(40));
 
         assert_eq!(timing.acquisition_elapsed, Duration::from_millis(120));
-        assert_eq!(timing.transaction_elapsed, Duration::from_millis(40));
-        assert_ne!(
-            timing.transaction_elapsed,
-            retry_backoff + Duration::from_millis(160)
+        assert_eq!(
+            timing.write_admission_wait_elapsed,
+            Duration::from_millis(35)
         );
+        assert_eq!(timing.transaction_elapsed, Duration::from_millis(40));
     }
 
     #[test]
@@ -548,6 +974,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: fast_acquisition,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: fast_transaction,
             }
             .slow_phase(),
@@ -556,6 +983,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: fast_transaction,
             }
             .slow_phase(),
@@ -564,6 +992,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: fast_acquisition,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: SLOW_TRANSACTION,
             }
             .slow_phase(),
@@ -572,6 +1001,7 @@ mod tests {
         assert_eq!(
             CompletedTransactionTiming {
                 acquisition_elapsed: SLOW_POOL_ACQUISITION,
+                write_admission_wait_elapsed: Duration::ZERO,
                 transaction_elapsed: SLOW_TRANSACTION,
             }
             .slow_phase(),
@@ -588,6 +1018,7 @@ mod tests {
                 .record_slow_success(
                     CompletedTransactionTiming {
                         acquisition_elapsed: fast_acquisition,
+                        write_admission_wait_elapsed: Duration::ZERO,
                         transaction_elapsed: fast_transaction,
                     },
                     SqliteTransactionOutcome::Committed,
@@ -609,6 +1040,7 @@ mod tests {
                 .record_slow_success(
                     CompletedTransactionTiming {
                         acquisition_elapsed: Duration::from_millis(150),
+                        write_admission_wait_elapsed: Duration::ZERO,
                         transaction_elapsed: Duration::from_millis(300),
                     },
                     SqliteTransactionOutcome::RolledBack,
@@ -679,13 +1111,13 @@ mod tests {
         let telemetry = SqliteTelemetry::new(SqliteOperation::DirectTurnTerminalSettlement);
         let commit = telemetry
             .observe_commit_db(
-                SuccessfulTransactionTiming::from_boundaries(origin, origin),
+                SuccessfulTransactionTiming::from_durations(Duration::ZERO, Duration::ZERO, origin),
                 async { Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed)) },
             )
             .await;
         let rollback = telemetry
             .observe_rollback_db(
-                SuccessfulTransactionTiming::from_boundaries(origin, origin),
+                SuccessfulTransactionTiming::from_durations(Duration::ZERO, Duration::ZERO, origin),
                 async { Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed)) },
             )
             .await;
@@ -716,6 +1148,47 @@ mod tests {
         assert!(captured_spans.iter().all(|span| span
             .get("span.name")
             .is_some_and(|name| name == "db.failure")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_transaction_completion_records_once_with_aggregate_observation() {
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCollector::new(),
+        );
+        let acquisition_started_at = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .unwrap();
+        let transaction_started_at = acquisition_started_at + Duration::from_millis(20);
+
+        telemetry
+            .observe_commit_db(
+                SuccessfulTransactionTiming::from_durations(
+                    transaction_started_at.saturating_duration_since(acquisition_started_at),
+                    Duration::ZERO,
+                    transaction_started_at,
+                ),
+                async { Ok::<(), _>(()) },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = telemetry
+            .collector
+            .as_ref()
+            .unwrap()
+            .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::MessagePersistence.index();
+        assert_eq!(operation_count(&snapshot.outcomes[access][category]), 1);
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Success.index()],
+            1
+        );
+        assert!(snapshot.totals[access][category].pool_wait_micros >= 20_000);
+        assert_eq!(snapshot.totals[access][category].writer_held_micros, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -760,6 +1233,7 @@ mod tests {
                 usage_data: None,
                 created_at: Utc::now(),
             },
+            db.sqlite_workload_collector.clone(),
         )
         .await
         .unwrap_err();
@@ -777,7 +1251,7 @@ mod tests {
         );
         assert_eq!(
             event.get("db_phase").map(String::as_str),
-            Some("locator_delete")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             event.get("db_sqlite_primary_code").map(String::as_str),
@@ -796,6 +1270,347 @@ mod tests {
         let rendered = format!("{event:?}");
         assert!(!rendered.contains("sensitive-message-id"));
         assert!(!rendered.contains("sensitive payload sentinel"));
+    }
+
+    #[tokio::test]
+    async fn successful_commit_disarms_abandoned_outcome() {
+        let collector = SqliteWorkloadCollector::new();
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::FtsUpsert,
+            SqliteWorkloadCategory::Fts,
+            SqliteAccessKind::Write,
+            collector.clone(),
+        );
+        let timing = SuccessfulTransactionTiming::from_durations(
+            Duration::ZERO,
+            Duration::ZERO,
+            Instant::now(),
+        );
+        telemetry
+            .observe_commit_db(timing, async { Ok::<(), DbError>(()) })
+            .await
+            .unwrap();
+        drop(telemetry);
+
+        let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::Fts.index();
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "transaction terminals require typed commit/rollback observation")]
+    async fn generic_observation_rejects_transaction_terminals() {
+        let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
+        telemetry
+            .observe_db(SqlitePhase::Commit, async { Ok::<(), DbError>(()) })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn unfinished_telemetry_records_one_abandoned_operation() {
+        let collector = SqliteWorkloadCollector::new();
+        {
+            let _telemetry = SqliteTelemetry::with_collector(
+                SqliteOperation::FtsUpsert,
+                SqliteWorkloadCategory::Fts,
+                SqliteAccessKind::Write,
+                collector.clone(),
+            );
+        }
+        let snapshot = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::Fts.index();
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::Abandoned.index()],
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_transaction_completion_records_once() {
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+            SqliteWorkloadCollector::new(),
+        );
+        let origin = Instant::now();
+
+        let result = telemetry
+            .observe_commit_db(
+                SuccessfulTransactionTiming::from_durations(Duration::ZERO, Duration::ZERO, origin),
+                async { Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed)) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
+        let snapshot = telemetry
+            .collector
+            .as_ref()
+            .unwrap()
+            .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let access = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::MessagePersistence.index();
+        assert_eq!(operation_count(&snapshot.outcomes[access][category]), 1);
+        assert_eq!(
+            snapshot.outcomes[access][category][SqliteOutcome::OtherFailure.index()],
+            1
+        );
+    }
+
+    fn assert_wait_samples(
+        collector: &SqliteWorkloadCollector,
+        expected_pool: u64,
+        expected_admission: u64,
+    ) {
+        let report = collector.aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
+        let write = SqliteAccessKind::Write.index();
+        let category = SqliteWorkloadCategory::MessagePersistence.index();
+        assert_eq!(
+            report.pool_wait_histogram[write][category]
+                .iter()
+                .sum::<u64>(),
+            expected_pool
+        );
+        assert_eq!(
+            report.write_admission_wait_histogram[write][category]
+                .iter()
+                .sum::<u64>(),
+            expected_admission
+        );
+    }
+
+    #[tokio::test]
+    async fn post_pool_failure_and_later_failure_keep_proven_wait_boundaries() {
+        let collector = SqliteWorkloadCollector::new();
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+            collector.clone(),
+        );
+        let ((), pool) = telemetry
+            .observe_pool_acquisition_sqlx(async { Ok::<_, sqlx::Error>(()) })
+            .await
+            .unwrap();
+        let result = telemetry
+            .observe_transaction_admission_db(pool, async {
+                Err::<(), _>(DbError::Sqlx(sqlx::Error::BeginFailed))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_wait_samples(&collector, 1, 1);
+
+        let collector = SqliteWorkloadCollector::new();
+        let telemetry = SqliteTelemetry::with_collector(
+            SqliteOperation::ConversationDelete,
+            SqliteWorkloadCategory::MessagePersistence,
+            SqliteAccessKind::Write,
+            collector.clone(),
+        );
+        let ((), pool) = telemetry
+            .observe_pool_acquisition_sqlx(async { Ok::<_, sqlx::Error>(()) })
+            .await
+            .unwrap();
+        let ((), _timing) = telemetry
+            .observe_transaction_admission_db(pool, async { Ok::<_, DbError>(()) })
+            .await
+            .unwrap();
+        let _ = telemetry
+            .observe_db(SqlitePhase::Statement, async {
+                Err::<(), _>(DbError::Sqlx(sqlx::Error::PoolClosed))
+            })
+            .await;
+        assert_wait_samples(&collector, 1, 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_after_admission_keeps_proven_wait_boundaries() {
+        let collector = SqliteWorkloadCollector::new();
+        {
+            let telemetry = SqliteTelemetry::with_collector(
+                SqliteOperation::ConversationDelete,
+                SqliteWorkloadCategory::MessagePersistence,
+                SqliteAccessKind::Write,
+                collector.clone(),
+            );
+            let ((), pool) = telemetry
+                .observe_pool_acquisition_sqlx(async { Ok::<_, sqlx::Error>(()) })
+                .await
+                .unwrap();
+            let _ = telemetry
+                .observe_transaction_admission_db(pool, async { Ok::<_, DbError>(()) })
+                .await
+                .unwrap();
+        }
+        assert_wait_samples(&collector, 1, 1);
+    }
+
+    fn message_persistence_outcomes(db: &Database) -> [u64; SqliteOutcome::ALL.len()] {
+        db.sqlite_workload_collector
+            .aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros())
+            .outcomes[SqliteAccessKind::Write.index()]
+            [SqliteWorkloadCategory::MessagePersistence.index()]
+    }
+
+    fn assert_one_outcome_delta(
+        before: [u64; SqliteOutcome::ALL.len()],
+        after: [u64; SqliteOutcome::ALL.len()],
+        expected: SqliteOutcome,
+    ) {
+        for outcome in SqliteOutcome::ALL {
+            assert_eq!(
+                after[outcome.index()] - before[outcome.index()],
+                u64::from(outcome == expected),
+                "unexpected {outcome:?} delta",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_commit_records_exactly_one_success() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("delete-success", "Delete", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        db.delete_conversation("delete-success").await.unwrap();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::Success,
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_missing_rolls_back_with_one_failure_outcome() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        let error = db.delete_conversation("delete-missing").await.unwrap_err();
+
+        assert!(matches!(error, DbError::ConversationNotFound(id) if id == "delete-missing"));
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
+    }
+
+    #[tokio::test]
+    async fn update_display_data_commit_records_exactly_one_success() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("display-success", "Display", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "display-success-message",
+            "display-success",
+            &MessageContent::tool("tool", "result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        db.update_message_display_data(
+            "display-success-message",
+            &serde_json::json!({"hidden": false}),
+        )
+        .await
+        .unwrap();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::Success,
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_owned_fts_insert_failure_emits_sparse_phase_and_one_parent_failure() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("display-fts-failure", "Display", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "display-fts-failure-message",
+            "display-fts-failure",
+            &MessageContent::tool("tool", "result", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
+            .bind("display-fts-failure-message")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE message_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let before = message_persistence_outcomes(&db);
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        db.update_message_display_data(
+            "display-fts-failure-message",
+            &serde_json::json!({"hidden": false}),
+        )
+        .await
+        .unwrap_err();
+
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("fts_insert")
+        );
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("message.update_display_data"),
+        );
+    }
+
+    #[tokio::test]
+    async fn update_display_data_missing_rolls_back_with_one_failure_outcome() {
+        let db = Database::open_in_memory().await.unwrap();
+        let before = message_persistence_outcomes(&db);
+
+        let error = db
+            .update_message_display_data("display-missing", &serde_json::json!({"hidden": false}))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DbError::MessageNotFound(id) if id == "display-missing"));
+        assert_one_outcome_delta(
+            before,
+            message_persistence_outcomes(&db),
+            SqliteOutcome::OtherFailure,
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -830,6 +1645,10 @@ mod tests {
             error,
             Err(crate::DbError::Sqlx(sqlx::Error::PoolClosed))
         ));
+        let outcomes = message_persistence_outcomes(&db);
+        assert_eq!(operation_count(&outcomes), 1);
+        assert_eq!(outcomes[SqliteOutcome::OtherFailure.index()], 1);
+        assert_eq!(outcomes[SqliteOutcome::Abandoned.index()], 0);
         let events = capture.events();
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -847,7 +1666,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn caller_owned_fts_transaction_records_first_source_write_failure() {
+    async fn display_update_records_transaction_admission_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("caller-owned-statement.db");
         let setup = Database::open(path.to_str().unwrap()).await.unwrap();
@@ -896,6 +1715,10 @@ mod tests {
         sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
 
         assert!(matches!(error, Err(crate::DbError::Sqlx(_))));
+        let outcomes = message_persistence_outcomes(&db);
+        assert_eq!(operation_count(&outcomes), 1);
+        assert_eq!(outcomes[SqliteOutcome::Busy.index()], 1);
+        assert_eq!(outcomes[SqliteOutcome::Abandoned.index()], 0);
         let events = capture.events();
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -904,7 +1727,7 @@ mod tests {
         );
         assert_eq!(
             events[0].get("db_phase").map(String::as_str),
-            Some("statement")
+            Some("transaction_acquisition")
         );
         assert_eq!(
             events[0].get("db_sqlite_primary_code").map(String::as_str),

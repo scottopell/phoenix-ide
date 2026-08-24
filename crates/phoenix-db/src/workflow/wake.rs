@@ -8,6 +8,7 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
+use crate::sqlite_telemetry::SqliteOperation;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -25,7 +26,7 @@ use phoenix_workflow::{
     RuntimeAcceptanceStatus, Timestamp, TransitionId, Version, WorkflowId, WorkflowStatus,
 };
 use serde::Serialize;
-use sqlx::Row;
+use sqlx::{Connection, Row};
 #[cfg(test)]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -459,6 +460,22 @@ impl WakeRepository {
     pub fn new(pool: sqlx::SqlitePool) -> Self {
         Self {
             workflow_repo: WorkflowRepository::new(pool),
+            #[cfg(test)]
+            failpoint_namespace: next_failpoint_namespace(),
+            #[cfg(test)]
+            write_intent_test_latch: None,
+        }
+    }
+
+    pub(crate) fn with_sqlite_workload_collector(
+        pool: sqlx::SqlitePool,
+        sqlite_workload_collector: crate::SqliteWorkloadCollector,
+    ) -> Self {
+        Self {
+            workflow_repo: WorkflowRepository::with_sqlite_workload_collector(
+                pool,
+                sqlite_workload_collector,
+            ),
             #[cfg(test)]
             failpoint_namespace: next_failpoint_namespace(),
             #[cfg(test)]
@@ -2241,22 +2258,27 @@ impl WakeRepository {
             return Ok(MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible);
         }
 
-        if let Some(existing) = self
-            .get_delivery_message_link(input.workflow_id, input.delivery_id)
-            .await?
-        {
-            return Ok(MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing));
-        }
+        let telemetry = self
+            .workflow_repo
+            .sqlite_telemetry(SqliteOperation::WakePendingDeliveryMaterialization);
+        let (mut connection, acquisition) = telemetry
+            .observe_pool_acquisition_sqlx(self.workflow_repo.pool().acquire())
+            .await?;
+        let (mut tx, timing) = telemetry
+            .observe_transaction_admission_db(acquisition, async {
+                Ok(super::WorkflowTx::new(
+                    connection.begin_with("BEGIN IMMEDIATE").await?,
+                ))
+            })
+            .await?;
+        let body = async {
+            if let Some(existing) =
+                fetch_delivery_message_link_tx(&mut tx, input.workflow_id, input.delivery_id).await?
+            {
+                return Ok(MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing));
+            }
 
-        let mut tx = self.workflow_repo.begin_tx().await?;
-        if let Some(existing) =
-            fetch_delivery_message_link_tx(&mut tx, input.workflow_id, input.delivery_id).await?
-        {
-            tx.commit().await?;
-            return Ok(MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(existing));
-        }
-
-        let candidate = sqlx::query(
+            let candidate = sqlx::query(
             "SELECT d.workflow_id, d.delivery_id, d.effect_id, d.barrier_id, d.consumer_kind,
                     d.event_codec_family, d.event_codec_version, d.payload_kind, d.payload_blob,
                     d.requires_runtime_acceptance, d.status, d.runtime_acceptance_status,
@@ -2279,10 +2301,9 @@ impl WakeRepository {
         .bind(&input.conversation_id)
         .fetch_optional(&mut *tx.tx)
         .await?;
-        let Some(row) = candidate else {
-            tx.rollback().await?;
-            return Ok(MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible);
-        };
+            let Some(row) = candidate else {
+                return Ok(MaterializePendingDeliveryMessageOutcome::WrongOwnerOrIneligible);
+            };
 
         let registering_tool_use_id: String = row.get("registering_tool_use_id");
         let terminal_kind: String = row.get("terminal_kind");
@@ -2335,7 +2356,12 @@ impl WakeRepository {
             created_at,
         };
         if has_message_fts_tx(&mut tx).await? {
-            crate::retrieval::fts_upsert_conn(&mut tx.tx, &message).await?;
+            crate::retrieval::fts_upsert_conn(
+                &mut tx.tx,
+                &message,
+                crate::retrieval::FtsObservation::ParentTransaction(telemetry.parent_observer()),
+            )
+            .await?;
         }
         sqlx::query(
             "INSERT INTO wake_delivery_messages (
@@ -2360,10 +2386,26 @@ impl WakeRepository {
                     "wake delivery message link missing after insert".to_string(),
                 )
             })?;
-        tx.commit().await?;
-        Ok(MaterializePendingDeliveryMessageOutcome::Materialized(
-            linked,
-        ))
+            Ok::<_, DbError>(MaterializePendingDeliveryMessageOutcome::Materialized(linked))
+        }
+        .await;
+
+        match body {
+            Ok(outcome @ MaterializePendingDeliveryMessageOutcome::Materialized(_)) => {
+                telemetry.observe_commit_db(timing, tx.commit()).await?;
+                Ok(outcome)
+            }
+            Ok(outcome) => {
+                telemetry.observe_rollback_db(timing, tx.rollback()).await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                telemetry
+                    .observe_failure_rollback_db(timing, tx.rollback())
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn get_delivery_message_link(
@@ -4684,9 +4726,12 @@ fn delivery_message_link_from_join_row(
 mod tests {
     use super::*;
     use crate::migrations::run_pending_migrations;
+    use crate::sqlite_telemetry::test_support::EventCapture;
     use crate::workflow::WorkflowHead;
+    use crate::{operation_count, SqliteOutcome, SqliteSnapshotWindow};
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::str::FromStr;
+    use tracing_subscriber::prelude::*;
 
     async fn setup_repo_schema(pool: &sqlx::SqlitePool) {
         sqlx::raw_sql(crate::ddl::SCHEMA)
@@ -5163,6 +5208,117 @@ mod tests {
                 panic!("expected materialized/already-materialized link")
             }
         }
+    }
+
+    fn wake_write_outcomes(repo: &WakeRepository) -> [u64; SqliteOutcome::ALL.len()] {
+        repo.workflow_repo
+            .sqlite_workload_collector
+            .as_ref()
+            .expect("test collector")
+            .aggregate_report(
+                SqliteSnapshotWindow::OneHour,
+                crate::sqlite_workload::unix_now_micros(),
+            )
+            .outcomes[crate::SqliteAccessKind::Write.index()]
+            [crate::SqliteWorkloadCategory::DurableWorkflows.index()]
+    }
+
+    fn assert_wake_outcome_delta(
+        before: [u64; SqliteOutcome::ALL.len()],
+        after: [u64; SqliteOutcome::ALL.len()],
+        expected: SqliteOutcome,
+    ) {
+        assert_eq!(operation_count(&after) - operation_count(&before), 1);
+        for outcome in SqliteOutcome::ALL {
+            assert_eq!(
+                after[outcome.index()] - before[outcome.index()],
+                u64::from(outcome == expected),
+                "unexpected {outcome:?} delta",
+            );
+        }
+        assert_eq!(
+            after[SqliteOutcome::Abandoned.index()] - before[SqliteOutcome::Abandoned.index()],
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_materialization_typed_terminals_record_exact_outcomes() {
+        let (_dir, base, _) = open_repo_pair().await;
+        let collector = crate::SqliteWorkloadCollector::new();
+        let repo = WakeRepository::with_sqlite_workload_collector(
+            base.workflow_repo.pool.clone(),
+            collector,
+        );
+        let pending = create_pending_terminal_delivery(&repo, WorkflowId(790)).await;
+        let input = materialize_input(&pending, "wake result", None, false, Timestamp(40));
+
+        let before_commit = wake_write_outcomes(&repo);
+        assert!(matches!(
+            repo.materialize_pending_delivery_message_once(&input)
+                .await
+                .unwrap(),
+            MaterializePendingDeliveryMessageOutcome::Materialized(_)
+        ));
+        assert_wake_outcome_delta(
+            before_commit,
+            wake_write_outcomes(&repo),
+            SqliteOutcome::Success,
+        );
+
+        let before_replay = wake_write_outcomes(&repo);
+        assert!(matches!(
+            repo.materialize_pending_delivery_message_once(&input)
+                .await
+                .unwrap(),
+            MaterializePendingDeliveryMessageOutcome::AlreadyMaterialized(_)
+        ));
+        assert_wake_outcome_delta(
+            before_replay,
+            wake_write_outcomes(&repo),
+            SqliteOutcome::Success,
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_fts_failure_emits_parent_evidence_and_one_failure_outcome() {
+        let (_dir, base, _) = open_repo_pair().await;
+        let collector = crate::SqliteWorkloadCollector::new();
+        let repo = WakeRepository::with_sqlite_workload_collector(
+            base.workflow_repo.pool.clone(),
+            collector,
+        );
+        let pending = create_pending_terminal_delivery(&repo, WorkflowId(791)).await;
+        sqlx::query("DROP TABLE message_fts_rows")
+            .execute(&repo.workflow_repo.pool)
+            .await
+            .unwrap();
+        let input = materialize_input(&pending, "wake result", None, false, Timestamp(41));
+        let before = wake_write_outcomes(&repo);
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        assert!(repo
+            .materialize_pending_delivery_message_once(&input)
+            .await
+            .is_err());
+
+        assert_wake_outcome_delta(
+            before,
+            wake_write_outcomes(&repo),
+            SqliteOutcome::OtherFailure,
+        );
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("db_phase").map(String::as_str),
+            Some("locator_lookup")
+        );
+        assert_eq!(
+            events[0].get("db_operation").map(String::as_str),
+            Some("wake.pending_delivery_materialization")
+        );
     }
 
     #[tokio::test]

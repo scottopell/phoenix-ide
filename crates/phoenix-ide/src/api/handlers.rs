@@ -430,6 +430,10 @@ pub fn create_router(state: AppState) -> Router {
             get(super::deployment::deployment_disk),
         )
         .route(
+            "/api/deployment/sqlite-workload",
+            get(super::deployment::sqlite_workload_report),
+        )
+        .route(
             "/api/deployment/disk/managed-worktrees/cleanup",
             post(super::deployment::cleanup_managed_worktree),
         )
@@ -4173,7 +4177,9 @@ async fn get_wake_status(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let rows = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    let rows = state
+        .db
+        .wake_repository()
         .list_active_unresolved_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -4201,7 +4207,7 @@ async fn cancel_wake(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let repo = state.db.wake_repository();
     let row = repo
         .fetch_binding_for_conversation_contract(&id, &contract_id)
         .await
@@ -4248,7 +4254,7 @@ async fn cancel_active_direct_turn(
     state: &AppState,
     conversation_id: &str,
 ) -> Result<Option<phoenix_workflow::Materialization>, AppError> {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let repo = state.db.workflow_repository();
     let Some(turn) = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
@@ -4275,7 +4281,7 @@ async fn load_active_direct_turn_authority(
     state: &AppState,
     conversation_id: &str,
 ) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, AppError> {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let repo = state.db.workflow_repository();
     let turn = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
@@ -4925,8 +4931,7 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
@@ -4985,8 +4990,7 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == existing.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
@@ -5236,7 +5240,9 @@ async fn archive_conversation(
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -5617,7 +5623,9 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     #[cfg(test)]
     state.runtime.wait_at_hard_delete_barrier().await;
     refuse_if_coordinator(state, id, "delete").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -8741,7 +8749,7 @@ pub(crate) mod hard_delete_cascade_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -11767,7 +11775,9 @@ pub(crate) mod hard_delete_cascade_tests {
             &target,
             payload.to_exact_bytes().expect("encode prepared payload"),
         );
-        phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        state
+            .db
+            .workflow_repository()
             .accept_authoritative_turn(
                 &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
                     client_key: ClientTurnKey::new("pending-message").expect("client key"),
@@ -11828,7 +11838,9 @@ pub(crate) mod hard_delete_cascade_tests {
 
         assert!(response.ok);
         assert!(!response.no_op);
-        let active = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let active = state
+            .db
+            .workflow_repository()
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 "c-pending-turn".to_string(),
             ))
@@ -12027,7 +12039,9 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete conversation with pending turn");
 
         assert!(state.db.get_conversation("c-delete-turn").await.is_err());
-        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let discoverable = state
+            .db
+            .workflow_repository()
             .list_discoverable_accepted_runtime_direct_turns(None, 10)
             .await
             .expect("discover turns");
@@ -12909,7 +12923,9 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("conversation")
                 .archived
         );
-        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let discoverable = state
+            .db
+            .workflow_repository()
             .list_discoverable_accepted_runtime_direct_turns(None, 10)
             .await
             .expect("discover turns");
@@ -13915,7 +13931,7 @@ mod regenerate_conversation_name_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14121,7 +14137,7 @@ mod upgrade_model_state_guard_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14402,7 +14418,7 @@ mod file_read_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -15059,7 +15075,7 @@ mod attachment_storage_tests {
             &conversation,
             payload.to_exact_bytes().expect("encode payload"),
         );
-        phoenix_db::workflow::WorkflowRepository::new(db.pool().clone())
+        db.workflow_repository()
             .accept_authoritative_turn(
                 &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
                     client_key: ClientTurnKey::new("msg-direct-turn-files").expect("client key"),
@@ -15180,8 +15196,7 @@ mod chat_authority_tests {
             None,
         ));
         let terminals = runtime.terminals.clone();
-        let message_retriever: Arc<dyn crate::db::MessageRetriever> =
-            Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever: Arc<dyn crate::db::MessageRetriever> = Arc::new(db.fts_retriever());
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             llm_registry.clone(),
@@ -15509,7 +15524,7 @@ mod wake_handler_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -15551,7 +15566,7 @@ mod wake_handler_tests {
         conversation_id: &str,
         contract_id: &str,
     ) {
-        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let repo = state.db.wake_repository();
         let work_scope_id = state
             .db
             .get_conversation(conversation_id)
@@ -15661,10 +15676,59 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn deployment_sqlite_workload_rejects_invalid_window_values() {
+        let state = make_test_state().await;
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deployment/sqlite-workload?window=bogus")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deployment_sqlite_workload_returns_closed_category_rows() {
+        let state = make_test_state().await;
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deployment/sqlite-workload?window=one_hour")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["window"], "one_hour");
+        assert!(payload["writer_categories"].is_array());
+        assert!(payload["reads"].is_array());
+        let writer_categories = payload["writer_categories"]
+            .as_array()
+            .expect("writer categories array");
+        let read_categories = payload["reads"].as_array().expect("read categories array");
+        assert!(!writer_categories.is_empty());
+        assert!(!read_categories.is_empty());
+        assert_eq!(writer_categories[0]["category"], "message_persistence");
+        assert_eq!(read_categories[0]["category"], "message_persistence");
+    }
+
+    #[tokio::test]
     async fn conversation_search_returns_warming_when_live_index_is_stale() {
         let mut state = make_test_state().await;
         seed_conversation(&state, "conv-stale-search").await;
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15719,7 +15783,7 @@ mod wake_handler_tests {
             )
             .await
             .unwrap();
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15833,7 +15897,7 @@ mod wake_handler_tests {
             .archive_conversation("conv-arch")
             .await
             .expect("archive");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -15899,7 +15963,7 @@ mod wake_handler_tests {
                 .await
                 .expect("add limit message");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -15976,7 +16040,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add other");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16106,7 +16170,7 @@ mod wake_handler_tests {
             .await
             .expect("create creation jobs view");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16150,7 +16214,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add prefix message");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16178,7 +16242,7 @@ mod wake_handler_tests {
         let state = make_test_state().await;
         seed_conversation(&state, "conv-fired").await;
         register_bash_wake(&state, 6100, "conv-fired", "contract-fired").await;
-        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let repo = state.db.wake_repository();
         let started = repo
             .claim_observation_if_eligible(
                 phoenix_workflow::WorkflowId(6100),
