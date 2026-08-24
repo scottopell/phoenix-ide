@@ -208,7 +208,9 @@ impl NativeStatementCallbackContext {
 
     fn note_prepare_boundary(&mut self) {
         if self.prepare_pending {
-            self.begin_prepare();
+            self.reset_prepare_state();
+            self.prepare_pending = true;
+            self.prepare_ambiguous = true;
             self.prepare_boundary_seen = false;
         } else {
             self.prepare_boundary_seen = true;
@@ -1288,7 +1290,7 @@ mod tests {
     async fn migrated_pool_stale_prepare_degrades_instead_of_misattributing_workflow() {
         let db = Database::open_in_memory().await.unwrap();
         let mut connection = db.pool().acquire().await.unwrap();
-        let _unexecuted = connection
+        let unexecuted = connection
             .prepare(
                 sqlx::query::<sqlx::Sqlite>(
                     "SELECT canonical_path FROM projects WHERE id = 'stale'",
@@ -1302,6 +1304,8 @@ mod tests {
             .execute(&mut *connection)
             .await
             .unwrap();
+        drop(unexecuted);
+        connection.close().await.unwrap();
         let after = report_now(&db.sqlite_workload_collector);
         let write = SqliteAccessKind::Write.index();
         assert_eq!(
@@ -1334,6 +1338,50 @@ mod tests {
         assert_eq!(metadata.category, SqliteWorkloadCategory::Other);
         assert_eq!(metadata.access, None);
         assert_eq!(metadata.kind, StatementKind::TransactionControl);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn overlapping_unbound_read_then_write_prepare_degrades_access() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.note_prepare_boundary();
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::RuntimeState,
+            Some(SqliteAccessKind::Read),
+        );
+        context.note_prepare_boundary();
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::RuntimeState,
+            Some(SqliteAccessKind::Write),
+        );
+
+        let earlier_read = context.metadata_for_statement_run(8, 0, 0);
+
+        assert_eq!(earlier_read.category, SqliteWorkloadCategory::Other);
+        assert_eq!(earlier_read.access, None);
+        assert_eq!(report_now(&collector).classification_gap_count, 1);
+    }
+
+    #[test]
+    fn overlapping_unbound_project_then_workflow_prepare_never_claims_workflow() {
+        let collector = SqliteWorkloadCollector::new();
+        let mut context = NativeStatementCallbackContext::new(collector.clone());
+        context.note_prepare_boundary();
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::PrProjectData,
+            Some(SqliteAccessKind::Read),
+        );
+        context.note_prepare_boundary();
+        context.note_prepare_metadata(
+            SqliteWorkloadCategory::DurableWorkflows,
+            Some(SqliteAccessKind::Write),
+        );
+
+        let workflow = context.metadata_for_statement_run(8, 0, 0);
+
+        assert_eq!(workflow.category, SqliteWorkloadCategory::Other);
+        assert_eq!(workflow.access, None);
         assert_eq!(report_now(&collector).classification_gap_count, 1);
     }
 
@@ -1527,7 +1575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_category_read_write_interleave_degrades_without_wrong_access() {
+    async fn same_category_read_write_interleave_preserves_read_access() {
         let db = Database::open_in_memory().await.unwrap();
         let mut connection = db.pool().acquire().await.unwrap();
         let before = report_now(&db.sqlite_workload_collector);
@@ -1540,7 +1588,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let _write = connection
+        let write = connection
             .prepare(
                 sqlx::query::<sqlx::Sqlite>(
                     "UPDATE conversations SET title = title WHERE id = 'same-category'",
@@ -1550,22 +1598,31 @@ mod tests {
             .await
             .unwrap();
         read.query().fetch_optional(&mut *connection).await.unwrap();
+        drop(read);
+        drop(write);
+        connection.close().await.unwrap();
         let report = report_now(&db.sqlite_workload_collector);
         let read_index = SqliteAccessKind::Read.index();
         let write_index = SqliteAccessKind::Write.index();
+        let read_delta = report.totals[read_index][SqliteWorkloadCategory::Other.index()]
+            .baseline_statement_count
+            - before.totals[read_index][SqliteWorkloadCategory::Other.index()]
+                .baseline_statement_count;
+        let write_delta = SqliteWorkloadCategory::ALL
+            .into_iter()
+            .map(|category| {
+                report.totals[write_index][category.index()].baseline_statement_count
+                    - before.totals[write_index][category.index()].baseline_statement_count
+            })
+            .sum::<u64>();
+        assert_eq!(read_delta, 1);
         assert_eq!(
-            report.totals[read_index][SqliteWorkloadCategory::Other.index()]
+            report.totals[read_index][SqliteWorkloadCategory::RuntimeState.index()]
                 .baseline_statement_count,
-            before.totals[read_index][SqliteWorkloadCategory::Other.index()]
-                .baseline_statement_count
-                + 1
-        );
-        assert_eq!(
-            report.totals[write_index][SqliteWorkloadCategory::RuntimeState.index()]
+            before.totals[read_index][SqliteWorkloadCategory::RuntimeState.index()]
                 .baseline_statement_count,
-            before.totals[write_index][SqliteWorkloadCategory::RuntimeState.index()]
-                .baseline_statement_count
         );
+        assert_eq!(write_delta, 0, "unexecuted UPDATE must not record a write");
         assert!(report.classification_gap_count > before.classification_gap_count);
     }
 
