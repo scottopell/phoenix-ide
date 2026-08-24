@@ -702,7 +702,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         creation_prompt: None,
         creation_error: None,
         cached_pr: None,
-        inner: conv.clone(),
+        inner: crate::runtime::PresentationConversation(conv.clone()),
     }
 }
 

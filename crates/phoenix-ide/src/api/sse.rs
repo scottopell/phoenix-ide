@@ -536,7 +536,7 @@ mod tests {
 
     fn fixture_enriched_conversation() -> EnrichedConversation {
         EnrichedConversation {
-            inner: fixture_conversation(),
+            inner: crate::runtime::PresentationConversation(fixture_conversation()),
             conv_mode_label: "explore".to_string(),
             branch_name: None,
             worktree_path: None,
@@ -934,6 +934,12 @@ mod tests {
     fn parity_conversation_became_terminal() {
         let event = SseEvent::ConversationBecameTerminal { sequence_id: 17 };
         assert_parity(&event);
+    }
+
+    #[test]
+    fn enriched_conversation_omits_internal_product_identity() {
+        let value = serde_json::to_value(fixture_enriched_conversation()).unwrap();
+        assert!(value.get("product_conversation_id").is_none());
     }
 
     #[test]

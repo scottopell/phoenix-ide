@@ -2806,6 +2806,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_distinct_product_and_transcript_ids_admit_close() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation = db
+            .create_conversation(
+                "fresh-transcript",
+                "fresh-transcript",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            conversation.id,
+            conversation.product_conversation_id.as_str()
+        );
+
+        let obligation = db
+            .begin_close_foundation(&conversation.product_conversation_id, "fresh-attempt")
+            .await
+            .unwrap();
+        assert_eq!(
+            obligation.product_conversation_id(),
+            &conversation.product_conversation_id
+        );
+        let members: Vec<String> = sqlx::query_scalar(
+            "SELECT conversation_id FROM close_attempt_members
+             WHERE attempt_id = 'fresh-attempt' ORDER BY continuation_ordinal",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(members, vec![conversation.id]);
+    }
+
+    #[tokio::test]
     async fn three_unarchived_chain_latest_admits_and_reads_topology() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;

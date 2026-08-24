@@ -460,6 +460,13 @@ CREATE TABLE product_conversations (
     )
 );
 
+CREATE TRIGGER product_conversations_kind_is_immutable
+BEFORE UPDATE OF kind ON product_conversations
+FOR EACH ROW WHEN OLD.kind <> NEW.kind
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation kind is immutable');
+END;
+
 ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE;
 
 CREATE TEMP TABLE migration_070_membership (
@@ -565,6 +572,17 @@ END;
 
 CREATE TRIGGER conversations_validate_product_parent_on_insert
 BEFORE INSERT ON conversations
+FOR EACH ROW WHEN NEW.parent_conversation_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM conversations parent
+    WHERE parent.id = NEW.parent_conversation_id
+      AND parent.product_conversation_id = NEW.product_conversation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'subordinate execution must share parent ProductConversation');
+END;
+
+CREATE TRIGGER conversations_validate_product_parent_on_update
+BEFORE UPDATE OF parent_conversation_id ON conversations
 FOR EACH ROW WHEN NEW.parent_conversation_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM conversations parent
     WHERE parent.id = NEW.parent_conversation_id
@@ -1136,11 +1154,16 @@ WHEN OLD.topology_sealed = 0 AND NEW.topology_sealed = 1 AND (
     )
     OR NOT EXISTS (
         SELECT 1 FROM conversations root
-        WHERE root.id = OLD.product_conversation_id
+        WHERE root.product_conversation_id = OLD.product_conversation_id
           AND root.runtime_role = 'user'
           AND root.parent_conversation_id IS NULL
           AND root.user_initiated = 1
           AND root.archived = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM conversations predecessor
+              WHERE predecessor.product_conversation_id = root.product_conversation_id
+                AND predecessor.continued_in_conv_id = root.id
+          )
     )
     OR EXISTS (
         SELECT 1
@@ -1322,7 +1345,15 @@ WHEN EXISTS (
       ON dependent_obligation.product_conversation_id = OLD.product_conversation_id
     JOIN close_retirement_resources dependent
       ON dependent.attempt_id = dependent_obligation.attempt_id
-    WHERE root.id = OLD.product_conversation_id
+    WHERE root.product_conversation_id = OLD.product_conversation_id
+      AND root.runtime_role = 'user'
+      AND root.parent_conversation_id IS NULL
+      AND root.user_initiated = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM conversations predecessor
+          WHERE predecessor.product_conversation_id = root.product_conversation_id
+            AND predecessor.continued_in_conv_id = root.id
+      )
       AND proof.inspection_generation = OLD.inspection_generation
       AND proof.inspection_fingerprint = OLD.inspection_fingerprint
       AND proof.proof_kind IN ('retired', 'absence_adopted')
@@ -12565,9 +12596,35 @@ mod tests {
         .await
         .is_err());
         assert!(sqlx::query(
+            "UPDATE product_conversations SET kind = 'coordinator', ordinary_lifecycle = NULL
+             WHERE id = 'ordinary-a'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
             "INSERT INTO conversations (
                  id, product_conversation_id, parent_conversation_id, runtime_role
              ) VALUES ('child', 'ordinary-b', 'a', 'sub_agent')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, state_updated_at, created_at, updated_at
+             ) VALUES (
+                 'valid-child', 'ordinary-a', 'a', 'sub_agent', 0,
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE conversations SET parent_conversation_id = 'b'
+             WHERE id = 'valid-child'",
         )
         .execute(&pool)
         .await

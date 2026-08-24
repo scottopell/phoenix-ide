@@ -1565,10 +1565,27 @@ pub struct CachedPrSummary {
 /// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
 /// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
 /// the extra display fields.
+#[derive(Debug, Clone)]
+pub struct PresentationConversation(pub crate::db::Conversation);
+
+impl serde::Serialize for PresentationConversation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("Conversation must serialize as an object"))?;
+        object.remove("product_conversation_id");
+        value.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EnrichedConversation {
     #[serde(flatten)]
-    pub inner: crate::db::Conversation,
+    pub inner: PresentationConversation,
     pub conv_mode_label: String,
     pub branch_name: Option<String>,
     pub worktree_path: Option<String>,
