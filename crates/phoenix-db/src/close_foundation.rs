@@ -2249,16 +2249,40 @@ mod tests {
             .unwrap();
         conversation.product_conversation_id = parent.product_conversation_id;
         let mut tx = db.pool().begin().await.unwrap();
-        crate::insert_conversation_tx(&mut tx, &conversation)
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
             .await
             .unwrap();
-        tx.commit().await.unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id,
+                 product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(parent_id)
+        .bind(id)
+        .bind(conversation.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
             .bind(id)
             .bind(parent_id)
-            .execute(db.pool())
+            .execute(&mut *tx)
             .await
             .unwrap();
+        crate::insert_conversation_tx(&mut tx, &conversation)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
 
     async fn allocate_scope_worktree(db: &Database, conversation_id: &str) -> WorkScopeId {

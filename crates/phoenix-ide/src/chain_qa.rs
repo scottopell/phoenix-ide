@@ -200,31 +200,6 @@ impl ChainQa {
         Ok(qa_id_for_caller)
     }
 
-    /// Test/foreground-driven variant: runs the agent loop and finalize in the
-    /// current task instead of spawning. Used by integration tests that need
-    /// deterministic completion before asserting on the persisted row.
-    #[cfg(test)]
-    pub async fn submit_question_blocking(
-        &self,
-        root_id: &str,
-        question: &str,
-    ) -> Result<ChainQaId, ChainQaError> {
-        let prep = self.prepare_invocation(root_id, question).await?;
-        let qa_id = prep.row_id.clone();
-
-        let runtime = self.runtime_registry.get_or_create(root_id).await;
-        let in_flight_guard = runtime.begin_qa();
-
-        let invocation_result = self.run_answer_invocation(&prep, &runtime).await;
-        self.finalize(&qa_id, invocation_result, &runtime).await;
-        drop(in_flight_guard);
-        self.runtime_registry
-            .release_if_idle(runtime.root_conv_id())
-            .await;
-
-        Ok(qa_id)
-    }
-
     /// Phase 1 of the submission flow.
     ///
     /// Validates the chain, snapshots its shape, builds the orientation
@@ -900,25 +875,6 @@ fn read_page(messages: &[Message], cursor: usize) -> String {
     }
 }
 
-/// Render a whole conversation transcript by concatenating
-/// [`render_message_line`] over non-hidden messages. The production read path
-/// ([`read_page`]) streams the window incrementally instead; this materializes
-/// the full transcript and is used only to assert rendering in tests.
-#[cfg(test)]
-fn render_full_transcript(messages: &[Message]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        // Mirror the index extractor: never surface UI-hidden recovery/
-        // dismissal markers, so the agent can't answer from suppressed
-        // implementation artifacts.
-        if message_is_hidden(m) {
-            continue;
-        }
-        out.push_str(&render_message_line(m));
-    }
-    out
-}
-
 /// Render one (non-hidden) message as a `"Label: body\n"` line for the read
 /// path. Factored out so [`read_page`] can stream the transcript a message at a
 /// time without materializing the whole thing.
@@ -1026,6 +982,3 @@ fn trailing_continuation_summary(messages: &[Message]) -> Option<String> {
         _ => None,
     })
 }
-
-#[cfg(test)]
-mod tests;

@@ -2884,6 +2884,17 @@ def cmd_seed(
             (parent_id,),
         ).fetchone()
         continuation_scope = None if conv_mode["mode"] == "Direct" else parent_scope
+        conn.execute("PRAGMA defer_foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO product_continuation_reservations ("
+            " predecessor_conversation_id, successor_conversation_id, product_conversation_id"
+            ") VALUES (?, ?, ?)",
+            (parent_id, new_id, parent_product_conversation_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
+            (new_id, parent_id),
+        )
         _insert_modern_conversation(
             conn,
             conversation_id=new_id,
@@ -2896,6 +2907,11 @@ def cmd_seed(
             work_scope_id=continuation_scope,
             product_conversation_id=parent_product_conversation_id,
         )
+        conn.execute(
+            "DELETE FROM product_continuation_reservations "
+            "WHERE predecessor_conversation_id = ?",
+            (parent_id,),
+        )
         # Continuation summary message bridges parent -> child in the UI.
         msg_id = str(_uuid.uuid4())
         cont_content = json.dumps({"summary": _SEED_CONTEXT_SUMMARY})
@@ -2905,11 +2921,6 @@ def cmd_seed(
             " content, created_at"
             ") VALUES (?, ?, 0, 'continuation', ?, ?)",
             (msg_id, new_id, cont_content, now),
-        )
-        # Wire parent -> child.
-        conn.execute(
-            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
-            (new_id, parent_id),
         )
         return new_id, new_slug
 

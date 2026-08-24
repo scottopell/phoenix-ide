@@ -12419,11 +12419,7 @@ mod authoritative_user_message_effect_tests {
         .await
         .unwrap();
 
-        assert!(matches!(
-            &*state_rx.borrow(),
-            ConvState::HandedOff { successor_conv_id }
-                if successor_conv_id == "successor-conv"
-        ));
+        assert!(matches!(&*state_rx.borrow(), ConvState::Idle));
         assert_eq!(rt.state_updated_at, persisted_timestamp);
         assert!(rt.handoff_completion_authority.is_none());
     }

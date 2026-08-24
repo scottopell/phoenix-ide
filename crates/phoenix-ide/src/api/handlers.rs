@@ -2097,6 +2097,7 @@ async fn create_conversation_with_id(
         checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
+        approved_task: None,
     };
     let job_id = uuid::Uuid::new_v4().to_string();
     let creation_job = crate::db::InsertConversationCreationJob {
@@ -2249,6 +2250,31 @@ pub(crate) fn validate_user_ref(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn create_detached_task_worktree_blocking(
+    repo_root: &str,
+    target_path: &std::path::Path,
+    approved_branch: &str,
+) -> Result<String, BranchWorktreeError> {
+    let repo = std::path::Path::new(repo_root);
+    let parent = target_path.parent().ok_or_else(|| {
+        BranchWorktreeError::Git("detached worktree target has no parent directory".to_string())
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| BranchWorktreeError::Git(error.to_string()))?;
+    run_git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            target_path.to_string_lossy().as_ref(),
+            approved_branch,
+        ],
+    )
+    .map_err(|error| BranchWorktreeError::Git(error.clone()))?;
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Create a git worktree for an existing branch. Runs on a blocking thread.
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
 ///
 /// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
@@ -6169,7 +6195,7 @@ async fn conversation_response(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(ConversationResponse {
-        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
+        conversation: conversation_to_json_with_seed(state, &conversation, true).await?,
     }))
 }
 
@@ -8413,6 +8439,7 @@ mod conversation_cwd_validation_tests {
                     checkout_ref: None,
                     seed_parent_id: None,
                     seed_label: None,
+                    approved_task: None,
                 },
             })
             .await
@@ -8515,6 +8542,7 @@ mod conversation_cwd_validation_tests {
                     checkout_ref: None,
                     seed_parent_id: None,
                     seed_label: None,
+                    approved_task: None,
                 },
             })
             .await
@@ -12700,9 +12728,38 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("create");
-        for id in &ids[1..] {
+        for pair in ids.windows(2) {
+            let predecessor_id = pair[0];
+            let id = pair[1];
             let now = chrono::Utc::now().to_rfc3339();
             let scope_id = format!("scope-{id}");
+            let mut tx = state
+                .db
+                .pool()
+                .begin()
+                .await
+                .expect("begin continuation fixture");
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .expect("defer fixture foreign keys");
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("reserve continuation edge");
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
+                .await
+                .expect("link");
             sqlx::query(
                 "INSERT INTO work_scopes (
                      id, authority_kind, environment_kind, cwd, created_at, updated_at
@@ -12710,7 +12767,7 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .bind(&scope_id)
             .bind(&now)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await
             .expect("scope");
             sqlx::query(
@@ -12724,17 +12781,18 @@ pub(crate) mod hard_delete_cascade_tests {
             .bind(format!("slug-{id}"))
             .bind(scope_id)
             .bind(now)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await
             .expect("create");
-        }
-        for pair in ids.windows(2) {
-            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-                .bind(pair[1])
-                .bind(pair[0])
-                .execute(state.db.pool())
-                .await
-                .expect("link");
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume continuation reservation");
+            tx.commit().await.expect("commit continuation fixture");
         }
     }
 
@@ -13072,6 +13130,7 @@ pub(crate) mod hard_delete_cascade_tests {
     /// worktree + branch on disk. Returns the tempdir guard (kept alive by
     /// caller), the repo path, the worktree path, and the branch name so
     /// the test can assert against the filesystem after a chain operation.
+    #[allow(clippy::too_many_lines)]
     async fn build_workmode_chain_with_shared_worktree(
         state: &AppState,
         ids: &[&str; 3],
@@ -13143,7 +13202,36 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("create root conv");
-        for id in &ids[1..] {
+        for pair in ids.windows(2) {
+            let predecessor_id = pair[0];
+            let id = pair[1];
+            let mut tx = state
+                .db
+                .pool()
+                .begin()
+                .await
+                .expect("begin continuation fixture");
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .expect("defer fixture foreign keys");
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("reserve continuation edge");
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
+                .await
+                .expect("link");
             sqlx::query(
                 "INSERT INTO conversations (
                      id, product_conversation_id, slug, title, user_initiated,
@@ -13162,17 +13250,18 @@ pub(crate) mod hard_delete_cascade_tests {
             .bind(format!("Title {id}"))
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(&root.id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await
             .expect("create continuation member");
-        }
-        for pair in ids.windows(2) {
-            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-                .bind(pair[1])
-                .bind(pair[0])
-                .execute(state.db.pool())
-                .await
-                .expect("link");
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume continuation reservation");
+            tx.commit().await.expect("commit continuation fixture");
         }
 
         (tmp, repo, worktree, branch)
@@ -14042,6 +14131,12 @@ mod regenerate_conversation_name_tests {
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
         assert_eq!(response.conversation["slug"], "useful-auth-fix");
+        assert!(response
+            .conversation
+            .get("product_conversation_id")
+            .is_none());
+        assert!(response.conversation.get("presentation_mode").is_some());
+        assert!(response.conversation.get("work_scope_key").is_some());
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
@@ -15036,6 +15131,7 @@ mod attachment_storage_tests {
             checkout_ref: None,
             seed_parent_id: None,
             seed_label: None,
+            approved_task: None,
         };
         db.insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
             id: "job-creation-file".to_string(),

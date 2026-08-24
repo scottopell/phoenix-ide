@@ -493,8 +493,6 @@ pub struct RuntimeManager {
     #[cfg(test)]
     fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    handoff_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
     runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -2129,8 +2127,6 @@ impl RuntimeManager {
             #[cfg(test)]
             fork_runtime_start_barrier: AsyncMutex::new(None),
             #[cfg(test)]
-            handoff_runtime_start_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
             runtime_authority_transfer_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_authority_sealed_barrier: AsyncMutex::new(None),
@@ -3362,21 +3358,14 @@ impl RuntimeManager {
         self: &Arc<Self>,
         parent_conversation_id: &str,
         approval: &TaskApprovalHandoffData,
-        authority: &mut AdmittedOperation,
+        _authority: &mut AdmittedOperation,
     ) -> Result<TaskApprovalHandoffResponse, String> {
         let successor = self
             .db
-            .create_task_approval_handoff_conversation(parent_conversation_id, approval)
+            .create_task_approval_handoff_creation_job(parent_conversation_id, approval)
             .await
             .map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        if let Some(barrier) = self.handoff_runtime_start_barrier.lock().await.take() {
-            barrier.wait().await;
-            barrier.wait().await;
-        }
-        let _ = self
-            .get_or_create_with_authority(&successor.id, authority.reborrow())
-            .await?;
+        self.kick_creation_worker();
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
             state_updated_at: successor.state_updated_at,
@@ -7601,63 +7590,38 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn admitted_task_handoff_startup_survives_closure_after_commit() {
+    async fn admitted_task_handoff_persists_creation_job_before_authority_closes() {
         let manager = Arc::new(test_manager().await);
         create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
-        let authority = manager.acquire_local_authority_pass().unwrap();
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        *manager.handoff_runtime_start_barrier.lock().await = Some(Arc::clone(&barrier));
-        let (response_tx, _response_rx) = oneshot::channel();
-        let request = TaskApprovalHandoffRequest {
-            parent_conversation_id: "handoff-parent".to_string(),
-            approval: TaskApprovalHandoffData {
-                task_id: "12345".to_string(),
-                task_title: "Inherited handoff".to_string(),
-                branch_name: "task-12345-inherited-handoff".to_string(),
-                worktree_path: "/tmp".to_string(),
-                base_branch: "main".to_string(),
-                title: "Inherited handoff".to_string(),
-                priority: crate::task_source::Priority::P1,
-                plan: "Do the work".to_string(),
-                task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
-            },
-            authority,
-            response_tx,
+        let mut authority = manager.acquire_local_authority_pass().unwrap();
+        let approval = TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "Inherited handoff".to_string(),
+            branch_name: "task-12345-inherited-handoff".to_string(),
+            worktree_path: "/tmp".to_string(),
+            base_branch: "main".to_string(),
+            title: "Inherited handoff".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Do the work".to_string(),
+            task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
         };
-        let handoff = {
-            let manager = Arc::clone(&manager);
-            tokio::spawn(async move {
-                let mut authority = request.authority;
-                manager
-                    .create_and_start_task_handoff(
-                        &request.parent_conversation_id,
-                        &request.approval,
-                        &mut authority,
-                    )
-                    .await
-            })
-        };
-
-        barrier.wait().await;
-        let parent = manager
-            .db()
-            .get_conversation("handoff-parent")
+        let response = manager
+            .create_and_start_task_handoff("handoff-parent", &approval, &mut authority)
             .await
             .unwrap();
-        let successor_id = parent
-            .continued_in_conv_id
-            .expect("handoff commit links successor");
-        manager.signal_fatal_local_authority("test_handoff_startup");
-        assert_eq!(
-            manager.fatal_local_authority_fence.owners_at_first_close(),
-            Some(1)
-        );
-        barrier.wait().await;
-
-        let response = handoff.await.unwrap().unwrap();
-        assert_eq!(response.successor_conv_id, successor_id);
-        let successor = manager.db().get_conversation(&successor_id).await.unwrap();
-        assert_eq!(response.state_updated_at, successor.state_updated_at);
+        manager.signal_fatal_local_authority("test_handoff_after_commit");
+        let successor = manager
+            .db()
+            .get_conversation(&response.successor_conv_id)
+            .await
+            .unwrap();
+        assert!(matches!(successor.state, ConvState::Provisioning { .. }));
+        assert!(manager
+            .db()
+            .get_conversation_creation_job_for_conversation(&successor.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -10418,6 +10382,33 @@ mod scope_liveness_tests {
             .await
             .expect("get predecessor")
             .product_conversation_id;
+        let mut tx = mgr
+            .db()
+            .pool()
+            .begin()
+            .await
+            .expect("begin continuation fixture");
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .expect("defer fixture foreign keys");
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(from)
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("reserve continuation edge");
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(to)
+            .bind(from)
+            .execute(&mut *tx)
+            .await
+            .expect("wire continuation");
         sqlx::query(
             "UPDATE conversations
              SET runtime_role = 'user', parent_conversation_id = NULL
@@ -10425,15 +10416,18 @@ mod scope_liveness_tests {
         )
         .bind(to)
         .bind(product_conversation_id.as_str())
-        .execute(mgr.db().pool())
+        .execute(&mut *tx)
         .await
         .expect("promote continuation transcript");
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind(to)
-            .bind(from)
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(from)
+        .execute(&mut *tx)
+        .await
+        .expect("consume continuation reservation");
+        tx.commit().await.expect("commit continuation fixture");
     }
 
     async fn set_context_exhausted(mgr: &RuntimeManager, id: &str) {

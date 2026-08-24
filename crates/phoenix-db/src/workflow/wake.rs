@@ -5041,7 +5041,33 @@ mod tests {
         pool: &sqlx::SqlitePool,
         id: &str,
         product_conversation_id: &str,
+        predecessor_id: Option<&str>,
     ) {
+        let mut tx = pool.begin().await.unwrap();
+        if let Some(predecessor_id) = predecessor_id {
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id,
+                     product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(product_conversation_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO conversations
              (id, product_conversation_id, slug, title, user_initiated, state_updated_at,
@@ -5053,9 +5079,20 @@ mod tests {
         )
         .bind(id)
         .bind(product_conversation_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+        if let Some(predecessor_id) = predecessor_id {
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
     }
 
     async fn insert_conversation(pool: &sqlx::SqlitePool, id: &str) {
@@ -5068,7 +5105,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        insert_conversation_in_product(pool, id, &product_conversation_id).await;
+        insert_conversation_in_product(pool, id, &product_conversation_id, None).await;
     }
 
     async fn external_acceptance_identity(
@@ -6973,18 +7010,22 @@ mod tests {
         .fetch_one(&repo.workflow_repo.pool)
         .await
         .unwrap();
-        insert_conversation_in_product(&repo.workflow_repo.pool, "conv-2", &root_product_id).await;
-        insert_conversation_in_product(&repo.workflow_repo.pool, "conv-3", &root_product_id).await;
+        insert_conversation_in_product(
+            &repo.workflow_repo.pool,
+            "conv-2",
+            &root_product_id,
+            Some("conv-1"),
+        )
+        .await;
+        insert_conversation_in_product(
+            &repo.workflow_repo.pool,
+            "conv-3",
+            &root_product_id,
+            Some("conv-2"),
+        )
+        .await;
         let workflow_id = WorkflowId(1191);
         create_pending_terminal_delivery(&repo, workflow_id).await;
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'conv-2' WHERE id = 'conv-1'")
-            .execute(&repo.workflow_repo.pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'conv-3' WHERE id = 'conv-2'")
-            .execute(&repo.workflow_repo.pool)
-            .await
-            .unwrap();
         assert_eq!(restarted.list_pending("conv-1").await.unwrap().len(), 1);
 
         assert_eq!(

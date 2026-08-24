@@ -396,6 +396,8 @@ pub struct ConversationCreationIntent {
     pub seed_parent_id: Option<String>,
     #[serde(default)]
     pub seed_label: Option<String>,
+    #[serde(default)]
+    pub approved_task: Option<crate::task_handoff::ApprovedTaskSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

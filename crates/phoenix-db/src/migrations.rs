@@ -455,7 +455,8 @@ CREATE TABLE product_conversations (
     id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
     kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator')),
     ordinary_lifecycle TEXT CHECK (
-        (kind = 'ordinary' AND ordinary_lifecycle IN ('open', 'history'))
+        (kind = 'ordinary' AND ordinary_lifecycle IS NOT NULL
+         AND ordinary_lifecycle IN ('open', 'history'))
         OR (kind = 'coordinator' AND ordinary_lifecycle IS NULL)
     )
 );
@@ -469,34 +470,21 @@ END;
 
 ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT REFERENCES product_conversations(id) ON DELETE CASCADE;
 
-UPDATE conversations
-SET continued_in_conv_id = NULL
-WHERE runtime_role = 'sub_agent'
-  AND continued_in_conv_id IS NOT NULL;
-
-UPDATE conversations
-SET parent_conversation_id = NULL
-WHERE runtime_role = 'sub_agent'
-  AND parent_conversation_id IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM conversations parent
-      WHERE parent.id = conversations.parent_conversation_id
-  );
-
-INSERT OR IGNORE INTO work_scopes (
-    id, authority_kind, lifecycle, created_at, updated_at, environment_kind, cwd
-)
-SELECT
-    'legacy-orphan-product-' || hex(CAST(orphan.id AS BLOB)),
-    'restricted_explore',
-    'active',
-    COALESCE(NULLIF(orphan.created_at, ''), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    COALESCE(NULLIF(orphan.updated_at, ''), STRFTIME('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    'unowned_cwd',
-    COALESCE(NULLIF(orphan.sub_agent_cwd_override, ''), '/tmp')
+CREATE TEMP TABLE migration_070_orphan_subordinates (
+    conversation_id TEXT PRIMARY KEY,
+    source_parent_id TEXT,
+    group_key TEXT NOT NULL,
+    tombstone_id TEXT NOT NULL,
+    tombstone_scope_id TEXT NOT NULL
+);
+INSERT INTO migration_070_orphan_subordinates
+SELECT orphan.id,
+       orphan.parent_conversation_id,
+       COALESCE(orphan.parent_conversation_id, orphan.id),
+       'legacy-orphan-parent-' || hex(CAST(COALESCE(orphan.parent_conversation_id, orphan.id) AS BLOB)),
+       'legacy-orphan-scope-' || hex(CAST(COALESCE(orphan.parent_conversation_id, orphan.id) AS BLOB))
 FROM conversations orphan
 WHERE orphan.runtime_role = 'sub_agent'
-  AND orphan.work_scope_id IS NULL
   AND (
       orphan.parent_conversation_id IS NULL
       OR NOT EXISTS (
@@ -505,23 +493,75 @@ WHERE orphan.runtime_role = 'sub_agent'
       )
   );
 
-UPDATE conversations
-SET work_scope_id = 'legacy-orphan-product-' || hex(CAST(id AS BLOB))
-WHERE runtime_role = 'sub_agent'
-  AND work_scope_id IS NULL
-  AND (
-      parent_conversation_id IS NULL
-      OR NOT EXISTS (
-          SELECT 1 FROM conversations parent
-          WHERE parent.id = conversations.parent_conversation_id
-      )
-  );
+CREATE TEMP TABLE migration_070_orphan_tombstone_collision_guard (
+    collision_count INTEGER NOT NULL CHECK (collision_count = 0)
+);
+INSERT INTO migration_070_orphan_tombstone_collision_guard
+SELECT
+    (SELECT COUNT(*)
+     FROM migration_070_orphan_subordinates orphan
+     JOIN conversations existing ON existing.id = orphan.tombstone_id)
+  + (SELECT COUNT(*)
+     FROM migration_070_orphan_subordinates orphan
+     JOIN work_scopes existing ON existing.id = orphan.tombstone_scope_id);
+DROP TABLE migration_070_orphan_tombstone_collision_guard;
+
+INSERT INTO work_scopes (
+    id, authority_kind, lifecycle, retired_at, retired_reason, created_at, updated_at,
+    environment_kind, cwd, worktree_path, branch_name, base_branch
+)
+SELECT DISTINCT tombstone_scope_id, 'restricted_explore', 'retired',
+       '1970-01-01T00:00:00Z', 'legacy orphan subordinate tombstone',
+       '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z',
+       'none', NULL, NULL, NULL, NULL
+FROM migration_070_orphan_subordinates;
+
+INSERT INTO conversations (
+    id, title, user_initiated, state, state_kind, state_updated_at,
+    created_at, updated_at, archived, runtime_role, work_scope_id, cm_kind
+)
+SELECT tombstone_id, 'Retired legacy subordinate parent', 0,
+       json_object('type', 'terminal'), 'terminal', '1970-01-01T00:00:00Z',
+       '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', 1, 'user',
+       tombstone_scope_id, 'explore'
+FROM migration_070_orphan_subordinates
+GROUP BY group_key, tombstone_id, tombstone_scope_id;
+
+CREATE TABLE legacy_orphan_subordinate_tombstones (
+    root_conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    source_parent_id TEXT,
+    retired_at_us INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(retired_at_us) = 'integer' AND retired_at_us >= 0)
+);
+INSERT INTO legacy_orphan_subordinate_tombstones (
+    root_conversation_id, source_parent_id, retired_at_us
+)
+SELECT tombstone_id, MAX(source_parent_id), 0
+FROM migration_070_orphan_subordinates
+GROUP BY tombstone_id;
 
 UPDATE conversations
-SET runtime_role = 'user',
-    user_initiated = 1
+SET parent_conversation_id = (
+        SELECT orphan.tombstone_id
+        FROM migration_070_orphan_subordinates orphan
+        WHERE orphan.conversation_id = conversations.id
+    ),
+    continued_in_conv_id = NULL,
+    work_scope_id = COALESCE(
+        work_scope_id,
+        (SELECT orphan.tombstone_scope_id
+         FROM migration_070_orphan_subordinates orphan
+         WHERE orphan.conversation_id = conversations.id)
+    )
+WHERE id IN (SELECT conversation_id FROM migration_070_orphan_subordinates);
+
+UPDATE conversations
+SET continued_in_conv_id = NULL
 WHERE runtime_role = 'sub_agent'
-  AND parent_conversation_id IS NULL;
+  AND continued_in_conv_id IS NOT NULL;
+
+DROP TABLE migration_070_orphan_subordinates;
 
 CREATE TEMP TABLE migration_070_continuation_fork_guard (
     ambiguous_successor_count INTEGER NOT NULL CHECK (ambiguous_successor_count = 0)
@@ -588,15 +628,6 @@ WITH RECURSIVE roots(conversation_id, product_conversation_id, kind) AS (
 INSERT INTO migration_070_membership
 SELECT conversation_id, product_conversation_id, kind FROM members;
 
-INSERT INTO migration_070_membership (conversation_id, product_conversation_id, kind)
-SELECT orphan.id, orphan.id, 'ordinary'
-FROM conversations orphan
-WHERE orphan.runtime_role = 'sub_agent'
-  AND NOT EXISTS (
-      SELECT 1 FROM migration_070_membership mapped
-      WHERE mapped.conversation_id = orphan.id
-  );
-
 CREATE TEMP TABLE migration_070_membership_guard (
     unresolved_count INTEGER NOT NULL CHECK (unresolved_count = 0)
 );
@@ -644,6 +675,40 @@ DROP TABLE migration_070_continuation_shape_guard;
 CREATE UNIQUE INDEX conversations_one_predecessor_per_successor
 ON conversations(continued_in_conv_id)
 WHERE continued_in_conv_id IS NOT NULL;
+
+CREATE TABLE product_continuation_reservations (
+    predecessor_conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT NOT NULL UNIQUE,
+    product_conversation_id TEXT NOT NULL
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    CHECK (predecessor_conversation_id <> successor_conversation_id)
+);
+
+CREATE TRIGGER conversations_require_single_product_root_on_insert
+BEFORE INSERT ON conversations
+FOR EACH ROW WHEN NEW.runtime_role IN ('user', 'coordinator')
+  AND NEW.parent_conversation_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM conversations existing WHERE existing.id = NEW.id
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM conversations predecessor
+      WHERE predecessor.continued_in_conv_id = NEW.id
+  )
+  AND EXISTS (
+      SELECT 1 FROM conversations member
+      WHERE member.product_conversation_id = NEW.product_conversation_id
+        AND member.runtime_role = NEW.runtime_role
+        AND member.parent_conversation_id IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM conversations predecessor
+            WHERE predecessor.continued_in_conv_id = member.id
+        )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation requires one parent-transcript root');
+END;
 
 CREATE TRIGGER conversations_require_product_membership_on_insert
 BEFORE INSERT ON conversations
@@ -713,19 +778,70 @@ BEGIN
     SELECT RAISE(ABORT, 'only subordinate executions may have a same-ProductConversation parent');
 END;
 
+CREATE TRIGGER conversations_require_single_product_root_on_update
+BEFORE UPDATE OF runtime_role, parent_conversation_id, product_conversation_id ON conversations
+FOR EACH ROW WHEN NEW.runtime_role IN ('user', 'coordinator')
+  AND NEW.parent_conversation_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM conversations predecessor
+      WHERE predecessor.continued_in_conv_id = NEW.id
+        AND predecessor.id <> OLD.id
+  )
+  AND EXISTS (
+      SELECT 1 FROM conversations member
+      WHERE member.product_conversation_id = NEW.product_conversation_id
+        AND member.runtime_role = NEW.runtime_role
+        AND member.parent_conversation_id IS NULL
+        AND member.id <> OLD.id
+        AND NOT EXISTS (
+            SELECT 1 FROM conversations predecessor
+            WHERE predecessor.continued_in_conv_id = member.id
+              AND predecessor.id <> OLD.id
+        )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'ProductConversation requires one parent-transcript root');
+END;
+
+CREATE TRIGGER conversations_preserve_parent_subordinate_topology_on_update
+BEFORE UPDATE OF runtime_role, parent_conversation_id ON conversations
+FOR EACH ROW WHEN
+    (NEW.runtime_role = 'sub_agent' AND (
+        NEW.parent_conversation_id IS NULL
+        OR NEW.continued_in_conv_id IS NOT NULL
+        OR EXISTS (
+            SELECT 1 FROM conversations predecessor
+            WHERE predecessor.continued_in_conv_id = NEW.id
+        )
+    ))
+    OR (NEW.runtime_role IN ('user', 'coordinator')
+        AND NEW.parent_conversation_id IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'parent transcripts and subordinate executions have disjoint topology');
+END;
+
 CREATE TRIGGER conversations_validate_product_continuation_on_update
 BEFORE UPDATE OF continued_in_conv_id ON conversations
-FOR EACH ROW WHEN NEW.continued_in_conv_id IS NOT NULL AND (
-    NEW.runtime_role NOT IN ('user', 'coordinator')
-    OR NEW.parent_conversation_id IS NOT NULL
-    OR NOT EXISTS (
-        SELECT 1 FROM conversations successor
-        WHERE successor.id = NEW.continued_in_conv_id
-          AND successor.product_conversation_id = NEW.product_conversation_id
-          AND successor.parent_conversation_id IS NULL
-          AND successor.runtime_role = NEW.runtime_role
-    )
-)
+FOR EACH ROW WHEN
+    (OLD.continued_in_conv_id IS NOT NULL
+     AND OLD.continued_in_conv_id IS NOT NEW.continued_in_conv_id)
+    OR (NEW.continued_in_conv_id IS NOT NULL AND (
+        NEW.runtime_role NOT IN ('user', 'coordinator')
+        OR NEW.parent_conversation_id IS NOT NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM conversations successor
+            WHERE successor.id = NEW.continued_in_conv_id
+              AND successor.product_conversation_id = NEW.product_conversation_id
+              AND successor.parent_conversation_id IS NULL
+              AND successor.runtime_role = NEW.runtime_role
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM product_continuation_reservations reservation
+            WHERE reservation.predecessor_conversation_id = NEW.id
+              AND reservation.successor_conversation_id = NEW.continued_in_conv_id
+              AND reservation.product_conversation_id = NEW.product_conversation_id
+        )
+    ))
 BEGIN
     SELECT RAISE(ABORT, 'continuation must connect parent transcripts in one ProductConversation');
 END;
@@ -780,6 +896,60 @@ FOR EACH ROW WHEN NEW.continued_in_conv_id IS NOT NULL AND EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'continuation topology must be acyclic');
 END;
+
+CREATE TRIGGER product_continuation_reservations_validate_on_insert
+BEFORE INSERT ON product_continuation_reservations
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM conversations predecessor
+    WHERE predecessor.id = NEW.predecessor_conversation_id
+      AND predecessor.product_conversation_id = NEW.product_conversation_id
+      AND predecessor.runtime_role IN ('user', 'coordinator')
+      AND predecessor.parent_conversation_id IS NULL
+      AND predecessor.continued_in_conv_id IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'continuation reservation requires an uncontinued parent transcript');
+END;
+
+CREATE TRIGGER product_continuation_reservations_validate_on_delete
+BEFORE DELETE ON product_continuation_reservations
+FOR EACH ROW WHEN NOT EXISTS (
+    SELECT 1 FROM conversations predecessor
+    JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+    WHERE predecessor.id = OLD.predecessor_conversation_id
+      AND predecessor.continued_in_conv_id = OLD.successor_conversation_id
+      AND successor.product_conversation_id = OLD.product_conversation_id
+      AND successor.runtime_role = predecessor.runtime_role
+      AND successor.parent_conversation_id IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'continuation reservation requires a completed continuation edge');
+END;
+
+CREATE TABLE product_conversation_sources (
+    target_product_conversation_id TEXT PRIMARY KEY
+        REFERENCES product_conversations(id) ON DELETE CASCADE,
+    source_product_conversation_id TEXT NOT NULL
+        CHECK (typeof(source_product_conversation_id) = 'text'
+               AND source_product_conversation_id <> ''),
+    source_conversation_id TEXT NOT NULL
+        CHECK (typeof(source_conversation_id) = 'text'
+               AND source_conversation_id <> ''),
+    relation_kind TEXT NOT NULL CHECK (relation_kind IN ('approved_task')),
+    relation_key TEXT NOT NULL
+        CHECK (typeof(relation_key) = 'text' AND relation_key <> ''),
+    created_at_us INTEGER NOT NULL
+        CHECK (typeof(created_at_us) = 'integer' AND created_at_us >= 0),
+    CHECK (target_product_conversation_id <> source_product_conversation_id)
+);
+
+CREATE INDEX product_conversation_sources_by_source
+ON product_conversation_sources(source_product_conversation_id);
+
+CREATE UNIQUE INDEX product_conversation_sources_one_relation_key
+ON product_conversation_sources(
+    source_product_conversation_id, relation_kind, relation_key
+);
 
 DROP TRIGGER close_obligations_require_admission_phase_on_insert;
 
@@ -12693,7 +12863,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_070_backfills_orphan_subagent_as_ordinary_aggregate() {
+    #[allow(clippy::too_many_lines)]
+    async fn migration_070_preserves_orphan_subagent_behind_hidden_tombstone() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
         sqlx::raw_sql(
@@ -12704,6 +12875,12 @@ mod tests {
              ) VALUES (
                  'orphan-worker', 'orphan-worker', 0, '{\"type\":\"idle\"}', 'idle',
                  '2025-01-01', '2025-01-01', '2025-01-01', 1, 'sub_agent', 'deleted-parent'
+             );
+             INSERT INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content, created_at
+             ) VALUES (
+                 'orphan-message', 'orphan-worker', 1, 'assistant',
+                 '{\"blocks\":[{\"type\":\"text\",\"text\":\"preserved\"}]}', '2025-01-01'
              );
              PRAGMA foreign_keys = ON;",
         )
@@ -12718,14 +12895,15 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(membership, "orphan-worker");
+        let tombstone_id = "legacy-orphan-parent-64656C657465642D706172656E74";
+        assert_eq!(membership, tombstone_id);
         let parent: Option<String> = sqlx::query_scalar(
             "SELECT parent_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(parent, None);
+        assert_eq!(parent.as_deref(), Some(tombstone_id));
         let role: (String, bool) = sqlx::query_as(
             "SELECT runtime_role, user_initiated FROM conversations
              WHERE id = 'orphan-worker'",
@@ -12733,11 +12911,12 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(role, ("user".to_string(), true));
+        assert_eq!(role, ("sub_agent".to_string(), false));
         let aggregate: (String, Option<String>) = sqlx::query_as(
             "SELECT kind, ordinary_lifecycle FROM product_conversations
-             WHERE id = 'orphan-worker'",
+             WHERE id = ?1",
         )
+        .bind(tombstone_id)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -12745,6 +12924,50 @@ mod tests {
             aggregate,
             ("ordinary".to_string(), Some("history".to_string()))
         );
+        let preserved_message: String =
+            sqlx::query_scalar("SELECT content FROM messages WHERE message_id = 'orphan-message'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(preserved_message.contains("preserved"));
+        let tombstone: (bool, String, String) = sqlx::query_as(
+            "SELECT root.user_initiated, root.runtime_role, scope.lifecycle
+             FROM legacy_orphan_subordinate_tombstones marker
+             JOIN conversations root ON root.id = marker.root_conversation_id
+             JOIN work_scopes scope ON scope.id = root.work_scope_id
+             WHERE root.id = ?1",
+        )
+        .bind(tombstone_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tombstone,
+            (false, "user".to_string(), "retired".to_string())
+        );
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations
+             WHERE product_conversation_id = ?1
+               AND user_initiated = 1",
+        )
+        .bind(tombstone_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(visible, 0);
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        assert!(db
+            .list_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
+        assert!(db
+            .list_archived_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|conversation| conversation.product_conversation_id.as_str() != tombstone_id));
     }
 
     #[tokio::test]
@@ -12807,6 +13030,13 @@ mod tests {
         assert!(sqlx::query(
             "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
              VALUES ('bad-coordinator', 'coordinator', 'open')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('bad-ordinary', 'ordinary', NULL)",
         )
         .execute(&pool)
         .await
@@ -12874,6 +13104,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_070_rejects_invalid_continuation_and_parent_topology() {
         let pool = test_pool().await;
         setup_schema_before_migration_070(&pool).await;
@@ -12893,14 +13124,92 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::raw_sql(
+        assert!(sqlx::query(
             "INSERT INTO conversations (
                  id, product_conversation_id, runtime_role, user_initiated, work_scope_id,
                  state_updated_at, created_at, updated_at
-             ) VALUES
-                 ('a-next', 'ordinary-a', 'user', 1, 'scope-a', '2025-01-01', '2025-01-01', '2025-01-01'),
-                 ('a-fork', 'ordinary-a', 'user', 1, 'scope-a', '2025-01-01', '2025-01-01', '2025-01-01');
-             UPDATE conversations SET continued_in_conv_id = 'a-next' WHERE id = 'a';",
+             ) VALUES (
+                 'disconnected', 'ordinary-a', 'user', 1, 'scope-a',
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id,
+                 product_conversation_id
+             ) VALUES ('a', 'a-next', 'ordinary-a')",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = 'a-next' WHERE id = 'a'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, runtime_role, user_initiated, work_scope_id,
+                 state_updated_at, created_at, updated_at
+             ) VALUES (
+                 'a-next', 'ordinary-a', 'user', 1, 'scope-a',
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = 'a'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = NULL WHERE id = 'a'",)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = 'b' WHERE id = 'a'",)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "UPDATE conversations
+             SET runtime_role = 'sub_agent', parent_conversation_id = 'a-next'
+             WHERE id = 'a'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE conversations
+             SET runtime_role = 'sub_agent', parent_conversation_id = 'a'
+             WHERE id = 'a-next'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, state_updated_at, created_at, updated_at
+             ) VALUES (
+                 'a-fork', 'ordinary-a', 'a', 'sub_agent', 0,
+                 '2025-01-01', '2025-01-01', '2025-01-01'
+             )",
         )
         .execute(&pool)
         .await

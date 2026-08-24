@@ -1896,6 +1896,28 @@ mod reconcile_worktrees_tests {
             .execute(db.pool())
             .await
             .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(from)
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(to)
+            .bind(from)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO conversations (
                  id, product_conversation_id, slug, user_initiated, runtime_role,
@@ -1912,15 +1934,18 @@ mod reconcile_worktrees_tests {
                 .map(phoenix_core::work_scope::WorkScopeId::as_str),
         )
         .bind(chrono::Utc::now().to_rfc3339())
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await
         .unwrap();
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind(to)
-            .bind(from)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(from)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
 
     /// Case (a): parent reached `ContextExhausted`. Worktree directory is

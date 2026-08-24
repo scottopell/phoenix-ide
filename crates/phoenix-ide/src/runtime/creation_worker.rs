@@ -1,7 +1,7 @@
 use crate::api::handlers::{
-    create_branch_worktree_blocking, create_managed_explore_worktree_blocking, generate_slug,
-    slugify_label, title_from_text, validate_user_ref, AppError, BranchWorktreeError,
-    BranchWorktreeInfo, ManagedWorktreeError,
+    create_branch_worktree_blocking, create_detached_task_worktree_blocking,
+    create_managed_explore_worktree_blocking, generate_slug, slugify_label, title_from_text,
+    validate_user_ref, AppError, BranchWorktreeError, BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
@@ -490,6 +490,7 @@ async fn provision_conversation(
     let initial_cwd = valid_cwd.into_raw();
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
+    let approved_task_creation = requested_mode == "approved_task";
 
     let mut resolved_model = resolve_creation_model(
         &manager.llm_registry,
@@ -523,19 +524,28 @@ async fn provision_conversation(
 
     match requested_mode {
         "direct" => {}
-        "branch" => {
+        "branch" | "approved_task" => {
             let repo_root = repo_root.clone().ok_or_else(|| {
                 (
                     "Branch mode requires a git repository".to_string(),
                     ErrorKind::InvalidRequest,
                 )
             })?;
-            let branch_name = desired_base_branch.clone().ok_or_else(|| {
-                (
-                    "Branch mode requires base_branch naming the existing branch".to_string(),
-                    ErrorKind::InvalidRequest,
-                )
-            })?;
+            let branch_name = if requested_mode == "approved_task" {
+                intent.checkout_ref.clone().ok_or_else(|| {
+                    (
+                        "Approved-task creation requires the approved branch".to_string(),
+                        ErrorKind::InvalidRequest,
+                    )
+                })?
+            } else {
+                desired_base_branch.clone().ok_or_else(|| {
+                    (
+                        "Branch mode requires base_branch naming the existing branch".to_string(),
+                        ErrorKind::InvalidRequest,
+                    )
+                })?
+            };
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             checkpoint_creation_stage(
@@ -557,6 +567,9 @@ async fn provision_conversation(
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
             let path_for_blocking = existing_path.clone();
+            let base_branch_for_blocking = desired_base_branch
+                .clone()
+                .unwrap_or_else(|| branch_name.clone());
             let worktree_admission = acquire_creation_admission(
                 manager,
                 "branch worktree mutation rejected after fatal local authority closure",
@@ -564,31 +577,49 @@ async fn provision_conversation(
             let info = run_admitted_blocking(worktree_admission, move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
-                    validate_worktree_branch(&path_for_blocking, &branch_name)?;
+                    if !approved_task_creation {
+                        validate_worktree_branch(&path_for_blocking, &branch_name)?;
+                    }
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
-                    let default_branch = crate::git_ops::run_git(
-                        Path::new(&repo_for_blocking),
-                        &["symbolic-ref", "refs/remotes/origin/HEAD"],
-                    )
-                    .ok()
-                    .and_then(|s| {
-                        s.trim()
-                            .strip_prefix("refs/remotes/origin/")
-                            .map(String::from)
-                    })
-                    .or_else(|| {
+                    let base_branch = if approved_task_creation {
+                        base_branch_for_blocking
+                    } else {
                         crate::git_ops::run_git(
                             Path::new(&repo_for_blocking),
-                            &["rev-parse", "--abbrev-ref", "HEAD"],
+                            &["symbolic-ref", "refs/remotes/origin/HEAD"],
                         )
                         .ok()
-                        .map(|s| s.trim().to_string())
-                    })
-                    .unwrap_or_else(|| branch_name.clone());
+                        .and_then(|s| {
+                            s.trim()
+                                .strip_prefix("refs/remotes/origin/")
+                                .map(String::from)
+                        })
+                        .or_else(|| {
+                            crate::git_ops::run_git(
+                                Path::new(&repo_for_blocking),
+                                &["rev-parse", "--abbrev-ref", "HEAD"],
+                            )
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                        })
+                        .unwrap_or_else(|| branch_name.clone())
+                    };
                     Ok(BranchWorktreeInfo {
                         branch_name,
                         worktree_path,
-                        base_branch: default_branch,
+                        base_branch,
+                    })
+                } else if approved_task_creation {
+                    let worktree_path = create_detached_task_worktree_blocking(
+                        &repo_for_blocking,
+                        &path_for_blocking,
+                        &branch_name,
+                    )
+                    .map_err(branch_worktree_error_to_kind)?;
+                    Ok(BranchWorktreeInfo {
+                        branch_name,
+                        worktree_path,
+                        base_branch: base_branch_for_blocking,
                     })
                 } else {
                     create_branch_worktree_blocking(&repo_for_blocking, &conv_id, &branch_name, &db)
@@ -613,13 +644,28 @@ async fn provision_conversation(
             .await?;
             effective_cwd.clone_from(&info.worktree_path);
             desired_base_branch = Some(info.base_branch.clone());
-            conv_mode = ConvMode::Branch {
-                branch_name: NonEmptyString::new(info.branch_name)
-                    .map_err(|_| ("empty branch name".to_string(), ErrorKind::ServerError))?,
-                worktree_path: NonEmptyString::new(info.worktree_path)
-                    .map_err(|_| ("empty worktree path".to_string(), ErrorKind::ServerError))?,
-                base_branch: NonEmptyString::new(info.base_branch)
-                    .map_err(|_| ("empty base branch".to_string(), ErrorKind::ServerError))?,
+            conv_mode = if let Some(snapshot) = intent.approved_task.as_ref() {
+                ConvMode::Work {
+                    branch_name: NonEmptyString::new(info.branch_name)
+                        .map_err(|_| ("empty branch name".to_string(), ErrorKind::ServerError))?,
+                    worktree_path: NonEmptyString::new(info.worktree_path)
+                        .map_err(|_| ("empty worktree path".to_string(), ErrorKind::ServerError))?,
+                    base_branch: NonEmptyString::new(info.base_branch)
+                        .map_err(|_| ("empty base branch".to_string(), ErrorKind::ServerError))?,
+                    task_id: NonEmptyString::new(snapshot.task_id.clone())
+                        .map_err(|_| ("empty task id".to_string(), ErrorKind::ServerError))?,
+                    task_title: NonEmptyString::new(snapshot.task_title.clone())
+                        .map_err(|_| ("empty task title".to_string(), ErrorKind::ServerError))?,
+                }
+            } else {
+                ConvMode::Branch {
+                    branch_name: NonEmptyString::new(info.branch_name)
+                        .map_err(|_| ("empty branch name".to_string(), ErrorKind::ServerError))?,
+                    worktree_path: NonEmptyString::new(info.worktree_path)
+                        .map_err(|_| ("empty worktree path".to_string(), ErrorKind::ServerError))?,
+                    base_branch: NonEmptyString::new(info.base_branch)
+                        .map_err(|_| ("empty base branch".to_string(), ErrorKind::ServerError))?,
+                }
             };
         }
         "auto" if repo_root.is_none() => {}
@@ -1317,6 +1363,7 @@ mod temporary_creation_branch_tests {
                 checkout_ref: None,
                 seed_parent_id: None,
                 seed_label: None,
+                approved_task: None,
             },
             status: "cancelling".to_string(),
             generation: 1,
