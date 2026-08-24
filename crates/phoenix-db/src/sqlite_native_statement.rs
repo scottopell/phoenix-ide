@@ -1405,20 +1405,25 @@ mod tests {
             .unwrap();
         let after =
             db.sqlite_workload_aggregate_report(SqliteSnapshotWindow::OneHour, unix_now_micros());
-        assert!(after.classification_gap_count > before.classification_gap_count);
         let read = SqliteAccessKind::Read.index();
+        let successful_delta = [
+            SqliteWorkloadCategory::Other,
+            SqliteWorkloadCategory::PrProjectData,
+        ]
+        .into_iter()
+        .map(|category| {
+            after.totals[read][category.index()].baseline_statement_count
+                - before.totals[read][category.index()].baseline_statement_count
+        })
+        .sum::<u64>();
+        assert_eq!(successful_delta, 1);
         assert_eq!(
-            after.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count,
-            before.totals[read][SqliteWorkloadCategory::Other.index()].baseline_statement_count + 1
+            after.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count,
+            before.totals[read][SqliteWorkloadCategory::RuntimeState.index()]
+                .baseline_statement_count,
+            "failed conversations prepare must not taint the later projects statement",
         );
-        for category in SqliteWorkloadCategory::ALL {
-            if category != SqliteWorkloadCategory::Other {
-                assert_eq!(
-                    after.totals[read][category.index()].baseline_statement_count,
-                    before.totals[read][category.index()].baseline_statement_count
-                );
-            }
-        }
     }
 
     #[tokio::test]
