@@ -215,9 +215,6 @@ class PhoenixClient:
         )
         resp.raise_for_status()
 
-    # ------------------------------------------------------------------
-    # Discovery (REQ-CLI-011)
-    # ------------------------------------------------------------------
 
     def list_conversations(self) -> list[dict]:
         """List all non-archived conversations."""
@@ -236,9 +233,6 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json().get('hits', [])
 
-    # ------------------------------------------------------------------
-    # Interaction (REQ-CLI-009)
-    # ------------------------------------------------------------------
 
     def respond_to_question(self, conv_id: str, answers: dict[str, str]) -> dict:
         """Answer a pending user question (AwaitingUserResponse state)."""
@@ -295,9 +289,6 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()
 
-    # ------------------------------------------------------------------
-    # Introspection (REQ-CLI-010)
-    # ------------------------------------------------------------------
 
     def get_diff(self, conv_id: str) -> dict:
         """Worktree diff against the conversation's base branch."""
@@ -341,9 +332,6 @@ class PhoenixClient:
         resp.raise_for_status()
         return resp.json()
 
-    # ------------------------------------------------------------------
-    # Platform & config (REQ-CLI-012)
-    # ------------------------------------------------------------------
 
     def get_version(self) -> dict:
         """Server build version and git SHA."""
@@ -515,6 +503,19 @@ class PhoenixClient:
                                 'messages': messages
                             }
 
+                        # AwaitingUserResponse and AwaitingTaskApproval are
+                        # needs_action states: the server pauses here WITHOUT
+                        # emitting agent_done (display_state is needs_action,
+                        # not terminal). Return control so a synchronous agent
+                        # can issue --respond/--dismiss-question (or the
+                        # deferred --approve-task) instead of hanging until the
+                        # timeout.
+                        if state_kind in ('awaiting_user_response', 'awaiting_task_approval'):
+                            return {
+                                'conversation': conversation,
+                                'messages': messages
+                            }
+
                         # Idle is the normal terminal state. The server emits
                         # agent_done on the idle transition, but treat an idle
                         # state_change as terminal too so a missed agent_done
@@ -555,6 +556,10 @@ class PhoenixClient:
             state_kind = _state_kind(state)
 
             if state_kind == 'idle':
+                return self.get_messages(conv_id)
+            elif state_kind in ('awaiting_user_response', 'awaiting_task_approval'):
+                # needs_action states: the server pauses without agent_done.
+                # Return control so the agent can issue --respond etc.
                 return self.get_messages(conv_id)
             elif state_kind == 'error':
                 raise PhoenixError(_state_error_message(state, 'Unknown error'))
@@ -737,6 +742,10 @@ def print_diff(diff: dict) -> None:
     click.echo(f"Label: {diff.get('label', '')}  Kind: {diff.get('kind', '')}")
     if diff.get('pr_number') is not None:
         click.echo(f"PR: #{diff['pr_number']}")
+    commit_log = diff.get('commit_log') or ''
+    if commit_log:
+        click.echo("--- COMMIT LOG ---")
+        click.echo(commit_log)
     committed = diff.get('committed_diff') or ''
     if committed:
         click.echo("--- COMMITTED DIFF ---")
@@ -759,12 +768,22 @@ def print_diff(diff: dict) -> None:
 
 
 def _render_checkout_status(cs: object) -> str:
-    """Render a CheckoutStatus tagged enum as a short token."""
+    """Render a CheckoutStatus tagged enum, including remote relationship."""
     if not isinstance(cs, dict):
         return str(cs) if cs else ''
     kind = cs.get('kind', 'unknown')
     if kind == 'named_branch':
-        return f"branch={cs.get('branch_name', '?')}@{cs.get('head_oid', '?')[:8]}"
+        base = f"branch={cs.get('branch_name', '?')}@{cs.get('head_oid', '?')[:8]}"
+        rs = cs.get('remote_status')
+        if isinstance(rs, dict):
+            rkind = rs.get('kind', '')
+            if rkind in ('tracked', 'matching'):
+                base += f"  {rkind}:{rs.get('remote_ref', '?')} +{rs.get('ahead', 0)}/-{rs.get('behind', 0)}"
+            elif rkind == 'no_known':
+                base += "  no-upstream"
+            elif rkind == 'unavailable':
+                base += f"  upstream-unavailable({rs.get('reason', '?')})"
+        return base
     if kind == 'detached':
         return f"detached@{cs.get('head_oid', '?')[:8]}"
     if kind == 'unborn':
@@ -821,7 +840,8 @@ def print_git_status(gs: dict) -> None:
 
 
 def print_proposals(proposals: list[dict]) -> None:
-    """Compact fork-proposal listing, including the snapshotted brief body."""
+    """Compact fork-proposal listing, including the snapshotted brief body
+    and any resolved fork/refinement conversation ids."""
     if not proposals:
         click.echo("No fork proposals found.")
         return
@@ -838,10 +858,15 @@ def print_proposals(proposals: list[dict]) -> None:
         body = p.get('body') or ''
         if body:
             click.echo(f"    body: {body}")
+        # Resolved successor conversations (for spawned/promoted proposals).
+        if p.get('fork_conversation_id'):
+            click.echo(f"    fork_conversation: {p['fork_conversation_id']}")
+        if p.get('refinement_conversation_id'):
+            click.echo(f"    refinement_conversation: {p['refinement_conversation_id']}")
 
 
 def print_tasks(tasks: list[dict]) -> None:
-    """Compact task-file listing."""
+    """Compact task-file listing, including the on-disk path."""
     if not tasks:
         click.echo("No tasks found.")
         return
@@ -850,6 +875,11 @@ def print_tasks(tasks: list[dict]) -> None:
             f"  {t.get('id', ''):6s} [{t.get('status', ''):12s}] "
             f"pri={t.get('priority', ''):4s} {t.get('slug', '')}"
         )
+        # TaskEntry always carries the absolute path to the task file;
+        # print it so callers can locate the file (especially when task
+        # discovery uses a non-default directory).
+        if t.get('path'):
+            click.echo(f"    path: {t['path']}")
         if t.get('conversation_slug'):
             click.echo(f"    owner: {t['conversation_slug']}")
 
@@ -1046,9 +1076,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             print(osc8_run_link(command))
         return
 
-    # ------------------------------------------------------------------
-    # Discovery (REQ-CLI-011)
-    # ------------------------------------------------------------------
     if list_conversations:
         print_conversations_table(client.list_conversations())
         return
@@ -1058,29 +1085,29 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         print_search_hits(hits)
         return
 
-    # ------------------------------------------------------------------
-    # Platform & config (REQ-CLI-012) -- no conversation required
-    # ------------------------------------------------------------------
+    # Platform & config (REQ-CLI-012) -- no conversation required.
+    # Process every selected flag so `--version --deployment --env`
+    # prints all three, not just the first.
     if show_version:
+        click.echo("=== VERSION ===")
         _print_json(client.get_version())
-        return
     if deployment:
+        click.echo("=== DEPLOYMENT ===")
         _print_json(client.get_deployment())
-        return
     if show_env:
+        click.echo("=== ENV ===")
         _print_json(client.get_env())
-        return
     if mcp_status:
+        click.echo("=== MCP STATUS ===")
         _print_json(client.get_mcp_status())
-        return
     if usage_overview:
+        click.echo("=== USAGE OVERVIEW ===")
         _print_json(client.get_usage_overview())
+    if show_version or deployment or show_env or mcp_status or usage_overview:
         return
 
-    # ------------------------------------------------------------------
     # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
     # (validation already done above, before auth.)
-    # ------------------------------------------------------------------
     if respond or dismiss_question or dismiss_error or cancel_steer:
         conv = client.get_conversation(conversation)
         if respond:
@@ -1116,14 +1143,12 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         click.echo(f"Continuation: {slug}  [{status}]", err=True)
         if result.get('error'):
             click.echo(f"  error: {result['error']}", err=True)
-        # A dispatch_failed continuation created the successor but did not
-        # deliver the handoff. Exit nonzero so automation does not treat an
-        # unseeded successor as ready to use. (accepted/already_exists are
-        # success.)
+        # Print the successor id first so automation has the recovery handle
+        # even when we exit nonzero (a dispatch_failed continuation still
+        # created the successor; the id is the handle to recover it).
+        print(result.get('conversation_id', ''))
         if status == 'dispatch_failed':
             sys.exit(1)
-        # Print the new conversation id/slug for the caller to use next.
-        print(result.get('conversation_id', ''))
         return
 
     if diff:
