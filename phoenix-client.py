@@ -758,6 +758,41 @@ def print_diff(diff: dict) -> None:
         )
 
 
+def _render_checkout_status(cs: object) -> str:
+    """Render a CheckoutStatus tagged enum as a short token."""
+    if not isinstance(cs, dict):
+        return str(cs) if cs else ''
+    kind = cs.get('kind', 'unknown')
+    if kind == 'named_branch':
+        return f"branch={cs.get('branch_name', '?')}@{cs.get('head_oid', '?')[:8]}"
+    if kind == 'detached':
+        return f"detached@{cs.get('head_oid', '?')[:8]}"
+    if kind == 'unborn':
+        return f"unborn({cs.get('branch_name') or '?'})"
+    if kind == 'unavailable':
+        return f"unavailable"
+    return kind
+
+
+def _render_changed_path(p: dict) -> str:
+    """Render a GitChangedPath tagged enum (kind: ordinary/renamed/copied/untracked/unmerged)."""
+    kind = p.get('kind', 'unknown')
+    path = p.get('path', '')
+    if kind == 'ordinary':
+        idx = p.get('index_status', '')
+        wt = p.get('worktree_status', '')
+        return f"{path}  [index={idx} worktree={wt}]"
+    if kind == 'renamed':
+        return f"{p.get('previous_path', '')} -> {path}  [worktree={p.get('worktree_status', '')}]"
+    if kind == 'copied':
+        return f"{p.get('source_path', '')} => {path}  [worktree={p.get('worktree_status', '')}]"
+    if kind == 'untracked':
+        return f"{path}  [untracked]"
+    if kind == 'unmerged':
+        return f"{path}  [unmerged]"
+    return f"{path}  [{kind}]"
+
+
 def print_git_status(gs: dict) -> None:
     """Delimited git status snapshot."""
     kind = gs.get('kind', 'snapshot')
@@ -767,6 +802,8 @@ def print_git_status(gs: dict) -> None:
         return
     if kind == 'unavailable':
         click.echo(f"Unavailable: {gs.get('reason', 'unknown')}")
+        if gs.get('checkout_status') is not None:
+            click.echo(f"  checkout: {_render_checkout_status(gs['checkout_status'])}")
         return
     # snapshot
     counts = gs.get('counts') or {}
@@ -777,12 +814,14 @@ def print_git_status(gs: dict) -> None:
         f"Untracked: {counts.get('untracked_paths', 0)}  "
         f"Conflicted: {counts.get('conflicted_paths', 0)}"
     )
+    if gs.get('checkout_status') is not None:
+        click.echo(f"Checkout: {_render_checkout_status(gs['checkout_status'])}")
     for p in gs.get('changed_paths') or []:
-        click.echo(f"  {p.get('path', '')}  [{p.get('status', '')}]")
+        click.echo(f"  {_render_changed_path(p)}")
 
 
 def print_proposals(proposals: list[dict]) -> None:
-    """Compact fork-proposal listing."""
+    """Compact fork-proposal listing, including the snapshotted brief body."""
     if not proposals:
         click.echo("No fork proposals found.")
         return
@@ -793,6 +832,12 @@ def print_proposals(proposals: list[dict]) -> None:
         )
         if p.get('task_file'):
             click.echo(f"    task: {p['task_file']}")
+        # The body is the sole snapshot of the brief (it is not in the
+        # transcript), so an agent inspecting proposals needs it to see
+        # what was actually proposed.
+        body = p.get('body') or ''
+        if body:
+            click.echo(f"    body: {body}")
 
 
 def print_tasks(tasks: list[dict]) -> None:
@@ -924,6 +969,27 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         phoenix-client.py --poll "Hello"
     """
     resolved_url = api_url or _detect_api_url()
+
+    # Validate conversation-required flags before contacting the server.
+    # Otherwise a missing -c with an unreachable server reports a connection
+    # error instead of the usage error the contract requires.
+    needs_conv = (
+        respond
+        or dismiss_question
+        or dismiss_error
+        or cancel_steer
+        or continue_conv
+        or diff
+        or git_status
+        or usage
+        or system_prompt
+        or tasks
+        or proposals
+        or trajectory_export
+    )
+    if needs_conv and not conversation:
+        raise click.UsageError("this option requires --conversation.")
+
     client = PhoenixClient(resolved_url, password=password)
     client.ensure_authenticated()
 
@@ -1013,24 +1079,8 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 
     # ------------------------------------------------------------------
     # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
+    # (validation already done above, before auth.)
     # ------------------------------------------------------------------
-    needs_conv = (
-        respond
-        or dismiss_question
-        or dismiss_error
-        or cancel_steer
-        or continue_conv
-        or diff
-        or git_status
-        or usage
-        or system_prompt
-        or tasks
-        or proposals
-        or trajectory_export
-    )
-    if needs_conv and not conversation:
-        raise click.UsageError("this option requires --conversation.")
-
     if respond or dismiss_question or dismiss_error or cancel_steer:
         conv = client.get_conversation(conversation)
         if respond:
@@ -1066,6 +1116,12 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         click.echo(f"Continuation: {slug}  [{status}]", err=True)
         if result.get('error'):
             click.echo(f"  error: {result['error']}", err=True)
+        # A dispatch_failed continuation created the successor but did not
+        # deliver the handoff. Exit nonzero so automation does not treat an
+        # unseeded successor as ready to use. (accepted/already_exists are
+        # success.)
+        if status == 'dispatch_failed':
+            sys.exit(1)
         # Print the new conversation id/slug for the caller to use next.
         print(result.get('conversation_id', ''))
         return

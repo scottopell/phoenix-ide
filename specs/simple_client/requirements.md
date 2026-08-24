@@ -149,7 +149,7 @@ THE SYSTEM SHALL exit with a usage error before contacting the server
 WHEN the conversation is not in the required state
 THE SYSTEM SHALL surface the server's conflict message and exit non-zero
 
-**Rationale:** An agent driving Phoenix needs to resolve the states that pause a conversation — questions, resumable errors, queued steering messages, and context exhaustion — not just send messages. Task and fork-proposal approval flows are deferred pending the transcript/compaction refactor; the continuation handoff is exposed against the current live contract and will be updated if the refactor changes it.
+**Rationale:** An agent driving Phoenix needs to resolve the states that pause a conversation — questions, resumable errors, queued steering messages, and context exhaustion — not just send messages. Task and fork-proposal approval flows are out of scope for this requirement (see `executive.md` for the deferral note).
 
 ---
 
