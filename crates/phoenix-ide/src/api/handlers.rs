@@ -6106,17 +6106,7 @@ async fn rename_conversation(
             _ => AppError::NotFound(e.to_string()),
         })?;
 
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
-
-    Ok(Json(ConversationResponse {
-        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
-    }))
+    conversation_response(&state, &id).await
 }
 
 async fn regenerate_conversation_name(
@@ -14113,6 +14103,29 @@ mod regenerate_conversation_name_tests {
         id: &str,
     ) -> Result<Json<ConversationResponse>, AppError> {
         regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+    }
+
+    #[tokio::test]
+    async fn rename_response_uses_canonical_presentation_serializer() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("unused"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-rename", "before-rename").await;
+
+        let Json(response) = rename_conversation(
+            State(state.clone()),
+            Path("conv-rename".to_string()),
+            Json(RenameRequest {
+                name: "After Rename".to_string(),
+            }),
+        )
+        .await
+        .expect("rename");
+        assert_eq!(response.conversation["slug"], "After Rename");
+        assert!(response.conversation.get("presentation_mode").is_some());
+        assert!(response.conversation.get("requires_action").is_some());
+        assert!(response.conversation.get("work_scope_key").is_some());
     }
 
     #[tokio::test]

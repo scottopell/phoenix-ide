@@ -370,6 +370,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "persist_product_conversation_identity",
         sql: MIGRATION_070,
     },
+    Migration {
+        version: 71,
+        name: "correct_product_conversation_lifecycle_seed",
+        sql: MIGRATION_071,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -452,7 +457,7 @@ pub(crate) fn normalize_sql(sql: &str) -> String {
 
 const MIGRATION_070: &str = r"
 CREATE TABLE product_conversations (
-    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
+    id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND trim(id) <> ''),
     kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator')),
     ordinary_lifecycle TEXT CHECK (
         (kind = 'ordinary' AND ordinary_lifecycle IS NOT NULL
@@ -641,7 +646,15 @@ DROP TABLE migration_070_membership_guard;
 INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
 SELECT DISTINCT m.product_conversation_id, m.kind,
        CASE m.kind
-           WHEN 'ordinary' THEN CASE WHEN root.archived = 1 THEN 'history' ELSE 'open' END
+           WHEN 'ordinary' THEN CASE WHEN EXISTS (
+               SELECT 1 FROM migration_070_membership current
+               JOIN conversations latest ON latest.id = current.conversation_id
+               WHERE current.product_conversation_id = m.product_conversation_id
+                 AND latest.runtime_role = 'user'
+                 AND latest.parent_conversation_id IS NULL
+                 AND latest.continued_in_conv_id IS NULL
+                 AND latest.archived = 0
+           ) THEN 'open' ELSE 'history' END
        END
 FROM migration_070_membership m
 JOIN conversations root ON root.id = m.product_conversation_id;
@@ -2045,6 +2058,92 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
+
+const MIGRATION_071: &str = r"
+UPDATE product_conversations
+SET ordinary_lifecycle = CASE WHEN EXISTS (
+    SELECT 1 FROM conversations latest
+    WHERE latest.product_conversation_id = product_conversations.id
+      AND latest.runtime_role = 'user'
+      AND latest.parent_conversation_id IS NULL
+      AND latest.continued_in_conv_id IS NULL
+      AND latest.archived = 0
+) THEN 'open' ELSE 'history' END
+WHERE kind = 'ordinary';
+
+CREATE TRIGGER product_conversation_id_before_insert
+BEFORE INSERT ON product_conversations
+WHEN trim(NEW.id) = ''
+BEGIN
+    SELECT RAISE(ABORT, 'product conversation id must not be blank');
+END;
+
+CREATE TRIGGER product_conversation_id_before_update
+BEFORE UPDATE OF id ON product_conversations
+WHEN trim(NEW.id) = ''
+BEGIN
+    SELECT RAISE(ABORT, 'product conversation id must not be blank');
+END;
+
+CREATE TRIGGER product_conversation_lifecycle_after_insert
+AFTER INSERT ON conversations
+WHEN NEW.product_conversation_id IS NOT NULL
+BEGIN
+    UPDATE product_conversations
+    SET ordinary_lifecycle = CASE WHEN EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = NEW.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+    ) THEN 'open' ELSE 'history' END
+    WHERE id = NEW.product_conversation_id AND kind = 'ordinary';
+END;
+
+CREATE TRIGGER product_conversation_lifecycle_after_update
+AFTER UPDATE OF archived, continued_in_conv_id, parent_conversation_id, runtime_role,
+                product_conversation_id ON conversations
+WHEN NEW.product_conversation_id IS NOT NULL OR OLD.product_conversation_id IS NOT NULL
+BEGIN
+    UPDATE product_conversations
+    SET ordinary_lifecycle = CASE WHEN EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = NEW.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+    ) THEN 'open' ELSE 'history' END
+    WHERE id = NEW.product_conversation_id AND kind = 'ordinary';
+    UPDATE product_conversations
+    SET ordinary_lifecycle = CASE WHEN EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = OLD.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+    ) THEN 'open' ELSE 'history' END
+    WHERE id = OLD.product_conversation_id AND kind = 'ordinary';
+END;
+
+CREATE TRIGGER product_conversation_lifecycle_after_delete
+AFTER DELETE ON conversations
+WHEN OLD.product_conversation_id IS NOT NULL
+BEGIN
+    UPDATE product_conversations
+    SET ordinary_lifecycle = CASE WHEN EXISTS (
+        SELECT 1 FROM conversations latest
+        WHERE latest.product_conversation_id = OLD.product_conversation_id
+          AND latest.runtime_role = 'user'
+          AND latest.parent_conversation_id IS NULL
+          AND latest.continued_in_conv_id IS NULL
+          AND latest.archived = 0
+    ) THEN 'open' ELSE 'history' END
+    WHERE id = OLD.product_conversation_id AND kind = 'ordinary';
+END;
 ";
 
 const MIGRATION_069: &str = "";
@@ -11884,7 +11983,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration')",
+             VALUES (70, 'temporarily_skip_product_conversation_migration'),
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction')",
         )
         .execute(&pool)
         .await
@@ -12761,13 +12861,14 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO _migrations (version, name)
-             VALUES (70, 'temporarily_skip_product_conversation_migration')",
+             VALUES (70, 'temporarily_skip_product_conversation_migration'),
+                    (71, 'temporarily_skip_product_conversation_lifecycle_correction')",
         )
         .execute(pool)
         .await
         .unwrap();
         run_pending_migrations(pool).await.unwrap();
-        sqlx::query("DELETE FROM _migrations WHERE version = 70")
+        sqlx::query("DELETE FROM _migrations WHERE version IN (70, 71)")
             .execute(pool)
             .await
             .unwrap();
@@ -12785,7 +12886,7 @@ mod tests {
                  continued_in_conv_id, work_scope_id
              ) VALUES
                  ('open-root', 'open-root', 1, '{\"type\":\"idle\"}', 'idle',
-                  '2025-01-01', '2025-01-01', '2025-01-01', 0, 'user', NULL, 'open-latest', 'scope-open'),
+                  '2025-01-01', '2025-01-01', '2025-01-01', 1, 'user', NULL, 'open-latest', 'scope-open'),
                  ('open-latest', 'open-latest', 1, '{\"type\":\"idle\"}', 'idle',
                   '2025-01-01', '2025-01-01', '2025-01-01', 0, 'user', NULL, NULL, 'scope-open'),
                  ('worker', 'worker', 0, '{\"type\":\"idle\"}', 'idle',
@@ -12811,7 +12912,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
+
+        assert!(sqlx::query(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('   ', 'ordinary', 'open')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
 
         let memberships: Vec<(String, String)> =
             sqlx::query_as("SELECT id, product_conversation_id FROM conversations ORDER BY id")
@@ -12888,7 +12997,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 2);
         let membership: String = sqlx::query_scalar(
             "SELECT product_conversation_id FROM conversations WHERE id = 'orphan-worker'",
         )

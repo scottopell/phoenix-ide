@@ -6815,18 +6815,31 @@ impl Database {
             Self::new_scope_for_conversation(&parent.cwd, &conv_mode_columns(&ConvMode::Direct));
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT target.id
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT target.id, job.intent_json
              FROM product_conversation_sources source
              JOIN conversations target ON target.product_conversation_id = source.target_product_conversation_id
+             JOIN conversation_creation_jobs job ON job.conversation_id = target.id
              WHERE source.source_product_conversation_id = ?1
-               AND source.relation_kind = 'approved_task' AND source.relation_key = ?2",
+               AND source.relation_kind = 'approved_task' AND source.relation_key = ?2
+               AND target.parent_conversation_id IS NULL
+             ORDER BY target.created_at ASC, target.id ASC
+             LIMIT 1",
         )
         .bind(parent.product_conversation_id.as_str())
         .bind(&snapshot.task_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(existing) = existing {
+        if let Some((existing, existing_intent_json)) = existing {
+            let existing_intent: ConversationCreationIntent =
+                serde_json::from_str(&existing_intent_json)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            if existing_intent.approved_task.as_ref() != Some(&snapshot) {
+                return Err(DbError::ContinuationPrecondition(format!(
+                    "approved task handoff conflicts with committed reviewed snapshot {}",
+                    snapshot.task_id
+                )));
+            }
             tx.commit().await?;
             return self.get_conversation(&existing).await;
         }
@@ -6896,6 +6909,18 @@ impl Database {
                 Err(error) => return Err(DbError::Sqlx(error)),
             }
         }
+        let source_state = ConvState::Idle;
+        sqlx::query(
+            "UPDATE conversations
+             SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4",
+        )
+        .bind(serde_json::to_string(&source_state).unwrap())
+        .bind(conv_state_kind(&source_state))
+        .bind(&now_str)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
                  id, conversation_id, message_id, status, stage, attempt, generation, intent_json,
@@ -20319,6 +20344,7 @@ mod tests {
             task_id: "27002".to_string(),
             task_title: "Approve Fresh".to_string(),
             branch_name: "task-27002-approve-fresh".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
             worktree_path: "/source-worktree-must-not-transfer".to_string(),
             base_branch: "main".to_string(),
             title: "Approve Fresh".to_string(),
@@ -20344,23 +20370,19 @@ mod tests {
         assert_eq!(snapshot.plan, approval.plan);
         assert_eq!(snapshot.branch_name, approval.branch_name);
         assert!(!job.intent.text.contains(&approval.worktree_path));
-        let mut mutated_retry = approval.clone();
-        mutated_retry.plan = "unreviewed replacement plan".to_string();
         let replayed = db
-            .create_task_approval_handoff_creation_job("handoff-parent", &mutated_retry)
+            .create_task_approval_handoff_creation_job("handoff-parent", &approval)
             .await
             .unwrap();
         assert_eq!(replayed.id, successor.id);
-        let replayed_job = db
-            .get_conversation_creation_job_for_conversation(&successor.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            replayed_job.intent.approved_task.unwrap().plan,
-            approval.plan,
-            "retries cannot replace the reviewed snapshot"
-        );
+        let mut divergent_retry = approval.clone();
+        divergent_retry.plan = "unreviewed replacement plan".to_string();
+        assert!(matches!(
+            db.create_task_approval_handoff_creation_job("handoff-parent", &divergent_retry)
+                .await,
+            Err(DbError::ContinuationPrecondition(message))
+                if message.contains("conflicts with committed reviewed snapshot")
+        ));
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM conversation_creation_jobs WHERE conversation_id = ?1",
         )
@@ -20381,6 +20403,7 @@ mod tests {
             task_id: "27003".to_string(),
             task_title: "Concurrent".to_string(),
             branch_name: "task-27003-concurrent".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
             worktree_path: "/ignored".to_string(),
             base_branch: "main".to_string(),
             title: "Concurrent".to_string(),

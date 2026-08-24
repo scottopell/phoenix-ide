@@ -7598,6 +7598,7 @@ mod scope_liveness_tests {
             task_id: "12345".to_string(),
             task_title: "Inherited handoff".to_string(),
             branch_name: "task-12345-inherited-handoff".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
             worktree_path: "/tmp".to_string(),
             base_branch: "main".to_string(),
             title: "Inherited handoff".to_string(),

@@ -396,6 +396,7 @@ pub struct ConversationCreationIntent {
     pub seed_parent_id: Option<String>,
     #[serde(default)]
     pub seed_label: Option<String>,
+    // owned: pre-approved-task rows had no reviewed snapshot; None is correct.
     #[serde(default)]
     pub approved_task: Option<crate::task_handoff::ApprovedTaskSnapshot>,
 }

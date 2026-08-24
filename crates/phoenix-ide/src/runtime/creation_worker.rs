@@ -570,6 +570,7 @@ async fn provision_conversation(
             let base_branch_for_blocking = desired_base_branch
                 .clone()
                 .unwrap_or_else(|| branch_name.clone());
+            let approved_task_snapshot = intent.approved_task.clone();
             let worktree_admission = acquire_creation_admission(
                 manager,
                 "branch worktree mutation rejected after fatal local authority closure",
@@ -577,7 +578,37 @@ async fn provision_conversation(
             let info = run_admitted_blocking(worktree_admission, move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
-                    if !approved_task_creation {
+                    if approved_task_creation {
+                        let approved_commit_oid = approved_task_snapshot
+                            .as_ref()
+                            .expect("approved_task mode has reviewed snapshot")
+                            .approved_commit_oid
+                            .as_str();
+                        let head = crate::git_ops::run_git(
+                            &path_for_blocking,
+                            &["rev-parse", "HEAD"],
+                        )
+                        .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+                        if head.trim() != approved_commit_oid {
+                            return Err((
+                                format!(
+                                    "approved-task worktree HEAD {} does not match approved commit {approved_commit_oid}",
+                                    head.trim()
+                                ),
+                                ErrorKind::InvalidRequest,
+                            ));
+                        }
+                        let symbolic_head = crate::git_ops::run_git(
+                            &path_for_blocking,
+                            &["symbolic-ref", "-q", "HEAD"],
+                        );
+                        if symbolic_head.is_ok() {
+                            return Err((
+                                "approved-task worktree must remain detached".to_string(),
+                                ErrorKind::InvalidRequest,
+                            ));
+                        }
+                    } else {
                         validate_worktree_branch(&path_for_blocking, &branch_name)?;
                     }
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
@@ -613,7 +644,11 @@ async fn provision_conversation(
                     let worktree_path = create_detached_task_worktree_blocking(
                         &repo_for_blocking,
                         &path_for_blocking,
-                        &branch_name,
+                        approved_task_snapshot
+                            .as_ref()
+                            .expect("approved_task mode has reviewed snapshot")
+                            .approved_commit_oid
+                            .as_str(),
                     )
                     .map_err(branch_worktree_error_to_kind)?;
                     Ok(BranchWorktreeInfo {

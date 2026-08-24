@@ -911,9 +911,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(conversation_id.to_string());
-            if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
-                let _ = settled.send(());
-            }
             if self
                 .close_after_terminal_settlement
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -922,11 +919,17 @@ mod tests {
                     .store(false, std::sync::atomic::Ordering::Release);
             }
             let mut results = self.terminal_results.lock().unwrap();
-            if results.len() == 1 {
+            let result = if results.len() == 1 {
                 results[0].clone()
             } else {
                 results.remove(0)
+            };
+            if result.is_ok() {
+                if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
+                    let _ = settled.send(());
+                }
             }
+            result
         }
     }
 
