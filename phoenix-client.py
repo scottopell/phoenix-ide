@@ -171,16 +171,21 @@ class PhoenixClient:
 
     def get_conversation(self, id_or_slug: str) -> dict:
         """Get conversation by ID or slug."""
-        # Try as slug first
-        try:
-            resp = self.http.get(f"{self.base_url}/api/conversations/by-slug/{id_or_slug}")
-            if resp.status_code == 200:
-                return resp.json()['conversation']
-        except Exception:
-            pass
+        encoded = quote(id_or_slug, safe='')
+        # Try as slug first. Only fall through to the ID lookup on a 404
+        # (slug not found); let other errors — connection failures, 5xx,
+        # malformed JSON — propagate so the caller sees the real cause
+        # instead of a misleading "not found" from the ID path.
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/by-slug/{encoded}"
+        )
+        if resp.status_code == 200:
+            return resp.json()['conversation']
+        if resp.status_code != 404:
+            resp.raise_for_status()
 
         # Try as ID
-        resp = self.http.get(f"{self.base_url}/api/conversations/{id_or_slug}")
+        resp = self.http.get(f"{self.base_url}/api/conversations/{encoded}")
         resp.raise_for_status()
         return resp.json()['conversation']
 
@@ -505,6 +510,16 @@ class PhoenixClient:
                         if state_kind == 'context_exhausted':
                             summary = state.get('summary', '') if isinstance(state, dict) else ''
                             click.echo(f"Context exhausted: {summary}", err=True)
+                            return {
+                                'conversation': conversation,
+                                'messages': messages
+                            }
+
+                        # Idle is the normal terminal state. The server emits
+                        # agent_done on the idle transition, but treat an idle
+                        # state_change as terminal too so a missed agent_done
+                        # (race, reconnect) doesn't hang until the timeout.
+                        if state_kind == 'idle':
                             return {
                                 'conversation': conversation,
                                 'messages': messages
@@ -1121,6 +1136,14 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 def main_with_error_handling():
     try:
         main(standalone_mode=False)
+    except click.ClickException as e:
+        # standalone_mode=False makes Click raise UsageError/ClickException
+        # instead of handling them; surface them cleanly instead of a traceback.
+        e.show()
+        sys.exit(e.exit_code)
+    except click.Abort:
+        click.echo("Aborted", err=True)
+        sys.exit(1)
     except PhoenixError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
