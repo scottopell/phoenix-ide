@@ -17,7 +17,7 @@ REQ-CLI-005: SSE Streaming (--poll for fallback)
 REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution (uv run)
 REQ-CLI-008: Model Selection (--model, --list-models)
-REQ-CLI-009: Interaction (--respond, --dismiss-question, --dismiss-error, --cancel-steer)
+REQ-CLI-009: Interaction (--respond, --dismiss-question, --dismiss-error, --cancel-steer, --continue)
 REQ-CLI-010: Introspection (--diff, --git-status, --usage, --system-prompt, --tasks, --proposals)
 REQ-CLI-011: Discovery (--list-conversations, --search-conversations)
 REQ-CLI-012: Platform & Config (--version, --deployment, --env, --mcp-status, --usage-overview, --trajectory-export)
@@ -267,6 +267,28 @@ class PhoenixClient:
             f"{self.base_url}/api/conversations/{conv_id}/steering-queue/{encoded}"
         )
         resp.raise_for_status()
+
+    def continue_conversation(
+        self, conv_id: str, handoff: str, message_id: str | None = None
+    ) -> dict:
+        """Continue a context-exhausted conversation with a handoff message.
+
+        Creates (or returns the existing) successor conversation. The parent
+        must be in ContextExhausted state; otherwise the server returns 409.
+        Returns {conversation_id, slug?, status, error?} where status is one
+        of accepted | dispatch_failed | already_exists.
+        """
+        import uuid
+        payload = {
+            "handoff": handoff,
+            "message_id": message_id or str(uuid.uuid4()),
+        }
+        resp = self.http.post(
+            f"{self.base_url}/api/conversations/{conv_id}/continue",
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # Introspection (REQ-CLI-010)
@@ -821,6 +843,9 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
               help='Dismiss a user-resumable error. Requires --conversation')
 @click.option('--cancel-steer', 'cancel_steer', metavar='MSG_ID', default=None,
               help='Cancel a queued steering message by id. Requires --conversation')
+@click.option('--continue', 'continue_conv', is_flag=True,
+              help='Continue a context-exhausted conversation with a handoff. The handoff text '
+                   'comes from MESSAGE or stdin. Requires --conversation')
 # Introspection (REQ-CLI-010) -- require --conversation
 @click.option('--diff', is_flag=True,
               help='Print the worktree diff for --conversation and exit')
@@ -854,7 +879,7 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, list_conversations, search_conversations, search_limit, respond, dismiss_question, dismiss_error, cancel_steer, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, list_conversations, search_conversations, search_limit, respond, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -979,6 +1004,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         or dismiss_question
         or dismiss_error
         or cancel_steer
+        or continue_conv
         or diff
         or git_status
         or usage
@@ -1009,6 +1035,25 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             client.cancel_steering(conv['id'], cancel_steer)
             click.echo(f"Cancelled steering message {cancel_steer}.")
             return
+
+    if continue_conv:
+        conv = client.get_conversation(conversation)
+        handoff = message
+        if not handoff and not sys.stdin.isatty():
+            handoff = sys.stdin.read().strip()
+        if not handoff:
+            raise click.UsageError(
+                "--continue needs a handoff as MESSAGE or piped on stdin."
+            )
+        result = client.continue_conversation(conv['id'], handoff)
+        slug = result.get('slug') or result.get('conversation_id')
+        status = result.get('status', 'unknown')
+        click.echo(f"Continuation: {slug}  [{status}]", err=True)
+        if result.get('error'):
+            click.echo(f"  error: {result['error']}", err=True)
+        # Print the new conversation id/slug for the caller to use next.
+        print(result.get('conversation_id', ''))
+        return
 
     if diff:
         conv = client.get_conversation(conversation)
