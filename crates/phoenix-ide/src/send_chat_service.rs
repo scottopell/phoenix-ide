@@ -77,8 +77,6 @@ pub(crate) struct SendChatApplicationService {
     runtime: Arc<RuntimeManager>,
 }
 
-const MAX_STEER_QUEUE_DEPTH: usize = 5;
-
 impl SendChatApplicationService {
     pub(crate) fn new(db: crate::db::Database, runtime: Arc<RuntimeManager>) -> Self {
         Self { db, runtime }
@@ -190,7 +188,7 @@ impl SendChatApplicationService {
                 .steering_queue_depth(&conversation.id)
                 .await
                 .map_err(map_conversation_load_error)?
-                >= MAX_STEER_QUEUE_DEPTH
+                >= crate::db::MAX_STEERING_QUEUE_DEPTH
         {
             return Ok(steering_queue_full_outcome());
         }
@@ -241,7 +239,7 @@ impl SendChatApplicationService {
                 }
             }
 
-            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+            if steering_queue.len() >= crate::db::MAX_STEERING_QUEUE_DEPTH {
                 return Ok(steering_queue_full_outcome());
             }
             let event = Event::SteerMessage {

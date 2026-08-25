@@ -55,6 +55,7 @@ enum DirectChatOutcomeKind {
 
 value ResolvedTarget {
     conversation_id: String
+    product_conversation: bedrock/ProductConversation
     successor_conversation_id: String?
 }
 

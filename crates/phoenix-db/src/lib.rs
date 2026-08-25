@@ -55,6 +55,9 @@ pub use sqlite_workload::{
 };
 pub use workflow::*;
 
+/// Maximum pending steering entries permitted per conversation.
+pub const MAX_STEERING_QUEUE_DEPTH: usize = 5;
+
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::{
     EffectiveEffort, EffortSource, LlmAttemptMetrics, LlmAttemptOutcome, LlmTransport, ModelEffort,
@@ -6126,7 +6129,6 @@ impl Database {
         id: &str,
         queue: &[phoenix_core::domain::sm_event::SteerEntry],
     ) -> DbResult<()> {
-        const MAX_STEERING_QUEUE_DEPTH: usize = 5;
         let now = Utc::now();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         require_product_conversation_admission_tx(&mut tx, id).await?;
@@ -6205,7 +6207,6 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
-        const MAX_STEERING_QUEUE_DEPTH: i64 = 5;
         let now = Utc::now();
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
@@ -6225,7 +6226,9 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
-        if queue_position >= MAX_STEERING_QUEUE_DEPTH {
+        let queue_depth = usize::try_from(queue_position)
+            .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))?;
+        if queue_depth >= MAX_STEERING_QUEUE_DEPTH {
             tx.rollback().await?;
             return Err(DbError::SteeringQueueFull);
         }
@@ -17414,12 +17417,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steering_append_refuses_the_sixth_entry_in_its_write_transaction() {
+    async fn steering_append_refuses_entry_beyond_capacity_in_its_write_transaction() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("capacity", "capacity", "/tmp", true, None, None)
             .await
             .unwrap();
-        for index in 0..5 {
+        for index in 0..MAX_STEERING_QUEUE_DEPTH {
             db.append_steering_entry(
                 "capacity",
                 &steering_entry(&format!("entry-{index}")),
@@ -17435,7 +17438,44 @@ mod tests {
                 .unwrap_err(),
             DbError::SteeringQueueFull
         ));
-        assert_eq!(db.get_steering_queue("capacity").await.unwrap().len(), 5);
+        assert_eq!(
+            db.get_steering_queue("capacity").await.unwrap().len(),
+            MAX_STEERING_QUEUE_DEPTH
+        );
+    }
+    #[tokio::test]
+    async fn steering_queue_mutators_share_exported_capacity() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation(
+            "capacity-update",
+            "capacity-update",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let queue = (0..MAX_STEERING_QUEUE_DEPTH)
+            .map(|index| steering_entry(&format!("entry-{index}")))
+            .collect::<Vec<_>>();
+        db.update_steering_queue("capacity-update", &queue)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.steering_queue_depth("capacity-update").await.unwrap(),
+            MAX_STEERING_QUEUE_DEPTH
+        );
+        assert!(matches!(
+            db.update_steering_queue(
+                "capacity-update",
+                &[queue.clone(), vec![steering_entry("overflow")]].concat(),
+            )
+            .await
+            .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
     }
 
     #[tokio::test]
