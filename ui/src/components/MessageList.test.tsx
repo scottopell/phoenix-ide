@@ -3657,6 +3657,50 @@ describe('handleTotalListHeightChanged', () => {
     expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
+  it('a touch elsewhere on the page that prunes the last transcript touch ends the gesture', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-foreign-touchend"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // A transcript drag whose row is virtualized away: its end is never seen.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+
+    // An unrelated touch elsewhere on the page ends. The window listener
+    // prunes the vanished transcript identifier — leaving ownership empty
+    // without ever resolving the gesture the policy still holds.
+    fireEvent.touchEnd(document.body, { touches: [], changedTouches: [{ identifier: 9 }] });
+
+    // Scrolling back to the tail must still confirm. Nothing else is coming
+    // to notice that the gesture is over.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 690, clientHeight: 400 });
+    fireEvent.wheel(scroller, { deltaY: 120 });
+    fireEvent.scroll(scroller);
+
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

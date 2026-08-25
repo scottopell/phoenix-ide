@@ -943,10 +943,14 @@ function MessageListImpl({
       const requestFromUpwardIntent = () => {
         if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
-      // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming
+      // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming.
+      // Either nothing this scroller owns is still down, or what it owns has
+      // gone longer than the bound without an event of its own. An empty set
+      // was previously a reason to skip, which is backwards: it is the
+      // strongest evidence there is that no observable finger is driving.
       const abandonStaleGesture = abandonStaleGestureRef.current = () => {
-        if (scrollerTouchIdsRef.current.size === 0) return;
-        if (Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
+        if (scrollerTouchIdsRef.current.size > 0
+          && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
         scrollerTouchIdsRef.current.clear();
         touchStartYRef.current = null;
         dispatchScrollEvent({ type: 'gestureAbandoned' });
@@ -957,14 +961,11 @@ function MessageListImpl({
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
         }
-        // Nothing this scroller owned is still down, so any gesture the policy
-        // still holds ended without its end event being seen — the detached
-        // touchend case. A new touch must not inherit its evidence, and the
-        // gesture cannot be resolved either: the position it ended at was
-        // never observed, and the current one belongs to a later moment.
-        if (scrollerTouchIdsRef.current.size === 0) {
-          dispatchScrollEvent({ type: 'gestureAbandoned' });
-        }
+        // A new touch must not inherit the evidence of a gesture that already
+        // ended, and that gesture cannot be resolved either: the position it
+        // ended at was never observed, and the current one belongs to a later
+        // moment.
+        abandonStaleGesture();
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }
@@ -993,7 +994,13 @@ function MessageListImpl({
         for (const id of Array.from(scrollerTouchIdsRef.current)) {
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
         }
-        if (!owned) return;
+        if (!owned) {
+          // A touch anywhere on the page reaches this listener, and the
+          // pruning above can take away the last transcript touch whose own
+          // end was never delivered. Nothing later would notice.
+          abandonStaleGesture();
+          return;
+        }
         // The gesture continues while a finger remains, and the next touchmove
         // measures against this baseline — clearing it would silence upward
         // intent for the finger still on the screen.
