@@ -806,6 +806,60 @@ describe('VirtualTranscript', () => {
     }
   });
 
+  it('applies the correction as a position, not an offset from wherever the DOM ended up', () => {
+    vi.useFakeTimers();
+    try {
+      const ref = { current: null as VirtualTranscriptHandle | null };
+      let scroller: HTMLDivElement | null = null;
+      let clampOnPublish = false;
+
+      render(
+        <VirtualTranscript
+          ref={ref}
+          items={makeItems(30, 50)}
+          getKey={(item) => item.id}
+          estimatedExtent={50}
+          overscan={2000}
+          initialTail={false}
+          renderItem={renderRow}
+          onRangeChange={() => {
+            if (!clampOnPublish) return;
+            clampOnPublish = false;
+            // Losing the spacer shortens the transcript, and a browser clamps
+            // a viewport sitting past the new maximum. A positioning command
+            // asking for a snapshot in this window then adopts that position.
+            scroller!.scrollTop = 1370;
+            ref.current?.physicalSnapshot();
+          }}
+          scrollerRef={(element) => { scroller = element; }}
+        />,
+      );
+
+      act(() => {
+        scroller!.scrollTop = 1380;
+        fireEvent.scroll(scroller!);
+      });
+      const row = document.querySelector<HTMLElement>('[data-virtual-key="item-27"]')!;
+      act(() => {
+        fireEvent.touchStart(row, { touches: [{ identifier: 6 }], changedTouches: [{ identifier: 6 }] });
+      });
+      const above = document.querySelector<HTMLElement>('[data-virtual-key="item-5"]')!;
+      act(() => resizeObservers[0]!.triggerEntries([[above, 20]]));
+
+      clampOnPublish = true;
+      act(() => {
+        fireEvent.touchEnd(row, { touches: [], changedTouches: [{ identifier: 6 }] });
+        vi.advanceTimersByTime(GESTURE_STALE_MS + 500);
+      });
+
+      // The correction owed was to a position, not a distance. Re-basing it
+      // on the clamp applies part of the shift twice and moves the reader.
+      expect(scrollTopOf(scroller)).toBe(1350);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reconciles immediately when the top spacer can no longer absorb the drift', () => {
     vi.useFakeTimers();
     try {

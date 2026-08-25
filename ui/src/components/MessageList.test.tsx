@@ -3701,6 +3701,53 @@ describe('handleTotalListHeightChanged', () => {
     expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
+  it('space on a transcript control does not claim the viewport', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-space-key"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-space-key', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump owns the viewport. Space pressed on something inside a row
+    // activates that control rather than paging the transcript, so the
+    // command is still the one positioning and nothing should be acquired.
+    act(() => listRef.current?.scrollToUnitIndex(2));
+    const control = container.querySelector<HTMLElement>('#messages .message');
+    expect(control).not.toBeNull();
+    fireEvent.keyDown(control!, { key: ' ' });
+
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    // The request is scheduled in a microtask, so let it run before
+    // concluding it never happened.
+    await act(async () => { await Promise.resolve(); });
+    expect(onLoadOlderMessages).not.toHaveBeenCalled();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

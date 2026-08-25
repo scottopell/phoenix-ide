@@ -361,9 +361,11 @@ THE SYSTEM SHALL preserve the tail by issuing exactly one VirtualTranscript
 scroll-to-tail command
 AND SHALL keep unread-tail state clear
 
-WHEN a key that drives the transcript in either direction is pressed while
-it has focus
+WHEN a key whose default action moves the transcript in either direction is
+pressed while it has focus
 THE SYSTEM SHALL treat it as the user taking the viewport over
+AND SHALL NOT treat a key the focused element consumes for itself — text
+entry, or an activation key on a control — as viewport movement
 SO THAT a positioning command in flight yields to a reader who keys their own
 way to the tail, in either direction
 

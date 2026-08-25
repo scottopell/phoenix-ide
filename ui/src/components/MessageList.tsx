@@ -106,6 +106,11 @@ const RESTORE_OFFSET_TOLERANCE_PX = 2;
  *  one such state; so is a navigation they have taken over, which is what the
  *  user-returning phase records. A command still positioning is not — that
  *  movement is the command's own (REQ-MLRU-014). */
+function isTextEntry(element: HTMLElement): boolean {
+  const tag = element.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
+}
+
 function readerMovedViewport(machine: ScrollMachineState): boolean {
   if (machine.kind !== 'live') return false;
   return machine.follow.kind === 'reading'
@@ -1078,6 +1083,13 @@ function MessageListImpl({
         const target = e.target;
         const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
         if (!readsTranscript) return;
+        // A key only takes the viewport over when its default action is to
+        // move it. Typing consumes these keys outright, and Space activates a
+        // focused control rather than paging the transcript — treating either
+        // as a takeover would tell the policy a reader moved a viewport that
+        // never moved.
+        if (target instanceof HTMLElement && isTextEntry(target)) return;
+        if (e.key === ' ' && target !== document.body && target !== ref) return;
         const upward = UPWARD_KEYS.has(e.key);
         // Keys that drive the transcript toward the tail take the viewport
         // over just as upward ones do. Recognising only upward keys left a

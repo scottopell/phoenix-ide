@@ -129,9 +129,13 @@ interface PhysicalStore<T> {
    *  who owns it, and the two disagree whenever a reader is holding a
    *  position that happens to still be at the tail. */
   tailFollowAllowed: boolean;
-  /** ScrollTop adjustment owed by a drift reconcile, applied in a layout
-   *  effect so the spacer change and the scrollTop write land in one paint. */
-  pendingScrollDelta: number | null;
+  /** Absolute position a computed correction still owes the viewport, applied
+   *  in a layout effect so the spacer change and the write land in one paint. Stored
+   *  as a position, not an offset: anything that resynchronizes geometry from
+   *  the DOM in the interval — or a browser clamping the viewport as the
+   *  spacer shrinks — would otherwise re-base the offset and apply part of
+   *  the shift twice (REQ-VT-004). */
+  pendingScrollTop: number | null;
   /** ScrollTop value this component last wrote; cleared by the first
    *  non-matching scroll event. */
   pendingProgrammaticTop: number | null;
@@ -303,7 +307,7 @@ function totalPhysicalExtent<T>(store: PhysicalStore<T>): number {
  *  this, not `viewportTop`, for anything describing where the reader sits
  *  relative to content (REQ-VT-004). */
 function settledViewportTop<T>(store: PhysicalStore<T>): number {
-  return store.viewportTop + (store.pendingScrollDelta ?? 0);
+  return store.pendingScrollTop ?? store.viewportTop;
 }
 
 function rowViewportOffset<T>(store: PhysicalStore<T>): number {
@@ -341,7 +345,7 @@ function setScrollerScrollTop<T>(store: PhysicalStore<T>, nextTop: number): void
   // Placing the viewport somewhere absolute retires that position, so the
   // correction goes with it — applied afterwards it would displace the
   // caller's chosen position by the drift (REQ-VT-004).
-  store.pendingScrollDelta = null;
+  store.pendingScrollTop = null;
   store.viewportTop = scrollTop;
   if (scroller && scroller.scrollTop !== scrollTop) {
     store.pendingProgrammaticTop = scrollTop;
@@ -381,7 +385,7 @@ function applyAnchor<T>(store: PhysicalStore<T>, anchor: VirtualTranscriptAnchor
   // Mid-scroll absorption (REQ-VT-004); requires leading-spacer room and no
   // correction already owed as a write — a correction lives in the spacer or
   // in a pending write, never both.
-  if (delta !== 0 && scrollIsActive(store) && store.pendingScrollDelta === null) {
+  if (delta !== 0 && scrollIsActive(store) && store.pendingScrollTop === null) {
     const driftNext = store.drift - delta;
     const firstOffset = store.range ? store.layout.itemAt(store.range.startIndex)?.offset ?? 0 : 0;
     if (firstOffset + driftNext >= 0) {
@@ -519,7 +523,7 @@ function createStore<T>(props: VirtualTranscriptProps<T>): PhysicalStore<T> {
     activeTouchIds: new Set(),
     lastGestureAtMs: Number.NEGATIVE_INFINITY,
     tailFollowAllowed: true,
-    pendingScrollDelta: null,
+    pendingScrollTop: null,
     pendingProgrammaticTop: null,
   };
   recompute(store);
@@ -893,15 +897,15 @@ function VirtualTranscriptInner<T>(
 
   const reconcileTimerRef = useRef(0);
 
-  // Drift reconciliation (REQ-VT-004). pendingScrollDelta applies in a
+  // Drift reconciliation (REQ-VT-004). The owed position is written in a
   // layout effect: spacer change and scrollTop write must share one paint.
   useLayoutEffect(() => {
     const current = storeRef.current;
     if (!current) return;
-    if (current.pendingScrollDelta !== null) {
-      const delta = current.pendingScrollDelta;
-      current.pendingScrollDelta = null;
-      setScrollerScrollTop(current, current.viewportTop + delta);
+    if (current.pendingScrollTop !== null) {
+      const target = current.pendingScrollTop;
+      current.pendingScrollTop = null;
+      setScrollerScrollTop(current, target);
       recompute(current);
       publish();
       return;
@@ -914,7 +918,7 @@ function VirtualTranscriptInner<T>(
       if (firstOffset + current.drift < 0) {
         const drift = current.drift;
         current.drift = 0;
-        current.pendingScrollDelta = -drift;
+        current.pendingScrollTop = current.viewportTop - drift;
         recompute(current);
         publish();
         return;
@@ -932,7 +936,7 @@ function VirtualTranscriptInner<T>(
         }
         const drift = store.drift;
         store.drift = 0;
-        store.pendingScrollDelta = -drift;
+        store.pendingScrollTop = store.viewportTop - drift;
         recompute(store);
         publish();
       }, SCROLL_SETTLE_MS);
