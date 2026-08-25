@@ -615,15 +615,21 @@ impl WakeRepository {
                 .execute(&mut *tx.tx)
                 .await?;
             }
-            tx.commit().await?;
-            return Ok(if exact_replay || migrated_replay {
-                WakeRegistrationOutcome::Replayed {
+            if exact_replay || migrated_replay {
+                tx.commit().await?;
+                return Ok(WakeRegistrationOutcome::Replayed {
                     workflow_id: existing.workflow_id,
                     receipt: replay_receipt(&existing),
-                }
-            } else {
-                WakeRegistrationOutcome::Conflict
-            });
+                });
+            }
+            if let Err(error) =
+                require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id).await
+            {
+                tx.rollback().await?;
+                return Err(error);
+            }
+            tx.commit().await?;
+            return Ok(WakeRegistrationOutcome::Conflict);
         }
 
         if let Err(error) =
@@ -6277,6 +6283,37 @@ mod tests {
             repo.register(&input, "fp-2", Timestamp(10)).await.unwrap(),
             WakeRegistrationOutcome::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn close_fence_preserves_exact_wake_replay_and_refuses_nonexact_binding() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let db =
+            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
+        let input = intent();
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let product_conversation_id = db
+            .get_conversation("conv-1")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-existing-fence")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Replayed { .. }
+        ));
+        assert!(matches!(
+            repo.register(&input, "changed", Timestamp(10))
+                .await
+                .unwrap_err(),
+            DbError::CloseAdmissionFenced(_)
+        ));
     }
 
     #[tokio::test]

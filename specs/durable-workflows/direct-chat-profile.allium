@@ -34,6 +34,7 @@ enum DirectChatRejectReason {
     malformed_request
     | target_unavailable
     | capability_closed
+    | close_admission_fenced
 }
 
 enum PayloadSourceKind { inline_text | inline_file_reference | skill_invocation }
@@ -426,12 +427,20 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
 }
 
 rule ActiveCloseObligationFencesNewDirectTurnAdmission {
-    when: DirectChatRequested(request)
-    let conversation = request.resolved_target.conversation
-    requires: active_close_obligation(conversation.product_conversation)
-    requires: not same_key_existing_acceptance(request.turn_key)
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
 
-    ensures: DirectChatRejected(request, "close_admission_fenced")
+    let resolved_target = resolved_target_for(request)
+    let prepared_payload = prepared_payload_for(request, resolved_target)
+    let turn_key = target_bound_key(resolved_target, prepared_payload.user_message_id)
+
+    requires: active_close_obligation(resolved_target.conversation.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) = null
+
+    ensures: DirectChatOutcome.created(
+        kind: TerminalRejected,
+        terminal_rejected: close_admission_fenced
+    )
 
     @guidance
         -- The close-attempt admission and new direct-turn acceptance share one
