@@ -3378,6 +3378,51 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
+  it('a top-edge rubber-band return is not travel toward the tail', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-top-rubber-band"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    // A conversation that barely overflows: the whole scrollable range is
+    // inside the 100px pin zone, so the top edge is also near the tail.
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 480, scrollTop: 80, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(480));
+
+    setupScroller(scroller, { scrollHeight: 480, scrollTop: 0, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // Dragging at the top edge: iOS reports scrollTop past the start of the
+    // range, and a measurement lands while it is there.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: -30, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(500));
+
+    // The bounce relaxes back to the top. Measured against an out-of-range
+    // previous position this reads as movement toward the tail, and the lift
+    // would confirm a return the reader never made.
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

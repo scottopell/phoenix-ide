@@ -436,9 +436,17 @@ lift derivation treats as proof of a return, since the tail moves
 independently of the viewport and a change in distance is therefore not
 evidence of anything the reader did
 
+WHEN a viewport measurement is taken
+THE SYSTEM SHALL clamp the observed scroll position into the scrollable range
+in force at that moment
+SO THAT no recorded measurement carries a position the scroller cannot
+actually hold, at either edge
+
 WHEN scroll movement is classified as upward or downward intent
-THE SYSTEM SHALL clamp the observed scroll position into the scrollable
-range before comparing against the previous position
+THE SYSTEM SHALL re-clamp the previously recorded position into the range in
+force now before comparing the two
+SO THAT a range that moved between the two measurements cannot make a
+stationary viewport look as though it travelled
 AND SHALL classify a clamped position equal to the previous one as neither
 direction, recording its geometry without inferring intent
 SO THAT overscroll rubber-band bounce-back at either edge is never

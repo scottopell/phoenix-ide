@@ -102,6 +102,21 @@ const RESTORE_OFFSET_TOLERANCE_PX = 2;
  *  either through a follow mode that holds position, or a touch that has
  *  moved, which takes ownership from the movement itself rather than from a
  *  scroll event (REQ-MLRU-014). */
+/** A scroller reports positions outside its own scrollable range during
+ *  overscroll. Snapshots are built here so none of them can carry one. */
+function clampScrollTop(scrollTop: number, element: HTMLElement): number {
+  const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+  return Math.min(Math.max(scrollTop, 0), maxScrollTop);
+}
+
+function snapshotOf(element: HTMLElement): ScrollSnapshot {
+  return {
+    scrollHeight: element.scrollHeight,
+    scrollTop: clampScrollTop(element.scrollTop, element),
+    clientHeight: element.clientHeight,
+  };
+}
+
 function tailFollowGranted(state: ScrollMachineState): boolean {
   if (state.kind !== 'live' && state.kind !== 'mount-rescue') return true;
   if (state.gesture.kind === 'touch' && state.gesture.moved) return false;
@@ -790,7 +805,7 @@ function MessageListImpl({
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
-    return s ? { scrollHeight: s.scrollHeight, scrollTop: s.scrollTop, clientHeight: s.clientHeight } : null;
+    return s ? snapshotOf(s) : null;
   }, []);
 
   // Physical tail edge, forwarded verbatim (scroll_policy.allium).
@@ -905,7 +920,7 @@ function MessageListImpl({
       ref.dataset['appScrollOwner'] = '';
       dispatchScrollEvent({
         type: 'scrollerAttached',
-        snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
+        snapshot: snapshotOf(ref),
       });
       const onPointerDown = () => {
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
@@ -917,11 +932,7 @@ function MessageListImpl({
       const requestFromUpwardIntent = () => {
         if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
-      // A gesture the platform never reports as ended would otherwise defer
-      // every confirmation to a lift that is not coming, so the chip outlives
-      // the interaction that raised it. A finger still down after this long
-      // with no touch event of its own is not the one driving the viewport —
-      // the same bound, for the same reason, as VirtualTranscript's.
+      // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming
       const abandonStaleGesture = () => {
         if (scrollerTouchIdsRef.current.size === 0) return;
         if (Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
@@ -1006,19 +1017,19 @@ function MessageListImpl({
         if (transcriptRef.current?.isProgrammaticScroll(ref.scrollTop)) {
           dispatchScrollEvent({
             type: 'scrollerAttached',
-            snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
+            snapshot: snapshotOf(ref),
           });
           updateEarlierHistoryRestoreRef.current();
           return;
         }
-        // Clamp before classifying direction: overscroll rubber-band frames
-        // must not read as intent (scroll_policy.allium / REQ-MLRU-014).
-        const maxScrollTop = Math.max(0, ref.scrollHeight - ref.clientHeight);
-        const clampedTop = Math.min(Math.max(ref.scrollTop, 0), maxScrollTop);
-        const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: clampedTop, clientHeight: ref.clientHeight };
+        const snapshot = snapshotOf(ref);
+        const clampedTop = snapshot.scrollTop;
+        // The recorded position is already in range, but the range itself
+        // moves as content grows and shrinks, so re-clamp it against the one
+        // in force now before comparing two positions across that change.
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
-          ? Math.min(machine.geometry.lastSnapshot?.scrollTop ?? clampedTop, maxScrollTop)
+          ? clampScrollTop(machine.geometry.lastSnapshot?.scrollTop ?? clampedTop, ref)
           : clampedTop;
         // Three outcomes, not two. Clamping collapses rubber-band frames onto
         // the position already held, and a standstill is not movement in
@@ -1035,10 +1046,10 @@ function MessageListImpl({
         updateEarlierHistoryRestoreRef.current();
       };
       const onKeyDown = (e: KeyboardEvent) => {
-        abandonStaleGesture();
         const target = e.target;
         const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
         if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
+        abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
         dispatchScrollEvent({ type: 'upwardIntent' });
