@@ -663,11 +663,11 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         crate::db::DbError::ProductConversationUnavailable(_) => {
             SendChatServiceError::HistoryUnavailable
         }
-        crate::db::DbError::SteeringQueueFull => SendChatServiceError::Busy,
         crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {
             ..
         }) => SendChatServiceError::IdempotencyConflict,
-        crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
+        crate::db::DbError::SteeringQueueFull
+        | crate::db::DbError::DirectTurnConflict(TurnConflict::ConversationAlreadyOwned {
             ..
         }) => SendChatServiceError::Busy,
         crate::db::DbError::DirectTurnConflict(
