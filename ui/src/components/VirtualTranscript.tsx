@@ -149,10 +149,7 @@ interface StorePublisher<T> {
 const DEFAULT_ESTIMATED_EXTENT = 1;
 const PINNED_EPSILON = 1;
 export const SCROLL_SETTLE_MS = 150;
-/** A finger resting this long without moving or scrolling has no momentum
- *  left to preserve, so a correction written then cannot cancel one. The
- *  bound also stops a lift that no listener could observe from deferring
- *  reconciliation indefinitely. */
+/** Bound on how long a touch alone may defer reconciliation (REQ-VT-004). */
 export const GESTURE_STALE_MS = 2000;
 
 function scrollIsActive<T>(store: PhysicalStore<T>): boolean {
