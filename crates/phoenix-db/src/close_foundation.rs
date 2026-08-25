@@ -51,6 +51,7 @@ pub enum ProductConversationAdmission {
         product_conversation_id: ProductConversationId,
     },
     Refused(CloseAdmissionFence),
+    History(ProductConversationId),
 }
 
 impl ProductConversationAdmission {
@@ -84,6 +85,16 @@ pub(crate) async fn admit_product_conversation_operation_tx(
         product_conversation_id,
         "conversations.product_conversation_id",
     )?;
+    let lifecycle: Option<String> =
+        sqlx::query_scalar("SELECT ordinary_lifecycle FROM product_conversations WHERE id = ?1")
+            .bind(product_conversation_id.as_str())
+            .fetch_optional(&mut **tx)
+            .await?;
+    if lifecycle.as_deref() == Some("history") {
+        return Ok(ProductConversationAdmission::History(
+            product_conversation_id,
+        ));
+    }
     let obligation = sqlx::query(
         "SELECT attempt_id, phase FROM close_obligations
          WHERE product_conversation_id = ?1 AND phase <> 'completed'",
@@ -119,6 +130,9 @@ pub(crate) async fn require_product_conversation_admission_tx(
             product_conversation_id,
         } => Ok(product_conversation_id),
         ProductConversationAdmission::Refused(fence) => Err(DbError::CloseAdmissionFenced(fence)),
+        ProductConversationAdmission::History(product_conversation_id) => Err(
+            DbError::ProductConversationUnavailable(product_conversation_id),
+        ),
     }
 }
 
@@ -2939,6 +2953,25 @@ mod tests {
             db.product_conversation_admission("root").await.unwrap(),
             ProductConversationAdmission::Accepted { product_conversation_id }
                 if product_conversation_id == product_id("root")
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_refuses_history_after_close_completes() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let product_conversation_id = product_id("root");
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.product_conversation_admission("root").await.unwrap(),
+            ProductConversationAdmission::History(id) if id == product_conversation_id
         ));
     }
 

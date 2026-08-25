@@ -82,7 +82,10 @@ impl WakeRegistrar for ProductionWakeRegistrar {
             .await
         {
             Ok(outcome) => outcome,
-            Err(phoenix_db::DbError::CloseAdmissionFenced(_)) => {
+            Err(
+                phoenix_db::DbError::CloseAdmissionFenced(_)
+                | phoenix_db::DbError::ProductConversationUnavailable(_),
+            ) => {
                 return Ok(RegisteredWake::Unavailable);
             }
             Err(error) => return Err(error.to_string()),
@@ -1321,6 +1324,34 @@ mod tests {
             expires_at: Timestamp(expires_at),
             prepared_fingerprint: fingerprint.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn production_registrar_returns_typed_unavailable_for_history() {
+        let (db, repo, scope) = open_repo().await;
+        let (kick_tx, mut kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let product_conversation_id = db
+            .get_conversation("conv")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            registrar
+                .register(register_input(&scope, "b-history", "fp-history", 50))
+                .await
+                .unwrap(),
+            RegisteredWake::Unavailable
+        );
+        assert_eq!(*kick_rx.borrow_and_update(), 0);
     }
 
     #[tokio::test]

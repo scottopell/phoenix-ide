@@ -4199,6 +4199,12 @@ async fn send_chat(
                     "close_admission_fenced",
                 )))
             }
+            crate::send_chat_service::SendChatServiceError::HistoryUnavailable => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Conversation is archived and unavailable for messaging.".to_string(),
+                    "target_unavailable",
+                )))
+            }
             crate::send_chat_service::SendChatServiceError::Expansion {
                 message,
                 error_type,

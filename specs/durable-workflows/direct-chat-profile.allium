@@ -171,6 +171,7 @@ entity DirectChatConsumerCursor {
 -- prepared_payload_for(request, resolved_target), prepared_fingerprint_for(resolved_target, payload)
 -- immutable_after_acceptance(payload), immutable_after_acceptance(fingerprint)
 -- same_key_existing_acceptance(turn_key), fingerprints_match(left, right), prepared_event_emitted_for(turn_key)
+-- request_matches_existing_acceptance(request, acceptance)
 -- conflicting_fingerprint(existing_acceptance), runtime_slot_for(resolved_target), slot_is_available(slot)
 -- canonical_delivery_for(acceptance), runtime_acceptance_for(delivery), runtime_identity_matches_acceptance(acceptance, runtime_acceptance)
 -- committed_outcome_for(acceptance), replay_of(outcome), steering_target_matches_successor(acceptance)
@@ -450,10 +451,15 @@ rule ActiveCloseObligationFencesNewDirectTurnAdmission {
 }
 
 rule ActiveCloseObligationAllowsExactDirectTurnReplay {
-    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    when: DirectChatRequested(client, request)
+    requires: rejection_reason_for(request) = null
+
+    let resolved_target = resolved_target_for(request)
+    let turn_key = target_bound_key(resolved_target, request.client_message_id)
+
     requires: active_close_obligation(resolved_target.conversation.product_conversation)
     requires: same_key_existing_acceptance(turn_key) != null
-    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: request_matches_existing_acceptance(request, same_key_existing_acceptance(turn_key))
     requires: same_key_existing_acceptance(turn_key).committed_outcome != null
 
     ensures: replay_of(committed_outcome_for(same_key_existing_acceptance(turn_key)))

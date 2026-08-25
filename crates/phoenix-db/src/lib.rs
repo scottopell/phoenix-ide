@@ -179,6 +179,12 @@ pub enum DbError {
     CloseFoundationConflict(String),
     #[error("new aggregate work is fenced by Close attempt {0:?}")]
     CloseAdmissionFenced(CloseAdmissionFence),
+    #[error("ProductConversation {0} is unavailable because it is in History")]
+    ProductConversationUnavailable(
+        phoenix_core::domain::product_conversation::ProductConversationId,
+    ),
+    #[error("steering queue is full")]
+    SteeringQueueFull,
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
     #[error("Close foundation repair required: {0:?}")]
@@ -6120,8 +6126,14 @@ impl Database {
         id: &str,
         queue: &[phoenix_core::domain::sm_event::SteerEntry],
     ) -> DbResult<()> {
+        const MAX_STEERING_QUEUE_DEPTH: usize = 5;
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_product_conversation_admission_tx(&mut tx, id).await?;
+        if queue.len() > MAX_STEERING_QUEUE_DEPTH {
+            tx.rollback().await?;
+            return Err(DbError::SteeringQueueFull);
+        }
 
         let exists = sqlx::query("SELECT 1 FROM conversations WHERE id = ?1")
             .bind(id)
@@ -6163,6 +6175,16 @@ impl Database {
         Ok(())
     }
 
+    pub async fn steering_queue_depth(&self, id: &str) -> DbResult<usize> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        usize::try_from(count)
+            .map_err(|_| DbError::Serialization("steering queue depth overflow".to_string()))
+    }
+
     /// Append one steering entry atomically and return its committed zero-based
     /// queue position. Existing rows are never rewritten, so a concurrent drain
     /// cannot be resurrected by a stale read-modify-write snapshot.
@@ -6177,6 +6199,7 @@ impl Database {
         entry: &phoenix_core::domain::sm_event::SteerEntry,
         request_fingerprint: &str,
     ) -> DbResult<usize> {
+        const MAX_STEERING_QUEUE_DEPTH: i64 = 5;
         let now = Utc::now();
         #[cfg(test)]
         if let Some(latch) = &self.steering_begin_test_latch {
@@ -6195,6 +6218,11 @@ impl Database {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
+
+        if queue_position >= MAX_STEERING_QUEUE_DEPTH {
+            tx.rollback().await?;
+            return Err(DbError::SteeringQueueFull);
+        }
 
         sqlx::query(
             "INSERT INTO steering_acceptance_receipts
@@ -17377,6 +17405,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    #[tokio::test]
+    async fn steering_append_refuses_the_sixth_entry_in_its_write_transaction() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("capacity", "capacity", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        for index in 0..5 {
+            db.append_steering_entry(
+                "capacity",
+                &steering_entry(&format!("entry-{index}")),
+                &format!("fingerprint-{index}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            db.append_steering_entry("capacity", &steering_entry("overflow"), "overflow")
+                .await
+                .unwrap_err(),
+            DbError::SteeringQueueFull
+        ));
+        assert_eq!(db.get_steering_queue("capacity").await.unwrap().len(), 5);
     }
 
     #[tokio::test]

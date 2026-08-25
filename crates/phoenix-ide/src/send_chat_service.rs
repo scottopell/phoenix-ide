@@ -67,6 +67,8 @@ pub(crate) enum SendChatServiceError {
     Busy,
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
+    #[error("conversation is permanently unavailable in History")]
+    HistoryUnavailable,
 }
 
 #[derive(Clone)]
@@ -117,6 +119,22 @@ impl SendChatApplicationService {
         {
             return Ok(outcome);
         }
+        match self
+            .runtime
+            .db()
+            .product_conversation_admission(&conversation.id)
+            .await
+            .map_err(map_conversation_load_error)?
+        {
+            crate::db::ProductConversationAdmission::Accepted { .. } => {}
+            crate::db::ProductConversationAdmission::Refused(_) => {
+                return Ok(close_admission_fenced_outcome());
+            }
+            crate::db::ProductConversationAdmission::History(_) => {
+                return Ok(history_unavailable_outcome());
+            }
+        }
+
         if conversation.archived {
             return Ok(SendChatOutcome::Rejected {
                 message: "Conversation is archived and unavailable for messaging.".to_string(),
@@ -165,6 +183,18 @@ impl SendChatApplicationService {
             }
         }
 
+        if should_enqueue_steering(&acceptability)
+            && self
+                .runtime
+                .db()
+                .steering_queue_depth(&conversation.id)
+                .await
+                .map_err(map_conversation_load_error)?
+                >= MAX_STEER_QUEUE_DEPTH
+        {
+            return Ok(steering_queue_full_outcome());
+        }
+
         let validated_files = validate_files(&req).await?;
         let expanded = expand_request(&self.db, &conversation, &req).await?;
         let acceptance_state = self
@@ -195,12 +225,24 @@ impl SendChatApplicationService {
             || pending_queue_fences_direct_acceptance(&acceptance_state, !steering_queue.is_empty())
             || active_turn_fences_direct_acceptance(&acceptance_state, active_direct_turn.is_some())
         {
+            match self
+                .runtime
+                .db()
+                .product_conversation_admission(&conversation.id)
+                .await
+                .map_err(map_conversation_load_error)?
+            {
+                crate::db::ProductConversationAdmission::Accepted { .. } => {}
+                crate::db::ProductConversationAdmission::Refused(_) => {
+                    return Ok(close_admission_fenced_outcome());
+                }
+                crate::db::ProductConversationAdmission::History(_) => {
+                    return Ok(history_unavailable_outcome());
+                }
+            }
+
             if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
-                return Ok(SendChatOutcome::Rejected {
-                    message: "Steering queue is full; try again once a queued message has been delivered."
-                        .to_string(),
-                    code: "steering_queue_full",
-                });
+                return Ok(steering_queue_full_outcome());
             }
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
@@ -219,6 +261,12 @@ impl SendChatApplicationService {
                 return match error {
                     crate::runtime::SteeringAdmissionError::CloseAdmissionFenced => {
                         Ok(close_admission_fenced_outcome())
+                    }
+                    crate::runtime::SteeringAdmissionError::HistoryUnavailable => {
+                        Ok(history_unavailable_outcome())
+                    }
+                    crate::runtime::SteeringAdmissionError::QueueFull => {
+                        Ok(steering_queue_full_outcome())
                     }
                     crate::runtime::SteeringAdmissionError::Internal(error) => {
                         Err(SendChatServiceError::Dispatch(error))
@@ -316,6 +364,9 @@ impl SendChatApplicationService {
             }
             Err(crate::db::DbError::CloseAdmissionFenced(_)) => {
                 return Ok(close_admission_fenced_outcome());
+            }
+            Err(crate::db::DbError::ProductConversationUnavailable(_)) => {
+                return Ok(history_unavailable_outcome());
             }
             Err(error) => return Err(map_direct_turn_accept_error(error)),
         };
@@ -547,6 +598,21 @@ fn now_timestamp() -> Timestamp {
     Timestamp(u64::try_from(now).unwrap_or_default())
 }
 
+fn steering_queue_full_outcome() -> SendChatOutcome {
+    SendChatOutcome::Rejected {
+        message: "Steering queue is full; try again once a queued message has been delivered."
+            .to_string(),
+        code: "steering_queue_full",
+    }
+}
+
+fn history_unavailable_outcome() -> SendChatOutcome {
+    SendChatOutcome::Rejected {
+        message: "Conversation is archived and unavailable for messaging.".to_string(),
+        code: "target_unavailable",
+    }
+}
+
 fn close_admission_fenced_outcome() -> SendChatOutcome {
     SendChatOutcome::Rejected {
         message: "Conversation is closing and cannot accept new work.".to_string(),
@@ -557,6 +623,10 @@ fn close_admission_fenced_outcome() -> SendChatOutcome {
 fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
         crate::db::DbError::CloseAdmissionFenced(_) => SendChatServiceError::CloseAdmissionFenced,
+        crate::db::DbError::ProductConversationUnavailable(_) => {
+            SendChatServiceError::HistoryUnavailable
+        }
+        crate::db::DbError::SteeringQueueFull => SendChatServiceError::Busy,
         crate::db::DbError::ConversationNotFound(message) => {
             SendChatServiceError::NotFound(message)
         }
@@ -590,6 +660,10 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
 fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceError {
     match error {
         crate::db::DbError::CloseAdmissionFenced(_) => SendChatServiceError::CloseAdmissionFenced,
+        crate::db::DbError::ProductConversationUnavailable(_) => {
+            SendChatServiceError::HistoryUnavailable
+        }
+        crate::db::DbError::SteeringQueueFull => SendChatServiceError::Busy,
         crate::db::DbError::DirectTurnConflict(TurnConflict::PreparedSemanticsChanged {
             ..
         }) => SendChatServiceError::IdempotencyConflict,

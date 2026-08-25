@@ -448,6 +448,10 @@ impl Drop for AdmittedOperation {
 pub enum SteeringAdmissionError {
     #[error("conversation is fenced by an active Close attempt")]
     CloseAdmissionFenced,
+    #[error("conversation is permanently unavailable in History")]
+    HistoryUnavailable,
+    #[error("steering queue is full")]
+    QueueFull,
     #[error("{0}")]
     Internal(String),
 }
@@ -5444,6 +5448,10 @@ impl RuntimeManager {
                     crate::db::DbError::CloseAdmissionFenced(_) => {
                         SteeringAdmissionError::CloseAdmissionFenced
                     }
+                    crate::db::DbError::ProductConversationUnavailable(_) => {
+                        SteeringAdmissionError::HistoryUnavailable
+                    }
+                    crate::db::DbError::SteeringQueueFull => SteeringAdmissionError::QueueFull,
                     error => SteeringAdmissionError::Internal(format!(
                         "Failed to persist steering queue before enqueue: {error}"
                     )),

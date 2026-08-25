@@ -590,12 +590,29 @@ impl WakeRepository {
         let existing = fetch_existing_binding_tx(&mut tx, input).await?;
         if let Some(existing) = existing {
             let exact_replay = existing.prepared_fingerprint == prepared_fingerprint;
+            if exact_replay {
+                tx.commit().await?;
+                return Ok(WakeRegistrationOutcome::Replayed {
+                    workflow_id: existing.workflow_id,
+                    receipt: replay_receipt(&existing),
+                });
+            }
             let migrated_replay = existing.fingerprint_needs_scope_upgrade
+                && existing.expires_at == input.expires_at
                 && existing.registration_scope == input.registration_scope
                 && existing.conversation_id == input.conversation_id
                 && existing.resource == input.resource
                 && input.root_conversation_id == input.conversation_id
                 && existing.registering_tool_use_id == input.registering_tool_use_id;
+            if migrated_replay {
+                if let Err(error) =
+                    require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
+                        .await
+                {
+                    tx.rollback().await?;
+                    return Err(error);
+                }
+            }
             if migrated_replay {
                 sqlx::query(
                     "UPDATE wake_bindings
@@ -615,7 +632,7 @@ impl WakeRepository {
                 .execute(&mut *tx.tx)
                 .await?;
             }
-            if exact_replay || migrated_replay {
+            if migrated_replay {
                 tx.commit().await?;
                 return Ok(WakeRegistrationOutcome::Replayed {
                     workflow_id: existing.workflow_id,
