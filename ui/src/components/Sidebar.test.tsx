@@ -102,20 +102,15 @@ describe('Sidebar — ProductConversation navigation', () => {
 
 
 
-  it('shows the archived list when the active conversation is archived', async () => {
-    const archived = makeConv('archived-id', 'archived-active', {
-      archived: true,
-      project_id: 'proj-1',
-    });
-
+  it('shows History when the active aggregate product conversation is archived', async () => {
     const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/archived-active']}>
+      <MemoryRouter initialEntries={['/product-conversations/pc-archived']}>
         <Sidebar
           collapsed={false}
           onToggle={vi.fn()}
           conversations={[]}
-          archivedConversations={[archived]}
-          activeSlug="archived-active"
+          archivedConversations={[]}
+          activeSlug="pc-archived"
           onConversationCreated={vi.fn()}
         />
       </MemoryRouter>,
@@ -130,33 +125,54 @@ describe('Sidebar — ProductConversation navigation', () => {
 
 
 
-  it('limits collapsed sidebar dots and exposes an overflow marker', async () => {
-    const conversations = Array.from({ length: 12 }, (_, index) =>
-      makeConv(`conv-${index}`, `conv-${index}`, { project_id: index % 2 === 0 ? 'proj-1' : 'proj-2' }),
-    );
+  it('marks a collapsed aggregate dot active for its latest-row identity', async () => {
     const onToggle = vi.fn();
 
     const { container, getByRole } = render(
-      <MemoryRouter initialEntries={['/c/conv-11']}>
+      <MemoryRouter initialEntries={['/product-conversations/pc-open']}>
         <Sidebar
           collapsed
           onToggle={onToggle}
-          conversations={conversations}
+          conversations={[]}
           archivedConversations={[]}
-          activeSlug="conv-11"
+          activeSlug="latest-pc-open"
           onConversationCreated={vi.fn()}
         />
       </MemoryRouter>,
     );
 
     await waitFor(() => {
-      expect(container.querySelectorAll('.sidebar-dot-btn')).toHaveLength(1);
+      expect(container.querySelector('[aria-label="Open Display pc-open"]')).toHaveClass('active');
     });
-    expect(container.querySelector('[aria-label="Open Display pc-open"]')).not.toBeNull();
-    expect(container.querySelector('[title="conv-11"]')).toBeNull();
 
     fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));
     expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to cached member rows and retries a failed aggregate refresh', async () => {
+    apiMock.listProductConversations
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ product_conversations: [makeProductConversation('pc-recovered')] });
+    const cached = makeConv('cached-id', 'cached-slug');
+
+    const { container, getByRole } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[cached]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(getByRole('status')).toHaveTextContent('Showing cached conversations'));
+    expect(container.querySelector('[data-id="cached-id"]')).not.toBeNull();
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 
   it('labels the global nav entry as Coordinator', async () => {

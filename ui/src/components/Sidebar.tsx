@@ -161,8 +161,10 @@ export function Sidebar({
     }
     if (lastArchiveRevealSlugRef.current === activeSlug) return;
 
-    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug));
-    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug));
+    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug))
+      || openProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
+    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug))
+      || archivedProductConversations.some((row) => productRowMatchesRoute(row, activeSlug));
     if (!inActiveList && !inArchivedList) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
@@ -171,7 +173,7 @@ export function Sidebar({
       setShowArchived(false);
     }
     lastArchiveRevealSlugRef.current = activeSlug;
-  }, [activeSlug, conversations, archivedConversations, showArchived]);
+  }, [activeSlug, archivedConversations, archivedProductConversations, conversations, openProductConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
     navigate('/new');
