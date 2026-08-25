@@ -429,7 +429,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     // One chain block with the user-set chain name.
     const block = container.querySelector('.conv-chain-block');
     expect(block).not.toBeNull();
-    expect(block!.querySelector('.conv-chain-name-label')!.textContent).toBe('Conversation history');
+    expect(block!.querySelector('.conv-chain-name-label')!.textContent).toBe('auth refactor');
 
     // Default state: expanded — both members render.
     const memberRows = block!.querySelectorAll('.conv-item-chain-member');
@@ -529,7 +529,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
       </MemoryRouter>
     );
 
-    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('root-slug-text');
   });
 
   it('caret toggles collapse without navigating; members hide when collapsed', () => {
@@ -561,7 +561,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     expect(container.querySelectorAll('.conv-item-chain-member').length).toBe(2);
   });
 
-  it('history label is not a navigation entry point', () => {
+  it('visible aggregate title opens the retained compatibility route on desktop', () => {
     const root = makeConv('myroot', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leaf',
@@ -598,7 +598,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     // post-navigation pathname.
     const calls = onPath.mock.calls;
     expect(calls.length).toBeGreaterThan(0);
-    expect(calls[calls.length - 1]![0]).toBe('/');
+    expect(calls[calls.length - 1]![0]).toBe('/chains/myroot');
   });
 
   it('clicking a member fires onConversationClick (not the chain page)', () => {
@@ -648,7 +648,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
 
     // Chain block is rendered; members show position labels (#1, #2) not raw slugs.
     expect(container.querySelector('.conv-chain-block')).not.toBeNull();
-    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('auth refactor');
     expect(container.querySelectorAll('.conv-item-slug-pos').length).toBe(2);
   });
 });
@@ -693,7 +693,7 @@ describe('Chain lifecycle UI (task 02701)', () => {
     );
 
     expect(container.querySelectorAll('.conv-chain-block')).toHaveLength(1);
-    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('auth refactor');
     expect(container.querySelector('.conv-chain-menu-btn')).toBeNull();
     expect(container.querySelector('[href^="/chains/"]')).toBeNull();
   });
@@ -744,19 +744,29 @@ describe('Chain lifecycle UI (task 02701)', () => {
     expect(labels).toEqual(['Rename', 'Archive', 'Delete']);
   });
 
-  it('archived list groups chains the same as the active list', () => {
+  it('archived history title opens the retained compatibility route', () => {
+    const onPath = vi.fn();
     const { container } = render(
-      <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={[]}
-          archivedConversations={chainConvs({ archived: true })}
-          showArchived
-        />
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="*" element={(
+            <>
+              <ConversationList
+                {...defaultProps}
+                conversations={[]}
+                archivedConversations={chainConvs({ archived: true })}
+                showArchived
+              />
+              <PathReader onPath={onPath} />
+            </>
+          )} />
+        </Routes>
       </MemoryRouter>,
     );
-    expect(container.querySelector('.conv-chain-block')).not.toBeNull();
-    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')).toHaveTextContent('auth refactor');
+    fireEvent.click(container.querySelector('.conv-chain-name')!);
+    const calls = onPath.mock.calls;
+    expect(calls[calls.length - 1]![0]).toBe('/chains/cr');
   });
 });
 
@@ -931,6 +941,7 @@ describe('Mobile conversation list redesign', () => {
     );
 
     expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelector('.conv-chain-name-label')).toHaveTextContent('mobile chain');
     expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
     const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
     expect(summary).not.toBeNull();
@@ -944,7 +955,7 @@ describe('Mobile conversation list redesign', () => {
 
     fireEvent.click(container.querySelector('.conv-chain-name')!);
     const calls = onPath.mock.calls;
-    expect(calls[calls.length - 1]![0]).toBe('/');
+    expect(calls[calls.length - 1]![0]).toBe('/chains/root-id');
   });
 
   it('minimizes completed non-latest members on mobile full-page lists', () => {
@@ -1143,7 +1154,7 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Readable root task title');
     expect(container.querySelector('.conv-chain-summary-title')?.textContent).toBe('Latest #2: Readable latest task title');
     expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('f872dd1a');
     expect(container.querySelector('.conv-chain-summary-title')?.textContent).not.toContain('9d1b4cc');
@@ -1168,7 +1179,7 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Conversation history');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Readable fork task title');
     expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('fork-123e4567');
   });
 

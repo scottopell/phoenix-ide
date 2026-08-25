@@ -410,6 +410,7 @@ export const ChainBlock = memo(function ChainBlock({
   onCloseRowMenu,
   rowMenuRef,
 }: ChainBlockProps) {
+  const navigate = useNavigate();
   const latestMember = item.members.find((m) => m.id === item.latestMemberId) ?? item.members[item.members.length - 1];
   const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
   const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
@@ -447,12 +448,16 @@ export const ChainBlock = memo(function ChainBlock({
             <polyline points="6 9 12 15 18 9" />
           </svg>
         </button>
-        <div className="conv-chain-name" title={chainDisplayTitle}>
-          <span className="conv-chain-name-label">Conversation history</span>
-          {listDensity !== 'mobile' && (
-            <span className="conv-chain-count">{item.members.length} parts</span>
-          )}
-        </div>
+        <button
+          className="conv-chain-name"
+          onClick={() => navigate(`/chains/${item.rootId}`)}
+          title={`Open conversation history "${chainDisplayTitle}"`}
+        >
+          <span className="conv-chain-name-label">{chainDisplayTitle}</span>
+          <span className="conv-chain-count">
+            {listDensity === 'mobile' ? 'Conversation history' : `Conversation history · ${item.members.length} parts`}
+          </span>
+        </button>
       </div>
       {collapsed && listDensity === 'mobile' && latestMember && (
         <button
