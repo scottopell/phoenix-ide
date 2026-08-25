@@ -184,7 +184,7 @@ function useMessageReviewNotes(
     setAnnotating(null);
     setHighlightedLine(null);
     setShowPanel(false);
-  }, [sequenceId]);
+  }, [occurrenceToken, sequenceId]);
 
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
     setAnnotating({ sequenceId, lineNumber, lineContent });

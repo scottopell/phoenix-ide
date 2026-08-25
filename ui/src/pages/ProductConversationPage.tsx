@@ -812,7 +812,14 @@ function ProductConversationPageInner() {
           <aside className="product-conversation-page__dock">
             <ChainWorkScopeDock
               activeConvId={snapshot.latest_transcript_row_id}
-              workIdentity={synthChain?.work_identity ?? null}
+              workIdentity={{
+                work_conv_id: aggregateWorkIdentity.work_transcript_row_id,
+                worktree_path: aggregateWorkIdentity.worktree_path,
+                branch_name: aggregateWorkIdentity.branch_name,
+                base_branch: aggregateWorkIdentity.base_branch,
+                task_id: aggregateWorkIdentity.task_id,
+                task_title: aggregateWorkIdentity.task_title,
+              }}
             />
           </aside>
         )}
