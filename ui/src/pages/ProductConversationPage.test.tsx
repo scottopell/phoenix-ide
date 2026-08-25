@@ -655,6 +655,35 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('message-order')).not.toHaveTextContent('stale-a');
   });
 
+  it('discards delayed pagination errors and cleanup after the route owner changes', async () => {
+    const { api } = await import('../api');
+    let rejectOlder!: (reason: Error) => void;
+    const older = new Promise<ProductConversationSnapshotView>((_resolve, reject) => { rejectOlder = reject; });
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockReturnValueOnce(older)
+      .mockResolvedValueOnce(makeSnapshot({
+        product_conversation_id: 'pc-2',
+        canonical_route: '/product-conversations/pc-2',
+        presentation: { kind: 'state', display_name: 'Product Beta', presentation_mode: 'idle' },
+        segments: [{ segment_ordinal: 1, transcript_row_id: 'row-b', slug: 'row-b', title: 'Beta', messages: [makeMessage('beta-message', 1, 'beta')], handoff: null }],
+        latest_transcript_row_id: 'row-b',
+        writable_transcript_row_id: 'row-b',
+        before: null,
+        has_older: false,
+      }));
+
+    renderPage('/product-conversations/pc-1', true);
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older' }));
+    fireEvent.click(screen.getByRole('button', { name: 'open second product' }));
+    await screen.findByRole('heading', { name: 'Product Beta' });
+    await act(async () => rejectOlder(new Error('stale A failure')));
+
+    expect(screen.queryByText('stale A failure')).not.toBeInTheDocument();
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['loadingOlderMessages']).toBe(false);
+  });
+
   it('threads restore basis, root directory, system prompt, and explicit absent work scope', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot)
@@ -671,7 +700,12 @@ describe('ProductConversationPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
     await waitFor(() => expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({
       kind: 'positioning',
-      command: expect.objectContaining({ kind: 'restore_after_prefix_expansion', messageId: 'm-3', viewportStartOffset: 17 }),
+      command: expect.objectContaining({
+        kind: 'restore_after_prefix_expansion',
+        messageId: 'm-3',
+        viewportStartOffset: 17,
+        view: expect.objectContaining({ generation: 1, transcriptGeneration: 1 }),
+      }),
     })));
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['filePathRootDir']).toBe('/tmp/latest-root');
     expect(conversationNavStackSpy.mock.lastCall?.[0]?.['systemPrompt']).toBe('Preserve this system prompt');
