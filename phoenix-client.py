@@ -1133,6 +1133,17 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             f"Conflicting single-shot flags: {', '.join(other)}. "
             f"Pass at most one."
         )
+    # A positional MESSAGE combined with any early-return mode (other than
+    # --continue / --suggest, which consume it) is silently dropped. Reject.
+    message_consuming = continue_conv or suggest
+    if message and not message_consuming and (
+        conv_selected or platform_selected or discovery_selected or legacy_selected
+    ):
+        modes = conv_selected + platform_selected + discovery_selected + legacy_selected
+        raise click.UsageError(
+            f"Conflicting: MESSAGE cannot be combined with {', '.join(modes)}. "
+            f"(Only --continue and --suggest consume MESSAGE.)"
+        )
     if conv_selected and platform_selected:
         raise click.UsageError(
             f"Conflicting flags: {', '.join(platform_selected)} cannot be combined "
