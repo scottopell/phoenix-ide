@@ -2129,18 +2129,18 @@ END;
 
 WITH RECURSIVE ancestors(child_id, ancestor_id, depth, path) AS (
     SELECT child.id, child.parent_conversation_id, 1,
-           '|' || child.id || '|' || child.parent_conversation_id || '|'
+           ',' || hex(child.id) || ',' || hex(child.parent_conversation_id) || ','
     FROM conversations child
     WHERE child.runtime_role = 'sub_agent'
       AND child.parent_conversation_id IS NOT NULL
     UNION ALL
     SELECT ancestors.child_id, parent.parent_conversation_id, ancestors.depth + 1,
-           ancestors.path || parent.parent_conversation_id || '|'
+           ancestors.path || hex(parent.parent_conversation_id) || ','
     FROM ancestors
     JOIN conversations parent ON parent.id = ancestors.ancestor_id
     WHERE parent.runtime_role = 'sub_agent'
       AND parent.parent_conversation_id IS NOT NULL
-      AND instr(ancestors.path, '|' || parent.parent_conversation_id || '|') = 0
+      AND instr(ancestors.path, ',' || hex(parent.parent_conversation_id) || ',') = 0
 ), eligible_ancestors(child_id, ancestor_id, depth) AS (
     SELECT ancestors.child_id, ancestors.ancestor_id, ancestors.depth
     FROM ancestors
@@ -13622,6 +13622,60 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(parent, "root");
+    }
+
+    #[tokio::test]
+    async fn migration_073_reparents_delimiter_bearing_legacy_ids() {
+        let pool = test_pool().await;
+        setup_schema_before_migration_070(&pool).await;
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('ordinary-a', 'ordinary', 'open');
+             INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES ('scope-a', 'work', 'unowned_cwd', '/tmp/a', '2025-01-01', '2025-01-01');
+             INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES
+                 ('root', 'ordinary-a', NULL, 'user', 1, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('C|a', 'ordinary-a', 'root', 'sub_agent', 0, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('a', 'ordinary-a', 'C|a', 'sub_agent', 0, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('C', 'ordinary-a', 'a', 'sub_agent', 0, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM _migrations WHERE version = 73")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let invalid_parents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM conversations child
+             JOIN conversations parent ON parent.id = child.parent_conversation_id
+             WHERE child.runtime_role = 'sub_agent'
+               AND parent.runtime_role = 'sub_agent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(invalid_parents, 0);
     }
 
     #[tokio::test]
