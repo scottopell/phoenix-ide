@@ -1566,6 +1566,8 @@ fn build_child_conversation(
     let slug = format!("fork-{conv_id}");
     Conversation {
         id: conv_id.to_string(),
+        product_conversation_id:
+            phoenix_core::domain::product_conversation::ProductConversationId::new(),
         runtime_role: phoenix_core::work_scope::RuntimeRole::User,
         attached_work_scope_id: None,
         slug: Some(slug.clone()),
@@ -1633,6 +1635,7 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
         | DbError::Serialization(_)
+        | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationRepairRequired(_)

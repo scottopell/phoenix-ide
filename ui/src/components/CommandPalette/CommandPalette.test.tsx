@@ -91,6 +91,29 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('CommandPalette lifecycle availability', () => {
+  it('does not offer archive for a continuation-linked row', () => {
+    const root = makeConversation({ id: 'root-id', slug: 'root', continued_in_conv_id: 'leaf-id' });
+    const leaf = makeConversation({ id: 'leaf-id', slug: 'leaf' });
+    renderPalette(root, [root, leaf]);
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> archive' } });
+
+    expect(screen.queryByText('Archive Current Conversation')).toBeNull();
+  });
+
+  it('keeps archive available for a standalone conversation', () => {
+    const standalone = makeConversation({ id: 'solo-id', slug: 'solo' });
+    renderPalette(standalone, [standalone]);
+
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '> archive' } });
+
+    expect(screen.getByText('Archive Current Conversation')).toBeInTheDocument();
+  });
+});
+
 describe('CommandPalette file root', () => {
   it('prefers the active conversation worktree path over cwd', () => {
     expect(activeConversationFileRoot(makeConversation({

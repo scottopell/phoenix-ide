@@ -493,8 +493,6 @@ pub struct RuntimeManager {
     #[cfg(test)]
     fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    handoff_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
     runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -1565,10 +1563,27 @@ pub struct CachedPrSummary {
 /// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
 /// all `Conversation` fields at the top level (via `#[serde(flatten)]`) plus
 /// the extra display fields.
+#[derive(Debug, Clone)]
+pub struct PresentationConversation(pub crate::db::Conversation);
+
+impl serde::Serialize for PresentationConversation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("Conversation must serialize as an object"))?;
+        object.remove("product_conversation_id");
+        value.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EnrichedConversation {
     #[serde(flatten)]
-    pub inner: crate::db::Conversation,
+    pub inner: PresentationConversation,
     pub conv_mode_label: String,
     pub branch_name: Option<String>,
     pub worktree_path: Option<String>,
@@ -1976,6 +1991,9 @@ pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
         ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
         ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => None,
     }) {
+        if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
+            return None;
+        }
         return Some(branch);
     }
     if !conversations.iter().any(|conv| {
@@ -2000,7 +2018,7 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
-        let message_retriever = Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever = Arc::new(db.fts_retriever());
         Self::new_with_message_retriever(
             db,
             llm_registry,
@@ -2068,7 +2086,7 @@ impl RuntimeManager {
         let fatal_local_authority_fence = FatalLocalAuthorityFence::new();
         let wake_registrar: Arc<dyn WakeRegistrar> =
             Arc::new(crate::runtime::wake::ProductionWakeRegistrar::new(
-                phoenix_db::workflow::wake::WakeRepository::new(db.pool().clone()),
+                db.wake_repository(),
                 wake_kick_tx.clone(),
             ));
         Self {
@@ -2111,8 +2129,6 @@ impl RuntimeManager {
             bash_reconciliation_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             fork_runtime_start_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
-            handoff_runtime_start_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_authority_transfer_barrier: AsyncMutex::new(None),
             #[cfg(test)]
@@ -3066,7 +3082,7 @@ impl RuntimeManager {
             .list_pending_continuation_conversation_ids()
             .await
             .map_err(|error| error.to_string())?;
-        let repository = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repository = self.db.workflow_repository();
         self.run_authority_units(conversation_ids, move |conversation_id| {
             let repository = repository.clone();
             async move {
@@ -3345,21 +3361,14 @@ impl RuntimeManager {
         self: &Arc<Self>,
         parent_conversation_id: &str,
         approval: &TaskApprovalHandoffData,
-        authority: &mut AdmittedOperation,
+        _authority: &mut AdmittedOperation,
     ) -> Result<TaskApprovalHandoffResponse, String> {
         let successor = self
             .db
-            .create_task_approval_handoff_conversation(parent_conversation_id, approval)
+            .create_task_approval_handoff_creation_job(parent_conversation_id, approval)
             .await
             .map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        if let Some(barrier) = self.handoff_runtime_start_barrier.lock().await.take() {
-            barrier.wait().await;
-            barrier.wait().await;
-        }
-        let _ = self
-            .get_or_create_with_authority(&successor.id, authority.reborrow())
-            .await?;
+        self.kick_creation_worker();
         Ok(TaskApprovalHandoffResponse {
             successor_conv_id: successor.id,
             state_updated_at: successor.state_updated_at,
@@ -4138,7 +4147,7 @@ impl RuntimeManager {
             )
             .await;
         }
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let mut consumed_action_ids = HashSet::new();
         loop {
             let actions = self
@@ -4340,7 +4349,7 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<DatabaseTerminalRecovery, DatabaseTerminalRecoveryError> {
-        let repo = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let Some(obligation) = repo
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
@@ -5812,7 +5821,9 @@ impl RuntimeManager {
         &self,
         conversation_id: &str,
     ) -> Result<Option<phoenix_db::workflow::DirectTurnTerminalObligation>, String> {
-        let obligation = phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+        let obligation = self
+            .db
+            .workflow_repository()
             .load_active_terminal_obligation(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
@@ -5858,7 +5869,8 @@ impl RuntimeManager {
             return Ok(true);
         }
 
-        phoenix_db::workflow::WorkflowRepository::new(self.db.pool().clone())
+        self.db
+            .workflow_repository()
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
             ))
@@ -7379,7 +7391,7 @@ mod scope_liveness_tests {
             .await
             .expect("create acceptance conversation");
         manager.signal_fatal_local_authority("test_acceptance_boundary");
-        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let repository = manager.db().workflow_repository();
         let prepared = phoenix_workflow::PreparedTurn::from_exact_payload(
             &phoenix_workflow::ConversationAuthority(conversation.id),
             b"closed acceptance".to_vec(),
@@ -7581,63 +7593,39 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn admitted_task_handoff_startup_survives_closure_after_commit() {
+    async fn admitted_task_handoff_persists_creation_job_before_authority_closes() {
         let manager = Arc::new(test_manager().await);
         create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
-        let authority = manager.acquire_local_authority_pass().unwrap();
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        *manager.handoff_runtime_start_barrier.lock().await = Some(Arc::clone(&barrier));
-        let (response_tx, _response_rx) = oneshot::channel();
-        let request = TaskApprovalHandoffRequest {
-            parent_conversation_id: "handoff-parent".to_string(),
-            approval: TaskApprovalHandoffData {
-                task_id: "12345".to_string(),
-                task_title: "Inherited handoff".to_string(),
-                branch_name: "task-12345-inherited-handoff".to_string(),
-                worktree_path: "/tmp".to_string(),
-                base_branch: "main".to_string(),
-                title: "Inherited handoff".to_string(),
-                priority: crate::task_source::Priority::P1,
-                plan: "Do the work".to_string(),
-                task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
-            },
-            authority,
-            response_tx,
+        let mut authority = manager.acquire_local_authority_pass().unwrap();
+        let approval = TaskApprovalHandoffData {
+            task_id: "12345".to_string(),
+            task_title: "Inherited handoff".to_string(),
+            branch_name: "task-12345-inherited-handoff".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            worktree_path: "/tmp".to_string(),
+            base_branch: "main".to_string(),
+            title: "Inherited handoff".to_string(),
+            priority: crate::task_source::Priority::P1,
+            plan: "Do the work".to_string(),
+            task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
         };
-        let handoff = {
-            let manager = Arc::clone(&manager);
-            tokio::spawn(async move {
-                let mut authority = request.authority;
-                manager
-                    .create_and_start_task_handoff(
-                        &request.parent_conversation_id,
-                        &request.approval,
-                        &mut authority,
-                    )
-                    .await
-            })
-        };
-
-        barrier.wait().await;
-        let parent = manager
-            .db()
-            .get_conversation("handoff-parent")
+        let response = manager
+            .create_and_start_task_handoff("handoff-parent", &approval, &mut authority)
             .await
             .unwrap();
-        let successor_id = parent
-            .continued_in_conv_id
-            .expect("handoff commit links successor");
-        manager.signal_fatal_local_authority("test_handoff_startup");
-        assert_eq!(
-            manager.fatal_local_authority_fence.owners_at_first_close(),
-            Some(1)
-        );
-        barrier.wait().await;
-
-        let response = handoff.await.unwrap().unwrap();
-        assert_eq!(response.successor_conv_id, successor_id);
-        let successor = manager.db().get_conversation(&successor_id).await.unwrap();
-        assert_eq!(response.state_updated_at, successor.state_updated_at);
+        manager.signal_fatal_local_authority("test_handoff_after_commit");
+        let successor = manager
+            .db()
+            .get_conversation(&response.successor_conv_id)
+            .await
+            .unwrap();
+        assert!(matches!(successor.state, ConvState::Provisioning { .. }));
+        assert!(manager
+            .db()
+            .get_conversation_creation_job_for_conversation(&successor.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -9379,7 +9367,7 @@ mod scope_liveness_tests {
         };
         barrier.wait().await;
 
-        let repository = phoenix_db::workflow::WorkflowRepository::new(manager.db().pool().clone());
+        let repository = manager.db().workflow_repository();
         assert!(repository
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 conversation_id.to_string(),
@@ -9691,8 +9679,7 @@ mod scope_liveness_tests {
             SubmittedDirectTurnExpansionPolicy, SubmittedDirectTurnIdentity,
         };
         use phoenix_db::workflow::{
-            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput,
-            MaterializeAuthoritativeTurnInput, WorkflowRepository,
+            AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
         };
         use phoenix_workflow::{
             AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
@@ -9726,7 +9713,7 @@ mod scope_liveness_tests {
             },
         );
         let conversation = ConversationAuthority(conversation_id.to_string());
-        let repo = WorkflowRepository::new(mgr.db().pool().clone());
+        let repo = mgr.db().workflow_repository();
         let accepted = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
                 client_key: ClientTurnKey::new("direct-message").expect("client key"),
@@ -10287,12 +10274,7 @@ mod scope_liveness_tests {
             .await
             .expect("set context-exhausted");
         // Wire the continuation edge the chain walk reads.
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("leaf")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "leaf").await;
         // Refresh the in-memory row so `continued_in_conv_id` is populated.
         let parent = mgr.db().get_conversation("parent").await.expect("get");
         assert_eq!(
@@ -10350,12 +10332,7 @@ mod scope_liveness_tests {
             .await
             .expect("terminate successor");
         // Wire the continuation edge the chain walk reads.
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("successor")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "successor").await;
 
         assert!(
             !mgr.scope_has_live_conversation(&scope).await.unwrap(),
@@ -10381,12 +10358,7 @@ mod scope_liveness_tests {
             .await
             .expect("set handed-off");
         // successor stays non-terminal (live).
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind("successor")
-            .bind("parent")
-            .execute(mgr.db().pool())
-            .await
-            .expect("wire continuation");
+        wire_continuation(&mgr, "parent", "successor").await;
 
         assert!(
             !mgr.scope_has_live_conversation_excluding(&scope, "successor")
@@ -10408,12 +10380,58 @@ mod scope_liveness_tests {
 
     /// Helper: wire a `continued_in_conv_id` edge `from` → `to`.
     async fn wire_continuation(mgr: &RuntimeManager, from: &str, to: &str) {
+        let product_conversation_id = mgr
+            .db()
+            .get_conversation(from)
+            .await
+            .expect("get predecessor")
+            .product_conversation_id;
+        let mut tx = mgr
+            .db()
+            .pool()
+            .begin()
+            .await
+            .expect("begin continuation fixture");
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .expect("defer fixture foreign keys");
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(from)
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("reserve continuation edge");
         sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
             .bind(to)
             .bind(from)
-            .execute(mgr.db().pool())
+            .execute(&mut *tx)
             .await
             .expect("wire continuation");
+        sqlx::query(
+            "UPDATE conversations
+             SET runtime_role = 'user', parent_conversation_id = NULL
+             WHERE id = ?1 AND product_conversation_id = ?2",
+        )
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("promote continuation transcript");
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(from)
+        .execute(&mut *tx)
+        .await
+        .expect("consume continuation reservation");
+        tx.commit().await.expect("commit continuation fixture");
     }
 
     async fn set_context_exhausted(mgr: &RuntimeManager, id: &str) {
@@ -10444,7 +10462,7 @@ mod scope_liveness_tests {
         // A → B → C, all on the shared worktree.
         let scope = create_handleless_work_conv(&mgr, "A", worktree, None).await;
         create_handleless_work_conv(&mgr, "B", worktree, Some("A")).await;
-        create_handleless_work_conv(&mgr, "C", worktree, Some("B")).await;
+        create_handleless_work_conv(&mgr, "C", worktree, Some("A")).await;
         set_context_exhausted(&mgr, "A").await;
         set_context_exhausted(&mgr, "B").await;
         wire_continuation(&mgr, "A", "B").await;
@@ -10480,7 +10498,7 @@ mod scope_liveness_tests {
 
         let scope = create_handleless_work_conv(&mgr, "A", worktree, None).await;
         create_handleless_work_conv(&mgr, "B", worktree, Some("A")).await;
-        create_handleless_work_conv(&mgr, "C", worktree, Some("B")).await; // stays non-terminal (live)
+        create_handleless_work_conv(&mgr, "C", worktree, Some("A")).await; // stays non-terminal (live)
         set_context_exhausted(&mgr, "A").await;
         set_context_exhausted(&mgr, "B").await;
         wire_continuation(&mgr, "A", "B").await;

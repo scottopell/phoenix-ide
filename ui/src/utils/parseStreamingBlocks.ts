@@ -61,9 +61,6 @@ function isMarkdownFenceLang(lang: string): boolean {
  *
  * The fence lines themselves (opening and closing) are NOT included in block
  * content — only the body lines are.
- *
- * Block content always ends with '\n' unless it is the last block AND the buffer
- * itself does not end with a newline (property P9).
  */
 export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
   if (buffer === '') return [];

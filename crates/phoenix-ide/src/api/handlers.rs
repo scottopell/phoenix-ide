@@ -430,6 +430,10 @@ pub fn create_router(state: AppState) -> Router {
             get(super::deployment::deployment_disk),
         )
         .route(
+            "/api/deployment/sqlite-workload",
+            get(super::deployment::sqlite_workload_report),
+        )
+        .route(
             "/api/deployment/disk/managed-worktrees/cleanup",
             post(super::deployment::cleanup_managed_worktree),
         )
@@ -698,7 +702,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         creation_prompt: None,
         creation_error: None,
         cached_pr: None,
-        inner: conv.clone(),
+        inner: crate::runtime::PresentationConversation(conv.clone()),
     }
 }
 
@@ -2093,6 +2097,7 @@ async fn create_conversation_with_id(
         checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
+        approved_task: None,
     };
     let job_id = uuid::Uuid::new_v4().to_string();
     let creation_job = crate::db::InsertConversationCreationJob {
@@ -2245,6 +2250,48 @@ pub(crate) fn validate_user_ref(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn validate_detached_task_worktree(
+    worktree_path: &std::path::Path,
+    approved_commit_oid: &str,
+) -> Result<(), String> {
+    let head = run_git(worktree_path, &["rev-parse", "HEAD"])?;
+    if head.trim() != approved_commit_oid {
+        return Err(format!(
+            "approved-task worktree HEAD {} does not match approved commit {approved_commit_oid}",
+            head.trim()
+        ));
+    }
+    if run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        return Err("approved-task worktree must remain detached".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn create_detached_task_worktree_blocking(
+    repo_root: &str,
+    target_path: &std::path::Path,
+    approved_branch: &str,
+) -> Result<String, BranchWorktreeError> {
+    let repo = std::path::Path::new(repo_root);
+    let parent = target_path.parent().ok_or_else(|| {
+        BranchWorktreeError::Git("detached worktree target has no parent directory".to_string())
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| BranchWorktreeError::Git(error.to_string()))?;
+    run_git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            target_path.to_string_lossy().as_ref(),
+            approved_branch,
+        ],
+    )
+    .map_err(|error| BranchWorktreeError::Git(error.clone()))?;
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Create a git worktree for an existing branch. Runs on a blocking thread.
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
 ///
 /// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
@@ -4173,7 +4220,9 @@ async fn get_wake_status(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let rows = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    let rows = state
+        .db
+        .wake_repository()
         .list_active_unresolved_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -4201,7 +4250,7 @@ async fn cancel_wake(
         .get_conversation(&id)
         .await
         .map_err(|error| AppError::NotFound(error.to_string()))?;
-    let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+    let repo = state.db.wake_repository();
     let row = repo
         .fetch_binding_for_conversation_contract(&id, &contract_id)
         .await
@@ -4248,7 +4297,7 @@ async fn cancel_active_direct_turn(
     state: &AppState,
     conversation_id: &str,
 ) -> Result<Option<phoenix_workflow::Materialization>, AppError> {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let repo = state.db.workflow_repository();
     let Some(turn) = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
@@ -4275,7 +4324,7 @@ async fn load_active_direct_turn_authority(
     state: &AppState,
     conversation_id: &str,
 ) -> Result<Option<crate::runtime::traits::ActiveDirectTurn>, AppError> {
-    let repo = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone());
+    let repo = state.db.workflow_repository();
     let turn = repo
         .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
             conversation_id.to_string(),
@@ -4914,6 +4963,9 @@ async fn continue_conversation(
         .await
         .map_err(|e| match e {
             DbError::ConversationNotFound(msg) => AppError::NotFound(msg),
+            DbError::ContinuationPrecondition(msg) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(msg, "continuation_not_allowed"),
+            )),
             other => AppError::Internal(other.to_string()),
         })?;
 
@@ -4925,8 +4977,7 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == new_conv.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
@@ -4985,8 +5036,7 @@ async fn continue_conversation(
                 .get_conversation(&id)
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))?;
-            let wake_repo =
-                crate::db::workflow::wake::WakeRepository::new(state.runtime.db().pool().clone());
+            let wake_repo = state.runtime.db().wake_repository();
             if parent.attached_work_scope_id == existing.attached_work_scope_id {
                 wake_repo
                     .transfer_active_for_continuation(
@@ -5236,7 +5286,9 @@ async fn archive_conversation(
 /// continue; only the final `archived = 1` write is fatal.
 pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
     refuse_if_coordinator(state, id, "archive").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -5617,7 +5669,9 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     #[cfg(test)]
     state.runtime.wait_at_hard_delete_barrier().await;
     refuse_if_coordinator(state, id, "delete").await?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -5856,7 +5910,15 @@ async fn cascade_project_target(
             branch_name,
             worktree_path,
             ..
-        } => Some((branch_name.to_string(), worktree_path.to_string(), true)),
+        } => Some((
+            branch_name.to_string(),
+            worktree_path.to_string(),
+            crate::git_ops::run_git(
+                std::path::Path::new(worktree_path.as_str()),
+                &["symbolic-ref", "-q", "HEAD"],
+            )
+            .is_ok(),
+        )),
         ConvMode::Branch {
             branch_name,
             worktree_path,
@@ -6069,17 +6131,7 @@ async fn rename_conversation(
             _ => AppError::NotFound(e.to_string()),
         })?;
 
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
-
-    Ok(Json(ConversationResponse {
-        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
-    }))
+    conversation_response(&state, &id).await
 }
 
 async fn regenerate_conversation_name(
@@ -6158,7 +6210,7 @@ async fn conversation_response(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(ConversationResponse {
-        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
+        conversation: conversation_to_json_with_seed(state, &conversation, true).await?,
     }))
 }
 
@@ -8402,6 +8454,7 @@ mod conversation_cwd_validation_tests {
                     checkout_ref: None,
                     seed_parent_id: None,
                     seed_label: None,
+                    approved_task: None,
                 },
             })
             .await
@@ -8504,6 +8557,7 @@ mod conversation_cwd_validation_tests {
                     checkout_ref: None,
                     seed_parent_id: None,
                     seed_label: None,
+                    approved_task: None,
                 },
             })
             .await
@@ -8741,7 +8795,7 @@ pub(crate) mod hard_delete_cascade_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -11767,7 +11821,9 @@ pub(crate) mod hard_delete_cascade_tests {
             &target,
             payload.to_exact_bytes().expect("encode prepared payload"),
         );
-        phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        state
+            .db
+            .workflow_repository()
             .accept_authoritative_turn(
                 &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
                     client_key: ClientTurnKey::new("pending-message").expect("client key"),
@@ -11828,7 +11884,9 @@ pub(crate) mod hard_delete_cascade_tests {
 
         assert!(response.ok);
         assert!(!response.no_op);
-        let active = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let active = state
+            .db
+            .workflow_repository()
             .load_active_runtime_turn(&phoenix_workflow::ConversationAuthority(
                 "c-pending-turn".to_string(),
             ))
@@ -12027,7 +12085,9 @@ pub(crate) mod hard_delete_cascade_tests {
             .expect("delete conversation with pending turn");
 
         assert!(state.db.get_conversation("c-delete-turn").await.is_err());
-        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let discoverable = state
+            .db
+            .workflow_repository()
             .list_discoverable_accepted_runtime_direct_turns(None, 10)
             .await
             .expect("discover turns");
@@ -12671,20 +12731,83 @@ pub(crate) mod hard_delete_cascade_tests {
     /// test helper. The cascade tests only need the linkage; they don't
     /// exercise the `continue_conversation` gating on `context_exhausted`.
     async fn build_chain_for_test(state: &AppState, ids: &[&str]) {
-        for id in ids {
-            state
-                .db
-                .create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-                .await
-                .expect("create");
-        }
+        let root = state
+            .db
+            .create_conversation(
+                ids[0],
+                &format!("slug-{}", ids[0]),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
         for pair in ids.windows(2) {
+            let predecessor_id = pair[0];
+            let id = pair[1];
+            let now = chrono::Utc::now().to_rfc3339();
+            let scope_id = format!("scope-{id}");
+            let mut tx = state
+                .db
+                .pool()
+                .begin()
+                .await
+                .expect("begin continuation fixture");
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .expect("defer fixture foreign keys");
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("reserve continuation edge");
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-                .bind(pair[1])
-                .bind(pair[0])
-                .execute(state.db.pool())
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
                 .await
                 .expect("link");
+            sqlx::query(
+                "INSERT INTO work_scopes (
+                     id, authority_kind, environment_kind, cwd, created_at, updated_at
+                 ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+            )
+            .bind(&scope_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .expect("scope");
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, user_initiated, runtime_role,
+                     work_scope_id, state_updated_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+            )
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .bind(format!("slug-{id}"))
+            .bind(scope_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .expect("create");
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume continuation reservation");
+            tx.commit().await.expect("commit continuation fixture");
         }
     }
 
@@ -12755,49 +12878,29 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn chain_delete_preflights_coordinator_role_before_mutation() {
+    async fn chain_rejects_coordinator_role_in_ordinary_aggregate_before_delete() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["cc-a", "cc-b"]).await;
-        sqlx::query(
+        assert!(sqlx::query(
             "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'cc-b'",
         )
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
-        let err = crate::api::chains::delete_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("cc-a".to_string()),
-        )
+        .execute(state.db.pool())
         .await
-        .expect_err("Coordinator chain must be immutable");
-        match err {
-            AppError::Conflict(detail) => {
-                assert_eq!(detail.error_type, "coordinator_lifecycle");
-            }
-            other => panic!("expected 409, got {other:?}"),
-        }
+        .is_err());
         assert!(state.db.get_conversation("cc-a").await.is_ok());
         assert!(state.db.get_conversation("cc-b").await.is_ok());
     }
 
     #[tokio::test]
-    async fn chain_archive_preflights_coordinator_role_before_mutation() {
+    async fn chain_rejects_coordinator_role_in_ordinary_aggregate_before_archive() {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["ca-a", "ca-b"]).await;
-        sqlx::query(
+        assert!(sqlx::query(
             "UPDATE conversations SET runtime_role = 'coordinator', work_scope_id = NULL WHERE id = 'ca-b'",
         )
-            .execute(state.db.pool())
-            .await
-            .unwrap();
-
-        crate::api::chains::archive_chain_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Path("ca-a".to_string()),
-        )
+        .execute(state.db.pool())
         .await
-        .expect_err("Coordinator chain must be immutable");
+        .is_err());
         assert!(!state.db.get_conversation("ca-a").await.unwrap().archived);
         assert!(!state.db.get_conversation("ca-b").await.unwrap().archived);
     }
@@ -12909,7 +13012,9 @@ pub(crate) mod hard_delete_cascade_tests {
                 .expect("conversation")
                 .archived
         );
-        let discoverable = phoenix_db::workflow::WorkflowRepository::new(state.db.pool().clone())
+        let discoverable = state
+            .db
+            .workflow_repository()
             .list_discoverable_accepted_runtime_direct_turns(None, 10)
             .await
             .expect("discover turns");
@@ -13040,6 +13145,7 @@ pub(crate) mod hard_delete_cascade_tests {
     /// worktree + branch on disk. Returns the tempdir guard (kept alive by
     /// caller), the repo path, the worktree path, and the branch name so
     /// the test can assert against the filesystem after a chain operation.
+    #[allow(clippy::too_many_lines)]
     async fn build_workmode_chain_with_shared_worktree(
         state: &AppState,
         ids: &[&str; 3],
@@ -13092,33 +13198,85 @@ pub(crate) mod hard_delete_cascade_tests {
             task_title: crate::db::NonEmptyString::new("test chain").unwrap(),
         };
 
-        for id in ids {
-            state
-                .db
-                .create_conversation_with_project(
-                    id,
-                    &format!("slug-{id}"),
-                    worktree.to_str().unwrap(),
-                    true,
-                    None,
-                    None,
-                    Some(&project.id),
-                    &mode,
-                    None,
-                    None,
-                    None,
-                    crate::llm_language::LlmLanguage::default(),
-                )
-                .await
-                .expect("create conv");
-        }
+        let root_id = ids[0];
+        let root = state
+            .db
+            .create_conversation_with_project(
+                root_id,
+                &format!("slug-{root_id}"),
+                worktree.to_str().unwrap(),
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create root conv");
         for pair in ids.windows(2) {
+            let predecessor_id = pair[0];
+            let id = pair[1];
+            let mut tx = state
+                .db
+                .pool()
+                .begin()
+                .await
+                .expect("begin continuation fixture");
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
+                .await
+                .expect("defer fixture foreign keys");
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("reserve continuation edge");
             sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-                .bind(pair[1])
-                .bind(pair[0])
-                .execute(state.db.pool())
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
                 .await
                 .expect("link");
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, title, user_initiated,
+                     state, state_kind, state_updated_at, created_at, updated_at,
+                     archived, model, project_id, desired_base_branch,
+                     cm_kind, cm_task_id, cm_task_title, runtime_role, work_scope_id
+                 )
+                 SELECT ?1, product_conversation_id, ?2, ?3, 1,
+                        state, state_kind, ?4, ?4, ?4,
+                        0, model, project_id, desired_base_branch,
+                        cm_kind, cm_task_id, cm_task_title, 'user', work_scope_id
+                 FROM conversations WHERE id = ?5",
+            )
+            .bind(id)
+            .bind(format!("slug-{id}"))
+            .bind(format!("Title {id}"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(&root.id)
+            .execute(&mut *tx)
+            .await
+            .expect("create continuation member");
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume continuation reservation");
+            tx.commit().await.expect("commit continuation fixture");
         }
 
         (tmp, repo, worktree, branch)
@@ -13915,7 +14073,7 @@ mod regenerate_conversation_name_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -13973,6 +14131,29 @@ mod regenerate_conversation_name_tests {
     }
 
     #[tokio::test]
+    async fn rename_response_uses_canonical_presentation_serializer() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("unused"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-rename", "before-rename").await;
+
+        let Json(response) = rename_conversation(
+            State(state.clone()),
+            Path("conv-rename".to_string()),
+            Json(RenameRequest {
+                name: "After Rename".to_string(),
+            }),
+        )
+        .await
+        .expect("rename");
+        assert_eq!(response.conversation["slug"], "After Rename");
+        assert!(response.conversation.get("presentation_mode").is_some());
+        assert!(response.conversation.get("requires_action").is_some());
+        assert!(response.conversation.get("work_scope_key").is_some());
+    }
+
+    #[tokio::test]
     async fn successful_generation_renames_with_existing_slug_rules() {
         let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
             StubLlm::Ok("Useful Auth Fix"),
@@ -13988,6 +14169,12 @@ mod regenerate_conversation_name_tests {
 
         let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
         assert_eq!(response.conversation["slug"], "useful-auth-fix");
+        assert!(response
+            .conversation
+            .get("product_conversation_id")
+            .is_none());
+        assert!(response.conversation.get("presentation_mode").is_some());
+        assert!(response.conversation.get("work_scope_key").is_some());
         let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
         assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
     }
@@ -14121,7 +14308,7 @@ mod upgrade_model_state_guard_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14402,7 +14589,7 @@ mod file_read_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -14982,6 +15169,7 @@ mod attachment_storage_tests {
             checkout_ref: None,
             seed_parent_id: None,
             seed_label: None,
+            approved_task: None,
         };
         db.insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
             id: "job-creation-file".to_string(),
@@ -15059,7 +15247,7 @@ mod attachment_storage_tests {
             &conversation,
             payload.to_exact_bytes().expect("encode payload"),
         );
-        phoenix_db::workflow::WorkflowRepository::new(db.pool().clone())
+        db.workflow_repository()
             .accept_authoritative_turn(
                 &phoenix_db::workflow::direct_turn::AcceptAuthoritativeTurn {
                     client_key: ClientTurnKey::new("msg-direct-turn-files").expect("client key"),
@@ -15180,8 +15368,7 @@ mod chat_authority_tests {
             None,
         ));
         let terminals = runtime.terminals.clone();
-        let message_retriever: Arc<dyn crate::db::MessageRetriever> =
-            Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let message_retriever: Arc<dyn crate::db::MessageRetriever> = Arc::new(db.fts_retriever());
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),
             llm_registry.clone(),
@@ -15509,7 +15696,7 @@ mod wake_handler_tests {
         ));
         let terminals = runtime.terminals.clone();
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+            std::sync::Arc::new(db.fts_retriever());
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
@@ -15551,7 +15738,7 @@ mod wake_handler_tests {
         conversation_id: &str,
         contract_id: &str,
     ) {
-        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let repo = state.db.wake_repository();
         let work_scope_id = state
             .db
             .get_conversation(conversation_id)
@@ -15661,10 +15848,59 @@ mod wake_handler_tests {
     }
 
     #[tokio::test]
+    async fn deployment_sqlite_workload_rejects_invalid_window_values() {
+        let state = make_test_state().await;
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deployment/sqlite-workload?window=bogus")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deployment_sqlite_workload_returns_closed_category_rows() {
+        let state = make_test_state().await;
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deployment/sqlite-workload?window=one_hour")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["window"], "one_hour");
+        assert!(payload["writer_categories"].is_array());
+        assert!(payload["reads"].is_array());
+        let writer_categories = payload["writer_categories"]
+            .as_array()
+            .expect("writer categories array");
+        let read_categories = payload["reads"].as_array().expect("read categories array");
+        assert!(!writer_categories.is_empty());
+        assert!(!read_categories.is_empty());
+        assert_eq!(writer_categories[0]["category"], "message_persistence");
+        assert_eq!(read_categories[0]["category"], "message_persistence");
+    }
+
+    #[tokio::test]
     async fn conversation_search_returns_warming_when_live_index_is_stale() {
         let mut state = make_test_state().await;
         seed_conversation(&state, "conv-stale-search").await;
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15719,7 +15955,7 @@ mod wake_handler_tests {
             )
             .await
             .unwrap();
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.unwrap();
         state.message_retriever = Arc::new(retriever);
         state
@@ -15833,7 +16069,7 @@ mod wake_handler_tests {
             .archive_conversation("conv-arch")
             .await
             .expect("archive");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -15899,7 +16135,7 @@ mod wake_handler_tests {
                 .await
                 .expect("add limit message");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -15976,7 +16212,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add other");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16106,7 +16342,7 @@ mod wake_handler_tests {
             .await
             .expect("create creation jobs view");
         }
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16150,7 +16386,7 @@ mod wake_handler_tests {
             )
             .await
             .expect("add prefix message");
-        let retriever = crate::db::Fts5Retriever::new(state.db.pool().clone());
+        let retriever = state.db.fts_retriever();
         retriever.reconcile().await.expect("reconcile");
         let mut state = state;
         state.message_retriever = std::sync::Arc::new(retriever);
@@ -16178,7 +16414,7 @@ mod wake_handler_tests {
         let state = make_test_state().await;
         seed_conversation(&state, "conv-fired").await;
         register_bash_wake(&state, 6100, "conv-fired", "contract-fired").await;
-        let repo = phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone());
+        let repo = state.db.wake_repository();
         let started = repo
             .claim_observation_if_eligible(
                 phoenix_workflow::WorkflowId(6100),
@@ -16250,5 +16486,126 @@ mod wake_handler_tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
         assert_eq!(second.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod detached_task_worktree_tests {
+    use super::*;
+
+    fn git(path: &std::path::Path, args: &[&str]) -> String {
+        run_git(path, args).unwrap()
+    }
+
+    fn detached_work_conversation(
+        path: &std::path::Path,
+    ) -> phoenix_core::domain::db_schema::Conversation {
+        use phoenix_core::domain::db_schema::{ConvMode, Conversation, NonEmptyString};
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::work_scope::{RuntimeRole, WorkScopeId};
+        let now = chrono::Utc::now();
+        Conversation {
+            id: "detached".to_string(),
+            product_conversation_id: ProductConversationId::parse("detached").unwrap(),
+            slug: Some("detached".to_string()),
+            title: Some("Detached".to_string()),
+            cwd: path.to_string_lossy().to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Terminal,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: true,
+            model: None,
+            effort: None,
+            service_tier: phoenix_core::domain::llm_types::ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::Work {
+                branch_name: NonEmptyString::new("task-approved").unwrap(),
+                worktree_path: NonEmptyString::new(path.to_string_lossy().to_string()).unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("17002").unwrap(),
+                task_title: NonEmptyString::new("Detached").unwrap(),
+            },
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(WorkScopeId::parse("detached-scope").unwrap()),
+            desired_base_branch: None,
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn detached_task_cleanup_reaps_worktree_without_deleting_source_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "approved"]);
+        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "task-approved", &approved_oid]);
+        let target = repo.path().join(".phoenix/worktrees/detached-target");
+        create_detached_task_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            &target,
+            &approved_oid,
+        )
+        .unwrap_or_else(|_| panic!("create detached target"));
+        let conversation = detached_work_conversation(&target);
+        assert_eq!(
+            crate::runtime::cleanup_branch_for_unretained_work_scope(&target, [&conversation]),
+            None
+        );
+        git(
+            repo.path(),
+            &["worktree", "remove", "--force", target.to_str().unwrap()],
+        );
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
+            approved_oid
+        );
+    }
+
+    #[test]
+    fn detached_task_target_is_pinned_to_approved_oid_after_branch_moves() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "approved"]);
+        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "task-approved", &approved_oid]);
+        std::fs::write(repo.path().join("task.md"), "moved").unwrap();
+        git(repo.path(), &["add", "task.md"]);
+        git(repo.path(), &["commit", "-m", "source moved"]);
+        let moved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        git(repo.path(), &["branch", "-f", "task-approved", &moved_oid]);
+
+        let target = repo.path().join(".phoenix/worktrees/detached-target");
+        create_detached_task_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            &target,
+            &approved_oid,
+        )
+        .unwrap_or_else(|_| panic!("create detached approved target"));
+        assert_eq!(git(&target, &["rev-parse", "HEAD"]).trim(), approved_oid);
+        validate_detached_task_worktree(&target, &approved_oid).unwrap();
+        assert!(validate_detached_task_worktree(&target, &moved_oid).is_err());
+        assert_eq!(
+            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
+            moved_oid
+        );
     }
 }

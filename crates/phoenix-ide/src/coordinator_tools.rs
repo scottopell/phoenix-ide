@@ -439,7 +439,6 @@ fn result(value: Result<String, String>) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phoenix_db::retrieval::Fts5Retriever;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -476,7 +475,7 @@ mod tests {
 
     async fn application_tools() -> (WritingConversationTools, Vec<Arc<dyn Tool>>) {
         let db = crate::db::Database::open_in_memory().await.unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let runtime = Arc::new(crate::runtime::RuntimeManager::new(
             db.clone(),
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),
@@ -512,7 +511,7 @@ mod tests {
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let tool = ExplicitCwdSandboxedBash(GlobalReadService::new(db, retriever));
         let context = context("coordinator");
         (tool, context)
@@ -563,7 +562,7 @@ mod tests {
         db.create_conversation("origin", "origin", "/tmp", true, None, None)
             .await
             .unwrap();
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let retriever = Arc::new(db.fts_retriever());
         let runtime = Arc::new(crate::runtime::RuntimeManager::new(
             db.clone(),
             Arc::new(phoenix_llm::ModelRegistry::new_empty()),

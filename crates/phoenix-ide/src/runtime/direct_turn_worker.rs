@@ -61,7 +61,7 @@ pub(crate) async fn run(
     ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let worker = DirectTurnWorker::new(
-        WorkflowRepository::new(manager.db().pool().clone()),
+        manager.db().workflow_repository(),
         Arc::new(ProductionDirectTurnDispatcher { manager }),
         Arc::new(SystemClock),
         fresh_process_incarnation(),
@@ -911,9 +911,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(conversation_id.to_string());
-            if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
-                let _ = settled.send(());
-            }
             if self
                 .close_after_terminal_settlement
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -922,11 +919,17 @@ mod tests {
                     .store(false, std::sync::atomic::Ordering::Release);
             }
             let mut results = self.terminal_results.lock().unwrap();
-            if results.len() == 1 {
+            let result = if results.len() == 1 {
                 results[0].clone()
             } else {
                 results.remove(0)
+            };
+            if result.is_ok() {
+                if let Some(settled) = self.terminal_settled.lock().unwrap().take() {
+                    let _ = settled.send(());
+                }
             }
+            result
         }
     }
 
@@ -966,7 +969,7 @@ mod tests {
         db.create_conversation("conv-b", "B", "/tmp", true, None, None)
             .await
             .unwrap();
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         (repo, Arc::new(RecordingDispatcher::default()))
     }
 
@@ -1175,7 +1178,7 @@ mod tests {
         db.establish_parent_reconcile_action(parent_id)
             .await
             .unwrap();
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let real_result = {
@@ -2177,7 +2180,7 @@ mod tests {
         .await
         .unwrap();
 
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         let turn_id = accept(&repo, "settle-before-resume").await;
         let workflow_id = repo.workflow_id_for_turn(turn_id).await.unwrap().unwrap();
         let claim = repo

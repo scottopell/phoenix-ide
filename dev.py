@@ -697,8 +697,9 @@ def _node_env() -> dict:
     def node_matches(node_bin: Path) -> bool:
         try:
             import subprocess as _sp
-            ver_out = _sp.check_output([str(node_bin), "--version"],
-                                       text=True).strip()  # e.g. "v24.1.0"
+            ver_out = _sp.check_output(
+                [str(node_bin), "--version"], text=True, timeout=10,
+            ).strip()  # e.g. "v24.1.0"
             found_major = ver_out.lstrip("v").split(".")[0]
             # Accept the candidate if it meets or exceeds the requested major
             return int(found_major) >= int(major)
@@ -710,8 +711,10 @@ def _node_env() -> dict:
         try:
             import subprocess as _sp
             import re as _re
-            out = _sp.check_output(["corepack", "--version"], env={**env, "PATH": path},
-                                   text=True).strip()
+            out = _sp.check_output(
+                ["corepack", "--version"], env={**env, "PATH": path},
+                text=True, timeout=10,
+            ).strip()
             match = _re.search(r"(\d+)\.(\d+)", out)
             if not match:
                 return False
@@ -890,6 +893,9 @@ LAUNCHD_DEPLOY_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "activate.lock"
 LAUNCHD_DEPLOY_CLAIM_LOCK_PATH = LAUNCHD_DEPLOY_DIR / "claim.lock"
 LAUNCHD_DEPLOY_ACTIVE_PATH = LAUNCHD_DEPLOY_DIR / "active"
 LAUNCHD_DEPLOY_HELPER_PREFIX = "com.phoenix-ide.deploy"
+LAUNCHD_TRANSITION_TIMEOUT_SECS = 30.0
+LAUNCHD_HEALTH_TIMEOUT_SECS = 120.0
+LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS = 30.0
 LAUNCHD_HANDOFF_PROTOCOL_VERSION = 1
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
@@ -2439,6 +2445,7 @@ def cmd_seed(
         desired_base_branch: str | None = None,
         seed_label: str | None = None,
         work_scope_id: str | None = None,
+        product_conversation_id: str | None = None,
     ) -> str:
         mode_kind = str(mode["mode"]).lower()
         state_kind = str(json.loads(state_json)["type"])
@@ -2488,17 +2495,26 @@ def cmd_seed(
                 ),
             )
 
+        product_conversation_id = product_conversation_id or f"product-{conversation_id}"
+        conn.execute(
+            "INSERT OR IGNORE INTO product_conversations ("
+            " id, kind, ordinary_lifecycle"
+            ") VALUES (?, 'ordinary', 'open')",
+            (product_conversation_id,),
+        )
+
         conn.execute(
             "INSERT INTO conversations ("
-            " id, slug, title, parent_conversation_id, user_initiated,"
+            " id, product_conversation_id, slug, title, parent_conversation_id, user_initiated,"
             " state, state_kind, state_updated_at, created_at, updated_at, archived,"
             " model, project_id, desired_base_branch, seed_parent_id, seed_label,"
             " cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,"
             " runtime_role, work_scope_id"
-            ") VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
             " ?, ?, ?, ?, 'user', ?)",
             (
                 conversation_id,
+                product_conversation_id,
                 slug,
                 title,
                 state_json,
@@ -2523,11 +2539,19 @@ def cmd_seed(
         conversation_id: str,
     ) -> str | None:
         row = conn.execute(
-            "SELECT work_scope_id FROM conversations WHERE id = ?",
+            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?",
             (conversation_id,),
         ).fetchone()
         conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        if row is not None:
+            conn.execute(
+                "DELETE FROM product_conversations WHERE id = ?"
+                " AND NOT EXISTS ("
+                "  SELECT 1 FROM conversations WHERE product_conversation_id = ?"
+                " )",
+                (row[1], row[1]),
+            )
         if row is not None and row[0] is not None:
             conn.execute(
                 "DELETE FROM work_scopes WHERE id = ?"
@@ -2855,11 +2879,22 @@ def cmd_seed(
         new_slug = f"{root_slug}-{chain_index}-{new_id[:4]}"
         new_title = _title_from_slug(root_slug)
         idle_state = json.dumps({"type": "idle"})
-        parent_scope = conn.execute(
-            "SELECT work_scope_id FROM conversations WHERE id = ?",
+        parent_scope, parent_product_conversation_id = conn.execute(
+            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?",
             (parent_id,),
-        ).fetchone()[0]
+        ).fetchone()
         continuation_scope = None if conv_mode["mode"] == "Direct" else parent_scope
+        conn.execute("PRAGMA defer_foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO product_continuation_reservations ("
+            " predecessor_conversation_id, successor_conversation_id, product_conversation_id"
+            ") VALUES (?, ?, ?)",
+            (parent_id, new_id, parent_product_conversation_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
+            (new_id, parent_id),
+        )
         _insert_modern_conversation(
             conn,
             conversation_id=new_id,
@@ -2870,6 +2905,12 @@ def cmd_seed(
             cwd=cwd,
             project_id=project_id,
             work_scope_id=continuation_scope,
+            product_conversation_id=parent_product_conversation_id,
+        )
+        conn.execute(
+            "DELETE FROM product_continuation_reservations "
+            "WHERE predecessor_conversation_id = ?",
+            (parent_id,),
         )
         # Continuation summary message bridges parent -> child in the UI.
         msg_id = str(_uuid.uuid4())
@@ -2880,11 +2921,6 @@ def cmd_seed(
             " content, created_at"
             ") VALUES (?, ?, 0, 'continuation', ?, ?)",
             (msg_id, new_id, cont_content, now),
-        )
-        # Wire parent -> child.
-        conn.execute(
-            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
-            (new_id, parent_id),
         )
         return new_id, new_slug
 
@@ -3652,6 +3688,161 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     else:
         print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
+
+
+@dataclasses.dataclass(frozen=True)
+class DoctorResult:
+    name: str
+    ok: bool
+    detail: str
+    required: bool = True
+
+
+def _doctor_version(
+    command: list[str], *, env: dict | None = None, cwd: Path | None = None,
+    required_line: str | None = None,
+) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except OSError as error:
+        return False, f"cannot execute: {error.strerror or error}"
+    output = (completed.stdout or completed.stderr).strip().splitlines()
+    detail = output[0] if output else f"exit {completed.returncode}"
+    ok = completed.returncode == 0
+    if required_line is not None:
+        ok = ok and required_line in output
+    return ok, detail
+
+
+def collect_doctor_results() -> list[DoctorResult]:
+    node_environment = {**node_env(), "COREPACK_ENABLE_NETWORK": "0"}
+    results: list[DoctorResult] = []
+
+    git_ok, git_version = _doctor_version(["git", "--version"])
+    results.append(DoctorResult("git", git_ok, git_version))
+
+    node_ok, node_version = _doctor_version(["node", "--version"], env=node_environment)
+    requested_node = (ROOT / ".node-version").read_text().strip().split(".")[0]
+    if node_ok:
+        try:
+            node_ok = int(node_version.lstrip("v").split(".")[0]) >= int(requested_node)
+        except ValueError:
+            node_ok = False
+    results.append(DoctorResult("node", node_ok, f"{node_version} (requires >= {requested_node})"))
+
+    corepack_ok, corepack_version = _doctor_version(
+        ["corepack", "--version"], env=node_environment,
+    )
+    if corepack_ok:
+        try:
+            parsed = tuple(int(part) for part in corepack_version.split(".")[:2])
+            corepack_ok = parsed >= _MIN_COREPACK
+        except ValueError:
+            corepack_ok = False
+    results.append(DoctorResult(
+        "corepack",
+        corepack_ok,
+        f"{corepack_version} (requires >= {'.'.join(map(str, _MIN_COREPACK))})",
+    ))
+
+    pnpm_ok, pnpm_version = _doctor_version(
+        ["pnpm", "--version"], env=node_environment, cwd=UI_DIR,
+    )
+    pinned_pnpm = _read_pnpm_pin()
+    pnpm_ok = pnpm_ok and pnpm_version == pinned_pnpm
+    results.append(DoctorResult("pnpm", pnpm_ok, f"{pnpm_version} (requires {pinned_pnpm})"))
+
+    pinned_rust_match = re.search(
+        r'^channel\s*=\s*"([^"]+)"',
+        (ROOT / "rust-toolchain.toml").read_text(),
+        flags=re.MULTILINE,
+    )
+    pinned_rust = pinned_rust_match.group(1) if pinned_rust_match else "repository pin"
+    rust_environment = {**os.environ, "RUSTUP_AUTO_INSTALL": "0"}
+    rust_ok, rust_version = _doctor_version(
+        ["rustc", "--version"], env=rust_environment,
+    )
+    rust_ok = rust_ok and f"rustc {pinned_rust} " in f"{rust_version} "
+    results.append(DoctorResult("rustc", rust_ok, f"{rust_version} (requires {pinned_rust})"))
+
+    cargo_ok, cargo_version = _doctor_version(
+        ["cargo", "--version"], env=rust_environment,
+    )
+    results.append(DoctorResult("cargo", cargo_ok, cargo_version))
+    for name, command in (
+        ("rustfmt", ["cargo", "fmt", "--version"]),
+        ("clippy", ["cargo", "clippy", "--version"]),
+    ):
+        ok, detail = _doctor_version(command, env=rust_environment)
+        results.append(DoctorResult(name, ok, detail))
+
+    if platform.system() == "Linux":
+        target = _linux_musl_target()
+        linker_env = f"CC_{target.replace('-', '_')}"
+        linker = os.environ.get(linker_env) or (
+            "aarch64-linux-musl-gcc" if target.startswith("aarch64-") else "musl-gcc"
+        )
+        ok, detail = _doctor_version([linker, "--version"])
+        results.append(DoctorResult("musl-linker", ok, f"{linker}: {detail}"))
+        target_ok, _targets = _doctor_version(
+            ["rustup", "target", "list", "--installed", "--toolchain", pinned_rust],
+            env=rust_environment,
+            required_line=target,
+        )
+        results.append(DoctorResult(
+            "rust-musl-target", target_ok,
+            f"{target} installed" if target_ok else f"{target} not installed",
+        ))
+
+    if platform.system() == "Linux":
+        strip_path = shutil.which("strip")
+        results.append(DoctorResult("strip", strip_path is not None, strip_path or "not found"))
+
+    configured_browser = os.environ.get("PHOENIX_CHROME_EXECUTABLE")
+    browser = Path(configured_browser).expanduser() if configured_browser else _find_chromium_binary()
+    if browser is not None and not (browser.is_file() and os.access(browser, os.X_OK)):
+        browser = None
+    results.append(DoctorResult(
+        "chrome",
+        browser is not None,
+        str(browser) if browser is not None else "not found",
+    ))
+
+    for name, command, environment in (
+        ("cargo-nextest", ["cargo", "nextest", "--version"], rust_environment),
+        ("allium", ["allium", "--version"], None),
+        ("ripgrep", ["rg", "--version"], None),
+        ("ast-grep", ["ast-grep", "--version"], None),
+    ):
+        ok, detail = _doctor_version(command, env=environment)
+        results.append(DoctorResult(name, ok, detail, required=False))
+
+    return results
+
+
+def cmd_doctor() -> bool:
+    results = collect_doctor_results()
+    for result in results:
+        marker = "✓" if result.ok else ("✗" if result.required else "-")
+        role = "" if result.required else " (optional)"
+        print(f"{marker} {result.name}{role}: {result.detail}")
+
+    missing = [result.name for result in results if result.required and not result.ok]
+    if missing:
+        print(f"\nMissing required prerequisites: {', '.join(missing)}")
+        return False
+    print("\nReady for full local development and deployment checks.")
+    return True
 
 
 def cmd_status():
@@ -9412,6 +9603,8 @@ def launchd_prod_deploy(
             "deployed_sha_path": str(PROD_SHA_PATH),
             "lock_path": str(LAUNCHD_DEPLOY_LOCK_PATH),
             "claim_lock_path": str(LAUNCHD_DEPLOY_CLAIM_LOCK_PATH),
+            "transition_timeout_secs": LAUNCHD_TRANSITION_TIMEOUT_SECS,
+            "health_timeout_secs": LAUNCHD_HEALTH_TIMEOUT_SECS,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         _write_json_atomic(staging / "manifest.json", manifest)
@@ -9472,7 +9665,12 @@ def _print_launchd_deploy_status() -> None:
             print(f"    Rollback failure: {deploy['rollback_failure']}")
         if deploy.get("state") in {"preparing", "prepared", "activating"}:
             age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(deploy["updated_at"])
-            if age.total_seconds() > 120:
+            stale_after = (
+                4 * LAUNCHD_TRANSITION_TIMEOUT_SECS
+                + 2 * LAUNCHD_HEALTH_TIMEOUT_SECS
+                + LAUNCHD_STALE_HANDOFF_ALLOWANCE_SECS
+            )
+            if age.total_seconds() > stale_after:
                 print("    STALE: inspect ~/.phoenix-ide/deploy/activation.log and confirm no helper is running before clearing the active marker")
     except Exception as exc:
         print(f"  Last deploy: unreadable status ({type(exc).__name__})")
@@ -9729,6 +9927,8 @@ def main():
     # status
     sub.add_parser("status", help="Check what's running")
 
+    sub.add_parser("doctor", help="Diagnose local development and deployment prerequisites")
+
     # check
     check_parser = sub.add_parser("check", help="Run lint, fmt check, and tests")
     check_parser.add_argument(
@@ -9924,13 +10124,14 @@ def main():
 
     # --pretty composes from the global flag and the per-subcommand flag.
     pretty = args.pretty_global or getattr(args, "pretty", False)
-    if pretty:
+    if pretty and args.command != "doctor":
         _bootstrap_rich()
 
     global _CHECK_PROFILE
     if args.command == "check" and getattr(args, "profile_work_dir", None):
         args.profile_work = True
-    _bootstrap_dev_tracing()
+    if args.command != "doctor":
+        _bootstrap_dev_tracing()
     if args.command == "check" and getattr(args, "profile_work", False):
         # Provider imports/initialization are outside the measured check interval.
         _init_dev_tracing()
@@ -9941,7 +10142,8 @@ def main():
         except ValueError as error:
             print(f"error: {error}", file=sys.stderr)
             sys.exit(2)
-    _start_dev_command_tracing(args.command)
+    if args.command != "doctor":
+        _start_dev_command_tracing(args.command)
     if _CHECK_PROFILE is not None and _DEV_TRACING is None:
         print(
             "  ⚠ CPU artifacts will be recorded, but dev tracing is unavailable; "
@@ -9964,6 +10166,9 @@ def main():
         cmd_restart(phoenix_port=args.port, tls=args.https)
     elif args.command == "status":
         cmd_status()
+    elif args.command == "doctor":
+        if not cmd_doctor():
+            sys.exit(1)
     elif args.command == "check":
         cmd_check(
             gate=not args.check_all,

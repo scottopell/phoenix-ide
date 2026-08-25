@@ -11,7 +11,6 @@ use phoenix_core::domain::sm_event::{
 };
 use phoenix_db::workflow::{
     AcceptAuthoritativeTurn, ScopedDirectTurnReplayError, ScopedDirectTurnReplayLookup,
-    WorkflowRepository,
 };
 use phoenix_db::SteeringAcceptanceFingerprint;
 use phoenix_workflow::{
@@ -184,7 +183,7 @@ impl SendChatApplicationService {
             .get_steering_queue(&req.conversation_id)
             .await
             .map_err(map_conversation_load_error)?;
-        let repo = WorkflowRepository::new(self.db.pool().clone());
+        let repo = self.db.workflow_repository();
         let active_direct_turn = repo
             .load_active_runtime_turn(&ConversationAuthority(conversation.id.clone()))
             .await
@@ -457,7 +456,7 @@ async fn lookup_durable_replay(
     req: &SendChatRequest,
     submitted: &SubmittedDirectTurnIdentity,
 ) -> Result<DurableReplayOutcome, SendChatServiceError> {
-    let repo = WorkflowRepository::new(db.pool().clone());
+    let repo = db.workflow_repository();
     match repo
         .lookup_scoped_direct_turn_replay(
             &ConversationAuthority(req.conversation_id.clone()),
@@ -541,6 +540,7 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::ConversationAlreadyExists(_)
         | crate::db::DbError::Serialization(_)
+        | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
         | crate::db::DbError::CloseFoundationRepairRequired(_)
@@ -580,6 +580,7 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::MessageNotFound(_)
         | crate::db::DbError::SlugExists(_)
         | crate::db::DbError::Serialization(_)
+        | crate::db::DbError::ContinuationPrecondition(_)
         | crate::db::DbError::CloseFoundationConflict(_)
         | crate::db::DbError::CloseFoundationPrecondition(_)
         | crate::db::DbError::CloseFoundationRepairRequired(_)
@@ -844,7 +845,6 @@ mod tests {
     };
     use phoenix_db::workflow::{
         AcceptAuthoritativeTurn, ClaimAuthoritativeTurnInput, MaterializeAuthoritativeTurnInput,
-        WorkflowRepository,
     };
     use phoenix_workflow::{
         AcceptedDisposition, ClientTurnKey, ConversationAuthority, LeaseExpiry, PreparedTurn,
@@ -1032,7 +1032,7 @@ mod tests {
         req.conversation_id = "conv-replay".to_string();
         req.message_id = "client-key".to_string();
         let db = db_with_conversation(&req.conversation_id).await;
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         let payload = prepared_payload(&req, "first expansion");
         let turn = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
@@ -1105,7 +1105,7 @@ mod tests {
         let mut req = request();
         req.conversation_id = "conv-terminal-replay".to_string();
         let db = db_with_conversation(&req.conversation_id).await;
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         let payload = prepared_payload(&req, "accepted before terminal");
         let turn = repo
             .accept_authoritative_turn(&AcceptAuthoritativeTurn {
@@ -1142,7 +1142,7 @@ mod tests {
         let mut req = request();
         req.conversation_id = "conv-archived-replay".to_string();
         let db = db_with_conversation(&req.conversation_id).await;
-        let repo = WorkflowRepository::new(db.pool().clone());
+        let repo = db.workflow_repository();
         let payload = prepared_payload(&req, "accepted before archive");
         repo.accept_authoritative_turn(&AcceptAuthoritativeTurn {
             client_key: ClientTurnKey::new(req.message_id.clone()).unwrap(),

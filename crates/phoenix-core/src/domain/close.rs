@@ -1,9 +1,8 @@
-use std::fmt;
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
+pub use crate::domain::product_conversation::ProductConversationId;
 use crate::work_scope::{RuntimeRole, WorkScopeId};
 
 const GIT_PATH_IDENTITY_CODEC_VERSION: &str = "git_path_bytes_hex_v1";
@@ -52,66 +51,6 @@ impl fmt::Display for CloseAttemptIdError {
     }
 }
 impl std::error::Error for CloseAttemptIdError {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(transparent)]
-pub struct ProductConversationId(String);
-
-impl<'de> Deserialize<'de> for ProductConversationId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl ProductConversationId {
-    /// # Errors
-    /// Returns [`ProductConversationIdError`] when the supplied identifier is empty.
-    pub fn parse(value: impl Into<String>) -> Result<Self, ProductConversationIdError> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            return Err(ProductConversationIdError::Empty);
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ProductConversationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for ProductConversationId {
-    type Err = ProductConversationIdError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProductConversationIdError {
-    Empty,
-}
-
-impl fmt::Display for ProductConversationIdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("product conversation id cannot be empty"),
-        }
-    }
-}
-
-impl std::error::Error for ProductConversationIdError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -1246,27 +1185,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn product_conversation_id_rejects_empty() {
-        assert_eq!(
-            ProductConversationId::parse(""),
-            Err(ProductConversationIdError::Empty)
-        );
-        assert_eq!(
-            ProductConversationId::parse(" \t"),
-            Err(ProductConversationIdError::Empty)
-        );
-        assert!(serde_json::from_str::<ProductConversationId>(r#""""#).is_err());
-    }
-
-    #[test]
-    fn product_conversation_id_round_trips() {
-        let id = ProductConversationId::parse("root-1").unwrap();
-        assert_eq!(id.as_str(), "root-1");
-        assert_eq!(id.to_string(), "root-1");
-        assert_eq!(ProductConversationId::from_str("root-1").unwrap(), id);
-    }
 
     #[test]
     fn transcript_conversation_id_is_distinct_and_round_trips() {

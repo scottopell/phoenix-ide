@@ -499,6 +499,11 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-1".to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "product-conv-1",
+                )
+                .unwrap(),
             slug: Some("test-conv".to_string()),
             title: Some("Test Conversation".to_string()),
             cwd: "/tmp/work".to_string(),
@@ -531,7 +536,7 @@ mod tests {
 
     fn fixture_enriched_conversation() -> EnrichedConversation {
         EnrichedConversation {
-            inner: fixture_conversation(),
+            inner: crate::runtime::PresentationConversation(fixture_conversation()),
             conv_mode_label: "explore".to_string(),
             branch_name: None,
             worktree_path: None,
@@ -929,6 +934,12 @@ mod tests {
     fn parity_conversation_became_terminal() {
         let event = SseEvent::ConversationBecameTerminal { sequence_id: 17 };
         assert_parity(&event);
+    }
+
+    #[test]
+    fn enriched_conversation_omits_internal_product_identity() {
+        let value = serde_json::to_value(fixture_enriched_conversation()).unwrap();
+        assert!(value.get("product_conversation_id").is_none());
     }
 
     #[test]

@@ -12,8 +12,9 @@
 use super::AppState;
 use crate::api::installation_ownership::{self, InstallationOwnership};
 use crate::api::process_sample::ProcessObservation;
+use crate::db::approximate_percentiles_from_histogram;
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -154,6 +155,142 @@ pub struct AboutResourcesSnapshot {
     pub host: HostResources,
     pub managed_total: ManagedResourceTotals,
     pub categories: Vec<ManagedResourceCategory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum SqliteReportWindow {
+    OneHour,
+    SixHours,
+    TwentyFourHours,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum SqliteReportCategory {
+    MessagePersistence,
+    DurableWorkflows,
+    Fts,
+    RuntimeState,
+    PrProjectData,
+    Maintenance,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteWorkloadReportQuery {
+    pub window: SqliteReportWindow,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteWorkloadReportResponse {
+    pub sampled_at: DateTime<Utc>,
+    pub window: SqliteReportWindow,
+    pub bucket_count: usize,
+    pub restart_truncated: bool,
+    pub process_started_at: DateTime<Utc>,
+    pub process_uptime_seconds: u64,
+    pub covered_uptime_seconds: u64,
+    pub covered_uptime_micros: u64,
+    pub coverage: SqliteWorkloadCoverage,
+    pub classification: SqliteClassificationSummary,
+    pub baseline_categories: Vec<SqliteBaselineCategoryReport>,
+    pub writer_categories: Vec<SqliteWriterCategoryReport>,
+    pub reads: Vec<SqliteReadCategoryReport>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteWorkloadCoverage {
+    pub bucket_count: usize,
+    pub fully_covered: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteClassificationSummary {
+    pub typed_outcome_count: u64,
+    pub typed_other_outcome_count: u64,
+    pub typed_other_outcome_share_percent: Option<f64>,
+    pub baseline_statement_count: u64,
+    pub baseline_other_statement_count: u64,
+    pub baseline_other_statement_share_percent: Option<f64>,
+    pub abandoned_count: u64,
+    pub classification_gap_count: u64,
+    pub writer_occupancy_gap_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteBaselineCategoryReport {
+    pub category: SqliteReportCategory,
+    pub label: String,
+    pub baseline_statement_count: u64,
+    pub native_statement_latency: SqliteWaitSummary,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteWriterCategoryReport {
+    pub category: SqliteReportCategory,
+    pub label: String,
+    pub typed_operation_count: u64,
+    pub typed_latency: SqliteWaitSummary,
+    pub writer_occupancy_percent: f64,
+    pub peak_concurrency: u32,
+    pub pool_wait: Option<SqliteWaitSummary>,
+    pub admission_wait: Option<SqliteWaitSummary>,
+    pub retries: Option<SqliteRetrySummary>,
+    pub failures: SqliteFailureSummary,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteReadCategoryReport {
+    pub category: SqliteReportCategory,
+    pub label: String,
+    pub typed_operation_count: u64,
+    pub typed_latency: SqliteWaitSummary,
+    pub total_profiled_read_execution_ms: u64,
+    pub profiled_statement_latency: SqliteWaitSummary,
+    pub peak_concurrency: u32,
+    pub pool_wait: Option<SqliteWaitSummary>,
+    pub retries: Option<SqliteRetrySummary>,
+    pub failures: SqliteFailureSummary,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteWaitSummary {
+    pub sample_count: u64,
+    pub total_ms: u64,
+    pub avg_ms: Option<u64>,
+    pub p50_upper_bound_ms: Option<u64>,
+    pub p95_upper_bound_ms: Option<u64>,
+    pub p99_upper_bound_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteRetrySummary {
+    pub retry_count: u64,
+    pub backed_off_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct SqliteFailureSummary {
+    pub busy: u64,
+    pub locked: u64,
+    pub pool_timeout: u64,
+    pub other_timeout: u64,
+    pub other_failure: u64,
+    pub abandoned: u64,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -363,6 +500,13 @@ pub async fn about_resources(State(state): State<AppState>) -> impl IntoResponse
     Json(sample_about_resources(&state).await)
 }
 
+pub async fn sqlite_workload_report(
+    State(state): State<AppState>,
+    Query(query): Query<SqliteWorkloadReportQuery>,
+) -> impl IntoResponse {
+    Json(sample_sqlite_workload_report(&state, query.window))
+}
+
 pub async fn cleanup_managed_worktree(
     State(state): State<AppState>,
     Json(request): Json<ManagedWorktreeCleanupRequest>,
@@ -488,6 +632,313 @@ fn remove_leftover_worktree(
         }
     }
     Ok(removed)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn sample_sqlite_workload_report(
+    state: &AppState,
+    window: SqliteReportWindow,
+) -> SqliteWorkloadReportResponse {
+    use crate::db::{SqliteAccessKind, SqliteSnapshotWindow, SqliteWorkloadCategory};
+
+    let sampled = state
+        .db
+        .sample_sqlite_workload_aggregate_report(window.into());
+    let sampled_at = DateTime::<Utc>::from_timestamp_micros(
+        i64::try_from(sampled.sampled_at_unix_micros).unwrap_or(i64::MAX),
+    )
+    .unwrap_or_else(Utc::now);
+    let report = sampled.report;
+    let covered_seconds = report.covered_uptime_micros / 1_000_000;
+    let process_uptime_seconds = report.process_uptime_micros / 1_000_000;
+    let requested_minutes = match report.requested_window {
+        SqliteSnapshotWindow::OneHour => 60,
+        SqliteSnapshotWindow::SixHours => 360,
+        SqliteSnapshotWindow::TwentyFourHours => 1_440,
+    };
+    let covered = report.bucket_count;
+    let process_started_at = DateTime::<Utc>::from_timestamp_micros(
+        i64::try_from(report.process_started_at_unix_micros).unwrap_or(i64::MAX),
+    )
+    .unwrap_or(sampled_at);
+    let requested_window_micros =
+        u64::try_from(requested_minutes).unwrap_or_default() * 60 * 1_000_000;
+    let coverage = SqliteWorkloadCoverage {
+        bucket_count: covered,
+        fully_covered: has_full_sqlite_coverage(
+            report.covered_uptime_micros,
+            requested_window_micros,
+        ),
+        label: format!(
+            "{} covered across {covered} bucket(s); requested {requested_minutes}m",
+            format_uptime_seconds(covered_seconds)
+        ),
+    };
+    let writer_window_micros = report.covered_uptime_micros;
+
+    let baseline_categories = SqliteWorkloadCategory::ALL
+        .iter()
+        .copied()
+        .map(|category| {
+            let totals = report.totals[SqliteAccessKind::Write.index()][category.index()];
+            let read_totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
+            SqliteBaselineCategoryReport {
+                category: SqliteReportCategory::from(category),
+                label: sqlite_category_label(category).to_string(),
+                baseline_statement_count: totals
+                    .baseline_statement_count
+                    .saturating_add(read_totals.baseline_statement_count),
+                native_statement_latency: wait_summary(
+                    &sum_latency_histograms(
+                        &report.native_statement_latency_histogram[SqliteAccessKind::Write.index()]
+                            [category.index()],
+                        &report.native_statement_latency_histogram[SqliteAccessKind::Read.index()]
+                            [category.index()],
+                    ),
+                    totals
+                        .native_statement_latency_micros
+                        .saturating_add(read_totals.native_statement_latency_micros),
+                ),
+            }
+        })
+        .collect();
+
+    let writer_categories = SqliteWorkloadCategory::ALL
+        .iter()
+        .copied()
+        .map(|category| {
+            let totals = report.totals[SqliteAccessKind::Write.index()][category.index()];
+            let outcomes = &report.outcomes[SqliteAccessKind::Write.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
+            let utilization_percent = if writer_window_micros == 0 {
+                0.0
+            } else {
+                (totals.writer_held_micros as f64) / (writer_window_micros as f64) * 100.0
+            };
+            SqliteWriterCategoryReport {
+                category: SqliteReportCategory::from(category),
+                label: sqlite_category_label(category).to_string(),
+                typed_operation_count: operation_count,
+                typed_latency: wait_summary(
+                    &report.typed_attempt_latency_histogram[SqliteAccessKind::Write.index()]
+                        [category.index()],
+                    totals.typed_attempt_latency_micros,
+                ),
+                writer_occupancy_percent: utilization_percent,
+                peak_concurrency: totals.writer_concurrency_peak,
+                pool_wait: available_wait_summary(
+                    &report.pool_wait_histogram[SqliteAccessKind::Write.index()][category.index()],
+                    totals.pool_wait_micros,
+                ),
+                admission_wait: available_wait_summary(
+                    &report.write_admission_wait_histogram[SqliteAccessKind::Write.index()]
+                        [category.index()],
+                    totals.write_admission_wait_micros,
+                ),
+                retries: retry_summary(totals.retry_count, totals.retry_backoff_micros),
+                failures: failure_summary(outcomes),
+            }
+        })
+        .collect();
+
+    let reads = SqliteWorkloadCategory::ALL
+        .iter()
+        .copied()
+        .map(|category| {
+            let totals = report.totals[SqliteAccessKind::Read.index()][category.index()];
+            let outcomes = &report.outcomes[SqliteAccessKind::Read.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
+            let total_profiled_read_execution_ms = totals.read_connection_micros / 1_000;
+            SqliteReadCategoryReport {
+                category: SqliteReportCategory::from(category),
+                label: sqlite_category_label(category).to_string(),
+                typed_operation_count: operation_count,
+                typed_latency: wait_summary(
+                    &report.typed_attempt_latency_histogram[SqliteAccessKind::Read.index()]
+                        [category.index()],
+                    totals.typed_attempt_latency_micros,
+                ),
+                total_profiled_read_execution_ms,
+                profiled_statement_latency: wait_summary(
+                    &report.native_statement_latency_histogram[SqliteAccessKind::Read.index()]
+                        [category.index()],
+                    totals.native_statement_latency_micros,
+                ),
+                peak_concurrency: totals.read_concurrency_peak,
+                pool_wait: available_wait_summary(
+                    &report.pool_wait_histogram[SqliteAccessKind::Read.index()][category.index()],
+                    totals.pool_wait_micros,
+                ),
+                retries: retry_summary(totals.retry_count, totals.retry_backoff_micros),
+                failures: failure_summary(outcomes),
+            }
+        })
+        .collect();
+
+    SqliteWorkloadReportResponse {
+        sampled_at,
+        window,
+        bucket_count: covered,
+        restart_truncated: report.restart_truncated,
+        process_started_at,
+        process_uptime_seconds,
+        covered_uptime_seconds: covered_seconds,
+        covered_uptime_micros: report.covered_uptime_micros,
+        coverage,
+        classification: classification_summary(&report),
+        baseline_categories,
+        writer_categories,
+        reads,
+    }
+}
+
+fn has_full_sqlite_coverage(covered_uptime_micros: u64, requested_window_micros: u64) -> bool {
+    covered_uptime_micros == requested_window_micros
+}
+
+fn available_wait_summary(
+    histogram: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+    total_wait_micros: u64,
+) -> Option<SqliteWaitSummary> {
+    (histogram.iter().copied().sum::<u64>() > 0).then(|| wait_summary(histogram, total_wait_micros))
+}
+
+fn sum_latency_histograms(
+    left: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+    right: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+) -> [u64; crate::db::SqliteLatencyBin::ALL.len()] {
+    std::array::from_fn(|index| left[index].saturating_add(right[index]))
+}
+
+fn wait_summary(
+    histogram: &[u64; crate::db::SqliteLatencyBin::ALL.len()],
+    total_wait_micros: u64,
+) -> SqliteWaitSummary {
+    let percentiles = approximate_percentiles_from_histogram(histogram);
+    let total_ms = total_wait_micros / 1_000;
+    SqliteWaitSummary {
+        sample_count: percentiles.sample_count,
+        total_ms,
+        avg_ms: total_ms.checked_div(percentiles.sample_count),
+        p50_upper_bound_ms: percentiles.p50_upper_bound_ms,
+        p95_upper_bound_ms: percentiles.p95_upper_bound_ms,
+        p99_upper_bound_ms: percentiles.p99_upper_bound_ms,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn classification_summary(
+    report: &crate::db::SqliteWorkloadAggregateReport,
+) -> SqliteClassificationSummary {
+    use crate::db::{SqliteAccessKind, SqliteOutcome, SqliteWorkloadCategory};
+
+    let mut typed_outcome_count = 0u64;
+    let mut typed_other_outcome_count = 0u64;
+    let mut baseline_statement_count = 0u64;
+    let mut baseline_other_statement_count = 0u64;
+    let mut abandoned_count = 0u64;
+    for access in SqliteAccessKind::ALL {
+        for category in SqliteWorkloadCategory::ALL {
+            let totals = report.totals[access.index()][category.index()];
+            let outcomes = &report.outcomes[access.index()][category.index()];
+            let operation_count = crate::db::operation_count(outcomes);
+            typed_outcome_count = typed_outcome_count.saturating_add(operation_count);
+            baseline_statement_count =
+                baseline_statement_count.saturating_add(totals.baseline_statement_count);
+            abandoned_count =
+                abandoned_count.saturating_add(outcomes[SqliteOutcome::Abandoned.index()]);
+            if category == SqliteWorkloadCategory::Other {
+                typed_other_outcome_count =
+                    typed_other_outcome_count.saturating_add(operation_count);
+                baseline_other_statement_count = baseline_other_statement_count.saturating_add(
+                    report.totals[access.index()][category.index()].baseline_statement_count,
+                );
+            }
+        }
+    }
+    SqliteClassificationSummary {
+        typed_outcome_count,
+        typed_other_outcome_count,
+        typed_other_outcome_share_percent: (typed_outcome_count > 0)
+            .then(|| typed_other_outcome_count as f64 * 100.0 / typed_outcome_count as f64),
+        baseline_statement_count,
+        baseline_other_statement_count,
+        baseline_other_statement_share_percent: (baseline_statement_count > 0).then(|| {
+            baseline_other_statement_count as f64 * 100.0 / baseline_statement_count as f64
+        }),
+        abandoned_count,
+        classification_gap_count: report.classification_gap_count,
+        writer_occupancy_gap_count: report.writer_occupancy_gap_count,
+    }
+}
+
+fn format_uptime_seconds(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn retry_summary(retry_count: u64, retry_backoff_micros: u64) -> Option<SqliteRetrySummary> {
+    (retry_count > 0 || retry_backoff_micros > 0).then_some(SqliteRetrySummary {
+        retry_count,
+        backed_off_ms: retry_backoff_micros / 1_000,
+    })
+}
+
+fn failure_summary(outcomes: &[u64; crate::db::SqliteOutcome::ALL.len()]) -> SqliteFailureSummary {
+    use crate::db::SqliteOutcome;
+
+    SqliteFailureSummary {
+        busy: outcomes[SqliteOutcome::Busy.index()],
+        locked: outcomes[SqliteOutcome::Locked.index()],
+        pool_timeout: outcomes[SqliteOutcome::PoolTimeout.index()],
+        other_timeout: outcomes[SqliteOutcome::OtherTimeout.index()],
+        other_failure: outcomes[SqliteOutcome::OtherFailure.index()],
+        abandoned: outcomes[SqliteOutcome::Abandoned.index()],
+    }
+}
+
+fn sqlite_category_label(category: crate::db::SqliteWorkloadCategory) -> &'static str {
+    match category {
+        crate::db::SqliteWorkloadCategory::MessagePersistence => "Message persistence",
+        crate::db::SqliteWorkloadCategory::DurableWorkflows => "Durable workflows",
+        crate::db::SqliteWorkloadCategory::Fts => "Full-text search",
+        crate::db::SqliteWorkloadCategory::RuntimeState => "Runtime state",
+        crate::db::SqliteWorkloadCategory::PrProjectData => "PR/project data",
+        crate::db::SqliteWorkloadCategory::Maintenance => "Maintenance",
+        crate::db::SqliteWorkloadCategory::Other => "Other",
+    }
+}
+
+impl From<crate::db::SqliteWorkloadCategory> for SqliteReportCategory {
+    fn from(value: crate::db::SqliteWorkloadCategory) -> Self {
+        match value {
+            crate::db::SqliteWorkloadCategory::MessagePersistence => Self::MessagePersistence,
+            crate::db::SqliteWorkloadCategory::DurableWorkflows => Self::DurableWorkflows,
+            crate::db::SqliteWorkloadCategory::Fts => Self::Fts,
+            crate::db::SqliteWorkloadCategory::RuntimeState => Self::RuntimeState,
+            crate::db::SqliteWorkloadCategory::PrProjectData => Self::PrProjectData,
+            crate::db::SqliteWorkloadCategory::Maintenance => Self::Maintenance,
+            crate::db::SqliteWorkloadCategory::Other => Self::Other,
+        }
+    }
+}
+
+impl From<SqliteReportWindow> for crate::db::SqliteSnapshotWindow {
+    fn from(value: SqliteReportWindow) -> Self {
+        match value {
+            SqliteReportWindow::OneHour => Self::OneHour,
+            SqliteReportWindow::SixHours => Self::SixHours,
+            SqliteReportWindow::TwentyFourHours => Self::TwentyFourHours,
+        }
+    }
 }
 
 async fn build_disk_info(state: &AppState) -> DeploymentDiskInfo {
@@ -1136,6 +1587,28 @@ mod tests {
     use phoenix_core::domain::db_schema::NonEmptyString;
     use std::fs;
 
+    #[test]
+    fn empty_sqlite_wait_summary_is_unavailable_without_dividing() {
+        let summary = wait_summary(&[0; crate::db::SqliteLatencyBin::ALL.len()], 0);
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.avg_ms, None);
+        assert_eq!(summary.p50_upper_bound_ms, None);
+    }
+
+    #[test]
+    fn unaligned_sufficient_uptime_is_not_fully_covered() {
+        let requested = 60 * 60 * 1_000_000;
+        let covered = requested - 1;
+        assert!(!has_full_sqlite_coverage(covered, requested));
+        let label = format!(
+            "{} covered across {} bucket(s); requested {}m",
+            format_uptime_seconds(covered / 1_000_000),
+            60,
+            60
+        );
+        assert_eq!(label, "59m 59s covered across 60 bucket(s); requested 60m");
+    }
+
     fn loc(path: PathBuf, mode: MeasureMode) -> DiskLocation {
         DiskLocation {
             category: DiskCategory::DataDirectory,
@@ -1157,6 +1630,9 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
+                    .unwrap(),
             slug: Some(format!("slug-{id}")),
             title: Some(format!("Title {id}")),
             cwd: "/tmp".to_string(),

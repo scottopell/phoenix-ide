@@ -24,12 +24,15 @@ struct SourceSnapshotTestBarrier {
     release: tokio::sync::Notify,
 }
 
-use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase, SqliteTelemetry};
+use crate::sqlite_telemetry::{
+    ParentSqliteObserver, SqliteOperation, SqlitePhase, SqliteTelemetry,
+};
+use crate::sqlite_workload::{SqliteAccessKind, SqliteWorkloadCategory, SqliteWorkloadCollector};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{Message, MessageType};
 use phoenix_core::domain::message_text::index_text;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Connection, Row, SqlitePool};
 use thiserror::Error;
 
 /// Which conversations a retrieval may draw from. The *only* axis separating
@@ -249,6 +252,7 @@ pub enum FtsMessageReconcileOutcome {
 pub struct Fts5Retriever {
     pool: SqlitePool,
     reconciled: Arc<AtomicBool>,
+    sqlite_workload_collector: SqliteWorkloadCollector,
     #[cfg(test)]
     source_snapshot_test_barrier: Option<Arc<SourceSnapshotTestBarrier>>,
 }
@@ -257,10 +261,11 @@ impl Fts5Retriever {
     /// Build a retriever over the given pool. Call [`Self::reconcile`] once at
     /// startup to bring the index in line with `messages`.
     #[must_use]
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, sqlite_workload_collector: SqliteWorkloadCollector) -> Self {
         Self {
             pool,
             reconciled: Arc::new(AtomicBool::new(false)),
+            sqlite_workload_collector,
             #[cfg(test)]
             source_snapshot_test_barrier: None,
         }
@@ -431,7 +436,14 @@ impl Fts5Retriever {
             return Ok(FtsMessageReconcileOutcome::Unchanged);
         }
         Ok(
-            if fts_reconcile_upsert(&self.pool, &message, &existing_rows).await? {
+            if fts_reconcile_upsert(
+                &self.pool,
+                &message,
+                &existing_rows,
+                self.sqlite_workload_collector.clone(),
+            )
+            .await?
+            {
                 if existing_rows.is_empty() {
                     FtsMessageReconcileOutcome::Indexed
                 } else {
@@ -734,50 +746,95 @@ impl MessageRetriever for Fts5Retriever {
 
 // ---- index maintenance (called by `Database` write paths) ----
 
+fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
+    match error {
+        crate::DbError::Sqlx(error) => error,
+        crate::DbError::ConversationNotFound(_)
+        | crate::DbError::ConversationAlreadyExists(_)
+        | crate::DbError::MessageNotFound(_)
+        | crate::DbError::SlugExists(_)
+        | crate::DbError::Serialization(_)
+        | crate::DbError::ContinuationPrecondition(_)
+        | crate::DbError::CloseFoundationConflict(_)
+        | crate::DbError::CloseFoundationPrecondition(_)
+        | crate::DbError::CloseFoundationRepairRequired(_)
+        | crate::DbError::CloseFoundationNotFound(_)
+        | crate::DbError::DirectTurnConflict(_)
+        | crate::DbError::ForkProposalConflict(_)
+        | crate::DbError::GitRepositoryWorkScopeProjectConflict { .. }
+        | crate::DbError::DormantGitRepositoryCatchupPermitTargetMismatch
+        | crate::DbError::DormantGitRepositoryCatchupStaleOperation
+        | crate::DbError::DormantGitRepositoryCatchupBlockedByReadinessClaim
+        | crate::DbError::DormantGitRepositoryReadinessCatchupInProgress
+        | crate::DbError::DormantGitRepositoryReadinessReceiptTargetMismatch
+        | crate::DbError::DormantGitRepositoryReadinessReceiptOperationMismatch => {
+            unreachable!("retrieval telemetry closure only returns SQLx errors")
+        }
+    }
+}
+
 /// (Re)index a single message: replace any existing index row(s) for its id
 /// with a fresh extraction. Idempotent for a given message content.
 ///
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
-pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
-    let mut tx = telemetry
-        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+pub async fn fts_upsert(
+    pool: &SqlitePool,
+    message: &Message,
+    collector: SqliteWorkloadCollector,
+) -> Result<(), sqlx::Error> {
+    let telemetry = SqliteTelemetry::with_collector(
+        SqliteOperation::FtsUpsert,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+        collector,
+    );
+    let (mut connection, pool_timing) = telemetry
+        .observe_pool_acquisition_sqlx(pool.acquire())
         .await?;
-    fts_upsert_conn_with_telemetry(&mut tx, message, &telemetry).await?;
+    let (mut tx, transaction_timing) = telemetry
+        .observe_transaction_admission_db(pool_timing, async {
+            Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+        })
+        .await
+        .map_err(sqlx_from_db_error)?;
+    fts_upsert_conn(&mut tx, message, FtsObservation::Standalone(&telemetry)).await?;
     telemetry
-        .observe_sqlx(SqlitePhase::Commit, tx.commit())
-        .await?;
+        .observe_commit_db(transaction_timing, async { Ok(tx.commit().await?) })
+        .await
+        .map_err(sqlx_from_db_error)?;
     Ok(())
 }
 
-/// Replace a message's index row(s) using a caller-provided connection or
-/// transaction, so the index write commits **atomically with the source
-/// write** (REQ-RET-003). The delete+insert pair is two statements; running
-/// them on one connection keeps them in the caller's transaction, so a
-/// concurrent upsert of the same `message_id` cannot interleave into duplicate
-/// rows (`SQLite` serializes write transactions).
-///
-/// # Errors
-/// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
-pub async fn fts_upsert_conn(
-    conn: &mut sqlx::SqliteConnection,
-    message: &Message,
-) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsUpsert);
-    fts_upsert_conn_with_telemetry(conn, message, &telemetry).await
+#[derive(Clone, Copy)]
+pub(crate) enum FtsObservation<'a> {
+    Standalone(&'a SqliteTelemetry),
+    ParentTransaction(ParentSqliteObserver<'a>),
 }
 
-pub(crate) async fn fts_upsert_conn_with_telemetry(
+impl FtsObservation<'_> {
+    async fn observe<T>(
+        self,
+        phase: SqlitePhase,
+        operation: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        match self {
+            Self::Standalone(telemetry) => telemetry.observe_sqlx(phase, operation).await,
+            Self::ParentTransaction(observer) => observer.observe(phase, operation).await,
+        }
+    }
+}
+
+pub(crate) async fn fts_upsert_conn(
     conn: &mut sqlx::SqliteConnection,
     message: &Message,
-    telemetry: &SqliteTelemetry,
+    observation: FtsObservation<'_>,
 ) -> Result<(), sqlx::Error> {
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    delete_message_rows(conn, &message.message_id, telemetry).await?;
-    let inserted = telemetry
-        .observe_sqlx(
+    delete_message_rows(conn, &message.message_id, observation).await?;
+    let inserted = observation
+        .observe(
             SqlitePhase::FtsInsert,
             sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
                 .bind(text)
@@ -789,7 +846,7 @@ pub(crate) async fn fts_upsert_conn_with_telemetry(
         inserted.last_insert_rowid(),
         message,
         &fingerprint,
-        telemetry,
+        observation,
     )
     .await?;
     Ok(())
@@ -798,10 +855,10 @@ pub(crate) async fn fts_upsert_conn_with_telemetry(
 async fn delete_message_rows(
     conn: &mut sqlx::SqliteConnection,
     message_id: &str,
-    telemetry: &SqliteTelemetry,
+    observation: FtsObservation<'_>,
 ) -> Result<(), sqlx::Error> {
-    let rowids: Vec<i64> = telemetry
-        .observe_sqlx(
+    let rowids: Vec<i64> = observation
+        .observe(
             SqlitePhase::LocatorLookup,
             sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = ?1")
                 .bind(message_id)
@@ -809,8 +866,8 @@ async fn delete_message_rows(
         )
         .await?;
     for rowid in rowids {
-        telemetry
-            .observe_sqlx(
+        observation
+            .observe(
                 SqlitePhase::FtsRowDelete,
                 sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
                     .bind(rowid)
@@ -818,8 +875,8 @@ async fn delete_message_rows(
             )
             .await?;
     }
-    telemetry
-        .observe_sqlx(
+    observation
+        .observe(
             SqlitePhase::LocatorDelete,
             sqlx::query("DELETE FROM message_fts_rows WHERE message_id = ?1")
                 .bind(message_id)
@@ -834,10 +891,10 @@ async fn record_fts_row(
     fts_rowid: i64,
     message: &Message,
     fingerprint: &str,
-    telemetry: &SqliteTelemetry,
+    observation: FtsObservation<'_>,
 ) -> Result<(), sqlx::Error> {
-    telemetry
-        .observe_sqlx(
+    observation
+        .observe(
             SqlitePhase::LocatorInsert,
             sqlx::query(
                 "INSERT INTO message_fts_rows
@@ -878,17 +935,30 @@ pub struct FtsLocatorWitness {
 ///
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if a query fails.
+#[allow(clippy::too_many_lines)] // one transaction validates and replaces one witnessed index generation
 pub async fn fts_reconcile_upsert(
     pool: &SqlitePool,
     message: &Message,
     observed: &[FtsLocatorWitness],
+    collector: SqliteWorkloadCollector,
 ) -> Result<bool, sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsReconcileUpsert);
+    let telemetry = SqliteTelemetry::with_collector(
+        SqliteOperation::FtsReconcileUpsert,
+        SqliteWorkloadCategory::Fts,
+        SqliteAccessKind::Write,
+        collector,
+    );
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    let mut tx = telemetry
-        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
+    let (mut connection, pool_timing) = telemetry
+        .observe_pool_acquisition_sqlx(pool.acquire())
         .await?;
+    let (mut tx, transaction_timing) = telemetry
+        .observe_transaction_admission_db(pool_timing, async {
+            Ok(connection.begin_with("BEGIN IMMEDIATE").await?)
+        })
+        .await
+        .map_err(sqlx_from_db_error)?;
     if observed.is_empty() {
         let existing: i64 = telemetry
             .observe_sqlx(
@@ -899,7 +969,10 @@ pub async fn fts_reconcile_upsert(
             )
             .await?;
         if existing > 0 {
-            tx.rollback().await?;
+            telemetry
+                .observe_rollback_db(transaction_timing, async { Ok(tx.rollback().await?) })
+                .await
+                .map_err(sqlx_from_db_error)?;
             return Ok(false);
         }
     } else {
@@ -926,7 +999,10 @@ pub async fn fts_reconcile_upsert(
             )
             .await?;
         if current != observed || current.iter().any(|entry| !entry.physical_match) {
-            tx.rollback().await?;
+            telemetry
+                .observe_rollback_db(transaction_timing, async { Ok(tx.rollback().await?) })
+                .await
+                .map_err(sqlx_from_db_error)?;
             return Ok(false);
         }
         for entry in &current {
@@ -939,7 +1015,10 @@ pub async fn fts_reconcile_upsert(
                 )
                 .await?;
             if deleted.rows_affected() != 1 {
-                tx.rollback().await?;
+                telemetry
+                    .observe_rollback_db(transaction_timing, async { Ok(tx.rollback().await?) })
+                    .await
+                    .map_err(sqlx_from_db_error)?;
                 return Ok(false);
             }
             telemetry
@@ -965,24 +1044,30 @@ pub async fn fts_reconcile_upsert(
         inserted.last_insert_rowid(),
         message,
         &fingerprint,
-        &telemetry,
+        FtsObservation::Standalone(&telemetry),
     )
     .await?;
     telemetry
-        .observe_sqlx(SqlitePhase::Commit, tx.commit())
-        .await?;
+        .observe_commit_db(transaction_timing, async { Ok(tx.commit().await?) })
+        .await
+        .map_err(sqlx_from_db_error)?;
     Ok(true)
 }
 
 pub(crate) async fn fts_index_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
-    telemetry: &SqliteTelemetry,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id, telemetry).await?;
+    delete_message_rows(
+        tx,
+        &message.message_id,
+        FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
     let text = index_text(message);
-    let inserted = telemetry
-        .observe_sqlx(
+    let inserted = observer
+        .observe(
             SqlitePhase::FtsInsert,
             sqlx::query("INSERT INTO message_fts (text) VALUES (?1)")
                 .bind(&text)
@@ -994,7 +1079,7 @@ pub(crate) async fn fts_index_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(&text),
-        telemetry,
+        FtsObservation::ParentTransaction(observer),
     )
     .await
 }
@@ -1002,11 +1087,16 @@ pub(crate) async fn fts_index_message_tx(
 pub(crate) async fn fts_hide_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message: &Message,
-    telemetry: &SqliteTelemetry,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
-    delete_message_rows(tx, &message.message_id, telemetry).await?;
-    let inserted = telemetry
-        .observe_sqlx(
+    delete_message_rows(
+        tx,
+        &message.message_id,
+        FtsObservation::ParentTransaction(observer),
+    )
+    .await?;
+    let inserted = observer
+        .observe(
             SqlitePhase::FtsInsert,
             sqlx::query("INSERT INTO message_fts (text) VALUES ('')").execute(&mut **tx),
         )
@@ -1016,79 +1106,24 @@ pub(crate) async fn fts_hide_message_tx(
         inserted.last_insert_rowid(),
         message,
         &content_fingerprint(""),
-        telemetry,
+        FtsObservation::ParentTransaction(observer),
     )
     .await
 }
 
-/// Remove all index rows for one message id.
-///
-/// # Errors
-/// Returns the underlying [`sqlx::Error`] if the delete fails.
-pub async fn fts_delete_message(pool: &SqlitePool, message_id: &str) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteMessage);
-    let mut tx = telemetry
-        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
-        .await?;
-    delete_message_rows(&mut tx, message_id, &telemetry).await?;
-    telemetry
-        .observe_sqlx(SqlitePhase::Commit, tx.commit())
-        .await?;
-    Ok(())
-}
-
-/// Remove all index rows for a conversation (used on hard delete, since the
-/// standalone FTS table has no FK cascade — REQ-RET-003).
-///
-/// # Errors
-/// Returns the underlying [`sqlx::Error`] if the delete fails.
-pub async fn fts_delete_conversation(
-    pool: &SqlitePool,
-    conversation_id: &str,
-) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
-    let mut tx = telemetry
-        .observe_sqlx(SqlitePhase::TransactionAcquisition, pool.begin())
-        .await?;
-    fts_delete_conversation_conn_with_telemetry(&mut tx, conversation_id, &telemetry).await?;
-    telemetry
-        .observe_sqlx(SqlitePhase::Commit, tx.commit())
-        .await?;
-    Ok(())
-}
-
-/// Remove all index rows for a conversation using a caller-provided
-/// connection/transaction, so the index prune commits atomically with the
-/// conversation/message delete — deleted content cannot resurface in recall
-/// even if the process crashes between the source delete and the prune
-/// (REQ-RET-003).
-///
-/// # Errors
-/// Returns the underlying [`sqlx::Error`] if the delete fails.
-pub async fn fts_delete_conversation_conn(
+pub(crate) async fn fts_delete_conversation_conn(
     conn: &mut sqlx::SqliteConnection,
     conversation_id: &str,
+    observer: ParentSqliteObserver<'_>,
 ) -> Result<(), sqlx::Error> {
-    let telemetry = SqliteTelemetry::new(SqliteOperation::FtsDeleteConversation);
-    fts_delete_conversation_conn_with_telemetry(conn, conversation_id, &telemetry).await
-}
-
-pub(crate) async fn fts_delete_conversation_conn_with_telemetry(
-    conn: &mut sqlx::SqliteConnection,
-    conversation_id: &str,
-    telemetry: &SqliteTelemetry,
-) -> Result<(), sqlx::Error> {
-    let rowids: Vec<i64> = telemetry
-        .observe_sqlx(
-            SqlitePhase::LocatorLookup,
-            sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
-                .bind(conversation_id)
-                .fetch_all(&mut *conn),
-        )
-        .await?;
+    let rowids: Vec<i64> =
+        sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE conversation_id = ?1")
+            .bind(conversation_id)
+            .fetch_all(&mut *conn)
+            .await?;
     for rowid in rowids {
-        telemetry
-            .observe_sqlx(
+        observer
+            .observe(
                 SqlitePhase::FtsRowDelete,
                 sqlx::query("DELETE FROM message_fts WHERE rowid = ?1")
                     .bind(rowid)
@@ -1096,8 +1131,8 @@ pub(crate) async fn fts_delete_conversation_conn_with_telemetry(
             )
             .await?;
     }
-    telemetry
-        .observe_sqlx(
+    observer
+        .observe(
             SqlitePhase::LocatorDelete,
             sqlx::query("DELETE FROM message_fts_rows WHERE conversation_id = ?1")
                 .bind(conversation_id)
@@ -1362,6 +1397,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_fts_upsert_records_exact_shared_collector_outcomes() {
+        let db = seed().await;
+        let message = Message {
+            message_id: "fts-outcome".to_string(),
+            conversation_id: "c-a".to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("shared collector outcome"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let before = db.sqlite_workload_aggregate_report(
+            crate::SqliteSnapshotWindow::OneHour,
+            crate::sqlite_workload::unix_now_micros(),
+        );
+
+        fts_upsert(db.pool(), &message, db.sqlite_workload_collector.clone())
+            .await
+            .unwrap();
+        let after_success = db.sqlite_workload_aggregate_report(
+            crate::SqliteSnapshotWindow::OneHour,
+            crate::sqlite_workload::unix_now_micros(),
+        );
+        let write = SqliteAccessKind::Write.index();
+        let fts = SqliteWorkloadCategory::Fts.index();
+        assert_eq!(
+            after_success.outcomes[write][fts][crate::SqliteOutcome::Success.index()],
+            before.outcomes[write][fts][crate::SqliteOutcome::Success.index()] + 1,
+        );
+        assert_eq!(
+            crate::sqlite_workload::operation_count(&after_success.outcomes[write][fts]),
+            crate::sqlite_workload::operation_count(&before.outcomes[write][fts]) + 1,
+        );
+
+        sqlx::query("DROP TABLE message_fts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        fts_upsert(db.pool(), &message, db.sqlite_workload_collector.clone())
+            .await
+            .unwrap_err();
+        let after_failure = db.sqlite_workload_aggregate_report(
+            crate::SqliteSnapshotWindow::OneHour,
+            crate::sqlite_workload::unix_now_micros(),
+        );
+        assert_eq!(
+            crate::sqlite_workload::operation_count(&after_failure.outcomes[write][fts]),
+            crate::sqlite_workload::operation_count(&after_success.outcomes[write][fts]) + 1,
+        );
+        assert_eq!(
+            after_failure.outcomes[write][fts][crate::SqliteOutcome::OtherFailure.index()],
+            after_success.outcomes[write][fts][crate::SqliteOutcome::OtherFailure.index()] + 1,
+        );
+    }
+
+    #[tokio::test]
     async fn indexes_on_insert_and_retrieves_in_scope() {
         let db = seed().await;
         db.add_message(
@@ -1383,7 +1475,7 @@ mod tests {
         .await
         .unwrap();
 
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         // Global finds the rate-limiter message.
         let hits = r
@@ -1437,7 +1529,7 @@ mod tests {
         .await
         .unwrap();
 
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         assert_eq!(
             retriever
                 .retrieve(global_request("confidential recovery"))
@@ -1470,7 +1562,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert_eq!(r.retrieve(global_request("alpha")).await.unwrap().len(), 1);
 
         db.update_tool_message_content("t1", "compiling crate omega")
@@ -1497,7 +1589,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert_eq!(r.retrieve(global_request("zebra")).await.unwrap().len(), 1);
 
         db.delete_conversation("c-a").await.unwrap();
@@ -1520,7 +1612,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         // Simulate a stale index: wipe it, plus inject an orphan row.
         sqlx::query("DELETE FROM message_fts")
@@ -1570,7 +1662,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let plan = r.discover_reconcile_plan().await.unwrap();
 
@@ -1598,7 +1690,7 @@ mod tests {
         .await
         .unwrap();
 
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert!(r.reconcile().await.is_err());
         let physical: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE rowid = ?1")
             .bind(orphan)
@@ -1692,7 +1784,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut retriever = Fts5Retriever::new(db.pool().clone());
+        let mut retriever = db.fts_retriever();
         let stale_message =
             Fts5Retriever::messages(retriever.discover_reconcile_plan().await.unwrap())
                 .into_iter()
@@ -1718,7 +1810,7 @@ mod tests {
             reconcile.await.unwrap().unwrap(),
             FtsMessageReconcileOutcome::Unchanged
         ));
-        let verifier = Fts5Retriever::new(db.pool().clone());
+        let verifier = db.fts_retriever();
         assert!(verifier
             .retrieve(global_request("visible stale plan token"))
             .await
@@ -1763,6 +1855,7 @@ mod tests {
                 content_hash: stale_hash,
                 physical_match: true,
             }],
+            db.sqlite_workload_collector.clone(),
         )
         .await
         .unwrap());
@@ -1822,10 +1915,14 @@ mod tests {
             .unwrap();
 
         // add_message already indexed once; upsert the same message twice more.
-        fts_upsert(db.pool(), &msg).await.unwrap();
-        fts_upsert(db.pool(), &msg).await.unwrap();
+        fts_upsert(db.pool(), &msg, db.sqlite_workload_collector.clone())
+            .await
+            .unwrap();
+        fts_upsert(db.pool(), &msg, db.sqlite_workload_collector.clone())
+            .await
+            .unwrap();
 
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         let hits = r.retrieve(global_request("kangaroo")).await.unwrap();
         assert_eq!(hits.len(), 1, "repeated upsert must not duplicate the row");
     }
@@ -1842,7 +1939,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest {
@@ -1874,7 +1971,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         retriever.reconcile().await.unwrap();
 
         for query in ["runni", "optimizatio", "skie"] {
@@ -1908,7 +2005,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         retriever.reconcile().await.unwrap();
 
         let hits = retriever
@@ -1947,7 +2044,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         retriever.reconcile().await.unwrap();
 
         let hits = retriever
@@ -1976,7 +2073,7 @@ mod tests {
         db.add_message("m1", "c1", &MessageContent::user(&long_token), None, None)
             .await
             .unwrap();
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         retriever.reconcile().await.unwrap();
 
         let hits = retriever
@@ -2012,7 +2109,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let retriever = Fts5Retriever::new(db.pool().clone());
+        let retriever = db.fts_retriever();
         retriever.reconcile().await.unwrap();
 
         for (query, expected) in [("übe", "c-case"), ("eco", "c-diacritic")] {
@@ -2037,7 +2134,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest::natural_language(
@@ -2081,7 +2178,7 @@ mod tests {
         .await
         .unwrap();
         db.archive_conversation("c-b").await.unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest {
@@ -2131,7 +2228,7 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest {
@@ -2179,7 +2276,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest {
@@ -2283,7 +2380,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
 
         let hits = r
             .retrieve(RetrievalRequest {
@@ -2306,7 +2403,7 @@ mod tests {
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
             .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert!(
             r.is_fresh_for(&["c-a".into()]).await.unwrap(),
             "all messages indexed and fresh",
@@ -2355,7 +2452,7 @@ mod tests {
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
             .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         let rowid: i64 =
             sqlx::query_scalar("SELECT fts_rowid FROM message_fts_rows WHERE message_id = 'm1'")
                 .fetch_one(db.pool())
@@ -2376,7 +2473,7 @@ mod tests {
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
             .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert!(r.is_fresh_for(&["c-a".into()]).await.unwrap());
 
         // Orphan: an index row in this conversation with no live source message
@@ -2396,7 +2493,7 @@ mod tests {
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
             .unwrap();
-        let r = Fts5Retriever::new(db.pool().clone());
+        let r = db.fts_retriever();
         assert!(r.is_fresh_for(&["c-a".into()]).await.unwrap());
 
         // A second physical row for the same live message_id carrying the same

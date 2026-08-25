@@ -433,6 +433,7 @@ pub struct CompleteScheduleOccurrenceInput {
 #[derive(Debug, Clone)]
 pub struct WorkflowRepository {
     pool: SqlitePool,
+    sqlite_workload_collector: Option<crate::SqliteWorkloadCollector>,
 }
 
 impl WorkflowRepository {
@@ -444,6 +445,23 @@ impl WorkflowRepository {
         Ok(WorkflowTx::new(
             self.pool.begin_with("BEGIN IMMEDIATE").await?,
         ))
+    }
+
+    pub(crate) fn sqlite_telemetry(
+        &self,
+        operation: crate::sqlite_telemetry::SqliteOperation,
+    ) -> crate::sqlite_telemetry::SqliteTelemetry {
+        self.sqlite_workload_collector.as_ref().map_or_else(
+            || crate::sqlite_telemetry::SqliteTelemetry::new(operation),
+            |collector| {
+                crate::sqlite_telemetry::SqliteTelemetry::with_collector(
+                    operation,
+                    crate::SqliteWorkloadCategory::DurableWorkflows,
+                    crate::SqliteAccessKind::Write,
+                    collector.clone(),
+                )
+            },
+        )
     }
 }
 
@@ -474,7 +492,7 @@ pub(crate) struct WorkflowTx<'a> {
 }
 
 impl<'a> WorkflowTx<'a> {
-    fn new(tx: SqliteTx<'a>) -> Self {
+    pub(crate) fn new(tx: SqliteTx<'a>) -> Self {
         Self { tx }
     }
 
@@ -1286,7 +1304,20 @@ async fn workflow_profile_kind(
 impl WorkflowRepository {
     #[must_use]
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            sqlite_workload_collector: None,
+        }
+    }
+
+    pub(crate) fn with_sqlite_workload_collector(
+        pool: SqlitePool,
+        sqlite_workload_collector: crate::SqliteWorkloadCollector,
+    ) -> Self {
+        Self {
+            pool,
+            sqlite_workload_collector: Some(sqlite_workload_collector),
+        }
     }
 
     #[must_use]

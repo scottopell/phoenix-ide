@@ -257,7 +257,7 @@ describe('ConversationRow — cached PR badge', () => {
     expect(document.querySelector('[data-id="leaf-id"] .sidebar-pr-badge')).not.toBeNull();
   });
 
-  it('does not render non-latest chain member PR badges when the member row is expanded', () => {
+  it('does not render non-latest chain member PR badges', () => {
     const root = makeConv('root-id', 'root-slug', {
       continued_in_conv_id: 'leaf-id',
       updated_at: '2024-01-01T00:00:00Z',
@@ -278,12 +278,7 @@ describe('ConversationRow — cached PR badge', () => {
       </MemoryRouter>,
     );
 
-    const rootMenuButton = document.querySelector(
-      '[data-id="root-id"] .conv-item-menu-btn',
-    ) as HTMLButtonElement;
-    fireEvent.click(rootMenuButton);
-
-    expect(document.querySelector('[data-id="root-id"]')).toHaveClass('expanded');
+    expect(document.querySelector('[data-id="root-id"] .conv-item-menu-btn')).toBeNull();
     expect(document.querySelector('[data-id="root-id"] .sidebar-pr-badge')).toBeNull();
     expect(document.querySelectorAll('.sidebar-pr-badge')).toHaveLength(1);
   });
@@ -561,7 +556,7 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     expect(container.querySelectorAll('.conv-item-chain-member').length).toBe(2);
   });
 
-  it('clicking the chain name navigates to /chains/:rootId', () => {
+  it('visible aggregate title opens the retained compatibility route on desktop', () => {
     const root = makeConv('myroot', 'r', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leaf',
@@ -685,117 +680,53 @@ describe('Chain lifecycle UI (task 02701)', () => {
     return [leaf, root];
   };
 
-  it('chain header ⋮ menu shows Rename / Archive / Delete in the active list', () => {
-    const onArchiveChain = vi.fn();
-    const onDeleteChain = vi.fn();
-
+  it('keeps one grouped history projection without first-class Chain links or actions', () => {
     const { container } = render(
       <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={chainConvs()}
-          onArchiveChain={onArchiveChain}
-          onDeleteChain={onDeleteChain}
-        />
+        <ConversationList {...defaultProps} conversations={chainConvs()} />
       </MemoryRouter>,
     );
 
-    const menuBtn = container.querySelector(
-      '.conv-chain-menu-btn',
-    ) as HTMLButtonElement;
-    expect(menuBtn).not.toBeNull();
-    fireEvent.click(menuBtn);
-
-    const actions = container.querySelector('.conv-chain-actions');
-    expect(actions).not.toBeNull();
-    const labels = Array.from(
-      actions!.querySelectorAll<HTMLButtonElement>('.action-btn'),
-    ).map((b) => b.textContent?.trim());
-    expect(labels).toEqual([
-      'Rename chain…',
-      'Archive chain',
-      'Delete chain',
-    ]);
+    expect(container.querySelectorAll('.conv-chain-block')).toHaveLength(1);
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('auth refactor');
+    expect(container.querySelector('.conv-chain-menu-btn')).toBeNull();
+    expect(container.querySelector('[href^="/chains/"]')).toBeNull();
   });
 
-  it('chain header ⋮ menu omits any unarchive affordance in the archived list', () => {
+  it.each([
+    { surface: 'active desktop', listDensity: 'full' as const, showArchived: false },
+    { surface: 'active mobile', listDensity: 'mobile' as const, showArchived: false },
+    { surface: 'history', listDensity: 'full' as const, showArchived: true },
+  ])('hides every row-level mutation for linked members on $surface', ({ listDensity, showArchived }) => {
+    const linked = chainConvs({
+      archived: showArchived,
+      ...(listDensity === 'mobile' ? { presentation_mode: 'wait_input' as const } : {}),
+    });
     const { container } = render(
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
-          conversations={[]}
-          archivedConversations={chainConvs({ archived: true })}
-          showArchived
+          listDensity={listDensity}
+          conversations={showArchived ? [] : linked}
+          archivedConversations={showArchived ? linked : []}
+          showArchived={showArchived}
         />
       </MemoryRouter>,
     );
 
-    const menuBtn = container.querySelector(
-      '.conv-chain-menu-btn',
-    ) as HTMLButtonElement;
-    fireEvent.click(menuBtn);
+    if (listDensity === 'mobile' && container.querySelectorAll('.conv-item-chain-member').length === 0) {
+      fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    }
 
-    const labels = Array.from(
-      container.querySelectorAll<HTMLButtonElement>(
-        '.conv-chain-actions .action-btn',
-      ),
-    ).map((b) => b.textContent?.trim());
-    // Archive is terminal — no Archive/Unarchive entry on archived chains.
-    expect(labels).toEqual([
-      'Rename chain…',
-      'Delete chain',
-    ]);
-  });
-
-  it('Archive chain action invokes onArchiveChain with the rootId', () => {
-    const onArchiveChain = vi.fn();
-    const { container } = render(
-      <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={chainConvs()}
-          onArchiveChain={onArchiveChain}
-        />
-      </MemoryRouter>,
-    );
-
-    fireEvent.click(container.querySelector('.conv-chain-menu-btn')!);
-    const archiveBtn = Array.from(
-      container.querySelectorAll<HTMLButtonElement>(
-        '.conv-chain-actions .action-btn',
-      ),
-    ).find((b) => b.textContent?.trim() === 'Archive chain');
-    fireEvent.click(archiveBtn!);
-
-    expect(onArchiveChain).toHaveBeenCalledTimes(1);
-    expect(onArchiveChain).toHaveBeenCalledWith('cr');
-  });
-
-  it('chain member row dropdown shows only Rename', () => {
-    const { container } = render(
-      <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={chainConvs()}
-        />
-      </MemoryRouter>,
-    );
-
-    const memberRow = container.querySelector(
-      '.conv-item-chain-member',
-    ) as HTMLElement;
-    expect(memberRow).not.toBeNull();
-    const rowMenuBtn = memberRow.querySelector(
-      '.conv-item-menu-btn',
-    ) as HTMLButtonElement;
-    fireEvent.click(rowMenuBtn);
-
-    const labels = Array.from(
-      memberRow.querySelectorAll<HTMLButtonElement>(
-        '.conv-item-actions .action-btn',
-      ),
-    ).map((b) => b.textContent?.trim());
-    expect(labels).toEqual(['Rename']);
+    const memberRows = container.querySelectorAll('.conv-item-chain-member');
+    expect(memberRows).toHaveLength(2);
+    for (const memberRow of memberRows) {
+      expect(memberRow.querySelector('.conv-item-menu-btn')).toBeNull();
+      expect(memberRow.querySelector('.conv-item-actions')).toBeNull();
+      expect(memberRow).not.toHaveTextContent('Rename');
+      expect(memberRow).not.toHaveTextContent('Archive');
+      expect(memberRow).not.toHaveTextContent('Delete');
+    }
   });
 
   it('standalone row dropdown still shows Rename / Archive / Delete', () => {
@@ -817,21 +748,29 @@ describe('Chain lifecycle UI (task 02701)', () => {
     expect(labels).toEqual(['Rename', 'Archive', 'Delete']);
   });
 
-  it('archived list groups chains the same as the active list', () => {
+  it('archived history title opens the retained compatibility route', () => {
+    const onPath = vi.fn();
     const { container } = render(
-      <MemoryRouter>
-        <ConversationList
-          {...defaultProps}
-          conversations={[]}
-          archivedConversations={chainConvs({ archived: true })}
-          showArchived
-        />
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="*" element={(
+            <>
+              <ConversationList
+                {...defaultProps}
+                conversations={[]}
+                archivedConversations={chainConvs({ archived: true })}
+                showArchived
+              />
+              <PathReader onPath={onPath} />
+            </>
+          )} />
+        </Routes>
       </MemoryRouter>,
     );
-    expect(container.querySelector('.conv-chain-block')).not.toBeNull();
-    expect(
-      container.querySelector('.conv-chain-name-label')!.textContent,
-    ).toBe('auth refactor');
+    expect(container.querySelector('.conv-chain-name-label')).toHaveTextContent('auth refactor');
+    fireEvent.click(container.querySelector('.conv-chain-name')!);
+    const calls = onPath.mock.calls;
+    expect(calls[calls.length - 1]![0]).toBe('/chains/cr');
   });
 });
 
@@ -970,7 +909,7 @@ describe('Mobile conversation list redesign', () => {
     expect(secondary).toContainElement(time);
   });
 
-  it('defaults mobile chains to a compact summary with separate chain and latest-conversation targets', () => {
+  it('defaults mobile continuation history to a compact latest-conversation target', () => {
     const root = makeConv('root-id', 'root-slug', {
       updated_at: '2024-01-01T00:00:00Z',
       continued_in_conv_id: 'leaf-id',
@@ -1006,6 +945,7 @@ describe('Mobile conversation list redesign', () => {
     );
 
     expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelector('.conv-chain-name-label')).toHaveTextContent('mobile chain');
     expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
     const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
     expect(summary).not.toBeNull();
@@ -1431,17 +1371,12 @@ describe('ChainBlock — React.memo behaviour', () => {
     return {
       item: buildItem(),
       collapsed: false,
-      isMenuOpen: false,
       expandedRowId: null,
       keyboardSelectedId: null,
       activeSlug: null,
       listDensity: 'full',
       showArchived: false,
       onToggleCollapsed: vi.fn(),
-      onToggleChainMenu: vi.fn(),
-      onCloseChainMenu: vi.fn(),
-      onArchiveChain: vi.fn(),
-      onDeleteChain: vi.fn(),
       onRowClick: vi.fn(),
       onRowToggleMenu: vi.fn(),
       onArchive: vi.fn(),
@@ -1449,7 +1384,6 @@ describe('ChainBlock — React.memo behaviour', () => {
       onRename: vi.fn(),
       onCloseRowMenu: vi.fn(),
       rowMenuRef: undefined,
-      chainMenuRef: undefined,
       ...overrides,
     };
   }

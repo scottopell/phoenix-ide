@@ -320,7 +320,9 @@ pub(crate) async fn abandon_task(
             "task abandonment rejected after fatal local authority closure".to_string(),
         )
     })?;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -624,7 +626,9 @@ pub(crate) async fn mark_merged(
 ) -> Result<Json<SuccessResponse>, AppError> {
     let admission = state.runtime.conversation_admission(&id).await;
     let _admission = admission.lock().await;
-    if phoenix_db::workflow::wake::WakeRepository::new(state.db.pool().clone())
+    if state
+        .db
+        .wake_repository()
         .has_owed_work_for_conversation(&id)
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
@@ -753,6 +757,9 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: id.to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(id)
+                    .unwrap(),
             slug: Some(format!("slug-{id}")),
             title: Some(format!("Title {id}")),
             cwd: "/tmp/work".to_string(),

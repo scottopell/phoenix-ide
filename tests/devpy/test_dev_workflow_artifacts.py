@@ -64,6 +64,111 @@ class DevWorkflowArtifactTests(unittest.TestCase):
         build.assert_called_once_with()
         start.assert_called_once_with(port=8041, release=False, tls=False)
 
+    def test_doctor_probe_runs_in_requested_directory_and_handles_launch_errors(self):
+        with mock.patch.object(self.dev.subprocess, "run", side_effect=PermissionError("denied")) as run:
+            ok, detail = self.dev._doctor_version(["pnpm", "--version"], cwd=self.dev.UI_DIR)
+
+        self.assertFalse(ok)
+        self.assertIn("cannot execute", detail)
+        self.assertEqual(self.dev.UI_DIR, run.call_args.kwargs["cwd"])
+
+    def test_doctor_probe_matches_required_line_across_multiline_output(self):
+        completed = self.dev.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="stable\nx86_64-unknown-linux-musl\n", stderr="",
+        )
+        with mock.patch.object(self.dev.subprocess, "run", return_value=completed):
+            ok, _detail = self.dev._doctor_version(
+                ["rustup", "target", "list"],
+                required_line="x86_64-unknown-linux-musl",
+            )
+        self.assertTrue(ok)
+
+    def test_doctor_honors_explicit_chrome_executable(self):
+        chrome = Path("/custom/Google Chrome")
+        versions = {
+            "node": (True, "v26.0.0"),
+            "corepack": (True, "0.35.0"),
+            "pnpm": (True, "11.0.8"),
+            "rustup": (True, "rustc 1.95.0 (test)"),
+            "rustc": (True, "rustc 1.95.0 (test)"),
+            "cargo": (True, "cargo 1.95.0"),
+            "allium": (False, "not found"),
+            "rg": (False, "not found"),
+            "ast-grep": (False, "not found"),
+        }
+
+        def probe(command, **_kwargs):
+            if command[0] == "rustup":
+                return (True, "rustc 1.95.0 (test)") if "rustc" in command else (True, "cargo 1.95.0")
+            return versions.get(command[0], (True, "ok"))
+
+        with (
+            mock.patch.dict(self.dev.os.environ, {"PHOENIX_CHROME_EXECUTABLE": str(chrome)}),
+            mock.patch.object(self.dev, "_doctor_version", side_effect=probe),
+            mock.patch.object(Path, "is_file", autospec=True, side_effect=lambda path: path == chrome),
+            mock.patch.object(self.dev.os, "access", return_value=True),
+            mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/strip"),
+        ):
+            results = self.dev.collect_doctor_results()
+
+        browser = next(result for result in results if result.name == "chrome")
+        self.assertTrue(browser.ok)
+        self.assertEqual(str(chrome), browser.detail)
+
+    def test_doctor_pnpm_probe_disables_corepack_network(self):
+        seen_environment = None
+
+        def probe(command, **kwargs):
+            nonlocal seen_environment
+            if command[0] == "pnpm":
+                seen_environment = kwargs["env"]
+            return True, {
+                "node": "v26.0.0",
+                "corepack": "0.35.0",
+                "pnpm": "11.0.8",
+                "rustup": "rustc 1.95.0 (test)" if "rustc" in command else "cargo 1.95.0",
+                "cargo": "cargo 1.95.0",
+            }.get(command[0], "ok")
+
+        with (
+            mock.patch.object(self.dev, "_doctor_version", side_effect=probe),
+            mock.patch.object(self.dev, "_find_chromium_binary", return_value=Path("/chrome")),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(self.dev.os, "access", return_value=True),
+            mock.patch.object(self.dev.shutil, "which", return_value="/usr/bin/strip"),
+        ):
+            self.dev.collect_doctor_results()
+
+        self.assertEqual("0", seen_environment["COREPACK_ENABLE_NETWORK"])
+
+    def test_doctor_fails_only_for_missing_required_prerequisites(self):
+        results = [
+            self.dev.DoctorResult("cargo", False, "not found"),
+            self.dev.DoctorResult("allium", False, "not found", required=False),
+        ]
+
+        with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
+            with mock.patch("builtins.print") as output:
+                self.assertFalse(self.dev.cmd_doctor())
+
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("✗ cargo: not found", rendered)
+        self.assertIn("- allium (optional): not found", rendered)
+        self.assertIn("Missing required prerequisites: cargo", rendered)
+
+    def test_doctor_succeeds_when_only_optional_tools_are_missing(self):
+        results = [
+            self.dev.DoctorResult("cargo", True, "cargo 1.95.0"),
+            self.dev.DoctorResult("ast-grep", False, "not found", required=False),
+        ]
+
+        with mock.patch.object(self.dev, "collect_doctor_results", return_value=results):
+            with mock.patch("builtins.print") as output:
+                self.assertTrue(self.dev.cmd_doctor())
+
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("Ready for full local development and deployment checks.", rendered)
+
     def test_chromium_discovery_prefers_native_signed_chrome_over_path_chromium(self):
         signed_chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         path_chromium = Path("/opt/homebrew/bin/chromium")

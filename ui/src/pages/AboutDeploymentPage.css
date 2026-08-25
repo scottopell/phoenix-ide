@@ -272,3 +272,77 @@
   text-align: center;
   padding: 18px 0;
 }
+
+.about-sqlite-toolbar,
+.about-sqlite-window-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.about-sqlite-window-button {
+  padding: 4px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.about-sqlite-window-button--active {
+  border-color: var(--accent-color);
+  color: var(--text-color);
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+}
+
+.about-sqlite-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.about-sqlite-summary__card {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+.about-sqlite-summary__card dt {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.about-sqlite-summary__card dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.about-sqlite-tables {
+  display: grid;
+  gap: 12px;
+}
+
+.about-sqlite-table {
+  width: 100%;
+}
+
+.about-sqlite-table th,
+.about-sqlite-table td {
+  text-align: left;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (width <= 720px) {
+  .about-sqlite-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .about-sqlite-section {
+    overflow-x: auto;
+  }
+}

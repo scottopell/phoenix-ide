@@ -1878,13 +1878,13 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingTaskApproval { .. },
-            ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete { successor_conv_id }),
-        ) => Ok(ParentTransitionResult::new(ParentState::HandedOff {
-            successor_conv_id: successor_conv_id.clone(),
-        })
-        .with_effect(Effect::PersistState)
-        .with_effect(Effect::NotifyStateChange)
-        .with_effect(Effect::notify_agent_done())),
+            ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete { .. }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::NotifyStateChange)
+                .with_effect(Effect::notify_agent_done()),
+        ),
 
         (
             ParentState::AwaitingTaskApproval { .. },
@@ -3660,6 +3660,34 @@ mod tests {
             .position(|effect| matches!(effect, Effect::NotifyAgentDone))
             .expect("turn completion is broadcast");
         assert!(state_change < agent_done);
+    }
+
+    #[test]
+    fn fresh_task_handoff_completion_returns_source_to_idle() {
+        let state = ConvState::AwaitingTaskApproval {
+            task_file: "tasks/12345-p1-ready--review.md".to_string(),
+            title: "Review".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Check the result".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskHandoffComplete {
+                successor_conv_id: "fresh-target".to_string(),
+            },
+        )
+        .expect("task handoff completion transitions");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PersistState)));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyStateChange)));
     }
 
     #[test]
