@@ -2445,6 +2445,7 @@ def cmd_seed(
         desired_base_branch: str | None = None,
         seed_label: str | None = None,
         work_scope_id: str | None = None,
+        product_conversation_id: str | None = None,
     ) -> str:
         mode_kind = str(mode["mode"]).lower()
         state_kind = str(json.loads(state_json)["type"])
@@ -2494,17 +2495,26 @@ def cmd_seed(
                 ),
             )
 
+        product_conversation_id = product_conversation_id or f"product-{conversation_id}"
+        conn.execute(
+            "INSERT OR IGNORE INTO product_conversations ("
+            " id, kind, ordinary_lifecycle"
+            ") VALUES (?, 'ordinary', 'open')",
+            (product_conversation_id,),
+        )
+
         conn.execute(
             "INSERT INTO conversations ("
-            " id, slug, title, parent_conversation_id, user_initiated,"
+            " id, product_conversation_id, slug, title, parent_conversation_id, user_initiated,"
             " state, state_kind, state_updated_at, created_at, updated_at, archived,"
             " model, project_id, desired_base_branch, seed_parent_id, seed_label,"
             " cm_kind, cm_task_id, cm_task_title, cm_next_taskmd_id_hint,"
             " runtime_role, work_scope_id"
-            ") VALUES (?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, ?,"
             " ?, ?, ?, ?, 'user', ?)",
             (
                 conversation_id,
+                product_conversation_id,
                 slug,
                 title,
                 state_json,
@@ -2529,11 +2539,19 @@ def cmd_seed(
         conversation_id: str,
     ) -> str | None:
         row = conn.execute(
-            "SELECT work_scope_id FROM conversations WHERE id = ?",
+            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?",
             (conversation_id,),
         ).fetchone()
         conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        if row is not None:
+            conn.execute(
+                "DELETE FROM product_conversations WHERE id = ?"
+                " AND NOT EXISTS ("
+                "  SELECT 1 FROM conversations WHERE product_conversation_id = ?"
+                " )",
+                (row[1], row[1]),
+            )
         if row is not None and row[0] is not None:
             conn.execute(
                 "DELETE FROM work_scopes WHERE id = ?"
@@ -2861,11 +2879,22 @@ def cmd_seed(
         new_slug = f"{root_slug}-{chain_index}-{new_id[:4]}"
         new_title = _title_from_slug(root_slug)
         idle_state = json.dumps({"type": "idle"})
-        parent_scope = conn.execute(
-            "SELECT work_scope_id FROM conversations WHERE id = ?",
+        parent_scope, parent_product_conversation_id = conn.execute(
+            "SELECT work_scope_id, product_conversation_id FROM conversations WHERE id = ?",
             (parent_id,),
-        ).fetchone()[0]
+        ).fetchone()
         continuation_scope = None if conv_mode["mode"] == "Direct" else parent_scope
+        conn.execute("PRAGMA defer_foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO product_continuation_reservations ("
+            " predecessor_conversation_id, successor_conversation_id, product_conversation_id"
+            ") VALUES (?, ?, ?)",
+            (parent_id, new_id, parent_product_conversation_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
+            (new_id, parent_id),
+        )
         _insert_modern_conversation(
             conn,
             conversation_id=new_id,
@@ -2876,6 +2905,12 @@ def cmd_seed(
             cwd=cwd,
             project_id=project_id,
             work_scope_id=continuation_scope,
+            product_conversation_id=parent_product_conversation_id,
+        )
+        conn.execute(
+            "DELETE FROM product_continuation_reservations "
+            "WHERE predecessor_conversation_id = ?",
+            (parent_id,),
         )
         # Continuation summary message bridges parent -> child in the UI.
         msg_id = str(_uuid.uuid4())
@@ -2886,11 +2921,6 @@ def cmd_seed(
             " content, created_at"
             ") VALUES (?, ?, 0, 'continuation', ?, ?)",
             (msg_id, new_id, cont_content, now),
-        )
-        # Wire parent -> child.
-        conn.execute(
-            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
-            (new_id, parent_id),
         )
         return new_id, new_slug
 

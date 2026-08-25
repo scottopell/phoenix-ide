@@ -10,18 +10,77 @@ use tokio::sync::broadcast;
 
 /// Build a 3-member linear chain and return the ids in chain order.
 async fn build_linear_chain(db: &Database, ids: &[&str]) {
-    for id in ids {
-        db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-            .await
-            .unwrap();
-    }
+    let root = db
+        .create_conversation(
+            ids[0],
+            &format!("slug-{}", ids[0]),
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     for pair in ids.windows(2) {
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind(pair[1])
-            .bind(pair[0])
-            .execute(db.pool())
+        let predecessor_id = pair[0];
+        let id = pair[1];
+        let now = chrono::Utc::now().to_rfc3339();
+        let scope_id = format!("scope-{id}");
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(predecessor_id)
+        .bind(id)
+        .bind(root.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(id)
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+        )
+        .bind(&scope_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+        )
+        .bind(id)
+        .bind(root.product_conversation_id.as_str())
+        .bind(format!("slug-{id}"))
+        .bind(scope_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(predecessor_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
 }
 
@@ -183,7 +242,7 @@ async fn submit_question_rejects_single_member_root() {
         .submit_question("solo-root", "anything")
         .await
         .unwrap_err();
-    matches!(err, ChainQaError::NotAChainRoot(_));
+    assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
 }
 
 #[tokio::test]
@@ -198,7 +257,7 @@ async fn submit_question_rejects_non_root_member() {
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
-    matches!(err, ChainQaError::NotAChainRoot(_));
+    assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
 }
 
 // --- Streaming integration (Phase 3) --------------------------------------

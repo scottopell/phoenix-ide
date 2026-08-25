@@ -777,18 +777,78 @@ mod tests {
     /// Mirror of the `chain_qa` test helper — builds a linear chain and
     /// links `continued_in_conv_id` between successive members.
     async fn build_linear_chain(db: &Database, ids: &[&str]) {
-        for id in ids {
-            db.create_conversation(id, &format!("slug-{id}"), "/tmp", true, None, None)
-                .await
-                .unwrap();
-        }
+        let root_id = ids[0];
+        let root = db
+            .create_conversation(
+                root_id,
+                &format!("slug-{root_id}"),
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         for pair in ids.windows(2) {
-            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-                .bind(pair[1])
-                .bind(pair[0])
-                .execute(db.pool())
+            let predecessor_id = pair[0];
+            let id = pair[1];
+            let now = chrono::Utc::now().to_rfc3339();
+            let scope_id = format!("scope-{id}");
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::query("PRAGMA defer_foreign_keys = ON")
+                .execute(&mut *tx)
                 .await
                 .unwrap();
+            sqlx::query(
+                "INSERT INTO product_continuation_reservations (
+                     predecessor_conversation_id, successor_conversation_id, product_conversation_id
+                 ) VALUES (?1, ?2, ?3)",
+            )
+            .bind(predecessor_id)
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(id)
+                .bind(predecessor_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO work_scopes (
+                     id, authority_kind, environment_kind, cwd, created_at, updated_at
+                 ) VALUES (?1, 'restricted_explore', 'unowned_cwd', '/tmp', ?2, ?2)",
+            )
+            .bind(&scope_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (
+                     id, product_conversation_id, slug, user_initiated, runtime_role,
+                     state_updated_at, created_at, updated_at, work_scope_id
+                 ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?4, ?4, ?5)",
+            )
+            .bind(id)
+            .bind(root.product_conversation_id.as_str())
+            .bind(format!("slug-{id}"))
+            .bind(now)
+            .bind(scope_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query(
+                "DELETE FROM product_continuation_reservations
+                 WHERE predecessor_conversation_id = ?1",
+            )
+            .bind(predecessor_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
         }
     }
 

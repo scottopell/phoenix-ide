@@ -628,6 +628,11 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "root".to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "product-root",
+                )
+                .expect("fixture conversation id is non-empty"),
             slug: Some("root".to_string()),
             title: Some("root".to_string()),
             cwd: "/tmp".to_string(),

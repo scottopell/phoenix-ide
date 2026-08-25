@@ -3483,8 +3483,17 @@ mod tests {
             .await
             .unwrap();
             sqlx::query(
+                "INSERT OR IGNORE INTO product_conversations (id, kind, ordinary_lifecycle)
+                 VALUES (?1, 'ordinary', 'open')",
+            )
+            .bind(conversation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
                 "INSERT OR IGNORE INTO conversations
-                 (id, runtime_role, work_scope_id) VALUES (?1, 'user', ?2)",
+                 (id, product_conversation_id, runtime_role, work_scope_id)
+                 VALUES (?1, ?1, 'user', ?2)",
             )
             .bind(conversation_id)
             .bind(work_scope_id)
@@ -4633,10 +4642,25 @@ mod tests {
     #[tokio::test]
     async fn child_terminal_reconcile_rotates_id_and_preserves_originating_authority() {
         let repo = repo().await;
-        sqlx::query(
-            "UPDATE conversations SET parent_conversation_id = 'conv-b' WHERE id = 'conv-a'",
+        let db = Database::from_pool_for_tests(repo.pool.clone(), String::new());
+        db.delete_conversation("conv-a").await.unwrap();
+        db.create_conversation_with_project(
+            "conv-a",
+            "A",
+            "/tmp",
+            false,
+            Some("conv-b"),
+            None,
+            None,
+            &phoenix_core::domain::db_schema::ConvMode::Explore {
+                worktree_path: None,
+                next_taskmd_id_hint: None,
+            },
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
         )
-        .execute(&repo.pool)
         .await
         .unwrap();
         let original_parent = repo

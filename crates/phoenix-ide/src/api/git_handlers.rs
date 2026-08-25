@@ -2439,6 +2439,11 @@ mod tests {
             ),
             runtime_role: crate::work_scope::RuntimeRole::User,
             id: "conv-test".to_string(),
+            product_conversation_id:
+                phoenix_core::domain::product_conversation::ProductConversationId::parse(
+                    "product-conv-test",
+                )
+                .unwrap(),
             slug: None,
             title: None,
             cwd: cwd.to_string_lossy().to_string(),

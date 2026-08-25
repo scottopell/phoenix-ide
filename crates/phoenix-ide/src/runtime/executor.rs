@@ -8385,6 +8385,7 @@ where
                 task_id: approval_result.task_id,
                 task_title: approval_result.task_title,
                 branch_name: approval_result.branch_name,
+                approved_commit_oid: approval_result.approved_commit_oid,
                 worktree_path: approval_result.worktree_path,
                 base_branch: approval_result.base_branch,
                 title: title_backup,
@@ -8426,6 +8427,7 @@ struct TaskApprovalResult {
     task_id: String,
     task_title: String,
     branch_name: String,
+    approved_commit_oid: String,
     first_task: bool,
     task_file: String,
     /// Absolute path to the git worktree created for this conversation
@@ -10336,10 +10338,14 @@ fn execute_approve_task_blocking(
         tracing::info!(branch = %branch_name, "Task file already on the branch unchanged — no commit needed");
     }
 
+    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
+        approved_commit_oid,
         first_task: false,
         task_file: format!("{tasks_dir_name}/{final_filename}"),
         worktree_path: worktree_path_str,
@@ -10428,10 +10434,14 @@ fn execute_approve_plain_markdown_blocking(
         tracing::info!(branch = %branch_name, worktree = %worktree_path_str, "Plain-markdown task approved — temp branch renamed; task file already on the branch unchanged, no commit needed");
     }
 
+    let approved_commit_oid = run_git(&worktree_path, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
+        approved_commit_oid,
         first_task: false,
         task_file: task_file.to_string(),
         worktree_path: worktree_path_str,
@@ -12419,11 +12429,7 @@ mod authoritative_user_message_effect_tests {
         .await
         .unwrap();
 
-        assert!(matches!(
-            &*state_rx.borrow(),
-            ConvState::HandedOff { successor_conv_id }
-                if successor_conv_id == "successor-conv"
-        ));
+        assert!(matches!(&*state_rx.borrow(), ConvState::Idle));
         assert_eq!(rt.state_updated_at, persisted_timestamp);
         assert!(rt.handoff_completion_authority.is_none());
     }
@@ -14924,6 +14930,7 @@ mod runtime_context_promotion_tests {
             task_id: "123".to_string(),
             task_title: "Approved task".to_string(),
             branch_name: "task-123-approved".to_string(),
+            approved_commit_oid: "0123456789abcdef0123456789abcdef01234567".to_string(),
             first_task: true,
             task_file: "tasks/123-p1-ready--approved.md".to_string(),
             worktree_path: "/repo/.phoenix/worktrees/conv".to_string(),

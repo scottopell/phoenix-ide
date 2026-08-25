@@ -89,10 +89,27 @@ class ModernSeedTest(unittest.TestCase):
                         "seed_label": None,
                         "continued_in_conv_id": None,
                     })
+                    conn.execute("PRAGMA defer_foreign_keys = ON")
+                    conn.execute(
+                        "INSERT INTO product_continuation_reservations ("
+                        " predecessor_conversation_id, successor_conversation_id,"
+                        " product_conversation_id"
+                        ") VALUES (?, ?, ?)",
+                        (fixture_id, successor["id"], successor["product_conversation_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
+                        (successor["id"], fixture_id),
+                    )
                     conn.execute(
                         f"INSERT INTO conversations ({', '.join(columns)})"
                         f" VALUES ({', '.join('?' for _ in columns)})",
                         tuple(successor[column] for column in columns),
+                    )
+                    conn.execute(
+                        "DELETE FROM product_continuation_reservations "
+                        "WHERE predecessor_conversation_id = ?",
+                        (fixture_id,),
                     )
                     conn.execute(
                         "DELETE FROM messages WHERE conversation_id = ?", fixture

@@ -1880,12 +1880,72 @@ mod reconcile_worktrees_tests {
     }
 
     async fn wire_continuation(db: &db::Database, from: &str, to: &str) {
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+        let product_conversation_id = db
+            .get_conversation(from)
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let to_conversation = db.get_conversation(to).await.unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(to)
-            .bind(from)
             .execute(db.pool())
             .await
             .unwrap();
+        sqlx::query("DELETE FROM product_conversations WHERE id = ?1")
+            .bind(to_conversation.product_conversation_id.as_str())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES (?1, ?2, ?3)",
+        )
+        .bind(from)
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind(to)
+            .bind(from)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 1, 'user', ?4, ?5, ?5, ?5)",
+        )
+        .bind(to)
+        .bind(product_conversation_id.as_str())
+        .bind(to_conversation.slug)
+        .bind(
+            to_conversation
+                .attached_work_scope_id
+                .as_ref()
+                .map(phoenix_core::work_scope::WorkScopeId::as_str),
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = ?1",
+        )
+        .bind(from)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
     }
 
     /// Case (a): parent reached `ContextExhausted`. Worktree directory is
@@ -1957,12 +2017,7 @@ mod reconcile_worktrees_tests {
         // Exposed API `continue_conversation` also updates in a transaction,
         // but we want to isolate the reconcile behaviour without running the
         // full continuation pipeline (and without needing an active runtime).
-        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
-            .bind(child_id)
-            .bind(parent_id)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        wire_continuation(&db, parent_id, child_id).await;
 
         assert!(!std::path::Path::new(&wt_path).exists());
 

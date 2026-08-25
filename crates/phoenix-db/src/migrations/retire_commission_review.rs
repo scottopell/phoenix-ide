@@ -1190,6 +1190,21 @@ mod tests {
     async fn upgraded_schema_matches_fresh_conversation_columns() {
         let upgraded = legacy_pool().await;
         run_migration(&upgraded).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE product_conversations (
+                 id TEXT PRIMARY KEY CHECK (typeof(id) = 'text' AND id <> ''),
+                 kind TEXT NOT NULL CHECK (kind IN ('ordinary', 'coordinator')),
+                 ordinary_lifecycle TEXT CHECK (
+                     (kind = 'ordinary' AND ordinary_lifecycle IN ('open', 'history'))
+                     OR (kind = 'coordinator' AND ordinary_lifecycle IS NULL)
+                 )
+             );
+             ALTER TABLE conversations ADD COLUMN product_conversation_id TEXT
+                 REFERENCES product_conversations(id) ON DELETE CASCADE;",
+        )
+        .execute(&upgraded)
+        .await
+        .unwrap();
         let fresh = crate::Database::open_in_memory().await.unwrap();
 
         assert_eq!(

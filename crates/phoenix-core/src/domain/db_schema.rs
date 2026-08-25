@@ -1,6 +1,7 @@
 //! Database schema and types
 
 use crate::domain::llm_types::ContentBlock;
+use crate::domain::product_conversation::ProductConversationId;
 use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
 pub use crate::domain::sm_state::ConvState;
 use crate::work_scope::{RuntimeRole, WorkScopeId};
@@ -395,6 +396,9 @@ pub struct ConversationCreationIntent {
     pub seed_parent_id: Option<String>,
     #[serde(default)]
     pub seed_label: Option<String>,
+    // owned: pre-approved-task rows had no reviewed snapshot; None is correct.
+    #[serde(default)]
+    pub approved_task: Option<crate::task_handoff::ApprovedTaskSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -423,6 +427,7 @@ pub struct ConversationCreationJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
+    pub product_conversation_id: ProductConversationId,
     pub slug: Option<String>,
     /// Human-readable title for UI display (e.g., "Fix Login Page CSS").
     /// Derived from the slug by title-casing when not set explicitly.
@@ -1980,6 +1985,8 @@ mod conversation_serde_tests {
     fn fixture(continued_in_conv_id: Option<String>) -> Conversation {
         Conversation {
             id: "conv-1".to_string(),
+            product_conversation_id: ProductConversationId::parse("conv-1")
+                .expect("conversation id is non-empty"),
             slug: Some("test-conv".to_string()),
             title: Some("Test Conv".to_string()),
             cwd: "/tmp/work".to_string(),

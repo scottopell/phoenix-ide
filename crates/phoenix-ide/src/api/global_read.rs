@@ -1097,6 +1097,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
+        | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationRepairRequired(_)
@@ -1191,17 +1192,57 @@ mod tests {
             .await
             .unwrap();
         phoenix_db::run_pending_migrations(db.pool()).await.unwrap();
-        db.create_conversation("root", "root", "/tmp", true, None, None)
+        let root = db
+            .create_conversation("root", "root", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.create_conversation("leaf", "leaf", "/tmp", true, None, None)
+        sqlx::query(
+            "INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES ('scope-leaf', 'restricted_explore', 'unowned_cwd', '/tmp',
+                       '2025-01-01', '2025-01-01')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
             .await
             .unwrap();
-        db.create_conversation("idle", "idle", "/tmp", true, None, None)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_continuation_reservations (
+                 predecessor_conversation_id, successor_conversation_id, product_conversation_id
+             ) VALUES ('root', 'leaf', ?1)",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
         sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'root'")
-            .execute(db.pool())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations (
+                 id, product_conversation_id, slug, user_initiated, runtime_role,
+                 work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES ('leaf', ?1, 'leaf', 1, 'user', 'scope-leaf',
+                       '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .bind(root.product_conversation_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM product_continuation_reservations
+             WHERE predecessor_conversation_id = 'root'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.create_conversation("idle", "idle", "/tmp", true, None, None)
             .await
             .unwrap();
         sqlx::query("UPDATE conversations SET state = '{\"type\":\"tool_executing\",\"current_tool\":null,\"remaining_tools\":[]}', state_kind = 'tool_executing', state_updated_at = '2026-07-21T12:00:00Z', updated_at = '2026-07-21T12:01:00Z', cm_task_id = '44008', cm_task_title = 'done task' WHERE id = 'leaf'")
