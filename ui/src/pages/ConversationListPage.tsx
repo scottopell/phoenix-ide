@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
-import type { ChainView, Conversation, CodexLoginPreflight } from '../api';
+import type { Conversation, CodexLoginPreflight } from '../api';
 import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
 import {
   useConversationsList,
@@ -11,7 +11,6 @@ import {
 import { NewConversationPage } from './NewConversationPage';
 import { ConversationList } from '../components/ConversationList';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { RenameDialog } from '../components/RenameDialog';
 import { StorageStatus } from '../components/StorageStatus';
 
@@ -84,11 +83,6 @@ export function ConversationListPage() {
 
   // Delete confirmation state
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
-  // Chain delete confirmation state. We fetch the full ChainView when a
-  // user invokes "Delete chain" so the confirm dialog can show member count
-  // + worktree count without forcing every list query to carry the chain
-  // detail.
-  const [deleteChainTarget, setDeleteChainTarget] = useState<ChainView | null>(null);
 
   // Rename state
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
@@ -238,61 +232,6 @@ export function ConversationListPage() {
     }
   };
 
-  // (Pre-08684 ConversationListPage held a chain-grouping helper here used
-  // only by the offline-queue optimistic flip in handleArchiveChain.
-  // With ConversationStore as the single source of
-  // truth, those handlers no longer mutate a local list — they enqueue
-  // the op and let refresh() reconcile when the queue drains. The helper,
-  // along with the `computeChainRoots` import it depended on, is gone.
-  // If a future change wants eager-flip-on-queue back, dispatch
-  // local_conversation_update against each chain member's atom and
-  // re-import the helper.)
-
-  const handleArchiveChain = async (rootId: string) => {
-    try {
-      if (isOnline) {
-        await api.archiveChain(rootId);
-        await refresh();
-      } else {
-        await queueOperation({
-          type: 'archive_chain',
-          conversationId: rootId,
-          payload: {},
-          createdAt: new Date(),
-          retryCount: 0,
-          status: 'pending',
-        });
-        // Offline path: the queued op will fire on reconnect; refresh()
-        // then reconciles. The offline indicator already signals the
-        // queue is pending.
-      }
-    } catch (err) {
-      console.error('Failed to archive chain:', err);
-      showError(err instanceof Error ? err.message : 'Failed to archive chain', 5000);
-    }
-  };
-
-  const requestDeleteChain = async (rootId: string) => {
-    try {
-      const view = await api.getChain(rootId);
-      setDeleteChainTarget(view);
-    } catch (err) {
-      console.error('Failed to load chain for delete:', err);
-      showError(err instanceof Error ? err.message : 'Failed to load chain', 5000);
-    }
-  };
-
-  const handleDeleteChain = async () => {
-    if (!deleteChainTarget) return;
-    try {
-      await api.deleteChain(deleteChainTarget.root_conv_id);
-      setDeleteChainTarget(null);
-      await refresh();
-    } catch (err) {
-      console.error('Failed to delete chain:', err);
-      showError(err instanceof Error ? err.message : 'Failed to delete chain', 5000);
-    }
-  };
 
   const handleRename = async (newName: string) => {
     if (!renameTarget) return;
@@ -416,8 +355,6 @@ export function ConversationListPage() {
               onArchive={handleArchive}
               onDelete={handleSetDeleteTarget}
               onRename={handleSetRenameTarget}
-              onArchiveChain={handleArchiveChain}
-              onDeleteChain={requestDeleteChain}
               onConversationClick={handleConversationClick}
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
@@ -446,12 +383,6 @@ export function ConversationListPage() {
         danger
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
-      />
-      <ChainDeleteConfirm
-        visible={deleteChainTarget !== null}
-        chain={deleteChainTarget}
-        onConfirm={handleDeleteChain}
-        onCancel={() => setDeleteChainTarget(null)}
       />
       <RenameDialog
         visible={renameTarget !== null}

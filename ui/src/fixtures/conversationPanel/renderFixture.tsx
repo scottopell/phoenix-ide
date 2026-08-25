@@ -85,8 +85,6 @@ export function ConversationPanelFixture({ scenario, showToolbar = true }: Props
                   onArchive={() => {}}
                   onDelete={() => {}}
                   onRename={() => {}}
-                  onArchiveChain={() => {}}
-                  onDeleteChain={() => {}}
                   onConversationClick={() => {}}
                   activeSlug={conversationPanelFixtureData.activeSlug}
                   sidebarMode

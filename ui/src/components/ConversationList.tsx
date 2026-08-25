@@ -29,13 +29,6 @@ interface ConversationListProps {
   onArchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
-  /** Chain-scope archive/delete. Triggered from the chain block
-   *  header `⋮` menu. Per-member rows never invoke these — they hide the
-   *  affordance entirely so the only path to a chain lifecycle op is the
-   *  chain header. The rename callback is per-member rename and reuses
-   *  `onRename` (slugs stay per-conversation). */
-  onArchiveChain?: (rootId: string) => void;
-  onDeleteChain?: (rootId: string) => void;
   onConversationClick?: (conv: Conversation) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
@@ -380,7 +373,6 @@ export const ConversationRow = memo(function ConversationRow({
 interface ChainBlockProps {
   item: Extract<SidebarItem, { kind: 'chain' }>;
   collapsed: boolean;
-  isMenuOpen: boolean;
   /** Chain-scoped, not global. The parent passes the expanded/keyboard-selected
    *  row id only when it belongs to THIS chain, else null — so a global id change
    *  that lands on a different chain produces referentially-identical props here
@@ -392,10 +384,6 @@ interface ChainBlockProps {
   listDensity: 'full' | 'mobile' | 'sidebar';
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
-  onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
-  onCloseChainMenu: () => void;
-  onArchiveChain?: ((rootId: string) => void) | undefined;
-  onDeleteChain?: ((rootId: string) => void) | undefined;
   onRowClick: (conv: Conversation) => void;
   onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
@@ -403,23 +391,17 @@ interface ChainBlockProps {
   onRename: (conv: Conversation) => void;
   onCloseRowMenu: () => void;
   rowMenuRef?: React.RefObject<HTMLDivElement> | undefined;
-  chainMenuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
 export const ChainBlock = memo(function ChainBlock({
   item,
   collapsed,
-  isMenuOpen,
   expandedRowId,
   keyboardSelectedId,
   activeSlug,
   listDensity,
   showArchived,
   onToggleCollapsed,
-  onToggleChainMenu,
-  onCloseChainMenu,
-  onArchiveChain,
-  onDeleteChain,
   onRowClick,
   onRowToggleMenu,
   onArchive,
@@ -427,9 +409,7 @@ export const ChainBlock = memo(function ChainBlock({
   onRename,
   onCloseRowMenu,
   rowMenuRef,
-  chainMenuRef,
 }: ChainBlockProps) {
-  const navigate = useNavigate();
   const latestMember = item.members.find((m) => m.id === item.latestMemberId) ?? item.members[item.members.length - 1];
   const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
   const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
@@ -467,67 +447,10 @@ export const ChainBlock = memo(function ChainBlock({
             <polyline points="6 9 12 15 18 9" />
           </svg>
         </button>
-        <button
-          className="conv-chain-name"
-          onClick={() => navigate(`/chains/${item.rootId}`)}
-          title={`Open chain "${chainDisplayTitle}"`}
-        >
-          <span className="conv-chain-name-label">{chainDisplayTitle}</span>
+        <div className="conv-chain-name" title={chainDisplayTitle}>
+          <span className="conv-chain-name-label">Conversation history</span>
           {listDensity !== 'mobile' && (
             <span className="conv-chain-count">{item.members.length} parts</span>
-          )}
-        </button>
-        <div ref={chainMenuRef} className="conv-chain-menu-container">
-          <button
-            className="conv-chain-menu-btn"
-            onClick={(e) => onToggleChainMenu(e, item.rootId)}
-            title="Chain actions"
-            aria-label="Chain actions"
-          >
-            ⋮
-          </button>
-          {isMenuOpen && (
-            <div className="conv-item-actions conv-chain-actions">
-              <button
-                className="action-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseChainMenu();
-                  // The chain name is edited on the ChainPage header (the single
-                  // chain_name input). `?rename=1` opens that editor directly so
-                  // the menu item lands on an actionable state instead of a bare
-                  // page (a no-op when already on the chain page).
-                  navigate(`/chains/${item.rootId}?rename=1`);
-                }}
-              title={`Open chain "${chainDisplayTitle}" to rename it`}
-              >
-                Rename chain…
-              </button>
-              {!showArchived && (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseChainMenu();
-                    onArchiveChain?.(item.rootId);
-                  }}
-                  title={`Archive chain "${chainDisplayTitle}"`}
-                >
-                  Archive chain
-                </button>
-              )}
-              <button
-                className="action-btn danger"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseChainMenu();
-                  onDeleteChain?.(item.rootId);
-                }}
-                title={`Delete chain "${chainDisplayTitle}" (can't be undone)`}
-              >
-                Delete chain
-              </button>
-            </div>
           )}
         </div>
       </div>
@@ -598,8 +521,6 @@ export function ConversationList({
   onArchive,
   onDelete,
   onRename,
-  onArchiveChain,
-  onDeleteChain,
   onConversationClick,
   activeSlug,
   sidebarMode,
@@ -611,10 +532,8 @@ export function ConversationList({
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [expandedChainId, setExpandedChainId] = useState<string | null>(null);
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
-  const chainMenuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
   const lastRevealedActiveSlugRef = useRef<string | null>(null);
 
@@ -632,17 +551,6 @@ export function ConversationList({
     document.addEventListener('mousedown', handleMouseDown);
     return () => document.removeEventListener('mousedown', handleMouseDown);
   }, [expandedId]);
-
-  useEffect(() => {
-    if (!expandedChainId) return;
-    const handleMouseDown = (e: MouseEvent) => {
-      if (chainMenuRef.current && !chainMenuRef.current.contains(e.target as Node)) {
-        setExpandedChainId(null);
-      }
-    };
-    document.addEventListener('mousedown', handleMouseDown);
-    return () => document.removeEventListener('mousedown', handleMouseDown);
-  }, [expandedChainId]);
 
   const displayList = showArchived ? archivedConversations : conversations;
 
@@ -693,14 +601,7 @@ export function ConversationList({
 
   const toggleActions = useCallback((e: React.MouseEvent, convId: string) => {
     e.stopPropagation();
-    setExpandedChainId(null);
     setExpandedId((prev) => (prev === convId ? null : convId));
-  }, []);
-
-  const toggleChainActions = useCallback((e: React.MouseEvent, rootId: string) => {
-    e.stopPropagation();
-    setExpandedId(null);
-    setExpandedChainId((prev) => (prev === rootId ? null : rootId));
   }, []);
 
   const toggleChainCollapsed = useCallback((rootId: string) => {
@@ -755,7 +656,6 @@ export function ConversationList({
   }, [activeSlug, groupedItems, collapsedChains, effectiveListDensity]);
 
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
-  const closeChainMenu = useCallback(() => setExpandedChainId(null), []);
 
   const isEmpty = displayList.length === 0;
 
@@ -873,17 +773,12 @@ export function ConversationList({
                 key={`chain:${item.rootId}`}
                 item={item}
                 collapsed={collapsed}
-                isMenuOpen={expandedChainId === item.rootId}
                 expandedRowId={chainExpandedRowId}
                 keyboardSelectedId={chainKeyboardSelectedId}
                 activeSlug={chainActiveSlug}
                 listDensity={effectiveListDensity}
                 showArchived={showArchived}
                 onToggleCollapsed={toggleChainCollapsed}
-                onToggleChainMenu={toggleChainActions}
-                onCloseChainMenu={closeChainMenu}
-                onArchiveChain={onArchiveChain}
-                onDeleteChain={onDeleteChain}
                 onRowClick={handleClick}
                 onRowToggleMenu={toggleActions}
                 onArchive={onArchive}
@@ -891,7 +786,6 @@ export function ConversationList({
                 onRename={onRename}
                 onCloseRowMenu={closeRowMenu}
                 rowMenuRef={menuRef}
-                chainMenuRef={expandedChainId === item.rootId ? chainMenuRef : undefined}
               />
             );
           })
