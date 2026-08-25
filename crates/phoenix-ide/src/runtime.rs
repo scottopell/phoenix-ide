@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub(crate) mod close;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
@@ -581,6 +582,7 @@ pub struct RuntimeManager {
     direct_turn_kick_tx: tokio::sync::watch::Sender<u64>,
     direct_turn_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
     fatal_local_authority_fence: Arc<FatalLocalAuthorityFence>,
+    close_admission_coordinator: close::CloseAdmissionCoordinator,
     wake_registrar: Option<Arc<dyn WakeRegistrar>>,
 }
 
@@ -2163,6 +2165,7 @@ impl RuntimeManager {
             direct_turn_kick_tx,
             direct_turn_kick_rx: RwLock::new(Some(direct_turn_kick_rx)),
             fatal_local_authority_fence,
+            close_admission_coordinator: close::CloseAdmissionCoordinator::default(),
             wake_registrar: Some(wake_registrar),
         }
     }
@@ -3222,6 +3225,13 @@ impl RuntimeManager {
     pub fn kick_creation_worker(&self) {
         let next = self.creation_kick_tx.borrow().wrapping_add(1);
         let _ = self.creation_kick_tx.send(next);
+    }
+
+    /// Recover pending persisted Close fences before worker admission begins.
+    /// This performs no user-visible Close transition; it only reconstitutes the
+    /// runtime owner for durable fences already established by an attempt.
+    pub(crate) async fn recover_close_admission_fences(&self) -> Result<(), String> {
+        self.close_admission_coordinator.recover(&self.db).await
     }
 
     pub fn kick_wake_worker(&self) {

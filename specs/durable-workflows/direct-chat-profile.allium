@@ -425,6 +425,30 @@ rule SecondaryConsumersAreMonotonicViewsOfAcceptedTurns {
     ensures: acceptance.accepted_turn = acceptance.accepted_turn
 }
 
+rule ActiveCloseObligationFencesNewDirectTurnAdmission {
+    when: DirectChatRequested(request)
+    let conversation = request.resolved_target.conversation
+    requires: active_close_obligation(conversation.product_conversation)
+    requires: not same_key_existing_acceptance(request.turn_key)
+
+    ensures: DirectChatRejected(request, "close_admission_fenced")
+
+    @guidance
+        -- The close-attempt admission and new direct-turn acceptance share one
+        -- serialized durable decision boundary. Existing exact-key acceptance is
+        -- replay, not new work, and remains available for recovery.
+}
+
+rule ActiveCloseObligationAllowsExactDirectTurnReplay {
+    when: DirectChatPrepared(turn_key, resolved_target, prepared_payload, prepared_fingerprint)
+    requires: active_close_obligation(resolved_target.conversation.product_conversation)
+    requires: same_key_existing_acceptance(turn_key) != null
+    requires: fingerprints_match(same_key_existing_acceptance(turn_key).prepared_fingerprint, prepared_fingerprint)
+    requires: same_key_existing_acceptance(turn_key).committed_outcome != null
+
+    ensures: replay_of(committed_outcome_for(same_key_existing_acceptance(turn_key)))
+}
+
 rule CloseSettlementBridgesToLatestAcceptedDirectTurn {
     when: bedrock_close_settlement_request(product_conversation, attempt_id)
     let latest_parent = bedrock/Parent{product_conversation: product_conversation, is_latest_row: true}

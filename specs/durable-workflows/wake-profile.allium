@@ -241,6 +241,7 @@ rule RegistrationCreatesDurableWakeWorkflowBeforeReceipt {
     requires: resource.kind = subagent implies registering_conversation_owns_child(conversation, resource)
     requires: resource_identity_is_stable(resource)
     requires: active_registration_fence(conversation)
+    requires: not active_close_obligation(conversation.product_conversation)
     requires: not conversation_is_terminal_or_archived(conversation)
 
     let contract_id = next_contract_id()
@@ -284,6 +285,20 @@ rule RegistrationCreatesDurableWakeWorkflowBeforeReceipt {
         -- effect, and the contract binding are durable.
 }
 
+rule ActiveCloseObligationPreservesExactWakeRegistrationReplay {
+    when: WakeRegistrationRequested(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: active_close_obligation(conversation.product_conversation)
+    let prepared_fingerprint = prepared_registration_fingerprint_for(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+    requires: exact_existing_wake_registration(conversation, resource, tool_use_id, prepared_fingerprint)
+
+    ensures: WakeRegistrationSucceeded(existing_wake_registration_receipt(conversation, resource, tool_use_id, prepared_fingerprint))
+
+    @guidance
+        -- Close-attempt admission and new wake registration share one serialized
+        -- durable decision boundary. An exact existing registration is replay,
+        -- not new work, and remains available for recovery.
+}
+
 rule RegistrationUsesDefaultWaitBound {
     when: WakeRegistrationRequested(agent, conversation, resource, omitted, tool_use_id)
     ensures: WakeRegistrationRequested(agent, conversation, resource, config.default_max_wait_seconds, tool_use_id)
@@ -299,6 +314,8 @@ rule RegistrationRejectsUnavailableOrUnauthorizedResource {
             or not registering_conversation_owns_child(conversation, resource)
         )
         or not active_registration_fence(conversation)
+        or active_close_obligation(conversation.product_conversation)
+            and not exact_existing_wake_registration(conversation, resource, tool_use_id, prepared_registration_fingerprint_for(agent, conversation, resource, requested_max_wait_seconds, tool_use_id))
         or conversation_is_terminal_or_archived(conversation)
     ensures: WakeRegistrationRejected("wake_unavailable")
 }

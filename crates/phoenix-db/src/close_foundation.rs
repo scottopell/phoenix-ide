@@ -33,6 +33,29 @@ pub struct CloseFoundationTopology {
     pub members: Vec<CloseFoundationTopologyMember>,
 }
 
+/// The only admission decision a product-aggregate operation may observe.
+///
+/// Callers must make this decision inside their owning write transaction; an
+/// observation made before that transaction is not an admission capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductConversationAdmission {
+    Accepted {
+        product_conversation_id: ProductConversationId,
+    },
+    Refused {
+        product_conversation_id: ProductConversationId,
+        attempt_id: CloseAttemptId,
+        phase: ClosePhase,
+    },
+}
+
+impl ProductConversationAdmission {
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+}
+
 impl CloseFoundationTopology {
     #[must_use]
     pub fn member_ids(&self) -> Vec<&str> {
@@ -40,6 +63,46 @@ impl CloseFoundationTopology {
             .iter()
             .map(|member| member.conversation.id.as_str())
             .collect()
+    }
+}
+
+pub(crate) async fn admit_product_conversation_operation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+) -> DbResult<ProductConversationAdmission> {
+    let product_conversation_id: String =
+        sqlx::query_scalar("SELECT product_conversation_id FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| DbError::ConversationNotFound(conversation_id.to_string()))?;
+    let product_conversation_id = parse_product_conversation_id(
+        product_conversation_id,
+        "conversations.product_conversation_id",
+    )?;
+    let obligation = sqlx::query(
+        "SELECT attempt_id, phase FROM close_obligations
+         WHERE product_conversation_id = ?1 AND phase <> 'completed'",
+    )
+    .bind(product_conversation_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match obligation {
+        None => Ok(ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        }),
+        Some(row) => {
+            let attempt_id = parse_close_attempt_id(row.try_get("attempt_id")?)?;
+            let phase_raw: String = row.try_get("phase")?;
+            let phase = ClosePhase::from_db_str(&phase_raw).ok_or_else(|| {
+                DbError::Serialization(format!("unknown close phase {phase_raw}"))
+            })?;
+            Ok(ProductConversationAdmission::Refused {
+                product_conversation_id,
+                attempt_id,
+                phase,
+            })
+        }
     }
 }
 
@@ -800,6 +863,20 @@ fn encode_aggregate_snapshot_component<'a>(
 // close-foundation precondition/not-found errors enforced by this module.
 #[allow(clippy::missing_errors_doc)]
 impl Database {
+    /// Resolve an aggregate's current fence for diagnostics and recovery.
+    ///
+    /// This read does not grant admission. Mutating callers must instead call
+    /// [`admit_product_conversation_operation_tx`] in their own write transaction.
+    pub async fn product_conversation_admission(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<ProductConversationAdmission> {
+        let mut tx = self.pool.begin().await?;
+        let admission = admit_product_conversation_operation_tx(&mut tx, conversation_id).await?;
+        tx.commit().await?;
+        Ok(admission)
+    }
+
     pub async fn close_foundation_topology(
         &self,
         product_conversation_id: &ProductConversationId,
@@ -2831,6 +2908,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(members, vec![conversation.id]);
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_is_open_without_a_close_attempt() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        assert!(matches!(
+            db.product_conversation_admission("root").await.unwrap(),
+            ProductConversationAdmission::Accepted { product_conversation_id }
+                if product_conversation_id == product_id("root")
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_conversation_admission_refuses_every_captured_member_after_close_begins() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_child(&db, "latest", "root").await;
+        db.begin_close_foundation(&product_id("root"), "admission-fence")
+            .await
+            .unwrap();
+
+        for conversation_id in ["root", "latest"] {
+            assert!(matches!(
+                db.product_conversation_admission(conversation_id)
+                    .await
+                    .unwrap(),
+                ProductConversationAdmission::Refused { attempt_id, phase, .. }
+                    if attempt_id.as_str() == "admission-fence"
+                        && phase == ClosePhase::AwaitingBlockerResolution
+            ));
+        }
     }
 
     #[tokio::test]

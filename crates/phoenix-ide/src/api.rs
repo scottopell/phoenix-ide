@@ -170,6 +170,10 @@ impl AppState {
                 "retired automatic wake obligations before runtime startup"
             );
         }
+        runtime
+            .recover_close_admission_fences()
+            .await
+            .map_err(std::io::Error::other)?;
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;

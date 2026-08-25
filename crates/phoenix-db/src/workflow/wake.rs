@@ -9,6 +9,7 @@ use super::{
     WorkflowSequenceName, WorkflowTx,
 };
 use crate::sqlite_telemetry::SqliteOperation;
+use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -623,6 +624,19 @@ impl WakeRepository {
             } else {
                 WakeRegistrationOutcome::Conflict
             });
+        }
+
+        if let ProductConversationAdmission::Refused {
+            product_conversation_id,
+            attempt_id,
+            phase,
+        } = admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation_id).await?
+        {
+            tx.rollback().await?;
+            return Err(DbError::CloseFoundationConflict(format!(
+                "Close attempt {attempt_id} in phase {} fences ProductConversation {product_conversation_id} from new wake registration",
+                phase.as_str()
+            )));
         }
 
         let workflow_id = match allocated_workflow_id {
@@ -4910,6 +4924,43 @@ mod tests {
             registered_at: Timestamp(10),
             expires_at: Timestamp(100),
         }
+    }
+
+    #[tokio::test]
+    async fn close_admission_fence_refuses_new_wake_registration_without_creating_binding() {
+        let db = crate::Database::open_in_memory().await.unwrap();
+        db.create_conversation("wake-fenced", "Wake fenced", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_conversation_id = db
+            .get_conversation("wake-fenced")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-fence")
+            .await
+            .unwrap();
+        let repo = WakeRepository::new(db.pool().clone());
+        let mut input = intent();
+        input.conversation_id = "wake-fenced".into();
+        input.root_conversation_id = "wake-fenced".into();
+
+        let error = repo
+            .register(&input, "wake-fence-fingerprint", Timestamp(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DbError::CloseFoundationConflict(message) if message.contains("wake registration"))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM wake_bindings WHERE conversation_id = 'wake-fenced'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     fn resolve_input(
