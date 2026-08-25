@@ -811,7 +811,7 @@ def _render_checkout_status(cs: object) -> str:
         return str(cs) if cs else ''
     kind = cs.get('kind', 'unknown')
     if kind == 'named_branch':
-        base = f"branch={cs.get('branch_name', '?')}@{cs.get('head_oid', '?')[:8]}"
+        base = f"branch={cs.get('branch_name', '?')}@{cs.get('head_oid', '?')}"
         rs = cs.get('remote_status')
         if isinstance(rs, dict):
             rkind = rs.get('kind', '')
@@ -823,7 +823,7 @@ def _render_checkout_status(cs: object) -> str:
                 base += f"  upstream-unavailable({rs.get('reason', '?')})"
         return base
     if kind == 'detached':
-        base = f"detached@{cs.get('head_oid', '?')[:8]}"
+        base = f"detached@{cs.get('head_oid', '?')}"
         refs = cs.get('pointing_refs') or []
         if refs:
             base += f"  refs={','.join(refs)}"
@@ -934,8 +934,8 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 
     Splits on the LAST '=' so the key (question text) can contain '=' — e.g.
     --respond 'Is 2+2=4?=yes' → key='Is 2+2=4?', value='yes'. A value
-    containing '=' cannot be expressed this way; for that, use a structured
-    input (not yet supported).
+    containing '=' cannot be expressed this way; for that, use --respond-json
+    with a JSON object of {question: answer}, which is fully unambiguous.
     """
     out: dict[str, str] = {}
     for pair in pairs:
@@ -1105,6 +1105,10 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         ('--usage-overview', usage_overview),
         ('--trajectory-export', trajectory_export),
     ] if flag]
+    discovery_selected = [name for name, flag in [
+        ('--list-conversations', list_conversations),
+        ('--search-conversations', search_conversations is not None),
+    ] if flag]
     if len(conv_selected) > 1:
         raise click.UsageError(
             f"Conflicting conversation-scoped flags: {', '.join(conv_selected)}. "
@@ -1113,6 +1117,11 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     if conv_selected and platform_selected:
         raise click.UsageError(
             f"Conflicting flags: {', '.join(platform_selected)} cannot be combined "
+            f"with {', '.join(conv_selected)}."
+        )
+    if conv_selected and discovery_selected:
+        raise click.UsageError(
+            f"Conflicting flags: {', '.join(discovery_selected)} cannot be combined "
             f"with {', '.join(conv_selected)}."
         )
 
