@@ -231,6 +231,7 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     convState: { type: 'awaiting_user_response', questions: [] },
     isArchived: false,
     onRetryPending: vi.fn(),
+    onCancelSteering: vi.fn(),
     onOpenFile: vi.fn(),
     ...overrides,
   });
@@ -570,7 +571,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,live-sent,live-streamed,product-handoff:pc-1:row-2:cont-2'
+        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,live-sent,live-streamed,product-handoff:pc-1:row-2:cont-2'
       );
       expect(conversationNavStackSpy.mock.lastCall?.[0]?.['pendingMessages']).toEqual([
         expect.objectContaining({ localId: 'pending-local', status: 'pending' }),

@@ -23,6 +23,11 @@ import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
 
+type OwnedSnapshot = {
+  productConversationId: string;
+  value: ProductConversationSnapshotView;
+};
+
 function toMessage(message: EnrichedMessage): Message {
   return {
     message_id: message.message_id,
@@ -77,6 +82,13 @@ function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): M
     });
 }
 
+function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[]): Message[] {
+  const liveById = new Map(liveMessages.map((message) => [message.message_id, message]));
+  const merged = snapshotMessages.map((message) => liveById.get(message.message_id) ?? message);
+  const snapshotIds = new Set(snapshotMessages.map((message) => message.message_id));
+  return [...merged, ...liveMessages.filter((message) => !snapshotIds.has(message.message_id))];
+}
+
 function makeAggregateMessages(
   snapshot: ProductConversationSnapshotView,
   latestProjection: EmbeddedConversationProjection | null,
@@ -96,9 +108,10 @@ function makeAggregateMessages(
   }
   const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
   const latestHandoff = latestSegment ? makeHandoffMessage(snapshot, latestSegment.segment_ordinal) : null;
+  const latestSnapshotMessages = latestSegment?.messages.map(toMessage) ?? [];
   return [
     ...historical,
-    ...latestProjection.messages,
+    ...mergeMessagesById(latestSnapshotMessages, latestProjection.messages),
     ...(latestHandoff ? [latestHandoff] : []),
   ];
 }
@@ -229,15 +242,19 @@ function ProductConversationPageInner() {
   const hashTargetMessageId = location.hash.startsWith('#message-')
     ? decodeURIComponent(location.hash.slice('#message-'.length))
     : null;
-  const [snapshot, setSnapshot] = useState<ProductConversationSnapshotView | null>(null);
+  const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
+  const snapshot = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
+    ? ownedSnapshot.value
+    : null;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
   const [latestProjection, setLatestProjection] = useState<EmbeddedConversationProjection | null>(null);
+  const [historyGeneration, setHistoryGeneration] = useState(0);
   const chainRootId = snapshot?.chain_qa_compatibility?.root_transcript_row_id ?? null;
   const [atom, dispatch] = useChainAtom(chainRootId);
-  const { chain, inflight, inflightOrder, draft, submitting, sseLost } = atom;
+  const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const inflightRef = useRef(inflight);
   inflightRef.current = inflight;
@@ -256,7 +273,8 @@ function ProductConversationPageInner() {
     api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE })
       .then((next) => {
         if (cancelled) return;
-        setSnapshot(next);
+        setOwnedSnapshot({ productConversationId, value: next });
+        setHistoryGeneration(0);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -325,10 +343,13 @@ function ProductConversationPageInner() {
         message_limit: PAGE_SIZE,
         before: snapshot.before,
       });
-      setSnapshot((current) => {
-        if (!current) return older;
-        return mergeOlderSegments(current, older);
+      setOwnedSnapshot((current) => {
+        if (!current || current.productConversationId !== productConversationId) {
+          return { productConversationId, value: older };
+        }
+        return { productConversationId, value: mergeOlderSegments(current.value, older) };
       });
+      setHistoryGeneration((generation) => generation + 1);
     } catch (err) {
       setOlderError(err instanceof Error ? err.message : 'Failed to load earlier history.');
     } finally {
@@ -349,8 +370,8 @@ function ProductConversationPageInner() {
   const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
   const transcriptView = {
     conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
-    generation: 0,
-    transcriptGeneration: 0,
+    generation: historyGeneration,
+    transcriptGeneration: historyGeneration,
   };
   const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
   const transcriptPositioning = hashTargetLoaded
@@ -368,9 +389,9 @@ function ProductConversationPageInner() {
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
 
   useEffect(() => {
-    if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder) return;
+    if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder || olderError) return;
     void loadOlderMessages();
-  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, snapshot?.has_older]);
+  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, olderError, snapshot?.has_older]);
 
   const synthChain = useMemo(() => {
     if (!snapshot) return null;
@@ -460,6 +481,7 @@ function ProductConversationPageInner() {
             pendingMessages={latestProjection?.pendingMessages ?? []}
             convState={convState}
             onRetry={latestProjection?.onRetryPending ?? (() => {})}
+            onCancelSteering={latestProjection?.onCancelSteering}
             onOpenFile={latestProjection?.onOpenFile}
             enableMessageSidepanel={false}
             enableMessageFullscreen={false}
@@ -476,6 +498,12 @@ function ProductConversationPageInner() {
 
         {(chainRootId || (isOpen && snapshot.latest_transcript_row_id)) && (
           <section className="product-conversation-page__qa" aria-label="Product conversation recall and live controls">
+            {loadError && (
+              <div role="alert" className="product-conversation-page__error">
+                <span>Failed to load recall history: {loadError}</span>
+                <button type="button" onClick={() => { if (chainRootId) void refreshChain(chainRootId); }}>Retry</button>
+              </div>
+            )}
             {synthChain && chainRootId && (
               <ChainQaColumn
                 chain={synthChain}
@@ -485,7 +513,7 @@ function ProductConversationPageInner() {
                 setDraft={setDraft}
                 submitting={submitting}
                 sseLost={sseLost}
-                onSubmit={handleSubmit}
+                onSubmit={loadError ? () => {} : handleSubmit}
                 onReask={handleReask}
                 activeTextareaRef={activeTextareaRef}
                 onRetryConnection={() => {

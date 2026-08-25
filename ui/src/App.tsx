@@ -143,7 +143,11 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
     return () => { cancelled = true; };
   }, [location.hash, location.search, navigate, reference]);
 
-  if (fallbackToRow) return <ConversationPage />;
+  if (fallbackToRow) {
+    return location.pathname.startsWith('/c/')
+      ? <ConversationPage />
+      : <main role="alert">Unable to resolve this conversation link. Retry when connected.</main>;
+  }
   return <RouteFallback />;
 }
 
