@@ -257,7 +257,7 @@ describe('ConversationRow — cached PR badge', () => {
     expect(document.querySelector('[data-id="leaf-id"] .sidebar-pr-badge')).not.toBeNull();
   });
 
-  it('does not render non-latest chain member PR badges when the member row is expanded', () => {
+  it('does not render non-latest chain member PR badges', () => {
     const root = makeConv('root-id', 'root-slug', {
       continued_in_conv_id: 'leaf-id',
       updated_at: '2024-01-01T00:00:00Z',
@@ -278,12 +278,7 @@ describe('ConversationRow — cached PR badge', () => {
       </MemoryRouter>,
     );
 
-    const rootMenuButton = document.querySelector(
-      '[data-id="root-id"] .conv-item-menu-btn',
-    ) as HTMLButtonElement;
-    fireEvent.click(rootMenuButton);
-
-    expect(document.querySelector('[data-id="root-id"]')).toHaveClass('expanded');
+    expect(document.querySelector('[data-id="root-id"] .conv-item-menu-btn')).toBeNull();
     expect(document.querySelector('[data-id="root-id"] .sidebar-pr-badge')).toBeNull();
     expect(document.querySelectorAll('.sidebar-pr-badge')).toHaveLength(1);
   });
@@ -698,31 +693,40 @@ describe('Chain lifecycle UI (task 02701)', () => {
     expect(container.querySelector('[href^="/chains/"]')).toBeNull();
   });
 
-  it('chain member row dropdown shows only Rename', () => {
+  it.each([
+    { surface: 'active desktop', listDensity: 'full' as const, showArchived: false },
+    { surface: 'active mobile', listDensity: 'mobile' as const, showArchived: false },
+    { surface: 'history', listDensity: 'full' as const, showArchived: true },
+  ])('hides every row-level mutation for linked members on $surface', ({ listDensity, showArchived }) => {
+    const linked = chainConvs({
+      archived: showArchived,
+      ...(listDensity === 'mobile' ? { presentation_mode: 'wait_input' as const } : {}),
+    });
     const { container } = render(
       <MemoryRouter>
         <ConversationList
           {...defaultProps}
-          conversations={chainConvs()}
+          listDensity={listDensity}
+          conversations={showArchived ? [] : linked}
+          archivedConversations={showArchived ? linked : []}
+          showArchived={showArchived}
         />
       </MemoryRouter>,
     );
 
-    const memberRow = container.querySelector(
-      '.conv-item-chain-member',
-    ) as HTMLElement;
-    expect(memberRow).not.toBeNull();
-    const rowMenuBtn = memberRow.querySelector(
-      '.conv-item-menu-btn',
-    ) as HTMLButtonElement;
-    fireEvent.click(rowMenuBtn);
+    if (listDensity === 'mobile' && container.querySelectorAll('.conv-item-chain-member').length === 0) {
+      fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    }
 
-    const labels = Array.from(
-      memberRow.querySelectorAll<HTMLButtonElement>(
-        '.conv-item-actions .action-btn',
-      ),
-    ).map((b) => b.textContent?.trim());
-    expect(labels).toEqual(['Rename']);
+    const memberRows = container.querySelectorAll('.conv-item-chain-member');
+    expect(memberRows).toHaveLength(2);
+    for (const memberRow of memberRows) {
+      expect(memberRow.querySelector('.conv-item-menu-btn')).toBeNull();
+      expect(memberRow.querySelector('.conv-item-actions')).toBeNull();
+      expect(memberRow).not.toHaveTextContent('Rename');
+      expect(memberRow).not.toHaveTextContent('Archive');
+      expect(memberRow).not.toHaveTextContent('Delete');
+    }
   });
 
   it('standalone row dropdown still shows Rename / Archive / Delete', () => {

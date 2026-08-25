@@ -313,44 +313,44 @@ export const ConversationRow = memo(function ConversationRow({
           <span className="conv-item-cwd">{conv.cwd}</span>
         </div>
       </div>
-      <div ref={menuRef} className="conv-item-menu-container">
-        <button
-          className="conv-item-menu-btn"
-          onClick={(e) => onToggleMenu(e, conv.id)}
-          title="Actions"
-          aria-label="Conversation actions"
-          aria-haspopup="menu"
-          aria-expanded={isMenuOpen}
-        >
-          ⋮
-        </button>
-        {isMenuOpen && (
-          <div className="conv-item-actions">
-            <button
-              className="action-btn"
-              onClick={(e) => {
-                e.stopPropagation();
-                onCloseMenu();
-                onRename(conv);
-              }}
-              title={`Rename conversation "${displayTitle}"`}
-            >
-              Rename
-            </button>
-            {!isChainMember && !showArchived && (
+      {!isChainMember && (
+        <div ref={menuRef} className="conv-item-menu-container">
+          <button
+            className="conv-item-menu-btn"
+            onClick={(e) => onToggleMenu(e, conv.id)}
+            title="Actions"
+            aria-label="Conversation actions"
+            aria-haspopup="menu"
+            aria-expanded={isMenuOpen}
+          >
+            ⋮
+          </button>
+          {isMenuOpen && (
+            <div className="conv-item-actions">
               <button
                 className="action-btn"
                 onClick={(e) => {
                   e.stopPropagation();
                   onCloseMenu();
-                  onArchive(conv);
+                  onRename(conv);
                 }}
-                title={`Archive conversation "${displayTitle}"`}
+                title={`Rename conversation "${displayTitle}"`}
               >
-                Archive
+                Rename
               </button>
-            )}
-            {!isChainMember && (
+              {!showArchived && (
+                <button
+                  className="action-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseMenu();
+                    onArchive(conv);
+                  }}
+                  title={`Archive conversation "${displayTitle}"`}
+                >
+                  Archive
+                </button>
+              )}
               <button
                 className="action-btn danger"
                 onClick={(e) => {
@@ -362,10 +362,10 @@ export const ConversationRow = memo(function ConversationRow({
               >
                 Delete
               </button>
-            )}
-          </div>
-        )}
-      </div>
+            </div>
+          )}
+        </div>
+      )}
     </li>
   );
 });
