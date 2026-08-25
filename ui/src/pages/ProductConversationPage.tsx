@@ -23,6 +23,7 @@ import type { TranscriptPositioningInput } from '../conversation/transcriptPosit
 import { ChainQaColumn, ChainWorkScopeDock } from './ChainPage';
 import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import './ProductConversationPage.css';
 
@@ -261,7 +262,14 @@ function SourceMeta({ snapshot }: { snapshot: ProductConversationSnapshotView })
         <div className="product-conversation-meta__row">
           <span className="product-conversation-meta__label">Source</span>
           <span>
-            {snapshot.source.relation} · {snapshot.source.status} · {snapshot.source.relation_key}
+            {snapshot.source.relation} · {snapshot.source.relation_key} ·{' '}
+            {snapshot.source.status === 'present' ? (
+              <a href={`/product-conversations/${snapshot.source.source_product_conversation_id}`}>
+                Open source conversation
+              </a>
+            ) : (
+              <span>Source conversation deleted</span>
+            )}
           </span>
         </div>
       )}
@@ -627,8 +635,8 @@ function ProductConversationPageInner() {
             onOpenFile={latestProjection?.onOpenFile}
             filePathRootDir={latestProjection?.filePathRootDir}
             systemPrompt={latestProjection?.systemPrompt}
-            enableMessageSidepanel={false}
-            enableMessageFullscreen={false}
+            enableMessageSidepanel
+            enableMessageFullscreen
             conversationId={latestConversationId ?? snapshot.product_conversation_id}
             slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
             hasOlderMessages={snapshot.has_older}
@@ -676,8 +684,9 @@ function ProductConversationPageInner() {
                   onProjectionChange={setLatestProjection}
                 />
                 {aggregateMessageSlot && (
-                  <Suspense fallback={null}>
-                    <MessageViewer
+                  <ReviewNotesProvider scopeKey={latestConversationId ?? snapshot.product_conversation_id}>
+                    <Suspense fallback={null}>
+                      <MessageViewer
                       sequenceId={aggregateMessageSlot.sequenceId}
                       messageId={aggregateMessageSlot.messageId}
                       messages={aggregateMessages}
@@ -686,9 +695,10 @@ function ProductConversationPageInner() {
                       presentation={aggregateMessageSlot.presentation}
                       canTogglePresentation
                       onPresentationChange={viewerSlot.setPresentation}
-                      inline={aggregateMessageSlot.presentation === 'pane'}
-                    />
-                  </Suspense>
+                        inline={aggregateMessageSlot.presentation === 'pane'}
+                      />
+                    </Suspense>
+                  </ReviewNotesProvider>
                 )}
               </div>
             ) : (

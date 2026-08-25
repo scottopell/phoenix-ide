@@ -210,6 +210,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const routeSlug = slugMatch?.[1] ?? null;
   const productConversationId = productMatch?.[1] ?? null;
   const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
+  const [productSnapshotRetry, setProductSnapshotRetry] = useState(0);
   useEffect(() => {
     if (!productConversationId) {
       setProductSnapshot(null);
@@ -224,12 +225,18 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         if (!cancelled) setProductSnapshot(null);
       });
     return () => { cancelled = true; };
-  }, [productConversationId]);
+  }, [productConversationId, productSnapshotRetry]);
   const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
   const activeSlug = routeSlug ?? ownedProductSnapshot?.latest_transcript_row_id ?? null;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  useEffect(() => {
+    if (!productConversationId || ownedProductSnapshot) return;
+    const retry = () => setProductSnapshotRetry((value) => value + 1);
+    window.addEventListener('online', retry);
+    return () => window.removeEventListener('online', retry);
+  }, [ownedProductSnapshot, productConversationId]);
   // Live work-scope inventory (SSE-fed) for the active conversation, threaded
   // into FileExplorerPanel's Work scope section + collapsed-rail badge
   // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes

@@ -37,6 +37,7 @@ function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: 
 function productRowDotClass(row: ProductConversationListRow): string {
   if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
   switch (row.presentation.presentation_mode) {
+    case 'needs_action': return 'awaiting-approval';
     case 'working': return 'working';
     case 'error': return 'error';
     case 'done': return 'terminal';

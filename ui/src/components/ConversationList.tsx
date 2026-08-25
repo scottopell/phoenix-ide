@@ -178,6 +178,7 @@ function productConversationDisplayTitle(row: ProductConversationListRow): strin
 function productConversationStatusLabel(row: ProductConversationListRow): string {
   if (row.presentation.kind === 'needs_action') return 'Needs action';
   switch (row.presentation.presentation_mode) {
+    case 'needs_action': return 'Needs action';
     case 'working': return 'Working';
     case 'error': return 'Error';
     case 'done': return 'Completed';

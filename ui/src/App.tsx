@@ -120,8 +120,9 @@ function AppRoutes() {
 function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [fallbackSnapshot, setFallbackSnapshot] = useState<{ canonicalRoute: string; rowSlug: string } | null>(null);
+  const [fallbackSnapshot, setFallbackSnapshot] = useState<{ reference: string; rowSlug: string } | null>(null);
   const [retryToken, setRetryToken] = useState(0);
+  const activeFallback = fallbackSnapshot?.reference === reference ? fallbackSnapshot : null;
 
   useEffect(() => {
     if (!reference) {
@@ -141,19 +142,16 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
       })
       .catch(() => {
         if (!cancelled) {
-          setFallbackSnapshot((current) => current ?? {
-            canonicalRoute: location.pathname,
-            rowSlug: reference,
-          });
+          setFallbackSnapshot({ reference, rowSlug: reference });
         }
       });
     return () => { cancelled = true; };
   }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
 
-  if (fallbackSnapshot) {
+  if (activeFallback) {
     return (
       <main>
-        <EmbeddedConversationPage slug={fallbackSnapshot.rowSlug} suppressCanonicalization routePrefix="/c" />
+        <EmbeddedConversationPage slug={activeFallback.rowSlug} suppressCanonicalization routePrefix="/c" />
         <div role="alert">Showing cached conversation while live snapshot is unavailable.</div>
         <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
       </main>

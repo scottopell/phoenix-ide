@@ -679,19 +679,19 @@ describe('ProductConversationPage', () => {
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
   });
 
-  it('disables aggregate transcript nested message viewers so the aggregate route owns placement', async () => {
+  it('keeps aggregate transcript viewer actions reachable while the aggregate route owns placement', async () => {
     renderPage();
     await waitForPageReady();
-    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('false');
-    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('false');
+    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('true');
+    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('true');
   });
 
-  it('wires aggregate-route message-viewer events without re-enabling nested transcript viewers', async () => {
+  it('wires aggregate-route message-viewer events through reachable transcript actions', async () => {
     renderPage();
     await waitForPageReady();
     fireEvent.click(screen.getByRole('button', { name: 'open aggregate viewer' }));
-    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('false');
-    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('false');
+    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('true');
+    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('true');
   });
 
   it('enables the live runtime for an open aggregate despite stale writable-row metadata', async () => {
