@@ -1863,6 +1863,53 @@ describe('history scroll acknowledgement + continuity suppression', () => {
 });
 
 describe('history expansion feedback', () => {
+  it('loads earlier history when a navigation-owned viewport is dragged to the loaded start', async () => {
+    const onLoadOlderMessages = vi.fn();
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={[makeMessage(1, 'user'), makeMessage(2, 'agent'), makeMessage(3, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-nav-history"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-nav-history', generation: 1, transcriptGeneration: 1 } }}
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump takes the viewport, then the reader takes over and drags upward.
+    act(() => listRef.current?.scrollToUnitIndex(2));
+    fireEvent.pointerDown(scroller);
+
+    // The drag reaches the loaded-history boundary and stops there. The
+    // scroll handler gated on the previously published range and skipped the
+    // request, so the range publish is the only remaining chance to acquire —
+    // and the viewport moved because the reader moved it.
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
+  });
+
   it('automatically loads earlier history when the reader approaches the loaded start', async () => {
     const onLoadOlderMessages = vi.fn();
     virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });

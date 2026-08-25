@@ -1285,7 +1285,14 @@ function MessageListImpl({
   const requestEarlierHistory = useCallback((source: 'range' | 'upward-intent' | 'retry') => {
     const machine = scrollMachineRef.current;
     const ownsCurrentView = machine.kind === 'live' && machine.conversationId === conversationId;
-    const readerOwnsViewport = ownsCurrentView && machine.follow.kind === 'reading';
+    // A range change is only a reason to acquire history when the reader put
+    // the viewport there. Reading is one such state; so is a navigation the
+    // reader has taken over, which is what the user-returning phase records.
+    // Positioning is not — that range change is the command's own doing.
+    const readerMovedViewport = ownsCurrentView && (
+      machine.follow.kind === 'reading'
+      || (machine.follow.kind === 'navigating' && machine.follow.phase === 'user-returning')
+    );
     if (
       earlierHistoryRequestScheduledRef.current
       || !hasOlderMessages
@@ -1293,7 +1300,7 @@ function MessageListImpl({
       || !onLoadOlderMessages
       || (!ownsCurrentView && source !== 'retry')
       || (olderHistoryError && source !== 'retry')
-      || (source === 'range' && !readerOwnsViewport)
+      || (source === 'range' && !readerMovedViewport)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');

@@ -391,6 +391,16 @@ WHEN a touch begins
 THE SYSTEM SHALL remember the pre-gesture follow mode
 AND a touch that ends without movement SHALL restore that mode
 
+WHEN the rendered range reaches the start of loaded history
+THE SYSTEM SHALL acquire earlier history only if the reader moved the
+viewport there — while reading, or while a navigation the reader has taken
+over is returning under their control
+AND SHALL NOT acquire it from a range change produced by a positioning
+command still running
+SO THAT a jump that lands near the start of loaded history does not
+recursively acquire more of it, while a reader who drags there after such a
+jump is not left at a boundary that never expands
+
 WHEN a gesture the platform never reports as ended is discovered — at the
 next interaction, or once a finger reported down has outlasted the
 gesture-staleness bound without an event of its own
