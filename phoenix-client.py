@@ -1124,6 +1124,11 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             f"Conflicting flags: {', '.join(discovery_selected)} cannot be combined "
             f"with {', '.join(conv_selected)}."
         )
+    if discovery_selected and platform_selected:
+        raise click.UsageError(
+            f"Conflicting flags: {', '.join(discovery_selected)} cannot be combined "
+            f"with {', '.join(platform_selected)}."
+        )
 
     # /api/version is auth-exempt (api/auth.rs::is_exempt_path), so --version
     # can run before the auth gate — useful for credential-less connection/
@@ -1244,6 +1249,31 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                     raise click.UsageError("--respond-json must be a JSON object {question: answer}.")
             else:
                 answers = parse_kv_pairs(respond)
+            # Validate keys against the pending questions: the server's
+            # answers.get(&q.question) silently drops unknown keys and
+            # resumes the model anyway, reporting success. Catch mistyped
+            # keys and warn on incomplete answers before sending.
+            state = conv.get('state') or {}
+            if isinstance(state, dict):
+                state_kind = state.get('type') or state.get('kind') or ''
+            else:
+                state_kind = str(state) if state else ''
+            if state_kind == 'awaiting_user_response':
+                pending = state.get('questions') or []
+                pending_texts = {q.get('question', '') for q in pending if isinstance(q, dict)}
+                unknown = [k for k in answers if k not in pending_texts]
+                if unknown:
+                    raise click.UsageError(
+                        f"Unknown question key(s): {', '.join(repr(k) for k in unknown)}. "
+                        f"Pending questions: {', '.join(repr(q) for q in sorted(pending_texts))}"
+                    )
+                unanswered = [q for q in pending_texts if q not in answers]
+                if unanswered:
+                    click.echo(
+                        f"Warning: {len(unanswered)} pending question(s) left unanswered: "
+                        f"{', '.join(repr(q) for q in sorted(unanswered))}",
+                        err=True,
+                    )
             client.respond_to_question(conv['id'], answers)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
             return
@@ -1255,7 +1285,9 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             client.dismiss_error(conv['id'])
             click.echo(f"Dismissed error for {conv.get('slug', conv['id'])}.")
             return
-        if cancel_steer:
+        if cancel_steer is not None:
+            if not cancel_steer:
+                raise click.UsageError("--cancel-steer requires a non-empty message id.")
             client.cancel_steering(conv['id'], cancel_steer)
             click.echo(f"Cancelled steering message {cancel_steer}.")
             return
