@@ -242,7 +242,7 @@ async fn submit_question_rejects_single_member_root() {
         .submit_question("solo-root", "anything")
         .await
         .unwrap_err();
-    matches!(err, ChainQaError::NotAChainRoot(_));
+    assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
 }
 
 #[tokio::test]
@@ -257,7 +257,7 @@ async fn submit_question_rejects_non_root_member() {
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
-    matches!(err, ChainQaError::NotAChainRoot(_));
+    assert!(matches!(err, ChainQaError::NotAChainRoot(_)));
 }
 
 // --- Streaming integration (Phase 3) --------------------------------------

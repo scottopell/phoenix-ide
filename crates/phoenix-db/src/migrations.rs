@@ -2076,15 +2076,19 @@ CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligation
 const MIGRATION_073: &str = r"
 DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_insert;
 DROP TRIGGER IF EXISTS conversations_validate_product_parent_on_update;
+DROP TRIGGER IF EXISTS conversations_preserve_subordinate_parent_on_update;
 
 CREATE TRIGGER conversations_validate_product_parent_on_insert
 BEFORE INSERT ON conversations
 FOR EACH ROW WHEN
-    (NEW.runtime_role = 'sub_agent' AND NOT EXISTS (
-        SELECT 1 FROM conversations parent
-        WHERE parent.id = NEW.parent_conversation_id
-          AND parent.product_conversation_id = NEW.product_conversation_id
-          AND parent.runtime_role IN ('user', 'coordinator')
+    (NEW.runtime_role = 'sub_agent' AND (
+        NEW.parent_conversation_id = NEW.id
+        OR NOT EXISTS (
+            SELECT 1 FROM conversations parent
+            WHERE parent.id = NEW.parent_conversation_id
+              AND parent.product_conversation_id = NEW.product_conversation_id
+              AND parent.runtime_role IN ('user', 'coordinator')
+        )
     ))
     OR (NEW.runtime_role <> 'sub_agent' AND NEW.parent_conversation_id IS NOT NULL)
 BEGIN
@@ -2094,16 +2098,80 @@ END;
 CREATE TRIGGER conversations_validate_product_parent_on_update
 BEFORE UPDATE OF parent_conversation_id, product_conversation_id, runtime_role ON conversations
 FOR EACH ROW WHEN
-    (NEW.runtime_role = 'sub_agent' AND NOT EXISTS (
-        SELECT 1 FROM conversations parent
-        WHERE parent.id = NEW.parent_conversation_id
-          AND parent.product_conversation_id = NEW.product_conversation_id
-          AND parent.runtime_role IN ('user', 'coordinator')
+    (NEW.runtime_role = 'sub_agent' AND (
+        NEW.parent_conversation_id = NEW.id
+        OR NOT EXISTS (
+            SELECT 1 FROM conversations parent
+            WHERE parent.id = NEW.parent_conversation_id
+              AND parent.product_conversation_id = NEW.product_conversation_id
+              AND parent.runtime_role IN ('user', 'coordinator')
+        )
     ))
     OR (NEW.runtime_role <> 'sub_agent' AND NEW.parent_conversation_id IS NOT NULL)
 BEGIN
     SELECT RAISE(ABORT, 'subordinate parent must be a same-ProductConversation user or coordinator');
 END;
+
+CREATE TRIGGER conversations_preserve_subordinate_parent_on_update
+BEFORE UPDATE OF product_conversation_id, runtime_role ON conversations
+FOR EACH ROW WHEN EXISTS (
+    SELECT 1 FROM conversations child
+    WHERE child.parent_conversation_id = OLD.id
+      AND child.runtime_role = 'sub_agent'
+      AND (
+          NEW.product_conversation_id <> child.product_conversation_id
+          OR NEW.runtime_role NOT IN ('user', 'coordinator')
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'subordinate parent must remain a same-ProductConversation user or coordinator');
+END;
+
+WITH RECURSIVE ancestors(child_id, ancestor_id, depth, path) AS (
+    SELECT child.id, child.parent_conversation_id, 1,
+           '|' || child.id || '|' || child.parent_conversation_id || '|'
+    FROM conversations child
+    WHERE child.runtime_role = 'sub_agent'
+      AND child.parent_conversation_id IS NOT NULL
+    UNION ALL
+    SELECT ancestors.child_id, parent.parent_conversation_id, ancestors.depth + 1,
+           ancestors.path || parent.parent_conversation_id || '|'
+    FROM ancestors
+    JOIN conversations parent ON parent.id = ancestors.ancestor_id
+    WHERE parent.runtime_role = 'sub_agent'
+      AND parent.parent_conversation_id IS NOT NULL
+      AND instr(ancestors.path, '|' || parent.parent_conversation_id || '|') = 0
+), eligible_ancestors(child_id, ancestor_id, depth) AS (
+    SELECT ancestors.child_id, ancestors.ancestor_id, ancestors.depth
+    FROM ancestors
+    JOIN conversations child ON child.id = ancestors.child_id
+    JOIN conversations ancestor ON ancestor.id = ancestors.ancestor_id
+    WHERE ancestor.product_conversation_id = child.product_conversation_id
+      AND ancestor.runtime_role IN ('user', 'coordinator')
+)
+UPDATE conversations AS child
+SET parent_conversation_id = (
+    SELECT eligible_ancestors.ancestor_id
+    FROM eligible_ancestors
+    WHERE eligible_ancestors.child_id = child.id
+    ORDER BY eligible_ancestors.depth
+    LIMIT 1
+)
+WHERE child.runtime_role = 'sub_agent'
+  AND NOT EXISTS (
+      SELECT 1 FROM conversations parent
+      WHERE parent.id = child.parent_conversation_id
+        AND parent.product_conversation_id = child.product_conversation_id
+        AND parent.runtime_role IN ('user', 'coordinator')
+  )
+  AND EXISTS (
+      SELECT 1 FROM eligible_ancestors
+      WHERE eligible_ancestors.child_id = child.id
+  );
+
+UPDATE conversations
+SET runtime_role = runtime_role
+WHERE runtime_role = 'sub_agent';
 ";
 
 const MIGRATION_072: &str = r"
@@ -13448,6 +13516,14 @@ mod tests {
         .await
         .unwrap();
         assert!(sqlx::query(
+            "UPDATE conversations
+             SET runtime_role = 'sub_agent', parent_conversation_id = id
+             WHERE id = 'b'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
             "UPDATE conversations SET continued_in_conv_id = 'a-fork'
              WHERE id = 'valid-child'",
         )
@@ -13498,6 +13574,99 @@ mod tests {
         .execute(&pool)
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_073_reparents_preexisting_recursive_subordinate_parent() {
+        let pool = test_pool().await;
+        setup_schema_before_migration_070(&pool).await;
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('ordinary-a', 'ordinary', 'open');
+             INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES ('scope-a', 'work', 'unowned_cwd', '/tmp/a', '2025-01-01', '2025-01-01');
+             INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES
+                 ('root', 'ordinary-a', NULL, 'user', 1, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('first-subordinate', 'ordinary-a', 'root', 'sub_agent', 0, 'scope-a',
+                  '2025-01-01', '2025-01-01', '2025-01-01'),
+                 ('recursive-subordinate', 'ordinary-a', 'first-subordinate', 'sub_agent', 0,
+                  'scope-a', '2025-01-01', '2025-01-01', '2025-01-01');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM _migrations WHERE version = 73")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 1);
+        let parent: String = sqlx::query_scalar(
+            "SELECT parent_conversation_id FROM conversations WHERE id = 'recursive-subordinate'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(parent, "root");
+    }
+
+    #[tokio::test]
+    async fn migration_073_rejects_unrecoverable_recursive_subordinate_cycle() {
+        let pool = test_pool().await;
+        setup_schema_before_migration_070(&pool).await;
+        sqlx::query(
+            "INSERT INTO _migrations (version, name)
+             VALUES (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 3);
+
+        sqlx::raw_sql(
+            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle)
+             VALUES ('ordinary-a', 'ordinary', 'open');
+             INSERT INTO work_scopes (
+                 id, authority_kind, environment_kind, cwd, created_at, updated_at
+             ) VALUES ('scope-a', 'work', 'unowned_cwd', '/tmp/a', '2025-01-01', '2025-01-01');
+             INSERT INTO conversations (
+                 id, product_conversation_id, parent_conversation_id, runtime_role,
+                 user_initiated, work_scope_id, state_updated_at, created_at, updated_at
+             ) VALUES ('self-cycle', 'ordinary-a', NULL, 'user', 1, 'scope-a',
+                       '2025-01-01', '2025-01-01', '2025-01-01');
+             UPDATE conversations
+             SET runtime_role = 'sub_agent', parent_conversation_id = id
+             WHERE id = 'self-cycle';",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM _migrations WHERE version = 73")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(run_pending_migrations(&pool).await.is_err());
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _migrations WHERE version = 73)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
