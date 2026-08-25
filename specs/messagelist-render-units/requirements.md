@@ -361,6 +361,12 @@ THE SYSTEM SHALL preserve the tail by issuing exactly one VirtualTranscript
 scroll-to-tail command
 AND SHALL keep unread-tail state clear
 
+WHEN a key that drives the transcript in either direction is pressed while
+it has focus
+THE SYSTEM SHALL treat it as the user taking the viewport over
+SO THAT a positioning command in flight yields to a reader who keys their own
+way to the tail, in either direction
+
 WHEN upward wheel or viewport movement, a moved touch, or a conversation-
 navigation jump indicates that the user is reading earlier content
 THE SYSTEM SHALL transfer viewport ownership to the user immediately
@@ -395,8 +401,9 @@ WHEN the rendered range reaches the start of loaded history
 THE SYSTEM SHALL acquire earlier history only if the reader moved the
 viewport there — while reading, or while a navigation the reader has taken
 over is returning under their control
-AND SHALL NOT acquire it from a range change produced by a positioning
-command still running
+AND SHALL apply that condition whatever noticed the boundary, since a
+positioning command that scrolls a target into view directly is
+indistinguishable from reader movement at the scroll event alone
 SO THAT a jump that lands near the start of loaded history does not
 recursively acquire more of it, while a reader who drags there after such a
 jump is not left at a boundary that never expands

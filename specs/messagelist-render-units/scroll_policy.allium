@@ -667,11 +667,14 @@ rule LeavingBottomDuringTouchIsRemembered {
     ensures: policy.gesture_departed_bottom = true
 }
 
+-- A finger on the screen is a claim on the viewport whether or not it has
+-- moved yet, so the edge records geometry and the lift decides.
 rule BottomDuringStationaryTouchOnlyUpdatesGeometry {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = true
     requires: policy.gesture_mode = touch_stationary
     ensures: policy.at_bottom = true
+    ensures: policy.follow_mode = policy.follow_mode
 }
 
 rule BottomDuringMovedTouchCannotReleaseOwnership {

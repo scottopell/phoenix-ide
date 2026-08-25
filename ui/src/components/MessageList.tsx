@@ -1065,13 +1065,22 @@ function MessageListImpl({
         }
         updateEarlierHistoryRestoreRef.current();
       };
+      const UPWARD_KEYS = new Set(['ArrowUp', 'PageUp', 'Home']);
+      const DOWNWARD_KEYS = new Set(['ArrowDown', 'PageDown', 'End', ' ']);
       const onKeyDown = (e: KeyboardEvent) => {
         const target = e.target;
         const readsTranscript = target === document.body || (target instanceof Node && ref.contains(target));
-        if (!readsTranscript || (e.key !== 'ArrowUp' && e.key !== 'PageUp' && e.key !== 'Home')) return;
+        if (!readsTranscript) return;
+        const upward = UPWARD_KEYS.has(e.key);
+        // Keys that drive the transcript toward the tail take the viewport
+        // over just as upward ones do. Recognising only upward keys left a
+        // jump stuck in its positioning phase, which then refused to confirm
+        // the arrival the reader had keyed their way to.
+        if (!upward && !DOWNWARD_KEYS.has(e.key)) return;
         abandonStaleGesture();
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'interactionStarted' });
+        if (!upward) return;
         dispatchScrollEvent({ type: 'upwardIntent' });
         requestFromUpwardIntent();
       };
@@ -1317,7 +1326,12 @@ function MessageListImpl({
       || !onLoadOlderMessages
       || (!ownsCurrentView && source !== 'retry')
       || (olderHistoryError && source !== 'retry')
-      || (source === 'range' && !readerMoved)
+      // Which signal noticed the boundary does not change who moved the
+      // viewport to it. Find navigation scrolls rows into view directly,
+      // without going through the transcript, so those writes look like
+      // upward intent — and a positioning-owned search must not walk itself
+      // backwards through history (REQ-MLRU-014).
+      || (source !== 'retry' && !readerMoved)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');

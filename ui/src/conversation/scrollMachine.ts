@@ -429,9 +429,14 @@ export function reduceScrollMachine(
       if (!event.atBottom || next.kind === 'mount-rescue') {
         return { state: next, effects: [] };
       }
+      // The edge says where the viewport is, and a finger on the screen is
+      // the reader's claim on it whether or not it has moved yet. Confirming
+      // under a stationary touch would hand the tail back mid-interaction and
+      // snap the next growth out from under them; the lift decides instead,
+      // from its own measurement.
       if (
         (next.kind === 'live' && next.follow.kind === 'navigating' && next.follow.phase === 'positioning') ||
-        (next.gesture.kind === 'touch' && next.gesture.moved)
+        next.gesture.kind === 'touch'
       ) {
         return { state: next, effects: [] };
       }

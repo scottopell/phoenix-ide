@@ -368,6 +368,44 @@ describe('scrollMachine durable follow policy', () => {
     expectLiveMode(reduceScrollMachine(next, { type: 'touchEnded', remainingTouches: 0 }).state, 'reading');
   });
 
+  it('the pinned edge does not confirm while a finger is on the screen', () => {
+    // A stationary touch has claimed the viewport even though it has not
+    // moved yet. Content shifting beneath it can reach the physical edge, and
+    // confirming there would hand the tail back mid-interaction.
+    const state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    const during = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(during.state, 'reading');
+    expect(effectTypes(during.effects)).not.toContain('clearUnread');
+
+    // The lift decides, from the endpoint it measures for itself. Here the
+    // gesture never travelled, so ownership stays with the reader.
+    const lifted = reduceScrollMachine(during.state, {
+      type: 'touchEnded',
+      remainingTouches: 0,
+      snapshot: snap(1_000, 100, 400),
+    });
+    expectLiveMode(lifted.state, 'reading');
+  });
+
+  it('a braking touch that rides momentum to the tail still confirms on lift', () => {
+    // The companion case: the same stationary touch, but momentum carried the
+    // viewport down under it. That travel is observed, so the lift confirms —
+    // which is why withholding the pinned confirmation costs nothing here.
+    let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'tailContentAdvanced' }).state;
+    expect(state.kind === 'live' && state.unread).toBe(true);
+    state = reduceScrollMachine(state, { type: 'downwardMovement', snapshot: snap(1_000, 600, 400) }).state;
+    state = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true }).state;
+
+    const lifted = reduceScrollMachine(state, {
+      type: 'touchEnded',
+      remainingTouches: 0,
+      snapshot: snap(1_000, 600, 400),
+    });
+    expectLiveMode(lifted.state, 'following');
+    expect(lifted.state.kind === 'live' && lifted.state.unread).toBe(false);
+  });
+
   it('a gesture that departs the tail and returns to it confirms on lift', () => {
     // The same start and end position as the case above; only the travel in
     // between distinguishes them, which is why the maximum is recorded.

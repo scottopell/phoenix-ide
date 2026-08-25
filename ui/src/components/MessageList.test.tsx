@@ -3619,6 +3619,44 @@ describe('handleTotalListHeightChanged', () => {
     expect(container.querySelector('.jump-to-newest')).not.toBeNull();
   });
 
+  it('keying downward after a jump takes the viewport over and confirms at the tail', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          ref={listRef}
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-downward-keys"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.pinnedChanged?.(false));
+
+    // A jump takes the viewport; the reader then keys their own way down to
+    // the tail. Only upward keys used to count as taking over, so the jump
+    // stayed in its positioning phase and the arrival was refused.
+    act(() => listRef.current?.scrollToUnitIndex(0));
+    fireEvent.keyDown(scroller, { key: 'PageDown' });
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // Following again, so streamed growth follows the tail instead of
+    // raising a chip the reader already keyed past.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 700, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(
