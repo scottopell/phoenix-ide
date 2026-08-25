@@ -348,6 +348,11 @@ pub struct ConversationRouteResponse {
     pub slug: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProductConversationRouteResponse {
+    pub transcript_row_id: String,
+}
+
 /// Response with conversation and messages
 #[derive(Debug, Serialize)]
 pub struct ConversationWithMessagesResponse {

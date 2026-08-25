@@ -140,10 +140,13 @@ function ProductConversationPage() {
       .then((route) => {
         if (!cancelled) {
           navigate({
-            pathname: `/c/${route.slug ?? route.id}`,
+            pathname: `/c/${route.transcript_row_id}`,
             search: location.search,
             hash: location.hash,
-          }, { replace: true });
+          }, {
+            replace: true,
+            state: { preserveTranscriptRouteId: true },
+          });
         }
       })
       .catch(() => {

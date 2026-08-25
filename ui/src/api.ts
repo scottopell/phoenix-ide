@@ -634,6 +634,10 @@ export interface ConversationRouteResponse {
   slug: string | null;
 }
 
+export interface ProductConversationRouteResponse {
+  transcript_row_id: string;
+}
+
 export interface ConversationMessageTombstone {
   [key: string]: unknown;
 }
@@ -1630,7 +1634,7 @@ export const api = {
     return resp.json();
   },
 
-  async getProductConversationRoute(productConversationId: string): Promise<ConversationRouteResponse> {
+  async getProductConversationRoute(productConversationId: string): Promise<ProductConversationRouteResponse> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(productConversationId)}/route`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');

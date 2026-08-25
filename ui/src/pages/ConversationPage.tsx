@@ -851,7 +851,10 @@ function ConversationPageContent({
       const route = await resolveConversationRoute(slug);
       if (cancelled) return;
       setResolvedRouteConversationId(route.id);
-      if (route.slug && route.slug !== slug && routePrefix === '/c') {
+      const preserveTranscriptRouteId = (
+        locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
+      )?.preserveTranscriptRouteId === true;
+      if (route.slug && route.slug !== slug && routePrefix === '/c' && !preserveTranscriptRouteId) {
         navigate({
           pathname: `/c/${route.slug}`,
           search: locationRef.current.search,

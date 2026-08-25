@@ -34,11 +34,11 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse,
-    RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse,
-    SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    NotificationSettingsRequest, ProductConversationRouteResponse, ProjectFileSearchQuery,
+    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, ReconcileAcceptedMessagesRequest,
+    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
+    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -3429,7 +3429,7 @@ fn product_route_db_to_app(error: DbError) -> AppError {
 async fn get_product_conversation_route(
     State(state): State<AppState>,
     Path(reference): Path<String>,
-) -> Result<Json<ConversationRouteResponse>, AppError> {
+) -> Result<Json<ProductConversationRouteResponse>, AppError> {
     let db = state.runtime.db();
     let resolved = db
         .resolve_ordinary_product_conversation(&reference)
@@ -3441,9 +3441,8 @@ async fn get_product_conversation_route(
         .map_err(product_route_db_to_app)?
         .root
         .conversation;
-    Ok(Json(ConversationRouteResponse {
-        id: conversation.id,
-        slug: conversation.slug,
+    Ok(Json(ProductConversationRouteResponse {
+        transcript_row_id: conversation.id,
     }))
 }
 
@@ -16595,9 +16594,68 @@ mod conversation_route_tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(body["id"], root.id);
-        assert_eq!(body["slug"], "root-slug");
-        assert_ne!(body["id"], successor.id);
+        assert_eq!(body["transcript_row_id"], root.id);
+        assert_ne!(body["transcript_row_id"], successor.id);
+    }
+
+    #[tokio::test]
+    async fn product_route_returns_root_id_when_root_slug_looks_like_another_id() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "root-id",
+                "00000000-0000-0000-0000-000000000001",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let colliding = state
+            .db
+            .create_conversation(
+                "00000000-0000-0000-0000-000000000001",
+                "other",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let product = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/product-conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let product: serde_json::Value =
+            serde_json::from_slice(&to_bytes(product.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(product["transcript_row_id"], root.id);
+
+        let direct = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/conversations/{}/route", colliding.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&to_bytes(direct.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(direct["id"], colliding.id);
     }
 
     #[tokio::test]
@@ -16653,7 +16711,7 @@ mod conversation_route_tests {
         let product: serde_json::Value =
             serde_json::from_slice(&to_bytes(product.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(product["id"], root.id);
+        assert_eq!(product["transcript_row_id"], root.id);
     }
 }
 
