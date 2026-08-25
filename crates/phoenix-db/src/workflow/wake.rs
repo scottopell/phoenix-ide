@@ -589,7 +589,12 @@ impl WakeRepository {
         let mut tx = self.workflow_repo.begin_tx().await?;
         let existing = fetch_existing_binding_tx(&mut tx, input).await?;
         if let Some(existing) = existing {
-            let exact_replay = existing.prepared_fingerprint == prepared_fingerprint;
+            let exact_replay = existing.prepared_fingerprint == prepared_fingerprint
+                && existing.expires_at == input.expires_at
+                && existing.registration_scope == input.registration_scope
+                && existing.conversation_id == input.conversation_id
+                && existing.resource == input.resource
+                && existing.registering_tool_use_id == input.registering_tool_use_id;
             if exact_replay {
                 match admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation_id)
                     .await?
@@ -6344,6 +6349,14 @@ mod tests {
         ));
         assert!(matches!(
             repo.register(&input, "changed", Timestamp(10))
+                .await
+                .unwrap_err(),
+            DbError::CloseAdmissionFenced(_)
+        ));
+        let mut changed_expiry = input;
+        changed_expiry.expires_at = Timestamp(11);
+        assert!(matches!(
+            repo.register(&changed_expiry, "exact", Timestamp(10))
                 .await
                 .unwrap_err(),
             DbError::CloseAdmissionFenced(_)

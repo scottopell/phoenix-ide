@@ -283,10 +283,11 @@ rule ResolveTargetAndPrepareImmutablePayloadBeforeAcceptance {
     requires: target_resolution_preserves_permissions(request)
 
     let resolved_target = resolved_target_for(request)
-    requires: not active_close_obligation(resolved_target.conversation.product_conversation)
     let prepared_payload = prepared_payload_for(request, resolved_target)
     let prepared_fingerprint = prepared_fingerprint_for(resolved_target, prepared_payload)
     let turn_key = target_bound_key(resolved_target, prepared_payload.user_message_id)
+    requires: not active_close_obligation(resolved_target.product_conversation)
+        or same_key_existing_acceptance(turn_key) != null
 
     ensures: parts_are_fully_resolved(prepared_payload.parts)
     ensures: prepared_fingerprint.resolved_target_key = resolved_target_key(resolved_target)
@@ -436,7 +437,7 @@ rule ActiveCloseObligationFencesNewDirectTurnAdmission {
     let resolved_target = resolved_target_for(request)
     let turn_key = target_bound_key(resolved_target, request.client_message_id)
 
-    requires: active_close_obligation(resolved_target.conversation.product_conversation)
+    requires: active_close_obligation(resolved_target.product_conversation)
     requires: same_key_existing_acceptance(turn_key) = null
 
     ensures: DirectChatOutcome.created(
@@ -458,7 +459,7 @@ rule ActiveCloseObligationAllowsExactDirectTurnReplay {
     let resolved_target = resolved_target_for(request)
     let turn_key = target_bound_key(resolved_target, request.client_message_id)
 
-    requires: active_close_obligation(resolved_target.conversation.product_conversation)
+    requires: active_close_obligation(resolved_target.product_conversation)
     requires: same_key_existing_acceptance(turn_key) != null
     requires: request_matches_existing_acceptance(request, same_key_existing_acceptance(turn_key))
     requires: same_key_existing_acceptance(turn_key).committed_outcome != null

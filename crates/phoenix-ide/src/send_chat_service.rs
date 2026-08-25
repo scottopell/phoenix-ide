@@ -181,18 +181,6 @@ impl SendChatApplicationService {
             }
         }
 
-        if should_enqueue_steering(&acceptability)
-            && self
-                .runtime
-                .db()
-                .steering_queue_depth(&conversation.id)
-                .await
-                .map_err(map_conversation_load_error)?
-                >= crate::db::MAX_STEERING_QUEUE_DEPTH
-        {
-            return Ok(steering_queue_full_outcome());
-        }
-
         let validated_files = validate_files(&req).await?;
         let expanded = expand_request(&self.db, &conversation, &req).await?;
         let acceptance_state = self
@@ -239,9 +227,6 @@ impl SendChatApplicationService {
                 }
             }
 
-            if steering_queue.len() >= crate::db::MAX_STEERING_QUEUE_DEPTH {
-                return Ok(steering_queue_full_outcome());
-            }
             let event = Event::SteerMessage {
                 text: expanded.display_text.clone(),
                 llm_text: expanded.llm_text,
