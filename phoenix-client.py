@@ -743,10 +743,18 @@ def print_search_hits(hits: list[dict]) -> None:
         prov = f" [{msg_type}" if msg_type else ''
         if created_at:
             prov += f" {created_at}" if msg_type else f" [{created_at}"
-        # Exact identifiers so automation can pin the transcript entry.
+        # Exact identifiers so automation can correlate the result with its
+        # exact transcript entry. Emit the full conversation_id and message_id
+        # (not the slug / a truncated id), matching ConversationContentSource.
+        conv_id = h.get('conversation_id') or ''
         msg_id = h.get('message_id') or ''
+        ids = []
+        if conv_id:
+            ids.append(f"conv={conv_id}")
         if msg_id:
-            prov += f" msg={msg_id[:8]}"
+            ids.append(f"msg={msg_id}")
+        if ids:
+            prov += ' ' + ' '.join(ids) if prov else ' [' + ' '.join(ids)
         if prov:
             prov += ']'
         click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{prov}{archived}")
@@ -803,7 +811,11 @@ def _render_checkout_status(cs: object) -> str:
                 base += f"  upstream-unavailable({rs.get('reason', '?')})"
         return base
     if kind == 'detached':
-        return f"detached@{cs.get('head_oid', '?')[:8]}"
+        base = f"detached@{cs.get('head_oid', '?')[:8]}"
+        refs = cs.get('pointing_refs') or []
+        if refs:
+            base += f"  refs={','.join(refs)}"
+        return base
     if kind == 'unborn':
         return f"unborn({cs.get('branch_name') or '?'})"
     if kind == 'unavailable':
