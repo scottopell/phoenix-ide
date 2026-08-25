@@ -824,6 +824,7 @@ function ProductConversationPageInner() {
               priority={taskApprovalOverlay.priority}
               plan={taskApprovalOverlay.plan}
               contextWindowUsed={approvalContextWindowUsed ?? undefined}
+              modelContextWindow={latestProjection.modelContextWindow}
               onApprove={(handoff) => api.approveTask(taskApprovalOverlay.conversationId, handoff).then(() => {}).catch(() => {})}
               onReject={() => api.rejectTask(taskApprovalOverlay.conversationId).then(() => {}).catch(() => {})}
               onSendFeedback={(annotations) => api.sendTaskFeedback(taskApprovalOverlay.conversationId, annotations).then(() => {}).catch(() => {})}

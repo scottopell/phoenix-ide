@@ -461,8 +461,8 @@ export function Sidebar({
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
-          conversations={productConversationsError && productConversations.length === 0 ? conversations : []}
-          archivedConversations={productConversationsError && productConversations.length === 0 ? archivedConversations : []}
+          conversations={conversations}
+          archivedConversations={archivedConversations}
           productConversations={openProductConversations}
           archivedProductConversations={archivedProductConversations}
           showArchived={showArchived}

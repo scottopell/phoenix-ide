@@ -189,6 +189,7 @@ export interface EmbeddedConversationProjection {
   onOpenFile: (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void;
   filePathRootDir: string;
   systemPrompt?: string | undefined;
+  modelContextWindow?: number | undefined;
 }
 
 interface EmbeddedConversationHostProps {
@@ -559,6 +560,9 @@ function ConversationPageContent({
 
   // Shared models/credential poller — one request loop app-wide.
   const { models: availableModels, credentialStatus, defaultModel } = useModels();
+  const matchingModel = availableModels.find((model) => model.id === atom.conversation?.model);
+  const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
+  const modelContextWindow = actualModelContextWindow ?? 200_000;
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
@@ -1756,6 +1760,7 @@ function ConversationPageContent({
       onOpenFile: handleOpenFileFromPatch,
       filePathRootDir: conversation?.worktree_path ?? conversation?.cwd ?? '/',
       systemPrompt: atom.systemPrompt ?? undefined,
+      ...(actualModelContextWindow ? { modelContextWindow: actualModelContextWindow } : {}),
     });
     return () => {
       onProjectionChange(null);
@@ -1775,6 +1780,7 @@ function ConversationPageContent({
     conversation?.worktree_path,
     conversation?.cwd,
     atom.systemPrompt,
+    actualModelContextWindow,
   ]);
 
   const localCreateIntent = readCreateIntent(conversationId);
@@ -2072,15 +2078,6 @@ function ConversationPageContent({
       );
     }
   }
-
-  // Derived: model context window is a pure function of the current model's
-  // spec. Falls back to 200_000 for legacy surfaces when availableModels hasn't
-  // loaded yet or the model isn't in the registry.
-  const matchingModel = availableModels
-    ? availableModels.find((model) => model.id === atom.conversation?.model)
-    : undefined;
-  const actualModelContextWindow = matchingModel ? matchingModel.context_window : null;
-  const modelContextWindow = actualModelContextWindow ?? 200_000;
 
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
   // when this conversation was spawned from another via a seed action.
