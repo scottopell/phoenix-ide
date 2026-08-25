@@ -245,13 +245,22 @@ pub struct ProductConversationTranscriptRowView {
     pub title: Option<String>,
 }
 
+/// The presentation state of an ordinary `ProductConversation`.
+///
+/// History/open is exclusively `ordinary_lifecycle`; presentation cannot carry a
+/// second archival flag. The tagged variants make action-needed and ordinary
+/// state displays mutually exclusive on the wire.
 #[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ProductConversationPresentationView {
-    pub display_name: String,
-    pub presentation_mode: String,
-    pub requires_action: bool,
-    pub archived: bool,
+pub enum ProductConversationPresentationView {
+    NeedsAction {
+        display_name: String,
+    },
+    State {
+        display_name: String,
+        presentation_mode: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -282,6 +291,7 @@ pub struct ProductConversationHandoffView {
     pub predecessor_transcript_row_id: String,
     pub successor_transcript_row_id: String,
     pub continuation_message_id: String,
+    pub accepted_successor_message_id: String,
     pub summary: String,
 }
 

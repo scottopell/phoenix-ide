@@ -4926,13 +4926,7 @@ async fn dispatch_continuation_handoff(
             // before executor persistence remains replayable.
             (ContinueConversationStatus::Accepted, None)
         }
-        Ok(
-            crate::send_chat_service::SendChatOutcome::AlreadyPersisted
-            | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
-        ) => {
-            // Both outcomes have another durable representation. Normally the
-            // message trigger has already consumed the intent for AlreadyPersisted;
-            // this delete also handles durable steering and reconciliation.
+        Ok(crate::send_chat_service::SendChatOutcome::AlreadyPersisted) => {
             if let Err(error) = state
                 .db
                 .delete_continuation_dispatch_intent(&parent_id)
@@ -4945,6 +4939,11 @@ async fn dispatch_continuation_handoff(
                     "handoff is durable but continuation intent cleanup failed",
                 );
             }
+            (ContinueConversationStatus::Accepted, None)
+        }
+        Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => {
+            // The opening message is not persisted yet. Its INSERT trigger consumes
+            // this intent and records the completed handoff atomically.
             (ContinueConversationStatus::Accepted, None)
         }
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {

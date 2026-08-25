@@ -4,6 +4,7 @@ use phoenix_core::domain::product_conversation::{
     ProductConversationKind,
 };
 use phoenix_core::work_scope::RuntimeRole;
+use serde::Serialize;
 use sqlx::{Executor, Row, SqliteConnection};
 
 use crate::{Database, DbError, DbResult, MessageContent, MessageType};
@@ -45,6 +46,17 @@ pub struct ProductConversationSnapshotRead {
     pub requested_transcript_row_id: String,
 }
 
+/// A per-segment upper bound captured with an aggregate page cursor.
+///
+/// Bounds keep pagination on the original message snapshot while later tail
+/// appends remain visible to a fresh read. Topology remains validated separately.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductConversationSegmentCeiling {
+    pub transcript_row_id: String,
+    pub tail_sequence_id: i64,
+    pub tail_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductConversationTranscriptRow {
     pub conversation: crate::Conversation,
@@ -75,6 +87,7 @@ pub struct ProductConversationHandoff {
     pub predecessor_transcript_row_id: String,
     pub successor_transcript_row_id: String,
     pub continuation_message_id: String,
+    pub accepted_successor_message_id: String,
     pub summary: String,
 }
 
@@ -361,13 +374,13 @@ impl Database {
         for transcript_row in transcript_rows {
             debug_assert_eq!(transcript_row.conversation.runtime_role, RuntimeRole::User);
             let handoff = match transcript_row.conversation.continued_in_conv_id.as_deref() {
-                Some(successor_transcript_row_id) => Some(
-                    self.persisted_continuation_handoff(
+                Some(successor_transcript_row_id) => {
+                    self.completed_continuation_handoff(
                         &transcript_row.conversation.id,
                         successor_transcript_row_id,
                     )
-                    .await?,
-                ),
+                    .await?
+                }
                 None => None,
             };
             segments.push(ProductConversationSegment {
@@ -411,6 +424,7 @@ impl Database {
         &self,
         reference: &str,
         before: Option<(i64, i64, String)>,
+        segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<ProductConversationSnapshotRead> {
         let mut connection = self.pool.acquire().await?;
@@ -427,6 +441,7 @@ impl Database {
                 &mut connection,
                 aggregate.product_conversation.id(),
                 before,
+                segment_ceilings,
                 limit,
             )
             .await?;
@@ -535,14 +550,14 @@ impl Database {
         let mut segments = Vec::with_capacity(transcript_rows.len());
         for transcript_row in transcript_rows {
             let handoff = match transcript_row.conversation.continued_in_conv_id.as_deref() {
-                Some(successor) => Some(
-                    Self::persisted_continuation_handoff_on(
+                Some(successor) => {
+                    Self::completed_continuation_handoff_on(
                         connection,
                         &transcript_row.conversation.id,
                         successor,
                     )
-                    .await?,
-                ),
+                    .await?
+                }
                 None => None,
             };
             segments.push(ProductConversationSegment {
@@ -591,35 +606,49 @@ impl Database {
         })
     }
 
-    async fn persisted_continuation_handoff_on(
+    /// Returns the completed handoff relation when it was recorded at acceptance.
+    ///
+    /// `None` is historical absence: predecessors completed before migration 074
+    /// had no durable handoff relation and must not be guessed from transcript rows.
+    async fn completed_continuation_handoff_on(
         connection: &mut SqliteConnection,
         predecessor: &str,
         successor: &str,
-    ) -> DbResult<ProductConversationHandoff> {
-        let row = sqlx::query("SELECT message_id, content FROM messages WHERE conversation_id = ?1 AND message_type = 'continuation' ORDER BY sequence_id DESC, message_id DESC LIMIT 1")
-            .bind(predecessor).fetch_optional(&mut *connection).await?;
-        let Some(row) = row else {
-            return Err(DbError::Serialization(format!(
-                "continuation edge from {predecessor} has no persisted continuation message"
-            )));
-        };
-        let content: serde_json::Value =
-            serde_json::from_str(&row.try_get::<String, _>("content")?)
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let MessageContent::Continuation(content) =
-            MessageContent::from_stored_json(MessageType::Continuation, content)
-                .map_err(DbError::Serialization)?
-        else {
-            return Err(DbError::Serialization(
-                "continuation message parsed as another content type".to_string(),
-            ));
-        };
-        Ok(ProductConversationHandoff {
-            predecessor_transcript_row_id: predecessor.to_string(),
-            successor_transcript_row_id: successor.to_string(),
-            continuation_message_id: row.try_get("message_id")?,
-            summary: content.summary,
+    ) -> DbResult<Option<ProductConversationHandoff>> {
+        let row = sqlx::query(
+            "SELECT handoff.continuation_message_id, handoff.accepted_successor_message_id,
+                    continuation.content
+             FROM completed_continuation_handoffs handoff
+             JOIN messages continuation
+               ON continuation.message_id = handoff.continuation_message_id
+             WHERE handoff.predecessor_conversation_id = ?1
+               AND handoff.successor_conversation_id = ?2",
+        )
+        .bind(predecessor)
+        .bind(successor)
+        .fetch_optional(&mut *connection)
+        .await?;
+        row.map(|row| {
+            let content: serde_json::Value =
+                serde_json::from_str(&row.try_get::<String, _>("content")?)
+                    .map_err(|error| DbError::Serialization(error.to_string()))?;
+            let MessageContent::Continuation(content) =
+                MessageContent::from_stored_json(MessageType::Continuation, content)
+                    .map_err(DbError::Serialization)?
+            else {
+                return Err(DbError::Serialization(
+                    "completed handoff references a non-continuation message".to_string(),
+                ));
+            };
+            Ok(ProductConversationHandoff {
+                predecessor_transcript_row_id: predecessor.to_string(),
+                successor_transcript_row_id: successor.to_string(),
+                continuation_message_id: row.try_get("continuation_message_id")?,
+                accepted_successor_message_id: row.try_get("accepted_successor_message_id")?,
+                summary: content.summary,
+            })
         })
+        .transpose()
     }
 
     async fn product_conversation_source_on(
@@ -654,15 +683,21 @@ impl Database {
         connection: &mut SqliteConnection,
         product_conversation_id: &ProductConversationId,
         before: Option<(i64, i64, String)>,
+        segment_ceilings: Option<&[ProductConversationSegmentCeiling]>,
         limit: usize,
     ) -> DbResult<Vec<(i64, crate::Message)>> {
-        let mut rows = Self::message_page_query(product_conversation_id, before, limit)
-            .try_map(|row| {
-                let ordinal: i64 = row.try_get("ordinal")?;
-                super::parse_message_row(row).map(|message| (ordinal, message))
-            })
-            .fetch_all(&mut *connection)
-            .await?;
+        let segment_ceilings = segment_ceilings
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let mut rows =
+            Self::message_page_query(product_conversation_id, before, segment_ceilings, limit)
+                .try_map(|row| {
+                    let ordinal: i64 = row.try_get("ordinal")?;
+                    super::parse_message_row(row).map(|message| (ordinal, message))
+                })
+                .fetch_all(&mut *connection)
+                .await?;
         let mut messages = rows
             .iter()
             .map(|(_, message)| message.clone())
@@ -677,6 +712,7 @@ impl Database {
     fn message_page_query(
         product_conversation_id: &ProductConversationId,
         before: Option<(i64, i64, String)>,
+        segment_ceilings: Option<String>,
         limit: usize,
     ) -> sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
         let before_ordinal = before.as_ref().map(|(ordinal, _, _)| *ordinal);
@@ -687,9 +723,19 @@ impl Database {
              AND NOT EXISTS (SELECT 1 FROM conversations predecessor WHERE predecessor.product_conversation_id = root.product_conversation_id AND predecessor.continued_in_conv_id = root.id)
              UNION ALL SELECT successor.id, transcript.ordinal + 1 FROM transcript JOIN conversations predecessor ON predecessor.id = transcript.id JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
              WHERE successor.product_conversation_id = ?1 AND successor.runtime_role = 'user' AND successor.parent_conversation_id IS NULL
+         ), snapshot_ceiling AS (
+             SELECT json_extract(value, '$.transcript_row_id') AS transcript_row_id,
+                    json_extract(value, '$.tail_sequence_id') AS tail_sequence_id,
+                    json_extract(value, '$.tail_message_id') AS tail_message_id
+             FROM json_each(?2)
          ) SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at, transcript.ordinal FROM transcript JOIN messages ON messages.conversation_id = transcript.id
-         WHERE (?2 IS NULL OR transcript.ordinal < ?2 OR (transcript.ordinal = ?2 AND (messages.sequence_id < ?3 OR (messages.sequence_id = ?3 AND messages.message_id < ?4)))) ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?5")
-        .bind(product_conversation_id.as_str().to_string()).bind(before_ordinal).bind(before_sequence_id).bind(before_message_id).bind(i64::try_from(limit).expect("page limit fits i64"))
+         WHERE NOT EXISTS (
+                 SELECT 1 FROM completed_continuation_handoffs handoff
+                 WHERE handoff.accepted_successor_message_id = messages.message_id
+             )
+           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM snapshot_ceiling ceiling WHERE ceiling.transcript_row_id = transcript.id AND (messages.sequence_id < ceiling.tail_sequence_id OR (messages.sequence_id = ceiling.tail_sequence_id AND messages.message_id <= ceiling.tail_message_id))))
+           AND (?3 IS NULL OR transcript.ordinal < ?3 OR (transcript.ordinal = ?3 AND (messages.sequence_id < ?4 OR (messages.sequence_id = ?4 AND messages.message_id < ?5)))) ORDER BY transcript.ordinal DESC, messages.sequence_id DESC, messages.message_id DESC LIMIT ?6")
+        .bind(product_conversation_id.as_str().to_string()).bind(segment_ceilings).bind(before_ordinal).bind(before_sequence_id).bind(before_message_id).bind(i64::try_from(limit).expect("page limit fits i64"))
     }
 
     /// Fetches one bounded, newest-first page across the ordered aggregate transcript.
@@ -768,41 +814,22 @@ impl Database {
         Ok(rows)
     }
 
-    async fn persisted_continuation_handoff(
+    /// Returns the acceptance-time handoff relation, if this edge has one.
+    ///
+    /// `None` is historical absence: migration 074 deliberately does not invent
+    /// a relation for pre-feature continuation edges.
+    async fn completed_continuation_handoff(
         &self,
         predecessor_transcript_row_id: &str,
         successor_transcript_row_id: &str,
-    ) -> DbResult<ProductConversationHandoff> {
-        let row = sqlx::query(
-            "SELECT message_id, content FROM messages
-             WHERE conversation_id = ?1 AND message_type = 'continuation'
-             ORDER BY sequence_id DESC, message_id DESC LIMIT 1",
+    ) -> DbResult<Option<ProductConversationHandoff>> {
+        let mut connection = self.pool.acquire().await?;
+        Self::completed_continuation_handoff_on(
+            &mut connection,
+            predecessor_transcript_row_id,
+            successor_transcript_row_id,
         )
-        .bind(predecessor_transcript_row_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Err(DbError::Serialization(format!(
-                "continuation edge from {predecessor_transcript_row_id} has no persisted continuation message"
-            )));
-        };
-        let content: serde_json::Value =
-            serde_json::from_str(&row.try_get::<String, _>("content")?)
-                .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let MessageContent::Continuation(content) =
-            MessageContent::from_stored_json(MessageType::Continuation, content)
-                .map_err(DbError::Serialization)?
-        else {
-            return Err(DbError::Serialization(
-                "continuation message parsed as another content type".to_string(),
-            ));
-        };
-        Ok(ProductConversationHandoff {
-            predecessor_transcript_row_id: predecessor_transcript_row_id.to_string(),
-            successor_transcript_row_id: successor_transcript_row_id.to_string(),
-            continuation_message_id: row.try_get("message_id")?,
-            summary: content.summary,
-        })
+        .await
     }
 
     async fn product_conversation_source(
@@ -865,7 +892,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+    use crate::{
+        ContinuationContent, ContinueOutcome, ConvState, MessageContent,
+        NewContinuationDispatchIntent,
+    };
 
     #[tokio::test]
     async fn resolves_member_identity_and_reads_typed_handoff() {
@@ -882,7 +912,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let successor = match db.continue_conversation(&root.id).await.unwrap() {
+        let (outcome, _) = db
+            .continue_conversation_with_intent(
+                &root.id,
+                NewContinuationDispatchIntent {
+                    message_id: "opening".to_string(),
+                    handoff: "accepted opening handoff".to_string(),
+                    user_agent: None,
+                },
+            )
+            .await
+            .unwrap();
+        let successor = match outcome {
             ContinueOutcome::Created(conversation) => conversation,
             other @ (ContinueOutcome::AlreadyContinued(_)
             | ContinueOutcome::ParentNotContextExhausted { .. }) => {
@@ -895,6 +936,15 @@ mod tests {
             &MessageContent::Continuation(ContinuationContent {
                 summary: "exact handoff".to_string(),
             }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "opening",
+            &successor.id,
+            &MessageContent::user("accepted opening handoff"),
             None,
             None,
         )
@@ -914,7 +964,71 @@ mod tests {
         assert_eq!(aggregate.segments[0].transcript_row.segment_ordinal, 0);
         let handoff = aggregate.segments[0].handoff.as_ref().unwrap();
         assert_eq!(handoff.continuation_message_id, "boundary");
+        assert_eq!(handoff.accepted_successor_message_id, "opening");
         assert_eq!(handoff.summary, "exact handoff");
+        let completed: (String, String, String, String) = sqlx::query_as(
+            "SELECT predecessor_conversation_id, successor_conversation_id,
+                    continuation_message_id, accepted_successor_message_id
+             FROM completed_continuation_handoffs",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            completed,
+            (
+                root.id,
+                successor.id,
+                "boundary".to_string(),
+                "opening".to_string()
+            )
+        );
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM continuation_dispatch_intents")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_feature_continuation_edge_has_documented_historical_handoff_absence() {
+        let db = Database::open_in_memory().await.unwrap();
+        let root = db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &root.id,
+            &ConvState::ContextExhausted {
+                summary: "exhausted".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let successor = match db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        db.add_message(
+            "legacy-boundary",
+            &root.id,
+            &MessageContent::Continuation(ContinuationContent {
+                summary: "legacy handoff".to_string(),
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let aggregate = db
+            .get_ordinary_product_conversation(&root.product_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.latest_transcript_row_id, successor.id);
+        assert!(aggregate.segments[0].handoff.is_none());
     }
 
     #[tokio::test]

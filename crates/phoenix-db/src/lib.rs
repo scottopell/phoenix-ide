@@ -38,8 +38,8 @@ pub(crate) use git_repository_reconciliation::{
 pub use migrations::run_pending_migrations;
 pub use product_conversation_read::{
     ProductConversationAggregate, ProductConversationListProjection, ProductConversationSegment,
-    ProductConversationSnapshotRead, ProductConversationSource, ProductConversationSourceKind,
-    ProductConversationTranscriptRow, ResolvedProductConversation,
+    ProductConversationSegmentCeiling, ProductConversationSnapshotRead, ProductConversationSource,
+    ProductConversationSourceKind, ProductConversationTranscriptRow, ResolvedProductConversation,
 };
 pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
