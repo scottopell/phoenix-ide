@@ -3581,6 +3581,54 @@ describe('handleTotalListHeightChanged', () => {
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
   });
 
+  it('the second of two fingers dragging is upward intent even if the first holds still', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const onLoadOlderMessages = vi.fn();
+    virtualTranscriptMock.captureVisibleAnchor.mockReturnValue({ key: 'msg-1', index: 0, offset: 14 });
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-two-finger-second"
+          hasOlderMessages
+          onLoadOlderMessages={onLoadOlderMessages}
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-two-finger-second', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 2,
+    }));
+    onLoadOlderMessages.mockClear();
+
+    // Both fingers belong to the transcript. The first never moves; the
+    // second drags down. One baseline for the pair can only describe the
+    // finger it was taken from, so the drag went unseen.
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }],
+      changedTouches: [{ identifier: 1, clientY: 300 }],
+    });
+    fireEvent.touchStart(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 320 }],
+      changedTouches: [{ identifier: 2, clientY: 320 }],
+    });
+    fireEvent.touchMove(scroller, {
+      touches: [{ identifier: 1, clientY: 300 }, { identifier: 2, clientY: 460 }],
+    });
+
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
+  });
+
   it('a lift is judged by where the viewport actually is, not the last frame reported', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(
@@ -3705,7 +3753,7 @@ describe('handleTotalListHeightChanged', () => {
     expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
-  it('space on a transcript control does not claim the viewport', async () => {
+  it('space claims the viewport only where nothing else consumes it', async () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const listRef = createRef<React.ElementRef<typeof MessageList>>();
     const onLoadOlderMessages = vi.fn();
@@ -3735,9 +3783,10 @@ describe('handleTotalListHeightChanged', () => {
     // activates that control rather than paging the transcript, so the
     // command is still the one positioning and nothing should be acquired.
     act(() => listRef.current?.scrollToUnitIndex(2));
-    const control = container.querySelector<HTMLElement>('#messages .message');
-    expect(control).not.toBeNull();
-    fireEvent.keyDown(control!, { key: ' ' });
+    const row = container.querySelector<HTMLElement>('#messages .message')!;
+    const control = document.createElement('button');
+    row.appendChild(control);
+    fireEvent.keyDown(control, { key: ' ' });
 
     act(() => virtualTranscriptMock.rangeChanged?.({
       renderedRange: { startIndex: 0, endIndex: 2 },
@@ -3750,6 +3799,17 @@ describe('handleTotalListHeightChanged', () => {
     // concluding it never happened.
     await act(async () => { await Promise.resolve(); });
     expect(onLoadOlderMessages).not.toHaveBeenCalled();
+
+    // The converse: Space on ordinary transcript content is not consumed by
+    // anything, so it pages the scroller and does take the viewport over.
+    fireEvent.keyDown(row, { key: ' ' });
+    act(() => virtualTranscriptMock.rangeChanged?.({
+      renderedRange: { startIndex: 0, endIndex: 2 },
+      visibleRange: { startIndex: 0, endIndex: 1 },
+      viewportTop: 0,
+      layoutRevision: 3,
+    }));
+    await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalledTimes(1));
   });
 
   it('re-snaps when viewport shrinks while pinned', () => {

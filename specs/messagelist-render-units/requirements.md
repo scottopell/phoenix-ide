@@ -365,7 +365,11 @@ WHEN a key whose default action moves the transcript in either direction is
 pressed while it has focus
 THE SYSTEM SHALL treat it as the user taking the viewport over
 AND SHALL NOT treat a key the focused element consumes for itself — text
-entry, or an activation key on a control — as viewport movement
+entry, or an activation key on a control that activates on it — as viewport
+movement
+SO THAT the test is what the key actually does from that element, not merely
+where focus happens to sit: a link inside the transcript activates on Enter
+and pages on Space, and pages the transcript accordingly
 SO THAT a positioning command in flight yields to a reader who keys their own
 way to the tail, in either direction
 
@@ -420,6 +424,14 @@ AND SHALL leave viewport ownership where the interaction placed it
 SO THAT an interaction whose end position was never observed can neither
 confirm from geometry belonging to a later moment nor defer every subsequent
 confirmation to a lift that is not coming
+
+WHEN a touch moves
+THE SYSTEM SHALL measure each owned touch against where that same touch began
+AND SHALL treat any one of them travelling toward earlier content as upward
+intent
+SO THAT a viewport clamped at the start of loaded history, which emits no
+scroll event to reason from, still hears the finger that is actually dragging
+rather than whichever one the platform happens to list first
 
 WHEN a touch moves
 THE SYSTEM SHALL transfer viewport ownership to the user even if no

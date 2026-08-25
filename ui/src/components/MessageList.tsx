@@ -111,6 +111,14 @@ function isTextEntry(element: HTMLElement): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || element.isContentEditable;
 }
 
+/** Elements that activate on Space, so Space does not reach the scroller.
+ *  A link is deliberately absent: Enter follows a link, Space pages past it. */
+const SPACE_ACTIVATED = 'button, select, summary, input, [role="button"], [role="checkbox"], [role="switch"], [role="radio"], [role="menuitem"], [role="tab"], [role="option"]';
+
+function consumesSpace(element: HTMLElement): boolean {
+  return element.closest(SPACE_ACTIVATED) !== null;
+}
+
 function readerMovedViewport(machine: ScrollMachineState): boolean {
   if (machine.kind !== 'live') return false;
   return machine.follow.kind === 'reading'
@@ -808,7 +816,10 @@ function MessageListImpl({
   const cancelScheduledEarlierHistoryRef = useRef<(() => void) | null>(null);
   const requestEarlierHistoryRef = useRef<(source: 'range' | 'upward-intent' | 'retry') => void>(() => {});
   const updateEarlierHistoryRestoreRef = useRef<() => void>(() => {});
-  const touchStartYRef = useRef<number | null>(null);
+  /** Where each owned finger went down, keyed by identifier. Per-touch
+   *  because any one of them dragging is upward intent, and a single baseline
+   *  can only ever describe one of them. */
+  const touchStartYRef = useRef(new Map<number, number>());
   /** Identifiers of touches that began on the transcript. Counts are taken
    *  by intersecting this with the event's live `touches` list: the set alone
    *  over-counts a finger whose row was unmounted mid-gesture (its touchend
@@ -955,17 +966,13 @@ function MessageListImpl({
         if (scrollerTouchIdsRef.current.size > 0
           && Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
         scrollerTouchIdsRef.current.clear();
-        touchStartYRef.current = null;
+        touchStartYRef.current.clear();
         dispatchScrollEvent({ type: 'gestureAbandoned' });
       };
-      // The event's touch list is global: a finger anywhere on the page can sit
-      // ahead of this scroller's in it, so a positional read compares the
-      // wrong one against the baseline and reports no movement at all.
-      const ownedTouchY = (e: TouchEvent): number | null => {
-        const owned = Array.from(e.touches)
-          .find((touch) => scrollerTouchIdsRef.current.has(touch.identifier));
-        return owned?.clientY ?? null;
-      };
+      // The event's touch list is global — a finger anywhere on the page can
+      // appear in it — so every read filters to this scroller's own.
+      const ownedTouches = (e: TouchEvent): Touch[] =>
+        Array.from(e.touches).filter((t) => scrollerTouchIdsRef.current.has(t.identifier));
       const onTouchStart = (e: TouchEvent) => {
         lastTouchAtMs.current = Date.now();
         const live = new Set(Array.from(e.touches).map((touch) => touch.identifier));
@@ -980,15 +987,25 @@ function MessageListImpl({
         for (const touch of Array.from(e.changedTouches)) {
           scrollerTouchIdsRef.current.add(touch.identifier);
         }
-        touchStartYRef.current = ownedTouchY(e);
+        for (const touch of ownedTouches(e)) {
+          if (!touchStartYRef.current.has(touch.identifier)) {
+            touchStartYRef.current.set(touch.identifier, touch.clientY);
+          }
+        }
         dispatchTranscriptPositioningRef.current({ type: 'user_interrupted' });
         dispatchScrollEvent({ type: 'touchStarted' });
       };
       const onTouchMove = (e: TouchEvent) => {
         lastTouchAtMs.current = Date.now();
         dispatchScrollEvent({ type: 'touchMoved' });
-        const currentY = ownedTouchY(e);
-        if (currentY !== null && touchStartYRef.current !== null && currentY > touchStartYRef.current) {
+        // Any owned finger dragging down reveals earlier content, so ask each
+        // against its own starting point rather than picking one to speak for
+        // the rest.
+        const draggedDown = ownedTouches(e).some((touch) => {
+          const start = touchStartYRef.current.get(touch.identifier);
+          return start !== undefined && touch.clientY > start;
+        });
+        if (draggedDown) {
           requestFromUpwardIntent();
         }
       };
@@ -1012,10 +1029,11 @@ function MessageListImpl({
           abandonStaleGesture();
           return;
         }
-        // The gesture continues while a finger remains, and the next touchmove
-        // measures against this baseline — clearing it would silence upward
-        // intent for the finger still on the screen.
-        touchStartYRef.current = ownedTouchY(e);
+        // Only the fingers that actually left lose their baselines; the ones
+        // still down keep measuring against where they started.
+        for (const id of Array.from(touchStartYRef.current.keys())) {
+          if (!scrollerTouchIdsRef.current.has(id)) touchStartYRef.current.delete(id);
+        }
         dispatchScrollEvent({
           type,
           remainingTouches: scrollerTouchIdsRef.current.size,
@@ -1093,7 +1111,7 @@ function MessageListImpl({
         // as a takeover would tell the policy a reader moved a viewport that
         // never moved.
         if (target instanceof HTMLElement && isTextEntry(target)) return;
-        if (e.key === ' ' && target !== document.body && target !== ref) return;
+        if (e.key === ' ' && target instanceof HTMLElement && consumesSpace(target)) return;
         const upward = UPWARD_KEYS.has(e.key);
         // Keys that drive the transcript toward the tail take the viewport
         // over just as upward ones do. Recognising only upward keys left a
