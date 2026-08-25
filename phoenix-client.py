@@ -1144,6 +1144,13 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             f"Conflicting: MESSAGE cannot be combined with {', '.join(modes)}. "
             f"(Only --continue and --suggest consume MESSAGE.)"
         )
+    # --continue sends only the handoff text; the continuation endpoint does
+    # not accept images, so --images would be silently discarded (REQ-CLI-003).
+    if continue_conv and images:
+        raise click.UsageError(
+            "--continue cannot be combined with --images "
+            "(the continuation endpoint does not accept attachments)."
+        )
     if conv_selected and platform_selected:
         raise click.UsageError(
             f"Conflicting flags: {', '.join(platform_selected)} cannot be combined "
