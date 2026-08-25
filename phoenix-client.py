@@ -476,6 +476,10 @@ class PhoenixClient:
                             raise PhoenixError(_state_error_message(state, 'Unknown error'))
                         if state_kind == 'context_exhausted':
                             return {'conversation': conversation, 'messages': messages}
+                        # needs_action states: return control immediately so the
+                        # agent can --respond/--dismiss-question instead of hanging.
+                        if state_kind in ('awaiting_user_response', 'awaiting_task_approval'):
+                            return {'conversation': conversation, 'messages': messages}
 
                     elif event.event == "message":
                         msg = data.get('message')
@@ -722,7 +726,7 @@ def print_conversations_table(conversations: list[dict]) -> None:
 
 
 def print_search_hits(hits: list[dict]) -> None:
-    """Compact search result listing: slug, score, snippet."""
+    """Compact search result listing: slug, score, snippet, plus provenance."""
     if not hits:
         click.echo("No matches found.")
         return
@@ -733,7 +737,15 @@ def print_search_hits(hits: list[dict]) -> None:
         if len(snippet) > 120:
             snippet = snippet[:117] + '...'
         archived = ' (archived)' if h.get('archived') else ''
-        click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{archived}")
+        # Provenance so an agent can assess the hit: message type and when.
+        msg_type = h.get('message_type') or ''
+        created_at = h.get('created_at') or ''
+        prov = f" [{msg_type}" if msg_type else ''
+        if created_at:
+            prov += f" {created_at}" if msg_type else f" [{created_at}"
+        if prov:
+            prov += ']'
+        click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{prov}{archived}")
 
 
 def print_diff(diff: dict) -> None:
@@ -742,6 +754,8 @@ def print_diff(diff: dict) -> None:
     click.echo(f"Label: {diff.get('label', '')}  Kind: {diff.get('kind', '')}")
     if diff.get('pr_number') is not None:
         click.echo(f"PR: #{diff['pr_number']}")
+    if diff.get('checkout_status') is not None:
+        click.echo(f"Checkout: {_render_checkout_status(diff['checkout_status'])}")
     commit_log = diff.get('commit_log') or ''
     if commit_log:
         click.echo("--- COMMIT LOG ---")
