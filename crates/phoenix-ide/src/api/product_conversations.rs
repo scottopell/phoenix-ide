@@ -34,6 +34,7 @@ pub struct SnapshotQuery {
 struct AggregateCursor {
     product_conversation_id: String,
     generation: Vec<AggregateGeneration>,
+    tail_watermarks: Vec<AggregateTailWatermark>,
     before_segment_ordinal: i64,
     before_sequence_id: i64,
 }
@@ -42,6 +43,12 @@ struct AggregateCursor {
 struct AggregateGeneration {
     transcript_row_id: String,
     transcript_generation: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AggregateTailWatermark {
+    transcript_row_id: String,
+    tail_sequence_id: i64,
 }
 
 pub async fn list_product_conversations(
@@ -93,14 +100,8 @@ pub async fn get_product_conversation(
     ))
 }
 
-fn canonical_route(root: &crate::db::ProductConversationTranscriptRow) -> String {
-    format!(
-        "/c/{}",
-        root.conversation
-            .slug
-            .as_deref()
-            .unwrap_or(&root.conversation.id)
-    )
+fn canonical_route(aggregate: &ProductConversationAggregate) -> String {
+    format!("/c/{}", aggregate.product_conversation.id())
 }
 
 fn list_row(
@@ -114,20 +115,13 @@ fn list_row(
     );
     Ok(ProductConversationListRow {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
-        canonical_route: canonical_route(&aggregate.root),
+        canonical_route: canonical_route(aggregate),
         canonical_root: transcript_row_view(&aggregate.root),
         ordinary_lifecycle: lifecycle,
         root_transcript_row_id: aggregate.root.conversation.id.clone(),
         latest_transcript_row_id: aggregate.latest_transcript_row_id.clone(),
         updated_at: aggregate.updated_at.to_rfc3339(),
-        presentation: presentation(
-            &aggregate
-                .segments
-                .last()
-                .ok_or_else(|| AppError::Internal("aggregate has no latest segment".to_string()))?
-                .transcript_row
-                .conversation,
-        ),
+        presentation: presentation(&aggregate.root.conversation),
     })
 }
 
@@ -143,7 +137,8 @@ async fn snapshot_view(
         .ordinary_lifecycle()
         .ok_or_else(|| AppError::Internal("ordinary aggregate lost lifecycle".to_string()))?;
     let generation = aggregate_generation(&aggregate);
-    let (messages, has_older, page_messages) =
+    let tail_watermarks = aggregate_tail_watermarks(&aggregate);
+    let (messages, has_older, page_messages, boundary_message_ids) =
         aggregate_messages(&state.db, &aggregate, cursor.as_ref(), message_limit).await?;
     let source = match aggregate.source.as_mut() {
         Some(source) => {
@@ -161,36 +156,36 @@ async fn snapshot_view(
     let segments = aggregate
         .segments
         .iter()
-        .map(|segment| segment_view(segment, &messages))
+        .map(|segment| segment_view(segment, &messages, &boundary_message_ids))
         .collect();
     Ok(ProductConversationSnapshotView {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
-        canonical_route: canonical_route(&aggregate.root),
+        canonical_route: canonical_route(&aggregate),
         requested_transcript_row_id,
         canonical_root: transcript_row_view(&aggregate.root),
         ordinary_lifecycle: lifecycle_view(lifecycle),
         root_transcript_row_id: root_id.clone(),
         latest_transcript_row_id: latest_id.clone(),
-        writable_transcript_row_id: (lifecycle == OrdinaryProductConversationLifecycle::Open)
-            .then_some(latest_id),
+        writable_transcript_row_id: writable_transcript_row_id(state, lifecycle, &aggregate).await,
         updated_at: aggregate.updated_at.to_rfc3339(),
-        presentation: presentation(
-            &aggregate
-                .segments
-                .last()
-                .ok_or_else(|| AppError::Internal("aggregate has no latest segment".to_string()))?
-                .transcript_row
-                .conversation,
-        ),
+        presentation: presentation(&aggregate.root.conversation),
         work_identity: work_identity(&aggregate),
         source,
-        chain_qa_compatibility: ProductConversationChainQaCompatibilityView {
-            url: format!("/api/chains/{root_id}"),
-            root_transcript_row_id: root_id,
-        },
+        chain_qa_compatibility: (aggregate.segments.len() > 1).then(|| {
+            ProductConversationChainQaCompatibilityView {
+                url: format!("/api/chains/{root_id}"),
+                root_transcript_row_id: root_id,
+            }
+        }),
         segments,
-        before: has_older
-            .then(|| encode_cursor(&next_cursor(&aggregate, &generation, &page_messages))),
+        before: has_older.then(|| {
+            encode_cursor(&next_cursor(
+                &aggregate,
+                &generation,
+                &tail_watermarks,
+                &page_messages,
+            ))
+        }),
         has_older,
     })
 }
@@ -205,57 +200,51 @@ async fn aggregate_messages(
         std::collections::HashMap<String, Vec<crate::api::wire::EnrichedMessage>>,
         bool,
         Vec<(i64, crate::db::Message)>,
+        std::collections::HashSet<String>,
     ),
     AppError,
 > {
-    let mut messages = Vec::new();
-    for segment in &aggregate.segments {
-        let mut segment_messages = db
-            .get_messages(&segment.transcript_row.conversation.id)
-            .await
-            .map_err(db_to_app)?;
-        for message in segment_messages.drain(..) {
-            if cursor.is_none_or(|cursor| {
-                before_cursor(
-                    segment.transcript_row.segment_ordinal,
-                    message.sequence_id,
-                    cursor,
-                )
-            }) {
-                messages.push((segment.transcript_row.segment_ordinal, message));
-            }
-        }
-    }
-    messages.sort_by(|(left_ordinal, left), (right_ordinal, right)| {
-        right_ordinal
-            .cmp(left_ordinal)
-            .then_with(|| right.sequence_id.cmp(&left.sequence_id))
-    });
+    let mut messages = db
+        .get_product_conversation_messages_page(
+            aggregate.product_conversation.id(),
+            cursor.map(|cursor| (cursor.before_segment_ordinal, cursor.before_sequence_id)),
+            limit + 1,
+        )
+        .await
+        .map_err(db_to_app)?;
     let has_older = messages.len() > limit;
     messages.truncate(limit);
+    let boundary_message_ids = aggregate
+        .segments
+        .iter()
+        .filter_map(|segment| segment.handoff.as_ref())
+        .map(|handoff| handoff.continuation_message_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
     let mut by_segment = std::collections::HashMap::<String, Vec<_>>::new();
     for (ordinal, message) in &messages {
         let _ = ordinal;
-        by_segment
-            .entry(message.conversation_id.clone())
-            .or_default()
-            .push(crate::api::wire::EnrichedMessage::from(message));
+        if !boundary_message_ids.contains(message.message_id.as_str()) {
+            by_segment
+                .entry(message.conversation_id.clone())
+                .or_default()
+                .push(crate::api::wire::EnrichedMessage::from(message));
+        }
     }
     for segment_messages in by_segment.values_mut() {
         segment_messages.sort_by_key(|message| message.sequence_id);
     }
-    Ok((by_segment, has_older, messages))
-}
-
-fn before_cursor(segment_ordinal: i64, sequence_id: i64, cursor: &AggregateCursor) -> bool {
-    segment_ordinal < cursor.before_segment_ordinal
-        || (segment_ordinal == cursor.before_segment_ordinal
-            && sequence_id < cursor.before_sequence_id)
+    let page_boundary_message_ids = messages
+        .iter()
+        .map(|(_, message)| message.message_id.clone())
+        .filter(|message_id| boundary_message_ids.contains(message_id.as_str()))
+        .collect();
+    Ok((by_segment, has_older, messages, page_boundary_message_ids))
 }
 
 fn next_cursor(
     aggregate: &ProductConversationAggregate,
     generation: &[AggregateGeneration],
+    tail_watermarks: &[AggregateTailWatermark],
     page_messages: &[(i64, crate::db::Message)],
 ) -> AggregateCursor {
     let (segment_ordinal, message) = page_messages
@@ -265,6 +254,7 @@ fn next_cursor(
     AggregateCursor {
         product_conversation_id: aggregate.product_conversation.id().to_string(),
         generation: generation.to_vec(),
+        tail_watermarks: tail_watermarks.to_vec(),
         before_segment_ordinal: *segment_ordinal,
         before_sequence_id: sequence_id,
     }
@@ -273,6 +263,7 @@ fn next_cursor(
 fn segment_view(
     segment: &ProductConversationSegment,
     messages: &std::collections::HashMap<String, Vec<crate::api::wire::EnrichedMessage>>,
+    page_boundary_message_ids: &std::collections::HashSet<String>,
 ) -> ProductConversationSegmentView {
     ProductConversationSegmentView {
         segment_ordinal: segment.transcript_row.segment_ordinal,
@@ -286,6 +277,7 @@ fn segment_view(
         handoff: segment
             .handoff
             .as_ref()
+            .filter(|handoff| page_boundary_message_ids.contains(&handoff.continuation_message_id))
             .map(|handoff| ProductConversationHandoffView {
                 predecessor_transcript_row_id: handoff.predecessor_transcript_row_id.clone(),
                 successor_transcript_row_id: handoff.successor_transcript_row_id.clone(),
@@ -387,12 +379,50 @@ fn aggregate_generation(aggregate: &ProductConversationAggregate) -> Vec<Aggrega
         .collect()
 }
 
+fn aggregate_tail_watermarks(
+    aggregate: &ProductConversationAggregate,
+) -> Vec<AggregateTailWatermark> {
+    aggregate
+        .segments
+        .iter()
+        .map(|segment| AggregateTailWatermark {
+            transcript_row_id: segment.transcript_row.conversation.id.clone(),
+            tail_sequence_id: segment.transcript_row.tail_sequence_id,
+        })
+        .collect()
+}
+
+async fn writable_transcript_row_id(
+    state: &AppState,
+    lifecycle: OrdinaryProductConversationLifecycle,
+    aggregate: &ProductConversationAggregate,
+) -> Option<String> {
+    if lifecycle != OrdinaryProductConversationLifecycle::Open {
+        return None;
+    }
+    let latest = aggregate
+        .segments
+        .last()?
+        .transcript_row
+        .conversation
+        .clone();
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&latest.id)
+        .await
+        .unwrap_or(latest.state);
+    crate::state_machine::check_user_message_acceptable(&effective_state)
+        .is_ok()
+        .then_some(latest.id)
+}
+
 fn validate_cursor(
     aggregate: &ProductConversationAggregate,
     cursor: &AggregateCursor,
 ) -> Result<(), AppError> {
     if cursor.product_conversation_id != aggregate.product_conversation.id().as_str()
         || cursor.generation != aggregate_generation(aggregate)
+        || cursor.tail_watermarks != aggregate_tail_watermarks(aggregate)
     {
         return Err(AppError::BadRequest(
             "stale or mismatched product conversation cursor".to_string(),
@@ -461,6 +491,7 @@ mod tests {
         let cursor = AggregateCursor {
             product_conversation_id: "one".to_string(),
             generation: vec![],
+            tail_watermarks: vec![],
             before_segment_ordinal: 0,
             before_sequence_id: 1,
         };
@@ -526,7 +557,11 @@ mod tests {
         let rows = listed["product_conversations"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["canonical_root"]["slug"], "root-slug");
-        assert_eq!(rows[0]["canonical_route"], "/c/root-slug");
+        assert_eq!(
+            rows[0]["canonical_route"],
+            format!("/c/{}", root.product_conversation_id)
+        );
+        assert_eq!(rows[0]["presentation"]["display_name"], "Root Slug");
         assert_eq!(rows[0]["latest_transcript_row_id"], successor.id);
 
         let snapshot = create_router(state.clone())
@@ -546,13 +581,88 @@ mod tests {
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(snapshot["requested_transcript_row_id"], successor.id);
-        assert_eq!(snapshot["canonical_route"], "/c/root-slug");
+        assert_eq!(
+            snapshot["canonical_route"],
+            format!("/c/{}", root.product_conversation_id)
+        );
         assert_eq!(snapshot["segments"][0]["segment_ordinal"], 0);
         assert_eq!(
             snapshot["segments"][0]["handoff"]["continuation_message_id"],
             "handoff"
         );
         assert_eq!(snapshot["writable_transcript_row_id"], successor.id);
+    }
+
+    #[tokio::test]
+    async fn canonical_route_is_product_keyed_and_aliases_survive_root_rename() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let expected_route = format!("/c/{}", root.product_conversation_id);
+        state
+            .db
+            .rename_conversation(&root.id, "renamed-root")
+            .await
+            .unwrap();
+
+        for reference in [
+            root.product_conversation_id.to_string(),
+            root.id.clone(),
+            "renamed-root".to_string(),
+        ] {
+            let response = create_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/product-conversations/{reference}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let snapshot: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(snapshot["canonical_route"], expected_route);
+        }
+    }
+
+    #[tokio::test]
+    async fn one_row_aggregate_has_no_chain_qa_compatibility_or_writable_exhausted_leaf() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::ContextExhausted {
+                    summary: "exhausted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/product-conversations/{}", root.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(snapshot["chain_qa_compatibility"].is_null());
+        assert!(snapshot["writable_transcript_row_id"].is_null());
     }
 
     #[allow(clippy::too_many_lines)]
@@ -629,7 +739,9 @@ mod tests {
             .unwrap();
 
         let mut before = None;
+        let mut emitted_cursor = None;
         let mut seen = Vec::new();
+        let mut seen_handoffs = Vec::new();
         loop {
             let suffix = before
                 .as_ref()
@@ -654,17 +766,24 @@ mod tests {
                 for message in segment["messages"].as_array().unwrap() {
                     seen.push(message["message_id"].as_str().unwrap().to_string());
                 }
+                if let Some(handoff) = segment["handoff"].as_object() {
+                    seen_handoffs.push(
+                        handoff["continuation_message_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
             }
             before = page["before"].as_str().map(str::to_string);
+            emitted_cursor.get_or_insert_with(|| before.clone().unwrap());
             if !page["has_older"].as_bool().unwrap() {
                 break;
             }
         }
         seen.sort();
-        assert_eq!(
-            seen,
-            vec!["root-1", "root-handoff", "successor-1", "successor-2"]
-        );
+        assert_eq!(seen, vec!["root-1", "successor-1", "successor-2"]);
+        assert_eq!(seen_handoffs, vec!["root-handoff"]);
 
         state
             .db
@@ -677,12 +796,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let stale_cursor = encode_cursor(&AggregateCursor {
-            product_conversation_id: root.product_conversation_id.to_string(),
-            generation: vec![],
-            before_segment_ordinal: 0,
-            before_sequence_id: 1,
-        });
+        let stale_cursor = emitted_cursor.expect("first page emits a cursor");
         let stale_response = create_router(state)
             .oneshot(
                 Request::builder()

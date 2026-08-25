@@ -225,7 +225,7 @@ pub struct ProductConversationSnapshotView {
     pub presentation: ProductConversationPresentationView,
     pub work_identity: Option<ProductConversationWorkIdentityView>,
     pub source: Option<ProductConversationSourceView>,
-    pub chain_qa_compatibility: ProductConversationChainQaCompatibilityView,
+    pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
     pub segments: Vec<ProductConversationSegmentView>,
     pub before: Option<String>,
     pub has_older: bool,

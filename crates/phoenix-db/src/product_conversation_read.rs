@@ -28,6 +28,8 @@ pub struct ProductConversationAggregate {
 pub struct ProductConversationTranscriptRow {
     pub conversation: crate::Conversation,
     pub segment_ordinal: i64,
+    /// Durable append watermark for this transcript segment.
+    pub tail_sequence_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -190,7 +192,14 @@ impl Database {
                    AND successor.runtime_role = 'user'
                    AND successor.parent_conversation_id IS NULL
              )
-             SELECT id, ordinal FROM transcript ORDER BY ordinal",
+             SELECT transcript.id, transcript.ordinal,
+                    COALESCE((
+                        SELECT MAX(message.sequence_id)
+                        FROM messages message
+                        WHERE message.conversation_id = transcript.id
+                    ), 0) AS tail_sequence_id
+             FROM transcript
+             ORDER BY ordinal",
         )
         .bind(product_conversation_id.as_str())
         .fetch_all(&self.pool)
@@ -202,6 +211,7 @@ impl Database {
             transcript_rows.push(ProductConversationTranscriptRow {
                 conversation: self.get_conversation(&id).await?,
                 segment_ordinal: ordinal,
+                tail_sequence_id: row.try_get("tail_sequence_id")?,
             });
         }
         let Some(root) = transcript_rows.first().cloned() else {
@@ -251,6 +261,78 @@ impl Database {
             segments,
             source,
         })
+    }
+
+    /// Fetches one bounded, newest-first page across the ordered aggregate transcript.
+    ///
+    /// The cursor is a segment ordinal plus that segment's message sequence. The
+    /// query deliberately limits before attachment hydration, so a long history
+    /// in any member cannot make an aggregate page hydrate every member's rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the bounded message projection or attachment
+    /// hydration fails.
+    pub async fn get_product_conversation_messages_page(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        before: Option<(i64, i64)>,
+        limit: usize,
+    ) -> DbResult<Vec<(i64, crate::Message)>> {
+        let before_ordinal = before.map(|(ordinal, _)| ordinal);
+        let before_sequence_id = before.map(|(_, sequence_id)| sequence_id);
+        let limit = i64::try_from(limit)
+            .map_err(|error| DbError::Serialization(format!("invalid page limit: {error}")))?;
+        let mut rows = sqlx::query(
+            "WITH RECURSIVE transcript(id, ordinal) AS (
+                 SELECT root.id, 0
+                 FROM conversations root
+                 WHERE root.product_conversation_id = ?1
+                   AND root.runtime_role = 'user'
+                   AND root.parent_conversation_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations predecessor
+                       WHERE predecessor.product_conversation_id = root.product_conversation_id
+                         AND predecessor.continued_in_conv_id = root.id
+                   )
+                 UNION ALL
+                 SELECT successor.id, transcript.ordinal + 1
+                 FROM transcript
+                 JOIN conversations predecessor ON predecessor.id = transcript.id
+                 JOIN conversations successor ON successor.id = predecessor.continued_in_conv_id
+                 WHERE successor.product_conversation_id = ?1
+                   AND successor.runtime_role = 'user'
+                   AND successor.parent_conversation_id IS NULL
+             )
+             SELECT message_id, conversation_id, sequence_id, message_type, content,
+                    display_data, usage_data, created_at, transcript.ordinal
+             FROM transcript
+             JOIN messages ON messages.conversation_id = transcript.id
+             WHERE (?2 IS NULL
+                    OR transcript.ordinal < ?2
+                    OR (transcript.ordinal = ?2 AND messages.sequence_id < ?3))
+             ORDER BY transcript.ordinal DESC, messages.sequence_id DESC
+             LIMIT ?4",
+        )
+        .bind(product_conversation_id.as_str())
+        .bind(before_ordinal)
+        .bind(before_sequence_id)
+        .bind(limit)
+        .try_map(|row| {
+            let ordinal: i64 = row.try_get("ordinal")?;
+            super::parse_message_row(row).map(|message| (ordinal, message))
+        })
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages = rows
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>();
+        super::hydrate_attachments(&self.pool, &mut messages).await?;
+        for ((_, message), hydrated) in rows.iter_mut().zip(messages) {
+            *message = hydrated;
+        }
+        Ok(rows)
     }
 
     async fn persisted_continuation_handoff(
