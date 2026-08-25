@@ -213,6 +213,8 @@ config {
 -- next_contract_id(), wake_profile_ref(), wake_snapshot_codec(), wake_event_codec(), wake_effect_codec()
 -- resolve_work_scope(conversation), stable_scope_identity(scope), resource_is_owned_in_scope(resource, scope)
 -- resource_identity_is_stable(resource), active_registration_fence(conversation), registration_fence_version(conversation)
+-- active_close_obligation(product_conversation), prepared_registration_fingerprint_for(agent, conversation, resource, requested_max_wait_seconds, tool_use_id)
+-- exact_existing_wake_registration(conversation, resource, tool_use_id, prepared_fingerprint), existing_wake_registration_receipt(conversation, resource, tool_use_id, prepared_fingerprint)
 -- conversation_is_terminal_or_archived(conversation), invalid_wait_bound(seconds), invalid_wait_bound_reason(seconds)
 -- observe_effect_for(intent), wake_registration_plan(intent, effect), workflow_and_effect_created_atomically(binding)
 -- evidence_matches_resource(evidence, resource), evidence_occurrence_time(evidence), durable_terminal_evidence_at_or_before(binding, deadline)

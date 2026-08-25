@@ -150,6 +150,7 @@ pub enum RegisteredWake {
     Registered { workflow_id: WorkflowId },
     Replayed { workflow_id: WorkflowId },
     Conflict,
+    Unavailable,
     Cancelled,
     CancelReplayed,
     CancelStale,
@@ -160,7 +161,11 @@ impl RegisteredWake {
     pub fn workflow_id(&self) -> Option<WorkflowId> {
         match self {
             Self::Registered { workflow_id } | Self::Replayed { workflow_id } => Some(*workflow_id),
-            Self::Conflict | Self::Cancelled | Self::CancelReplayed | Self::CancelStale => None,
+            Self::Conflict
+            | Self::Unavailable
+            | Self::Cancelled
+            | Self::CancelReplayed
+            | Self::CancelStale => None,
         }
     }
 }

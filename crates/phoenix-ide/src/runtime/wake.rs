@@ -76,11 +76,17 @@ impl WakeRegistrar for ProductionWakeRegistrar {
         );
         let prepared_fingerprint = input.prepared_fingerprint.clone();
         let intent = input.into_intent(now);
-        let outcome = self
+        let outcome = match self
             .repo
             .register(&intent, &prepared_fingerprint, now)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(outcome) => outcome,
+            Err(phoenix_db::DbError::CloseAdmissionFenced(_)) => {
+                return Ok(RegisteredWake::Unavailable);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         self.kick();
         Ok(match outcome {
             WakeRegistrationOutcome::Registered { workflow_id, .. } => {
@@ -1315,6 +1321,30 @@ mod tests {
             expires_at: Timestamp(expires_at),
             prepared_fingerprint: fingerprint.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn production_registrar_returns_typed_unavailable_for_close_fence() {
+        let (db, repo, scope) = open_repo().await;
+        let (kick_tx, mut kick_rx) = watch::channel(0u64);
+        let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let product_conversation_id = db
+            .get_conversation("conv")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        db.begin_close_foundation(&product_conversation_id, "wake-production-fence")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registrar
+                .register(register_input(&scope, "b-1", "fp-1", 50))
+                .await
+                .unwrap(),
+            RegisteredWake::Unavailable
+        );
+        assert_eq!(*kick_rx.borrow_and_update(), 0);
     }
 
     #[tokio::test]
