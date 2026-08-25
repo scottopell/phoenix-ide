@@ -7,9 +7,6 @@ use phoenix_core::domain::close::{
 use phoenix_db::Database;
 
 /// Runtime-owned recovery record for one persisted aggregate admission fence.
-///
-/// It deliberately contains no inspection, retirement, or History capability.
-/// Later Close slices take an exact record by attempt ID and add those capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveredCloseFence {
     attempt_id: CloseAttemptId,
@@ -28,10 +25,6 @@ impl From<CloseObligation> for RecoveredCloseFence {
 }
 
 /// Runtime owner for persisted aggregate Close admission fences.
-///
-/// The database remains the transactional admission authority. This coordinator
-/// owns the recovered attempt records for lifecycle handoff; it does not advance
-/// Close until a later settlement slice attaches those effects.
 #[derive(Default)]
 pub(crate) struct CloseAdmissionCoordinator {
     recovered_fences: RwLock<BTreeSet<RecoveredCloseFence>>,

@@ -4193,6 +4193,12 @@ async fn send_chat(
                     "conversation_busy",
                 )))
             }
+            crate::send_chat_service::SendChatServiceError::CloseAdmissionFenced => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Conversation is closing and cannot accept new work.".to_string(),
+                    "close_admission_fenced",
+                )))
+            }
             crate::send_chat_service::SendChatServiceError::Expansion {
                 message,
                 error_type,

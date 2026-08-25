@@ -756,6 +756,7 @@ fn sqlx_from_db_error(error: crate::DbError) -> sqlx::Error {
         | crate::DbError::Serialization(_)
         | crate::DbError::ContinuationPrecondition(_)
         | crate::DbError::CloseFoundationConflict(_)
+        | crate::DbError::CloseAdmissionFenced(_)
         | crate::DbError::CloseFoundationPrecondition(_)
         | crate::DbError::CloseFoundationRepairRequired(_)
         | crate::DbError::CloseFoundationNotFound(_)

@@ -1099,6 +1099,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::Serialization(_)
         | DbError::ContinuationPrecondition(_)
         | DbError::CloseFoundationConflict(_)
+        | DbError::CloseAdmissionFenced(_)
         | DbError::CloseFoundationPrecondition(_)
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)

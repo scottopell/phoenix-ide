@@ -445,6 +445,20 @@ impl Drop for AdmittedOperation {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SteeringAdmissionError {
+    #[error("conversation is fenced by an active Close attempt")]
+    CloseAdmissionFenced,
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<String> for SteeringAdmissionError {
+    fn from(error: String) -> Self {
+        Self::Internal(error)
+    }
+}
+
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
@@ -5374,7 +5388,7 @@ impl RuntimeManager {
         conversation_id: &str,
         event: Event,
         request_fingerprint: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), SteeringAdmissionError> {
         let Event::SteerMessage {
             ref text,
             ref llm_text,
@@ -5385,7 +5399,9 @@ impl RuntimeManager {
             ref skill_invocation,
         } = event
         else {
-            return Err("enqueue_steer_message expects Event::SteerMessage".into());
+            return Err(SteeringAdmissionError::Internal(
+                "enqueue_steer_message expects Event::SteerMessage".into(),
+            ));
         };
 
         // Build SteerEntry and persist before touching the executor channel.
@@ -5434,7 +5450,14 @@ impl RuntimeManager {
                 .db()
                 .append_steering_entry(conversation_id, &new_entry, request_fingerprint)
                 .await
-                .map_err(|e| format!("Failed to persist steering queue before enqueue: {e}"))?;
+                .map_err(|error| match error {
+                    crate::db::DbError::CloseAdmissionFenced(_) => {
+                        SteeringAdmissionError::CloseAdmissionFenced
+                    }
+                    error => SteeringAdmissionError::Internal(format!(
+                        "Failed to persist steering queue before enqueue: {error}"
+                    )),
+                })?;
             let _ = handle.broadcast_tx.send_live_projection(|sequence_id| {
                 SseEvent::SteerMessageQueued {
                     sequence_id,
@@ -5447,11 +5470,9 @@ impl RuntimeManager {
             // Keep the current-runtime read guard through channel admission so
             // eviction cannot retire this handle between commit and delivery.
             deposit_turn_trigger(&handle);
-            let send_result = handle
-                .event_tx
-                .send(event.clone())
-                .await
-                .map_err(|e| format!("Failed to send steer message: {e}"));
+            let send_result = handle.event_tx.send(event.clone()).await.map_err(|error| {
+                SteeringAdmissionError::Internal(format!("Failed to send steer message: {error}"))
+            });
             drop(runtimes);
             drop(steering_owner);
             if let Err(error) = send_result {

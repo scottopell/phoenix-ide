@@ -177,6 +177,8 @@ pub enum DbError {
     ContinuationPrecondition(String),
     #[error("Close foundation conflict: {0}")]
     CloseFoundationConflict(String),
+    #[error("new aggregate work is fenced by Close attempt {0:?}")]
+    CloseAdmissionFenced(CloseAdmissionFence),
     #[error("Close foundation precondition failed: {0}")]
     CloseFoundationPrecondition(String),
     #[error("Close foundation repair required: {0:?}")]
@@ -1200,6 +1202,42 @@ impl SubAgentCreationTestLatch {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CloseFoundationTestLatch {
+    pub transaction_entered: tokio::sync::Notify,
+    pub release_transaction: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CloseFoundationTestLatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            transaction_entered: tokio::sync::Notify::new(),
+            release_transaction: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SteeringBeginTestLatch {
+    before_begin: tokio::sync::Notify,
+    allow_begin: tokio::sync::Notify,
+    begin_called: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SteeringBeginTestLatch {
+    fn new() -> Self {
+        Self {
+            before_begin: tokio::sync::Notify::new(),
+            allow_begin: tokio::sync::Notify::new(),
+            begin_called: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 pub struct Database {
     pool: SqlitePool,
     sqlite_workload_collector: SqliteWorkloadCollector,
@@ -1210,6 +1248,10 @@ pub struct Database {
         std::sync::Arc<git_repository_reconciliation::DormantGitRepositoryCatchupAuthorityState>,
     #[cfg(test)]
     sub_agent_creation_test_latch: Option<std::sync::Arc<SubAgentCreationTestLatch>>,
+    #[cfg(test)]
+    pub(crate) close_foundation_test_latch: Option<std::sync::Arc<CloseFoundationTestLatch>>,
+    #[cfg(test)]
+    steering_begin_test_latch: Option<std::sync::Arc<SteeringBeginTestLatch>>,
 }
 
 impl Clone for Database {
@@ -1223,6 +1265,10 @@ impl Clone for Database {
                 .clone(),
             #[cfg(test)]
             sub_agent_creation_test_latch: self.sub_agent_creation_test_latch.clone(),
+            #[cfg(test)]
+            close_foundation_test_latch: self.close_foundation_test_latch.clone(),
+            #[cfg(test)]
+            steering_begin_test_latch: self.steering_begin_test_latch.clone(),
         }
     }
 }
@@ -1433,6 +1479,10 @@ impl Database {
             ),
             #[cfg(test)]
             sub_agent_creation_test_latch: None,
+            #[cfg(test)]
+            close_foundation_test_latch: None,
+            #[cfg(test)]
+            steering_begin_test_latch: None,
         }
     }
 
@@ -6128,7 +6178,14 @@ impl Database {
         request_fingerprint: &str,
     ) -> DbResult<usize> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.steering_begin_test_latch {
+            latch.before_begin.notify_waiters();
+            latch.allow_begin.notified().await;
+            latch.begin_called.notify_waiters();
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        require_product_conversation_admission_tx(&mut tx, id).await?;
 
         let (queue_position, ordinal): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(MAX(ordinal), -1) + 1
@@ -17203,6 +17260,65 @@ mod tests {
         // Replace-all with an empty queue clears everything.
         db.update_steering_queue("conv-s", &[]).await.unwrap();
         assert!(db.get_steering_queue("conv-s").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_admission_fence_serializes_concurrent_steering_admission() {
+        use phoenix_core::domain::sm_event::SteerEntry;
+
+        let (_dir, mut close_db, mut steering_db) = open_test_db_pair().await;
+        let close_latch = std::sync::Arc::new(CloseFoundationTestLatch::new());
+        let steering_latch = std::sync::Arc::new(SteeringBeginTestLatch::new());
+        close_db.close_foundation_test_latch = Some(close_latch.clone());
+        steering_db.steering_begin_test_latch = Some(steering_latch.clone());
+        close_db
+            .create_conversation("close-steering", "close steering", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_conversation_id = close_db
+            .get_conversation("close-steering")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let entry = SteerEntry {
+            text: "refused".to_string(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            message_id: "refused-steering".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+
+        let transaction_entered = close_latch.transaction_entered.notified();
+        let close_writer = close_db.clone();
+        let close = tokio::spawn(async move {
+            close_writer
+                .begin_close_foundation(&product_conversation_id, "close-vs-steering")
+                .await
+        });
+        transaction_entered.await;
+        let steering_before_begin = steering_latch.before_begin.notified();
+        let steering_begin_called = steering_latch.begin_called.notified();
+        let steering = tokio::spawn(async move {
+            steering_db
+                .append_steering_entry("close-steering", &entry, "refused-fingerprint")
+                .await
+        });
+        steering_before_begin.await;
+        steering_latch.allow_begin.notify_waiters();
+        steering_begin_called.await;
+        close_latch.release_transaction.notify_waiters();
+        close.await.unwrap().unwrap();
+        assert!(matches!(
+            steering.await.unwrap(),
+            Err(DbError::CloseAdmissionFenced(_))
+        ));
+        assert!(close_db
+            .get_steering_queue("close-steering")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

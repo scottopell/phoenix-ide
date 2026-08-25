@@ -33,6 +33,14 @@ pub struct CloseFoundationTopology {
     pub members: Vec<CloseFoundationTopologyMember>,
 }
 
+/// Exact durable Close attempt that currently fences aggregate work admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseAdmissionFence {
+    pub product_conversation_id: ProductConversationId,
+    pub attempt_id: CloseAttemptId,
+    pub phase: ClosePhase,
+}
+
 /// The only admission decision a product-aggregate operation may observe.
 ///
 /// Callers must make this decision inside their owning write transaction; an
@@ -42,11 +50,7 @@ pub enum ProductConversationAdmission {
     Accepted {
         product_conversation_id: ProductConversationId,
     },
-    Refused {
-        product_conversation_id: ProductConversationId,
-        attempt_id: CloseAttemptId,
-        phase: ClosePhase,
-    },
+    Refused(CloseAdmissionFence),
 }
 
 impl ProductConversationAdmission {
@@ -97,12 +101,24 @@ pub(crate) async fn admit_product_conversation_operation_tx(
             let phase = ClosePhase::from_db_str(&phase_raw).ok_or_else(|| {
                 DbError::Serialization(format!("unknown close phase {phase_raw}"))
             })?;
-            Ok(ProductConversationAdmission::Refused {
+            Ok(ProductConversationAdmission::Refused(CloseAdmissionFence {
                 product_conversation_id,
                 attempt_id,
                 phase,
-            })
+            }))
         }
+    }
+}
+
+pub(crate) async fn require_product_conversation_admission_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: &str,
+) -> DbResult<ProductConversationId> {
+    match admit_product_conversation_operation_tx(tx, conversation_id).await? {
+        ProductConversationAdmission::Accepted {
+            product_conversation_id,
+        } => Ok(product_conversation_id),
+        ProductConversationAdmission::Refused(fence) => Err(DbError::CloseAdmissionFenced(fence)),
     }
 }
 
@@ -897,6 +913,11 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        #[cfg(test)]
+        if let Some(latch) = &self.close_foundation_test_latch {
+            latch.transaction_entered.notify_waiters();
+            latch.release_transaction.notified().await;
+        }
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
@@ -2935,7 +2956,7 @@ mod tests {
                 db.product_conversation_admission(conversation_id)
                     .await
                     .unwrap(),
-                ProductConversationAdmission::Refused { attempt_id, phase, .. }
+                ProductConversationAdmission::Refused(CloseAdmissionFence { attempt_id, phase, .. })
                     if attempt_id.as_str() == "admission-fence"
                         && phase == ClosePhase::AwaitingBlockerResolution
             ));

@@ -8,8 +8,8 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
+use crate::require_product_conversation_admission_tx;
 use crate::sqlite_telemetry::SqliteOperation;
-use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -626,17 +626,11 @@ impl WakeRepository {
             });
         }
 
-        if let ProductConversationAdmission::Refused {
-            product_conversation_id,
-            attempt_id,
-            phase,
-        } = admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation_id).await?
+        if let Err(error) =
+            require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id).await
         {
             tx.rollback().await?;
-            return Err(DbError::CloseFoundationConflict(format!(
-                "Close attempt {attempt_id} in phase {} fences ProductConversation {product_conversation_id} from new wake registration",
-                phase.as_str()
-            )));
+            return Err(error);
         }
 
         let workflow_id = match allocated_workflow_id {
@@ -4949,9 +4943,7 @@ mod tests {
             .register(&input, "wake-fence-fingerprint", Timestamp(10))
             .await
             .unwrap_err();
-        assert!(
-            matches!(error, DbError::CloseFoundationConflict(message) if message.contains("wake registration"))
-        );
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM wake_bindings WHERE conversation_id = 'wake-fenced'",

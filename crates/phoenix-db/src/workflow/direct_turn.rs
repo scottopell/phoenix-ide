@@ -1,8 +1,6 @@
 use super::WorkflowRepository;
 use crate::sqlite_telemetry::{SqliteOperation, SqlitePhase};
-use crate::{
-    admit_product_conversation_operation_tx, DbError, DbResult, ProductConversationAdmission,
-};
+use crate::{require_product_conversation_admission_tx, DbError, DbResult};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::db_schema::{
     ConvState, FileAttachment, ImageData, Message, MessageContent,
@@ -329,17 +327,11 @@ impl WorkflowRepository {
                 owed_effects: Vec::new(),
             });
         }
-        if let ProductConversationAdmission::Refused {
-            product_conversation_id,
-            attempt_id,
-            phase,
-        } = admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation().0).await?
+        if let Err(error) =
+            require_product_conversation_admission_tx(&mut tx.tx, &input.conversation().0).await
         {
             tx.rollback().await?;
-            return Err(DbError::CloseFoundationConflict(format!(
-                "Close attempt {attempt_id} in phase {} fences ProductConversation {product_conversation_id} from new direct-turn admission",
-                phase.as_str()
-            )));
+            return Err(error);
         }
 
         let submitted_message_id =
@@ -3804,9 +3796,7 @@ mod tests {
             .accept_authoritative_turn(&input("conv-fenced", "refused", 2))
             .await
             .unwrap_err();
-        assert!(
-            matches!(error, DbError::CloseFoundationConflict(message) if message.contains("direct-turn admission"))
-        );
+        assert!(matches!(error, DbError::CloseAdmissionFenced(_)));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM durable_turns WHERE conversation_id = 'conv-fenced'",
