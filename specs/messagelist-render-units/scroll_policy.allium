@@ -126,8 +126,8 @@ surface ScrollPolicyAdapter {
         InteractionStarted(policy)
         TouchStarted(policy)
         TouchMoved(policy)
-        TouchEnded(policy, remaining_touches)
-        TouchCancelled(policy, remaining_touches)
+        TouchEnded(policy, remaining_touches, snapshot)
+        TouchCancelled(policy, remaining_touches, snapshot)
         GestureAbandoned(policy)
         UpwardIntent(policy, snapshot)
         NavigationJumped(policy)
@@ -463,7 +463,7 @@ rule TouchMovementTakesReadingOwnership {
 -- moving viewport into the return zone, which the confirmation rule below
 -- claims; the preconditions are complementary, so exactly one applies.
 rule TapEndRestoresPreGestureMode {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_stationary
@@ -481,7 +481,7 @@ rule TapEndRestoresPreGestureMode {
 -- farther away has arrived, and one that ends there without having travelled
 -- is a reader who stopped short or never moved anything.
 rule GestureEndTowardTailConfirmsTailReturn {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     requires: policy.follow_mode != navigating
@@ -498,7 +498,7 @@ rule GestureEndTowardTailConfirmsTailReturn {
 -- over, a scroll container claiming the pan — and none of those reasons is
 -- about where the reader left the viewport.
 rule GestureCancellationTowardTailConfirmsTailReturn {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     requires: policy.follow_mode != navigating
@@ -511,7 +511,7 @@ rule GestureCancellationTowardTailConfirmsTailReturn {
 }
 
 rule GestureEndWithoutTravelTowardTailKeepsOwnership {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
@@ -521,7 +521,7 @@ rule GestureEndWithoutTravelTowardTailKeepsOwnership {
 }
 
 rule GestureEndOutsideReturnZoneKeepsOwnership {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
@@ -534,7 +534,7 @@ rule GestureEndOutsideReturnZoneKeepsOwnership {
 -- interaction ending. Every other end and cancel rule excludes navigating for
 -- the same reason, so exactly one of them applies to any given ending.
 rule NavigationOwnershipSurvivesGestureEnd {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     requires: policy.follow_mode = navigating
@@ -542,7 +542,7 @@ rule NavigationOwnershipSurvivesGestureEnd {
 }
 
 rule NavigationOwnershipSurvivesGestureCancellation {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     requires: policy.follow_mode = navigating
@@ -550,7 +550,7 @@ rule NavigationOwnershipSurvivesGestureCancellation {
 }
 
 rule StationaryTouchCancellationRestoresPreGestureMode {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_stationary
@@ -561,7 +561,7 @@ rule StationaryTouchCancellationRestoresPreGestureMode {
 }
 
 rule MovedTouchCancellationPreservesReadingOwnership {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
@@ -571,13 +571,36 @@ rule MovedTouchCancellationPreservesReadingOwnership {
 }
 
 rule MovedTouchCancellationOutsideReturnZoneKeepsOwnership {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches = 0
     requires: policy.follow_mode != navigating
     requires: policy.gesture_mode = touch_moved
     requires: policy.distance_from_tail > config.pin_to_bottom_threshold
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
+}
+
+-- Where a gesture ended is a question about the moment it ended, and the last
+-- frame the platform delivered may predate the lift: iOS reports touchend
+-- ahead of the scroll frames that would place it. The end event carries its
+-- own measurement so the zone check reads the endpoint rather than the last
+-- one observed. It records geometry only — a lift is not movement — so this
+-- can withhold a confirmation the stale frame would have granted, never the
+-- reverse.
+rule GestureEndObservesItsOwnEndpoint {
+    when: TouchEnded(policy, remaining_touches, snapshot)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: carries_geometry(snapshot)
+    ensures: policy.distance_from_tail = snapshot.distance_from_tail
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
+}
+
+rule GestureCancellationObservesItsOwnEndpoint {
+    when: TouchCancelled(policy, remaining_touches, snapshot)
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    requires: carries_geometry(snapshot)
+    ensures: policy.distance_from_tail = snapshot.distance_from_tail
+    ensures: policy.travelled_toward_tail = policy.travelled_toward_tail
 }
 
 -- A gesture whose end event never arrives — the touch target unmounted
@@ -597,14 +620,14 @@ rule AbandonedGestureDiscardsEvidenceWithoutConfirming {
 }
 
 rule TouchEndWithRemainingTouchesPreservesGesture {
-    when: TouchEnded(policy, remaining_touches)
+    when: TouchEnded(policy, remaining_touches, snapshot)
     requires: remaining_touches > 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     ensures: policy.gesture_mode = policy.gesture_mode
 }
 
 rule TouchCancelWithRemainingTouchesPreservesGesture {
-    when: TouchCancelled(policy, remaining_touches)
+    when: TouchCancelled(policy, remaining_touches, snapshot)
     requires: remaining_touches > 0
     requires: policy.gesture_mode in { touch_stationary, touch_moved }
     ensures: policy.gesture_mode = policy.gesture_mode

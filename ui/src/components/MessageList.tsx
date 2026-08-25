@@ -1000,7 +1000,11 @@ function MessageListImpl({
         touchStartYRef.current = scrollerTouchIdsRef.current.size > 0
           ? e.touches[0]?.clientY ?? null
           : null;
-        dispatchScrollEvent({ type, remainingTouches: scrollerTouchIdsRef.current.size });
+        dispatchScrollEvent({
+          type,
+          remainingTouches: scrollerTouchIdsRef.current.size,
+          snapshot: snapshotOf(ref),
+        });
       };
       const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
       const onTouchCancel = (e: TouchEvent) => resolveTouchStop(e, 'touchCancelled');

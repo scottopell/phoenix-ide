@@ -419,6 +419,12 @@ AND a bottom callback received during that moved touch SHALL NOT release
 user ownership while the gesture is active
 SO THAT a callback describing where the viewport is cannot decide who owns it
 
+WHEN a gesture ends or is cancelled
+THE SYSTEM SHALL take its own measurement of where the viewport is at that
+moment rather than relying on the last one observed
+SO THAT a platform that reports the lift ahead of the scroll frames placing
+it cannot have the gesture judged against a position it has already left
+
 WHEN a gesture ends or is cancelled inside the pin-to-bottom threshold,
 having moved the viewport toward the tail during that gesture
 THE SYSTEM SHALL confirm the tail return

@@ -80,8 +80,8 @@ export type ScrollEvent =
   | { type: 'interactionStarted' }
   | { type: 'touchStarted' }
   | { type: 'touchMoved' }
-  | { type: 'touchEnded'; remainingTouches: number }
-  | { type: 'touchCancelled'; remainingTouches: number }
+  | { type: 'touchEnded'; remainingTouches: number; snapshot?: ScrollSnapshot }
+  | { type: 'touchCancelled'; remainingTouches: number; snapshot?: ScrollSnapshot }
   // The interaction ended without its end event ever being observed; see
   // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming.
   | { type: 'gestureAbandoned' }
@@ -289,12 +289,20 @@ function advanceTail(
 }
 
 function resolveTouch(
-  state: ReadySession,
+  incoming: ReadySession,
   remainingTouches: number,
+  snapshot?: ScrollSnapshot,
 ): Reduction {
-  if (state.gesture.kind !== 'touch' || remainingTouches > 0) {
-    return { state, effects: [] };
+  if (incoming.gesture.kind !== 'touch' || remainingTouches > 0) {
+    return { state: incoming, effects: [] };
   }
+  // Where the gesture ended is a question about now, and the last frame the
+  // platform delivered may predate the lift — iOS reports touchend ahead of
+  // the scroll frames that would place it. Reading the endpoint here can
+  // withhold a confirmation the stale frame would have granted, never the
+  // reverse: this records geometry only, and travel evidence is untouched.
+  const state = snapshot ? observeGeometry(incoming, snapshot) : incoming;
+  if (state.gesture.kind !== 'touch') return { state, effects: [] };
   // Navigation ownership is released by its own rules, never by a gesture
   // ending (scroll_policy.allium NavigationOwnershipSurvivesGestureEnd).
   const navigating = state.kind === 'live' && state.follow.kind === 'navigating';
@@ -483,7 +491,7 @@ export function reduceScrollMachine(
     case 'touchEnded':
     case 'touchCancelled':
       if (!isReady(state)) return { state, effects: [] };
-      return resolveTouch(state, event.remainingTouches);
+      return resolveTouch(state, event.remainingTouches, event.snapshot);
 
     case 'gestureAbandoned': {
       if (!isReady(state) || state.gesture.kind !== 'touch') return { state, effects: [] };

@@ -3577,6 +3577,48 @@ describe('handleTotalListHeightChanged', () => {
     await waitFor(() => expect(onLoadOlderMessages).toHaveBeenCalled());
   });
 
+  it('a lift is judged by where the viewport actually is, not the last frame reported', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-lift-endpoint"
+
+          transcriptPositioning={{ kind: 'idle', view: { conversationId: 'conv-under-test', generation: 1, transcriptGeneration: 1 } }}/>,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1000));
+
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 300, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    act(() => virtualTranscriptMock.totalExtentChanged?.(1100));
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+
+    // The drag carries the viewport into the return zone, which a moved
+    // gesture defers rather than confirming.
+    fireEvent.touchStart(scroller, { touches: [{ identifier: 1 }], changedTouches: [{ identifier: 1 }] });
+    fireEvent.touchMove(scroller, { touches: [{ identifier: 1 }] });
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 620, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    // It then travels back up and lifts before iOS delivers another scroll
+    // frame. Judging the lift by the last frame reported would confirm a
+    // return to a tail the viewport is now 400px away from.
+    setupScroller(scroller, { scrollHeight: 1100, scrollTop: 300, clientHeight: 400 });
+    fireEvent.touchEnd(scroller, { touches: [], changedTouches: [{ identifier: 1 }] });
+
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(
