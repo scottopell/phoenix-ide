@@ -6175,6 +6175,12 @@ impl Database {
         Ok(())
     }
 
+    /// Return the current steering queue depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the queue cannot be read or its count cannot be
+    /// represented as `usize`.
     pub async fn steering_queue_depth(&self, id: &str) -> DbResult<usize> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM steering_messages WHERE conversation_id = ?1")
