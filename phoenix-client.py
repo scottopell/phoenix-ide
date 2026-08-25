@@ -1109,9 +1109,28 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         ('--list-conversations', list_conversations),
         ('--search-conversations', search_conversations is not None),
     ] if flag]
+    # Legacy single-shot modes (each mutually exclusive with everything else).
+    legacy_selected = [name for name, flag in [
+        ('--list-models', list_models),
+        ('--list-projects', list_projects),
+        ('--wake-status', wake_status),
+        ('--wake-cancel', wake_cancel is not None),
+        ('--suggest', suggest),
+    ] if flag]
     if len(conv_selected) > 1:
         raise click.UsageError(
             f"Conflicting conversation-scoped flags: {', '.join(conv_selected)}. "
+            f"Pass at most one."
+        )
+    if len(discovery_selected) > 1:
+        raise click.UsageError(
+            f"Conflicting discovery flags: {', '.join(discovery_selected)}. "
+            f"Pass at most one."
+        )
+    if legacy_selected and (conv_selected or platform_selected or discovery_selected or len(legacy_selected) > 1):
+        other = conv_selected + platform_selected + discovery_selected + legacy_selected
+        raise click.UsageError(
+            f"Conflicting single-shot flags: {', '.join(other)}. "
             f"Pass at most one."
         )
     if conv_selected and platform_selected:
@@ -1269,10 +1288,10 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                     )
                 unanswered = [q for q in pending_texts if q not in answers]
                 if unanswered:
-                    click.echo(
-                        f"Warning: {len(unanswered)} pending question(s) left unanswered: "
-                        f"{', '.join(repr(q) for q in sorted(unanswered))}",
-                        err=True,
+                    raise click.UsageError(
+                        f"Incomplete answer map: {len(unanswered)} pending question(s) "
+                        f"left unanswered: {', '.join(repr(q) for q in sorted(unanswered))}. "
+                        f"The server irreversibly skips unanswered questions."
                     )
             client.respond_to_question(conv['id'], answers)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
