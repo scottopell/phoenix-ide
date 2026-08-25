@@ -102,6 +102,16 @@ const RESTORE_OFFSET_TOLERANCE_PX = 2;
  *  either through a follow mode that holds position, or a touch that has
  *  moved, which takes ownership from the movement itself rather than from a
  *  scroll event (REQ-MLRU-014). */
+/** Whether the reader is the one who put the viewport where it is. Reading is
+ *  one such state; so is a navigation they have taken over, which is what the
+ *  user-returning phase records. A command still positioning is not — that
+ *  movement is the command's own (REQ-MLRU-014). */
+function readerMovedViewport(machine: ScrollMachineState): boolean {
+  if (machine.kind !== 'live') return false;
+  return machine.follow.kind === 'reading'
+    || (machine.follow.kind === 'navigating' && machine.follow.phase === 'user-returning');
+}
+
 /** A scroller reports positions outside its own scrollable range during
  *  overscroll. Snapshots are built here so none of them can carry one. */
 function clampScrollTop(scrollTop: number, element: HTMLElement): number {
@@ -802,6 +812,7 @@ function MessageListImpl({
    *  since a vanished touch is absent from every later event's list. */
   const scrollerTouchIdsRef = useRef(new Set<number>());
   const lastTouchAtMs = useRef(0);
+  const abandonStaleGestureRef = useRef<() => void>(() => {});
 
   const readScrollSnapshot = useCallback((): ScrollSnapshot | null => {
     const s = scrollerRef.current;
@@ -933,7 +944,7 @@ function MessageListImpl({
         if (firstVisibleUnitIndexRef.current <= 2) requestEarlierHistoryRef.current('upward-intent');
       };
       // scroll_policy.allium AbandonedGestureDiscardsEvidenceWithoutConfirming
-      const abandonStaleGesture = () => {
+      const abandonStaleGesture = abandonStaleGestureRef.current = () => {
         if (scrollerTouchIdsRef.current.size === 0) return;
         if (Date.now() - lastTouchAtMs.current <= GESTURE_STALE_MS) return;
         scrollerTouchIdsRef.current.clear();
@@ -983,7 +994,12 @@ function MessageListImpl({
           if (!live.has(id)) scrollerTouchIdsRef.current.delete(id);
         }
         if (!owned) return;
-        touchStartYRef.current = null;
+        // The gesture continues while a finger remains, and the next touchmove
+        // measures against this baseline — clearing it would silence upward
+        // intent for the finger still on the screen.
+        touchStartYRef.current = scrollerTouchIdsRef.current.size > 0
+          ? e.touches[0]?.clientY ?? null
+          : null;
         dispatchScrollEvent({ type, remainingTouches: scrollerTouchIdsRef.current.size });
       };
       const onTouchEnd = (e: TouchEvent) => resolveTouchStop(e, 'touchEnded');
@@ -1147,6 +1163,7 @@ function MessageListImpl({
   }, [conversationId, dispatchScrollEvent, readScrollSnapshot]);
 
   const scrollToNewest = useCallback(() => {
+    abandonStaleGestureRef.current();
     dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
@@ -1265,7 +1282,10 @@ function MessageListImpl({
 
   const captureHistoryRestoreBasis = useCallback((readerIntent = false): RestoreBasis => {
     const machine = scrollMachineRef.current;
-    if (!readerIntent && (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading'))) {
+    // Same question as the acquisition guard, and it must be answered the same
+    // way: a request admitted because the reader moved the viewport has to
+    // carry the reader's anchor, or the prefix merge restores to the tail.
+    if (!readerIntent && !readerMovedViewport(machine)) {
       return { kind: 'following_tail' };
     }
     const transcript = transcriptRef.current;
@@ -1285,14 +1305,7 @@ function MessageListImpl({
   const requestEarlierHistory = useCallback((source: 'range' | 'upward-intent' | 'retry') => {
     const machine = scrollMachineRef.current;
     const ownsCurrentView = machine.kind === 'live' && machine.conversationId === conversationId;
-    // A range change is only a reason to acquire history when the reader put
-    // the viewport there. Reading is one such state; so is a navigation the
-    // reader has taken over, which is what the user-returning phase records.
-    // Positioning is not — that range change is the command's own doing.
-    const readerMovedViewport = ownsCurrentView && (
-      machine.follow.kind === 'reading'
-      || (machine.follow.kind === 'navigating' && machine.follow.phase === 'user-returning')
-    );
+    const readerMoved = ownsCurrentView && readerMovedViewport(machine);
     if (
       earlierHistoryRequestScheduledRef.current
       || !hasOlderMessages
@@ -1300,7 +1313,7 @@ function MessageListImpl({
       || !onLoadOlderMessages
       || (!ownsCurrentView && source !== 'retry')
       || (olderHistoryError && source !== 'retry')
-      || (source === 'range' && !readerMovedViewport)
+      || (source === 'range' && !readerMoved)
     ) return;
     earlierHistoryRequestScheduledRef.current = true;
     const restoreBasis = captureHistoryRestoreBasis(source === 'upward-intent' || source === 'retry');
