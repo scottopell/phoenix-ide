@@ -1327,10 +1327,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_registrar_returns_typed_unavailable_for_history() {
+    async fn production_registrar_refuses_exact_replay_for_history() {
         let (db, repo, scope) = open_repo().await;
         let (kick_tx, mut kick_rx) = watch::channel(0u64);
         let registrar = ProductionWakeRegistrar::new(repo, kick_tx);
+        let input = register_input(&scope, "b-history", "fp-history", 50);
+        assert!(matches!(
+            registrar.register(input.clone()).await.unwrap(),
+            RegisteredWake::Registered { .. }
+        ));
         let product_conversation_id = db
             .get_conversation("conv")
             .await
@@ -1345,13 +1350,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            registrar
-                .register(register_input(&scope, "b-history", "fp-history", 50))
-                .await
-                .unwrap(),
+            registrar.register(input).await.unwrap(),
             RegisteredWake::Unavailable
         );
-        assert_eq!(*kick_rx.borrow_and_update(), 0);
+        assert_eq!(*kick_rx.borrow_and_update(), 1);
     }
 
     #[tokio::test]

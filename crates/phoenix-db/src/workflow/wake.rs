@@ -8,8 +8,8 @@ use super::{
     LocalReceiptRecord, RecordObservationInput, RenewLeaseInput, WorkflowRepository,
     WorkflowSequenceName, WorkflowTx,
 };
-use crate::require_product_conversation_admission_tx;
 use crate::sqlite_telemetry::SqliteOperation;
+use crate::{admit_product_conversation_operation_tx, ProductConversationAdmission};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::{
     db_schema::{Message, MessageContent, UserContent},
@@ -591,11 +591,24 @@ impl WakeRepository {
         if let Some(existing) = existing {
             let exact_replay = existing.prepared_fingerprint == prepared_fingerprint;
             if exact_replay {
-                tx.commit().await?;
-                return Ok(WakeRegistrationOutcome::Replayed {
-                    workflow_id: existing.workflow_id,
-                    receipt: replay_receipt(&existing),
-                });
+                match admit_product_conversation_operation_tx(&mut tx.tx, &input.conversation_id)
+                    .await?
+                {
+                    ProductConversationAdmission::Accepted { .. }
+                    | ProductConversationAdmission::Refused(_) => {
+                        tx.commit().await?;
+                        return Ok(WakeRegistrationOutcome::Replayed {
+                            workflow_id: existing.workflow_id,
+                            receipt: replay_receipt(&existing),
+                        });
+                    }
+                    ProductConversationAdmission::History(product_conversation_id) => {
+                        tx.rollback().await?;
+                        return Err(DbError::ProductConversationUnavailable(
+                            product_conversation_id,
+                        ));
+                    }
+                }
             }
             let migrated_replay = existing.fingerprint_needs_scope_upgrade
                 && existing.expires_at == input.expires_at
@@ -605,9 +618,11 @@ impl WakeRepository {
                 && input.root_conversation_id == input.conversation_id
                 && existing.registering_tool_use_id == input.registering_tool_use_id;
             if migrated_replay {
-                if let Err(error) =
-                    require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
-                        .await
+                if let Err(error) = crate::require_product_conversation_admission_tx(
+                    &mut tx.tx,
+                    &input.conversation_id,
+                )
+                .await
                 {
                     tx.rollback().await?;
                     return Err(error);
@@ -640,7 +655,8 @@ impl WakeRepository {
                 });
             }
             if let Err(error) =
-                require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id).await
+                crate::require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
+                    .await
             {
                 tx.rollback().await?;
                 return Err(error);
@@ -650,7 +666,8 @@ impl WakeRepository {
         }
 
         if let Err(error) =
-            require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id).await
+            crate::require_product_conversation_admission_tx(&mut tx.tx, &input.conversation_id)
+                .await
         {
             tx.rollback().await?;
             return Err(error);
@@ -6330,6 +6347,35 @@ mod tests {
                 .await
                 .unwrap_err(),
             DbError::CloseAdmissionFenced(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn history_refuses_exact_wake_replay() {
+        let (_dir, repo, _) = open_repo_pair().await;
+        let db =
+            crate::Database::from_pool_for_tests(repo.workflow_repo.pool.clone(), String::new());
+        let input = intent();
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap(),
+            WakeRegistrationOutcome::Registered { .. }
+        ));
+        let product_conversation_id = db
+            .get_conversation("conv-1")
+            .await
+            .unwrap()
+            .product_conversation_id;
+        sqlx::query(
+            "UPDATE product_conversations SET ordinary_lifecycle = 'history' WHERE id = ?1",
+        )
+        .bind(product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            repo.register(&input, "exact", Timestamp(10)).await.unwrap_err(),
+            DbError::ProductConversationUnavailable(id) if id == product_conversation_id
         ));
     }
 
