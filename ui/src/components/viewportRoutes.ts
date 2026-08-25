@@ -5,6 +5,7 @@ export function isViewportOwnedRoute(pathname: string, desktop: boolean): boolea
   return /^\/?$/.test(pathname)
     || /^\/new\/?$/.test(pathname)
     || /^\/c\/[^/]+\/?$/.test(pathname)
+    || /^\/product-conversations\/[^/]+\/?$/.test(pathname)
     || /^\/global(?:\/[^/]+)?\/?$/.test(pathname);
 }
 

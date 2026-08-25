@@ -5,11 +5,14 @@ import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
   closeNotificationsForConversation,
+  getProductConversationListRevision,
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
+  notifyProductConversationListMayHaveChanged,
   registerCoordinatorForNotifications,
   resetNotificationRuntimeForTest,
+  subscribeProductConversationListRevision,
 } from './notifications';
 
 const notifications: MockNotification[] = [];
@@ -81,6 +84,25 @@ describe('Coordinator notification routing', () => {
       .toBe('/global/coordinator-id');
     expect(notificationRoute({ id: 'ordinary-id', slug: 'ordinary' }))
       .toBe('/c/ordinary');
+  });
+});
+
+describe('product conversation list revision notifications', () => {
+  it('coalesces multiple mutation pokes into one trailing revision bump', () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeProductConversationListRevision(listener);
+    const startRevision = getProductConversationListRevision();
+
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+    expect(listener).not.toHaveBeenCalled();
+
+    vi.runAllTimers();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(getProductConversationListRevision()).toBe(startRevision + 1);
+    unsubscribe();
   });
 });
 

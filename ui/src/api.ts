@@ -1676,8 +1676,10 @@ export const api = {
       `/api/product-conversations/${encodeURIComponent(productConversationId)}${query ? `?${query}` : ''}`,
     );
     if (!resp.ok) {
-      if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to fetch product conversation snapshot');
+      const detail = resp.status === 404
+        ? 'Conversation not found'
+        : 'Failed to fetch product conversation snapshot';
+      throw new ApiResponseError(detail, resp.status);
     }
     return resp.json();
   },

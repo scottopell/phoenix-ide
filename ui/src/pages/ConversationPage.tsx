@@ -1653,10 +1653,10 @@ function ConversationPageContent({
 
   useEffect(() => {
     const handler = (e: Event) => {
-      const { sequenceId, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
+      const { sequenceId, messageId, presentation } = (e as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
       if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
       if (presentation !== 'pane' && presentation !== 'fullscreen') return;
-      handleOpenMessageViewer(sequenceId, presentation);
+      handleOpenMessageViewer(sequenceId, presentation, messageId);
     };
     window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
     return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
@@ -1721,6 +1721,15 @@ function ConversationPageContent({
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  const ordinaryComposerEligible = !isArchived
+    && convStateForChildren.type !== 'provisioning'
+    && convStateForChildren.type !== 'creation_failed'
+    && convStateForChildren.type !== 'creation_cancelled'
+    && convStateForChildren.type !== 'context_exhausted'
+    && convStateForChildren.type !== 'awaiting_task_approval'
+    && convStateForChildren.type !== 'handed_off'
+    && convStateForChildren.type !== 'terminal';
+
   useEffect(() => {
     if (!onProjectionChange) return;
     onProjectionChange({
@@ -2472,7 +2481,7 @@ function ConversationPageContent({
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : !isArchived && ordinaryComposerEnabled && convStateForChildren.type !== 'provisioning' && convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled' && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : ordinaryComposerEnabled && ordinaryComposerEligible ? (
         <>
         {conversationId && (
           <WorkControlBar

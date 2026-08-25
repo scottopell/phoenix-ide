@@ -6,6 +6,7 @@ import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ThemeProvider } from './components/ThemeProvider';
 import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
+import { ChainProvider } from './chain';
 import { api } from './api';
 import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import './index.css';
@@ -20,8 +21,8 @@ const ConversationListPage = lazy(() =>
 const ProductConversationPage = lazy(() =>
   import('./pages/ProductConversationPage').then((m) => ({ default: m.ProductConversationPage })),
 );
-const ConversationPage = lazy(() =>
-  import('./pages/ConversationPage').then((m) => ({ default: m.ConversationPage })),
+const EmbeddedConversationPage = lazy(() =>
+  import('./pages/ConversationPage').then((m) => ({ default: m.EmbeddedConversationPage })),
 );
 const NewConversationPage = lazy(() =>
   import('./pages/NewConversationPage').then((m) => ({ default: m.NewConversationPage })),
@@ -119,11 +120,12 @@ function AppRoutes() {
 function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [fallbackToRow, setFallbackToRow] = useState(false);
+  const [fallbackSnapshot, setFallbackSnapshot] = useState<{ canonicalRoute: string; rowSlug: string } | null>(null);
+  const [retryToken, setRetryToken] = useState(0);
 
   useEffect(() => {
     if (!reference) {
-      setFallbackToRow(true);
+      setFallbackSnapshot(null);
       return;
     }
     let cancelled = false;
@@ -138,15 +140,24 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
         }
       })
       .catch(() => {
-        if (!cancelled) setFallbackToRow(true);
+        if (!cancelled) {
+          setFallbackSnapshot((current) => current ?? {
+            canonicalRoute: location.pathname,
+            rowSlug: reference,
+          });
+        }
       });
     return () => { cancelled = true; };
-  }, [location.hash, location.search, navigate, reference]);
+  }, [location.hash, location.pathname, location.search, navigate, reference, retryToken]);
 
-  if (fallbackToRow) {
-    return location.pathname.startsWith('/c/')
-      ? <ConversationPage />
-      : <main role="alert">Unable to resolve this conversation link. Retry when connected.</main>;
+  if (fallbackSnapshot) {
+    return (
+      <main>
+        <EmbeddedConversationPage slug={fallbackSnapshot.rowSlug} suppressCanonicalization routePrefix="/c" />
+        <div role="alert">Showing cached conversation while live snapshot is unavailable.</div>
+        <button type="button" onClick={() => { setFallbackSnapshot(null); setRetryToken((n) => n + 1); }}>Retry</button>
+      </main>
+    );
   }
   return <RouteFallback />;
 }
@@ -212,9 +223,11 @@ function App() {
         <BrowserRouter>
           <FocusScopeProvider>
             <ConversationProvider>
-              <ConversationReadinessProvider>
-                <AppRoutes />
-              </ConversationReadinessProvider>
+              <ChainProvider>
+                <ConversationReadinessProvider>
+                  <AppRoutes />
+                </ConversationReadinessProvider>
+              </ChainProvider>
             </ConversationProvider>
           </FocusScopeProvider>
         </BrowserRouter>

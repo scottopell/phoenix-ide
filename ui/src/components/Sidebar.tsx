@@ -1,4 +1,4 @@
-import { useState, useCallback, useContext, useEffect, useRef } from 'react';
+import { useState, useCallback, useContext, useEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
@@ -11,6 +11,7 @@ import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
+import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
 
 const COLLAPSED_DOT_LIMIT = 9;
 
@@ -110,6 +111,11 @@ export function Sidebar({
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
   const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
   const [productConversationsRetry, setProductConversationsRetry] = useState(0);
+  const productConversationListRevision = useSyncExternalStore(
+    subscribeProductConversationListRevision,
+    getProductConversationListRevision,
+    getProductConversationListRevision,
+  );
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
@@ -147,7 +153,7 @@ export function Sidebar({
     return () => {
       cancelled = true;
     };
-  }, [productConversationsRetry]);
+  }, [productConversationListRevision, productConversationsRetry]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
   const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');

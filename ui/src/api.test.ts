@@ -303,6 +303,17 @@ describe('conversation message history clients', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/product-conversations/pc-1?message_limit=100&before=cursor-1');
   });
+
+  it('preserves snapshot HTTP status for stale-cursor recovery', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+    } as unknown as Response);
+
+    await expect(api.getProductConversationSnapshot('pc-1', { before: 'stale' }))
+      .rejects.toMatchObject({ status: 400 });
+  });
 });
 
 describe('api.regenerateConversationName', () => {

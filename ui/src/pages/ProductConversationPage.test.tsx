@@ -5,7 +5,8 @@ import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { FileExplorerProvider } from '../components/FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
-import type { ChainView, ProductConversationSnapshotView } from '../api';
+import { ChainProvider } from '../chain';
+import { ApiResponseError, type ChainView, type ProductConversationSnapshotView } from '../api';
 
 const conversationNavStackSpy = vi.fn();
 const embeddedConversationPageSpy = vi.fn();
@@ -22,6 +23,8 @@ vi.mock('../components/ConversationNavStack', () => ({
     }> : [];
     return (
       <div>
+        <div data-testid="message-sidepanel-enabled">{String(props['enableMessageSidepanel'])}</div>
+        <div data-testid="message-fullscreen-enabled">{String(props['enableMessageFullscreen'])}</div>
         <button onClick={() => (props['onLoadOlderMessages'] as ((basis?: unknown) => void) | undefined)?.()}>
           load older
         </button>
@@ -40,7 +43,16 @@ vi.mock('../components/ConversationNavStack', () => ({
 vi.mock('./ConversationPage', () => ({
   EmbeddedConversationPage: (props: Record<string, unknown>) => {
     embeddedConversationPageSpy(props);
-    return <div data-testid="embedded-conversation-page">embedded {String(props['slug'])}</div>;
+    return (
+      <div data-testid="embedded-conversation-page">
+        embedded {String(props['slug'])}
+        <button onClick={() => window.dispatchEvent(new CustomEvent('phoenix:open-message-viewer', {
+          detail: { sequenceId: 3, messageId: 'm-3', presentation: 'pane' },
+        }))}>
+          open aggregate viewer
+        </button>
+      </div>
+    );
   },
 }));
 
@@ -215,12 +227,14 @@ function renderPage(initialEntry = '/product-conversations/pc-1', withRouteSwitc
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <ViewerSlotProvider browserSessionActive={false}>
-          <FileExplorerProvider>
+          <ChainProvider>
+            <FileExplorerProvider>
             {withRouteSwitch && <NavigateToSecondProduct />}
             <Routes>
               <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
             </Routes>
-          </FileExplorerProvider>
+            </FileExplorerProvider>
+          </ChainProvider>
         </ViewerSlotProvider>
       </MemoryRouter>
     </ConversationReadinessProvider>,
@@ -524,6 +538,27 @@ describe('ProductConversationPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('boom');
   });
 
+  it('keeps chain freshness counts in sync with live aggregate growth', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({
+      messages: [
+        makeMessage('m-3', 3),
+        makeMessage('m-4', 4),
+        makeMessage('live-sent', 5),
+        makeMessage('live-streamed', 6),
+      ],
+    });
+
+    await waitFor(() => {
+      expect(chainQaColumnSpy).toHaveBeenCalled();
+    });
+    const chain = chainQaColumnSpy.mock.lastCall?.[0]?.['chain'] as ChainView;
+    expect(chain.current_member_count).toBe(2);
+    expect(chain.current_total_messages).toBe(8);
+  });
+
   it('surfaces pagination failure through aggregated status', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot)
@@ -575,9 +610,28 @@ describe('ProductConversationPage', () => {
     await screen.findByTestId('embedded-conversation-page');
     expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
       slug: 'row-2',
-      ordinaryComposerEnabled: false,
+      ordinaryComposerEnabled: true,
       suppressCanonicalization: true,
     }));
+  });
+
+  it('re-enables the ordinary composer from live latest projection after approval ends', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({ convState: { type: 'awaiting_task_approval' } });
+    await waitFor(() => {
+      expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+        ordinaryComposerEnabled: true,
+      }));
+    });
+
+    emitLatestProjection({ convState: { type: 'idle' } });
+    await waitFor(() => {
+      expect(embeddedConversationPageSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+        ordinaryComposerEnabled: true,
+      }));
+    });
   });
 
   it('projects persisted and pending latest messages through distinct aggregate inputs', async () => {
@@ -623,6 +677,66 @@ describe('ProductConversationPage', () => {
     expect(screen.getByTestId('chain-qa-column')).toBeInTheDocument();
     expect(screen.queryByTestId('embedded-conversation-page')).not.toBeInTheDocument();
     expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+  });
+
+  it('disables aggregate transcript nested message viewers so the aggregate route owns placement', async () => {
+    renderPage();
+    await waitForPageReady();
+    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('false');
+    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('false');
+  });
+
+  it('wires aggregate-route message-viewer events without re-enabling nested transcript viewers', async () => {
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'open aggregate viewer' }));
+    expect(screen.getByTestId('message-sidepanel-enabled')).toHaveTextContent('false');
+    expect(screen.getByTestId('message-fullscreen-enabled')).toHaveTextContent('false');
+  });
+
+  it('enables the live runtime for an open aggregate despite stale writable-row metadata', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      writable_transcript_row_id: null,
+      ordinary_lifecycle: 'open',
+    }));
+
+    renderPage();
+    await waitForPageReady();
+
+    expect(embeddedConversationPageSpy.mock.lastCall?.[0]?.['ordinaryComposerEnabled']).toBe(true);
+  });
+
+  it('retries older-page fetch once with a fresh tail cursor after a stale 400 cursor error', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot)
+      .mockResolvedValueOnce(makeSnapshot())
+      .mockRejectedValueOnce(new ApiResponseError('stale cursor', 400))
+      .mockResolvedValueOnce(makeSnapshot({ before: 'cursor-2', has_older: true }))
+      .mockResolvedValueOnce(makeSnapshot({
+        segments: [{ segment_ordinal: 0, transcript_row_id: 'row-old', slug: 'old', title: 'Old', messages: [makeMessage('old-message', 0)], handoff: null }],
+        before: null,
+        has_older: false,
+      }));
+
+    renderPage();
+    await waitForPageReady();
+    fireEvent.click(screen.getByRole('button', { name: 'load older with anchor' }));
+
+    await waitFor(() => expect(screen.getByTestId('message-order')).toHaveTextContent('old-message,m-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4'));
+    expect(vi.mocked(api.getProductConversationSnapshot).mock.calls.slice(1, 4)).toEqual([
+      ['pc-1', { message_limit: 100, before: 'cursor-1' }],
+      ['pc-1', { message_limit: 100 }],
+      ['pc-1', { message_limit: 100, before: 'cursor-2' }],
+    ]);
+    expect(conversationNavStackSpy.mock.lastCall?.[0]?.['transcriptPositioning']).toEqual(expect.objectContaining({
+      kind: 'positioning',
+      command: expect.objectContaining({
+        kind: 'restore_after_prefix_expansion',
+        messageId: 'm-3',
+        viewportStartOffset: 17,
+      }),
+    }));
   });
 
   it('discards delayed older-page results after a new product route wins', async () => {

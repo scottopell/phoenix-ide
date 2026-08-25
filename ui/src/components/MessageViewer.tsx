@@ -14,6 +14,7 @@ import { useFocusedReviewExit } from './viewer/useFocusedReviewExit';
 
 interface MessageViewerProps {
   sequenceId: number;
+  messageId?: string | undefined;
   messages: Message[];
   onClose: () => void;
   onSendNotes: (notes: string) => void | Promise<void>;
@@ -23,16 +24,18 @@ interface MessageViewerProps {
   inline?: boolean | undefined;
 }
 
-export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
+export function MessageViewer({ sequenceId, messageId, messages, onClose, onSendNotes, presentation = 'pane', canTogglePresentation = false, onPresentationChange, inline }: MessageViewerProps) {
   useRegisterFocusScope('message-viewer');
-  const message = useMemo(
-    () => messages.find((m) => m.sequence_id === sequenceId) ?? null,
-    [messages, sequenceId],
-  );
+  const message = useMemo(() => {
+    if (messageId) {
+      return messages.find((m) => m.message_id === messageId) ?? null;
+    }
+    return messages.find((m) => m.sequence_id === sequenceId) ?? null;
+  }, [messageId, messages, sequenceId]);
 
   const content = message ? getMessageMarkdown(message) : '';
   const title = message ? messageTitle(message) : `Message #${sequenceId}`;
-  const notes = useMessageReviewNotes(sequenceId, message?.message_id, onSendNotes);
+  const notes = useMessageReviewNotes(sequenceId, message?.message_id ?? messageId, onSendNotes);
   const focused = presentation === 'fullscreen' && canTogglePresentation;
   const returnToPane = useCallback(() => onPresentationChange?.('pane'), [onPresentationChange]);
   const focusedExit = useFocusedReviewExit({

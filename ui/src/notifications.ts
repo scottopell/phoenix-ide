@@ -132,3 +132,33 @@ export function useNotificationClickNavigationBridge(): void {
     return () => window.removeEventListener('phoenix:navigate-to-conversation', handler);
   }, [navigate]);
 }
+
+const PRODUCT_CONVERSATION_LIST_REVISION_EVENT = 'phoenix:product-conversation-list-revision';
+let productConversationListRevision = 0;
+let productConversationListRevisionScheduled = false;
+
+function publishProductConversationListRevision(): void {
+  productConversationListRevision += 1;
+  window.dispatchEvent(new CustomEvent<number>(PRODUCT_CONVERSATION_LIST_REVISION_EVENT, {
+    detail: productConversationListRevision,
+  }));
+}
+
+export function notifyProductConversationListMayHaveChanged(): void {
+  if (productConversationListRevisionScheduled) return;
+  productConversationListRevisionScheduled = true;
+  window.setTimeout(() => {
+    productConversationListRevisionScheduled = false;
+    publishProductConversationListRevision();
+  }, 0);
+}
+
+export function subscribeProductConversationListRevision(listener: () => void): () => void {
+  const handler = () => listener();
+  window.addEventListener(PRODUCT_CONVERSATION_LIST_REVISION_EVENT, handler);
+  return () => window.removeEventListener(PRODUCT_CONVERSATION_LIST_REVISION_EVENT, handler);
+}
+
+export function getProductConversationListRevision(): number {
+  return productConversationListRevision;
+}

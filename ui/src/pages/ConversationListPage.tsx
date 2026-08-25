@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useLayoutEffect, useRef } from 'react';
+import { useState, useEffect, useCallback, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels, subscribeModels } from '../modelsPoller';
@@ -28,6 +28,7 @@ import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 import { SettingsDropdown } from '../components/SettingsDropdown';
 import { effectiveVisibleConversationCount } from './conversationListCount';
+import { getProductConversationListRevision, subscribeProductConversationListRevision } from '../notifications';
 
 const MOBILE_LIST_SCROLL_KEY = 'phoenix:mobile-conversation-list-scroll:v1';
 const MOBILE_ARCHIVED_LIST_SCROLL_KEY = 'phoenix:mobile-archived-list-scroll:v1';
@@ -48,6 +49,11 @@ export function ConversationListPage() {
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
   const [productListError, setProductListError] = useState<string | null>(null);
   const [productListRevision, setProductListRevision] = useState(0);
+  const productConversationListRevision = useSyncExternalStore(
+    subscribeProductConversationListRevision,
+    getProductConversationListRevision,
+    getProductConversationListRevision,
+  );
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
@@ -80,7 +86,7 @@ export function ConversationListPage() {
     return () => {
       cancelled = true;
     };
-  }, [productListRevision]);
+  }, [productConversationListRevision, productListRevision]);
 
   useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;

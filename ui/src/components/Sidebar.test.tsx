@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { notifyProductConversationListMayHaveChanged } from '../notifications';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { Conversation, ProductConversationListRow } from '../api';
@@ -172,6 +173,33 @@ describe('Sidebar — ProductConversation navigation', () => {
     expect(container.querySelector('[data-id="cached-id"]')).not.toBeNull();
     fireEvent.click(getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-recovered"]')).not.toBeNull());
+    expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces product-list refresh triggers from conversation store mutations without request loops', async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/c/cached-slug']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[makeConv('cached-id', 'cached-slug')]}
+          archivedConversations={[]}
+          activeSlug="cached-slug"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-open"]')).not.toBeNull());
+    apiMock.listProductConversations.mockResolvedValueOnce({
+      product_conversations: [makeProductConversation('pc-updated')],
+    });
+
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+    notifyProductConversationListMayHaveChanged();
+
+    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-updated"]')).not.toBeNull());
     expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2);
   });
 

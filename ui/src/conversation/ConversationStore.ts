@@ -2,7 +2,7 @@ import { createInitialAtom, conversationReducer } from './atom';
 import type { ConversationAtom, SSEAction } from './atom';
 import type { CachedPrSummary, Conversation } from '../api';
 import { RoutedStore } from './RoutedStore';
-import { notifyConversationSnapshotChange } from '../notifications';
+import { notifyConversationSnapshotChange, notifyProductConversationListMayHaveChanged } from '../notifications';
 import { parseConversationState } from '../utils';
 
 function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary | null | undefined): boolean {
@@ -152,6 +152,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       return false;
     }
     notifyConversationSnapshotChange(conversation);
+    notifyProductConversationListMayHaveChanged();
     return this.setAtom(routeKey, {
       ...destination,
       conversationId: conversation.id,
@@ -173,6 +174,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     }
     this.slugByConvId.set(conversation.id, slug);
     notifyConversationSnapshotChange(conversation);
+    notifyProductConversationListMayHaveChanged();
     return this.setAtom(slug, { ...destination, conversation });
   }
 

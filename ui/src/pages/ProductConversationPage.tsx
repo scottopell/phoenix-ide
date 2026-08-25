@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
+  ApiResponseError,
   api,
   streamApi,
   type ChainQaRow,
@@ -13,17 +14,43 @@ import {
   type Message,
   type ProductConversationSnapshotView,
 } from '../api';
-import { ChainProvider, useChainAtom, type InflightQa } from '../chain';
+import { useChainAtom, type InflightQa } from '../chain';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { parseConversationState } from '../utils';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import type { RestoreBasis } from '../conversation/historyExpansion';
 import type { TranscriptPositioningInput } from '../conversation/transcriptPositioning';
 import { ChainQaColumn, ChainWorkScopeDock } from './ChainPage';
+import { OPEN_MESSAGE_VIEWER_EVENT, type OpenMessageViewerEventDetail } from '../components/MessageContextMenu';
+import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
+const MessageViewer = lazy(() =>
+  import('../components/MessageViewer').then((m) => ({ default: m.MessageViewer })),
+);
+
+
+async function fetchOlderSnapshotWithFreshCursor(
+  productConversationId: string,
+  before: string,
+): Promise<ProductConversationSnapshotView> {
+  try {
+    return await api.getProductConversationSnapshot(productConversationId, {
+      message_limit: PAGE_SIZE,
+      before,
+    });
+  } catch (error) {
+    if (!(error instanceof ApiResponseError) || error.status !== 400) throw error;
+    const refreshed = await api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
+    if (!refreshed.has_older || !refreshed.before) throw error;
+    return api.getProductConversationSnapshot(productConversationId, {
+      message_limit: PAGE_SIZE,
+      before: refreshed.before,
+    });
+  }
+}
 
 type OwnedSnapshot = {
   productConversationId: string;
@@ -179,6 +206,10 @@ function aggregateConversationState(snapshot: ProductConversationSnapshotView, l
   return parseConversationState(maybeState);
 }
 
+function countSnapshotMessages(snapshot: ProductConversationSnapshotView): number {
+  return snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0);
+}
+
 function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory: ChainQaRow[]): ChainView {
   return {
     root_conv_id: snapshot.chain_qa_compatibility?.root_transcript_row_id ?? snapshot.requested_transcript_row_id,
@@ -199,7 +230,7 @@ function chainFromSnapshot(snapshot: ProductConversationSnapshotView, qaHistory:
       })),
     qa_history: qaHistory,
     current_member_count: snapshot.segments.length,
-    current_total_messages: snapshot.segments.reduce((sum, segment) => sum + segment.messages.length, 0),
+    current_total_messages: countSnapshotMessages(snapshot),
     work_identity: snapshot.work_identity ? {
       work_conv_id: snapshot.work_identity.work_transcript_row_id,
       branch_name: snapshot.work_identity.branch_name,
@@ -240,15 +271,12 @@ function SourceMeta({ snapshot }: { snapshot: ProductConversationSnapshotView })
 
 
 export function ProductConversationPage() {
-  return (
-    <ChainProvider>
-      <ProductConversationPageInner />
-    </ChainProvider>
-  );
+  return <ProductConversationPageInner />;
 }
 
 function ProductConversationPageInner() {
   const { productConversationId } = useParams<{ productConversationId: string }>();
+  const viewerSlot = useViewerSlot();
   const location = useLocation();
   const hashTargetMessageId = decodeMessageHash(location.hash);
   const [ownedSnapshot, setOwnedSnapshot] = useState<OwnedSnapshot | null>(null);
@@ -257,6 +285,7 @@ function ProductConversationPageInner() {
     : null;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [snapshotRetry, setSnapshotRetry] = useState(0);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
   const [latestProjection, setLatestProjection] = useState<EmbeddedConversationProjection | null>(null);
@@ -269,6 +298,11 @@ function ProductConversationPageInner() {
   const { chain, inflight, inflightOrder, draft, submitting, sseLost, loadError } = atom;
   const activeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const inflightRef = useRef(inflight);
+  const aggregateMessages = useMemo(
+    () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
+    [latestProjection, snapshot],
+  );
+  const aggregateMessageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
   inflightRef.current = inflight;
 
   useEffect(() => {
@@ -301,7 +335,7 @@ function ProductConversationPageInner() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [productConversationId]);
+  }, [productConversationId, snapshotRetry]);
 
   const refreshChain = useCallback(async (rootId: string) => {
     try {
@@ -320,6 +354,17 @@ function ProductConversationPageInner() {
     dispatch({ type: 'LOAD_BEGIN' });
     void refreshChain(chainRootId);
   }, [chainRootId, dispatch, refreshChain]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const { sequenceId, messageId, presentation } = (event as CustomEvent<OpenMessageViewerEventDetail>).detail ?? {};
+      if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
+      if (presentation !== 'pane' && presentation !== 'fullscreen') return;
+      viewerSlot.openMessage(sequenceId, presentation, messageId);
+    };
+    window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+  }, [viewerSlot]);
 
   useEffect(() => {
     if (!chainRootId) return;
@@ -365,10 +410,7 @@ function ProductConversationPageInner() {
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const older = await api.getProductConversationSnapshot(productConversationId, {
-        message_limit: PAGE_SIZE,
-        before: snapshot.before,
-      });
+      const older = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before);
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
@@ -403,10 +445,7 @@ function ProductConversationPageInner() {
     }
   }, [historyGeneration, latestProjection?.conversationId, loadingOlder, productConversationId, snapshot]);
 
-  const messages = useMemo(
-    () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
-    [latestProjection, snapshot],
-  );
+  const messages = aggregateMessages;
   const convState = useMemo(
     () => latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
     [latestProjection, loadingOlder, olderError, snapshot],
@@ -441,8 +480,14 @@ function ProductConversationPageInner() {
 
   const synthChain = useMemo(() => {
     if (!snapshot) return null;
-    return chain ?? chainFromSnapshot(snapshot, []);
-  }, [chain, snapshot]);
+    const fallback = chainFromSnapshot(snapshot, []);
+    if (!chain) return fallback;
+    return {
+      ...chain,
+      current_member_count: Math.max(chain.current_member_count, snapshot.segments.length),
+      current_total_messages: Math.max(chain.current_total_messages, messages.length, countSnapshotMessages(snapshot)),
+    };
+  }, [chain, messages.length, snapshot]);
 
   const renderableQas = useMemo(() => {
     const persisted: ChainQaRow[] = chain?.qa_history.slice() ?? [];
@@ -540,7 +585,22 @@ function ProductConversationPageInner() {
   }
 
   if (error || !snapshot) {
-    return <main className="product-conversation-page" role="alert">{error ?? 'Unable to open this product conversation.'}</main>;
+    const fallbackSlug = ownedSnapshot && ownedSnapshot.productConversationId === productConversationId
+      ? ownedSnapshot.value.latest_transcript_row_id
+      : productConversationId;
+    return (
+      <main className="product-conversation-page">
+        <div role="alert">{error ?? 'Unable to open this product conversation.'} Showing cached row if available.</div>
+        <button type="button" onClick={() => setSnapshotRetry((retry) => retry + 1)}>Retry</button>
+        {fallbackSlug && (
+          <EmbeddedConversationPage
+            slug={fallbackSlug}
+            routePrefix="/c"
+            suppressCanonicalization
+          />
+        )}
+      </main>
+    );
   }
 
   return (
@@ -612,9 +672,24 @@ function ProductConversationPageInner() {
                   slug={snapshot.latest_transcript_row_id}
                   showTranscript={false}
                   suppressCanonicalization={true}
-                  ordinaryComposerEnabled={snapshot.writable_transcript_row_id === snapshot.latest_transcript_row_id}
+                  ordinaryComposerEnabled={isOpen}
                   onProjectionChange={setLatestProjection}
                 />
+                {aggregateMessageSlot && (
+                  <Suspense fallback={null}>
+                    <MessageViewer
+                      sequenceId={aggregateMessageSlot.sequenceId}
+                      messageId={aggregateMessageSlot.messageId}
+                      messages={aggregateMessages}
+                      onClose={viewerSlot.close}
+                      onSendNotes={() => {}}
+                      presentation={aggregateMessageSlot.presentation}
+                      canTogglePresentation
+                      onPresentationChange={viewerSlot.setPresentation}
+                      inline={aggregateMessageSlot.presentation === 'pane'}
+                    />
+                  </Suspense>
+                )}
               </div>
             ) : (
               <div className="product-conversation-page__composer-placeholder">History is read-only.</div>

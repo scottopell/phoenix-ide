@@ -209,7 +209,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
   const routeSlug = slugMatch?.[1] ?? null;
   const productConversationId = productMatch?.[1] ?? null;
-  const [productSnapshot, setProductSnapshot] = useState<ProductConversationSnapshotView | null>(null);
+  const [productSnapshot, setProductSnapshot] = useState<{ ownerId: string; snapshot: ProductConversationSnapshotView } | null>(null);
   useEffect(() => {
     if (!productConversationId) {
       setProductSnapshot(null);
@@ -218,14 +218,15 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     let cancelled = false;
     api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
       .then((snapshot) => {
-        if (!cancelled) setProductSnapshot(snapshot);
+        if (!cancelled) setProductSnapshot({ ownerId: productConversationId, snapshot });
       })
       .catch(() => {
         if (!cancelled) setProductSnapshot(null);
       });
     return () => { cancelled = true; };
   }, [productConversationId]);
-  const activeSlug = routeSlug ?? productSnapshot?.latest_transcript_row_id ?? null;
+  const ownedProductSnapshot = productSnapshot?.ownerId === productConversationId ? productSnapshot.snapshot : null;
+  const activeSlug = routeSlug ?? ownedProductSnapshot?.latest_transcript_row_id ?? null;
   const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;

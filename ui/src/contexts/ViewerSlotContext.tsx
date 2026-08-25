@@ -44,7 +44,7 @@ export type ViewerSlot =
   | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; handleId: string }
-  | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number };
+  | { kind: 'message'; presentation: ViewerPresentation; sequenceId: number; messageId?: string | undefined };
 
 /** The slot's imperative surface. Identity-stable across slot / browser-session
  *  changes, so a command-only consumer (a button that opens a viewer) does not
@@ -57,7 +57,7 @@ export interface ViewerSlotCommands {
   /** Open the process inspector on a single bash handle by opaque id. */
   openInspect: (handleId: string) => void;
   /** Open a finalized chat message in the annotatable markdown viewer. */
-  openMessage: (sequenceId: number, presentation: ViewerPresentation) => void;
+  openMessage: (sequenceId: number, presentation: ViewerPresentation, messageId?: string) => void;
   /** Change only the active prose/message presentation, preserving identity. */
   setPresentation: (presentation: ViewerPresentation) => void;
   close: () => void;
@@ -173,7 +173,8 @@ function deriveSlot(
     case 'message': {
       const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
       if (sequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'message', presentation, sequenceId }, malformed: false };
+      const messageId = parseMessageIdParam(searchParams.get('message_id'));
+      return { slot: { kind: 'message', presentation, sequenceId, ...(messageId ? { messageId } : {}) }, malformed: false };
     }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
@@ -197,6 +198,10 @@ function parseMessageParam(messageParam: string | null): number | undefined {
   if (!messageParam || !/^[1-9]\d*$/.test(messageParam)) return undefined;
   const sequenceId = Number(messageParam);
   return Number.isSafeInteger(sequenceId) && sequenceId > 0 ? sequenceId : undefined;
+}
+
+function parseMessageIdParam(messageIdParam: string | null): string | undefined {
+  return messageIdParam && messageIdParam.length > 0 ? messageIdParam : undefined;
 }
 
 interface ViewerSlotProviderProps {
@@ -298,7 +303,7 @@ export function ViewerSlotProvider({
     });
   }, [setPatchContext, writeUrl]);
 
-  const openMessage = useCallback((sequenceId: number, presentation: ViewerPresentation) => {
+  const openMessage = useCallback((sequenceId: number, presentation: ViewerPresentation, messageId?: string) => {
     const validSequenceId = Number.isSafeInteger(sequenceId) && sequenceId > 0 ? sequenceId : undefined;
     if (validSequenceId === undefined) return;
     setPatchContext(null);
@@ -307,6 +312,7 @@ export function ViewerSlotProvider({
       next.set(VIEWER_PARAM, 'message');
       next.set(DIFF_PRESENTATION_PARAM, presentation);
       next.set(MESSAGE_PARAM, String(validSequenceId));
+      if (messageId) next.set('message_id', messageId);
     });
   }, [setPatchContext, writeUrl]);
 
