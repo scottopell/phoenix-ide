@@ -195,6 +195,7 @@ interface EmbeddedConversationHostProps {
   suppressCanonicalization?: boolean;
   ordinaryComposerEnabled?: boolean;
   suppressMessageViewerOwner?: boolean;
+  suppressTaskApprovalOwner?: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
 }
 
@@ -219,6 +220,7 @@ export function EmbeddedConversationPage({
   ordinaryComposerEnabled = true,
   onProjectionChange,
   suppressMessageViewerOwner = false,
+  suppressTaskApprovalOwner = false,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -251,6 +253,7 @@ export function EmbeddedConversationPage({
         ordinaryComposerEnabled={ordinaryComposerEnabled}
         suppressCanonicalization={suppressCanonicalization}
         suppressMessageViewerOwner={suppressMessageViewerOwner}
+        suppressTaskApprovalOwner={suppressTaskApprovalOwner}
         {...(onProjectionChange ? { onProjectionChange } : {})}
       />
     </ReviewNotesProvider>
@@ -282,6 +285,7 @@ function ConversationPageContent({
   suppressCanonicalization,
   onProjectionChange,
   suppressMessageViewerOwner,
+  suppressTaskApprovalOwner,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
@@ -291,6 +295,7 @@ function ConversationPageContent({
   suppressCanonicalization: boolean;
   onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
   suppressMessageViewerOwner: boolean;
+  suppressTaskApprovalOwner: boolean;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -2624,7 +2629,7 @@ function ConversationPageContent({
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
-      {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
+      {!suppressTaskApprovalOwner && showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
         <Suspense fallback={null}>
           <TaskApprovalReader
             title={atom.phase.title}

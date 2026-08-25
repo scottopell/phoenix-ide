@@ -181,6 +181,8 @@ export function MessageContextMenu({
   if (!menu) return null;
 
   const hasSelection = (window.getSelection()?.toString().length ?? 0) > 0;
+  const isProductHandoffBoundary = !!(menu.message.display_data as { productHistoricalHandoff?: unknown } | null | undefined)?.productHistoricalHandoff;
+  const viewerEnabledForMessage = !isProductHandoffBoundary;
 
   const copyMarkdown = () => {
     const md = getMessageMarkdown(menu.message);
@@ -262,7 +264,7 @@ export function MessageContextMenu({
           Copy output
         </button>
       )}
-      {enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
+      {viewerEnabledForMessage && enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
         <>
           <button className="msg-context-item" onClick={() => openMessage('pane')}>
             Open in sidepanel

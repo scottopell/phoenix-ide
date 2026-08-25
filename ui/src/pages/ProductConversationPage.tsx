@@ -39,20 +39,23 @@ const TaskApprovalReader = lazy(() =>
 async function fetchOlderSnapshotWithFreshCursor(
   productConversationId: string,
   before: string,
-): Promise<ProductConversationSnapshotView> {
+): Promise<{ older: ProductConversationSnapshotView; refreshedTail?: ProductConversationSnapshotView }> {
   try {
-    return await api.getProductConversationSnapshot(productConversationId, {
+    return { older: await api.getProductConversationSnapshot(productConversationId, {
       message_limit: PAGE_SIZE,
       before,
-    });
+    }) };
   } catch (error) {
     if (!(error instanceof ApiResponseError) || error.status !== 400) throw error;
     const refreshed = await api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE });
     if (!refreshed.has_older || !refreshed.before) throw error;
-    return api.getProductConversationSnapshot(productConversationId, {
-      message_limit: PAGE_SIZE,
-      before: refreshed.before,
-    });
+    return {
+      refreshedTail: refreshed,
+      older: await api.getProductConversationSnapshot(productConversationId, {
+        message_limit: PAGE_SIZE,
+        before: refreshed.before,
+      }),
+    };
   }
 }
 
@@ -142,7 +145,19 @@ function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): M
 
 function mergeMessagesById(snapshotMessages: Message[], liveMessages: Message[]): Message[] {
   const liveById = new Map(liveMessages.map((message) => [message.message_id, message]));
-  const merged = snapshotMessages.map((message) => liveById.get(message.message_id) ?? message);
+  const merged = snapshotMessages.map((message) => {
+    const live = liveById.get(message.message_id);
+    if (!live) return message;
+    return {
+      ...live,
+      display_data: {
+        ...(live.display_data ?? {}),
+        ...((message.display_data as { productOccurrenceToken?: string } | null | undefined)?.productOccurrenceToken
+          ? { productOccurrenceToken: (message.display_data as { productOccurrenceToken: string }).productOccurrenceToken }
+          : {}),
+      },
+    };
+  });
   const snapshotIds = new Set(snapshotMessages.map((message) => message.message_id));
   return [...merged, ...liveMessages.filter((message) => !snapshotIds.has(message.message_id))];
 }
@@ -500,11 +515,12 @@ function ProductConversationPageInner() {
     setLoadingOlder(true);
     setOlderError(null);
     try {
-      const older = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before);
+      const { older, refreshedTail } = await fetchOlderSnapshotWithFreshCursor(productConversationId, snapshot.before);
       if (routeGenerationRef.current !== routeGeneration || paginationRequestRef.current !== requestGeneration) return;
       setOwnedSnapshot((current) => {
         if (!current || current.productConversationId !== ownerId) return current;
-        return { productConversationId: ownerId, value: mergeOlderSegments(current.value, older) };
+        const authoritativeTail = refreshedTail ?? current.value;
+        return { productConversationId: ownerId, value: mergeOlderSegments(authoritativeTail, older) };
       });
       setHistoryGeneration((generation) => generation + 1);
       if (restoreBasis?.kind === 'reader_anchor') {
@@ -541,7 +557,7 @@ function ProductConversationPageInner() {
     [latestProjection, loadingOlder, olderError, snapshot],
   );
   const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
-  const latestConversationId = latestProjection?.conversationId;
+  const latestConversationId = latestProjection?.conversationId ?? snapshot?.latest_transcript_row_id ?? undefined;
   const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
   const aggregateWorkIdentity = snapshot?.work_identity ?? null;
   const transcriptView = {
@@ -550,6 +566,7 @@ function ProductConversationPageInner() {
     transcriptGeneration: historyGeneration,
   };
   const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
+  const hashTargetExhausted = !!hashTargetMessageId && !hashTargetLoaded && snapshot?.has_older === false;
   const transcriptPositioning = restoreCommand ?? (hashTargetLoaded
     ? {
       kind: 'positioning' as const,
@@ -703,6 +720,11 @@ function ProductConversationPageInner() {
           <p className="product-conversation-page__route">{snapshot.canonical_route}</p>
         </div>
         {olderError && <div className="product-conversation-page__status" role="alert">{olderError}</div>}
+        {hashTargetExhausted && (
+          <div className="product-conversation-page__status" role="alert">
+            The linked message is not available in this conversation history.
+          </div>
+        )}
       </header>
 
       <div className="product-conversation-page__layout">
@@ -764,7 +786,8 @@ function ProductConversationPageInner() {
                   slug={snapshot.latest_transcript_row_id}
                   showTranscript={false}
                   suppressCanonicalization={true}
-                  suppressMessageViewerOwner={true}
+                  suppressMessageViewerOwner
+                  suppressTaskApprovalOwner={true}
                   ordinaryComposerEnabled={isOpen}
                   onProjectionChange={setLatestProjection}
                 />
