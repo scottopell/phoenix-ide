@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { useDocumentViewportOwnership } from '../../components/viewportRoutes';
+import { FileExplorerProvider } from '../../components/FileExplorer';
 import { ConversationReadinessProvider } from '../../contexts/ConversationReadinessContext';
+import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { ConversationProvider } from '../../conversation';
 import { ProductConversationPage } from '../../pages/ProductConversationPage';
 import '../../index.css';
@@ -74,9 +76,13 @@ function ProductConversationFixtureBody({ scenario }: Props) {
       <MemoryRouter initialEntries={['/product-conversations/fixture-product-conversation']}>
         <ConversationProvider>
           <ConversationReadinessProvider>
-            <Routes>
-              <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
-            </Routes>
+            <ViewerSlotProvider scopeKey="fixture-product-conversation" browserSessionActive={false}>
+              <FileExplorerProvider>
+                <Routes>
+                  <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+                </Routes>
+              </FileExplorerProvider>
+            </ViewerSlotProvider>
           </ConversationReadinessProvider>
         </ConversationProvider>
       </MemoryRouter>

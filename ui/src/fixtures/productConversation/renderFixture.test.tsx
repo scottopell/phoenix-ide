@@ -7,7 +7,7 @@ import { getProductConversationScenario } from './scenarios';
 afterEach(() => cleanup());
 
 describe('ProductConversationFixture', () => {
-  it('renders the real desktop page with metadata, Q&A history, and the read-only composer placeholder', async () => {
+  it('renders the real desktop page with metadata, Q&A history, and the latest-row runtime', async () => {
     const scenario = getProductConversationScenario('desktop-multi-segment-qa-work');
     const { container } = render(<ProductConversationFixture scenario={scenario} />);
 
@@ -18,7 +18,7 @@ describe('ProductConversationFixture', () => {
     expect(screen.getByTestId('product-conversation-page')).toBeInTheDocument();
     expect(screen.getAllByText('Product Alpha').length).toBeGreaterThan(0);
     expect(screen.getByText('Presentation')).toBeInTheDocument();
-    expect(screen.getByText('History is read-only.')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="product-conversation-composer"]')).not.toBeNull();
     expect(screen.getByText('What user-visible surfaces must remain stable?')).toBeInTheDocument();
     expect(screen.getByText(/The route, title, lineage metadata/)).toBeInTheDocument();
   });

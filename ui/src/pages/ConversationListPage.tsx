@@ -46,6 +46,7 @@ export function ConversationListPage() {
   const [showArchived, setShowArchived] = useState(false);
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
   const [productListError, setProductListError] = useState<string | null>(null);
+  const [productListRevision, setProductListRevision] = useState(0);
   const mainRef = useRef<HTMLElement | null>(null);
   const didRestoreScrollRef = useRef(false);
   const currentScrollKey = showArchived ? MOBILE_ARCHIVED_LIST_SCROLL_KEY : MOBILE_LIST_SCROLL_KEY;
@@ -70,7 +71,7 @@ export function ConversationListPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [productListRevision]);
 
   useEffect(() => {
     if (isDesktop) didRestoreScrollRef.current = false;
@@ -369,7 +370,12 @@ export function ConversationListPage() {
           </section>
         ) : (
           <>
-            {productListError && <div role="alert" className="coordinator-error">{productListError}</div>}
+            {productListError && (
+              <div role="status" className="coordinator-error">
+                <span>Showing cached conversations — {productListError}</span>
+                <button type="button" onClick={() => setProductListRevision((revision) => revision + 1)}>Retry</button>
+              </div>
+            )}
             <ConversationList
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}

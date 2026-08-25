@@ -124,7 +124,7 @@ describe('Sidebar — ProductConversation navigation', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-product-conversation-id="pc-archived"]')).not.toBeNull();
     });
-    const archivedTab = getByRole('button', { name: /Archived 1/ });
+    const archivedTab = getByRole('button', { name: /History 1/ });
     expect(archivedTab.getAttribute('aria-pressed')).toBe('true');
   });
 
@@ -149,10 +149,13 @@ describe('Sidebar — ProductConversation navigation', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelectorAll('.sidebar-dot-btn')).toHaveLength(9);
-    expect(container.querySelector('[title="conv-11"]')).not.toBeNull();
+    await waitFor(() => {
+      expect(container.querySelectorAll('.sidebar-dot-btn')).toHaveLength(1);
+    });
+    expect(container.querySelector('[aria-label="Open Display pc-open"]')).not.toBeNull();
+    expect(container.querySelector('[title="conv-11"]')).toBeNull();
 
-    fireEvent.click(getByRole('button', { name: /3 more conversations/ }));
+    fireEvent.click(getByRole('button', { name: /Expand sidebar/ }));
     expect(onToggle).toHaveBeenCalledTimes(1);
   });
 

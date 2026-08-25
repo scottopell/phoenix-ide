@@ -202,25 +202,33 @@ function productConversationStateDotClass(row: ProductConversationListRow): stri
 const ProductConversationListRowView = memo(function ProductConversationListRowView({
   row,
   isActive,
+  isKeyboardSelected,
   listDensity,
   onClick,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
+  isKeyboardSelected: boolean;
   listDensity: 'full' | 'mobile' | 'sidebar';
   onClick: (row: ProductConversationListRow) => void;
 }) {
   const classes = [
     'conv-item',
     isActive ? 'active' : '',
+    isKeyboardSelected ? 'keyboard-selected' : '',
     'product-conversation-list-row',
   ].filter(Boolean).join(' ');
   const displayTitle = productConversationDisplayTitle(row);
   const presentationLabel = row.presentation.display_name;
   const statusTitle = productConversationStatusLabel(row);
   return (
-    <li className={classes} data-product-conversation-id={row.product_conversation_id}>
-      <div
+    <li
+      className={classes}
+      data-id={row.product_conversation_id}
+      data-product-conversation-id={row.product_conversation_id}
+    >
+      <button
+        type="button"
         className="conv-item-main"
         onClick={() => onClick(row)}
         title={`Open product conversation "${displayTitle}"`}
@@ -240,7 +248,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
             {formatRelativeTime(row.updated_at)}
           </span>
         </div>
-      </div>
+      </button>
       {listDensity !== 'mobile' && (
         <div className="conv-item-secondary-row">
           <span className="conv-item-secondary-badge">{row.ordinary_lifecycle === 'history' ? 'Archived' : 'Open'}</span>
@@ -668,6 +676,9 @@ export function ConversationList({
   }, [activeSlug, collapsedChains, effectiveListDensity]);
 
   const keyboardItems = useMemo(() => {
+    if (usingProductRows) {
+      return displayProductList.map((row) => ({ id: row.product_conversation_id }));
+    }
     const out: Conversation[] = [];
     for (const item of groupedItems) {
       if (item.kind === 'single') {
@@ -680,10 +691,19 @@ export function ConversationList({
       }
     }
     return out;
-  }, [effectiveListDensity, groupedItems, isChainCollapsed]);
+  }, [displayProductList, effectiveListDensity, groupedItems, isChainCollapsed, usingProductRows]);
 
   const { selectedId } = useKeyboardNav({
     items: keyboardItems,
+    ...(usingProductRows
+      ? {
+        onSelect: (item: { id: string }) => {
+          const row = displayProductList.find((candidate) => candidate.product_conversation_id === item.id);
+          if (row) onProductConversationClick?.(row);
+          else navigate(`/product-conversations/${item.id}`);
+        },
+      }
+      : {}),
     onNew: onNewConversation,
   });
 
@@ -783,7 +803,7 @@ export function ConversationList({
                 className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
                 onClick={() => { if (!showArchived) onToggleArchived(); }}
               >
-                Archived {archivedConversations.length}
+                History {usingProductRows ? archivedProductConversations.length : archivedConversations.length}
               </button>
               {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
             </div>
@@ -831,6 +851,7 @@ export function ConversationList({
               key={row.product_conversation_id}
               row={row}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
+              isKeyboardSelected={selectedId === row.product_conversation_id}
               listDensity={effectiveListDensity}
               onClick={(productRow) => {
                 if (onProductConversationClick) onProductConversationClick(productRow);

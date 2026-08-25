@@ -18,7 +18,7 @@ import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { parseConversationState } from '../utils';
 import type { EnrichedMessage } from '../generated/EnrichedMessage';
 import { ChainQaColumn, ChainWorkScopeDock } from './ChainPage';
-import { EmbeddedConversationPage } from './ConversationPage';
+import { EmbeddedConversationPage, type EmbeddedConversationProjection } from './ConversationPage';
 import './ProductConversationPage.css';
 
 const PAGE_SIZE = 100;
@@ -42,9 +42,9 @@ function sortSegments(snapshot: ProductConversationSnapshotView) {
     .sort((a, b) => a.segment_ordinal - b.segment_ordinal);
 }
 
-function makeHistoricalHandoffMessage(snapshot: ProductConversationSnapshotView, segmentOrdinal: number): Message | null {
+function makeHandoffMessage(snapshot: ProductConversationSnapshotView, segmentOrdinal: number): Message | null {
   const segment = sortSegments(snapshot).find((candidate) => candidate.segment_ordinal === segmentOrdinal);
-  if (!segment?.handoff || segment.handoff.kind !== 'historical') return null;
+  if (!segment?.handoff) return null;
   return {
     message_id: `product-handoff:${snapshot.product_conversation_id}:${segment.transcript_row_id}:${segment.handoff.continuation_message_id}`,
     conversation_id: snapshot.product_conversation_id,
@@ -63,13 +63,44 @@ function makeHistoricalHandoffMessage(snapshot: ProductConversationSnapshotView,
   };
 }
 
-function flattenSnapshotMessages(snapshot: ProductConversationSnapshotView): Message[] {
+function isLatestSegment(snapshot: ProductConversationSnapshotView, transcriptRowId: string): boolean {
+  return transcriptRowId === snapshot.latest_transcript_row_id;
+}
+
+function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): Message[] {
   return sortSegments(snapshot)
     .flatMap((segment) => {
-      const handoffMessage = makeHistoricalHandoffMessage(snapshot, segment.segment_ordinal);
+      if (isLatestSegment(snapshot, segment.transcript_row_id)) return [];
+      const handoffMessage = makeHandoffMessage(snapshot, segment.segment_ordinal);
       const segmentMessages = segment.messages.map(toMessage);
       return handoffMessage ? [handoffMessage, ...segmentMessages] : segmentMessages;
     });
+}
+
+function makeAggregateMessages(
+  snapshot: ProductConversationSnapshotView,
+  latestProjection: EmbeddedConversationProjection | null,
+): Message[] {
+  const historical = flattenHistoricalMessages(snapshot);
+  if (!latestProjection) {
+    const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
+    const latestMessages = latestSegment
+      ? [
+        ...(latestSegment.handoff
+          ? [makeHandoffMessage(snapshot, latestSegment.segment_ordinal)!]
+          : []),
+        ...latestSegment.messages.map(toMessage),
+      ]
+      : [];
+    return [...historical, ...latestMessages];
+  }
+  const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
+  const latestHandoff = latestSegment ? makeHandoffMessage(snapshot, latestSegment.segment_ordinal) : null;
+  return [
+    ...historical,
+    ...(latestHandoff ? [latestHandoff] : []),
+    ...latestProjection.messages,
+  ];
 }
 
 function mergeOlderSegments(
@@ -199,6 +230,7 @@ function ProductConversationPageInner() {
   const [error, setError] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
+  const [latestProjection, setLatestProjection] = useState<EmbeddedConversationProjection | null>(null);
   const chainRootId = snapshot?.chain_qa_compatibility?.root_transcript_row_id ?? null;
   const [atom, dispatch] = useChainAtom(chainRootId);
   const { chain, inflight, inflightOrder, draft, submitting, sseLost } = atom;
@@ -207,11 +239,16 @@ function ProductConversationPageInner() {
   inflightRef.current = inflight;
 
   useEffect(() => {
+    setLatestProjection(null);
+  }, [productConversationId]);
+
+  useEffect(() => {
     if (!productConversationId) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     setOlderError(null);
+
     api.getProductConversationSnapshot(productConversationId, { message_limit: PAGE_SIZE })
       .then((next) => {
         if (cancelled) return;
@@ -287,18 +324,26 @@ function ProductConversationPageInner() {
       setSnapshot((current) => {
         if (!current) return older;
         return mergeOlderSegments(current, older);
-      });    } catch (err) {
+      });
+    } catch (err) {
       setOlderError(err instanceof Error ? err.message : 'Failed to load earlier history.');
     } finally {
       setLoadingOlder(false);
     }
   }, [loadingOlder, productConversationId, snapshot]);
 
-  const messages = useMemo(() => snapshot ? flattenSnapshotMessages(snapshot) : [], [snapshot]);
-  const convState = useMemo(
-    () => snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState,
-    [loadingOlder, olderError, snapshot],
+  const messages = useMemo(
+    () => snapshot ? makeAggregateMessages(snapshot, latestProjection) : [],
+    [latestProjection, snapshot],
   );
+  const convState = useMemo(
+    () => latestProjection?.convState ?? (snapshot ? aggregateConversationState(snapshot, loadingOlder, olderError) : { type: 'idle' } satisfies ConversationState),
+    [latestProjection, loadingOlder, olderError, snapshot],
+  );
+  const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
+  const latestConversationId = latestProjection?.conversationId;
+  const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
+  const isOpen = snapshot?.ordinary_lifecycle === 'open';
 
   const synthChain = useMemo(() => {
     if (!snapshot) return null;
@@ -385,14 +430,14 @@ function ProductConversationPageInner() {
           {synthChain?.work_identity && <ChainWorkIdentityBlock identity={synthChain.work_identity} />}
           <ConversationNavStack
             messages={messages}
-            pendingMessages={[]}
+            pendingMessages={latestProjection?.pendingMessages ?? []}
             convState={convState}
             onRetry={() => {}}
             onOpenFile={undefined}
             enableMessageSidepanel={false}
             enableMessageFullscreen={false}
-            conversationId={snapshot.product_conversation_id}
-            slug={snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
+            conversationId={latestConversationId ?? snapshot.product_conversation_id}
+            slug={latestSlug ?? snapshot.canonical_root.slug ?? snapshot.requested_transcript_row_id}
             hasOlderMessages={snapshot.has_older}
             onLoadOlderMessages={snapshot.has_older ? () => { void loadOlderMessages(); } : undefined}
             loadingOlderMessages={loadingOlder}
@@ -405,30 +450,39 @@ function ProductConversationPageInner() {
                 transcriptGeneration: 0,
               },
             }}
+            {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
           />
         </section>
 
-        {synthChain && chainRootId && (
-          <section className="product-conversation-page__qa" aria-label="Product conversation chain question and answer">
-            <ChainQaColumn
-              chain={synthChain}
-              persisted={renderableQas.persisted}
-              inflight={renderableQas.inflightList}
-              draft={draft}
-              setDraft={setDraft}
-              submitting={submitting}
-              sseLost={sseLost}
-              onSubmit={handleSubmit}
-              onReask={handleReask}
-              activeTextareaRef={activeTextareaRef}
-              onRetryConnection={() => {
-                dispatch({ type: 'SSE_RESTORED' });
-                void refreshChain(chainRootId);
-              }}
-            />
-            {snapshot.writable_transcript_row_id ? (
+        {(chainRootId || (isOpen && snapshot.latest_transcript_row_id)) && (
+          <section className="product-conversation-page__qa" aria-label="Product conversation recall and live controls">
+            {synthChain && chainRootId && (
+              <ChainQaColumn
+                chain={synthChain}
+                persisted={renderableQas.persisted}
+                inflight={renderableQas.inflightList}
+                draft={draft}
+                setDraft={setDraft}
+                submitting={submitting}
+                sseLost={sseLost}
+                onSubmit={handleSubmit}
+                onReask={handleReask}
+                activeTextareaRef={activeTextareaRef}
+                onRetryConnection={() => {
+                  dispatch({ type: 'SSE_RESTORED' });
+                  void refreshChain(chainRootId);
+                }}
+              />
+            )}
+            {isOpen && snapshot.latest_transcript_row_id ? (
               <div className="product-conversation-page__composer" data-testid="product-conversation-composer">
-                <EmbeddedConversationPage slug={snapshot.writable_transcript_row_id} showTranscript={false} />
+                <EmbeddedConversationPage
+                  slug={snapshot.latest_transcript_row_id}
+                  showTranscript={false}
+                  suppressCanonicalization={true}
+                  ordinaryComposerEnabled={snapshot.writable_transcript_row_id === snapshot.latest_transcript_row_id}
+                  onProjectionChange={setLatestProjection}
+                />
               </div>
             ) : (
               <div className="product-conversation-page__composer-placeholder">History is read-only.</div>
@@ -436,10 +490,10 @@ function ProductConversationPageInner() {
           </section>
         )}
 
-        {snapshot.writable_transcript_row_id && synthChain?.work_identity && (
+        {snapshot.latest_transcript_row_id && synthChain?.work_identity && (
           <aside className="product-conversation-page__dock">
             <ChainWorkScopeDock
-              activeConvId={snapshot.writable_transcript_row_id}
+              activeConvId={snapshot.latest_transcript_row_id}
               workIdentity={synthChain.work_identity}
             />
           </aside>

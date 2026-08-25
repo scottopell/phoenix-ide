@@ -24,6 +24,38 @@ function collapsedDotConversations(conversations: readonly Conversation[], activ
   return [...conversations.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
 }
 
+function productRowMatchesRoute(row: ProductConversationListRow, routeIdentity: string | null): boolean {
+  return !!routeIdentity && (
+    row.product_conversation_id === routeIdentity
+    || row.latest_transcript_row_id === routeIdentity
+    || row.canonical_root.transcript_row_id === routeIdentity
+    || row.canonical_root.slug === routeIdentity
+  );
+}
+
+function productRowDotClass(row: ProductConversationListRow): string {
+  if (row.presentation.kind === 'needs_action') return 'awaiting-approval';
+  switch (row.presentation.presentation_mode) {
+    case 'working': return 'working';
+    case 'error': return 'error';
+    case 'done': return 'terminal';
+    default: return row.ordinary_lifecycle === 'history' ? 'terminal' : 'idle';
+  }
+}
+
+function collapsedDotProductConversations(
+  rows: readonly ProductConversationListRow[],
+  routeIdentity: string | null,
+): readonly ProductConversationListRow[] {
+  if (rows.length <= COLLAPSED_DOT_LIMIT) return rows;
+  const visible = rows.slice(0, COLLAPSED_DOT_LIMIT);
+  if (!routeIdentity || visible.some((row) => productRowMatchesRoute(row, routeIdentity))) return visible;
+
+  const active = rows.find((row) => productRowMatchesRoute(row, routeIdentity));
+  if (!active) return visible;
+  return [...rows.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
+}
+
 const ChevronLeft = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <polyline points="15 18 9 12 15 6" />
@@ -76,6 +108,8 @@ export function Sidebar({
   }, []);
   const [showArchived, setShowArchived] = useState(false);
   const [productConversations, setProductConversations] = useState<ProductConversationListRow[]>([]);
+  const [productConversationsError, setProductConversationsError] = useState<string | null>(null);
+  const [productConversationsRetry, setProductConversationsRetry] = useState(0);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
@@ -100,13 +134,20 @@ export function Sidebar({
     let cancelled = false;
     api.listProductConversations()
       .then((response) => {
-        if (!cancelled) setProductConversations(response.product_conversations);
+        if (!cancelled) {
+          setProductConversations(response.product_conversations);
+          setProductConversationsError(null);
+        }
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setProductConversationsError(error instanceof Error ? error.message : 'Failed to refresh conversations');
+        }
+      });
     return () => {
       cancelled = true;
     };
-  }, [conversations.length, archivedConversations.length]);
+  }, [productConversationsRetry]);
   const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const openProductConversations = productConversations.filter((row) => row.ordinary_lifecycle !== 'history');
   const archivedProductConversations = productConversations.filter((row) => row.ordinary_lifecycle === 'history');
@@ -217,8 +258,15 @@ export function Sidebar({
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
   const isOnGlobalPage = location.pathname === '/global';
-  const collapsedConversations = collapsedDotConversations(conversations, activeSlug);
-  const collapsedOverflowCount = Math.max(0, conversations.length - collapsedConversations.length);
+  const collapsedProductConversations = collapsedDotProductConversations(openProductConversations, activeSlug);
+  const collapsedConversations = productConversationsError && productConversations.length === 0
+    ? collapsedDotConversations(conversations, activeSlug)
+    : [];
+  const collapsedVisibleCount = collapsedProductConversations.length || collapsedConversations.length;
+  const collapsedTotalCount = collapsedProductConversations.length > 0
+    ? openProductConversations.length
+    : conversations.length;
+  const collapsedOverflowCount = Math.max(0, collapsedTotalCount - collapsedVisibleCount);
 
   if (collapsed) {
     return (
@@ -259,6 +307,17 @@ export function Sidebar({
           compact
         />
         <div className="sidebar-collapsed-dots">
+          {collapsedProductConversations.map((row) => (
+            <button
+              key={row.product_conversation_id}
+              className={`sidebar-dot-btn ${productRowMatchesRoute(row, activeSlug) ? 'active' : ''}`}
+              onClick={() => navigate(row.canonical_route)}
+              title={row.presentation.display_name}
+              aria-label={`Open ${row.presentation.display_name}`}
+            >
+              <span className={`conv-state-dot ${productRowDotClass(row)}`} />
+            </button>
+          ))}
           {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = matchesRouteSegment(conv, activeSlug);
@@ -341,7 +400,7 @@ export function Sidebar({
           onClick={() => { if (showArchived) handleToggleArchived(); }}
           aria-pressed={!showArchived}
         >
-          <span>Active</span>
+          <span>Open</span>
           <span className="sidebar-lifecycle-count">{scopedActiveCount}</span>
         </button>
         <button
@@ -350,13 +409,21 @@ export function Sidebar({
           onClick={() => { if (!showArchived) handleToggleArchived(); }}
           aria-pressed={showArchived}
         >
-          <span>Archived</span>
+          <span>History</span>
           <span className="sidebar-lifecycle-count">{scopedArchivedCount}</span>
         </button>
       </div>
+      {productConversationsError && (
+        <div className="sidebar-refresh-error" role="status">
+          <span>Showing cached conversations</span>
+          <button type="button" onClick={() => setProductConversationsRetry((revision) => revision + 1)}>Retry</button>
+        </div>
+      )}
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
+          conversations={productConversationsError && productConversations.length === 0 ? conversations : []}
+          archivedConversations={productConversationsError && productConversations.length === 0 ? archivedConversations : []}
           productConversations={openProductConversations}
           archivedProductConversations={archivedProductConversations}
           showArchived={showArchived}

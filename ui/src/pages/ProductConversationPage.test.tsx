@@ -3,6 +3,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ProductConversationPage } from './ProductConversationPage';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
+import { FileExplorerProvider } from '../components/FileExplorer';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import type { ChainView, ProductConversationSnapshotView } from '../api';
 
 const conversationNavStackSpy = vi.fn();
@@ -33,9 +35,9 @@ vi.mock('../components/ConversationNavStack', () => ({
 }));
 
 vi.mock('./ConversationPage', () => ({
-  EmbeddedConversationPage: ({ slug }: { slug: string }) => {
-    embeddedConversationPageSpy(slug);
-    return <div data-testid="embedded-conversation-page">embedded {slug}</div>;
+  EmbeddedConversationPage: (props: Record<string, unknown>) => {
+    embeddedConversationPageSpy(props);
+    return <div data-testid="embedded-conversation-page">embedded {String(props['slug'])}</div>;
   },
 }));
 
@@ -199,12 +201,38 @@ function renderPage() {
   return render(
     <ConversationReadinessProvider>
       <MemoryRouter initialEntries={['/product-conversations/pc-1']}>
-        <Routes>
-          <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
-        </Routes>
+        <ViewerSlotProvider browserSessionActive={false}>
+          <FileExplorerProvider>
+            <Routes>
+              <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
+            </Routes>
+          </FileExplorerProvider>
+        </ViewerSlotProvider>
       </MemoryRouter>
     </ConversationReadinessProvider>,
   );
+}
+
+function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) {
+  const props = embeddedConversationPageSpy.mock.lastCall?.[0] as Record<string, unknown> | undefined;
+  const onProjectionChange = props?.['onProjectionChange'] as ((projection: Record<string, unknown> | null) => void) | undefined;
+  if (!onProjectionChange) throw new Error('missing onProjectionChange');
+  onProjectionChange({
+    slug: 'row-2',
+    conversationId: 'conv-latest',
+    conversation: { work_scope_key: 'ws-live' },
+    messages: [makeMessage('live-sent', 5, 'conv-latest'), makeMessage('live-streamed', 6, 'conv-latest')],
+    pendingMessages: [{
+      localId: 'pending-local',
+      text: 'pending-local',
+      images: [],
+      status: 'pending',
+    }],
+    convState: { type: 'awaiting_user_response', questions: [] },
+    isArchived: false,
+    ordinaryComposerEnabled: true,
+    ...overrides,
+  });
 }
 
 beforeEach(() => {
@@ -255,6 +283,8 @@ describe('ProductConversationPage', () => {
   it('renders every typed historical handoff exactly once at the segment boundary', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      latest_transcript_row_id: 'row-3',
+      writable_transcript_row_id: 'row-3',
       segments: [
         {
           segment_ordinal: 3,
@@ -316,6 +346,46 @@ describe('ProductConversationPage', () => {
     expect(messages.filter((message) => message.message_id.includes('product-handoff:'))).toHaveLength(3);
   });
 
+  it('renders completed handoffs as the single typed segment boundary', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      segments: [
+        {
+          segment_ordinal: 1,
+          transcript_row_id: 'row-1',
+          slug: 'row-1',
+          title: 'Earlier',
+          messages: [makeMessage('m-1', 1), makeMessage('m-2', 2)],
+          handoff: null,
+        },
+        {
+          segment_ordinal: 2,
+          transcript_row_id: 'row-2',
+          slug: 'row-2',
+          title: 'Latest',
+          messages: [makeMessage('accepted-successor', 4)],
+          handoff: {
+            kind: 'completed',
+            predecessor_transcript_row_id: 'row-1',
+            successor_transcript_row_id: 'row-2',
+            continuation_message_id: 'continuation-request',
+            accepted_successor_message_id: 'accepted-successor',
+            summary: 'Completed handoff',
+          },
+        },
+      ],
+    }));
+
+    renderPage();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('message-order').textContent).toBe(
+        'm-1,m-2,product-handoff:pc-1:row-2:continuation-request,accepted-successor'
+      );
+    });
+    expect(screen.getByTestId('message-text-order')).toHaveTextContent('Completed handoff');
+  });
+
   it('keeps exact order across 100+ messages spanning multiple paginated segments', async () => {
     const { api } = await import('../api');
     const segment0Messages = Array.from({ length: 35 }, (_, index) => makeMessage(`m-${index + 1}`, index + 1, 'conv-0'));
@@ -323,6 +393,8 @@ describe('ProductConversationPage', () => {
     const segment2Messages = Array.from({ length: 40 }, (_, index) => makeMessage(`m-${index + 71}`, index + 71, 'conv-2'));
     vi.mocked(api.getProductConversationSnapshot)
       .mockResolvedValueOnce(makeSnapshot({
+        latest_transcript_row_id: 'row-3',
+        writable_transcript_row_id: 'row-3',
         segments: [
           {
             segment_ordinal: 2,
@@ -357,6 +429,8 @@ describe('ProductConversationPage', () => {
         has_older: true,
       }))
       .mockResolvedValueOnce(makeSnapshot({
+        latest_transcript_row_id: 'row-3',
+        writable_transcript_row_id: 'row-3',
         segments: [
           {
             segment_ordinal: 1,
@@ -459,14 +533,65 @@ describe('ProductConversationPage', () => {
       persisted: expect.arrayContaining([expect.objectContaining({ id: 'qa-1' })]),
     }));
     expect(screen.getByTestId('embedded-conversation-page')).toHaveTextContent('embedded row-2');
-    expect(embeddedConversationPageSpy).toHaveBeenCalledWith('row-2');
+    expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
+      slug: 'row-2',
+      suppressCanonicalization: true,
+      ordinaryComposerEnabled: true,
+    }));
     expect(screen.getByTestId('chain-work-scope-dock')).toBeInTheDocument();
     expect(chainWorkScopeDockSpy).toHaveBeenLastCalledWith(expect.objectContaining({
       activeConvId: 'row-2',
     }));
   });
 
-  it('omits composer for history-only snapshots', async () => {
+  it('keeps latest open row mounted even when writable transcript is null', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
+      writable_transcript_row_id: null,
+      chain_qa_compatibility: null,
+    }));
+
+    renderPage();
+
+    await screen.findByTestId('embedded-conversation-page');
+    expect(embeddedConversationPageSpy).toHaveBeenCalledWith(expect.objectContaining({
+      slug: 'row-2',
+      ordinaryComposerEnabled: false,
+      suppressCanonicalization: true,
+    }));
+  });
+
+  it('projects persisted and pending latest messages through distinct aggregate inputs', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('message-order').textContent).toBe(
+        'product-handoff:pc-1:row-1:cont-1,m-1,m-2,product-handoff:pc-1:row-2:cont-2,live-sent,live-streamed'
+      );
+      expect(conversationNavStackSpy.mock.lastCall?.[0]?.['pendingMessages']).toEqual([
+        expect.objectContaining({ localId: 'pending-local', status: 'pending' }),
+      ]);
+    });
+  });
+
+  it('lets projected latest state drive aggregate nav metadata', async () => {
+    renderPage();
+    await waitForPageReady();
+
+    emitLatestProjection({ slug: 'row-live-2', conversationId: 'conv-live-2', conversation: { work_scope_key: 'ws-latest' } });
+
+    await waitFor(() => {
+      const props = conversationNavStackSpy.mock.lastCall?.[0] as Record<string, unknown>;
+      expect(props['slug']).toBe('row-live-2');
+      expect(props['conversationId']).toBe('conv-live-2');
+      expect(props['workScopeKey']).toBe('ws-latest');
+    });
+  });
+
+  it('keeps history snapshots read-only while retaining lineage recall', async () => {
     const { api } = await import('../api');
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValueOnce(makeSnapshot({
       writable_transcript_row_id: null,

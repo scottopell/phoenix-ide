@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
-import { BrowserRouter, Routes, Route, useNavigate, useParams } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useNavigate, useParams, useLocation } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -115,6 +115,7 @@ function AppRoutes() {
 
 function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
@@ -125,13 +126,19 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
     let cancelled = false;
     api.getProductConversationSnapshot(reference, { message_limit: 1 })
       .then((snapshot) => {
-        if (!cancelled) navigate(snapshot.canonical_route, { replace: true });
+        if (!cancelled) {
+          navigate({
+            pathname: snapshot.canonical_route,
+            search: location.search,
+            hash: location.hash,
+          }, { replace: true });
+        }
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
       });
     return () => { cancelled = true; };
-  }, [navigate, reference]);
+  }, [location.hash, location.search, navigate, reference]);
 
   return failed ? <main role="alert">Failed to resolve product conversation route</main> : <RouteFallback />;
 }

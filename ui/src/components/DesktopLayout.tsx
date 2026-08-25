@@ -7,7 +7,7 @@ import {
   useWorkScope,
 } from '../conversation';
 import { useResizablePane, useIsDesktop } from '../hooks';
-import { api, type Conversation } from '../api';
+import { api, type Conversation, type ProductConversationSnapshotView } from '../api';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
@@ -201,14 +201,32 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     };
   }, [showInfo]);
 
-  // Extract active slug. `useConversationSnapshot` reads the row directly
-  // from the store — polling and SSE both write through the same atom,
-  // so this is the single source of truth for the active conversation.
-  // Returns null until polling or SSE init has populated the row
-  // (typically one tick after navigation; `if (!conversation)` callers
-  // downstream paint a skeleton during that window).
+  // Extract active route owner. `/c/:slug` reads directly from the store. The
+  // aggregate `/product-conversations/:id` route derives its latest transcript
+  // row from the typed snapshot so desktop work-scope/file panels stay anchored
+  // to the currently-open latest transcript without backend changes.
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
-  const activeSlug = slugMatch?.[1] ?? null;
+  const productMatch = location.pathname.match(/^\/product-conversations\/([^/?#]+)/);
+  const routeSlug = slugMatch?.[1] ?? null;
+  const productConversationId = productMatch?.[1] ?? null;
+  const [productSnapshot, setProductSnapshot] = useState<ProductConversationSnapshotView | null>(null);
+  useEffect(() => {
+    if (!productConversationId) {
+      setProductSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    api.getProductConversationSnapshot(productConversationId, { message_limit: 1 })
+      .then((snapshot) => {
+        if (!cancelled) setProductSnapshot(snapshot);
+      })
+      .catch(() => {
+        if (!cancelled) setProductSnapshot(null);
+      });
+    return () => { cancelled = true; };
+  }, [productConversationId]);
+  const activeSlug = routeSlug ?? productSnapshot?.latest_transcript_row_id ?? null;
+  const sidebarActiveIdentity = productConversationId ?? activeSlug;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
   // Live work-scope inventory (SSE-fed) for the active conversation, threaded
@@ -265,7 +283,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             onToggle={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
             conversations={conversations}
             archivedConversations={archivedConversations}
-            activeSlug={activeSlug}
+            activeSlug={sidebarActiveIdentity}
             onConversationCreated={() => refreshConversations()}
             width={sidebarPane.collapsed ? undefined : sidebarPane.size}
           />

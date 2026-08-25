@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type ConversationRouteResponse, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
   canCancelConversationState,
@@ -12,6 +12,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
+import type { PendingUserMessage } from '../hooks/useMessageQueue';
 import {
   decideRouteFocus,
   reduceRouteFocusState,
@@ -175,7 +176,23 @@ interface ConversationPageProps {
   composerQuickAction?: ComposerQuickAction | undefined;
 }
 
-interface EmbeddedConversationPageProps extends ConversationPageProps {
+export interface EmbeddedConversationProjection {
+  slug: string;
+  conversationId?: string;
+  conversation: Conversation | null;
+  messages: Message[];
+  pendingMessages: PendingUserMessage[];
+  convState: ReturnType<typeof parseConversationState>;
+  isArchived: boolean;
+}
+
+interface EmbeddedConversationHostProps {
+  suppressCanonicalization?: boolean;
+  ordinaryComposerEnabled?: boolean;
+  onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
+}
+
+interface EmbeddedConversationPageProps extends ConversationPageProps, EmbeddedConversationHostProps {
   slug: string;
   showTranscript?: boolean;
 }
@@ -192,12 +209,15 @@ export function EmbeddedConversationPage({
   routePrefix = '/c',
   composerQuickAction,
   showTranscript = true,
+  suppressCanonicalization = false,
+  ordinaryComposerEnabled = true,
+  onProjectionChange,
 }: EmbeddedConversationPageProps) {
   const navigate = useNavigate();
   const location = useLocation();
 
   useEffect(() => {
-    if (routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
+    if (suppressCanonicalization || routePrefix === '/global' || !slug || location.hash.startsWith('#message-')) return;
     let cancelled = false;
     api.resolveCoordinatorRoute(slug)
       .then(({ coordinator_id }) => {
@@ -208,7 +228,7 @@ export function EmbeddedConversationPage({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [location.hash, navigate, routePrefix, slug]);
+  }, [location.hash, navigate, routePrefix, slug, suppressCanonicalization]);
   return (
     <ReviewNotesProvider scopeKey={slug}>
       {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
@@ -221,6 +241,9 @@ export function EmbeddedConversationPage({
         routePrefix={routePrefix}
         composerQuickAction={composerQuickAction}
         showTranscript={showTranscript}
+        ordinaryComposerEnabled={ordinaryComposerEnabled}
+        suppressCanonicalization={suppressCanonicalization}
+        {...(onProjectionChange ? { onProjectionChange } : {})}
       />
     </ReviewNotesProvider>
   );
@@ -247,11 +270,17 @@ function ConversationPageContent({
   routePrefix,
   composerQuickAction,
   showTranscript,
+  ordinaryComposerEnabled,
+  suppressCanonicalization,
+  onProjectionChange,
 }: {
   slug: string;
   routePrefix: '/c' | '/global';
   composerQuickAction?: ComposerQuickAction | undefined;
   showTranscript: boolean;
+  ordinaryComposerEnabled: boolean;
+  suppressCanonicalization: boolean;
+  onProjectionChange?: (projection: EmbeddedConversationProjection | null) => void;
 }) {
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
@@ -878,7 +907,13 @@ function ConversationPageContent({
       const preserveTranscriptRouteId = (
         locationRef.current.state as { preserveTranscriptRouteId?: boolean } | null
       )?.preserveTranscriptRouteId === true;
-      if (route.slug && route.slug !== slug && routePrefix === '/c' && !preserveTranscriptRouteId) {
+      if (
+        route.slug
+        && route.slug !== slug
+        && routePrefix === '/c'
+        && !suppressCanonicalization
+        && !preserveTranscriptRouteId
+      ) {
         navigate({
           pathname: `/c/${route.slug}`,
           search: locationRef.current.search,
@@ -930,7 +965,7 @@ function ConversationPageContent({
       cancelled = true;
       window.removeEventListener('online', handleOnline);
     };
-  }, [slug, navigate, dispatch, eventCursorRef, routePrefix]);
+  }, [slug, navigate, dispatch, eventCursorRef, routePrefix, suppressCanonicalization]);
 
   const loadOlderMessagesForIntent = useCallback(async (intent: HistoryIntent) => {
     if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
@@ -1681,6 +1716,31 @@ function ConversationPageContent({
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  useEffect(() => {
+    if (!onProjectionChange) return;
+    onProjectionChange({
+      slug,
+      ...(conversationId ? { conversationId } : {}),
+      conversation: conversation ?? null,
+      messages: atom.messages,
+      pendingMessages,
+      convState: convStateForChildren,
+      isArchived,
+    });
+    return () => {
+      onProjectionChange(null);
+    };
+  }, [
+    onProjectionChange,
+    slug,
+    conversationId,
+    conversation,
+    atom.messages,
+    pendingMessages,
+    convStateForChildren,
+    isArchived,
+  ]);
+
   const localCreateIntent = readCreateIntent(conversationId);
   const provisioningPrompt = convStateForChildren.type === 'provisioning'
     ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
@@ -2396,7 +2456,7 @@ function ConversationPageContent({
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : !isArchived && convStateForChildren.type !== 'provisioning' && convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled' && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : !isArchived && ordinaryComposerEnabled && convStateForChildren.type !== 'provisioning' && convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled' && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkControlBar
