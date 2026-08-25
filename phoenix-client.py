@@ -726,7 +726,7 @@ def print_conversations_table(conversations: list[dict]) -> None:
 
 
 def print_search_hits(hits: list[dict]) -> None:
-    """Compact search result listing: slug, score, snippet, plus provenance."""
+    """Compact search result listing: slug, score, snippet, provenance, ids."""
     if not hits:
         click.echo("No matches found.")
         return
@@ -743,6 +743,10 @@ def print_search_hits(hits: list[dict]) -> None:
         prov = f" [{msg_type}" if msg_type else ''
         if created_at:
             prov += f" {created_at}" if msg_type else f" [{created_at}"
+        # Exact identifiers so automation can pin the transcript entry.
+        msg_id = h.get('message_id') or ''
+        if msg_id:
+            prov += f" msg={msg_id[:8]}"
         if prov:
             prov += ']'
         click.echo(f"  {slug:32s} {score:6.2f}  {snippet}{prov}{archived}")
@@ -803,7 +807,8 @@ def _render_checkout_status(cs: object) -> str:
     if kind == 'unborn':
         return f"unborn({cs.get('branch_name') or '?'})"
     if kind == 'unavailable':
-        return f"unavailable"
+        reason = cs.get('reason') or ''
+        return f"unavailable({reason})" if reason else "unavailable"
     return kind
 
 
@@ -822,7 +827,9 @@ def _render_changed_path(p: dict) -> str:
     if kind == 'untracked':
         return f"{path}  [untracked]"
     if kind == 'unmerged':
-        return f"{path}  [unmerged]"
+        idx = p.get('index_status', '')
+        wt = p.get('worktree_status', '')
+        return f"{path}  [unmerged index={idx} worktree={wt}]"
     return f"{path}  [{kind}]"
 
 
@@ -1035,6 +1042,36 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         raise click.UsageError("this option requires --conversation.")
 
     client = PhoenixClient(resolved_url, password=password)
+
+    # Platform & config (REQ-CLI-012) run before authentication: these are
+    # diagnostics (version/deployment/env/mcp-status/usage-overview) plus the
+    # conversation-scoped trajectory-export. /api/version is auth-exempt; the
+    # others will get a clean 401 from the server if auth is on and no
+    # password is supplied, rather than prompting and failing non-interactive
+    # automation. Process every selected flag so `--version --deployment --env`
+    # prints all three, not just the first.
+    if show_version:
+        click.echo("=== VERSION ===")
+        _print_json(client.get_version())
+    if deployment:
+        click.echo("=== DEPLOYMENT ===")
+        _print_json(client.get_deployment())
+    if show_env:
+        click.echo("=== ENV ===")
+        _print_json(client.get_env())
+    if mcp_status:
+        click.echo("=== MCP STATUS ===")
+        _print_json(client.get_mcp_status())
+    if usage_overview:
+        click.echo("=== USAGE OVERVIEW ===")
+        _print_json(client.get_usage_overview())
+    if trajectory_export:
+        conv = client.get_conversation(conversation)
+        click.echo("=== TRAJECTORY EXPORT ===")
+        _print_json(client.trajectory_export(conv['id']))
+    if show_version or deployment or show_env or mcp_status or usage_overview or trajectory_export:
+        return
+
     client.ensure_authenticated()
 
     if list_models:
@@ -1097,27 +1134,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     if search_conversations is not None:
         hits = client.search_conversations(search_conversations, limit=search_limit)
         print_search_hits(hits)
-        return
-
-    # Platform & config (REQ-CLI-012) -- no conversation required.
-    # Process every selected flag so `--version --deployment --env`
-    # prints all three, not just the first.
-    if show_version:
-        click.echo("=== VERSION ===")
-        _print_json(client.get_version())
-    if deployment:
-        click.echo("=== DEPLOYMENT ===")
-        _print_json(client.get_deployment())
-    if show_env:
-        click.echo("=== ENV ===")
-        _print_json(client.get_env())
-    if mcp_status:
-        click.echo("=== MCP STATUS ===")
-        _print_json(client.get_mcp_status())
-    if usage_overview:
-        click.echo("=== USAGE OVERVIEW ===")
-        _print_json(client.get_usage_overview())
-    if show_version or deployment or show_env or mcp_status or usage_overview:
         return
 
     # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
@@ -1188,10 +1204,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     if proposals:
         conv = client.get_conversation(conversation)
         print_proposals(client.get_proposals(conv['id']).get('proposals', []))
-        return
-    if trajectory_export:
-        conv = client.get_conversation(conversation)
-        _print_json(client.trajectory_export(conv['id']))
         return
 
     if not message:

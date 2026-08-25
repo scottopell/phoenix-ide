@@ -180,7 +180,7 @@ WHEN the agent runs `--search-conversations QUERY`
 THE SYSTEM SHALL search conversation contents and print matching hits
 AND accept `--search-limit N` to cap the number of hits
 
-**Rationale:** An agent that wants to continue a prior conversation by topic rather than by memorized slug has no way to find it today. Listing and search let the agent discover conversations by content.
+**Rationale:** An agent that wants to continue a prior conversation by topic rather than by memorized slug needs a way to find it by content. Listing and search let the agent discover conversations by content.
 
 ---
 
