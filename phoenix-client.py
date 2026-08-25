@@ -978,6 +978,10 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 # Interaction (REQ-CLI-009) -- require --conversation
 @click.option('--respond', 'respond', multiple=True, metavar='KEY=VALUE',
               help='Answer a pending user question (repeatable). Requires --conversation')
+@click.option('--respond-json', 'respond_json', default=None,
+              metavar='JSON',
+              help='Answer a pending user question with a JSON object of {question: answer}. '
+                   'Unambiguous for keys/values containing =. Requires --conversation')
 @click.option('--dismiss-question', is_flag=True,
               help='Dismiss a pending user question. Requires --conversation')
 @click.option('--dismiss-error', is_flag=True,
@@ -1020,7 +1024,7 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, list_conversations, search_conversations, search_limit, respond, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, wake_status, wake_cancel, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -1056,6 +1060,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # error instead of the usage error the contract requires.
     needs_conv = (
         respond
+        or respond_json
         or dismiss_question
         or dismiss_error
         or cancel_steer
@@ -1078,10 +1083,14 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # build discovery. The other platform/config projections (deployment, env,
     # mcp-status, usage-overview, trajectory-export) are NOT auth-exempt and
     # must run after ensure_authenticated() so they can prompt for a password.
+    # If --version is combined with other platform flags, print version then
+    # continue to the authenticated projections (don't return early).
+    other_platform = deployment or show_env or mcp_status or usage_overview or trajectory_export
     if show_version:
         click.echo("=== VERSION ===")
         _print_json(client.get_version())
-        return
+        if not other_platform:
+            return
 
     client.ensure_authenticated()
 
@@ -1178,6 +1187,7 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # action/projection, and combining them silently runs only the first.
     conv_scoped = [
         ('--respond', respond),
+        ('--respond-json', respond_json),
         ('--dismiss-question', dismiss_question),
         ('--dismiss-error', dismiss_error),
         ('--cancel-steer', cancel_steer),
@@ -1195,10 +1205,20 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             f"Conflicting conversation-scoped flags: {', '.join(selected)}. "
             f"Pass at most one."
         )
-    if respond or dismiss_question or dismiss_error or cancel_steer:
+    if respond or respond_json or dismiss_question or dismiss_error or cancel_steer:
         conv = client.get_conversation(conversation)
-        if respond:
-            answers = parse_kv_pairs(respond)
+        if respond or respond_json:
+            if respond and respond_json:
+                raise click.UsageError("--respond and --respond-json are mutually exclusive.")
+            if respond_json:
+                try:
+                    answers = json.loads(respond_json)
+                except json.JSONDecodeError as e:
+                    raise click.UsageError(f"--respond-json is not valid JSON: {e}")
+                if not isinstance(answers, dict):
+                    raise click.UsageError("--respond-json must be a JSON object {question: answer}.")
+            else:
+                answers = parse_kv_pairs(respond)
             client.respond_to_question(conv['id'], answers)
             click.echo(f"Responded to question for {conv.get('slug', conv['id'])}.")
             return
