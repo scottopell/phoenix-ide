@@ -746,8 +746,8 @@ def print_search_hits(hits: list[dict]) -> None:
         slug = h.get('slug') or h.get('conversation_id')
         score = h.get('score', 0.0)
         snippet = (h.get('snippet') or '').replace('\n', ' ')
-        if len(snippet) > 120:
-            snippet = snippet[:117] + '...'
+        # The server already bounds the snippet (retrieval.rs bounds to 240);
+        # do not truncate further, or the matching term may be cut.
         archived = ' (archived)' if h.get('archived') else ''
         # Provenance so an agent can assess the hit: message type and when.
         msg_type = h.get('message_type') or ''
@@ -1060,10 +1060,10 @@ def main(message, conversation, directory, images, model, list_models, list_proj
     # error instead of the usage error the contract requires.
     needs_conv = (
         respond
-        or respond_json
+        or respond_json is not None
         or dismiss_question
         or dismiss_error
-        or cancel_steer
+        or cancel_steer is not None
         or continue_conv
         or diff
         or git_status
@@ -1077,6 +1077,44 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         raise click.UsageError("this option requires --conversation.")
 
     client = PhoenixClient(resolved_url, password=password)
+
+    # Validate cross-family flag conflicts before any dispatch. Platform
+    # flags and conversation-scoped flags are mutually exclusive (one runs
+    # pre/around auth, the other post-auth against a conversation), and
+    # combining them silently drops one.
+    conv_scoped_flags = [
+        ('--respond', respond),
+        ('--respond-json', respond_json is not None),
+        ('--dismiss-question', dismiss_question),
+        ('--dismiss-error', dismiss_error),
+        ('--cancel-steer', cancel_steer is not None),
+        ('--continue', continue_conv),
+        ('--diff', diff),
+        ('--git-status', git_status),
+        ('--usage', usage),
+        ('--system-prompt', system_prompt),
+        ('--tasks', tasks),
+        ('--proposals', proposals),
+    ]
+    conv_selected = [name for name, flag in conv_scoped_flags if flag]
+    platform_selected = [name for name, flag in [
+        ('--version', show_version),
+        ('--deployment', deployment),
+        ('--env', show_env),
+        ('--mcp-status', mcp_status),
+        ('--usage-overview', usage_overview),
+        ('--trajectory-export', trajectory_export),
+    ] if flag]
+    if len(conv_selected) > 1:
+        raise click.UsageError(
+            f"Conflicting conversation-scoped flags: {', '.join(conv_selected)}. "
+            f"Pass at most one."
+        )
+    if conv_selected and platform_selected:
+        raise click.UsageError(
+            f"Conflicting flags: {', '.join(platform_selected)} cannot be combined "
+            f"with {', '.join(conv_selected)}."
+        )
 
     # /api/version is auth-exempt (api/auth.rs::is_exempt_path), so --version
     # can run before the auth gate — useful for credential-less connection/
@@ -1182,30 +1220,8 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         return
 
     # Interaction + Introspection (REQ-CLI-009 / 010) -- require -c
-    # (validation already done above, before auth.)
-    # Reject mutually-exclusive conversation-scoped flags: each is a distinct
-    # action/projection, and combining them silently runs only the first.
-    conv_scoped = [
-        ('--respond', respond),
-        ('--respond-json', respond_json),
-        ('--dismiss-question', dismiss_question),
-        ('--dismiss-error', dismiss_error),
-        ('--cancel-steer', cancel_steer),
-        ('--continue', continue_conv),
-        ('--diff', diff),
-        ('--git-status', git_status),
-        ('--usage', usage),
-        ('--system-prompt', system_prompt),
-        ('--tasks', tasks),
-        ('--proposals', proposals),
-    ]
-    selected = [name for name, flag in conv_scoped if flag]
-    if len(selected) > 1:
-        raise click.UsageError(
-            f"Conflicting conversation-scoped flags: {', '.join(selected)}. "
-            f"Pass at most one."
-        )
-    if respond or respond_json or dismiss_question or dismiss_error or cancel_steer:
+    # (validation and conflict checks already done above, before auth.)
+    if respond or respond_json is not None or dismiss_question or dismiss_error or cancel_steer is not None:
         conv = client.get_conversation(conversation)
         if respond or respond_json:
             if respond and respond_json:
