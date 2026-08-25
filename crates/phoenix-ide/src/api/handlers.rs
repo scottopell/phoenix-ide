@@ -3402,12 +3402,24 @@ async fn get_conversation_route(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRouteResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let db = state.runtime.db();
+    let conversation = match db.get_conversation(&id).await {
+        Ok(conversation) => conversation,
+        Err(DbError::ConversationNotFound(_)) => {
+            match db.resolve_ordinary_product_conversation(&id).await {
+                Ok(resolved) => {
+                    db.get_ordinary_product_conversation(&resolved.product_conversation_id)
+                        .await
+                        .map_err(|error| AppError::NotFound(error.to_string()))?
+                        .root
+                        .conversation
+                }
+                Err(DbError::ConversationNotFound(_)) => return Err(AppError::NotFound(id)),
+                Err(error) => return Err(AppError::Internal(error.to_string())),
+            }
+        }
+        Err(error) => return Err(AppError::Internal(error.to_string())),
+    };
 
     Ok(Json(ConversationRouteResponse {
         id: conversation.id,
@@ -16495,6 +16507,78 @@ mod wake_handler_tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
         assert_eq!(second.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod conversation_route_tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::api::handlers::hard_delete_cascade_tests::make_test_state;
+    use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+
+    #[tokio::test]
+    async fn route_resolves_product_conversation_id_to_its_canonical_root() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::ContextExhausted {
+                    summary: "exhausted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let successor = match state.db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        state
+            .db
+            .add_message(
+                "handoff",
+                &root.id,
+                &MessageContent::Continuation(ContinuationContent {
+                    summary: "handoff".to_string(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["id"], root.id);
+        assert_eq!(body["slug"], "root-slug");
+        assert_ne!(body["id"], successor.id);
     }
 }
 
