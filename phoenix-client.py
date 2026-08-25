@@ -1133,6 +1133,13 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             f"Conflicting single-shot flags: {', '.join(other)}. "
             f"Pass at most one."
         )
+    # --search-limit is a modifier for --search-conversations; without it,
+    # the limit is silently ignored and a positional MESSAGE would be sent as
+    # a normal chat message (a mutating LLM request). Reject the orphan.
+    if search_limit is not None and search_conversations is None:
+        raise click.UsageError(
+            "--search-limit requires --search-conversations."
+        )
     # A positional MESSAGE combined with any early-return mode (other than
     # --continue / --suggest, which consume it) is silently dropped. Reject.
     message_consuming = continue_conv or suggest
@@ -1146,10 +1153,16 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         )
     # --continue sends only the handoff text; the continuation endpoint does
     # not accept images, so --images would be silently discarded (REQ-CLI-003).
-    if continue_conv and images:
+    # The same applies to every early-return mode: none of them send images,
+    # so --images combined with any mode flag is silently dropped. Only the
+    # normal message path (no mode flag) sends images.
+    if images and (
+        conv_selected or platform_selected or discovery_selected or legacy_selected
+    ):
+        modes = conv_selected + platform_selected + discovery_selected + legacy_selected
         raise click.UsageError(
-            "--continue cannot be combined with --images "
-            "(the continuation endpoint does not accept attachments)."
+            f"--images cannot be combined with {', '.join(modes)} "
+            f"(none of these modes send attachments)."
         )
     if conv_selected and platform_selected:
         raise click.UsageError(
@@ -1303,6 +1316,16 @@ def main(message, conversation, directory, images, model, list_models, list_proj
                     raise click.UsageError(
                         f"Unknown question key(s): {', '.join(repr(k) for k in unknown)}. "
                         f"Pending questions: {', '.join(repr(q) for q in sorted(pending_texts))}"
+                    )
+                # The server's answers.get(&q.question) accepts empty-string
+                # values, irreversibly resuming with a meaningless answer.
+                # Reject blank answers before dispatch (matches the UI's
+                # allAnswered behavior).
+                blank = [k for k, v in answers.items() if k in pending_texts and not v]
+                if blank:
+                    raise click.UsageError(
+                        f"Blank answer(s) for: {', '.join(repr(k) for k in blank)}. "
+                        f"Every answer must be a non-empty string."
                     )
                 unanswered = [q for q in pending_texts if q not in answers]
                 if unanswered:
