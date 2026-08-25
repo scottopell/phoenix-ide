@@ -3,6 +3,7 @@
 pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use ts_rs::TS;
 
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
@@ -190,6 +191,151 @@ pub struct ConversationSearchResponse {
     pub hits: Vec<ConversationSearchHit>,
 }
 
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationListResponse {
+    pub product_conversations: Vec<ProductConversationListRow>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationListRow {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub latest_transcript_row_id: String,
+    pub updated_at: String,
+    pub presentation: ProductConversationPresentationView,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSnapshotView {
+    pub product_conversation_id: String,
+    pub canonical_route: String,
+    pub requested_transcript_row_id: String,
+    pub canonical_root: ProductConversationTranscriptRowView,
+    pub ordinary_lifecycle: OrdinaryProductConversationLifecycleView,
+    pub latest_transcript_row_id: String,
+    pub writable_transcript_row_id: Option<String>,
+    pub updated_at: String,
+    pub presentation: ProductConversationPresentationView,
+    pub work_identity: Option<ProductConversationWorkIdentityView>,
+    pub source: Option<ProductConversationSourceView>,
+    pub chain_qa_compatibility: Option<ProductConversationChainQaCompatibilityView>,
+    pub segments: Vec<ProductConversationSegmentView>,
+    pub before: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum OrdinaryProductConversationLifecycleView {
+    Open,
+    History,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationTranscriptRowView {
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+}
+
+/// The presentation state of an ordinary `ProductConversation`.
+///
+/// History/open is exclusively `ordinary_lifecycle`; presentation cannot carry a
+/// second archival flag. The tagged variants make action-needed and ordinary
+/// state displays mutually exclusive on the wire.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationPresentationView {
+    NeedsAction {
+        display_name: String,
+    },
+    State {
+        display_name: String,
+        presentation_mode: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationWorkIdentityView {
+    pub work_transcript_row_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_branch: String,
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationSegmentView {
+    pub segment_ordinal: i64,
+    pub transcript_row_id: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+    pub handoff: Option<ProductConversationHandoffView>,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationHandoffView {
+    Completed {
+        predecessor_transcript_row_id: String,
+        successor_transcript_row_id: String,
+        continuation_message_id: String,
+        accepted_successor_message_id: String,
+        summary: String,
+    },
+    Historical {
+        predecessor_transcript_row_id: String,
+        successor_transcript_row_id: String,
+        continuation_message_id: String,
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationSourceView {
+    Present {
+        source_product_conversation_id: String,
+        source_conversation_id: String,
+        relation: ProductConversationSourceRelationView,
+        relation_key: String,
+    },
+    Deleted {
+        source_product_conversation_id: String,
+        source_conversation_id: String,
+        relation: ProductConversationSourceRelationView,
+        relation_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ProductConversationSourceRelationView {
+    ApprovedTask,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ProductConversationChainQaCompatibilityView {
+    pub root_transcript_row_id: String,
+    pub url: String,
+}
+
 /// Response with a single conversation
 #[derive(Debug, Serialize)]
 pub struct ConversationResponse {
@@ -200,6 +346,11 @@ pub struct ConversationResponse {
 pub struct ConversationRouteResponse {
     pub id: String,
     pub slug: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductConversationRouteResponse {
+    pub transcript_row_id: String,
 }
 
 /// Response with conversation and messages

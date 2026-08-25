@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
@@ -108,6 +108,7 @@ function AppRoutes() {
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/terminal" element={<TerminalPage />} />
                 <Route path="/c/:slug" element={<ConversationPage />} />
+                <Route path="/product-conversations/:productConversationId" element={<ProductConversationPage />} />
                 <Route path="/chains/:rootConvId" element={<ChainPage />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
@@ -123,6 +124,38 @@ function AppRoutes() {
       <ShortcutHelpPanel visible={showHelp} onClose={() => setShowHelp(false)} />
     </>
   );
+}
+
+function ProductConversationPage() {
+  const { productConversationId } = useParams<{ productConversationId: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!productConversationId) return;
+    let cancelled = false;
+    setError(null);
+    api.getProductConversationRoute(productConversationId)
+      .then((route) => {
+        if (!cancelled) {
+          navigate({
+            pathname: `/c/${route.transcript_row_id}`,
+            search: location.search,
+            hash: location.hash,
+          }, {
+            replace: true,
+            state: { preserveTranscriptRouteId: true },
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError('Unable to open this product conversation.');
+      });
+    return () => { cancelled = true; };
+  }, [location.hash, location.search, navigate, productConversationId]);
+
+  return error ? <main role="alert">{error}</main> : <RouteFallback />;
 }
 
 function App() {

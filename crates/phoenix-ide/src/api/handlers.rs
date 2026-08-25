@@ -21,6 +21,7 @@ use super::lifecycle_handlers::{
     abandon_task, approve_fork_proposal, approve_task, dismiss_fork_proposal, list_fork_proposals,
     mark_merged, reject_task, request_changes_on_fork_proposal, task_feedback,
 };
+use super::product_conversations::{get_product_conversation, list_product_conversations};
 use super::sse::{sse_stream, SseInitTrace};
 use super::types::{
     AcceptedMessageDisposition, AcceptedMessageReconciliation, AttachmentUploadResponse,
@@ -33,11 +34,11 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, ReconcileAcceptedMessagesRequest, ReconcileAcceptedMessagesResponse,
-    RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse,
-    SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    NotificationSettingsRequest, ProductConversationRouteResponse, ProjectFileSearchQuery,
+    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, ReconcileAcceptedMessagesRequest,
+    ReconcileAcceptedMessagesResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse,
+    TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -126,6 +127,18 @@ pub fn create_router(state: AppState) -> Router {
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
         .route("/api/conversations/search", get(search_conversations))
+        .route(
+            "/api/product-conversations",
+            get(list_product_conversations),
+        )
+        .route(
+            "/api/product-conversations/:reference",
+            get(get_product_conversation),
+        )
+        .route(
+            "/api/product-conversations/:reference/route",
+            get(get_product_conversation_route),
+        )
         .route(
             "/api/global/coordinator",
             get(get_existing_coordinator).post(ensure_coordinator),
@@ -3398,11 +3411,38 @@ async fn get_conversation_route(
         .db()
         .get_conversation(&id)
         .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+        .map_err(product_route_db_to_app)?;
 
     Ok(Json(ConversationRouteResponse {
         id: conversation.id,
         slug: conversation.slug,
+    }))
+}
+
+fn product_route_db_to_app(error: DbError) -> AppError {
+    match error {
+        DbError::ConversationNotFound(id) => AppError::NotFound(id),
+        error => AppError::Internal(error.to_string()),
+    }
+}
+
+async fn get_product_conversation_route(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+) -> Result<Json<ProductConversationRouteResponse>, AppError> {
+    let db = state.runtime.db();
+    let resolved = db
+        .resolve_ordinary_product_conversation(&reference)
+        .await
+        .map_err(product_route_db_to_app)?;
+    let conversation = db
+        .get_ordinary_product_conversation(&resolved.product_conversation_id)
+        .await
+        .map_err(product_route_db_to_app)?
+        .root
+        .conversation;
+    Ok(Json(ProductConversationRouteResponse {
+        transcript_row_id: conversation.id,
     }))
 }
 
@@ -4885,13 +4925,7 @@ async fn dispatch_continuation_handoff(
             // before executor persistence remains replayable.
             (ContinueConversationStatus::Accepted, None)
         }
-        Ok(
-            crate::send_chat_service::SendChatOutcome::AlreadyPersisted
-            | crate::send_chat_service::SendChatOutcome::QueuedAsSteering,
-        ) => {
-            // Both outcomes have another durable representation. Normally the
-            // message trigger has already consumed the intent for AlreadyPersisted;
-            // this delete also handles durable steering and reconciliation.
+        Ok(crate::send_chat_service::SendChatOutcome::AlreadyPersisted) => {
             if let Err(error) = state
                 .db
                 .delete_continuation_dispatch_intent(&parent_id)
@@ -4904,6 +4938,11 @@ async fn dispatch_continuation_handoff(
                     "handoff is durable but continuation intent cleanup failed",
                 );
             }
+            (ContinueConversationStatus::Accepted, None)
+        }
+        Ok(crate::send_chat_service::SendChatOutcome::QueuedAsSteering) => {
+            // The opening message is not persisted yet. Its INSERT trigger consumes
+            // this intent and records the completed handoff atomically.
             (ContinueConversationStatus::Accepted, None)
         }
         Ok(crate::send_chat_service::SendChatOutcome::Rejected { message, .. }) => {
@@ -16486,6 +16525,193 @@ mod wake_handler_tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = cancel_via_router(&state, "conv-cancelled", "contract-cancelled").await;
         assert_eq!(second.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod conversation_route_tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::api::handlers::hard_delete_cascade_tests::make_test_state;
+    use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
+
+    #[tokio::test]
+    async fn product_conversation_route_resolves_product_id_to_its_canonical_root() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_conversation_state(
+                &root.id,
+                &ConvState::ContextExhausted {
+                    summary: "exhausted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let successor = match state.db.continue_conversation(&root.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected continuation, got {other:?}")
+            }
+        };
+        state
+            .db
+            .add_message(
+                "handoff",
+                &root.id,
+                &MessageContent::Continuation(ContinuationContent {
+                    summary: "handoff".to_string(),
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/product-conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["transcript_row_id"], root.id);
+        assert_ne!(body["transcript_row_id"], successor.id);
+    }
+
+    #[tokio::test]
+    async fn product_route_returns_root_id_when_root_slug_looks_like_another_id() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation(
+                "root-id",
+                "00000000-0000-0000-0000-000000000001",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let colliding = state
+            .db
+            .create_conversation(
+                "00000000-0000-0000-0000-000000000001",
+                "other",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let product = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/product-conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let product: serde_json::Value =
+            serde_json::from_slice(&to_bytes(product.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(product["transcript_row_id"], root.id);
+
+        let direct = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/conversations/{}/route", colliding.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&to_bytes(direct.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(direct["id"], colliding.id);
+    }
+
+    #[tokio::test]
+    async fn product_route_namespace_does_not_shadow_a_conversation_id() {
+        let state = make_test_state().await;
+        let root = state
+            .db
+            .create_conversation("root", "root", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let colliding = state
+            .db
+            .create_conversation(
+                &root.product_conversation_id.to_string(),
+                "collision",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let direct = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&to_bytes(direct.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(direct["id"], colliding.id);
+
+        let product = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/product-conversations/{}/route",
+                        root.product_conversation_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let product: serde_json::Value =
+            serde_json::from_slice(&to_bytes(product.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(product["transcript_row_id"], root.id);
     }
 }
 

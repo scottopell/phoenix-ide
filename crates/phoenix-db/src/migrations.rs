@@ -385,6 +385,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "forbid_recursive_subordinate_parents",
         sql: MIGRATION_073,
     },
+    Migration {
+        version: 74,
+        name: "persist_completed_continuation_handoffs",
+        sql: MIGRATION_074,
+    },
 ];
 
 pub(crate) fn compiled_migration_ledger() -> Vec<(i64, &'static str)> {
@@ -2071,6 +2076,82 @@ BEGIN
 END;
 
 CREATE UNIQUE INDEX close_obligations_one_active_per_product ON close_obligations(product_conversation_id) WHERE phase <> 'completed';
+";
+
+const MIGRATION_074: &str = r"
+CREATE TABLE completed_continuation_handoffs (
+    predecessor_conversation_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    successor_conversation_id TEXT UNIQUE NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    continuation_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT,
+    accepted_successor_message_id TEXT UNIQUE NOT NULL
+        REFERENCES messages(message_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER completed_continuation_handoffs_validate_insert
+BEFORE INSERT ON completed_continuation_handoffs
+FOR EACH ROW WHEN
+    NEW.predecessor_conversation_id = NEW.successor_conversation_id
+    OR NOT EXISTS (
+        SELECT 1 FROM conversations predecessor
+        WHERE predecessor.id = NEW.predecessor_conversation_id
+          AND predecessor.continued_in_conv_id = NEW.successor_conversation_id
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages continuation
+        WHERE continuation.message_id = NEW.continuation_message_id
+          AND continuation.conversation_id = NEW.predecessor_conversation_id
+          AND continuation.message_type = 'continuation'
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM messages accepted
+        WHERE accepted.message_id = NEW.accepted_successor_message_id
+          AND accepted.conversation_id = NEW.successor_conversation_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff relation mismatch');
+END;
+
+CREATE TRIGGER completed_continuation_handoffs_immutable
+BEFORE UPDATE ON completed_continuation_handoffs
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'completed continuation handoff is immutable');
+END;
+
+DROP TRIGGER consume_continuation_dispatch_intent;
+CREATE TRIGGER consume_continuation_dispatch_intent
+AFTER INSERT ON messages
+WHEN EXISTS (
+    SELECT 1 FROM continuation_dispatch_intents intent
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
+      AND intent.successor_conversation_id = NEW.conversation_id
+)
+BEGIN
+    INSERT INTO completed_continuation_handoffs (
+        predecessor_conversation_id, successor_conversation_id,
+        continuation_message_id, accepted_successor_message_id
+    )
+    SELECT intent.parent_conversation_id, intent.successor_conversation_id,
+           continuation.message_id, NEW.message_id
+    FROM continuation_dispatch_intents intent
+    JOIN messages continuation
+      ON continuation.conversation_id = intent.parent_conversation_id
+     AND continuation.message_type = 'continuation'
+    WHERE (NEW.message_id = intent.message_id
+           OR NEW.message_id = intent.successor_conversation_id || ':' || intent.message_id)
+      AND intent.successor_conversation_id = NEW.conversation_id
+    ORDER BY continuation.sequence_id DESC, continuation.message_id DESC
+    LIMIT 1;
+
+    DELETE FROM continuation_dispatch_intents
+    WHERE successor_conversation_id = NEW.conversation_id
+      AND (message_id = NEW.message_id
+           OR NEW.message_id = successor_conversation_id || ':' || message_id);
+END;
 ";
 
 const MIGRATION_073: &str = r"
@@ -12106,7 +12187,8 @@ mod tests {
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
+                    (74, 'temporarily_skip_completed_continuation_handoffs')",
         )
         .execute(&pool)
         .await
@@ -12993,7 +13075,8 @@ mod tests {
              VALUES (70, 'temporarily_skip_product_conversation_migration'),
                     (71, 'temporarily_skip_product_conversation_lifecycle_correction'),
                     (72, 'temporarily_skip_product_conversation_lifecycle_retention'),
-                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant')",
+                    (73, 'temporarily_skip_recursive_subordinate_parent_invariant'),
+                    (74, 'temporarily_skip_completed_continuation_handoffs')",
         )
         .execute(pool)
         .await

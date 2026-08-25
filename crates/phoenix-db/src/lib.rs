@@ -7,6 +7,7 @@ mod coordinator_query;
 mod ddl;
 mod git_repository_reconciliation;
 mod migrations;
+mod product_conversation_read;
 pub mod retrieval;
 mod sqlite_native_statement;
 mod sqlite_telemetry;
@@ -35,6 +36,12 @@ pub(crate) use git_repository_reconciliation::{
     DormantGitRepositoryCatchupOutcome, DormantGitRepositoryCatchupPermit,
 };
 pub use migrations::run_pending_migrations;
+pub use product_conversation_read::{
+    ProductConversationAggregate, ProductConversationHandoff, ProductConversationListProjection,
+    ProductConversationSegment, ProductConversationSegmentCeiling, ProductConversationSnapshotRead,
+    ProductConversationSource, ProductConversationSourceKind, ProductConversationTranscriptRow,
+    ProductConversationWorkIdentity, ResolvedProductConversation,
+};
 pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalGrouping,
     RetrievalMatchMode, RetrievalRequest, RetrievalScope, RetrievalVisibility, RetrievedChunk,
