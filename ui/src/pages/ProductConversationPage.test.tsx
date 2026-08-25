@@ -230,7 +230,8 @@ function emitLatestProjection(overrides: Partial<Record<string, unknown>> = {}) 
     }],
     convState: { type: 'awaiting_user_response', questions: [] },
     isArchived: false,
-    ordinaryComposerEnabled: true,
+    onRetryPending: vi.fn(),
+    onOpenFile: vi.fn(),
     ...overrides,
   });
 }
@@ -335,10 +336,10 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'product-handoff:pc-1:row-1:cont-1,m-1,m-2,product-handoff:pc-1:row-2:cont-2,m-3,m-4,product-handoff:pc-1:row-3:cont-3,m-5,m-6'
+        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,m-3,m-4,product-handoff:pc-1:row-2:cont-2,m-5,m-6,product-handoff:pc-1:row-3:cont-3'
       );
     });
-    expect(screen.getByTestId('message-types').textContent).toBe('system,user,agent,system,user,agent,system,user,agent');
+    expect(screen.getByTestId('message-types').textContent).toBe('user,agent,system,user,agent,system,user,agent,system');
     expect(screen.getByTestId('message-text-order').textContent).toContain('First handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Second handoff');
     expect(screen.getByTestId('message-text-order').textContent).toContain('Third handoff');
@@ -380,7 +381,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'm-1,m-2,product-handoff:pc-1:row-2:continuation-request,accepted-successor'
+        'm-1,m-2,accepted-successor,product-handoff:pc-1:row-2:continuation-request'
       );
     });
     expect(screen.getByTestId('message-text-order')).toHaveTextContent('Completed handoff');
@@ -487,11 +488,11 @@ describe('ProductConversationPage', () => {
       expect(screen.getByTestId('message-count')).toHaveTextContent('113');
     });
     const order = screen.getByTestId('message-order').textContent?.split(',') ?? [];
-    expect(order[0]).toBe('product-handoff:pc-1:row-1:cont-1');
-    expect(order[1]).toBe('m-1');
-    expect(order[36]).toBe('product-handoff:pc-1:row-2:cont-2');
-    expect(order[72]).toBe('product-handoff:pc-1:row-3:cont-3');
-    expect(order.at(-1)).toBe('m-110');
+    expect(order[0]).toBe('m-1');
+    expect(order[35]).toBe('product-handoff:pc-1:row-1:cont-1');
+    expect(order[71]).toBe('product-handoff:pc-1:row-2:cont-2');
+    expect(order[111]).toBe('m-110');
+    expect(order.at(-1)).toBe('product-handoff:pc-1:row-3:cont-3');
     expect(new Set(order).size).toBe(order.length);
   });
 
@@ -569,7 +570,7 @@ describe('ProductConversationPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('message-order').textContent).toBe(
-        'product-handoff:pc-1:row-1:cont-1,m-1,m-2,product-handoff:pc-1:row-2:cont-2,live-sent,live-streamed'
+        'm-1,m-2,product-handoff:pc-1:row-1:cont-1,live-sent,live-streamed,product-handoff:pc-1:row-2:cont-2'
       );
       expect(conversationNavStackSpy.mock.lastCall?.[0]?.['pendingMessages']).toEqual([
         expect.objectContaining({ localId: 'pending-local', status: 'pending' }),

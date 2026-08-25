@@ -20,6 +20,9 @@ const ConversationListPage = lazy(() =>
 const ProductConversationPage = lazy(() =>
   import('./pages/ProductConversationPage').then((m) => ({ default: m.ProductConversationPage })),
 );
+const ConversationPage = lazy(() =>
+  import('./pages/ConversationPage').then((m) => ({ default: m.ConversationPage })),
+);
 const NewConversationPage = lazy(() =>
   import('./pages/NewConversationPage').then((m) => ({ default: m.NewConversationPage })),
 );
@@ -116,11 +119,11 @@ function AppRoutes() {
 function ProductConversationAliasRedirect({ reference }: { reference: string | undefined }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [failed, setFailed] = useState(false);
+  const [fallbackToRow, setFallbackToRow] = useState(false);
 
   useEffect(() => {
     if (!reference) {
-      setFailed(true);
+      setFallbackToRow(true);
       return;
     }
     let cancelled = false;
@@ -135,12 +138,13 @@ function ProductConversationAliasRedirect({ reference }: { reference: string | u
         }
       })
       .catch(() => {
-        if (!cancelled) setFailed(true);
+        if (!cancelled) setFallbackToRow(true);
       });
     return () => { cancelled = true; };
   }, [location.hash, location.search, navigate, reference]);
 
-  return failed ? <main role="alert">Failed to resolve product conversation route</main> : <RouteFallback />;
+  if (fallbackToRow) return <ConversationPage />;
+  return <RouteFallback />;
 }
 
 function ConversationRouteRedirect() {

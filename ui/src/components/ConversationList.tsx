@@ -203,12 +203,14 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   row,
   isActive,
   isKeyboardSelected,
+  effectiveCwd,
   listDensity,
   onClick,
 }: {
   row: ProductConversationListRow;
   isActive: boolean;
   isKeyboardSelected: boolean;
+  effectiveCwd?: string | undefined;
   listDensity: 'full' | 'mobile' | 'sidebar';
   onClick: (row: ProductConversationListRow) => void;
 }) {
@@ -247,6 +249,7 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
           <span className="conv-item-date" title={formatShortDateTime(row.updated_at)}>
             {formatRelativeTime(row.updated_at)}
           </span>
+          {effectiveCwd && <span className="conv-item-cwd">{effectiveCwd}</span>}
         </div>
       </button>
       {listDensity !== 'mobile' && (
@@ -852,6 +855,11 @@ export function ConversationList({
               row={row}
               isActive={activeSlug === row.product_conversation_id || activeSlug === row.canonical_root.slug || activeSlug === row.canonical_root.transcript_row_id}
               isKeyboardSelected={selectedId === row.product_conversation_id}
+              effectiveCwd={conversations.find((conversation) => (
+                conversation.id === row.latest_transcript_row_id
+                || conversation.id === row.canonical_root.transcript_row_id
+                || conversation.slug === row.canonical_root.slug
+              ))?.cwd}
               listDensity={effectiveListDensity}
               onClick={(productRow) => {
                 if (onProductConversationClick) onProductConversationClick(productRow);

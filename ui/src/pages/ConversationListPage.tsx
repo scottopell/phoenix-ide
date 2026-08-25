@@ -377,6 +377,8 @@ export function ConversationListPage() {
               </div>
             )}
             <ConversationList
+              conversations={conversations}
+              archivedConversations={archivedConversations}
               productConversations={openProductConversations}
               archivedProductConversations={archivedProductConversations}
               showArchived={showArchived}

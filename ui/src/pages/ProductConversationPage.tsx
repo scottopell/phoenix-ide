@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { useParams } from 'react-router-dom';
+import { useLocation, useParams } from 'react-router-dom';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { MessageListSkeleton } from '../components/Skeleton';
 import {
@@ -73,7 +73,7 @@ function flattenHistoricalMessages(snapshot: ProductConversationSnapshotView): M
       if (isLatestSegment(snapshot, segment.transcript_row_id)) return [];
       const handoffMessage = makeHandoffMessage(snapshot, segment.segment_ordinal);
       const segmentMessages = segment.messages.map(toMessage);
-      return handoffMessage ? [handoffMessage, ...segmentMessages] : segmentMessages;
+      return handoffMessage ? [...segmentMessages, handoffMessage] : segmentMessages;
     });
 }
 
@@ -86,10 +86,10 @@ function makeAggregateMessages(
     const latestSegment = sortSegments(snapshot).find((segment) => isLatestSegment(snapshot, segment.transcript_row_id));
     const latestMessages = latestSegment
       ? [
+        ...latestSegment.messages.map(toMessage),
         ...(latestSegment.handoff
           ? [makeHandoffMessage(snapshot, latestSegment.segment_ordinal)!]
           : []),
-        ...latestSegment.messages.map(toMessage),
       ]
       : [];
     return [...historical, ...latestMessages];
@@ -98,8 +98,8 @@ function makeAggregateMessages(
   const latestHandoff = latestSegment ? makeHandoffMessage(snapshot, latestSegment.segment_ordinal) : null;
   return [
     ...historical,
-    ...(latestHandoff ? [latestHandoff] : []),
     ...latestProjection.messages,
+    ...(latestHandoff ? [latestHandoff] : []),
   ];
 }
 
@@ -225,6 +225,10 @@ export function ProductConversationPage() {
 
 function ProductConversationPageInner() {
   const { productConversationId } = useParams<{ productConversationId: string }>();
+  const location = useLocation();
+  const hashTargetMessageId = location.hash.startsWith('#message-')
+    ? decodeURIComponent(location.hash.slice('#message-'.length))
+    : null;
   const [snapshot, setSnapshot] = useState<ProductConversationSnapshotView | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -343,7 +347,30 @@ function ProductConversationPageInner() {
   const latestSlug = latestProjection?.slug ?? snapshot?.latest_transcript_row_id ?? null;
   const latestConversationId = latestProjection?.conversationId;
   const latestWorkScopeKey = latestProjection?.isArchived ? undefined : latestProjection?.conversation?.work_scope_key;
+  const transcriptView = {
+    conversationId: latestConversationId ?? snapshot?.product_conversation_id ?? '',
+    generation: 0,
+    transcriptGeneration: 0,
+  };
+  const hashTargetLoaded = !!hashTargetMessageId && messages.some((message) => message.message_id === hashTargetMessageId);
+  const transcriptPositioning = hashTargetLoaded
+    ? {
+      kind: 'positioning' as const,
+      command: {
+        kind: 'jump_to_message' as const,
+        token: 1,
+        requestToken: 0,
+        view: transcriptView,
+        targetMessageId: hashTargetMessageId,
+      },
+    }
+    : { kind: 'idle' as const, view: transcriptView };
   const isOpen = snapshot?.ordinary_lifecycle === 'open';
+
+  useEffect(() => {
+    if (!hashTargetMessageId || hashTargetLoaded || !snapshot?.has_older || loadingOlder) return;
+    void loadOlderMessages();
+  }, [hashTargetLoaded, hashTargetMessageId, loadOlderMessages, loadingOlder, snapshot?.has_older]);
 
   const synthChain = useMemo(() => {
     if (!snapshot) return null;
@@ -432,8 +459,8 @@ function ProductConversationPageInner() {
             messages={messages}
             pendingMessages={latestProjection?.pendingMessages ?? []}
             convState={convState}
-            onRetry={() => {}}
-            onOpenFile={undefined}
+            onRetry={latestProjection?.onRetryPending ?? (() => {})}
+            onOpenFile={latestProjection?.onOpenFile}
             enableMessageSidepanel={false}
             enableMessageFullscreen={false}
             conversationId={latestConversationId ?? snapshot.product_conversation_id}
@@ -442,14 +469,7 @@ function ProductConversationPageInner() {
             onLoadOlderMessages={snapshot.has_older ? () => { void loadOlderMessages(); } : undefined}
             loadingOlderMessages={loadingOlder}
             olderHistoryError={olderError}
-            transcriptPositioning={{
-              kind: 'idle',
-              view: {
-                conversationId: snapshot.product_conversation_id,
-                generation: 0,
-                transcriptGeneration: 0,
-              },
-            }}
+            transcriptPositioning={transcriptPositioning}
             {...(latestWorkScopeKey ? { workScopeKey: latestWorkScopeKey } : {})}
           />
         </section>
